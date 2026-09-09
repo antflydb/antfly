@@ -10175,3 +10175,26 @@ Remaining experiments, still default-off: shared immutable scoring origins,
 revision-scoped per-leaf maintenance debt, and durable compaction progress
 across newer source updates. Do not infer QPS recovery from reduced maintenance
 bytes; qualify against the preserved matched control across all metrics.
+
+#### Shared immutable scoring origins (2026-09-08; unqualified experiment)
+
+AFRC V2 row chunks now reference a checksum-bound AFRO origin object containing
+the centroid, metric and norm. Appends and repacks retain that object instead
+of embedding another complete AFQD directory/centroid in every chunk. The
+source WAL captures origins and chunks together; full checkpoints retain the
+reference closure. Query chunks own independent origin/backing leases, not a
+reference cycle through their generation's row cache. Missing or mismatched
+origins fail closed.
+
+The 768-dimensional, 64 single-row chunk fixture uses less than one eighth of
+the previous encoded bytes (including the one shared origin). This is a format
+sizing test, not an ingestion or QPS result. Debug vector-kernel/vectorindex
+tests passed (227 passed, three skipped), as did native mutation/checkpoint/
+reopen across L2, cosine and inner product, including missing-origin rejection.
+
+The row experiment remains default-off. AFRC V1 was experimental, not released;
+its frozen baseline executable and data stay together. Use fresh data for this
+candidate; do not open old experimental row files with the new executable.
+Per-leaf maintenance debt and durable progress across newer manifests remain
+separate follow-ups. Main's release-script follow-up at `167d2bd27` was merged
+after the larger reconciliation above.

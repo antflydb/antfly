@@ -3628,11 +3628,38 @@ const NativePostingRowResolver = struct {
     generation: *ExperimentalPostingReadGeneration,
     capture: ?*HBCIndex = null,
     chunks: std.AutoHashMapUnmanaged(u64, *posting_rows.Chunk) = .empty,
+    origins: std.AutoHashMapUnmanaged(u64, *posting_rows.Origin) = .empty,
 
     fn deinit(self: *NativePostingRowResolver) void {
         var values = self.chunks.valueIterator();
         while (values.next()) |chunk| chunk.*.release();
         self.chunks.deinit(self.alloc);
+        var origins = self.origins.valueIterator();
+        while (origins.next()) |origin| origin.*.release();
+        self.origins.deinit(self.alloc);
+    }
+
+    fn originForChunk(self: *@This(), bytes: []const u8) !*posting_rows.Origin {
+        const identity = try posting_rows.Chunk.originIdentity(bytes);
+        if (self.origins.get(identity.origin)) |origin| return origin;
+        const key = experimentalPostingValueKey(identity.origin, .row_chunk);
+        const origin = if (self.capture) |index| blk: {
+            if (index.experimental_posting_captured_values.get(key)) |stored| {
+                const blob = stored orelse return error.MissingPostingChunk;
+                break :blk try posting_rows.Origin.decode(self.alloc, blob.bytes());
+            }
+            break :blk try self.loadOrigin(identity.origin);
+        } else try self.loadOrigin(identity.origin);
+        errdefer origin.release();
+        if (!std.meta.eql(origin.identity, identity)) return error.PostingScoringOriginMismatch;
+        try self.origins.put(self.alloc, identity.origin, origin);
+        return origin;
+    }
+
+    fn loadOrigin(self: *@This(), serial: u64) !*posting_rows.Origin {
+        var resolved = (try self.generation.resolveValueAlloc(self.alloc, serial, .row_chunk)) orelse return error.MissingPostingChunk;
+        defer resolved.deinit(self.alloc);
+        return posting_rows.Origin.decode(self.alloc, resolved.bytes);
     }
 
     pub fn get(self: *NativePostingRowResolver, serial: u64) !?*posting_rows.Chunk {
@@ -3641,10 +3668,10 @@ const NativePostingRowResolver = struct {
         const chunk = if (self.capture) |index| blk: {
             if (index.experimental_posting_captured_values.get(key)) |maybe_blob| {
                 const blob = maybe_blob orelse return null;
-                break :blk try openBlob(self.alloc, blob);
+                break :blk try self.openBlob(blob);
             }
-            break :blk (try self.generation.openRowChunk(self.alloc, serial)) orelse return null;
-        } else (try self.generation.openRowChunk(self.alloc, serial)) orelse return null;
+            break :blk (try self.generation.openRowChunk(self, serial)) orelse return null;
+        } else (try self.generation.openRowChunk(self, serial)) orelse return null;
         errdefer chunk.release();
         try self.chunks.put(self.alloc, serial, chunk);
         return chunk;
@@ -3655,10 +3682,11 @@ const NativePostingRowResolver = struct {
         blob.release();
     }
 
-    fn openBlob(alloc: Allocator, blob: *ExperimentalPostingValueBlob) !*posting_rows.Chunk {
+    fn openBlob(self: *@This(), blob: *ExperimentalPostingValueBlob) !*posting_rows.Chunk {
+        const origin = try self.originForChunk(blob.bytes());
         blob.retain();
         errdefer blob.release();
-        return posting_rows.Chunk.open(alloc, blob.bytes(), .{ .leased = .{ .ptr = blob, .release = releaseBlob } });
+        return posting_rows.Chunk.open(self.alloc, blob.bytes(), .{ .leased = .{ .ptr = blob, .release = releaseBlob } }, origin);
     }
 
     const SegmentLease = struct {
@@ -3671,21 +3699,25 @@ const NativePostingRowResolver = struct {
         }
     };
 
-    fn openSegment(alloc: Allocator, segment: posting_segment_store_mod.RetainedSegment, bytes: []const u8) !*posting_rows.Chunk {
+    fn openSegment(self: *@This(), segment: posting_segment_store_mod.RetainedSegment, bytes: []const u8) !*posting_rows.Chunk {
+        const alloc = self.alloc;
+        const origin = try self.originForChunk(bytes);
         const offset = @intFromPtr(bytes.ptr) - @intFromPtr(segment.bytes().ptr);
         var retained = try segment.retain(alloc);
         errdefer retained.deinit(alloc);
         const lease = try alloc.create(SegmentLease);
         errdefer alloc.destroy(lease);
         lease.* = .{ .alloc = alloc, .segment = retained };
-        return posting_rows.Chunk.open(alloc, retained.bytes()[offset..][0..bytes.len], .{ .leased = .{ .ptr = lease, .release = SegmentLease.release } });
+        return posting_rows.Chunk.open(alloc, retained.bytes()[offset..][0..bytes.len], .{ .leased = .{ .ptr = lease, .release = SegmentLease.release } }, origin);
     }
 
-    fn openCopy(alloc: Allocator, bytes: []const u8) !*posting_rows.Chunk {
+    fn openCopy(self: *@This(), bytes: []const u8) !*posting_rows.Chunk {
+        const alloc = self.alloc;
+        const origin = try self.originForChunk(bytes);
         const owned = try alloc.alignedAlloc(u8, .@"8", bytes.len);
         errdefer alloc.free(owned);
         @memcpy(owned, bytes);
-        return posting_rows.Chunk.open(alloc, owned, .{ .owned = .@"8" });
+        return posting_rows.Chunk.open(alloc, owned, .{ .owned = .@"8" }, origin);
     }
 };
 
@@ -3784,18 +3816,18 @@ const ExperimentalPostingReadGeneration = struct {
         std.debug.assert(previous > 0 and previous < std.math.maxInt(u32));
     }
 
-    fn openRowChunk(self: *ExperimentalPostingReadGeneration, alloc: Allocator, serial: u64) !?*posting_rows.Chunk {
+    fn openRowChunk(self: *ExperimentalPostingReadGeneration, resolver: *NativePostingRowResolver, serial: u64) !?*posting_rows.Chunk {
         const key = experimentalPostingValueKey(serial, .row_chunk);
         var current: ?*ExperimentalPostingReadGeneration = self;
         while (current) |generation| : (current = generation.parent) {
-            if (generation.values.get(key)) |stored| return if (stored) |blob| try NativePostingRowResolver.openBlob(alloc, blob) else null;
+            if (generation.values.get(key)) |stored| return if (stored) |blob| try resolver.openBlob(blob) else null;
             if (generation.root) |root| {
-                if (root.materialized.get(key)) |stored| return if (stored.bytes) |bytes| try NativePostingRowResolver.openCopy(alloc, bytes) else null;
+                if (root.materialized.get(key)) |stored| return if (stored.bytes) |bytes| try resolver.openCopy(bytes) else null;
                 var i = root.segments.len;
                 while (i != 0) {
                     i -= 1;
                     if (try root.segments[i].getValue(serial, .row_chunk)) |bytes|
-                        return try NativePostingRowResolver.openSegment(alloc, root.retained_segments[i], bytes);
+                        return try resolver.openSegment(root.retained_segments[i], bytes);
                 }
                 return null;
             }
@@ -10747,6 +10779,9 @@ pub const HBCIndex = struct {
         defer snapshot.deinit();
         if (snapshot.identity.leaf != posting_id or snapshot.coverage > sequence) return error.Corrupted;
         for (snapshot.runs) |run| {
+            if (!(try emitted.getOrPut(alloc, run.chunk.identity.origin)).found_existing) {
+                try appendRowCheckpointValue(writer, sink, run.chunk.identity.origin, .row_chunk, sequence, run.chunk.origin.bytes);
+            }
             if ((try emitted.getOrPut(alloc, run.chunk.serial)).found_existing) continue;
             try appendRowCheckpointValue(writer, sink, run.chunk.serial, .row_chunk, sequence, run.chunk.bytes);
             if (reclaimer) |pages| pages.observe(run.chunk.bytes);
@@ -16852,9 +16887,11 @@ pub const HBCIndex = struct {
         const ids = try self.alloc.alloc(u64, qs.getCount());
         defer self.alloc.free(ids);
         for (ids, 0..) |*id, i| id.* = std.mem.readInt(u64, node.ids_bytes[i * 8 ..][0..8], .little);
+        const origin_identity = try self.allocatePostingRowIdentity();
         const identity = try self.allocatePostingRowIdentity();
-        const chunk = try posting_rows.Chunk.build(self.alloc, .{ .incarnation = identity.incarnation, .leaf = node_id, .origin = identity.serial }, identity.serial, identity.serial, ids, &qs.rabit);
+        const chunk = try posting_rows.Chunk.build(self.alloc, .{ .incarnation = identity.incarnation, .leaf = node_id, .origin = origin_identity.serial }, identity.serial, identity.serial, ids, &qs.rabit);
         defer chunk.release();
+        try self.captureNativeRowValue(origin_identity.serial, .row_chunk, chunk.origin.bytes);
         try self.captureNativeRowValue(identity.serial, .row_chunk, chunk.bytes);
         var snapshot = try posting_rows.Snapshot.init(self.alloc, chunk.identity, identity.serial, self.experimental_posting_capture_max_mutation_sequence, &.{.{ .chunk = chunk, .start = 0, .len = @intCast(ids.len) }});
         errdefer snapshot.deinit();
@@ -16895,7 +16932,7 @@ pub const HBCIndex = struct {
         const origin = row.snapshot.runs[0].chunk.view;
         var added = try self.quantizer.quantize(origin.centroid, vectors, count);
         defer added.deinit(self.alloc);
-        const chunk = try posting_rows.Chunk.build(self.alloc, row.snapshot.identity, identity.serial, identity.serial, leaf.members[previous_count..], &added);
+        const chunk = try posting_rows.Chunk.buildWithOrigin(self.alloc, row.snapshot.runs[0].chunk.origin, identity.serial, identity.serial, leaf.members[previous_count..], &added);
         defer chunk.release();
         var base = row.snapshot;
         base.alloc = self.alloc;
@@ -28831,6 +28868,17 @@ test "native posting row integration survives mutation checkpoint and reopen" {
             var row_count: usize = 0;
             for (1..idx.metadata.node_count + 1) |id| if (try generation.rowView(id)) |rows| {
                 row_count += rows.members.len;
+                const origin = rows.snapshot.runs[0].chunk.origin;
+                for (rows.snapshot.runs) |run| try std.testing.expect(run.chunk.origin == origin);
+                try std.testing.expectEqualSlices(u8, origin.bytes, (try generation.value(origin.identity.origin, .row_chunk)).?);
+                // A chunk cannot borrow an origin from a different lifetime or
+                // silently continue when its durable dependency is missing.
+                const broken = try ExperimentalPostingReadGeneration.createOverlay(alloc, generation, generation.covered_source_sequence.load(.acquire), generation.wal_generation.load(.acquire), generation.wal_committed_bytes.load(.acquire));
+                defer broken.release();
+                try broken.values.put(alloc, experimentalPostingValueKey(origin.identity.origin, .row_chunk), null);
+                var resolver = NativePostingRowResolver{ .alloc = alloc, .generation = broken };
+                defer resolver.deinit();
+                try std.testing.expectError(error.MissingPostingChunk, resolver.get(rows.snapshot.runs[0].chunk.serial));
             };
             try std.testing.expect(row_count > 0);
             try Fixture.check(&idx, &.{});

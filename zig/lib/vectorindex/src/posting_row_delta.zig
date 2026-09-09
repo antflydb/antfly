@@ -77,6 +77,69 @@ pub const RowRef = struct {
 /// One physical chunk; serials must never be reused within an incarnation.
 /// The byte buffer can be owned heap memory or a retained mapping. Reader
 /// verification state is private, while all scoring columns stay borrowed.
+/// Scoring origins are separate immutable objects. Every row chunk in a leaf
+/// generation retains this object; neither deletion nor repacking duplicates
+/// its centroid. Its durable key is Identity.origin in the row-chunk namespace.
+pub const Origin = struct {
+    alloc: Allocator,
+    refs: std.atomic.Value(u32) = .init(1),
+    identity: Identity,
+    bytes: []align(8) const u8,
+    centroid: []const f32,
+    centroid_norm: f32,
+    metric: u8,
+    checksum: u32,
+
+    pub fn decode(alloc: Allocator, encoded: []const u8) !*Origin {
+        try validateFrame(encoded, "AFRO");
+        const identity = readIdentity(encoded);
+        const dims = get(u64, encoded, 40);
+        if (!identity.valid() or dims == 0 or dims != (encoded.len - header_len) / 4 or
+            (encoded.len - header_len) % 4 != 0 or get(u64, encoded, 48) > 2 or
+            get(u32, encoded, 60) != 0 or get(u64, encoded, 64) != 0 or get(u64, encoded, 72) != 0)
+            return error.InvalidPostingRows;
+        const norm: f32 = @bitCast(get(u32, encoded, 56));
+        if (!std.math.isFinite(norm) or norm < 0) return error.InvalidPostingRows;
+        const bytes = try alloc.alignedAlloc(u8, .@"8", encoded.len);
+        errdefer alloc.free(bytes);
+        @memcpy(bytes, encoded);
+        const centroid = std.mem.bytesAsSlice(f32, bytes[header_len..]);
+        for (centroid) |value| if (!std.math.isFinite(value)) return error.InvalidPostingRows;
+        const self = try alloc.create(Origin);
+        self.* = .{ .alloc = alloc, .identity = identity, .bytes = bytes, .centroid = centroid, .centroid_norm = norm, .metric = @intCast(get(u64, bytes, 48)), .checksum = Crc32.hash(bytes) };
+        return self;
+    }
+
+    pub fn build(alloc: Allocator, identity: Identity, set: *const proto.RaBitQuantizedVectorSet) !*Origin {
+        if (@intFromEnum(set.metric) < 0 or @intFromEnum(set.metric) > 2) return error.InvalidPostingRows;
+        const size = try std.math.add(usize, header_len, try std.math.mul(usize, set.centroid.len, 4));
+        if (size > max_encoded_bytes) return error.PostingRowBackpressure;
+        const bytes = try alloc.alloc(u8, size);
+        defer alloc.free(bytes);
+        @memset(bytes, 0);
+        writeHeader(bytes, "AFRO", identity);
+        put(u64, bytes, 40, set.centroid.len);
+        put(u64, bytes, 48, @intCast(@intFromEnum(set.metric)));
+        put(u32, bytes, 56, @bitCast(set.centroid_norm));
+        @memcpy(bytes[header_len..], std.mem.sliceAsBytes(set.centroid));
+        seal(bytes);
+        return decode(alloc, bytes);
+    }
+
+    pub fn retain(self: *Origin) void {
+        const before = self.refs.fetchAdd(1, .monotonic);
+        std.debug.assert(before != 0 and before != std.math.maxInt(u32));
+    }
+
+    pub fn release(self: *Origin) void {
+        const before = self.refs.fetchSub(1, .acq_rel);
+        std.debug.assert(before != 0);
+        if (before != 1) return;
+        self.alloc.free(self.bytes);
+        self.alloc.destroy(self);
+    }
+};
+
 pub const Chunk = struct {
     alloc: Allocator,
     refs: std.atomic.Value(u32) = .init(1),
@@ -85,37 +148,62 @@ pub const Chunk = struct {
     revision: u64,
     bytes: []const u8,
     checksum: u32,
-    reader: directory.VerifiedReader,
+    origin: *Origin,
     view: directory.View,
     backing: Backing,
 
     pub const Backing = union(enum) {
-        /// Original allocation alignment (not the incidental pointer alignment).
         owned: std.mem.Alignment,
         leased: struct { ptr: *anyopaque, release: *const fn (*anyopaque) void },
     };
 
-    /// On success takes ownership of backing, not on failure. A lease must
-    /// already cover bytes and remain alive until the final chunk reference.
-    pub fn open(alloc: Allocator, bytes: []const u8, backing: Backing) !*Chunk {
+    /// Validates the frame before exposing a dependency key to the resolver.
+    pub fn originIdentity(bytes: []const u8) !Identity {
         try validateFrame(bytes, "AFRC");
-        if (get(u64, bytes, 64) != bytes.len - header_len or get(u64, bytes, 72) != 0)
-            return error.InvalidPostingRows;
         const identity = readIdentity(bytes);
-        if (!identity.valid() or get(u64, bytes, 40) == 0 or get(u64, bytes, 48) == 0 or get(u64, bytes, 56) != 0)
+        if (!identity.valid()) return error.InvalidPostingRows;
+        return identity;
+    }
+
+    /// Takes backing only on success, retaining origin independently. AFRC V2
+    /// contains IDs and scoring columns only; AFRO must be durable in the same
+    /// transaction/reference closure before this chunk can be published.
+    pub fn open(alloc: Allocator, bytes: []const u8, backing: Backing, origin: *Origin) !*Chunk {
+        const identity = try originIdentity(bytes);
+        if (!std.meta.eql(identity, origin.identity) or get(u32, bytes, 72) != origin.checksum)
+            return error.PostingScoringOriginMismatch;
+        const count_u64 = get(u64, bytes, 56);
+        const flags = get(u32, bytes, 76);
+        if (@intFromPtr(bytes.ptr) % 8 != 0 or count_u64 == 0 or count_u64 > std.math.maxInt(u32) or
+            get(u64, bytes, 40) == 0 or get(u64, bytes, 48) == 0 or
+            get(u64, bytes, 64) != bytes.len - header_len or flags > 1 or
+            (flags == 1 and origin.metric != 0)) return error.InvalidPostingRows;
+        const count: usize = @intCast(count_u64);
+        const width = @import("antfly_vector").rabitq.codeWidth(origin.centroid.len);
+        const row_bytes = try std.math.add(usize, 20 + @as(usize, if (flags == 1) 0 else 4), try std.math.mul(usize, width, 8));
+        if (try std.math.mul(usize, count, row_bytes) != bytes.len - header_len)
             return error.InvalidPostingRows;
-        var reader = try directory.VerifiedReader.init(alloc, bytes[header_len..]);
-        errdefer reader.deinit();
-        if (reader.reader.posting_count != 1) return error.InvalidPostingRows;
-        const view = (try reader.get(identity.leaf)) orelse return error.InvalidPostingRows;
-        if (view.metric > 2 or view.width != @import("antfly_vector").rabitq.codeWidth(view.centroid.len) or
-            view.count == 0 or view.count > std.math.maxInt(u32) or view.member_ids.len != view.count or
-            view.subgroup_plan != null or view.projections != null) return error.InvalidPostingRows;
-        // A malformed chunk must not introduce ambiguous live revisions.
+        var cursor: usize = header_len;
+        const view = directory.View{
+            .metric = origin.metric,
+            .centroid = origin.centroid,
+            .centroid_norm = origin.centroid_norm,
+            .member_ids = takeColumn(u64, bytes, &cursor, count),
+            .codes = takeColumn(u64, bytes, &cursor, count * width),
+            .code_counts = takeColumn(u32, bytes, &cursor, count),
+            .centroid_distances = takeColumn(f32, bytes, &cursor, count),
+            .quantized_dot_products = takeColumn(f32, bytes, &cursor, count),
+            .centroid_dot_products = takeColumn(f32, bytes, &cursor, if (flags == 1) 0 else count),
+            .omitted_l2_centroid_dots = flags == 1,
+            .count = count,
+            .width = width,
+            .projections = null,
+        };
         var ids = std.AutoHashMapUnmanaged(u64, void).empty;
         defer ids.deinit(alloc);
         for (view.member_ids) |id| if ((try ids.getOrPut(alloc, id)).found_existing) return error.DuplicatePostingVector;
         const self = try alloc.create(Chunk);
+        origin.retain();
         self.* = .{
             .alloc = alloc,
             .identity = identity,
@@ -123,36 +211,61 @@ pub const Chunk = struct {
             .revision = get(u64, bytes, 48),
             .bytes = bytes,
             .checksum = Crc32.hash(bytes),
-            .reader = reader,
+            .origin = origin,
             .view = view,
             .backing = backing,
         };
         return self;
     }
 
+    fn takeColumn(comptime T: type, bytes: []const u8, cursor: *usize, count: usize) []const T {
+        const start = cursor.*;
+        cursor.* += count * @sizeOf(T);
+        return std.mem.bytesAsSlice(T, @as([]align(@alignOf(T)) const u8, @alignCast(bytes[start..cursor.*])));
+    }
+
+    /// Convenience for constructing an initial leaf. Appends and repacks use
+    /// buildWithOrigin so their query views also share the centroid allocation.
     pub fn build(alloc: Allocator, identity: Identity, serial: u64, revision: u64, ids: []const u64, set: *const proto.RaBitQuantizedVectorSet) !*Chunk {
-        if (!identity.valid() or serial == 0 or revision == 0 or ids.len != set.getCount()) return error.InvalidPostingRows;
-        var writer = try directory.Writer.init(alloc, set.centroid.len, @intCast(@intFromEnum(set.metric)));
-        defer writer.deinit();
-        const members = try alloc.alloc(u8, try std.math.mul(usize, ids.len, 8));
-        defer alloc.free(members);
-        for (ids, 0..) |id, i| put(u64, members, i * 8, id);
-        try writer.appendWithMemberBytes(identity.leaf, set, members);
-        const payload = try writer.build();
-        defer alloc.free(payload);
-        const len = try std.math.add(usize, header_len, payload.len);
+        const origin = try Origin.build(alloc, identity, set);
+        defer origin.release();
+        return buildWithOrigin(alloc, origin, serial, revision, ids, set);
+    }
+
+    pub fn buildWithOrigin(alloc: Allocator, origin: *Origin, serial: u64, revision: u64, ids: []const u64, set: *const proto.RaBitQuantizedVectorSet) !*Chunk {
+        if (!std.mem.eql(u8, std.mem.sliceAsBytes(origin.centroid), std.mem.sliceAsBytes(set.centroid)) or
+            @as(u32, @bitCast(origin.centroid_norm)) != @as(u32, @bitCast(set.centroid_norm)) or
+            origin.metric != @intFromEnum(set.metric)) return error.PostingScoringOriginMismatch;
+        const count = ids.len;
+        const width = @import("antfly_vector").rabitq.codeWidth(origin.centroid.len);
+        const omitted = origin.metric == 0 and set.centroid_dot_products.len == 0;
+        if (serial == 0 or revision == 0 or count == 0 or count > std.math.maxInt(u32) or
+            count != set.getCount() or set.codes.width != width or set.codes.data.len != count * width or
+            set.code_counts.len != count or set.centroid_distances.len != count or
+            set.quantized_dot_products.len != count or (!omitted and set.centroid_dot_products.len != count))
+            return error.InvalidPostingRows;
+        const row_bytes = try std.math.add(usize, 20 + @as(usize, if (omitted) 0 else 4), try std.math.mul(usize, width, 8));
+        const len = try std.math.add(usize, header_len, try std.math.mul(usize, count, row_bytes));
         if (len > max_encoded_bytes) return error.PostingRowBackpressure;
-        // AFQD arrays need eight-byte alignment. The outer header preserves it.
         const bytes = try alloc.alignedAlloc(u8, .@"8", len);
         errdefer alloc.free(bytes);
         @memset(bytes, 0);
-        writeHeader(bytes, "AFRC", identity);
+        writeHeader(bytes, "AFRC", origin.identity);
+        put(u16, bytes, 4, 2);
         put(u64, bytes, 40, serial);
         put(u64, bytes, 48, revision);
-        put(u64, bytes, 64, payload.len);
-        @memcpy(bytes[header_len..], payload);
+        put(u64, bytes, 56, count);
+        put(u64, bytes, 64, len - header_len);
+        put(u32, bytes, 72, origin.checksum);
+        put(u32, bytes, 76, if (omitted) 1 else 0);
+        var cursor: usize = header_len;
+        inline for (.{ std.mem.sliceAsBytes(ids), std.mem.sliceAsBytes(set.codes.data), std.mem.sliceAsBytes(set.code_counts), std.mem.sliceAsBytes(set.centroid_distances), std.mem.sliceAsBytes(set.quantized_dot_products), std.mem.sliceAsBytes(set.centroid_dot_products) }) |column| {
+            @memcpy(bytes[cursor..][0..column.len], column);
+            cursor += column.len;
+        }
+        std.debug.assert(cursor == bytes.len);
         seal(bytes);
-        return open(alloc, bytes, .{ .owned = .@"8" });
+        return open(alloc, bytes, .{ .owned = .@"8" }, origin);
     }
 
     pub fn retain(self: *Chunk) void {
@@ -164,7 +277,7 @@ pub const Chunk = struct {
         const before = self.refs.fetchSub(1, .acq_rel);
         std.debug.assert(before != 0);
         if (before != 1) return;
-        self.reader.deinit();
+        self.origin.release();
         switch (self.backing) {
             .owned => |alignment| self.alloc.rawFree(@constCast(self.bytes), alignment, @returnAddress()),
             .leased => |lease| lease.release(lease.ptr),
@@ -219,7 +332,7 @@ pub const Snapshot = struct {
         var chunks = std.AutoHashMapUnmanaged(u64, *Chunk).empty;
         defer chunks.deinit(alloc);
         var count: usize = 0;
-        var bytes: u64 = 0;
+        var bytes: u64 = if (runs.len == 0) 0 else runs[0].chunk.origin.bytes.len;
         var physical_rows: u64 = 0;
         for (runs) |run| {
             const chunk = run.chunk;
@@ -509,7 +622,7 @@ pub const Repack = struct {
             if (set.centroid_dot_products.len != 0) @memcpy(set.centroid_dot_products[offset..end], source.centroid_dot_products);
             offset = end;
         }
-        return .{ .base = pinned, .compact = try Chunk.build(a, base.identity, serial, base.revision, ids, &set) };
+        return .{ .base = pinned, .compact = try Chunk.buildWithOrigin(a, base.runs[0].chunk.origin, serial, base.revision, ids, &set) };
     }
 
     pub fn deinit(self: *Repack) void {
@@ -592,7 +705,7 @@ fn seal(bytes: []u8) void {
 
 fn validateFrame(bytes: []const u8, magic: *const [4]u8) !void {
     if (bytes.len < header_len or bytes.len > max_encoded_bytes or !std.mem.eql(u8, bytes[0..4], magic) or
-        get(u16, bytes, 4) != 1 or get(u16, bytes, 6) != 0 or get(u32, bytes, 8) != bytes.len)
+        get(u16, bytes, 4) != @as(u16, if (std.mem.eql(u8, magic, "AFRC")) 2 else 1) or get(u16, bytes, 6) != 0 or get(u32, bytes, 8) != bytes.len)
         return error.InvalidPostingRows;
     if (get(u32, bytes, 12) != checksum(bytes)) return error.PostingRowChecksumMismatch;
 }
@@ -677,6 +790,57 @@ test "posting row deltas preserve revision identity and old query leases" {
     }
 }
 
+test "posting row shared origins remove dimension-scaled chunk duplication" {
+    const a = std.testing.allocator;
+    var quantizer = try @import("antfly_vector").quantizer.RaBitQuantizer.init(a, 768, 42, .cosine);
+    defer quantizer.deinit();
+    const center = [_]f32{0.125} ** 768;
+    const vector = [_]f32{0.25} ** 768;
+    var set = try quantizer.quantize(&center, &vector, 1);
+    defer set.deinit(a);
+    const origin = try Origin.build(a, test_identity, &set);
+    defer origin.release();
+    var chunks: [64]*Chunk = undefined;
+    var initialized: usize = 0;
+    defer for (chunks[0..initialized]) |chunk| chunk.release();
+    var new_bytes: usize = origin.bytes.len;
+    for (&chunks, 0..) |*chunk, i| {
+        chunk.* = try Chunk.buildWithOrigin(a, origin, i + 1, 1, &.{i + 1}, &set);
+        initialized += 1;
+        try std.testing.expect(chunk.*.origin == origin);
+        try std.testing.expect(chunk.*.view.centroid.ptr == origin.centroid.ptr);
+        new_bytes += chunk.*.bytes.len;
+    }
+    // Reproduce the prior full-AFQD payload only as a sizing oracle.
+    var previous = try directory.Writer.init(a, 768, @intCast(@intFromEnum(set.metric)));
+    defer previous.deinit();
+    const ids = [_]u64{1};
+    try previous.appendWithMemberBytes(test_identity.leaf, &set, std.mem.sliceAsBytes(&ids));
+    const previous_bytes = try previous.build();
+    defer a.free(previous_bytes);
+    try std.testing.expect(new_bytes * 8 < (header_len + previous_bytes.len) * chunks.len);
+    var runs: [64]Run = undefined;
+    for (&runs, chunks) |*run, chunk| run.* = .{ .chunk = chunk, .start = 0, .len = 1 };
+    var snapshot = try Snapshot.init(a, test_identity, 1, 100, &runs);
+    defer snapshot.deinit();
+    try std.testing.expectEqual(new_bytes, snapshot.physical_bytes);
+    var repack = try Repack.prepare(&snapshot, 1000);
+    defer repack.deinit();
+    try std.testing.expect(repack.compact.?.origin == origin);
+
+    var different_set = set;
+    var different_center = center;
+    different_center[0] += 0.125;
+    different_set.centroid = &different_center;
+    const wrong = try Origin.build(a, test_identity, &different_set);
+    defer wrong.release();
+    try std.testing.expectError(error.PostingScoringOriginMismatch, Chunk.open(a, chunks[0].bytes, .{ .owned = .@"8" }, wrong));
+    const damaged = try a.dupe(u8, origin.bytes);
+    defer a.free(damaged);
+    damaged[damaged.len - 1] ^= 1;
+    try std.testing.expectError(error.PostingRowChecksumMismatch, Origin.decode(a, damaged));
+}
+
 test "posting row manifests recover independently and reject broken dependencies" {
     const a = std.testing.allocator;
     const chunk = try testChunk(a, 1, 1, &.{ 10, 20, 30, 40 }, .cosine);
@@ -689,7 +853,9 @@ test "posting row manifests recover independently and reject broken dependencies
     defer a.free(encoded);
     // Reopen separate bytes/readers; no decoded aggregate or predecessor view.
     const reopened_bytes = try a.dupe(u8, chunk.bytes);
-    const reopened_chunk = Chunk.open(a, reopened_bytes, .{ .owned = .@"1" }) catch |err| {
+    const reopened_origin = try Origin.decode(a, chunk.origin.bytes);
+    defer reopened_origin.release();
+    const reopened_chunk = Chunk.open(a, reopened_bytes, .{ .owned = .@"1" }, reopened_origin) catch |err| {
         a.free(reopened_bytes);
         return err;
     };
@@ -726,7 +892,7 @@ test "posting row manifests recover independently and reject broken dependencies
     const bad_chunk = try a.dupe(u8, chunk.bytes);
     defer a.free(bad_chunk);
     bad_chunk[bad_chunk.len - 1] ^= 1;
-    try std.testing.expectError(error.PostingRowChecksumMismatch, Chunk.open(a, bad_chunk, .{ .owned = .@"1" }));
+    try std.testing.expectError(error.PostingRowChecksumMismatch, Chunk.open(a, bad_chunk, .{ .owned = .@"1" }, chunk.origin));
 }
 
 test "posting row repack preserves newer mutations without resurrecting rows" {
@@ -885,7 +1051,7 @@ test "posting row chunk leases outlive publication and release exactly once" {
         }
     };
     var lease = Lease{};
-    const borrowed = try Chunk.open(a, owned.bytes, .{ .leased = .{ .ptr = &lease, .release = Lease.release } });
+    const borrowed = try Chunk.open(a, owned.bytes, .{ .leased = .{ .ptr = &lease, .release = Lease.release } }, owned.origin);
     var query = try Snapshot.init(a, test_identity, 1, 100, &.{.{ .chunk = borrowed, .start = 0, .len = 4 }});
     borrowed.release();
     {
