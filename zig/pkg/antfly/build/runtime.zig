@@ -149,6 +149,10 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             link_libc,
             unit == .inference,
         );
+        // Only the API kernel serves schemas. The other units use its ABI;
+        // giving them these file imports would invalidate their caches too.
+        if (unit == .api_kernel)
+            role_mod.addImport("antfly_openapi_specs", production_antfly_imports.embedded_openapi);
         addMacosSdkPaths(b, role_mod, target);
         role_mod.addImport("antfly-client", antfly_client_pkg_mod);
         if (unit == .distributed) role_mod.addImport("antfly_storage_root", role_mod);

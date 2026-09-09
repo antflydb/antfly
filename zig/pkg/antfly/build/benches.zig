@@ -699,6 +699,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .optimize = .ReleaseFast,
     });
     antfly_imports.configureRuntime(b, storage_bench_root_mod, false, true, false);
+    storage_bench_root_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     storage_bench_mod.addImport("antfly-zig", storage_bench_root_mod);
     storage_bench_mod.addImport("antfly_platform", platform_mod);
 

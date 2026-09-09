@@ -29,8 +29,12 @@ generated files. `make openapi-check` compares them without modifying source fil
 Both use the normal Zig cache; source files, generator options, Python dependency
 locks, and the schema tree supply the inputs. No Git-derived cache key is needed.
 The HTTP API embeds the source schemas through a dedicated module with tracked
-`@embedFile` inputs. Schema contents stay out of shared build options, so artifacts
-that do not import the schema module keep their existing cache entries.
+`@embedFile` inputs. The API kernel and HTTP-serving test/benchmark roots attach
+that module explicitly; shared imports and build options carry no schema inputs.
+Editing an embedded schema leaves the CLI, distributed, serverless, and inference
+runtime archives cached. CI checks all six schema inputs using the real runtime
+constructor with small probe bodies (`python3 -m unittest tools.test_runtime_schema_cache`
+from `zig/`), including builds with a schema file missing.
 
 ## Default Tests
 

@@ -927,6 +927,7 @@ pub fn build(b: *std.Build) void {
         .sanitize_thread = sanitize_thread,
     });
     antfly_imports.configure(b, antfly_mod, false, link_libc);
+    antfly_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
 
     const embedded = antfly_embedded_build.addEmbedded(b, .{
         .optimize = optimize,
