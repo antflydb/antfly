@@ -167,7 +167,7 @@ Both backends add format parameter handling in their backup API handlers.
 ## Verification
 
 - Run Go unit tests: `GOEXPERIMENT=simd go test ./src/common/ -run TestBackupCodec`
-- Run Zig unit tests: `zig build unit-test` (backup_codec module tests)
+- Run Zig unit tests: `zig build antfly-unit-test` (backup_codec module tests)
 - Run E2E: `make e2e E2E_TEST=TestPortableBackup`
 - Cross-backend E2E: Python test that starts both Go and Zig instances
 

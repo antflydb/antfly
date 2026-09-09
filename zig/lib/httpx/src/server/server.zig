@@ -313,6 +313,10 @@ pub const Context = struct {
     /// Set to true when a streaming response has been sent via `streamResponse()`.
     /// When true, the connection loop skips the normal response serialization.
     h1_stream_sent: bool = false,
+    /// Connection policy established before dispatch, then narrowed by the
+    /// streaming response headers. Committed headers and socket retirement
+    /// must agree so clients do not reuse a connection the server will close.
+    h1_keep_alive: bool = true,
 
     // H2 streaming fields (set by the server for H2 streams, null for HTTP/1.1).
     h2: ?*H2Connection = null,
@@ -990,7 +994,10 @@ pub const Context = struct {
         resp.headers.deinit();
         resp.headers = headers;
         headers = Headers.init(self.allocator);
-        try resp.headers.set(HeaderName.CONNECTION, "keep-alive");
+        self.h1_keep_alive = self.h1_keep_alive and
+            self.request.headers.isKeepAlive(self.request.version) and
+            resp.headers.isKeepAlive(self.request.version);
+        try resp.headers.set(HeaderName.CONNECTION, if (self.h1_keep_alive) "keep-alive" else "close");
         try resp.headers.set(HeaderName.TRANSFER_ENCODING, "chunked");
 
         // Serialize headers only (no body)
@@ -2054,6 +2061,11 @@ pub const Server = struct {
             ctx.max_request_body_size = resolveRequestBodyLimit(self, req.method, req.uri.path) orelse self.config.max_body_size;
             req.body_budget = &self.body_budget;
             ctx.h1_sock = &sock;
+            const reaches_request_limit = self.config.max_requests_per_connection > 0 and
+                request_count + 1 >= self.config.max_requests_per_connection;
+            ctx.h1_keep_alive = self.config.keep_alive and
+                req.headers.isKeepAlive(req.version) and !reaches_request_limit and
+                self.shutdown_mode.load(.acquire) == 0;
             // A non-empty suffix is not necessarily a pipelined request: it
             // can be a partial or malformed request line. Preserve this fact
             // for handlers without mutating the live parser or buffer.
@@ -2107,17 +2119,11 @@ pub const Server = struct {
                 ctx.h1_stream_sent = false;
                 self.finishRequest();
                 request_active = false;
-                // Check if the client wants keep-alive
-                const stream_keep_alive = self.config.keep_alive and
-                    req.headers.isKeepAlive(req.version) and
+                const stream_keep_alive = ctx.h1_keep_alive and
                     self.shutdown_mode.load(.acquire) == 0;
                 if (!stream_keep_alive) return;
 
                 request_count += 1;
-                if (self.config.max_requests_per_connection > 0 and
-                    request_count >= self.config.max_requests_per_connection)
-                    return;
-
                 if (first_request) first_request = false;
                 self.io.sleep(Io.Duration.zero, .awake) catch {};
                 continue;
@@ -2131,16 +2137,13 @@ pub const Server = struct {
                 response.body = null;
             }
 
-            const request_wants_keep_alive = req.headers.isKeepAlive(req.version);
             // Handlers may deliberately shed an overloaded request and ask the
             // peer to reconnect later. Honor a response-side Connection: close
             // instead of advertising closure while retaining the socket and its
             // connection-admission permit until the keep-alive timeout.
             const response_wants_keep_alive = response.headers.isKeepAlive(req.version);
-            const reaches_request_limit = self.config.max_requests_per_connection > 0 and
-                request_count + 1 >= self.config.max_requests_per_connection;
-            const keep_alive = self.config.keep_alive and request_wants_keep_alive and response_wants_keep_alive and
-                !reaches_request_limit and self.shutdown_mode.load(.acquire) == 0;
+            const keep_alive = ctx.h1_keep_alive and response_wants_keep_alive and
+                self.shutdown_mode.load(.acquire) == 0;
             if (!keep_alive) {
                 try response.headers.set(HeaderName.CONNECTION, "close");
             }
@@ -4068,6 +4071,75 @@ test "HTTP streaming headers and automatic preflight preserve middleware policy"
         defer automatic.deinit();
         try std.testing.expectEqual(@as(u16, 204), automatic.status.code);
         try std.testing.expectEqualStrings("GET, OPTIONS", automatic.headers.get("Allow").?);
+    }
+}
+
+test "H1 streaming advertises and honors connection retirement" {
+    const State = struct {
+        fn handler(ctx: *Context) anyerror!Response {
+            if (mem.eql(u8, ctx.request.uri.path, "/close")) try ctx.setHeader(HeaderName.CONNECTION, "close");
+            var writer = try ctx.streamResponse(200);
+            try writer.writeEvent("done", "{}");
+            try writer.close();
+            return ctx.response.build();
+        }
+    };
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const Case = struct { keep_alive: bool = true, limit: u32 = 0, request_close: bool = false, handler_close: bool = false };
+    for ([_]Case{
+        .{ .limit = 2 },
+        .{ .keep_alive = false },
+        .{ .request_close = true },
+        .{ .handler_close = true },
+    }) |case| {
+        var server = Server.initWithConfig(allocator, io_impl.io(), .{
+            .host = "127.0.0.1",
+            .port = 0,
+            .keep_alive = case.keep_alive,
+            .max_requests_per_connection = case.limit,
+            .h1_disconnect_cancellation = .disabled,
+        });
+        defer server.deinit();
+        try server.get("/stream", State.handler);
+        try server.get("/close", State.handler);
+        try server.bind();
+        const thread = try std.Thread.spawn(.{}, struct {
+            fn run(s: *Server) void {
+                s.listen() catch |err| std.debug.panic("stream retirement listener failed: {}", .{err});
+            }
+        }.run, .{&server});
+        defer {
+            server.stop();
+            thread.join();
+        }
+        while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+        var client = try Socket.connect(server.boundAddress().?, std.Io.Threaded.global_single_threaded.io());
+        defer client.close();
+        try client.setRecvTimeout(5_000);
+        const count: u32 = if (case.limit > 0) case.limit else 1;
+        for (0..count) |index| {
+            const request = if (case.request_close)
+                "GET /stream HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n"
+            else if (case.handler_close)
+                "GET /close HTTP/1.1\r\nHost: test\r\n\r\n"
+            else
+                "GET /stream HTTP/1.1\r\nHost: test\r\n\r\n";
+            try client.sendAll(request);
+            var response: [2048]u8 = undefined;
+            var len: usize = 0;
+            while (!mem.endsWith(u8, response[0..len], "0\r\n\r\n")) {
+                if (len == response.len) return error.TestUnexpectedResult;
+                const n = try client.recv(response[len..]);
+                if (n == 0) return error.TestUnexpectedResult;
+                len += n;
+            }
+            const close = index + 1 == count;
+            const expected = if (close) "Connection: close\r\n" else "Connection: keep-alive\r\n";
+            try std.testing.expect(mem.indexOf(u8, response[0..len], expected) != null);
+            if (close) try std.testing.expectEqual(@as(usize, 0), try client.recv(&response));
+        }
     }
 }
 

@@ -19,7 +19,7 @@ The benchmark goal is to make these costs visible before changing the write path
 
 ### Disk LSM write bench
 
-Add `bench/storage/lsm_write_bench.zig` and a `zig build lsm-write-bench` step.
+Add `bench/storage/lsm_write_bench.zig` and a `zig build lsm-write-bench && ./zig-out/bin/lsm_write_bench --samples 3 --keys 20000 --hot-keys 1000 --overwrite-rounds 20 --value-size 128 --batch-size 1000 --storage host --mode both` step.
 
 Workloads:
 
@@ -44,12 +44,12 @@ Metrics:
 Useful commands:
 
 ```sh
-zig build lsm-write-bench -- --samples 3 --keys 100000 --batch-size 5000 --storage native --mode both
-zig build lsm-write-bench -- --samples 3 --keys 100000 --batch-size 5000 --storage host --mode both
-zig build lsm-write-bench -- --samples 3 --keys 100000 --batch-size 5000 --storage native --mode bulk_ingest --flush-threshold 1024
-zig build lsm-write-bench-compare -- --before /tmp/lsm-write-before.jsonl --after /tmp/lsm-write-after.jsonl
-zig build text-segment-write-bench -- --samples 3 --docs 100000 --batch-size 5000 --merge-width 8 --storage native
-zig build hbc-write-bench -- --samples 3 --vectors 100000 --dims 128 --batch-size 5000 --storage host
+zig build lsm-write-bench && ./zig-out/bin/lsm_write_bench --samples 3 --keys 100000 --batch-size 5000 --storage native --mode both
+zig build lsm-write-bench && ./zig-out/bin/lsm_write_bench --samples 3 --keys 100000 --batch-size 5000 --storage host --mode both
+zig build lsm-write-bench && ./zig-out/bin/lsm_write_bench --samples 3 --keys 100000 --batch-size 5000 --storage native --mode bulk_ingest --flush-threshold 1024
+zig build lsm-write-bench-compare && ./zig-out/bin/lsm_write_bench_compare --before /tmp/lsm-write-before.jsonl --after /tmp/lsm-write-after.jsonl
+zig build text-segment-write-bench && ./zig-out/bin/text_segment_write_bench --samples 3 --docs 100000 --batch-size 5000 --merge-width 8 --storage native
+zig build antfly-storage-bench && ./zig-out/bin/storage_bench hbc-write --samples 3 --vectors 100000 --dims 128 --batch-size 5000 --storage host
 ```
 
 Use `--storage native` for filesystem timings and `--storage host` for lower-noise persisted table/manifest write counts through the host storage abstraction.
@@ -110,7 +110,7 @@ Metrics:
 Useful command shape:
 
 ```sh
-zig build text-segment-write-bench -- --samples 3 --docs 100000 --batch-size 5000 --merge-width 8 --storage native
+zig build text-segment-write-bench && ./zig-out/bin/text_segment_write_bench --samples 3 --docs 100000 --batch-size 5000 --merge-width 8 --storage native
 ```
 
 ## Longer-Term Shape
@@ -128,10 +128,10 @@ The durable write path should look closer to Lucene/Tantivy/Pebble:
 
 Current status:
 
-- `zig build lsm-write-bench` exists and emits JSONL for sorted load, random load, focused random-ingest-plus-compaction-drain, overwrite, and delete workloads.
-- `zig build lsm-write-bench-compare` compares median timings and write-amplification counters by scenario/workload.
-- `zig build text-segment-write-bench` exists for full-text segment build, on-disk publish, merge, and force-merge mechanics outside the DB catalog.
-- `zig build hbc-write-bench` exists for empty bulk build vs default online HBC batches vs online batches with absent-id hints vs experimental coalesced leaf writes, with storage write counters and `HBCIndex.WriteProfile`.
+- `zig build lsm-write-bench && ./zig-out/bin/lsm_write_bench --samples 3 --keys 20000 --hot-keys 1000 --overwrite-rounds 20 --value-size 128 --batch-size 1000 --storage host --mode both` exists and emits JSONL for sorted load, random load, focused random-ingest-plus-compaction-drain, overwrite, and delete workloads.
+- `zig build lsm-write-bench-compare && ./zig-out/bin/lsm_write_bench_compare --before /tmp/lsm-write-before.jsonl --after /tmp/lsm-write-after.jsonl` compares median timings and write-amplification counters by scenario/workload.
+- `zig build text-segment-write-bench && ./zig-out/bin/text_segment_write_bench --samples 3 --docs 20000 --batch-size 1000 --terms-per-doc 12 --merge-width 8 --storage host` exists for full-text segment build, on-disk publish, merge, and force-merge mechanics outside the DB catalog.
+- `zig build antfly-storage-bench && ./zig-out/bin/storage_bench hbc-write --samples 3 --vectors 10000 --dims 128 --batch-size 1000 --leaf-size 128 --storage host` exists for empty bulk build vs default online HBC batches vs online batches with absent-id hints vs experimental coalesced leaf writes, with storage write counters and `HBCIndex.WriteProfile`.
 - Native 100k baselines are checked in under `bench/baselines/` for LSM writes, HBC writes, and full-text segment writes.
 - Derived dense replay now threads `.bulk_ingest` into the HBC insert choice: empty indexes use the HBC bulk builder, and replay batches whose vector IDs were newly allocated skip per-vector existence probes.
 - HBC leaf-write coalescing is implemented behind `BatchInsertOptions.coalesce_leaf_writes`. It reduces bytes but can be slower than the absent-id path, so production only enables it for bulk replay batches where vector IDs are known-new.
@@ -151,15 +151,15 @@ Current status:
 - Compaction candidates are now ranked by normalized `current / target` level pressure instead of absolute run/byte debt. The old units let 47 L0 runs outrank an L1 that was 1.179 GiB over its 128 MiB target, so each L0-to-L1 job could rewrite the oversized L1 before L1-to-L2 promotion ran. The ratio picker promotes the proportionally more overfull downstream level and has a regression fixture matching the 39-L0/1.36-GiB-L1 production failure shape.
 - HBC replay now enables the existing grouped leaf-write path for bulk batches whose vector IDs are known-new and defers quantized rebuilds to the end of each HBC write batch. This is not the final mutation-batch design, but it moves the coalescing path out of benchmark-only status.
 - HBC grouped mutation batching now handles no-split leaf groups with two or more inserts, writes changed leaf ranges during mutation, batch-refreshes unique ancestor range chains after split candidates settle, and defers bounded overflow leaf splits until the batch-end split-candidate phase. The split phase recursively requeues left/right leaves until they fit under `leaf_size`. Very large routed groups still fall back to the existing online path until the recursive split budget is proven under larger replay workloads.
-- `HBCIndex.WriteProfile` and `hbc-write-bench` now expose grouped-path guardrail counters: grouped leaf groups, grouped items, fallback items, split candidates, recursive splits, leaf range writes, ancestor range refreshes/nodes, grouped node body writes, and vec-leaf mapping writes.
-- `HBCIndex.WriteProfile` and `hbc-write-bench` also expose logical HBC namespace write counters for `nodes`, `meta`, `quant`, and `vecs`: put calls, append calls, delete calls, key bytes, and value bytes. Range writes are broken out separately because range keys live in the `nodes` namespace but have a different rewrite shape.
+- `HBCIndex.WriteProfile` and `antfly-storage-bench` now expose grouped-path guardrail counters: grouped leaf groups, grouped items, fallback items, split candidates, recursive splits, leaf range writes, ancestor range refreshes/nodes, grouped node body writes, and vec-leaf mapping writes.
+- `HBCIndex.WriteProfile` and `antfly-storage-bench` also expose logical HBC namespace write counters for `nodes`, `meta`, `quant`, and `vecs`: put calls, append calls, delete calls, key bytes, and value bytes. Range writes are broken out separately because range keys live in the `nodes` namespace but have a different rewrite shape.
 - A 20k native HBC smoke run with namespace counters showed the current coalesced path cuts node puts from about 92k to 26k, quantized puts from about 20.7k to 7.1k, and range puts from about 50k to 11k, but `vecs` puts stayed high at about 80k because raw vectors, metadata, and vec-leaf mappings were still interleaved with leaf mutation. The next slice now pre-stores raw vectors and metadata in sorted vector-id order with append puts for known-new coalesced batches, then leaves node/range/quantized/mapping mutation to the grouped path. On a 20k native smoke run this moved 40k raw vector/metadata writes from `vecs` puts to `vecs` appends and dropped `insert_store_vector_ns` from roughly 150-190 ms to about 2 ms; overall elapsed time was still close enough to default/assume-absent that larger samples are needed before broadening production use.
 - On a 100k native HBC smoke run after sorted raw-vector/metadata pre-store, coalesced online batches measured about 57.2 us/vector versus assume-absent at about 65.5 us/vector and default at about 67.2 us/vector. Storage bytes stayed lower at about 715 MB versus about 738 MB for default/assume-absent. The main counter movement was `insert_store_vector_ns` dropping from about 2.67 s to about 11 ms while 200k raw vector/metadata writes moved to append puts.
 - A follow-up final-only vec-leaf mapping experiment was rolled back. It reduced `vecs` put calls slightly, but rewrote older members in touched split leaves, increased storage bytes, and did not improve elapsed time on the 20k native smoke run.
 - On 100k native HBC smoke runs after bounded recursive split batching, coalesced online batches consistently wrote fewer bytes, about 715 MB versus default/assume-absent at about 738 MB, but timing is not consistently faster. A later 100k run measured coalesced at 68.4 us/vector versus default and assume-absent at about 66.8 us/vector. A deferred sorted leaf-range publication experiment was rolled back because it worsened timing while preserving the same byte reduction.
 - Deferred quantized rebuild now tracks the HBC nodes whose bodies changed during the write transaction and refreshes only that touched-node set at finish. This replaces the full-tree `rebuildAllQuantized()` behavior for adapters that provide the touched-node tracker. A 10k native smoke run with 5k batches moved coalesced deferred quantized puts to 182 versus 6,419 for non-deferred coalesced and 10,354 for default/assume-absent online batches.
 - The true mutation-batch work is partly implemented, not a clean win yet. The successful pieces are sorted raw-vector/metadata pre-store, no-split leaf grouping, bounded batch-end split handling, ancestor range refresh coalescing, and touched-node quantized rebuild. The rolled-back pieces were narrower experiments: final-only vec-leaf mapping and deferred sorted leaf-range publication both preserved byte reductions but worsened timing/storage behavior. The next safe HBC slice avoids writing an oversized temporary leaf before splitting a grouped overflow leaf; instead the grouped path now splits directly from the in-memory mutated leaf and queues the resulting leaves only for recursive overflow checks.
-- `zig build lsm-backend-test` is a focused LSM backend unit-test step; the current bucket passes 244 tests with one platform-specific skip, zero failures, and zero allocator leaks.
+- `zig build lsm-backend-test` is a focused LSM backend antfly-unit-test step; the current bucket passes 244 tests with one platform-specific skip, zero failures, and zero allocator leaks.
 - The bench can run against host-backed in-memory persistence, native filesystem storage, or memory-only storage.
 - `Backend.WriteStats` now exposes flush, table-file, manifest, and compaction timing/byte counters via `snapshotWriteStats()`.
 
@@ -226,7 +226,7 @@ Implement HBC mutation batching in phases:
 - Phase C: minimal quantized rebuilds. First slice done: track nodes whose bodies changed under deferred quantized mode and rebuild only that touched set at write finish. Next slice should make split-parent/subtree tracking explicit enough to distinguish leaf payloads from internal payloads in profile output.
 - Phase D: deletes and updates. Preserve `doc_key` as vector identity for normal indexes and parent-delete semantics for chunked vectors.
 
-The guardrail is `hbc-write-bench`: compare default, assume-absent, current coalesced, and mutation-batch workloads before enabling broader production use.
+The guardrail is `antfly-storage-bench`: compare default, assume-absent, current coalesced, and mutation-batch workloads before enabling broader production use.
 
 ### Hot-Path Durable-Log Batching Plan
 
@@ -636,7 +636,7 @@ sanity checks but is too compressible for write-amplification comparison.
 Useful first comparison:
 
 ```sh
-zig build lsm-write-bench -- --samples 1 --keys 20000 --hot-keys 1000 \
+zig build lsm-write-bench && ./zig-out/bin/lsm_write_bench --samples 1 --keys 20000 --hot-keys 1000 \
   --overwrite-rounds 20 --value-size 65536 --value-pattern keyed \
   --batch-size 1000 --storage native --mode default \
   --workload-set hot_overwrite
@@ -787,7 +787,7 @@ Changes made:
 Small Zig smoke after this change, matching the Pebble smoke shape:
 
 ```sh
-zig build lsm-write-bench -- --samples 1 --keys 2000 --hot-keys 500 \
+zig build lsm-write-bench && ./zig-out/bin/lsm_write_bench --samples 1 --keys 2000 --hot-keys 500 \
   --overwrite-rounds 2 --value-size 512 --value-pattern keyed \
   --batch-size 500 --storage memory --mode default \
   --workload-set hot_overwrite --hot-maintenance-steps 1 --readers 2
@@ -810,7 +810,7 @@ compaction policy, not repeated publication of every overwrite round.
 For a more overwrite-heavy comparison:
 
 ```sh
-zig build lsm-write-bench -- --samples 1 --keys 2000 --hot-keys 500 \
+zig build lsm-write-bench && ./zig-out/bin/lsm_write_bench --samples 1 --keys 2000 --hot-keys 500 \
   --overwrite-rounds 20 --value-size 512 --value-pattern keyed \
   --batch-size 500 --storage memory --mode default \
   --workload-set hot_overwrite --hot-maintenance-steps 1
@@ -929,7 +929,7 @@ entire large runs.
 6. Metrics/export.
    - Status: structured bench/log visibility improved; aggregate Prometheus
      LSM maintenance export done.
-   - `lsm-write-bench`, `hbc-write-bench`, and dense HBC structured logs now
+   - `lsm-write-bench`, `antfly-storage-bench`, and dense HBC structured logs now
      expose overlapping L0 pressure along with existing logical/physical table
      bytes, compression blocks, run bytes, L0 counts, and HBC namespace write
      counters.
@@ -1010,7 +1010,7 @@ entire large runs.
 10. Dense replay windowing and HBC CPU/debugging.
    - Status: targeted guardrail added and production path adjusted.
    - Why the earlier HBC benches missed the current VectorDBBench stall:
-     default `hbc-write-bench` used 128D vectors, larger batches, and one outer
+     default `antfly-storage-bench` used 128D vectors, larger batches, and one outer
      HBC/LSM session. VectorDBBench sends 1536D vectors as serial 500-document
      HTTP chunks with `sync_level=write`.
    - A 50k x 1536D native HBC guardrail now includes
@@ -1050,7 +1050,7 @@ entire large runs.
      the production envelope: 1536D vectors, 500-document chunks, weak-sync
      API/replay semantics, async derived catch-up, HBC session publication, LSM
      maintenance pressure, and status probes while ingest is active.
-   - `zig build dense-ingest-guardrail` now runs `dense_stack_bench` in
+   - `zig build antfly-storage-bench && ./zig-out/bin/storage_bench ingest --docs 5000 --dims 1536 --batch-size 500 --sync-level write --status-probe-every 1 --max-dense-lsm-run-bytes 1073741824 --max-dense-l0-runs 64 --max-status-probe-ns 500000000` now runs `dense_stack_bench` in
      ingest-only mode with a VectorDBBench-shaped smoke:
      `--docs 5000 --dims 1536 --batch-size 500 --sync-level write`.
      It emits an `ingest_summary` JSON line with write wall time, final drain
@@ -1063,13 +1063,14 @@ entire large runs.
      `--max-dense-lsm-run-bytes`, `--max-dense-l0-runs`,
      `--max-status-probe-ns`, `--max-write-ns-per-doc`, and
      `--max-hbc-quant-value-bytes`.
-   - This complements the focused `hbc-write-bench` per-batch-session scenario.
+   - This complements the focused `antfly-storage-bench` per-batch-session scenario.
      The HBC bench catches raw quantized/node publication debt; the dense ingest
      guardrail catches the DB/catalog/derived replay shape that can accidentally
      reintroduce that debt.
-   - `zig build hbc-write-guardrail` runs the focused HBC version with 1536D,
-     500-vector batches, and the per-batch-session scenario. `zig build
-     vector-write-guardrails` runs both the HBC and dense ingest smokes.
+   - Build `antfly-storage-bench antfly-storage-bench` once, then invoke their
+     binaries for the focused HBC case (1536D, 500-vector batches,
+     per-batch-session) and dense ingest smoke. The exact bounded workloads
+     are in [BENCHMARKS.md](../../../../../BENCHMARKS.md#vector-write-regression-workloads).
    - Remaining local coverage to add: a `DataServer`/write-source level smoke
      that starts the real background LSM maintenance scheduler and polls the
      public status path during ingest. The direct DB guardrail measures status

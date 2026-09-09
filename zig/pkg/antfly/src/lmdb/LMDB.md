@@ -420,7 +420,7 @@ Objective:
 Acceptance:
 
 - `zig build lmdb-test` passes
-- `zig build storage-lmdb-test -Dlmdb_backend=zig` passes
+- `zig build antfly-storage-lmdb-test -Dlmdb_backend=zig` passes
 - no known correctness gaps in the wrapper surface used by the repo
 
 ### M2. Confidence And Differential Testing

@@ -93,3 +93,29 @@ pub fn selectTestFilters(
         default_filters,
     );
 }
+
+/// Name the existing run nodes; do not add dependencies or duplicate suites.
+pub fn labelTestRuns(b: *std.Build, root: *std.Build.Step) void {
+    var visited = std.AutoHashMap(*std.Build.Step, void).init(b.allocator);
+    defer visited.deinit();
+    labelTestRunsRecursive(b, root, &visited);
+}
+
+fn labelTestRunsRecursive(b: *std.Build, step: *std.Build.Step, visited: *std.AutoHashMap(*std.Build.Step, void)) void {
+    const entry = visited.getOrPut(step) catch @panic("OOM");
+    if (entry.found_existing) return;
+    if (step.cast(std.Build.Step.Run)) |run| {
+        for (run.argv.items) |arg| {
+            if (arg != .artifact or arg.artifact.artifact.kind != .@"test") continue;
+            const artifact = arg.artifact.artifact;
+            const path = if (artifact.root_module.root_source_file) |source| switch (source) {
+                .src_path => |v| v.sub_path,
+                else => artifact.name,
+            } else artifact.name;
+            const selection = if (artifact.filters.len != 0) artifact.filters[0] else "all";
+            run.setName(b.fmt("test {s} [{s}]", .{ path, selection }));
+            break;
+        }
+    }
+    for (step.dependencies.items) |dependency| labelTestRunsRecursive(b, dependency, visited);
+}

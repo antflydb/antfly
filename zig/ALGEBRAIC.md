@@ -1424,16 +1424,13 @@ public query guardrail schema and algebraic toggles so default, schema-only, and
 public query guardrail JSONL summary events for no-schema, schema-only, and schema-plus-algebraic vector-pruning comparisons, including a no-listener handler mode for reproducible archived runs and local/standalone modes for transport/server overhead evidence
 benchmark-wide performance evidence summary for dataset, query, correctness, cold/warm, fanout, constrained, wide-key, stats, cardinality, range, histogram, churn, churn row-family, public-query, LSM, symbol/support byte growth, accumulator flush, adaptive bulk-maintenance counters, and public-query RSS coverage
 mixed-role benchmark root-cardinality comparisons constrain algebraic sidecar reads by primary document role so derived customer/profile facts do not broaden doc-scan/full-text order-only baselines
-algebraic-summary performance guardrail thresholds for coverage counts, cold/warm reads, fanout, constrained queries, wide-key composite queries, stats/cardinality/range/histogram queries, correctness failures, query latency, byte cost, symbol/support bytes, accumulator flushes, LSM flush/write-pressure compaction counts, public-query RSS, and churn cost
-algebraic-summary baseline-file comparison ratios for stable local performance guardrails
-`algebraic-performance-guardrail` build step with a checked-in JSONL fixture for coverage and baseline-ratio verifier regressions
-`algebraic-planner-ownership-guardrail` build step under `tools/guardrails/` that rejects production raw tensor-program construction outside the algebraic planner/IR layer
-`algebraic-archive-guardrail` build step that verifies archived production-hardening run directories include environment notes, raw/summary JSONL, threshold flags, optional baseline comparison, and non-smoke provenance
-`algebraic-roadmap-guardrail` build step that combines CI-safe algebraic performance, planner-ownership, and archive-evidence checks
-`scripts/run_algebraic_production_hardening.sh` runner for archived LSM analytics, adaptive coverage, cold/warm read coverage, graph traversal, public query no-schema/schema/algebraic comparisons, summary generation, threshold enforcement, optional baseline-ratio checks, bounded cardinality and per-stage sizing/churn knobs, query-shape coverage thresholds for cold/warm/constrained/wide/stats/cardinality/range/histogram records, path-promotion FST rebuild thresholds, public-query mode selection through `ALGEBRAIC_HARDENING_PUBLIC_MODE`, optional public-query symbolic-profile enforcement through `ALGEBRAIC_HARDENING_PUBLIC_REQUIRE_SYMBOLIC_PROFILE=1`, optional LSM bulk-ingest stress through `ALGEBRAIC_HARDENING_LSM_BULK_INGEST=1` across LSM analytics and adaptive coverage stages, LSM bulk finish knobs for flush, compact, deferred-L0 targets, and bounded foreground compaction budgets, and optional broad unit-test evidence
+db_bench summary performance guardrail thresholds for coverage counts, cold/warm reads, fanout, constrained queries, wide-key composite queries, stats/cardinality/range/histogram queries, correctness failures, query latency, byte cost, symbol/support bytes, accumulator flushes, LSM flush/write-pressure compaction counts, public-query RSS, and churn cost
+db_bench summary baseline-file comparison ratios for stable local performance guardrails
+`storage_bench summary` compares DB benchmark results, with checked-in coverage and baseline regression fixtures exercised in CI
+`scripts/run_db_query_matrix.py --suite analytics` runs the DB analytics and public schema comparisons
+`antfly-storage-db-test` includes planner ownership; `antfly-unit-test` retains dynamic-template safety coverage
 LSM bulk-session finish direct-ingests the final mutable state as a sorted run when direct bulk ingest is enabled and no immutable flush is pending, so algebraic bulk sidecars avoid a final normal flush and archived runs can guard `total_lsm_sorted_ingest_runs`
 algebraic bulk-ingest sessions defer promoted path dictionary FST rebuilds across all flushed coalescer batches and rebuild each dirty promoted dictionary once at DB bulk-session finish, before the primary store publishes the final sorted run
-`scripts/run_algebraic_integration_matrix.sh` runner for archived enabled/disabled integration evidence across roadmap guardrails, public-query default no-schema, schema-only, schema-plus-algebraic, focused algebraic DB tests, provisioned distributed non-algebraic fallback coverage, optional broad unit tests, and optional selected e2e tests
 durable planner default policy remains opt-in and conservative until LSM guardrail evidence covers latency, bytes, write cost, churn, cold reads, fanout, and constrained queries
 schema capability fingerprints, skipped-unbounded-field metadata, and debug lifecycle classification
 schema-derived v2 configs with declared laws and adaptive defaults
@@ -1540,125 +1537,35 @@ orders-to-dimensions shape.
 
 ## Performance Coverage
 
-Performance work is coverage-first before CI thresholds. The benchmark outputs
-are line-oriented so local runs can be summarized and compared without committing
-large JSONL result files.
+Algebraic correctness belongs to the normal DB, API, metadata, and graph suites.
+The existing `antfly-unit-test` aggregate retains the dynamic-template and
+cardinality-cache checks. Planner ownership is checked by an ordinary DB test.
+There are no separate algebraic test targets or matrix scripts.
 
-Adaptive coverage smoke:
-
-```sh
-zig build algebraic-bench -- --mode adaptive-coverage --algebraic-backend mem --docs 1000 --repeats 1 --batch-size 250 --churn-ops 100 2> /tmp/algebraic-adaptive-coverage.jsonl
-zig build algebraic-summary -- --input /tmp/algebraic-adaptive-coverage.jsonl
-```
-
-Durable LSM analytics smoke:
+The shared DB benchmark tools retain aggregation, adaptive materialization,
+cold/warm reads, joins, graph traversal, and schema comparison workloads:
 
 ```sh
-zig build algebraic-bench -- --mode lsm-analytics-smoke --docs 100 --repeats 1 --batch-size 50 --churn-ops 1 2> /tmp/algebraic-lsm-analytics-smoke.jsonl
-zig build algebraic-summary -- --input /tmp/algebraic-lsm-analytics-smoke.jsonl
+# From zig/:
+zig build antfly-storage-bench antfly-api-bench
+./zig-out/bin/storage_bench analytics --mode lsm-analytics --docs 50000 --repeats 5
+./zig-out/bin/storage_bench summary --input /tmp/db-combined.jsonl
+
+# From the repository root:
+python3 scripts/run_db_query_matrix.py --suite analytics --profile smoke
+python3 scripts/run_db_query_matrix.py --suite analytics --profile bounded \
+  --baseline /tmp/prior-comparison.stderr \
+  --summary-arg=--max-algebraic-query-ms-ratio-vs-baseline --summary-arg=1.25
 ```
 
-Full durable LSM analytics run:
-
-```sh
-zig build algebraic-bench -- --mode lsm-analytics --docs 5000 --repeats 3 --batch-size 500 --churn-ops 500 2> /tmp/algebraic-lsm-analytics.jsonl
-zig build algebraic-summary -- --input /tmp/algebraic-lsm-analytics.jsonl
-```
-
-Hybrid vector symbolic-pruning smoke:
-
-```sh
-zig build public-query-guardrail -- --query-shape hybrid-filter --docs 5000 --queries 100 --repeats 3 2> /tmp/public-query-noschema.jsonl
-zig build public-query-guardrail -- --query-shape hybrid-filter --with-schema --docs 5000 --queries 100 --repeats 3 2> /tmp/public-query-schema.jsonl
-zig build public-query-guardrail -- --query-shape hybrid-filter --with-algebraic --docs 5000 --queries 100 --repeats 3 2> /tmp/public-query-algebraic.jsonl
-cat /tmp/public-query-noschema.jsonl /tmp/public-query-schema.jsonl /tmp/public-query-algebraic.jsonl > /tmp/public-query-compare.jsonl
-zig build algebraic-summary -- --input /tmp/public-query-compare.jsonl
-```
-
-`--with-algebraic` implies `--with-schema`. Without either flag, the public API
-benchmark remains a no-schema/no-algebraic baseline. Add
-`--require-symbolic-profile` when the run should fail unless the public response
-contains dense/HBC profile counters for the algebraic symbolic-pruning path;
-hybrid paths currently report profile completeness explicitly because not every
-public query shape exposes dense profile counters yet.
-
-Performance evidence guardrail:
-
-```sh
-zig build algebraic-performance-guardrail
-zig build algebraic-planner-ownership-guardrail
-zig build algebraic-archive-guardrail
-zig build algebraic-roadmap-guardrail
-
-zig build algebraic-summary -- --input /tmp/algebraic-combined.jsonl \
-  --baseline /tmp/algebraic-baseline-summary.jsonl \
-  --require-performance-evidence \
-  --min-lsm-dataset-cases 1 \
-  --min-lsm-query-records 1 \
-  --min-cold-query-records 1 \
-  --min-warm-query-records 1 \
-  --min-constrained-query-records 1 \
-  --min-fanout-dataset-cases 1 \
-  --min-public-query-comparison-pairs 2 \
-  --max-correctness-failures 0 \
-  --max-algebraic-query-ms 25 \
-  --max-public-query-http-us 5000 \
-  --max-algebraic-bytes-per-doc 4096 \
-  --max-symbol-bytes-per-doc 1024 \
-  --max-support-bytes-per-doc 1024 \
-  --max-accumulator-flush-count 10000 \
-  --max-public-query-load-rss-peak-bytes 1073741824 \
-  --max-public-query-search-rss-peak-bytes 1073741824 \
-  --max-churn-algebraic-update-ms 1000 \
-  --max-algebraic-query-ms-ratio-vs-baseline 1.25 \
-  --max-public-query-http-us-ratio-vs-baseline 1.25 \
-  --max-algebraic-bytes-per-doc-ratio-vs-baseline 1.10 \
-  --max-churn-algebraic-update-ms-ratio-vs-baseline 1.25
-```
-
-The guardrail thresholds are command-line values rather than hard-coded CI
-constants. Local baseline runs should set them from stable measured numbers with
-enough tolerance to catch regressions without pinning hardware noise. The
-optional `--baseline` file should contain a prior `performance_evidence_summary`
-event from `algebraic-summary`.
-
-Production-hardening archives can be checked independently:
-
-```sh
-zig build algebraic-archive-guardrail -- \
-  --archive bench/results/algebraic-production-hardening/20260517T000000Z \
-  --require-thresholds \
-  --require-baseline \
-  --require-non-smoke
-```
-
-Use `--require-thresholds` once a run is meant to count as production evidence,
-`--require-baseline` once variance has been established from a prior summary,
-and `--require-non-smoke` for representative archived runs.
-
-Bounded graph traversal smoke:
-
-```sh
-zig build algebraic-bench -- --mode graph-traversal-smoke --docs 100 --repeats 3 --fanout 2 2> /tmp/algebraic-graph-traversal.jsonl
-zig build algebraic-summary -- --input /tmp/algebraic-graph-traversal.jsonl
-```
-
-The important summary events are:
-
-```text
-adaptive_query_compare      -> static/fallback/materialized latency by query shape
-adaptive_warmup_compare     -> backfill/warmup cost plus persisted candidate/progress lifecycle and policy-drift counts
-adaptive_coverage_summary   -> coverage matrix for adaptive benchmark cases plus rebuild/stale/cleanup/policy-drift counters
-lsm_analytics_summary       -> durable sidecar case/query/churn coverage
-public_query_symbolic_filter -> expected symbolic match set, profile completeness, and HBC candidate/rerank counts
-public_query_guardrail_summary -> public query latency, QPS, HBC, LSM, replay, and memory counters for one run
-public_query_comparison_summary -> no-schema/schema-only/schema-plus-algebraic public query latency, candidate, and byte comparisons
-churn_row_family -> per-workload row-family entry and byte counters for materialized_expr, docfact, pathfact, path_lookup, path_profile, joinfact, docjf, minmax, and sym rows; each event carries total workload update time, not isolated per-family timing
-churn_row_family_summary -> aggregate churn row-family entry and byte totals across the input JSONL
-performance_evidence_summary -> top-level coverage counts for scan, full-text, LSM, cold/warm, fanout, constrained, churn, churn row-family, correctness, public-query evidence, symbol/support bytes, accumulator flushes, path-promotion FST rebuilds, LSM flush/write-pressure compactions, and public-query RSS peaks
-performance_baseline_comparison -> current-vs-baseline ratios for latency, bytes, churn, and public-query evidence
-graph_algebraic_traversal_summary -> bounded traversal proof/reject/fallback counters, result nodes, path bytes, and query latency
-```
+The matrix builds once, records commands and environment information, checks
+coverage and correctness, and compares no-schema, schema-only, and algebraic
+public-query paths. `--analytics-arg`, `--public-arg`, and `--summary-arg` pass
+workload, LSM tuning, and measured threshold options directly to the tools.
+`--analytics-docs` and `--public-docs` control scale. See
+[BENCHMARKS.md](BENCHMARKS.md#db-query-comparisons) for defaults and examples.
+Performance limits should come from representative measurements; tiny verifier
+fixtures test the comparison tool and do not establish production baselines.
 
 ## Implementation State
 
@@ -1929,47 +1836,10 @@ plumbing. They are not production performance evidence by themselves. Production
 claims require larger repeatable runs with checked-in or archived baseline
 summaries, hardware/environment notes, and threshold tolerances chosen from
 measured variance rather than the tiny guardrail fixture.
-The archive verifier supports explicit minimum environment floors for documents,
-repeats, churn operations, public-query documents, graph documents, adaptive
-documents, and cold-read documents so non-smoke archives can prove the scale
-they claim instead of relying on the `smoke=0` label alone.
-
-Current local non-smoke archive evidence:
-
-```sh
-zig build algebraic-archive-guardrail -- \
-  --archive bench/results/algebraic-production-hardening/interactive-current-10k-post-resource-dist-envelope \
-  --require-thresholds \
-  --require-non-smoke \
-  --min-docs 10000 \
-  --min-repeats 2 \
-  --min-churn-ops 100 \
-  --min-public-docs 1000 \
-  --min-graph-docs 1000 \
-  --min-adaptive-docs 1000 \
-  --min-cold-docs 500
-```
-
-This thresholded archive passes the verifier and covers 23 LSM dataset cases,
-185 LSM query records, 63 algebraic query records, 61 doc-scan query records,
-61 full-text query records, cold/warm reads, constrained rollups, wide keys,
-stats/cardinality/range/histogram shapes, join fanout, update/delete churn,
-adaptive materialization coverage, graph traversal, and public
-no-schema/schema/schema-plus-algebraic comparisons. The summary reported zero
-correctness failures, 391 sorted-ingest LSM runs, zero normal LSM flushes, zero
-write-pressure compactions, zero path-dictionary FST rebuilds, max algebraic
-query latency of about 232 ms, max algebraic bytes per document of about 90.5
-KiB, max churn update latency of about 449 ms, and public handler-mode algebraic
-vector filtering slower than the no-schema/schema baselines. These numbers are
-evidence for the current implementation state, not release thresholds; adaptive
-warmup/churn cost and public-query overhead remain explicit optimization
-targets.
-
-`zig build algebraic-planner-ownership-guardrail` is a repo policy check under
-`tools/guardrails/`, not a benchmark. It enforces that production API, graph,
-and storage DB code do not construct raw tensor programs outside the algebraic
-planner/IR layer. Test blocks may still build explicit programs to exercise
-protocol validation and executor rejection behavior.
+Recorded benchmark commands, parameters, raw JSONL, and comparison summaries
+provide reproducible evidence through the shared DB matrix. Planner-ownership
+coverage is part of `antfly-storage-db-test`; no archive-verifier or separate
+policy executable is required.
 
 Failure-injection coverage should target stale lifecycle state, missing or
 conflicting dictionary ownership, adaptive backfill interruption, distributed
@@ -2103,7 +1973,7 @@ or index closes. Backend runtime wiring remains inherited from DB/table open:
 algebraic writes execute through the same DocStore/LSM runtime store as the
 primary and other managed index paths.
 Internal algebraic status also exposes `algebraic_path_dictionary_fst_rebuild_count`
-to benchmark JSONL. `algebraic-summary` rolls it into
+to benchmark JSONL. `storage_bench summary` rolls it into
 `total_path_dictionary_fst_rebuild_count` and
 `max_path_dictionary_fst_rebuild_count`, with
 `--max-path-dictionary-fst-rebuild-count` available for archived evidence. This
@@ -2158,7 +2028,7 @@ benefiting from the elevated active-session flush threshold. Algebraic benchmark
 dataset rows expose `algebraic_lsm_flushes`,
 `algebraic_lsm_flush_output_runs`, `algebraic_lsm_sorted_ingest_runs`,
 `algebraic_lsm_sorted_ingest_bytes`, and
-`algebraic_lsm_write_pressure_compactions`; `algebraic-summary` rolls those into
+`algebraic_lsm_write_pressure_compactions`; `storage_bench summary` rolls those into
 `performance_evidence_summary` and supports
 `--min-lsm-sorted-ingest-runs` so archived LSM bulk runs can prove the direct
 ingest path stayed active. Path-promotion FST rebuild counts are also rolled up
@@ -2178,37 +2048,28 @@ comparisons to remain zero so new algebraic benchmark comparisons cannot bypass
 correctness classification. The wide-key benchmark issues the public
 multi-field `terms.fields` shape over the same canonical group axes as its
 configured materializations, so it is now an exact comparison instead of a
-deliberately classified shape mismatch. The production-hardening runner forwards LSM tuning
-environment knobs such as `ALGEBRAIC_HARDENING_LSM_FLUSH_THRESHOLD`,
-`ALGEBRAIC_HARDENING_LSM_FLUSH_THRESHOLD_BYTES`,
-`ALGEBRAIC_HARDENING_LSM_BULK_INGEST_FLUSH_THRESHOLD_MULTIPLIER`,
-`ALGEBRAIC_HARDENING_LSM_BULK_INGEST_FLUSH_THRESHOLD_BYTES_MULTIPLIER`,
-`ALGEBRAIC_HARDENING_LSM_DIRECT_BULK_INGEST`,
-`ALGEBRAIC_HARDENING_LSM_COMPACT_THRESHOLD_RUNS`,
-`ALGEBRAIC_HARDENING_LSM_LEVEL_TARGET_RUNS_BASE`,
-`ALGEBRAIC_HARDENING_LSM_LEVEL_TARGET_RUNS_MULTIPLIER`,
-`ALGEBRAIC_HARDENING_LSM_LEVEL_TARGET_BYTES_BASE`, and
-`ALGEBRAIC_HARDENING_LSM_LEVEL_TARGET_BYTES_MULTIPLIER`, so archived bulk
-runs can intentionally force or relax direct-ingest eligibility, row-count and
-byte-count flush thresholds, active bulk-session threshold multipliers, and L0
-debt behavior. The `dataset_lsm_config` benchmark event records these values so
+deliberately classified shape mismatch. The shared DB matrix forwards LSM tuning through `--analytics-arg`, including
+`--lsm-flush-threshold`, `--lsm-flush-threshold-bytes`,
+`--lsm-bulk-ingest-flush-threshold-multiplier`,
+`--lsm-bulk-ingest-flush-threshold-bytes-multiplier`, `--lsm-direct-bulk-ingest`,
+and the compaction/level-target options. The `dataset_lsm_config` benchmark event records these values so
 archive summaries can be tied back to the exact LSM finish-session policy under
 test. The May 18, 2026 adaptive churn microbench showed the ready-spec cache
 reduced repeated maintenance-plan builds substantially, but the materialized
 adaptive LSM churn case remained dominated by lower-level sidecar mutation cost;
 larger archive work should keep that as an open optimization target rather than
 treating the cache as a complete churn fix. The algebraic benchmark and
-production-hardening runner now expose LSM bulk finish controls for publish-only,
+shared DB matrix expose LSM bulk finish controls for publish-only,
 flush-on-finish, compact-on-finish, deferred-L0 targets, and bounded foreground
 compaction steps/bytes/time so archives can compare publish latency against
 maintenance debt. External DB bulk finish now publishes the primary LSM session
 before forcing managed-index catch-up to `full_index`, so algebraic sidecar rows
 can fold the final coalesced documents and survive a durable LSM reopen at the
-user-visible finish boundary. The production-hardening runner also forwards the
+user-visible finish boundary. The shared DB matrix also forwards the
 selected LSM bulk-ingest flags to the cold/warm read stage. Cold-read archives
 should measure reopen behavior over the same direct sorted-ingest sidecar layout
 as the scale, adaptive, and churn stages when
-`ALGEBRAIC_HARDENING_LSM_BULK_INGEST=1`, rather than forcing a normal non-bulk
+`--analytics-arg=--algebraic-bulk-ingest`, rather than forcing a normal non-bulk
 build that creates unrelated flushes. MIN/MAX support compaction and per-row
 path-promotion FST rebuilds are no longer the primary bottlenecks in this
 workload.
@@ -2242,46 +2103,17 @@ above and remove the temporary roadmap item.
 ### Production Hardening
 
 1. Establish real performance baselines.
-   Run larger LSM analytics, adaptive coverage, public query, vector pruning, and
-   graph traversal benchmark suites on representative data. Archive the JSONL
-   summaries, record hardware/environment notes, and set regression thresholds
-   for latency, bytes, symbol/support-row growth, accumulator flushes, public
-   query RSS, write cost, churn, cold/warm reads, fanout, constrained queries,
-   and public query behavior. Use
-   `scripts/run_algebraic_production_hardening.sh` as the canonical local runner
-   so every archived run includes the same raw JSONL, combined summary, and
-   environment metadata. Public-query archive comparisons default to
-   `ALGEBRAIC_HARDENING_PUBLIC_MODE=handler`, which exercises the public query
-   handler and planner without a TCP listener; use
-   `ALGEBRAIC_HARDENING_PUBLIC_MODE=local` or `standalone` for transport/server
-   overhead runs. Symbolic profile enforcement is a separate opt-in
-   (`ALGEBRAIC_HARDENING_PUBLIC_REQUIRE_SYMBOLIC_PROFILE=1`) for archives that
-   specifically validate vector-pruning profile counters. Keep the default
-   combined run direct unless the run is specifically validating LSM bulk ingest; set
-   `ALGEBRAIC_HARDENING_LSM_BULK_INGEST=1` for that stress path and archive it
-   separately. Set `ALGEBRAIC_HARDENING_BASELINE` plus threshold env vars once
-   representative runs establish acceptable variance, so production archives
-   fail closed on correctness, coverage, latency, byte, and churn regressions.
-   Validate any archive used as evidence with
-   `zig build algebraic-archive-guardrail -- --archive <dir>
-   --require-thresholds --require-baseline --require-non-smoke`.
+   Use `scripts/run_db_query_matrix.py --suite analytics --profile bounded` for
+   LSM analytics, adaptive coverage, cold/warm reads, graph traversal, and public
+   schema comparisons. Preserve raw results and environment metadata. Set
+   `--baseline` and measured `--summary-arg` limits for latency, memory, storage,
+   and churn; pass LSM bulk/tuning options through `--analytics-arg`.
 
-2. Prove full-suite test health.
-   Run the broad repo test/build matrix with algebraic enabled and disabled.
-   Separate unrelated existing failures from algebraic regressions, then keep a
-   focused algebraic CI path plus a periodic broader integration path. Use
-   `scripts/run_algebraic_integration_matrix.sh` as the local evidence runner:
-   its default lanes cover the disabled/default public-query path, schema-only
-   path, schema-plus-algebraic path, focused algebraic DB tests, and a
-   provisioned distributed fallback test whose name intentionally does not match
-   the broad `--test-filter algebraic` lane. Set
-   `ALGEBRAIC_MATRIX_WARM_BUILDS=0` only when the build cache is already known
-   warm; the default warm-build pass keeps archived lanes from failing during
-   first-compile setup rather than actual algebraic behavior. Set
-   `ALGEBRAIC_MATRIX_RUN_UNIT_TEST=1` and `ALGEBRAIC_MATRIX_RUN_E2E=1` for the
-   broader periodic matrix, and archive the resulting `environment.txt`,
-   `warm-builds.txt`, `commands.txt`, `status.tsv`, and per-lane stdout/stderr
-   artifacts.
+2. Prove owner-suite test health.
+   Run `antfly-storage-db-test` and the API/metadata owner
+   suites, or `antfly-unit-test` for the aggregate including graph coverage. The DB matrix preserves the
+   no-schema/schema-only/algebraic public-query comparisons. Use the normal e2e
+   workflow for transport and server coverage.
 
 3. Harden crash, recovery, and rebuild behavior.
    Add failure-injection coverage for interrupted adaptive backfill,

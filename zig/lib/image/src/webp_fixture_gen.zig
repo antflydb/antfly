@@ -52,14 +52,19 @@ pub fn main(init: std.process.Init) !void {
     defer alloc.free(alpha_vp8);
     try writeAndDescribe(alloc, io, out_root, "lossy/alpha-vp8-1x1.webp", alpha_vp8);
 
-    const animated = [_]u8{
+    const animated = try buildAnimatedVp8lWebp(alloc);
+    defer alloc.free(animated);
+    try writeRejectedFixture(alloc, io, out_root, "unsupported/animated-1x1.webp", animated, error.AnimatedWebpUnsupported);
+
+    // Preserve the old malformed animation as an invalid-input fixture.
+    const empty_animation_control = [_]u8{
         'R', 'I', 'F', 'F', 30,                  0,   0,   0,
         'W', 'E', 'B', 'P', 'V',                 'P', '8', 'X',
         10,  0,   0,   0,   vp8x_flag_animation, 0,   0,   0,
         0,   0,   0,   0,   0,                   0,   'A', 'N',
         'I', 'M', 0,   0,   0,                   0,
     };
-    try writeFixture(alloc, io, out_root, "unsupported/animated-1x1.webp", &animated);
+    try writeRejectedFixture(alloc, io, out_root, "invalid/empty-animation-control.webp", &empty_animation_control, error.WebpDecodeFailed);
 
     const truncated = [_]u8{ 'R', 'I', 'F', 'F', 12, 0, 0, 0, 'W', 'E', 'B', 'P', 'V', 'P' };
     try writeFixture(alloc, io, out_root, "invalid/truncated-riff.webp", &truncated);
@@ -90,6 +95,43 @@ fn writeAndDescribe(alloc: Allocator, io: anytype, out_root: []const u8, rel: []
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(decoded.rgba, &hash, .{});
     std.debug.print("{s}\t{d}x{d}\t{s}\n", .{ rel, decoded.width, decoded.height, std.fmt.bytesToHex(hash, .lower) });
+}
+
+fn writeRejectedFixture(alloc: Allocator, io: std.Io, out_root: []const u8, rel: []const u8, bytes: []const u8, expected_error: anyerror) !void {
+    if (webp.decodeRgba(alloc, bytes)) |decoded| {
+        alloc.free(decoded.rgba);
+        return error.InvalidTestFixture;
+    } else |err| {
+        if (err != expected_error) return err;
+    }
+    try writeFixture(alloc, io, out_root, rel, bytes);
+}
+
+// https://developers.google.com/speed/webp/docs/riff_container#animation
+// A valid unsupported animation needs both the six-byte ANIM control payload
+// and an ANMF frame containing a complete encoded image subchunk.
+fn buildAnimatedVp8lWebp(alloc: Allocator) ![]u8 {
+    const still = try buildLiteralVp8lWebp(alloc, 1, 1, .{ 0x44, 0x22, 0x11, 0xff });
+    defer alloc.free(still);
+    const frame_chunk = still[12..]; // Strip the standalone RIFF/WEBP header.
+    const riff_size: u32 = @intCast(4 + (8 + 10) + (8 + 6) + (8 + 16 + frame_chunk.len));
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "RIFF");
+    try appendU32Le(alloc, &out, riff_size);
+    try out.appendSlice(alloc, "WEBPVP8X");
+    try appendU32Le(alloc, &out, 10);
+    try out.appendSlice(alloc, &.{ vp8x_flag_animation, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+    try out.appendSlice(alloc, "ANIM");
+    try appendU32Le(alloc, &out, 6);
+    try out.appendSlice(alloc, &.{ 0, 0, 0, 0, 0, 0 }); // Transparent background, infinite looping.
+    try out.appendSlice(alloc, "ANMF");
+    try appendU32Le(alloc, &out, @intCast(16 + frame_chunk.len));
+    // Origin (0, 0), 1x1 frame, 100 ms duration, default blend/disposal.
+    try out.appendSlice(alloc, &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 100, 0, 0, 0 });
+    try out.appendSlice(alloc, frame_chunk);
+    return try out.toOwnedSlice(alloc);
 }
 
 fn appendU32Le(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u32) !void {
