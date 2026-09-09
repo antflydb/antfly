@@ -35,11 +35,7 @@ const restore_jobs = @import("restore_jobs.zig");
 const batch_api = @import("batch.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
 const public_table_http = @import("public_table_http.zig");
-const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
 const query_request_diagnostics = @import("query_request_diagnostics.zig");
-const graph_distinct_budget_diagnostic = @import("../graph/distinct_budget_diagnostic.zig");
-const graph_path_weight_diagnostic = @import("../graph/path_weight_diagnostic.zig");
-const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zig");
 const graph_wire_envelope = @import("graph_wire_envelope.zig");
 const linear_merge_api = @import("linear_merge.zig");
 const cluster = @import("cluster.zig");
@@ -1020,6 +1016,62 @@ pub const HAMutationPolicySnapshot = struct {
     remote_apply_mutations_enabled: bool = false,
 };
 
+/// Live HA ingress policy owned by the process runtime. Promotion changes the
+/// authority role without rebuilding the HTTP router, so policy cannot be a
+/// startup-only boolean.
+pub const HAMutationPolicySource = struct {
+    ptr: *const anyopaque,
+    snapshot_fn: *const fn (ptr: *const anyopaque) HAMutationPolicySnapshot,
+
+    pub fn snapshot(self: HAMutationPolicySource) HAMutationPolicySnapshot {
+        return self.snapshot_fn(self.ptr);
+    }
+};
+
+/// Production-owned suspension and observation seam for deterministic request
+/// lifecycle testing. The interface deliberately carries semantic phases and
+/// operation IDs rather than VOPR types, so production code remains unaware of
+/// the explorer. Hooks may block/yield and may fail the request before product
+/// state changes; callers use this to expose safe scheduler boundaries on any
+/// `std.Io` backend.
+pub const RequestLifecyclePhase = enum {
+    ingress,
+    admission_acquired,
+    response_ready,
+};
+
+pub const RequestLifecycleEvent = struct {
+    phase: RequestLifecyclePhase,
+    operation_id: ?[]const u8 = null,
+};
+
+pub const RequestLifecycleHook = struct {
+    ptr: *anyopaque,
+    reach_fn: *const fn (ptr: *anyopaque, event: RequestLifecycleEvent) anyerror!void,
+
+    pub fn reach(self: RequestLifecycleHook, event: RequestLifecycleEvent) !void {
+        try self.reach_fn(self.ptr, event);
+    }
+};
+
+/// Public query response assembly boundary. This is separate from the generic
+/// ingress lifecycle because DataServer uses it to expose completed query
+/// work only after storage/read leases have been released. Implementations may
+/// suspend, so callers must reach it only while owning the response bytes.
+pub const QueryResultLifecycleEvent = struct {
+    operation_id: []const u8,
+    table_name: []const u8,
+    response_bytes: usize,
+};
+
+pub const QueryResultLifecycleHook = struct {
+    ptr: *anyopaque,
+    reach_fn: *const fn (ptr: *anyopaque, event: QueryResultLifecycleEvent) anyerror!void,
+
+    pub fn reach(self: QueryResultLifecycleHook, event: QueryResultLifecycleEvent) !void {
+        try self.reach_fn(self.ptr, event);
+    }
+};
 /// Optional request-count admission owner for an embedded inference runtime.
 /// API-only processes omit this and use their local fallback admission gate.
 pub const InferenceRequestAdmissionSource = struct {
@@ -1063,6 +1115,12 @@ pub const ApiHttpServerConfig = struct {
     /// Shared owner used when inference runs in this process. When present it
     /// supersedes the local fallback so every inference endpoint shares one cap.
     inference_request_admission_source: ?InferenceRequestAdmissionSource = null,
+    /// Optional deterministic suspension/observation seam. The owner must
+    /// outlive the API server and every in-flight request.
+    request_lifecycle_hook: ?RequestLifecycleHook = null,
+    /// Optional query assembly seam. The owner must outlive the API server and
+    /// every in-flight query.
+    query_result_lifecycle_hook: ?QueryResultLifecycleHook = null,
     /// Explicit in-process transport for the reserved local-inference virtual
     /// connection. The destination route owns admission and no public listener
     /// connection is consumed. Configured connections are always remote.
@@ -1128,6 +1186,17 @@ pub const ApiHttpServerConfig = struct {
     /// synchronous RemoteApply. The route classifier alone cannot establish
     /// the active durability policy.
     ha_remote_apply_mutations_enabled: bool = false,
+    /// Optional live source supplied by HA-aware runtimes. Static fields above
+    /// remain the policy for kernels and tests without a mutable role.
+    ha_mutation_policy_source: ?HAMutationPolicySource = null,
+    /// Optional production-neutral durable-join microstep observer. The hook
+    /// can coordinate process lifecycle or deterministic faults, but does not
+    /// replace the planner, worker protocol, or persistence implementation.
+    distributed_join_lifecycle_hook: ?distributed_join.LifecycleHook = null,
+    /// Caller-owned runtime store for durable join state. Prefer this in
+    /// borrowed-I/O runtimes so job durability stays inside their registered
+    /// storage domain instead of opening a native path-backed backend.
+    join_job_store: ?*backend_erased.Store = null,
     join_job_store_path: ?[]const u8 = null,
     join_job_lease_ttl_ms: ?u64 = null,
     join_job_retention_ms: ?u64 = null,
@@ -1259,7 +1328,13 @@ pub const TableVisibility = enum {
 };
 
 pub const AuthenticatedIdentity = struct {
+    const CatalogAlias = struct { logical: []u8, physical: []u8 };
     username: []u8,
+    /// Borrowed from the serving ApiHttpServer. Target-table operations
+    /// intersect the request's admitted permission snapshot with this live
+    /// policy source so revocation can take effect within a long request.
+    live_user_manager: ?*usermgr.UserManager = null,
+    catalog_aliases: []CatalogAlias = &.{},
     /// Stable identity of the credential that authenticated this request.
     /// Multiple API keys owned by one user must not become interchangeable
     /// transaction-session capabilities.
@@ -1273,6 +1348,11 @@ pub const AuthenticatedIdentity = struct {
     roles: [][]u8 = &.{},
 
     pub fn deinit(self: *AuthenticatedIdentity, alloc: std.mem.Allocator) void {
+        for (self.catalog_aliases) |alias| {
+            alloc.free(alias.logical);
+            alloc.free(alias.physical);
+        }
+        alloc.free(self.catalog_aliases);
         alloc.free(self.username);
         if (self.credential_principal.len > 0) alloc.free(self.credential_principal);
         for (self.permissions) |*permission| permission.deinit(alloc);
@@ -1692,6 +1772,10 @@ pub const StatusSource = struct {
 
             fn dropTableExact(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!metadata_table_topology_mutations.DropResult {
                 return try metadata_table_topology_mutations.drop(cast(ptr), alloc, .{}, table_name);
+            }
+
+            fn dropTableExpected(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, expected_table_id: u64) anyerror!void {
+                return try dropTableOnServiceExpected(cast(ptr), alloc, table_name, expected_table_id);
             }
 
             fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void {
@@ -2355,6 +2439,19 @@ fn dropTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []cons
     defer workflow.deinit();
     _ = try workflow.dropTable(svc, table.table_id);
     runPostCommitMutationRound(svc, "drop_table");
+}
+
+fn dropTableOnServiceExpected(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, expected_table_id: u64) !void {
+    var snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableGenerationChanged;
+    if (table.table_id != expected_table_id) return error.TableGenerationChanged;
+    if (extensionOwnsTableScopedObject(&snapshot, table_name)) return error.ExtensionOwnedObject;
+
+    var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
+    defer workflow.deinit();
+    _ = try workflow.dropTable(svc, expected_table_id);
+    try runPostMutationRound(svc);
 }
 
 fn updateSchemaOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8, expected_version: ?u32) !u32 {
@@ -3075,6 +3172,7 @@ pub const ApiHttpServer = struct {
                 break :blk registry;
             },
             .join_job_store = distributed_join.JoinJobStore.init(owner_alloc, .{
+                .join_job_store = cfg.join_job_store,
                 .join_job_store_path = cfg.join_job_store_path,
                 .join_job_lease_ttl_ms = cfg.join_job_lease_ttl_ms,
                 .join_job_retention_ms = cfg.join_job_retention_ms,
@@ -3151,6 +3249,29 @@ pub const ApiHttpServer = struct {
             .incoming_graph_routes = self.incoming_graph_routes.stats(),
             .inference_cache_budget = self.inferenceCacheBudget().stats(),
         };
+    }
+
+    pub fn reachRequestLifecycle(
+        self: *ApiHttpServer,
+        phase: RequestLifecyclePhase,
+        operation_id: ?[]const u8,
+    ) !void {
+        const hook = self.cfg.request_lifecycle_hook orelse return;
+        try hook.reach(.{ .phase = phase, .operation_id = operation_id });
+    }
+
+    fn reachQueryResultLifecycle(
+        self: *ApiHttpServer,
+        operation_id: []const u8,
+        table_name: []const u8,
+        response_bytes: usize,
+    ) !void {
+        const hook = self.cfg.query_result_lifecycle_hook orelse return;
+        try hook.reach(.{
+            .operation_id = operation_id,
+            .table_name = table_name,
+            .response_bytes = response_bytes,
+        });
     }
 
     pub fn queryAdmissionStats(self: *const ApiHttpServer) RequestAdmission.Stats {
@@ -3390,7 +3511,14 @@ pub const ApiHttpServer = struct {
             );
             server.txn_sessions.durable_scope = effective_cfg.session_store_scope;
         }
-        if (cfg.join_job_store_path orelse cfg.session_store_path) |base_path| {
+        if (cfg.join_job_store != null and cfg.join_job_store_path != null)
+            return error.InvalidApiServerConfig;
+        if (cfg.join_job_store) |runtime_store| {
+            const opened = try alloc.create(distributed_join.OpenedJoinJobStore);
+            errdefer alloc.destroy(opened);
+            opened.* = try distributed_join.OpenedJoinJobStore.openRuntime(alloc, runtime_store);
+            server.join_job_store.opened_join_job_store = opened;
+        } else if (cfg.join_job_store_path orelse cfg.session_store_path) |base_path| {
             const join_job_path = if (cfg.join_job_store_path != null)
                 try alloc.dupe(u8, base_path)
             else
@@ -3566,6 +3694,40 @@ pub const ApiHttpServer = struct {
         return self.query_embedding_cache.stats(self.inferenceCacheBudget());
     }
 
+    /// Install an owner-scoped cost model for query-embedding cache work.
+    /// The owning runtime may change this only while no cache request is in
+    /// flight. Keeping the seam on the ApiHttpServer preserves the cache's
+    /// real process lifetime instead of requiring callers to construct a
+    /// second cache beside the production owner.
+    pub fn setQueryEmbeddingCacheWorkCostPort(
+        self: *ApiHttpServer,
+        port: ?query_embedding_cache.WorkCostPort,
+    ) void {
+        self.query_embedding_cache.setWorkCostPort(port);
+    }
+
+    /// Resolve one already security-scoped cache key through this server's
+    /// production-owned cache and ResourceManager budget. Higher-level query
+    /// planning remains responsible for deriving keys that include provider,
+    /// model, template, and authorization scope.
+    pub fn getOrComputeQueryEmbeddingByKey(
+        self: *ApiHttpServer,
+        caller_alloc: std.mem.Allocator,
+        key: query_embedding_cache.Key,
+        deadline_ns: ?u64,
+        context: *anyopaque,
+        compute: query_embedding_cache.ComputeFn,
+    ) ![]f32 {
+        return self.query_embedding_cache.getOrCompute(
+            self.inferenceCacheBudget(),
+            caller_alloc,
+            key,
+            deadline_ns,
+            context,
+            compute,
+        );
+    }
+
     fn inferenceCacheBudget(self: *ApiHttpServer) *cache_budget.CacheBudget {
         const manager = self.shared_resource_manager orelse &self.local_resource_manager;
         return manager.queryEmbeddingCacheBudget();
@@ -3727,6 +3889,7 @@ pub const ApiHttpServer = struct {
         return .{
             .ptr = self,
             .vtable = &join_context_vtable,
+            .lifecycle_hook = self.cfg.distributed_join_lifecycle_hook,
         };
     }
 
@@ -3737,6 +3900,8 @@ pub const ApiHttpServer = struct {
         .get_join_shuffle_lease = joinCtxGetJoinShuffleLease,
         .upsert_join_shuffle_lease = joinCtxUpsertJoinShuffleLease,
         .remove_join_shuffle_lease = joinCtxRemoveJoinShuffleLease,
+        .realtime_now_millis = joinCtxRealtimeNowMillis,
+        .monotonic_now_ns = joinCtxMonotonicNowNs,
         .execute_plain_query = joinCtxExecutePlainQuery,
         .execute_query_dispatch = joinCtxExecuteQueryDispatch,
         .build_owned_search_request = joinCtxBuildOwnedSearchRequest,
@@ -3751,6 +3916,19 @@ pub const ApiHttpServer = struct {
     fn joinCtxFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         self.source.freeAdminSnapshot(snapshot);
+    }
+
+    fn joinCtxRealtimeNowMillis(ptr: *anyopaque) u64 {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const io = self.sharedApiIo() orelse return joinJobNowMillis();
+        const now_ns = @max(0, std.Io.Clock.now(.real, io).nanoseconds);
+        return @intCast(@divTrunc(now_ns, std.time.ns_per_ms));
+    }
+
+    fn joinCtxMonotonicNowNs(ptr: *anyopaque) u64 {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const io = self.sharedApiIo() orelse return platform_time.monotonicNs();
+        return @intCast(@max(0, std.Io.Clock.now(.awake, io).nanoseconds));
     }
 
     fn joinCtxLocalTableStats(
@@ -4981,8 +5159,27 @@ pub const ApiHttpServer = struct {
         owned.items = &.{};
     }
 
-    fn statusAdminSnapshot(self: *ApiHttpServer) !?metadata_api.AdminSnapshot {
+    pub fn statusAdminSnapshot(self: *ApiHttpServer) !?metadata_api.AdminSnapshot {
         return (try self.source.cachedAdminSnapshot()) orelse try self.source.adminSnapshot();
+    }
+
+    pub const TableDropSnapshot = struct {
+        snapshot: metadata_api.AdminSnapshot,
+        authoritative: bool,
+    };
+
+    /// Prefer an authority-fenced identity for destructive name-based
+    /// mutations. A coherent cached view is a progress fallback only when it
+    /// contains an identity that can be supplied to a conditional delete.
+    pub fn tableDropSnapshot(self: *ApiHttpServer) !?TableDropSnapshot {
+        const request: api_operation.RequestContext = .{};
+        if (self.source.linearizableSnapshot(request)) |snapshot| {
+            if (snapshot) |value| return .{ .snapshot = value, .authoritative = true };
+        } else |err| {
+            if (!isTransientMetadataObservationError(err)) return err;
+        }
+        const snapshot = (try self.statusAdminSnapshot()) orelse return null;
+        return .{ .snapshot = snapshot, .authoritative = false };
     }
 
     fn appendRemoteRuntimeStatusesFromSnapshot(
@@ -5719,7 +5916,9 @@ pub const ApiHttpServer = struct {
             defer freeOwnedStrings(manager.alloc, manager_roles);
             const credential_principal = try std.fmt.allocPrint(self.alloc, "basic:{s}", .{user.username});
             defer self.alloc.free(credential_principal);
-            return try cloneAuthenticatedIdentity(self.alloc, user.username, credential_principal, manager_permissions, manager_row_filters, user.metadata_json, manager_roles);
+            var identity = try cloneAuthenticatedIdentity(self.alloc, user.username, credential_principal, manager_permissions, manager_row_filters, user.metadata_json, manager_roles);
+            identity.live_user_manager = manager;
+            return identity;
         }
 
         if (std.mem.startsWith(u8, value, "ApiKey ") or std.mem.startsWith(u8, value, "Bearer ")) {
@@ -5733,7 +5932,9 @@ pub const ApiHttpServer = struct {
             defer validated.deinit(manager.alloc);
             const credential_principal = try std.fmt.allocPrint(self.alloc, "api-key:{s}", .{raw[0..colon_pos]});
             defer self.alloc.free(credential_principal);
-            return try cloneAuthenticatedIdentity(self.alloc, validated.username, credential_principal, validated.permissions, validated.row_filter, validated.metadata_json, validated.roles);
+            var identity = try cloneAuthenticatedIdentity(self.alloc, validated.username, credential_principal, validated.permissions, validated.row_filter, validated.metadata_json, validated.roles);
+            identity.live_user_manager = manager;
+            return identity;
         }
 
         return error.Unauthorized;
@@ -5798,6 +5999,14 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    fn internalAuthRealtimeNs(self: *ApiHttpServer) i128 {
+        if (self.cfg.backend_runtime) |runtime| {
+            if (runtime.io()) |io|
+                return @intCast(std.Io.Clock.real.now(io).nanoseconds);
+        }
+        return nowNs();
+    }
+
     fn authenticateTrustedPrincipalWithIssuer(
         self: *ApiHttpServer,
         token: []const u8,
@@ -5842,7 +6051,7 @@ pub const ApiHttpServer = struct {
         }
         const subject = jsonStringField(payload.get("sub")) orelse return error.Unauthorized;
         const exp = jsonIntegerField(payload.get("exp")) orelse return error.Unauthorized;
-        const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+        const now: i64 = @intCast(@divFloor(self.internalAuthRealtimeNs(), std.time.ns_per_s));
         if (exp < now) return error.Unauthorized;
         const issued_at = jsonIntegerField(payload.get("iat"));
         if (issued_at) |iat| {
@@ -7093,7 +7302,9 @@ pub const ApiHttpServer = struct {
 
     pub fn validateTableWritesAgainstSchema(self: *ApiHttpServer, table_name: []const u8, writes: anytype) !void {
         if (writes.len == 0) return;
-        var snapshot = (try self.source.adminSnapshot()) orelse return;
+        var snapshot_opt = try self.source.cachedAdminSnapshot();
+        if (snapshot_opt == null) snapshot_opt = try self.source.adminSnapshot();
+        var snapshot = snapshot_opt orelse return;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
 
@@ -8108,6 +8319,67 @@ pub const ApiHttpServer = struct {
             if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
             sleepNs(poll_interval_ns);
         }
+    }
+
+    pub const TableIdentityRetirement = enum {
+        absent,
+        replaced,
+    };
+
+    /// Observes retirement of one exact table identity. A same-name table
+    /// with a different ID is success for the original delete and must never
+    /// be treated as a reason to replay against the new object.
+    pub fn waitForTableIdentityRetirement(self: *ApiHttpServer, table_name: []const u8, expected_table_id: u64) !TableIdentityRetirement {
+        const timeout_ns = 30 * std.time.ns_per_s;
+        const poll_interval_ns = 50 * std.time.ns_per_ms;
+        const start_ns = platform_time.monotonicNs();
+        while (true) {
+            var maybe_snapshot = self.source.adminSnapshot() catch |err| {
+                if (!isTransientMetadataObservationError(err)) return err;
+                if (platform_time.monotonicNs() -| start_ns >= timeout_ns)
+                    return error.MetadataMutationOutcomeUnknown;
+                sleepNs(poll_interval_ns);
+                continue;
+            };
+            if (maybe_snapshot) |*snapshot| {
+                defer self.source.freeAdminSnapshot(snapshot);
+                const table = tables_api.findTableByName(snapshot, table_name) orelse return .absent;
+                if (table.table_id != expected_table_id) return .replaced;
+            } else {
+                return error.UnsupportedOperation;
+            }
+            if (platform_time.monotonicNs() -| start_ns >= timeout_ns)
+                return error.MetadataMutationOutcomeUnknown;
+            sleepNs(poll_interval_ns);
+        }
+    }
+
+    pub fn dropTableMetadata(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        expected_table_id: ?u64,
+        identity_authoritative: bool,
+    ) !TableIdentityRetirement {
+        if (self.source.supportsExpectedTableDrop()) {
+            if (expected_table_id) |table_id| {
+                self.source.dropTableExpected(alloc, table_name, table_id) catch |err| {
+                    if (err != error.TableGenerationChanged and !isAmbiguousMetadataMutationError(err)) return err;
+                };
+                return try self.waitForTableIdentityRetirement(table_name, table_id);
+            }
+
+            // An authoritative absence is a stable 404. A fallback snapshot
+            // without an identity cannot safely authorize a legacy name-only
+            // delete because the missing generation may already have been
+            // replaced between the failed authority read and this request.
+            if (identity_authoritative) return error.TableNotFound;
+            return error.MetadataMutationOutcomeUnknown;
+        }
+
+        try self.source.dropTable(alloc, table_name);
+        try self.waitForTableVisibility(table_name, .absent);
+        return .absent;
     }
 
     pub fn waitForProjectedTablePresence(self: *ApiHttpServer, table_name: []const u8) !void {
@@ -10518,12 +10790,12 @@ pub const ApiHttpServer = struct {
     ) !bool {
         for (details.tables) |table| {
             if ((table.staged_read_count > 0 or table.staged_predicate_count > 0) and
-                !transactionTablePermissionAllowed(authenticated_identity, table.table_name, .read)) return false;
+                !admittedTablePermissionAllowed(authenticated_identity, table.table_name, .read)) return false;
             if ((table.staged_write_count > 0 or table.staged_delete_count > 0) and
-                !transactionTablePermissionAllowed(authenticated_identity, table.table_name, .write)) return false;
+                !admittedTablePermissionAllowed(authenticated_identity, table.table_name, .write)) return false;
         }
         for (details.read_snapshots) |snapshot| {
-            if (!transactionTablePermissionAllowed(authenticated_identity, snapshot.table_name, .read)) return false;
+            if (!admittedTablePermissionAllowed(authenticated_identity, snapshot.table_name, .read)) return false;
             if (!(try self.transactionReadSnapshotVisible(
                 authenticated_identity,
                 snapshot.table_name,
@@ -10547,7 +10819,7 @@ pub const ApiHttpServer = struct {
             ))) return false;
         }
         for (request.tables) |table| {
-            if (!transactionTablePermissionAllowed(authenticated_identity, table.table_name, .write)) return false;
+            if (!admittedTablePermissionAllowed(authenticated_identity, table.table_name, .write)) return false;
         }
         return true;
     }
@@ -10558,7 +10830,7 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         key: []const u8,
     ) !bool {
-        if (!transactionTablePermissionAllowed(authenticated_identity, table_name, .read)) return false;
+        if (!admittedTablePermissionAllowed(authenticated_identity, table_name, .read)) return false;
         const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
         const filter = row_filter_json orelse return true;
@@ -10744,7 +11016,13 @@ pub const ApiHttpServer = struct {
             error.HASyncCommitWaitMissingContext,
             error.HASyncCommitWaitStandbyNotInPolicy,
             => return error.HAWriteDurabilityPending,
-            error.RaftBatchWriteOutcomeUnknown => return error.WriteOutcomeUnknown,
+            error.RaftBatchWriteOutcomeUnknown,
+            // Transport shutdown is an expected lifecycle outcome, but by
+            // itself does not prove that this batch's commit never began.
+            // Preserve the conservative do-not-retry signal, not an internal
+            // server error or an assertion that nothing was written.
+            error.ClientShuttingDown,
+            => return error.WriteOutcomeUnknown,
             // The public batch path is atomic: multi-group writes use 2PC and
             // the single-group fast path is one Raft command. Preserve the
             // conservative do-not-retry signal if a legacy adapter reports a
@@ -10805,6 +11083,7 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForMetadata,
             error.ReadUnavailable,
             => return error.ReadUnavailable,
+            error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
             error.PersistentDescriptorAdmissionExhausted,
             error.StorageReadTemporarilyUnavailable,
             => return error.StorageReadTemporarilyUnavailable,
@@ -10881,11 +11160,13 @@ pub const ApiHttpServer = struct {
     ) !query_api.QueryResponse {
         const retry_timeout_ns: u64 = if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
         const retry_poll_ns = 50 * std.time.ns_per_ms;
-        const start_ns = platform_time.monotonicNs();
+        const retry_io = self.sharedApiIo();
+        const start_ns = retryMonotonicNs(retry_io);
         const request_deadline_ns = query_contract.queryExecutionDeadlineNsFromBody(alloc, body) catch return error.InvalidQueryRequest;
+        const retry_deadline_ns = retryDeadlineFromNative(retry_io, request_deadline_ns);
         while (true) {
             try ensureRequestActive(cancellation);
-            if (retryDeadlineExpired(request_deadline_ns, platform_time.monotonicNs())) return error.Timeout;
+            if (retryDeadlineExpired(retry_deadline_ns, retryMonotonicNs(retry_io))) return error.Timeout;
             return self.executePublicTableQueryDispatchWithIdentity(
                 alloc,
                 source,
@@ -10899,13 +11180,14 @@ pub const ApiHttpServer = struct {
                 error.DocIdentityNamespaceMismatch,
                 error.IdentityReadGenerationChanged,
                 error.StorageReadTemporarilyUnavailable,
+                error.TopologyChanged,
                 => {
-                    const now_ns = platform_time.monotonicNs();
-                    if (retryDeadlineExpired(request_deadline_ns, now_ns)) return error.Timeout;
+                    const now_ns = retryMonotonicNs(retry_io);
+                    if (retryDeadlineExpired(retry_deadline_ns, now_ns)) return error.Timeout;
                     if (retry_timeout_ns == 0) return err;
-                    const sleep_ns = boundedRetrySleepNs(request_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return err;
+                    const sleep_ns = boundedRetrySleepNs(retry_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return err;
                     if (sleep_ns == 0) return error.Timeout;
-                    try sleepNsCancellable(sleep_ns, cancellation);
+                    try sleepNsCancellable(retry_io, sleep_ns, cancellation);
                     continue;
                 },
                 error.Timeout => {
@@ -10935,22 +11217,27 @@ pub const ApiHttpServer = struct {
     ) !?table_reads.LookupResponse {
         const retry_timeout_ns: u64 = if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
         const retry_poll_ns = 50 * std.time.ns_per_ms;
-        const start_ns = platform_time.monotonicNs();
+        const retry_io = self.sharedApiIo();
+        const start_ns = retryMonotonicNs(retry_io);
+        const retry_deadline_ns = table_catalog.RoutingBudget.initIo(null, retry_io).deadlineFrom(.{
+            .deadline_ns = request.deadline_ns,
+            .io = request.deadline_io,
+        });
         while (true) {
             try ensureTableOperationActive(request);
             return source.lookup(alloc, table_name, key, opts, consistency) catch |err| switch (err) {
                 error.StorageReadTemporarilyUnavailable => {
-                    const now_ns = platform_time.monotonicNs();
+                    const now_ns = retryMonotonicNs(retry_io);
                     if (retry_timeout_ns == 0) return err;
                     const sleep_ns = boundedRetrySleepNs(
-                        request.deadline_ns,
+                        retry_deadline_ns,
                         now_ns,
                         start_ns,
                         retry_timeout_ns,
                         retry_poll_ns,
                     ) orelse return err;
                     if (sleep_ns == 0) return error.DeadlineExceeded;
-                    try sleepNsCancellable(sleep_ns, request.cancellation);
+                    try sleepNsCancellable(retry_io, sleep_ns, request.cancellation);
                     continue;
                 },
                 else => return err,
@@ -11024,6 +11311,7 @@ pub const ApiHttpServer = struct {
                 error.HAReadWaitForMetadata,
                 error.ReadUnavailable,
                 => return error.ReadUnavailable,
+                error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
                 error.PersistentDescriptorAdmissionExhausted,
                 error.StorageReadTemporarilyUnavailable,
                 => return error.StorageReadTemporarilyUnavailable,
@@ -11088,6 +11376,7 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForMetadata,
             error.ReadUnavailable,
             => return error.ReadUnavailable,
+            error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
             error.PersistentDescriptorAdmissionExhausted,
             error.StorageReadTemporarilyUnavailable,
             => return error.StorageReadTemporarilyUnavailable,
@@ -11125,7 +11414,7 @@ pub const ApiHttpServer = struct {
             if (authenticated_identity) |identity| {
                 try applyAuthenticatedIdentityToJoinRequest(alloc, identity, &parsed_join.join);
             }
-            const join_ctx = self.joinContext().withExecutionDeadline(request_deadline_ns).withCancellation(cancellation);
+            const join_ctx = self.joinContext().withNativeExecutionDeadline(request_deadline_ns).withCancellation(cancellation);
             return .{ .json = try distributed_join.executeSupportedJoinedPublicTableQueryRequest(join_ctx, &self.join_job_store, alloc, source, table_name, body, row_filter_json, parsed_join.join, parsed_join.foreign_sources) };
         }
 
@@ -11181,6 +11470,7 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForMetadata,
             error.ReadUnavailable,
             => return error.ReadUnavailable,
+            error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
             error.PersistentDescriptorAdmissionExhausted,
             error.StorageReadTemporarilyUnavailable,
             => return error.StorageReadTemporarilyUnavailable,
@@ -11470,7 +11760,7 @@ pub const ApiHttpServer = struct {
 
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
-        const ctx = self.joinContext().withExecutionDeadline(request_deadline_ns).withCancellation(cancellation);
+        const ctx = self.joinContext().withNativeExecutionDeadline(request_deadline_ns).withCancellation(cancellation);
         const plan = try distributed_join.planSupportedJoinExecution(ctx, alloc, table_name, join, hits_ptr.items, foreign_sources);
         var right_result = try distributed_join.executeSupportedRightJoinQueryCoordinatorOnly(ctx, &self.join_job_store, alloc, source, join, hits_ptr.items, plan, foreign_sources);
         defer right_result.deinit(alloc);
@@ -11635,7 +11925,7 @@ pub const ApiHttpServer = struct {
         defer query_req.deinit(alloc);
         if (request_deadline_ns) |deadline| {
             query_req.req.execution_deadline_ns = deadline;
-            if (retryDeadlineExpired(deadline, platform_time.monotonicNs())) return error.Timeout;
+            try ensureRequestDeadline(deadline);
         }
         query_req.req.cancellation = cancellation;
         self.maybeRouteQueryToReadSchema(table_name, &query_req.req) catch |err| switch (err) {
@@ -11656,6 +11946,7 @@ pub const ApiHttpServer = struct {
         }
         return (queryWithTransientReadRetry(
             alloc,
+            self.sharedApiIo(),
             source,
             table_name,
             query_req.req,
@@ -11689,9 +11980,8 @@ pub const ApiHttpServer = struct {
         const identity: *const AuthenticatedIdentity = @ptrCast(@alignCast(ctx orelse {
             return .{ .allowed = false };
         }));
-        if (!permissionsAllow(identity.permissions, .table, table_name, .read)) {
+        if (!try tablePermissionCurrentlyAllowed(identity.*, table_name, .read))
             return .{ .allowed = false };
-        }
         return .{
             .allowed = true,
             .filter_query_json = try resolveEffectiveRowFilterJson(alloc, identity.*, table_name),
@@ -11869,6 +12159,7 @@ pub const ApiHttpServer = struct {
 
     fn queryWithTransientReadRetry(
         alloc: std.mem.Allocator,
+        retry_io: ?std.Io,
         source: table_reads.TableReadSource,
         table_name: []const u8,
         req: db_mod.types.SearchRequest,
@@ -11877,11 +12168,12 @@ pub const ApiHttpServer = struct {
     ) !?query_api.QueryResponse {
         const retry_timeout_ns = 5 * std.time.ns_per_s;
         const retry_poll_ns = 25 * std.time.ns_per_ms;
-        const start_ns = platform_time.monotonicNs();
+        const start_ns = retryMonotonicNs(retry_io);
+        const retry_deadline_ns = retryDeadlineFromNative(retry_io, req.execution_deadline_ns);
         var attempts: u32 = 0;
         while (true) : (attempts += 1) {
             try ensureRequestActive(req.cancellation);
-            if (retryDeadlineExpired(req.execution_deadline_ns, platform_time.monotonicNs())) return error.Timeout;
+            if (retryDeadlineExpired(retry_deadline_ns, retryMonotonicNs(retry_io))) return error.Timeout;
             return source.query(alloc, table_name, req, consistency) catch |err| switch (err) {
                 // FileNotFound surfaces when a read-only replica open races
                 // with the writer reclaiming obsolete LSM runs; reopening
@@ -11892,14 +12184,15 @@ pub const ApiHttpServer = struct {
                 error.FileNotFound,
                 error.TableReadChurn,
                 error.IdentityReadGenerationChanged,
+                error.TopologyChanged,
                 => {
                     if (err == error.IdentityReadGenerationChanged and req.identity_read_generation != null) return err;
                     std.log.warn("public table query read failed table={s} err={} attempt={d}", .{ table_name, err, attempts + 1 });
-                    const now_ns = platform_time.monotonicNs();
-                    if (retryDeadlineExpired(req.execution_deadline_ns, now_ns)) return error.Timeout;
-                    const sleep_ns = boundedRetrySleepNs(req.execution_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return err;
+                    const now_ns = retryMonotonicNs(retry_io);
+                    if (retryDeadlineExpired(retry_deadline_ns, now_ns)) return error.Timeout;
+                    const sleep_ns = boundedRetrySleepNs(retry_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return err;
                     if (sleep_ns == 0) return error.Timeout;
-                    try sleepNsCancellable(sleep_ns, req.cancellation);
+                    try sleepNsCancellable(retry_io, sleep_ns, req.cancellation);
                     continue;
                 },
                 // A catalog-valid name with no physical reader is a serving
@@ -11911,7 +12204,7 @@ pub const ApiHttpServer = struct {
                     .invalid_request => return error.InvalidQueryRequest,
                     .rebuilding => return error.IndexRebuilding,
                 },
-                error.Timeout, error.Cancelled => return err,
+                error.Timeout, error.Cancelled, error.DistributedQueryUnavailable => return err,
                 else => {
                     std.log.warn("public table query read failed table={s} err={}", .{ table_name, err });
                     return err;
@@ -12185,7 +12478,11 @@ pub const ApiHttpServer = struct {
                 },
                 else => {
                     if (metadata_authority.isRetryableError(err)) return error.NotLeader;
-                    return mapExecuteRestoreError(err);
+                    const mapped = mapExecuteRestoreError(err);
+                    if (mapped == error.InternalFailure) {
+                        std.log.err("table restore failed phase=metadata table={s} class={s}", .{ table_name, @errorName(err) });
+                    }
+                    return mapped;
                 },
             }) {
                 return;
@@ -12211,7 +12508,11 @@ pub const ApiHttpServer = struct {
             error.RestoreDestinationReauthorizationRequired => return error.RestoreDestinationReauthorizationRequired,
             else => {
                 if (metadata_authority.isRetryableError(err)) return error.NotLeader;
-                return mapExecuteRestoreError(err);
+                const mapped = mapExecuteRestoreError(err);
+                if (mapped == error.InternalFailure) {
+                    std.log.err("table restore failed phase=local table={s} class={s}", .{ table_name, @errorName(err) });
+                }
+                return mapped;
             },
         };
         if (outcome == .committed_durable) return error.RestoreDurabilityConfirmed;
@@ -12739,7 +13040,7 @@ pub const ApiHttpServer = struct {
         // Materialize catalog-owned fields once. The same exact config is sent
         // through consensus and used as the projection expectation, making the
         // operation idempotent across retries and leadership changes.
-        const assembled_indexes_json = indexes_api.addIndexToTableIndexesJson(alloc, table_before.indexes_json, index_name, authorized_index_json) catch |err| switch (err) {
+        const assembled_indexes_json = indexes_api.addIndexToTableIndexesJsonWithIo(alloc, self.inferenceIo(), table_before.indexes_json, index_name, authorized_index_json) catch |err| switch (err) {
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
         };
@@ -15162,6 +15463,7 @@ pub const ApiHttpServer = struct {
             error.IncompletePublishedSnapshot => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .index_rebuilding),
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .read_requires_primary),
             error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .standby_read_unavailable),
+            error.DistributedQueryUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .distributed_query_unavailable),
             error.PersistentDescriptorAdmissionExhausted, error.StorageReadTemporarilyUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .storage_read_temporarily_unavailable),
             error.InvalidManifest,
             error.InvalidTableFile,
@@ -15195,7 +15497,7 @@ pub const ApiHttpServer = struct {
         // `/query` selects its table from the body, so path middleware cannot
         // establish this authorization boundary. Keep the check in the query
         // service so every transport and direct caller is covered.
-        if (!transactionTablePermissionAllowed(authenticated_identity, table_name, .read))
+        if (!admittedTablePermissionAllowed(authenticated_identity, table_name, .read))
             return try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden");
         const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
@@ -15203,7 +15505,7 @@ pub const ApiHttpServer = struct {
         const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
         db_mod.resetLastSortRejectionDiagnostic();
         query_request_diagnostics.reset();
-        const query_response = self.executePublicTableQueryDispatchWithReadinessRetry(
+        var query_response = self.executePublicTableQueryDispatchWithReadinessRetry(
             self.alloc,
             source,
             table_name,
@@ -15212,6 +15514,10 @@ pub const ApiHttpServer = struct {
             authenticated_identity,
             if (cancellation) |value| value.token() else null,
         ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, body, err);
+        self.reachQueryResultLifecycle("public.table.query", table_name, query_response.json.len) catch |err| {
+            query_response.deinit(self.alloc);
+            return err;
+        };
         return try publicQuerySuccessResponse(self.alloc, query_response);
     }
 
@@ -15277,7 +15583,7 @@ pub const ApiHttpServer = struct {
 
             // Authorize every NDJSON line independently. A permitted decoy
             // line must not lend authority to a later protected-table line.
-            if (!transactionTablePermissionAllowed(line_identity, table_name, .read))
+            if (!try tablePermissionCurrentlyAllowed(line_identity, table_name, .read))
                 return try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden");
 
             const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, line_identity, table_name);
@@ -15296,6 +15602,11 @@ pub const ApiHttpServer = struct {
                 if (cancellation) |value| value.token() else null,
             ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, line, err);
             defer query_response.deinit(self.alloc);
+            try self.reachQueryResultLifecycle(
+                if (route_table_name == null) "public.global.multi_query" else "public.table.multi_query",
+                table_name,
+                query_response.json.len,
+            );
             accepted_legacy_graph_search = accepted_legacy_graph_search or
                 query_response.graph_dialect == .legacy;
 
@@ -17673,6 +17984,15 @@ fn sleepNs(duration_ns: u64) void {
     };
 }
 
+fn retryMonotonicNs(io: ?std.Io) u64 {
+    if (io) |borrowed| return @intCast(@max(0, std.Io.Clock.now(.awake, borrowed).nanoseconds));
+    return platform_time.monotonicNs();
+}
+
+fn retryDeadlineFromNative(io: ?std.Io, deadline_ns: ?u64) ?u64 {
+    return table_catalog.RoutingBudget.initIo(null, io).deadlineFrom(.init(deadline_ns));
+}
+
 const native_backup_quiescence_retry_base_ns: u64 = 10 * std.time.ns_per_ms;
 const native_backup_quiescence_retry_max_ns: u64 = 100 * std.time.ns_per_ms;
 
@@ -17710,14 +18030,17 @@ fn ensureTableOperationActive(request: api_operation.RequestContext) error{ Canc
     };
 }
 
-fn sleepNsCancellable(duration_ns: u64, cancellation: ?CancellationToken) !void {
+fn sleepNsCancellable(io: ?std.Io, duration_ns: u64, cancellation: ?CancellationToken) !void {
     // Retry sleeps are deliberately broken into short slices so a vanished
     // peer does not occupy an expensive query slot for the full backoff.
     var remaining = duration_ns;
     while (remaining > 0) {
         try ensureRequestActive(cancellation);
         const slice = @min(remaining, 5 * std.time.ns_per_ms);
-        sleepNs(slice);
+        if (io) |borrowed|
+            try borrowed.sleep(.fromNanoseconds(slice), .awake)
+        else
+            sleepNs(slice);
         remaining -= slice;
     }
     try ensureRequestActive(cancellation);
@@ -19963,13 +20286,54 @@ pub fn storedDestinationPrincipal(authenticated_identity: ?AuthenticatedIdentity
         identity.username;
 }
 
-fn transactionTablePermissionAllowed(
+/// Check the immutable credential scope captured when a request was admitted.
+/// Ordinary single-stage operations retain this authority for their lifetime;
+/// a later grant cannot broaden it.
+fn admittedTablePermissionAllowed(
     authenticated_identity: ?AuthenticatedIdentity,
     table_name: []const u8,
     permission_type: usermgr.PermissionType,
 ) bool {
     const identity = authenticated_identity orelse return true;
     return permissionsAllow(identity.permissions, .table, table_name, permission_type);
+}
+
+/// Intersect the authority admitted with a request with the credential's
+/// current policy. The snapshot prevents a later grant from broadening an
+/// in-flight request; the live check makes deletion, expiry, or revocation
+/// effective before the next protected table operation.
+fn tablePermissionCurrentlyAllowed(
+    authenticated_identity: ?AuthenticatedIdentity,
+    table_name: []const u8,
+    permission_type: usermgr.PermissionType,
+) !bool {
+    const identity = authenticated_identity orelse return true;
+    if (!permissionsAllow(identity.permissions, .table, table_name, permission_type))
+        return false;
+    const manager = identity.live_user_manager orelse return true;
+    const logical_name = logical: {
+        for (identity.catalog_aliases) |alias| {
+            if (std.mem.eql(u8, alias.physical, table_name)) break :logical alias.logical;
+        }
+        break :logical table_name;
+    };
+
+    if (std.mem.startsWith(u8, identity.credential_principal, "api-key:")) {
+        const key_id = identity.credential_principal["api-key:".len..];
+        const current = manager.effectiveApiKeyPermissions(key_id) catch |err| switch (err) {
+            error.ApiKeyNotFound, error.ApiKeyExpired, error.UserNotFound => return false,
+            else => return err,
+        };
+        defer freePermissions(manager.alloc, current);
+        return permissionsAllow(current, .table, logical_name, permission_type);
+    }
+
+    return try manager.permissionCurrentlyAllowed(
+        identity.username,
+        .table,
+        logical_name,
+        permission_type,
+    );
 }
 
 fn storedDestinationAllowedForIdentity(
@@ -22522,6 +22886,36 @@ pub fn shouldRetryMetadataMutation(err: anyerror, elapsed_ns: u64, timeout_ns: u
     return elapsed_ns < timeout_ns and metadata_authority.isMutationNotAdmittedError(err);
 }
 
+fn isTransientMetadataObservationError(err: anyerror) bool {
+    if (metadata_authority.isRetryableError(err)) return true;
+    return switch (err) {
+        error.Timeout,
+        error.ConnectionTimedOut,
+        error.HttpConnectionClosing,
+        error.ConnectionResetByPeer,
+        error.BrokenPipe,
+        error.EndOfStream,
+        error.UnexpectedHttpStatus,
+        => true,
+        else => false,
+    };
+}
+
+fn isAmbiguousMetadataMutationError(err: anyerror) bool {
+    return switch (err) {
+        error.MetadataMutationOutcomeUnknown,
+        error.Timeout,
+        error.ConnectionTimedOut,
+        error.HttpConnectionClosing,
+        error.ConnectionResetByPeer,
+        error.BrokenPipe,
+        error.EndOfStream,
+        error.UnexpectedHttpStatus,
+        => true,
+        else => false,
+    };
+}
+
 test "public metadata mutation retries transient authority loss only within its deadline" {
     const timeout_ns = default_metadata_mutation_retry_timeout_ns;
     try std.testing.expect(shouldRetryMetadataMutation(error.NotLeader, timeout_ns - 1, timeout_ns));
@@ -23037,6 +23431,22 @@ test "api http retry sleep is bounded by request deadline" {
     );
 }
 
+test "api http retry clock translates native query deadlines" {
+    var io = try @import("vopr").vopr_io.VoprIo.init(.{
+        .monotonic_ns = @intCast(platform_time.monotonicNs() + 1000 * std.time.ns_per_s),
+    });
+    defer io.deinit();
+    const native_deadline = platform_time.monotonicNs() + std.time.ns_per_s;
+    const deadline = retryDeadlineFromNative(io.io(), native_deadline).?;
+    const now_ns = retryMonotonicNs(io.io());
+    try std.testing.expect(deadline > now_ns);
+    try std.testing.expect(deadline <= now_ns + std.time.ns_per_s);
+    try std.testing.expect(!retryDeadlineExpired(deadline, now_ns));
+    try std.testing.expect(retryDeadlineExpired(retryDeadlineFromNative(io.io(), 0), now_ns));
+    try std.testing.expectEqual(native_deadline, retryDeadlineFromNative(null, native_deadline).?);
+    try std.testing.expect(retryDeadlineFromNative(io.io(), null) == null);
+}
+
 test "api http point lookup retries bounded local readiness races" {
     const FakeStatus = struct {
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
@@ -23173,6 +23583,7 @@ test "api http transient read retry honors expired request deadline before sourc
     var reads = FakeReads{};
     try std.testing.expectError(error.Timeout, ApiHttpServer.queryWithTransientReadRetry(
         std.testing.allocator,
+        null,
         reads.source(),
         "docs",
         .{ .execution_deadline_ns = 0 },
@@ -23206,18 +23617,20 @@ test "api http transient read retry stops before source query when client cancel
     var cancelled = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.Cancelled, ApiHttpServer.queryWithTransientReadRetry(
         std.testing.allocator,
+        null,
         reads.source(),
         "docs",
-        .{ .cancellation = &cancelled },
+        .{ .cancellation = CancellationToken.fromAtomic(&cancelled) },
         .read_index,
         .none,
     ));
     try std.testing.expectEqual(@as(u32, 0), reads.attempts);
 }
 
-test "api http retries identity generation churn from a fresh query snapshot" {
+test "api http retries identity generation and topology churn from a fresh query snapshot" {
     const FakeReads = struct {
         attempts: u32 = 0,
+        transient: anyerror = error.IdentityReadGenerationChanged,
 
         fn source(self: *@This()) table_reads.TableReadSource {
             return .{
@@ -23262,7 +23675,7 @@ test "api http retries identity generation churn from a fresh query snapshot" {
         ) anyerror!?query_api.QueryResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.attempts += 1;
-            if (self.attempts == 1) return error.IdentityReadGenerationChanged;
+            if (self.attempts == 1) return self.transient;
             return .{ .json = try alloc.dupe(u8, "{\"responses\":[]}") };
         }
     };
@@ -23270,6 +23683,7 @@ test "api http retries identity generation churn from a fresh query snapshot" {
     var reads = FakeReads{};
     var response = (try ApiHttpServer.queryWithTransientReadRetry(
         std.testing.allocator,
+        null,
         reads.source(),
         "docs",
         .{},
@@ -23279,6 +23693,21 @@ test "api http retries identity generation churn from a fresh query snapshot" {
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 2), reads.attempts);
     try std.testing.expectEqualStrings("{\"responses\":[]}", response.json);
+
+    reads.attempts = 0;
+    reads.transient = error.TopologyChanged;
+    var topology_response = (try ApiHttpServer.queryWithTransientReadRetry(
+        std.testing.allocator,
+        null,
+        reads.source(),
+        "docs",
+        .{},
+        .read_index,
+        .none,
+    )).?;
+    defer topology_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 2), reads.attempts);
+    try std.testing.expectEqualStrings("{\"responses\":[]}", topology_response.json);
 }
 
 test "api http maps missing physical index only for rebuilding lifecycle" {
@@ -23306,6 +23735,7 @@ test "api http maps missing physical index only for rebuilding lifecycle" {
 
     try std.testing.expectError(error.IndexRebuilding, ApiHttpServer.queryWithTransientReadRetry(
         std.testing.allocator,
+        null,
         FakeReads.source(),
         "docs",
         .{},
@@ -23314,6 +23744,7 @@ test "api http maps missing physical index only for rebuilding lifecycle" {
     ));
     try std.testing.expectError(error.IndexNotFound, ApiHttpServer.queryWithTransientReadRetry(
         std.testing.allocator,
+        null,
         FakeReads.source(),
         "docs",
         .{},
@@ -23397,6 +23828,7 @@ test "api http classifies catalog-to-serving index convergence without runtime s
     try std.testing.expect(try server.queryReferencesOnlyCatalogIndexes("docs", catalog_request));
     try std.testing.expectError(error.IndexRebuilding, ApiHttpServer.queryWithTransientReadRetry(
         alloc,
+        null,
         FakeReads.source(),
         "docs",
         catalog_request,
@@ -23408,6 +23840,7 @@ test "api http classifies catalog-to-serving index convergence without runtime s
     try std.testing.expect(!try server.queryReferencesOnlyCatalogIndexes("docs", unknown_request));
     try std.testing.expectError(error.InvalidQueryRequest, ApiHttpServer.queryWithTransientReadRetry(
         alloc,
+        null,
         FakeReads.source(),
         "docs",
         unknown_request,
@@ -23422,6 +23855,7 @@ test "api http classifies catalog-to-serving index convergence without runtime s
     try std.testing.expect(!try server.queryReferencesOnlyCatalogIndexes("docs", mismatched_primary_text_request));
     try std.testing.expectError(error.InvalidQueryRequest, ApiHttpServer.queryWithTransientReadRetry(
         alloc,
+        null,
         FakeReads.source(),
         "docs",
         mismatched_primary_text_request,
@@ -23436,6 +23870,7 @@ test "api http classifies catalog-to-serving index convergence without runtime s
     try std.testing.expect(try server.queryReferencesOnlyCatalogIndexes("docs", text_catalog_request));
     try std.testing.expectError(error.IndexRebuilding, ApiHttpServer.queryWithTransientReadRetry(
         alloc,
+        null,
         FakeReads.source(),
         "docs",
         text_catalog_request,
@@ -23469,6 +23904,7 @@ test "api http classifies catalog-to-serving index convergence without runtime s
     try std.testing.expect(try server.queryReferencesOnlyCatalogIndexes("docs", graph_catalog_request));
     try std.testing.expectError(error.IndexRebuilding, ApiHttpServer.queryWithTransientReadRetry(
         alloc,
+        null,
         FakeReads.source(),
         "docs",
         graph_catalog_request,
@@ -23486,6 +23922,7 @@ test "api http classifies catalog-to-serving index convergence without runtime s
     try std.testing.expect(!try server.queryReferencesOnlyCatalogIndexes("docs", mismatched_graph_request));
     try std.testing.expectError(error.InvalidQueryRequest, ApiHttpServer.queryWithTransientReadRetry(
         alloc,
+        null,
         FakeReads.source(),
         "docs",
         mismatched_graph_request,
@@ -23511,6 +23948,7 @@ test "api http classifies catalog-to-serving index convergence without runtime s
     try std.testing.expect(!try server.queryReferencesOnlyCatalogIndexes("docs", mismatched_request));
     try std.testing.expectError(error.InvalidQueryRequest, ApiHttpServer.queryWithTransientReadRetry(
         alloc,
+        null,
         FakeReads.source(),
         "docs",
         mismatched_request,
@@ -27285,7 +27723,7 @@ test "api http server document scan requires table read permission" {
     defer secrets_reader.deinit(alloc);
     try auth.manager.setRowFilter("secrets-reader", "secrets", "{\"term\":{\"tenant_id\":\"t1\"}}");
 
-    var read_source = table_reads.BoundTableReadSource.init("secrets", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = table_reads.BoundTableReadSource.init("secrets", 1, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var source = FakeSource{};
     const trusted_principal_secret = "gateway-trusted-principal-secret";
     const internal_secret = "dedicated-internal-service-secret";
@@ -28772,7 +29210,7 @@ test "api http server serves table lookup with version header" {
         .timestamp_ns = 4321,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -28926,7 +29364,7 @@ test "api http server decodes percent-encoded lookup keys" {
         .timestamp_ns = 4321,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -28997,7 +29435,7 @@ test "api http server serves document lookup through mcp tool" {
         .timestamp_ns = 4321,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -29123,7 +29561,7 @@ test "api http server serves fielded full-text search through mcp tools" {
         .sync_level = .full_index,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var table_write_source = table_writes.BoundTableWriteSource.init("docs", &db);
 
     const FakeSource = struct {
@@ -29675,7 +30113,7 @@ test "api http server serves table scan as ndjson" {
         },
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -29760,7 +30198,7 @@ test "api http server serves table query response envelope" {
         .sync_level = .full_index,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -29848,7 +30286,7 @@ test "api http server query string boolean controls survive reopen" {
                 .{ .key = "beta_only", .value = "{\"body\":\"beta delta\"}" },
             }, .sync_level = .full_index });
         }
-        var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+        var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
         var source = FakeSource{};
         var server = ApiHttpServer.init(alloc, .{}, source.iface(), table_source.source(), null);
         for (cases) |case| {
@@ -29908,7 +30346,7 @@ test "api http server executes public Query filter roots and compositions" {
         "files",
         77,
         &db,
-        raft_mod.read_gate.noopReadableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -30056,7 +30494,7 @@ test "api http server serves table query with SearchAF-shaped terms aggregations
         .sync_level = .full_index,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("files", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("files", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -30131,7 +30569,7 @@ test "api http server serves retrieval agent response envelope" {
         .sync_level = .full_index,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -30403,7 +30841,7 @@ test "api http server serves retrieval agent event stream" {
         .sync_level = .full_index,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -31670,6 +32108,21 @@ test "api http server routes table batches through the batch commit hook" {
     try std.testing.expectEqual(@as(usize, 0), writes.transaction_calls);
     try std.testing.expectEqual(@as(usize, 0), writes.batch_calls);
 
+    for ([_]anyerror{ error.ClientShuttingDown, error.RaftBatchWriteOutcomeUnknown, error.RaftBatchWritePartialOutcome }) |unknown_err| {
+        writes.commit_error = unknown_err;
+        const calls_before = writes.batch_commit_calls;
+        var unknown_resp = try executeHttpxTestRequest(&server, .{
+            .method = .POST,
+            .uri = "/tables/docs/batch",
+            .content_type = "application/json",
+            .body = batch_body,
+        });
+        defer unknown_resp.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u16, 409), unknown_resp.status);
+        try std.testing.expect(std.mem.indexOf(u8, unknown_resp.body, "write outcome unknown") != null);
+        try std.testing.expectEqual(calls_before + 1, writes.batch_commit_calls);
+    }
+
     for ([_]anyerror{ error.EnrichmentWaitCanceled, error.EnrichmentWaitTimeout, error.EnrichmentRetryInProgress }) |wait_err| {
         writes.commit_error = wait_err;
         var pending_resp = try executeHttpxTestRequest(&server, .{
@@ -31714,7 +32167,7 @@ test "api http server routes table batches through the batch commit hook" {
     defer legacy_pending_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 202), legacy_pending_resp.status);
     try std.testing.expect(std.mem.indexOf(u8, legacy_pending_resp.body, "\"status\":\"committed_pending\"") != null);
-    try std.testing.expectEqual(@as(usize, 7), writes.batch_commit_calls);
+    try std.testing.expectEqual(@as(usize, 10), writes.batch_commit_calls);
 }
 
 test "api http server serves table batch transforms" {
@@ -32020,7 +32473,7 @@ test "api http server serves public transaction commit route" {
         .timestamp_ns = 7,
     });
 
-    var read_source = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var table_source = table_writes.BoundTableWriteSource.init("docs", &db);
 
     const FakeSource = struct {
@@ -32681,7 +33134,7 @@ test "api http server serves long-lived public transaction session routes" {
         }
     };
 
-    var read_source = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), read_source.source(), table_source.source());
     defer server.deinit();
@@ -32928,7 +33381,7 @@ test "api transaction sessions enforce principal permissions and row filters" {
         }
     };
 
-    var read_source = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var source = FakeSource{};
     const secret = "transaction-principal-secret";
     var server = ApiHttpServer.init(alloc, .{
@@ -34182,6 +34635,7 @@ test "api http server preserves public query availability errors" {
     }{
         .{ .query_error = error.DocIdentityNamespaceMismatch, .status = 503, .body = "", .json = true, .unavailable_code = "doc_identity_unavailable", .unavailable_message = "doc identity unavailable" },
         .{ .query_error = error.ReadUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "standby_read_unavailable", .unavailable_message = "standby read unavailable" },
+        .{ .query_error = error.DistributedQueryUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "distributed_query_unavailable", .unavailable_message = "distributed query unavailable" },
         .{ .query_error = error.ReadRequiresPrimary, .status = 503, .body = "", .json = true, .unavailable_code = "read_requires_primary", .unavailable_message = "read requires primary" },
         .{ .query_error = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },
         .{ .query_error = error.IndexRebuilding, .status = 503, .body = "", .json = true, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
@@ -34243,6 +34697,188 @@ test "api http server preserves public query availability errors" {
             multi_resp.headers.len == 1 and std.ascii.eqlIgnoreCase(multi_resp.headers[0].name, "Retry-After"),
         );
     }
+}
+
+test "api http server exposes operation-specific query result assembly" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn iface() StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+    };
+    const FakeReads = struct {
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &.{
+                .lookup = lookup,
+                .scan = scan,
+                .query = query,
+            } };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return null;
+        }
+
+        fn query(_: *anyopaque, inner_alloc: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":[]}]}") };
+        }
+    };
+    const Observer = struct {
+        events: [2]QueryResultLifecycleEvent = undefined,
+        count: usize = 0,
+
+        fn hook(self: *@This()) QueryResultLifecycleHook {
+            return .{ .ptr = self, .reach_fn = reach };
+        }
+
+        fn reach(ptr: *anyopaque, event: QueryResultLifecycleEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.events[self.count] = event;
+            self.count += 1;
+        }
+    };
+
+    var reads = FakeReads{};
+    var observer = Observer{};
+    var server = ApiHttpServer.init(alloc, .{
+        .query_result_lifecycle_hook = observer.hook(),
+    }, FakeSource.iface(), reads.source(), null);
+    defer server.deinit();
+
+    var single = try server.handlePublicTableQuery("docs", "{\"query\":{\"match_all\":{}}}", null);
+    defer single.deinit(alloc);
+    var multi = try server.handlePublicTableMultiQuery("docs", "{\"query\":{\"match_all\":{}}}\n", null);
+    defer multi.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), observer.count);
+    try std.testing.expectEqualStrings("public.table.query", observer.events[0].operation_id);
+    try std.testing.expectEqualStrings("public.table.multi_query", observer.events[1].operation_id);
+    for (observer.events) |event| {
+        try std.testing.expectEqualStrings("docs", event.table_name);
+        try std.testing.expect(event.response_bytes > 0);
+    }
+}
+
+test "global multi-query rechecks live permission before each table result" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn iface() StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+    };
+    const FakeReads = struct {
+        query_count: usize = 0,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &.{
+                .lookup = lookup,
+                .scan = scan,
+                .query = query,
+            } };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return null;
+        }
+
+        fn query(ptr: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.query_count += 1;
+            return .{ .json = try std.fmt.allocPrint(
+                inner_alloc,
+                "{{\"responses\":[{{\"hits\":[{{\"_id\":\"{s}:result\"}}]}}]}}",
+                .{table_name},
+            ) };
+        }
+    };
+    const Observer = struct {
+        manager: *usermgr.UserManager,
+        event_count: usize = 0,
+        revoked: bool = false,
+
+        fn hook(self: *@This()) QueryResultLifecycleHook {
+            return .{ .ptr = self, .reach_fn = reach };
+        }
+
+        fn reach(ptr: *anyopaque, event: QueryResultLifecycleEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.event_count += 1;
+            if (!self.revoked and
+                std.mem.eql(u8, event.operation_id, "public.global.multi_query") and
+                std.mem.eql(u8, event.table_name, "docs"))
+            {
+                try self.manager.removePermissionFromUser("reader", "tenant_b_docs", .table);
+                self.revoked = true;
+            }
+        }
+    };
+
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var docs_read = try usermgr.Permission.initOwned(alloc, .table, "docs", .read);
+    defer docs_read.deinit(alloc);
+    var tenant_read = try usermgr.Permission.initOwned(alloc, .table, "tenant_b_docs", .read);
+    defer tenant_read.deinit(alloc);
+    var reader = try auth.manager.createUser("reader", "secret", &.{ docs_read, tenant_read });
+    reader.deinit(alloc);
+
+    var reads = FakeReads{};
+    var observer = Observer{ .manager = &auth.manager };
+    var server = ApiHttpServer.init(alloc, .{
+        .auth_enabled = true,
+        .user_manager = &auth.manager,
+        .query_result_lifecycle_hook = observer.hook(),
+    }, FakeSource.iface(), reads.source(), null);
+    defer server.deinit();
+    const authorization = try encodeBasicAuthorization(alloc, "reader", "secret");
+    defer alloc.free(authorization);
+    const body =
+        \\{"table":"docs","query":{"match_all":{}}}
+        \\{"table":"tenant_b_docs","query":{"match_all":{}}}
+    ;
+
+    var admitted = try server.authenticateRequest(.{ .authorization = authorization });
+    defer admitted.deinit(alloc);
+    var denied = try server.handlePublicGlobalMultiQuery(body, admitted);
+    defer denied.deinit(alloc);
+    try std.testing.expect(observer.revoked);
+    try std.testing.expectEqual(@as(u16, 403), denied.status);
+    try std.testing.expectEqualStrings("{\"error\":\"forbidden\"}", denied.body);
+    try std.testing.expectEqual(@as(usize, 1), reads.query_count);
+    try std.testing.expectEqual(@as(usize, 1), observer.event_count);
+
+    var restored = try usermgr.Permission.initOwned(alloc, .table, "tenant_b_docs", .read);
+    defer restored.deinit(alloc);
+    try auth.manager.addPermissionToUser("reader", restored);
+    var recovered_identity = try server.authenticateRequest(.{ .authorization = authorization });
+    defer recovered_identity.deinit(alloc);
+    var recovered = try server.handlePublicGlobalMultiQuery(body, recovered_identity);
+    defer recovered.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), recovered.status);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, recovered.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("responses").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 3), reads.query_count);
+    try std.testing.expectEqual(@as(usize, 3), observer.event_count);
 }
 
 test "shared application admission covers MCP query and write operations" {
@@ -34987,7 +35623,7 @@ test "api http server reports table storage empty from read visibility" {
     }
     try db.updateRange(.{ .start = "", .end = "" });
 
-    var read_source = table_reads.BoundTableReadSource.init("docs", 7, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = table_reads.BoundTableReadSource.init("docs", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -35357,7 +35993,12 @@ test "api http server serves local index runtime status" {
         .coverage_generation = identity.incarnation,
     });
 
-    var read_source = table_reads.BoundTableReadSource.init("docs", 7, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    const index_root = try std.fmt.allocPrint(alloc, "{s}/indexes/search_idx", .{path});
+    defer alloc.free(index_root);
+    const rebuild_state = db_mod.backfill_state.RebuildState.init(index_root);
+    try rebuild_state.update("doc:a");
+
+    var read_source = table_reads.BoundTableReadSource.init("docs", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -36693,7 +37334,7 @@ test "api http server serves provisioned index runtime backfill status across sh
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
-    var read_source = table_reads.ProvisionedTableReadSource.init(path, FakeCatalog.iface(), raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = table_reads.ProvisionedTableReadSource.init(path, FakeCatalog.iface(), raft_mod.read_gate.alreadyReadSafeBarrier());
     var server = ApiHttpServer.init(std.testing.allocator, .{}, FakeSource.iface(), read_source.source(), null);
 
     var detail_resp = try executeHttpxTestRequest(&server, .{
@@ -41678,7 +42319,7 @@ test "api http server backs up and restores a table through public routes" {
         .timestamp_ns = 1,
     });
 
-    var read_source = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var write_source = table_writes.BoundTableWriteSource.init("docs", &db);
 
     const FakeSource = struct {
@@ -46926,6 +47567,7 @@ test "query builder dependency 503 responses preserve public retry contract" {
 }
 
 pub fn projectCatalogIdentity(alloc: std.mem.Allocator, identity: *AuthenticatedIdentity, logical: []const u8, physical: []const u8) !void {
+    try appendCatalogAlias(alloc, identity, logical, physical);
     const permission_count = identity.permissions.len;
     for (0..permission_count) |i| {
         const original = identity.permissions[i];
@@ -46946,10 +47588,23 @@ pub fn projectCatalogIdentity(alloc: std.mem.Allocator, identity: *Authenticated
     }
 }
 
+fn appendCatalogAlias(alloc: std.mem.Allocator, identity: *AuthenticatedIdentity, logical: []const u8, physical: []const u8) !void {
+    for (identity.catalog_aliases) |alias| if (std.mem.eql(u8, alias.physical, physical)) return;
+    const logical_copy = try alloc.dupe(u8, logical);
+    errdefer alloc.free(logical_copy);
+    const physical_copy = try alloc.dupe(u8, physical);
+    errdefer alloc.free(physical_copy);
+    identity.catalog_aliases = try alloc.realloc(identity.catalog_aliases, identity.catalog_aliases.len + 1);
+    identity.catalog_aliases[identity.catalog_aliases.len - 1] = .{ .logical = logical_copy, .physical = physical_copy };
+}
+
 pub fn cloneCatalogIdentity(alloc: std.mem.Allocator, identity: ?AuthenticatedIdentity) !?AuthenticatedIdentity {
     const value = identity orelse return null;
     var owned = try cloneAuthenticatedIdentity(alloc, value.username, value.credential_principal, value.permissions, value.row_filter, value.metadata_json, value.roles);
+    errdefer owned.deinit(alloc);
     owned.is_internal_service = value.is_internal_service;
+    owned.live_user_manager = value.live_user_manager;
+    for (value.catalog_aliases) |alias| try appendCatalogAlias(alloc, &owned, alias.logical, alias.physical);
     return owned;
 }
 
@@ -47046,4 +47701,32 @@ fn projectCatalogStatusAlloc(alloc: std.mem.Allocator, body: []const u8, logical
         if (parsed.value.object.getPtr("name")) |name| name.* = .{ .string = logical_name };
     }
     return std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+}
+
+test "native catalog physical aliases retain live permission revocation after cloning" {
+    const alloc = std.testing.allocator;
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var permission = try usermgr.Permission.initOwned(alloc, .table, "analytics.public.*", .read);
+    defer permission.deinit(alloc);
+    var user = try auth.manager.createUser("reader", "secret", &.{permission});
+    defer user.deinit(alloc);
+    var permissions = [_]usermgr.Permission{permission};
+    var identity = (try cloneCatalogIdentity(alloc, .{
+        .username = @constCast("reader"),
+        .credential_principal = @constCast("basic:reader"),
+        .live_user_manager = &auth.manager,
+        .permissions = &permissions,
+    })).?;
+    defer identity.deinit(alloc);
+    try projectCatalogIdentity(alloc, &identity, "analytics.public.events", "table:stable");
+    var cloned = (try cloneCatalogIdentity(alloc, identity)).?;
+    defer cloned.deinit(alloc);
+    try std.testing.expect(try tablePermissionCurrentlyAllowed(cloned, "table:stable", .read));
+    try std.testing.expect(!try tablePermissionCurrentlyAllowed(cloned, "table:stable", .write));
+    try auth.manager.removePermissionFromUser("reader", "analytics.public.*", .table);
+    try std.testing.expect(!try tablePermissionCurrentlyAllowed(cloned, "table:stable", .read));
 }

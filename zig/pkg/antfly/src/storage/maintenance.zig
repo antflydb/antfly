@@ -388,7 +388,7 @@ test "storage maintenance coordinator is idempotent and single flight" {
     while (true) {
         const snapshot = coordinator.get(first.job_id).?;
         if (snapshot.state == .succeeded) break;
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     try std.testing.expectEqual(@as(u64, 1), fake.runs.load(.monotonic));
     try std.testing.expectError(error.IdempotencyConflict, coordinator.start(.vacuum, "same-key"));
@@ -435,7 +435,7 @@ test "storage maintenance cancellation reaches a cooperative engine" {
         fn run(_: *anyopaque, _: Operation, cancel: *const CancelToken) anyerror!Result {
             while (true) {
                 try cancel.check();
-                std.Thread.yield() catch {};
+                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
         }
     };
@@ -454,7 +454,7 @@ test "storage maintenance cancellation reaches a cooperative engine" {
             try std.testing.expect(!coordinator.isExclusiveActive());
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
 }
 
@@ -475,7 +475,7 @@ test "storage maintenance shutdown fences and drains its backend runtime owner" 
             defer self.stopped.store(true, .release);
             while (true) {
                 try cancel.check();
-                std.Thread.yield() catch {};
+                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
         }
     };
@@ -485,7 +485,7 @@ test "storage maintenance shutdown fences and drains its backend runtime owner" 
     defer runtime.deinit();
     var coordinator = try Coordinator.init(std.testing.allocator, fake.source(), runtime.ptr());
     _ = try coordinator.start(.vacuum, "shutdown-drain");
-    while (!fake.started.load(.acquire)) std.Thread.yield() catch {};
+    while (!fake.started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     coordinator.deinit();
     try std.testing.expect(fake.stopped.load(.acquire));
 }
@@ -514,7 +514,7 @@ test "storage maintenance snapshots remain valid after retention pruning" {
         while (true) {
             const snapshot = coordinator.get(first.job_id).?;
             if (snapshot.state == .failed) break :blk snapshot;
-            std.Thread.yield() catch {};
+            std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
     };
     try std.testing.expectEqualStrings("InjectedMaintenanceFailure", retained.error_name.?);
@@ -523,7 +523,7 @@ test "storage maintenance snapshots remain valid after retention pruning" {
     coordinator.jobs.items[0].completed_at_ms = nowMs() - Coordinator.idempotency_retention_ms;
     coordinator.mutex.unlock();
     const next = try coordinator.start(.check, null);
-    while (coordinator.get(next.job_id).?.state != .failed) std.Thread.yield() catch {};
+    while (coordinator.get(next.job_id).?.state != .failed) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(coordinator.get(first.job_id) == null);
     try std.testing.expectEqualStrings("InjectedMaintenanceFailure", retained.error_name.?);
 }
@@ -556,5 +556,5 @@ test "storage maintenance append allocation failure does not wedge coordinator" 
 
     failing.fail_index = std.math.maxInt(usize);
     const started = try coordinator.start(.check, null);
-    while (coordinator.get(started.job_id).?.state != .succeeded) std.Thread.yield() catch {};
+    while (coordinator.get(started.job_id).?.state != .succeeded) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 }

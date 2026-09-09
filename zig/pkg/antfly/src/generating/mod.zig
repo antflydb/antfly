@@ -510,7 +510,7 @@ pub fn executeChain(
     messages: []const ChatMessage,
 ) !GenerateResult {
     var factory_impl = BackendFactory.init(alloc, http);
-    return try lib.executeChain(alloc, chain, factory_impl.factory(), messages);
+    return try lib.executeChainWithIo(alloc, http.io, chain, factory_impl.factory(), messages);
 }
 
 pub fn executeChainWithAntflyProvider(
@@ -521,7 +521,7 @@ pub fn executeChainWithAntflyProvider(
     messages: []const ChatMessage,
 ) !GenerateResult {
     var factory_impl = BackendFactory.initWithAntflyProvider(alloc, http, embedded_antfly_provider);
-    return try lib.executeChain(alloc, chain, factory_impl.factory(), messages);
+    return try lib.executeChainWithIo(alloc, http.io, chain, factory_impl.factory(), messages);
 }
 
 pub fn executeChainWithOptions(
@@ -532,7 +532,7 @@ pub fn executeChainWithOptions(
     messages: []const ChatMessage,
 ) !GenerateResult {
     var factory_impl = BackendFactory.initWithOptions(alloc, http, options);
-    return try lib.executeChain(alloc, chain, factory_impl.factory(), messages);
+    return try lib.executeChainWithIo(alloc, http.io, chain, factory_impl.factory(), messages);
 }
 
 test "generating backend enforces shared policies and token budgets before dispatch" {

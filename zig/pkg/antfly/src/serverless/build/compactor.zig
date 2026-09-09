@@ -29,6 +29,8 @@ const catalog_mod = @import("../catalog/mod.zig");
 const shared_vector = @import("antfly_vector").vector;
 const full_text_indexes = @import("../../api/full_text_indexes.zig");
 const builder_mod = @import("builder.zig");
+const work_lease = @import("work_lease.zig");
+const maintenance_cancellation = @import("../maintenance_cancellation.zig");
 
 pub const CompactionResult = struct {
     namespace: []u8,
@@ -63,6 +65,24 @@ pub const Compactor = struct {
     }
 
     pub fn compactHead(self: *Compactor, namespace: []const u8) !CompactionResult {
+        return try self.compactHeadGuarded(namespace, null);
+    }
+
+    pub fn compactHeadGuarded(
+        self: *Compactor,
+        namespace: []const u8,
+        publication_guard: ?work_lease.PublicationGuard,
+    ) !CompactionResult {
+        return try self.compactHeadGuardedUntil(namespace, publication_guard, null);
+    }
+
+    pub fn compactHeadGuardedUntil(
+        self: *Compactor,
+        namespace: []const u8,
+        publication_guard: ?work_lease.PublicationGuard,
+        cancellation: ?maintenance_cancellation.Token,
+    ) !CompactionResult {
+        try maintenance_cancellation.check(cancellation);
         const current_head = try self.progress.getHead(namespace);
         var current = try self.manifests.getAlloc(namespace, current_head);
         defer current.deinit(self.alloc);
@@ -73,6 +93,7 @@ pub const Compactor = struct {
         defer self.alloc.free(document_payload);
         const base_entries = try document_segment_mod.decodeAlloc(self.alloc, document_payload);
         defer document_segment_mod.freeEntries(self.alloc, base_entries);
+        try maintenance_cancellation.check(cancellation);
 
         const before_docs = try allocMaterializedDocuments(self.alloc, base_entries);
         defer query_mod.freeMaterializedDocuments(self.alloc, before_docs);
@@ -86,12 +107,14 @@ pub const Compactor = struct {
             overlay_mutations = try allocMaterializerMutations(self.alloc, mutation_entries);
         }
         defer if (overlay_mutations.len > 0) freeMaterializerMutations(self.alloc, overlay_mutations);
+        try maintenance_cancellation.check(cancellation);
 
         const latest_docs = if (overlay_mutations.len > 0)
             try query_mod.materializeDocumentsOverBaseAlloc(self.alloc, before_docs, overlay_mutations)
         else
             try allocMaterializedDocuments(self.alloc, base_entries);
         defer query_mod.freeMaterializedDocuments(self.alloc, latest_docs);
+        try maintenance_cancellation.check(cancellation);
 
         const document_entries = try allocDocumentEntries(self.alloc, latest_docs);
         defer document_segment_mod.freeEntries(self.alloc, document_entries);
@@ -101,6 +124,7 @@ pub const Compactor = struct {
         defer self.alloc.free(compacted_documents);
         var document_artifact = try self.artifacts.put(compacted_documents);
         defer document_artifact.deinit(self.alloc);
+        try maintenance_cancellation.check(cancellation);
 
         const text_index_specs = try builder_mod.resolvePublishedTextIndexSpecsAlloc(self.alloc, .{
             .schema_json = current.stats.schema_json,
@@ -108,7 +132,7 @@ pub const Compactor = struct {
             .indexes_json = current.stats.indexes_json,
         }, &.{});
         defer full_text_indexes.freeFullTextIndexSpecs(self.alloc, text_index_specs);
-        const text_refs = try builder_mod.buildTextArtifactRefsForMaterializedDocsAlloc(
+        const text_refs = try builder_mod.buildTextArtifactRefsForMaterializedDocsAllocUntil(
             self.alloc,
             self.artifacts,
             current,
@@ -116,9 +140,11 @@ pub const Compactor = struct {
             latest_docs,
             overlay_mutations,
             text_index_specs,
+            cancellation,
         );
         defer builder_mod.freeArtifactRefs(self.alloc, text_refs);
-        const sparse_refs = try builder_mod.buildSparseArtifactRefsForMaterializedDocsAlloc(
+        try maintenance_cancellation.check(cancellation);
+        const sparse_refs = try builder_mod.buildSparseArtifactRefsForMaterializedDocsAllocUntil(
             self.alloc,
             self.artifacts,
             current,
@@ -126,8 +152,10 @@ pub const Compactor = struct {
             latest_docs,
             overlay_mutations,
             current.stats.published_search_sources,
+            cancellation,
         );
         defer builder_mod.freeArtifactRefs(self.alloc, sparse_refs);
+        try maintenance_cancellation.check(cancellation);
         const named_vector_policies = try currentNamedVectorPoliciesAlloc(
             self.alloc,
             self.artifacts,
@@ -137,7 +165,7 @@ pub const Compactor = struct {
             document_entries.len,
         );
         defer self.alloc.free(named_vector_policies);
-        const vector_refs = try builder_mod.buildVectorArtifactRefsForMaterializedDocsAlloc(
+        const vector_refs = try builder_mod.buildVectorArtifactRefsForMaterializedDocsAllocUntil(
             self.alloc,
             self.artifacts,
             current,
@@ -148,11 +176,13 @@ pub const Compactor = struct {
             null,
             named_vector_policies,
             current.stats.published_search_sources,
+            cancellation,
         );
         defer builder_mod.freeArtifactRefs(self.alloc, vector_refs);
+        try maintenance_cancellation.check(cancellation);
         const graph_index_names = try builder_mod.listGraphIndexNamesAlloc(self.alloc, current.stats.indexes_json);
         defer builder_mod.freeOwnedStrings(self.alloc, graph_index_names);
-        const graph_refs = try builder_mod.buildGraphArtifactRefsForMaterializedDocsAlloc(
+        const graph_refs = try builder_mod.buildGraphArtifactRefsForMaterializedDocsAllocUntil(
             self.alloc,
             self.artifacts,
             namespace,
@@ -162,8 +192,10 @@ pub const Compactor = struct {
             overlay_mutations,
             graph_index_names,
             true,
+            cancellation,
         );
         defer builder_mod.freeArtifactRefs(self.alloc, graph_refs);
+        try maintenance_cancellation.check(cancellation);
         var derived_outputs = try builder_mod.detectMaterializedDerivedOutputsAlloc(
             self.alloc,
             latest_docs,
@@ -171,6 +203,7 @@ pub const Compactor = struct {
             .{},
         );
         defer search_sources.deinitMaterializedDerivedOutputs(self.alloc, &derived_outputs);
+        try maintenance_cancellation.check(cancellation);
 
         if (mutation_index == null and artifactsMatchCompactedHead(current, document_artifact, text_refs, sparse_refs, vector_refs, graph_refs, derived_outputs)) {
             return .{
@@ -203,14 +236,25 @@ pub const Compactor = struct {
         );
         defer manifest.deinit(self.alloc);
 
-        try self.manifests.put(manifest);
-        const published = try self.progress.compareAndSwapHead(namespace, current_head, next_version);
+        try maintenance_cancellation.check(cancellation);
+        const published_version = try builder_mod.putManifestForPublication(
+            self.manifests,
+            &manifest,
+            current_head,
+        );
+        const published = try builder_mod.compareAndSwapHeadGuarded(
+            self.progress,
+            namespace,
+            current_head,
+            published_version,
+            publication_guard,
+        );
         if (!published) return error.HeadChanged;
 
         return .{
             .namespace = try self.alloc.dupe(u8, namespace),
             .published = true,
-            .version = next_version,
+            .version = published_version,
             .artifact_count = manifest.artifacts.len,
         };
     }

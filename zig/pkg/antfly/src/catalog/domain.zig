@@ -393,3 +393,13 @@ pub fn applyDeltaStateAlloc(alloc: std.mem.Allocator, state: State, delta: Delta
     try resources.appendSlice(alloc, delta.upserts);
     return cloneStateAlloc(alloc, .{ .revision = try std.math.add(u64, state.revision, 1), .next_id = delta.next_id, .resources = resources.items });
 }
+
+pub fn tableResourceMatches(grant: []const u8, target: []const u8) bool {
+    if (std.mem.eql(u8, grant, "*") or std.mem.eql(u8, grant, target)) return true;
+    const right = Target.parse(target) catch return false;
+    var buf: [512]u8 = undefined;
+    const canonical = std.fmt.bufPrint(&buf, "{s}.{s}.{s}", .{ right.database, right.namespace, right.table }) catch return false;
+    if (std.mem.endsWith(u8, grant, ".*")) return std.mem.startsWith(u8, canonical, grant[0 .. grant.len - 1]);
+    const left = Target.parse(grant) catch return false;
+    return std.mem.eql(u8, left.database, right.database) and std.mem.eql(u8, left.namespace, right.namespace) and std.mem.eql(u8, left.table, right.table);
+}

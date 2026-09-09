@@ -66,6 +66,7 @@ pub const RequestContext = struct {
     /// Absolute monotonic deadline. This deliberately does not use a wall
     /// clock or a transport timeout duration.
     deadline_ns: ?u64 = null,
+    deadline_io: ?@import("../runtime_io_abi.zig").Borrow = null,
     /// Borrowed request identity used for correlation. An empty value means
     /// the caller did not supply one; adapters may generate one in middleware.
     request_id: []const u8 = "",
@@ -85,7 +86,11 @@ pub const RequestContext = struct {
     pub fn ensureActive(self: RequestContext) ApiError!void {
         if (self.cancellation.isCancelled()) return error.Canceled;
         if (self.deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+            const now_ns = if (self.deadline_io) |borrow| blk: {
+                var receiver = borrow.receive() catch return error.Internal;
+                break :blk @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds)));
+            } else platform_time.monotonicNs();
+            if (now_ns >= deadline) return error.DeadlineExceeded;
         }
     }
 };

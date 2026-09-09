@@ -319,6 +319,10 @@ pub const Reconciler = struct {
         };
     }
 
+    pub fn setClock(self: *Reconciler, clock: platform_clock.Clock) void {
+        self.config.clock = clock;
+    }
+
     pub fn deinit(self: *Reconciler) void {
         self.shard_cooldowns.deinit(self.alloc);
         self.* = undefined;
@@ -3315,6 +3319,32 @@ fn groupSizeObservationConclusive(status: MergedGroupStatus) bool {
     // paired with live documents is a transient status-publication boundary,
     // not evidence that the shard is below its split threshold.
     return status.doc_count == 0 or status.disk_bytes != 0;
+}
+
+test "metadata reconciler requires explicit coherent disk size evidence" {
+    const Case = struct {
+        known: bool,
+        docs: u64,
+        bytes: u64,
+        conclusive: bool,
+    };
+    for ([_]Case{
+        .{ .known = false, .docs = 0, .bytes = 0, .conclusive = false },
+        .{ .known = false, .docs = 0, .bytes = 180, .conclusive = false },
+        .{ .known = false, .docs = 12, .bytes = 0, .conclusive = false },
+        .{ .known = false, .docs = 12, .bytes = 180, .conclusive = false },
+        .{ .known = true, .docs = 0, .bytes = 0, .conclusive = true },
+        .{ .known = true, .docs = 0, .bytes = 180, .conclusive = true },
+        .{ .known = true, .docs = 12, .bytes = 0, .conclusive = false },
+        .{ .known = true, .docs = 12, .bytes = 180, .conclusive = true },
+    }) |case| {
+        try std.testing.expectEqual(case.conclusive, groupSizeObservationConclusive(.{
+            .group_id = 4511,
+            .doc_count = case.docs,
+            .disk_bytes = case.bytes,
+            .disk_bytes_known = case.known,
+        }));
+    }
 }
 
 fn managerGroupBusy(

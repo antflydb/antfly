@@ -115,6 +115,9 @@ pub const TransitionService = struct {
     split_observation_retries: std.AutoHashMapUnmanaged(u64, TransitionRetry) = .empty,
     merge_observation_retries: std.AutoHashMapUnmanaged(u64, TransitionRetry) = .empty,
     metrics: TransitionServiceMetrics = .{},
+    // The owning runtime serializes entry. Shard I/O may re-enter that runtime
+    // through metadata apply; only one observation/action pass may be active.
+    pending_pass_active: bool = false,
 
     pub fn init(alloc: std.mem.Allocator, ops: anytype) !TransitionService {
         return try initWithRetryClock(alloc, ops, RetryClock.real());
@@ -125,11 +128,28 @@ pub const TransitionService = struct {
         ops: anytype,
         retry_clock: RetryClock,
     ) !TransitionService {
+        return try initWithRetryClockAndJitterSalt(
+            alloc,
+            ops,
+            retry_clock,
+            randomRetryJitterSalt(),
+        );
+    }
+
+    /// Constructs a service with caller-owned retry entropy. Simulation and
+    /// replay harnesses must supply a stable per-node salt so retry timing is
+    /// part of their controlled state rather than host RNG state.
+    pub fn initWithRetryClockAndJitterSalt(
+        alloc: std.mem.Allocator,
+        ops: anytype,
+        retry_clock: RetryClock,
+        retry_jitter_salt: u64,
+    ) !TransitionService {
         const OpsType = @TypeOf(ops);
         return .{
             .alloc = alloc,
             .retry_clock = retry_clock,
-            .retry_jitter_salt = randomRetryJitterSalt(),
+            .retry_jitter_salt = retry_jitter_salt,
             .ops = if (@hasField(OpsType, "ptr") and @hasField(OpsType, "vtable"))
                 .{ .adapter = try shard_ops.OwnedShardOperationAdapter.init(alloc, .{
                     .ptr = ops.ptr,
@@ -388,18 +408,64 @@ pub const TransitionService = struct {
         };
     }
 
-    /// Refreshes read-only transition observations outside status and planning
-    /// request paths. Non-authority replicas call this on their normal control
-    /// cadence so a newly elected authority already owns a bounded, recent
-    /// snapshot and never needs to execute shard I/O from an HTTP read.
+    /// Callbacks may replace pending storage. Own every record and its strings
+    /// before the first external call, then revalidate before publishing.
+    fn snapshotPendingRecords(self: *TransitionService, comptime T: type) ![]T {
+        const source = if (T == metadata.SplitTransitionRecord) self.pending_split.items else self.pending_merge.items;
+        const records = try self.alloc.alloc(T, source.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (records[0..initialized]) |*record| {
+                if (T == metadata.SplitTransitionRecord) deinitSplitRecord(self.alloc, record) else deinitMergeRecord(self.alloc, record);
+            }
+            self.alloc.free(records);
+        }
+        for (source, records) |record, *owned| {
+            owned.* = if (T == metadata.SplitTransitionRecord) try cloneSplitRecord(self.alloc, record) else try cloneMergeRecord(self.alloc, record);
+            initialized += 1;
+        }
+        return records;
+    }
+
+    fn freePendingSnapshot(self: *TransitionService, records: anytype) void {
+        for (records) |*record| {
+            if (@TypeOf(record.*) == metadata.SplitTransitionRecord) deinitSplitRecord(self.alloc, record) else deinitMergeRecord(self.alloc, record);
+        }
+        self.alloc.free(records);
+    }
+
+    fn pendingRecord(self: *TransitionService, record: anytype) ?*@TypeOf(record) {
+        if (@TypeOf(record) == metadata.SplitTransitionRecord) {
+            const index = findSplitIndex(self.pending_split.items, record.transition_id) orelse return null;
+            return &self.pending_split.items[index];
+        } else {
+            const index = findMergeIndex(self.pending_merge.items, record.transition_id) orelse return null;
+            return &self.pending_merge.items[index];
+        }
+    }
+
+    fn pendingRecordMatches(self: *TransitionService, expected: anytype) bool {
+        const current = self.pendingRecord(expected) orelse return false;
+        return transitionRecordEqual(current.*, expected);
+    }
+
+    /// Refresh read-only observations outside status/planning request paths.
+    /// Non-authority replicas retain a bounded, recent snapshot for takeover.
     pub fn refreshPendingObservations(self: *TransitionService) !void {
+        if (self.pending_pass_active) return;
+        self.pending_pass_active = true;
+        defer self.pending_pass_active = false;
         const now_ms = self.retry_clock.nowMs();
         const runtime = self.metadataRuntime();
 
-        for (self.pending_split.items) |record| {
+        const split_records = try self.snapshotPendingRecords(metadata.SplitTransitionRecord);
+        defer self.freePendingSnapshot(split_records);
+        for (split_records) |record| {
             if (splitObservationFresh(&self.cached_split_observations, record, now_ms)) continue;
             if (retryPending(&self.split_observation_retries, record.transition_id, now_ms)) continue;
+            if (!self.pendingRecordMatches(record)) continue;
             const observation = runtime.observeSplit(record) catch |err| {
+                if (!self.pendingRecordMatches(record)) continue;
                 try recordRetry(
                     self.alloc,
                     &self.split_observation_retries,
@@ -413,6 +479,7 @@ pub const TransitionService = struct {
                 });
                 continue;
             };
+            if (!self.pendingRecordMatches(record)) continue;
             _ = self.split_observation_retries.remove(record.transition_id);
             try self.rememberCachedSplitObservation(
                 record.transition_id,
@@ -422,10 +489,14 @@ pub const TransitionService = struct {
             );
         }
 
-        for (self.pending_merge.items) |record| {
+        const merge_records = try self.snapshotPendingRecords(metadata.MergeTransitionRecord);
+        defer self.freePendingSnapshot(merge_records);
+        for (merge_records) |record| {
             if (mergeObservationFresh(&self.cached_merge_observations, record.transition_id, now_ms)) continue;
             if (retryPending(&self.merge_observation_retries, record.transition_id, now_ms)) continue;
+            if (!self.pendingRecordMatches(record)) continue;
             const observation = runtime.observeMerge(record) catch |err| {
+                if (!self.pendingRecordMatches(record)) continue;
                 try recordRetry(
                     self.alloc,
                     &self.merge_observation_retries,
@@ -439,24 +510,34 @@ pub const TransitionService = struct {
                 });
                 continue;
             };
+            if (!self.pendingRecordMatches(record)) continue;
             _ = self.merge_observation_retries.remove(record.transition_id);
             try self.rememberCachedMergeObservation(record.transition_id, now_ms, observation);
         }
     }
 
     pub fn stepPending(self: *TransitionService) !TransitionStepResult {
+        if (self.pending_pass_active) return .{};
+        self.pending_pass_active = true;
+        defer self.pending_pass_active = false;
         var result = TransitionStepResult{};
         const now_ms = self.retry_clock.nowMs();
         const runtime = self.metadataRuntime();
 
-        for (self.pending_split.items) |*record| {
+        const split_records = try self.snapshotPendingRecords(metadata.SplitTransitionRecord);
+        defer self.freePendingSnapshot(split_records);
+        for (split_records) |*record| {
+            const expected = record.*;
             if (record.phase == .finalized or record.phase == .rolled_back) continue;
             if (retryPending(&self.split_retries, record.transition_id, now_ms)) continue;
+            if (!self.pendingRecordMatches(expected)) continue;
             const observation = runtime.observeSplit(record.*) catch |err| {
+                if (!self.pendingRecordMatches(expected)) continue;
                 try recordRetry(self.alloc, &self.split_retries, record.transition_id, now_ms, self.retry_jitter_salt);
                 std.log.warn("split transition observation failed transition_id={d} err={s}", .{ record.transition_id, @errorName(err) });
                 continue;
             };
+            if (!self.pendingRecordMatches(record.*)) continue;
             _ = self.split_observation_retries.remove(record.transition_id);
             try self.rememberCachedSplitObservation(
                 record.transition_id,
@@ -473,12 +554,17 @@ pub const TransitionService = struct {
                 else => {},
             }
             _ = metadata.TransitionDriver.stepSplitObserved(runtime, record, observation) catch |err| {
+                if (!self.pendingRecordMatches(expected)) continue;
                 try recordRetry(self.alloc, &self.split_retries, record.transition_id, now_ms, self.retry_jitter_salt);
                 std.log.warn("split transition step failed transition_id={d} phase={s} err={s}", .{ record.transition_id, @tagName(record.phase), @errorName(err) });
                 continue;
             };
+            if (!self.pendingRecordMatches(expected)) continue;
+            // Re-find the live entry after I/O; never retain an array pointer.
+            self.pendingRecord(expected).?.phase = record.phase;
             _ = self.split_retries.remove(record.transition_id);
             const updated_observation: ?metadata.SplitObservation = runtime.observeSplit(record.*) catch |err| blk: {
+                if (!self.pendingRecordMatches(record.*)) continue;
                 try recordRetry(
                     self.alloc,
                     &self.split_retries,
@@ -489,6 +575,7 @@ pub const TransitionService = struct {
                 std.log.warn("split transition post-step observation failed transition_id={d} err={s}", .{ record.transition_id, @errorName(err) });
                 break :blk null;
             };
+            if (!self.pendingRecordMatches(record.*)) continue;
             if (updated_observation) |updated| {
                 _ = self.split_retries.remove(record.transition_id);
                 try self.rememberCachedSplitObservation(
@@ -508,14 +595,20 @@ pub const TransitionService = struct {
             result.stepped_split += 1;
         }
 
-        for (self.pending_merge.items) |*record| {
+        const merge_records = try self.snapshotPendingRecords(metadata.MergeTransitionRecord);
+        defer self.freePendingSnapshot(merge_records);
+        for (merge_records) |*record| {
+            const expected = record.*;
             if (record.phase == .finalized or record.phase == .rolled_back) continue;
             if (retryPending(&self.merge_retries, record.transition_id, now_ms)) continue;
+            if (!self.pendingRecordMatches(expected)) continue;
             const observation = runtime.observeMerge(record.*) catch |err| {
+                if (!self.pendingRecordMatches(expected)) continue;
                 try recordRetry(self.alloc, &self.merge_retries, record.transition_id, now_ms, self.retry_jitter_salt);
                 std.log.warn("merge transition observation failed transition_id={d} err={s}", .{ record.transition_id, @errorName(err) });
                 continue;
             };
+            if (!self.pendingRecordMatches(record.*)) continue;
             _ = self.merge_observation_retries.remove(record.transition_id);
             try self.rememberCachedMergeObservation(record.transition_id, now_ms, observation);
             const state = metadata.TransitionController.describeMerge(record.*, observation);
@@ -527,12 +620,17 @@ pub const TransitionService = struct {
                 else => {},
             }
             _ = metadata.TransitionDriver.stepMergeObserved(runtime, record, observation) catch |err| {
+                if (!self.pendingRecordMatches(expected)) continue;
                 try recordRetry(self.alloc, &self.merge_retries, record.transition_id, now_ms, self.retry_jitter_salt);
                 std.log.warn("merge transition step failed transition_id={d} phase={s} err={s}", .{ record.transition_id, @tagName(record.phase), @errorName(err) });
                 continue;
             };
+            if (!self.pendingRecordMatches(expected)) continue;
+            // Re-find the live entry after I/O; never retain an array pointer.
+            self.pendingRecord(expected).?.phase = record.phase;
             _ = self.merge_retries.remove(record.transition_id);
             const updated_observation: ?metadata.MergeObservation = runtime.observeMerge(record.*) catch |err| blk: {
+                if (!self.pendingRecordMatches(record.*)) continue;
                 try recordRetry(
                     self.alloc,
                     &self.merge_retries,
@@ -543,6 +641,7 @@ pub const TransitionService = struct {
                 std.log.warn("merge transition post-step observation failed transition_id={d} err={s}", .{ record.transition_id, @errorName(err) });
                 break :blk null;
             };
+            if (!self.pendingRecordMatches(record.*)) continue;
             if (updated_observation) |updated| {
                 _ = self.merge_retries.remove(record.transition_id);
                 try self.rememberCachedMergeObservation(
@@ -622,7 +721,10 @@ pub const TransitionService = struct {
         runtime: metadata.MetadataTransitionRuntime,
         now_ms: u64,
     ) !void {
-        for (self.pending_split.items) |record| {
+        const split_records = try self.snapshotPendingRecords(metadata.SplitTransitionRecord);
+        defer self.freePendingSnapshot(split_records);
+        for (split_records) |record| {
+            if (!self.pendingRecordMatches(record)) continue;
             if (record.phase != .finalized and record.phase != .rolled_back) continue;
             if (self.cached_split_observations.get(record.transition_id)) |cached| {
                 if (cached.attempt_epoch == record.attempt_epoch and
@@ -635,7 +737,9 @@ pub const TransitionService = struct {
                 }
             }
             if (retryPending(&self.split_retries, record.transition_id, now_ms)) continue;
+            if (!self.pendingRecordMatches(record)) continue;
             const observation = runtime.observeSplit(record) catch |err| {
+                if (!self.pendingRecordMatches(record)) continue;
                 try recordRetry(
                     self.alloc,
                     &self.split_retries,
@@ -649,6 +753,7 @@ pub const TransitionService = struct {
                 });
                 continue;
             };
+            if (!self.pendingRecordMatches(record)) continue;
             _ = self.split_retries.remove(record.transition_id);
             _ = self.split_observation_retries.remove(record.transition_id);
             try self.rememberCachedSplitObservation(
@@ -659,7 +764,10 @@ pub const TransitionService = struct {
             );
         }
 
-        for (self.pending_merge.items) |record| {
+        const merge_records = try self.snapshotPendingRecords(metadata.MergeTransitionRecord);
+        defer self.freePendingSnapshot(merge_records);
+        for (merge_records) |record| {
+            if (!self.pendingRecordMatches(record)) continue;
             if (record.phase != .finalized and record.phase != .rolled_back) continue;
             if (self.cached_merge_observations.get(record.transition_id)) |cached| {
                 if (observationFresh(cached.observed_at_ms, now_ms) and
@@ -671,7 +779,9 @@ pub const TransitionService = struct {
                 }
             }
             if (retryPending(&self.merge_retries, record.transition_id, now_ms)) continue;
+            if (!self.pendingRecordMatches(record)) continue;
             const observation = runtime.observeMerge(record) catch |err| {
+                if (!self.pendingRecordMatches(record)) continue;
                 try recordRetry(
                     self.alloc,
                     &self.merge_retries,
@@ -685,6 +795,7 @@ pub const TransitionService = struct {
                 });
                 continue;
             };
+            if (!self.pendingRecordMatches(record)) continue;
             _ = self.merge_retries.remove(record.transition_id);
             _ = self.merge_observation_retries.remove(record.transition_id);
             try self.rememberCachedMergeObservation(record.transition_id, now_ms, observation);
@@ -884,6 +995,12 @@ fn randomRetryJitterSalt() u64 {
     return if (salt == 0) 1 else salt;
 }
 
+/// Resolves optional caller-owned entropy without forcing production callers
+/// to know how retry salts are generated.
+pub fn resolveRetryJitterSalt(configured: ?u64) u64 {
+    return configured orelse randomRetryJitterSalt();
+}
+
 fn mixRetryJitter(value: u64) u64 {
     var mixed = value;
     mixed = (mixed ^ (mixed >> 30)) *% 0xbf58_476d_1ce4_e5b9;
@@ -949,6 +1066,21 @@ test "transition retry jitter is bounded and desynchronizes services" {
         }
     }
     try std.testing.expect(found_distinct_delay);
+}
+
+// Value equality, including owned strings: identical metadata replacement is
+// harmless, but removed/replaced attempts and rollback changes fence stale I/O.
+fn transitionRecordEqual(left: anytype, right: @TypeOf(left)) bool {
+    return switch (@typeInfo(@TypeOf(left))) {
+        .@"struct" => |info| blk: {
+            inline for (info.fields) |field|
+                if (!transitionRecordEqual(@field(left, field.name), @field(right, field.name))) break :blk false;
+            break :blk true;
+        },
+        .optional => if (left) |value| if (right) |other| transitionRecordEqual(value, other) else false else right == null,
+        .pointer => std.mem.eql(u8, left, right),
+        else => std.meta.eql(left, right),
+    };
 }
 
 fn findSplitIndex(records: []const metadata.SplitTransitionRecord, transition_id: u64) ?usize {
@@ -1041,6 +1173,137 @@ fn cloneMergeRecord(alloc: std.mem.Allocator, record: metadata.MergeTransitionRe
 fn deinitMergeRecord(alloc: std.mem.Allocator, record: *metadata.MergeTransitionRecord) void {
     metadata.table_manager.freeMergeTransitionRecord(alloc, record.*);
     record.* = undefined;
+}
+
+test "transition service owns records and fences reentrant observations" {
+    const Pass = enum { step, background, terminal };
+    const Stub = struct {
+        service: *TransitionService = undefined,
+        remove: bool,
+        fail: bool,
+        calls: usize = 0,
+
+        const vtable: shard_ops.ShardOperationAdapter.VTable = blk: {
+            var value: shard_ops.ShardOperationAdapter.VTable = undefined;
+            for (std.meta.fields(@TypeOf(value))) |field| {
+                if (std.mem.eql(u8, field.name, "observe_split")) {
+                    @field(value, field.name) = observeSplit;
+                } else if (std.mem.eql(u8, field.name, "observe_merge")) {
+                    @field(value, field.name) = observeMerge;
+                } else {
+                    @field(value, field.name) = struct {
+                        fn call(_: *anyopaque, _: u64, _: @typeInfo(@typeInfo(field.type).pointer.child).@"fn".params[2].type.?) !void {
+                            return error.UnexpectedStaleTransitionAction;
+                        }
+                    }.call;
+                }
+            }
+            break :blk value;
+        };
+
+        fn mutate(self: *@This(), record: anytype) !void {
+            self.calls += 1;
+            const split = @TypeOf(record) == metadata.SplitTransitionRecord;
+            if (split) {
+                try std.testing.expect(self.service.removeSplit(record.transition_id));
+            } else {
+                try std.testing.expect(self.service.removeMerge(record.transition_id));
+            }
+            if (!self.remove) {
+                var replacement = record;
+                replacement.phase = .prepare;
+                replacement.rollback_reason = "replacement-rollback";
+                if (split) replacement.attempt_epoch += 1 else replacement.receiver_group_id += 1;
+                if (split) try self.service.submitSplit(replacement) else try self.service.submitMerge(replacement);
+            }
+            // Reallocate the pending array while the outer pass is suspended.
+            for (100..132) |id| {
+                var extra = record;
+                extra.transition_id = id;
+                extra.phase = .prepare;
+                if (split) try self.service.submitSplit(extra) else try self.service.submitMerge(extra);
+            }
+            const nested = try self.service.stepPending();
+            try std.testing.expectEqual(@as(usize, 0), nested.stepped_split + nested.stepped_merge);
+            try self.service.refreshPendingObservations();
+            try std.testing.expectEqual(@as(usize, 1), self.calls);
+            // This borrow must still describe the original owned snapshot.
+            try std.testing.expectEqualStrings("original-table", record.table_contract.table_name);
+            try std.testing.expect(record.rollback_reason == null);
+        }
+
+        fn observeSplit(ptr: *anyopaque, _: u64, record: metadata.SplitTransitionRecord) !metadata.SplitObservation {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.mutate(record);
+            if (self.fail) return error.SupersededObservation;
+            return std.mem.zeroes(metadata.SplitObservation);
+        }
+        fn observeMerge(ptr: *anyopaque, _: u64, record: metadata.MergeTransitionRecord) !metadata.MergeObservation {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.mutate(record);
+            if (self.fail) return error.SupersededObservation;
+            return std.mem.zeroes(metadata.MergeObservation);
+        }
+    };
+    inline for (.{ metadata.SplitTransitionRecord, metadata.MergeTransitionRecord }) |T| {
+        for ([_]Pass{ .step, .background, .terminal }) |pass| {
+            for ([_]bool{ false, true }) |remove| {
+                for ([_]bool{ false, true }) |fail| {
+                    var stub = Stub{ .remove = remove, .fail = fail };
+                    var service = try TransitionService.init(std.testing.allocator, shard_ops.ShardOperationAdapter{ .ptr = &stub, .vtable = &Stub.vtable });
+                    defer service.deinit();
+                    stub.service = &service;
+                    var record: T = if (T == metadata.SplitTransitionRecord)
+                        .{ .transition_id = 1, .attempt_epoch = 1, .source_group_id = 2, .destination_group_id = 3 }
+                    else
+                        .{ .transition_id = 1, .donor_group_id = 2, .receiver_group_id = 3 };
+                    record.table_contract.table_name = "original-table";
+                    if (pass == .terminal) record.phase = .finalized;
+                    if (T == metadata.SplitTransitionRecord) try service.submitSplit(record) else try service.submitMerge(record);
+                    if (pass == .background) try service.refreshPendingObservations() else _ = try service.stepPending();
+                    try std.testing.expectEqual(@as(usize, 1), stub.calls);
+                    try std.testing.expect(!service.pendingRecordMatches(record));
+                    try std.testing.expectEqual(@as(usize, 0), service.cached_split_observations.count() + service.cached_merge_observations.count());
+                    try std.testing.expectEqual(@as(usize, 0), service.split_retries.count() + service.merge_retries.count() + service.split_observation_retries.count() + service.merge_observation_retries.count());
+                }
+            }
+        }
+    }
+}
+
+test "transition service pending snapshots unwind allocation failures" {
+    const Probe = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var service = TransitionService{
+                .alloc = alloc,
+                .retry_clock = RetryClock.real(),
+                .retry_jitter_salt = 1,
+                .ops = .{ .runtime = .{} },
+            };
+            defer service.deinit();
+            try service.submitSplit(.{
+                .transition_id = 1,
+                .attempt_epoch = 1,
+                .source_group_id = 2,
+                .destination_group_id = 3,
+                .split_key = "middle",
+                .source_range_end = "end",
+                .table_contract = .{ .table_name = "docs", .schema_json = "{}", .indexes_json = "{}" },
+            });
+            try service.submitMerge(.{
+                .transition_id = 4,
+                .donor_group_id = 5,
+                .receiver_group_id = 6,
+                .rollback_reason = "operator",
+                .table_contract = .{ .table_name = "docs", .schema_json = "{}", .indexes_json = "{}" },
+            });
+            const splits = try service.snapshotPendingRecords(metadata.SplitTransitionRecord);
+            defer service.freePendingSnapshot(splits);
+            const merges = try service.snapshotPendingRecords(metadata.MergeTransitionRecord);
+            defer service.freePendingSnapshot(merges);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }
 
 test "transition service steps split and merge queues through runtime" {

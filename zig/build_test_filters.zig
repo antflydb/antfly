@@ -145,7 +145,7 @@ test "select accepts repeated and equals-form test filters" {
         "metadata service",
         "--test-filter=table manager",
         "--skip-test-filter",
-        "metadata sim",
+        "metadata VOPR",
         "--seed=0x1234",
     };
     const filters = select(std.testing.allocator, &args, &.{"default"});
