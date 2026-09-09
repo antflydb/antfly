@@ -5,14 +5,14 @@ Reference implementation: `/Users/ajroetker/go/src/github.com/ajroetker/go-jpeg2
 Current ISO Part 1 baseline before this work:
 
 ```text
-zig build lib-image-conformance-run
+zig build lib-image-conformance
 pass=4 fail=1 skip=18
 ```
 
 Current ISO Part 1 result after promoting the OpenJPEG-parity fixtures:
 
 ```text
-zig build lib-image-conformance-run
+zig build lib-image-conformance
 pass=23 fail=0 skip=0
 ```
 
@@ -33,9 +33,9 @@ the same PGX references:
 ## Performance Tracker
 
 - [x] Add a ReleaseFast image benchmark target.
-  - Command: `zig build lib-image-bench -- jpeg2000-decode <path> [iterations]`.
-  - Command: `zig build lib-image-bench -- jpeg2000-openjpeg-compare <path> [iterations]`.
-  - Alias: `zig build bench-image -- ...`.
+  - Command: `zig build lib-image-bench && ./zig-out/bin/lib-image-bench jpeg2000-decode <path> [iterations]`.
+  - Command: `zig build lib-image-bench && ./zig-out/bin/lib-image-bench jpeg2000-openjpeg-compare <path> [iterations]`.
+  - Alias: `zig build lib-image-bench && ./zig-out/bin/lib-image-bench ...`.
 
 - [x] Add OpenJPEG comparison timing.
   - The comparison shells out to `opj_decompress` and writes PGX output, so it measures the OpenJPEG CLI path rather than the libopenjp2 API directly.

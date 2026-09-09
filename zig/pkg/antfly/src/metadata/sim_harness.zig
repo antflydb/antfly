@@ -5823,8 +5823,8 @@ fn metadataVoprActionName(action: MetadataVoprAction) []const u8 {
 
 fn metadataVoprReplayCommand(cfg: MetadataVoprCampaignConfig) []const u8 {
     return switch (cfg.workload) {
-        .smoke => "zig build lib-metadata-vopr-test --summary failures",
-        .expanded => "zig build lib-metadata-vopr-chaos-test --summary failures",
+        .smoke => "zig build antfly-metadata-vopr-test --summary failures",
+        .expanded => "zig build antfly-metadata-vopr-chaos-test --summary failures",
     };
 }
 

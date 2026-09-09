@@ -34,6 +34,7 @@ pub const schema_capability = @import("schema_capability.zig");
 pub const symbol = @import("symbol.zig");
 
 test {
+    _ = @import("ownership_test.zig");
     _ = token;
     _ = value;
     _ = algebra;
