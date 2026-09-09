@@ -149,10 +149,14 @@ func TestInferenceRuntimeContract(t *testing.T) {
 					t.Logf("runtime output:\n%s", out)
 				}
 			}()
-			httpClient := &http.Client{Timeout: 20 * time.Second}
+			healthClient := &http.Client{Timeout: 2 * time.Second}
+			// Lazy loading does its cold model initialization inside the first
+			// request. Give it the same budget as eager readiness, not a health
+			// probe's deadline: released native CPU builds can take >20s in CI.
+			inferenceClient := &http.Client{Timeout: 90 * time.Second}
 			url := "http://127.0.0.1:" + port
 			status := func(path string) int {
-				resp, err := httpClient.Get(url + path)
+				resp, err := healthClient.Get(url + path)
 				if err != nil {
 					return 0
 				}
@@ -171,7 +175,7 @@ func TestInferenceRuntimeContract(t *testing.T) {
 				g.Expect(string(out)).To(ContainSubstring("warmed inference embedder model=" + model))
 			}
 			body := bytes.NewBufferString(`{"model":"` + model + `","input":"operator runtime contract smoke test"}`)
-			resp, err := httpClient.Post(url+"/ai/v1/embed", "application/json", body)
+			resp, err := inferenceClient.Post(url+"/ai/v1/embed", "application/json", body)
 			g.Expect(err).NotTo(HaveOccurred())
 			defer resp.Body.Close()
 			data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
