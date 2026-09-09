@@ -1373,6 +1373,8 @@ through both write-source configurations, along with bounded stateless retry
 behavior and preservation of conditional conflicts and unknown outcomes.
 The resource-pressure recording and exact replay remain in
 `full-cluster-vopr-test` as a separately selectable test.
+`vopr-runtime-regression-test` groups the runtime ownership, clock, snapshot,
+and cluster-replay regressions and accepts runtime `--test-filter` arguments.
 Forward-only v50 replaces the older standalone stale-generation cluster mode:
 the production-owner campaign queries version 4 and requires the authoritative
 document after a losing publication CAS and stale-derived-record rejection.

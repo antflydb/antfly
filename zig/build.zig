@@ -5691,9 +5691,14 @@ pub fn build(b: *std.Build) void {
     );
     lib_metadata_vopr_replay_stability_step.dependOn(&run_lib_metadata_vopr_replay_stability_tests.step);
 
+    // Production API/DataServer fixtures share the large runtime root. macOS
+    // ReleaseSafe compiles measured 16.55 GB for DataServer and 16.15 GB for
+    // metadata public-data tests; reserve the same 18 GiB as full-cluster
+    // histories. Keep Linux's separately measured 7 GiB reservation.
+    const production_vopr_compile_max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024;
     const lib_metadata_vopr_data_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 9 else 7) * 1024 * 1024 * 1024,
+        .max_rss = production_vopr_compile_max_rss,
         .filters = &.{"metadata VOPR distributed data survives split partition node restart and modeled storage crash"},
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -8102,7 +8107,7 @@ pub fn build(b: *std.Build) void {
 
     const data_server_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 9 else 7) * 1024 * 1024 * 1024,
+        .max_rss = production_vopr_compile_max_rss,
         .filters = &.{
             "production DataServer public HTTP",
             "production HTTP lifecycle runs chunked keep-alive pipeline and stream on VoprIo",
@@ -8219,10 +8224,8 @@ pub fn build(b: *std.Build) void {
     query_embedding_cache_vopr_test_step.dependOn(&run_query_embedding_cache_vopr_tests.step);
 
     // Every filtered full-cluster gate analyzes the same production-heavy
-    // root. Current macOS ReleaseSafe compiles peak around 15.1 GB; reserve
-    // one honest shared amount so the build scheduler cannot co-schedule them
-    // under stale per-mode estimates. Linux retains its measured 7 GiB bound.
-    const full_cluster_vopr_max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024;
+    // root, so use the shared reservation rather than per-mode estimates.
+    const full_cluster_vopr_max_rss = production_vopr_compile_max_rss;
     const transaction_runtime_filters: []const []const u8 = &.{
         "table transaction identities borrow runtime entropy and realtime",
         "table transaction recovery preserves fresh transactions on the runtime clock",
@@ -8235,7 +8238,7 @@ pub fn build(b: *std.Build) void {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("transaction-runtime-regression-test", "Check transaction identity, recovery clocks, and safe stateless retries").dependOn(&addCuratedTestRunArtifact(b, transaction_runtime_regressions, transaction_runtime_filters).step);
-    const migration_regression_tests = b.addTest(.{
+    const vopr_runtime_regression_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{
             "metadata VOPR distributed data survives split partition node restart and modeled storage crash",
@@ -8262,9 +8265,9 @@ pub fn build(b: *std.Build) void {
         .max_rss = full_cluster_vopr_max_rss,
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
-    const run_migration_regressions = b.addRunArtifact(migration_regression_tests);
-    if (b.args) |args| run_migration_regressions.addArgs(args);
-    b.step("vopr-migration-regression-test", "Run VOPR I/O migration ownership and replay regressions").dependOn(&run_migration_regressions.step);
+    const run_vopr_runtime_regressions = b.addRunArtifact(vopr_runtime_regression_tests);
+    if (b.args) |args| run_vopr_runtime_regressions.addArgs(args);
+    b.step("vopr-runtime-regression-test", "Run VOPR runtime ownership, clock, snapshot, and replay regressions").dependOn(&run_vopr_runtime_regressions.step);
 
     const full_cluster_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
