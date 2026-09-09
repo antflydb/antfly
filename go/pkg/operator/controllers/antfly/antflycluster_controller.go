@@ -13901,10 +13901,12 @@ func (r *AntflyClusterReconciler) reconcilePodDisruptionBudget(ctx context.Conte
 }
 
 type pvcUsageObservation struct {
-	matched       int
-	usedBytes     int64
-	capacityBytes int64
-	maxRequest    resource.Quantity
+	matched             int
+	expanding           int
+	usedBytes           int64
+	capacityBytes       int64
+	maxRequest          resource.Quantity
+	maxReportedCapacity resource.Quantity
 }
 
 type kubeletStatsSummary struct {
@@ -13973,6 +13975,25 @@ func (r *AntflyClusterReconciler) reconcileStorageAutoGrow(ctx context.Context, 
 		currentSize = observation.maxRequest
 		currentSizeStr = currentSize.String()
 	}
+	usagePercent := int32(0)
+	if observation.capacityBytes > 0 {
+		usagePercentValue := (observation.usedBytes/observation.capacityBytes)*100 + ((observation.usedBytes%observation.capacityBytes)*100)/observation.capacityBytes
+		const maxInt32 = int64(1<<31 - 1)
+		if usagePercentValue > maxInt32 {
+			usagePercentValue = maxInt32
+		}
+		usagePercent = int32(usagePercentValue)
+	}
+	if observation.expanding > 0 {
+		reportedCapacity := observation.maxReportedCapacity.String()
+		if observation.maxReportedCapacity.IsZero() {
+			reportedCapacity = "not yet reported"
+		}
+		message := fmt.Sprintf("Waiting for %d %s PVC(s) to finish expansion from reported capacity %s to requested size %s", observation.expanding, component, reportedCapacity, currentSize.String())
+		r.setStorageAutoGrowStatus(cluster, component, currentSize.String(), currentSize.String(), maxSize.String(), observation.usedBytes, observation.capacityBytes, usagePercent, antflyv1.ReasonStorageAutoGrowInProgress, message)
+		r.setStorageAutoGrowCondition(cluster, metav1.ConditionUnknown, antflyv1.ReasonStorageAutoGrowInProgress, message)
+		return currentSizeStr
+	}
 	if err != nil {
 		message := fmt.Sprintf("%s storage usage is unavailable: %v", component, err)
 		r.setStorageAutoGrowStatus(cluster, component, currentSize.String(), "", maxSize.String(), 0, 0, 0, antflyv1.ReasonStorageAutoGrowUsageUnavailable, message)
@@ -13986,12 +14007,6 @@ func (r *AntflyClusterReconciler) reconcileStorageAutoGrow(ctx context.Context, 
 		return currentSizeStr
 	}
 
-	usagePercentValue := (observation.usedBytes/observation.capacityBytes)*100 + ((observation.usedBytes%observation.capacityBytes)*100)/observation.capacityBytes
-	const maxInt32 = int64(1<<31 - 1)
-	if usagePercentValue > maxInt32 {
-		usagePercentValue = maxInt32
-	}
-	usagePercent := int32(usagePercentValue)
 	threshold := policy.GrowThresholdPercent
 	if threshold == 0 {
 		threshold = 85
@@ -14039,6 +14054,14 @@ func (r *AntflyClusterReconciler) observePVCUsage(ctx context.Context, cluster *
 		pvcNames[pvc.Name] = struct{}{}
 		if request := pvc.Spec.Resources.Requests[corev1.ResourceStorage]; request.Cmp(observation.maxRequest) > 0 {
 			observation.maxRequest = request
+		}
+		request := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+		capacity := pvc.Status.Capacity[corev1.ResourceStorage]
+		if capacity.Cmp(observation.maxReportedCapacity) > 0 {
+			observation.maxReportedCapacity = capacity
+		}
+		if capacity.IsZero() || request.Cmp(capacity) > 0 || pvcHasFileSystemResizePending(pvc) {
+			observation.expanding++
 		}
 	}
 	if len(pvcNames) == 0 {
