@@ -29553,6 +29553,77 @@ test "api http server serves table query response envelope" {
     try std.testing.expectEqualStrings("invalid query request", internal_field_resp.body);
 }
 
+test "api http server query string boolean controls survive reopen" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-http-query-string-boolean";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    const Case = struct { query: []const u8, ids: []const []const u8 };
+    const cases = [_]Case{
+        .{ .query = "{\"query\":\"alpha\"}", .ids = &.{ "both", "alpha_only" } },
+        .{ .query = "{\"match\":\"alpha beta\"}", .ids = &.{ "both", "alpha_only", "beta_only" } },
+        .{ .query = "{\"query\":\"body:alpha\"}", .ids = &.{ "both", "alpha_only" } },
+        .{ .query = "{\"query\":\"alpha beta\"}", .ids = &.{"both"} },
+        .{ .query = "{\"query\":\"body:alpha AND body:beta\"}", .ids = &.{"both"} },
+        .{ .query = "{\"query\":\"body:alpha AND body:alpha\"}", .ids = &.{ "both", "alpha_only" } },
+        .{ .query = "{\"conjuncts\":[{\"match\":\"alpha\",\"field\":\"body\"},{\"match\":\"beta\",\"field\":\"body\"}]}", .ids = &.{"both"} },
+        .{ .query = "{\"query\":\"body:alpha OR body:beta\"}", .ids = &.{ "both", "alpha_only", "beta_only" } },
+        .{ .query = "{\"query\":\"body:alpha AND NOT body:beta\"}", .ids = &.{"alpha_only"} },
+        .{ .query = "{\"query\":\"NOT body:alpha\"}", .ids = &.{"beta_only"} },
+        .{ .query = "{\"query\":\"(body:alpha OR body:beta) AND body:gamma\"}", .ids = &.{"alpha_only"} },
+        .{ .query = "{\"query\":\"body:alpha AND body:missing\"}", .ids = &.{} },
+    };
+    for (0..2) |phase| {
+        var db = try db_mod.DB.open(alloc, path, .{});
+        defer db.close();
+        if (phase == 0) {
+            try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
+            try db.batch(.{ .writes = &.{
+                .{ .key = "both", .value = "{\"body\":\"alpha beta\"}" },
+                .{ .key = "alpha_only", .value = "{\"body\":\"alpha gamma\"}" },
+                .{ .key = "beta_only", .value = "{\"body\":\"beta delta\"}" },
+            }, .sync_level = .full_index });
+        }
+        var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+        var source = FakeSource{};
+        var server = ApiHttpServer.init(alloc, .{}, source.iface(), table_source.source(), null);
+        for (cases) |case| {
+            const body = try std.fmt.allocPrint(alloc, "{{\"full_text_search\":{s},\"limit\":10}}", .{case.query});
+            defer alloc.free(body);
+            var resp = try executeHttpxTestRequest(&server, .{
+                .method = .POST,
+                .uri = "/tables/docs/query",
+                .content_type = "application/json",
+                .body = body,
+            });
+            defer resp.deinit(alloc);
+            try std.testing.expectEqual(@as(u16, 200), resp.status);
+            const parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, resp.body, .{});
+            defer parsed.deinit();
+            const hits = parsed.value.responses.?[0].hits.?.hits.?;
+            try std.testing.expectEqual(case.ids.len, hits.len);
+            for (case.ids) |id| {
+                var count: usize = 0;
+                for (hits) |hit| {
+                    if (std.mem.eql(u8, id, hit._id)) count += 1;
+                }
+                try std.testing.expectEqual(@as(usize, 1), count);
+            }
+        }
+    }
+}
+
 test "api http server executes public Query filter roots and compositions" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-http-sdk-filter-roots";

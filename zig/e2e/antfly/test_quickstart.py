@@ -283,6 +283,56 @@ def test_public_quickstart_default_field_searches_dynamic_strings(
     ]
 
 
+def test_public_quickstart_query_string_boolean_controls(backup_api):
+    table = f"quickstart_boolean_{time.time_ns()}"
+    backup_api.create_table(table, num_shards=1)
+    backup_api.batch_write(
+        table,
+        inserts={
+            "both": {"body": "alpha beta"},
+            "alpha_only": {"body": "alpha gamma"},
+            "beta_only": {"body": "beta delta"},
+        },
+        sync_level="full_index",
+    )
+    cases = [
+        ({"query": "alpha"}, {"both", "alpha_only"}),
+        ({"match": "alpha beta"}, {"both", "alpha_only", "beta_only"}),
+        ({"query": "body:alpha"}, {"both", "alpha_only"}),
+        ({"query": "alpha beta"}, {"both"}),
+        ({"query": "body:alpha AND body:beta"}, {"both"}),
+        ({"query": "body:alpha AND body:alpha"}, {"both", "alpha_only"}),
+        (
+            {
+                "conjuncts": [
+                    {"match": "alpha", "field": "body"},
+                    {"match": "beta", "field": "body"},
+                ]
+            },
+            {"both"},
+        ),
+        ({"query": "body:alpha OR body:beta"}, {"both", "alpha_only", "beta_only"}),
+        ({"query": "body:alpha AND NOT body:beta"}, {"alpha_only"}),
+        ({"query": "NOT body:alpha"}, {"beta_only"}),
+        ({"query": "(body:alpha OR body:beta) AND body:gamma"}, {"alpha_only"}),
+        ({"query": "body:alpha AND body:missing"}, set()),
+    ]
+
+    def assert_controls():
+        for query, expected in cases:
+            result = backup_api.query_table(
+                table, {"full_text_search": query, "limit": 10}
+            )
+            hits = result["responses"][0]["hits"]["hits"]
+            assert {hit["_id"] for hit in hits} == expected, query
+            assert len(hits) == len(expected), query
+
+    assert_controls()
+    if backup_api.supports_restart:
+        backup_api.restart_server()
+        assert_controls()
+
+
 def test_public_quickstart_rag_stream_requires_evidence(
     backup_api, inference_generator
 ):

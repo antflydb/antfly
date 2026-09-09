@@ -5604,6 +5604,7 @@ pub fn build(b: *std.Build) void {
         "api http server serves table scan as ndjson",
         "api http server routes table query through read schema full text index",
         "api http server serves table query response envelope",
+        "api http server query string boolean controls survive reopen",
         "api http server executes public Query filter roots and compositions",
         "public table query handler preserves structured filter and hierarchy diagnostics",
         "query dependency errors expose a stable JSON retry contract",
