@@ -9808,6 +9808,10 @@ Integration testing caught an eager single-delete merge that undid row
 preservation; the merge guard now also recognizes native rows. The scheduling
 review also removed a whole-generation rewrite on each soft row-debt event:
 those events use selective delta repacking while the segment chain has room.
+Pre-qualification review also caught an admission overestimate: row-native
+leaves must publish their RaBitQ scan-byte cost, not the float32 fallback cost
+merely because they live outside the aggregate directory. Both checkpoint
+encoders now preserve that distinction, with an integrated regression assertion.
 
 Validation so far: 43 row/WAL/segment Debug tests passed (one performance-only
 test skipped); 21 focused storage/capture/checkpoint tests passed without leaks;
@@ -9825,7 +9829,159 @@ even when the VectorDBBench client process eventually exits successfully.
 Matched public-API 50K/1M performance qualification is still pending. The
 standalone microbenchmark numbers above must not be presented as integrated
 latency, RSS, or disk improvements.
-Pre-qualification review also caught an admission overestimate: row-native
-leaves must publish their RaBitQ scan-byte cost, not the float32 fallback cost
-merely because they live outside the aggregate directory. Both checkpoint
-encoders now preserve that distinction, with an integrated regression assertion.
+
+##### First integrated public-API 50K A/B (2026-09-08)
+
+Frozen implementation: `0326a2bd9`, ReleaseFast executable under
+`.benchmark-assets/pr593-integrated-posting-rows-qualified-20260908/bin/antfly`.
+Evidence: `.benchmark-results/pr593-integrated-posting-rows-ab-20260908`.
+The same executable includes common in-progress source-vector changes from the
+shared worktree; this is a flag-off/on comparison, not a clean-commit comparison
+against historical binaries. Each receipt records executable/helper SHA-256s.
+Both arms use no-copy, staged readers, dense-delete preparation, batch 100,
+`sync_level=write`, C1/10/20/30, fixed-query profiling and 1,000 offered mixed
+overwrite rows/s. AB then BA fresh loads passed write-error, native-treatment,
+visibility, restart and paired recall gates. The full-text index is disabled
+equally through the public API. The subsequent 1M pairs also completed; see below.
+
+Two-arm medians (decimal GB/MB; not a best-of-each composite):
+
+| 50K metric | Control | Native row deltas |
+| --- | ---: | ---: |
+| Full readiness | 15.44 s | 16.01 s |
+| C30 QPS | 1,673 | 1,639 |
+| C30 p95 / p99 | 48.09 / 69.99 ms | 46.88 / 69.53 ms |
+| Live recall | 98.33% | 98.46% |
+| Mixed query QPS / p95 | 390 / 60.11 ms | 386 / 60.43 ms |
+| Mixed write p95 | 151.59 ms | 151.57 ms |
+| Final mixed catch-up | 0.737 s | 0.480 s |
+| Sampled mixed RSS | 1.537 GB | 1.344 GB |
+| Demand high-water | 1.007 GB | 0.823 GB |
+| Physical-footprint ledger high-water | 0.783 GB | 0.823 GB |
+| Allocated disk after restart | 440.49 MB | 499.14 MB |
+| Post-restart leaf-scoring mean | 1.182 ms | 1.422 ms |
+
+The normalized replay counters expose cost transfer rather than a total
+maintenance win. Each arm overwrote and replayed 30,100 rows. Total apply cost
+was 671.2/716.4 ms per 1,000 rows in controls and 781.8/769.7 in candidates.
+Aggregate delete time fell from 17.78/18.85 s to 2.93/3.02 s, but embedding
+apply rose from 2.12/2.43 s to 20.27/19.86 s. Existing detailed timers locate
+most of that increase in leaf mutation, not capture finalization. Do not call
+the smaller final catch-up timer a reduction in total replay work.
+
+Disk attribution puts the increase in ANN/index persisted bytes (median
+121.89 to 180.11 MB), not duplicated source embeddings. Lower RSS/demand does
+not establish lower physical footprint: the ledger median is 5.1% higher.
+Read-only and mixed throughput vary materially between repetitions. The row
+path currently forces fused scoring, unlike ordinary leaves; that is a
+candidate for an isolated follow-up, not yet a proven cause of the slower
+post-restart leaf timer. Keep the experiment default-off pending recovery of
+the measured mutation/space costs.
+
+##### Completed integrated public-API 1M A/B (2026-09-08)
+
+All eight 50K/1M arms completed successfully, including actual row mutation and
+durable publication evidence, mixed-write coverage, restart and paired recall.
+Every arm used executable SHA-256
+`8b61fa303dbdcd145b2baa20a7e8c8bef2fe8a98b03ea19f9e59ee24d718dbcd`.
+`matched-summary.json`, `replay-work-summary.json` and the original per-arm
+receipts/logs are preserved in the A/B root above. Correctness qualification is
+not performance promotion: no defaults were changed. This was a shared-host
+experiment without CPU isolation; other work and bounded correctness-test builds
+overlapped parts of the run. Keep both run orders and do not infer a historical
+baseline comparison or statistical confidence from two repetitions.
+
+| 1M metric, two-arm median | Control | Native row deltas |
+| --- | ---: | ---: |
+| Insert / full readiness | 263.53 / 347.74 s | 281.15 / 382.44 s |
+| C1 QPS / p95 | 81.3 / 16.52 ms | 53.2 / 37.65 ms |
+| C10 QPS / p95 | 647.6 / 23.91 ms | 281.3 / 96.10 ms |
+| C20 QPS / p95 | 705.4 / 67.89 ms | 314.1 / 109.76 ms |
+| C30 QPS / p95 / p99 | 593.5 / 110.43 / 144.24 ms | 436.2 / 117.69 / 150.03 ms |
+| Live recall | 99.01% | 99.05% |
+| Mixed query QPS / p95 | 195.5 / 120.35 ms | 225.0 / 81.79 ms |
+| Mixed accepted write rate / request p95 | 856.1 rows/s / 778.69 ms | 860.3 rows/s / 715.72 ms |
+| Final mixed catch-up | 5.420 s | 2.408 s |
+| Sampled read-only / mixed RSS | 5.827 / 5.496 GB | 5.984 / 4.764 GB |
+| Demand / physical-footprint ledger peak | 1.381 / 1.300 GB | 1.400 / 1.400 GB |
+| Allocated disk after restart | 3.810 GB | 3.775 GB |
+| Post-restart mean leaf scoring | 5.723 ms | 6.975 ms |
+
+Readiness regresses in both pairs (386.48 -> 409.01 s; 309.01 -> 355.88 s),
+as do C30 QPS (501.98 -> 376.17; 685.11 -> 496.27) and C30 p95
+(125.62 -> 131.48 ms; 95.25 -> 103.90 ms). Mixed query p95 improves in both
+pairs (166.71 -> 106.67 ms; 73.98 -> 56.92 ms), but mixed RSS reverses
+direction (+7.1%, then -28.1%). Do not present the median mixed-RSS reduction
+as a repeatable memory win. Settled allocated disk also reverses direction
+(-3.0%, then +1.1%); the slightly smaller median does not prove less I/O.
+
+Checkpoint amplification is substantially worse in both orders. Through source
+sequence 10001, controls publish 14/14 generations and write 2.048/2.055 GB of
+checkpoint bytes; candidates publish 60/55 generations and write 8.259/7.773 GB.
+Each candidate performs six full checkpoints versus two per control (counts
+exclude the initial empty-authority publication from the full-checkpoint count).
+That is 4.03x/3.78x checkpoint output, despite similar post-restart retained disk.
+
+Replay logs retain the same delete-to-append cost transfer at scale. In pair 1,
+control/candidate delete stages total 27.51/7.86 s and embedding-apply stages
+4.22/20.76 s; pair 2 gives 24.21/3.79 s and 4.34/24.04 s. These windows coalesce
+overwrites: 21,500/21,700 public rows become 9,200/15,100 replayed documents in
+pair 1, and 30,100 public rows per arm become 20,400/25,900 replayed documents
+in pair 2. Per-replayed-document timers are not per-public-write timers, and
+neither should be substituted for the measured mixed throughput/latency.
+
+Code review identifies the next structural targets, not yet fixed by this A/B:
+
+- AFRC currently embeds an AFQD header/origin for every append chunk. A
+  768-dimensional float32 origin alone is 3,072 bytes (6,144 at 1,536 dimensions),
+  disproportionate to a small RaBitQ append. Share immutable origin metadata;
+  batch transaction-local rows without duplicating authoritative embeddings.
+- Row-debt age/pending state is index-wide and is cleared only when the worker's
+  mutation epoch still equals the writer's. Continuous ingest can keep the old
+  debt signal active. Forced repacking then treats all fragmented leaves as aged.
+  Track and retire repaired debt by leaf/revision, with bounded work admission.
+- A newer absolute AFRM WAL-tail value can shadow a worker's compacted manifest
+  and reference the original chunks. Retaining that reference closure is required
+  for correctness, but does not preserve compaction progress. Publication needs
+  a revision-aware composition of the compacted base with newer row operations,
+  prepared off-lane and validated before the durable coherent generation swap.
+  Never reclaim the old closure or discard newer updates to improve a timer.
+
+The integrated row store is functional and recovery-tested, but is **not** an
+overall performance winner or the final low-amplification production design.
+
+##### Shared scoring-origin query preparation follow-up
+
+The integrated scorer grouped tombstone gaps within each chunk but still
+normalized and quantized the query again for every chunk. It now prepares once
+per leaf scoring origin and borrows the scratch planes across all chunks.
+Prepared contexts validate quantizer/origin compatibility and a nonwrapping
+scratch epoch; preparing another query (including a zero-diff query) invalidates
+the old context. This adds no heap buffers or changes to persisted formats,
+candidate order, score arithmetic, error bounds or authoritative completion.
+The existing filtered/range-serving fallback is unchanged.
+
+Implemented in `027c58ebf`. Validation: all 226 standalone
+vector-kernel/vectorindex Debug tests passed
+(three skips), plus the integrated native mutation/checkpoint/reopen fixture
+across all three metrics without leaks. Tests assert exactly one preparation
+for a fragmented leaf, bitwise row-score/bound/order parity after repacking,
+empty/invalid range behavior, cancellation, wrong origins/quantizers, stale
+scratch and epoch exhaustion.
+The quantizer tests also cross-compile for amd64/arm64 Linux; the database
+overwrite/reopen and 10,000-document replay checks pass with the row flag on.
+The same-binary ReleaseFast synthetic 1,024-row,
+768-dimensional kernel A/B uses reversed order over four repetitions:
+
+| Chunks per leaf | Repeated preparation, median | Shared preparation, median |
+| --- | ---: | ---: |
+| 1 | 8.14 us | 8.11 us |
+| 16 | 11.49 us | 9.38 us |
+| 64 | 21.62 us | 13.03 us |
+
+Raw output: `.benchmark-results/pr593-shared-row-query-20260908/kernel.log`.
+These are component timings, not public-query improvements. The completed
+50K/1M integration A/B deliberately retains the original `0326a2bd9` executable
+and does **not** include this follow-up. The broader row experiment stays
+default-off; this change alone does not address append-stage work, redundant
+origin bytes or repeated checkpoint publication.
