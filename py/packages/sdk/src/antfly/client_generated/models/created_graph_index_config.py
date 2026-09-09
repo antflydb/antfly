@@ -11,6 +11,7 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.created_graph_artifact_producer_config import CreatedGraphArtifactProducerConfig
     from ..models.created_graph_artifact_source_config import CreatedGraphArtifactSourceConfig
+    from ..models.created_graph_index_config_metrics import CreatedGraphIndexConfigMetrics
     from ..models.created_provider_config import CreatedProviderConfig
     from ..models.edge_type_config import EdgeTypeConfig
     from ..models.graph_algebraic_planning_config import GraphAlgebraicPlanningConfig
@@ -25,6 +26,7 @@ class CreatedGraphIndexConfig:
     """Credential-free normalized graph configuration returned after creation.
 
     Attributes:
+        metrics (CreatedGraphIndexConfigMetrics | Unset):
         summarizer (CreatedProviderConfig | Unset): Credential-free provider configuration returned after index
             creation. Only non-secret provider settings are represented.
         template (str | Unset):
@@ -40,6 +42,7 @@ class CreatedGraphIndexConfig:
         resolvers (list[GraphResolverConfig] | Unset):
     """
 
+    metrics: CreatedGraphIndexConfigMetrics | Unset = UNSET
     summarizer: CreatedProviderConfig | Unset = UNSET
     template: str | Unset = UNSET
     edge_types: list[EdgeTypeConfig] | Unset = UNSET
@@ -51,6 +54,10 @@ class CreatedGraphIndexConfig:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        metrics: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.metrics, Unset):
+            metrics = self.metrics.to_dict()
+
         summarizer: dict[str, Any] | Unset = UNSET
         if not isinstance(self.summarizer, Unset):
             summarizer = self.summarizer.to_dict()
@@ -91,6 +98,8 @@ class CreatedGraphIndexConfig:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if metrics is not UNSET:
+            field_dict["metrics"] = metrics
         if summarizer is not UNSET:
             field_dict["summarizer"] = summarizer
         if template is not UNSET:
@@ -114,12 +123,20 @@ class CreatedGraphIndexConfig:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.created_graph_artifact_producer_config import CreatedGraphArtifactProducerConfig
         from ..models.created_graph_artifact_source_config import CreatedGraphArtifactSourceConfig
+        from ..models.created_graph_index_config_metrics import CreatedGraphIndexConfigMetrics
         from ..models.created_provider_config import CreatedProviderConfig
         from ..models.edge_type_config import EdgeTypeConfig
         from ..models.graph_algebraic_planning_config import GraphAlgebraicPlanningConfig
         from ..models.graph_resolver_config import GraphResolverConfig
 
         d = dict(src_dict)
+        _metrics = d.pop("metrics", UNSET)
+        metrics: CreatedGraphIndexConfigMetrics | Unset
+        if isinstance(_metrics, Unset):
+            metrics = UNSET
+        else:
+            metrics = CreatedGraphIndexConfigMetrics.from_dict(_metrics)
+
         _summarizer = d.pop("summarizer", UNSET)
         summarizer: CreatedProviderConfig | Unset
         if isinstance(_summarizer, Unset):
@@ -173,6 +190,7 @@ class CreatedGraphIndexConfig:
                 resolvers.append(resolvers_item)
 
         created_graph_index_config = cls(
+            metrics=metrics,
             summarizer=summarizer,
             template=template,
             edge_types=edge_types,

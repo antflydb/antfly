@@ -42,6 +42,24 @@ pub const State = struct {
         return pending + if (self.materialized) @as(usize, 0) else if (nodes) self.persisted_nodes else self.persisted_edges;
     }
 
+    /// Canonical identity of the addressed boundary records. Call only after
+    /// materialization, on the read side of the transaction fence.
+    pub fn boundaryDigest(self: State) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly:partition-boundaries:v1");
+        for ([_][]const []u8{ self.edge_boundaries.items, self.node_boundaries.items }) |list| {
+            var size: [8]u8 = undefined;
+            std.mem.writeInt(u64, &size, list.len, .little);
+            hash.update(&size);
+            for (list) |key| {
+                std.mem.writeInt(u64, &size, key.len, .little);
+                hash.update(&size);
+                hash.update(key);
+            }
+        }
+        return hash.finalResult();
+    }
+
     fn boundaryKeyAlloc(alloc: Allocator, parent: []const u8, nodes: bool, index: usize) ![]u8 {
         var suffix = [_]u8{ '/', @intFromBool(nodes), 0, 0 };
         std.mem.writeInt(u16, suffix[2..4], @intCast(index), .big);

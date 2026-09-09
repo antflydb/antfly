@@ -472,6 +472,9 @@ components:
       type: object
       description: "Credential-free normalized graph configuration returned after creation."
       properties:
+        metrics:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/GraphMetricConfig" }
         summarizer: { $ref: "#/components/schemas/CreatedProviderConfig" }
         template: { type: string }
         edge_types:
@@ -2330,6 +2333,10 @@ components:
       x-antfly-mutually-exclusive:
         - [sources, source]
       properties:
+        metrics:
+          type: object
+          description: "Named published graph metrics. Serverless supports background refresh only and limits configurations to 16 metrics per graph, 64 total per publication, 64 types per filter, and 128 UTF-8 bytes per metric name."
+          additionalProperties: { $ref: "#/components/schemas/GraphMetricConfig" }
         sources:
           type: array
           minItems: 1
@@ -2373,6 +2380,53 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/GraphResolverConfig"
+    GraphMetricConfig:
+      type: object
+      additionalProperties: false
+      description: "Published metric configuration. If kind is omitted, the metric name must be a supported kind."
+      properties:
+        enabled: { type: boolean, default: true }
+        kind:
+          type: string
+          enum: [pagerank, degree, eigenvector, hits_authority, hits_hub]
+        refresh:
+          type: string
+          enum: [background, manual]
+          default: background
+          description: "Serverless accepts background only."
+        damping:
+          type: number
+          format: double
+          minimum: 0
+          exclusiveMinimum: true
+          maximum: 1
+          exclusiveMaximum: true
+          default: 0.85
+        tolerance:
+          type: number
+          format: double
+          minimum: 0
+          exclusiveMinimum: true
+          default: 0.000001
+        max_iterations:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 1000
+          default: 50
+        edge_filter:
+          $ref: "#/components/schemas/GraphMetricEdgeFilter"
+    GraphMetricEdgeFilter:
+      type: object
+      additionalProperties: false
+      description: "Omitting this object selects all edge types. A types list selects only those types; mode and types cannot both be supplied."
+      properties:
+        mode: { type: string, enum: [all] }
+        types:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { $ref: "#/components/schemas/GraphEdgeType" }
     GraphEdgeType:
       type: string
       minLength: 1

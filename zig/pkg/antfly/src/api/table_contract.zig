@@ -603,6 +603,7 @@ fn validatePublicNestedIndexFields(object: anytype, index_type: public_index_con
 
     const graph_shapes = .{
         .{ "algebraic_planning", public_index_contract.CreatedObjectShape.graph_algebraic_planning },
+        .{ "metrics", public_index_contract.CreatedObjectShape.graph_metrics },
     };
     inline for (graph_shapes) |field_shape| {
         const value = if (@hasField(Object, "map")) object.map.get(field_shape[0]) else object.get(field_shape[0]);
@@ -637,6 +638,8 @@ fn validatePublicArtifactSources(value: std.json.Value, shape: public_index_cont
 }
 
 fn validatePublicCreatedShape(value: std.json.Value, shape: public_index_contract.CreatedObjectShape) !void {
+    if (shape == .graph_metric_filter and value == .object and
+        publicRelationshipFieldActive(value.object, "mode") and publicRelationshipFieldActive(value.object, "types")) return error.InvalidCreateIndexRequest;
     if (!public_index_contract.createdValueMatchesShape(shape, value)) return error.InvalidCreateIndexRequest;
     switch (value) {
         .object => |object| {
@@ -1275,6 +1278,31 @@ test "table contract canonicalizes generated optional null fields" {
         "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"},\"title_body\":{\"name\":\"title_body\",\"type\":\"embeddings\",\"dimension\":3,\"template\":\"{{title}} {{body}}\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"antfly-embed-v1\",\"api_url\":\"http://127.0.0.1:8080/ai/v1\"}}}",
         indexes.value,
     );
+}
+
+test "table contract preserves graph metric configuration and rejects malformed nested values" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"type":"graph","metrics":{"rank":{"kind":"pagerank","max_iterations":20,"edge_filter":{"mode":null,"types":["selected"]}}}}
+    ;
+    const config = try parseCreateIndexRequest(alloc, "graph_idx", body);
+    defer alloc.free(config);
+    try ant_json.testing.expectEqualJsonText(alloc,
+        \\{"name":"graph_idx","type":"graph","metrics":{"rank":{"kind":"pagerank","max_iterations":20,"edge_filter":{"types":["selected"]}}}}
+    , config);
+    for ([_][]const u8{
+        "{\"metrics\":[]}",
+        "{\"metrics\":{\"rank\":{\"kind\":\"bogus\"}}}",
+        "{\"metrics\":{\"rank\":{\"max_iterations\":0}}}",
+        "{\"metrics\":{\"rank\":{\"damping\":1}}}",
+        "{\"metrics\":{\"rank\":{\"secret\":true}}}",
+        "{\"metrics\":{\"rank\":{\"edge_filter\":{\"types\":[]}}}}",
+        "{\"metrics\":{\"rank\":{\"edge_filter\":{\"mode\":\"all\",\"types\":[\"selected\"]}}}}",
+    }) |fields| {
+        const invalid = try std.fmt.allocPrint(alloc, "{{\"type\":\"graph\",{s}", .{fields[1..]});
+        defer alloc.free(invalid);
+        try std.testing.expectError(error.InvalidCreateIndexRequest, parseCreateIndexRequest(alloc, "graph_idx", invalid));
+    }
 }
 
 test "table contract preserves typed artifact-backed graph configuration" {

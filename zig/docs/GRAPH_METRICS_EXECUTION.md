@@ -22,7 +22,7 @@ discovery and adjacency production, reads the shared canonical membership for
 its own seed/initialization, and uses shared packed tiles for every iteration.
 HITS topology can serve PageRank or eigenvector; a forward-only owner cannot
 satisfy HITS. Published scores keep their existing format; intermediate jobs
-from execution schemas before v19 restart.
+from execution schemas before v20 restart.
 
 Cold scheduled builds first enqueue an index-scoped preparation task keyed by
 generation, filter and required orientation. Concurrent PageRank/eigenvector
@@ -52,10 +52,18 @@ Generation changes and loss of all eligible consumers
 retire preparation; independent numerical/publication lifetimes are unchanged.
 Inline numerical drains propagate coordinator terminal failures as failed status,
 preserving the durable root cause instead of replacing it with an idle-page error.
-Intermediate partition-plan v8 uses 4,096-unit scheduling ranges (capped at 256
+Intermediate partition-plan v9 uses 4,096-unit scheduling ranges (capped at 256
 partitions), with byte/work-bounded checkpoints within each range. Canonical
 256-entry membership/vector chunks remain separate from scheduling page size.
 Tests can inject smaller ranges to exercise takeover and partition boundaries.
+The sealed plan is a 76-byte counts/identity/checksum record. Census checkpoints
+write separately addressed, generation-checked boundary slots; completion hashes
+the boundary set outside the writer and publishes the small header in the same
+checkpoint CAS. Only initial manifest planning materializes those slots. Lease
+checks, topology ownership and subsequent iteration planning read the header;
+later numerical and summary pages reuse their iteration-zero range templates.
+Slots are bounded to 256 per direction and reused on generation changes. Filter
+removal reclaims both controls and slots through the bounded filter-plan GC.
 
 Reclamation is index-scoped, including indexes with zero configured metrics.
 Each transaction examines at most 64 pins and deletes at most 512 topology

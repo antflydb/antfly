@@ -1394,9 +1394,13 @@ fn appendPublicConfigValue(
                 // deny-list cannot safely project them into a public response,
                 // so preserve the table-status invariant and omit the entire
                 // write-only document.
-                if (public_index_contract.isWriteOnlyConfigField(entry.key_ptr.*)) continue;
-                if (isSensitivePublicConfigField(entry.key_ptr.*)) continue;
-                if (isSensitivePublicConfigValue(entry.key_ptr.*, entry.value_ptr.*)) continue;
+                // Metric map keys are user-owned names, not credential fields;
+                // their values are still projected through a closed schema.
+                if (object_shape != .graph_metrics) {
+                    if (public_index_contract.isWriteOnlyConfigField(entry.key_ptr.*)) continue;
+                    if (isSensitivePublicConfigField(entry.key_ptr.*)) continue;
+                    if (isSensitivePublicConfigValue(entry.key_ptr.*, entry.value_ptr.*)) continue;
+                }
                 if (!public_index_contract.createdFieldValueMatches(object_shape, entry.key_ptr.*, entry.value_ptr.*)) continue;
                 const child_shape = public_index_contract.createdObjectShapeForChild(object_shape, entry.key_ptr.*);
                 if (!public_index_contract.createdValueMatchesShape(child_shape, entry.value_ptr.*)) continue;
@@ -7473,6 +7477,22 @@ test "public index config encoders omit root write-only producer documents" {
         "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"external\":true,\"dimension\":384}",
         created,
     );
+}
+
+test "created graph metric configuration projects closed nested schemas" {
+    const alloc = std.testing.allocator;
+    const config =
+        \\{"type":"graph","metrics":{"api_key":{"kind":"pagerank","max_iterations":20,"edge_filter":{"types":["selected"],"secret":"private"},"credentials":"private"}}}
+    ;
+    const expected =
+        \\{"name":"graph_idx","type":"graph","metrics":{"api_key":{"kind":"pagerank","max_iterations":20,"edge_filter":{"types":["selected"]}}}}
+    ;
+    const created = try encodeCreatedIndexConfig(alloc, "graph_idx", config);
+    defer alloc.free(created);
+    try ant_json.testing.expectEqualJsonText(alloc, expected, created);
+    const stored = (try encodeSingleIndexConfig(alloc, "{\"graph_idx\":" ++ config ++ "}", "graph_idx")).?;
+    defer alloc.free(stored);
+    try ant_json.testing.expectEqualJsonText(alloc, expected, stored);
 }
 
 test "created graph index response projects closed nested schemas" {

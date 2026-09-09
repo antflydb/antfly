@@ -127,6 +127,76 @@ def _batch_write_stateful(api, table_name: str, **kwargs) -> dict:
     return batch
 
 
+def test_serverless_filtered_pagerank_uses_selected_topology(serverless_api):
+    table = f"graph_metric_selected_{time.time_ns()}"
+    serverless_api.ensure_table(table, created_at_ns=100)
+    assert_created_index(
+        serverless_api.create_index(
+            table,
+            "graph_idx",
+            {
+                "name": "graph_idx",
+                "type": "graph",
+                "metrics": {
+                    "rank": {
+                        "kind": "pagerank",
+                        "max_iterations": 20,
+                        "edge_filter": {"types": ["selected"]},
+                    }
+                },
+            },
+        ),
+        "graph_idx",
+        "graph",
+    )
+    config = serverless_api.get_index(table, "graph_idx")["config"]
+    assert config["metrics"]["rank"]["edge_filter"] == {"types": ["selected"]}
+    mutations = [
+        upsert(
+            source,
+            json_doc(
+                text=source,
+                graph_edges=[{"target": target, "edge_type": "selected"}],
+            ),
+        )
+        for source, target in [("a", "b"), ("b", "a")]
+    ]
+    mutations.extend(
+        upsert(
+            f"noise-{i}",
+            json_doc(
+                text="unrelated",
+                graph_edges=[{"target": f"noise-{i}", "edge_type": "noise"}],
+            ),
+        )
+        for i in range(128)
+    )
+    serverless_api.ingest_table(table, timestamp_ns=200, mutations=mutations)
+    try:
+        serverless_api.build_table(table)
+    except requests.HTTPError as error:
+        if error.response is None or error.response.status_code != 409:
+            raise
+
+    def published_scores():
+        response = serverless_api.query_table(
+            table,
+            {"graph_metric": {"index": "graph_idx", "metric": "rank", "top_k": 10}},
+        )
+        results = response.get("responses", [])
+        if not results:
+            return None
+        result = results[0].get("graph_metric_results", {}).get("rank", {})
+        scores = result.get("scores", [])
+        return scores if len(scores) == 2 else None
+
+    scores = wait_until(published_scores, timeout_s=30.0, interval_s=0.1)
+    assert scores is not None
+    assert {row["node"] for row in scores} == {"a", "b"}
+    for row in scores:
+        assert row["score"] == pytest.approx(0.5, abs=1e-12)
+
+
 def test_graph_neighbors_traverse_and_shortest_path(serverless_api):
     public_traverse_payload = {
         "graph_queries": {

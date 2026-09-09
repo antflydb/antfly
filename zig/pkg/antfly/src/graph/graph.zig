@@ -791,8 +791,8 @@ const graph_metric_packed_f64_magic: u64 = 0xA17F_5046_3634_0001;
 const graph_metric_packed_f64_header_len: usize = 24;
 const graph_metric_build_adoption_cursor_prefix = "@adopt:";
 const graph_metric_partition_plan_key = "meta:metric_partition_plan:v7";
-const graph_metric_partition_census_key = "meta:metric_partition_census:v2";
-const graph_metric_partition_plan_version: u32 = 8;
+const graph_metric_partition_census_key = "meta:metric_partition_census:v3";
+const graph_metric_partition_plan_version: u32 = 9;
 const graph_metric_partition_plan_checksum_seed: u64 = 0xA17F_504C_414E_0007;
 // The public API caps top-K at this value. Retaining a rank entry for every
 // score doubles write/storage amplification without improving any supported
@@ -2856,6 +2856,7 @@ pub const GraphIndex = struct {
         edge_generation: u64,
         edge_count: u64,
         node_count: u64,
+        boundary_digest: [32]u8 = @splat(0),
         edge_page_count: usize,
         node_page_count: usize,
         edge_boundaries: std.ArrayListUnmanaged([]u8) = .empty,
@@ -2889,152 +2890,62 @@ pub const GraphIndex = struct {
                 try index.graphMetricFilterGeneration(txn, cfg.edge_filter) != target_generation)
                 return error.GraphMetricBuildSnapshotChanged;
         }
-
-        fn encodedLen(self: @This()) !usize {
-            // Fixed header plus an integrity footer. The checksum binds every
-            // count, boundary, and page-unit span in the durable plan.
-            var len: usize = 44;
-            for (self.edge_boundaries.items) |key| {
-                if (key.len > std.math.maxInt(u32)) return error.GraphMetricBuildBudgetExceeded;
-                len = std.math.add(usize, len, 4 + key.len) catch return error.GraphMetricBuildBudgetExceeded;
-            }
-            for (self.node_boundaries.items) |key| {
-                if (key.len > std.math.maxInt(u32)) return error.GraphMetricBuildBudgetExceeded;
-                len = std.math.add(usize, len, 4 + key.len) catch return error.GraphMetricBuildBudgetExceeded;
-            }
-            const unit_bytes = std.math.mul(usize, self.edge_page_units.items.len, 8) catch
-                return error.GraphMetricBuildBudgetExceeded;
-            len = std.math.add(usize, len, unit_bytes) catch
-                return error.GraphMetricBuildBudgetExceeded;
-            return len;
-        }
     };
 
+    /// Control stays independent of boundary length. Lease validation,
+    /// topology ownership and numerical iterations read no boundary blocks.
     fn decodeGraphMetricPartitionPlanAlloc(self: *GraphIndex, raw: []const u8) !?GraphMetricPartitionPlan {
-        if (raw.len < 44 or std.mem.readInt(u32, raw[0..4], .little) != graph_metric_partition_plan_version) return null;
-        const payload_end = raw.len - 8;
-        const expected_checksum = std.mem.readInt(u64, raw[payload_end..][0..8], .little);
-        if (std.hash.Wyhash.hash(graph_metric_partition_plan_checksum_seed, raw[0..payload_end]) != expected_checksum) return null;
-        var plan = GraphMetricPartitionPlan{
+        if (raw.len != 76 or std.mem.readInt(u32, raw[0..4], .little) != graph_metric_partition_plan_version) return null;
+        if (std.hash.Wyhash.hash(graph_metric_partition_plan_checksum_seed, raw[0..68]) != std.mem.readInt(u64, raw[68..76], .little)) return null;
+        const edges = std.math.cast(usize, std.mem.readInt(u64, raw[12..20], .little)) orelse return null;
+        const nodes = std.math.cast(usize, std.mem.readInt(u64, raw[20..28], .little)) orelse return null;
+        const edge_pages = std.mem.readInt(u32, raw[28..32], .little);
+        const node_pages = std.mem.readInt(u32, raw[32..36], .little);
+        if (edge_pages != self.graphMetricDegreeScanPageCount(edges) or node_pages != self.graphMetricDegreeReducePageCount(nodes)) return null;
+        return .{
             .edge_generation = std.mem.readInt(u64, raw[4..12], .little),
-            .edge_count = std.mem.readInt(u64, raw[12..20], .little),
-            .node_count = std.mem.readInt(u64, raw[20..28], .little),
-            .edge_page_count = std.mem.readInt(u32, raw[28..32], .little),
-            .node_page_count = std.mem.readInt(u32, raw[32..36], .little),
+            .edge_count = edges,
+            .node_count = nodes,
+            .edge_page_count = edge_pages,
+            .node_page_count = node_pages,
+            .boundary_digest = raw[36..68].*,
         };
-        var plan_owned = true;
-        defer if (plan_owned) plan.deinit(self.alloc);
-        if (plan.edge_page_count > graph_metric_build_max_partition_pages or
-            plan.node_page_count > graph_metric_build_max_partition_pages)
-        {
-            return null;
-        }
-        const edge_count = std.math.cast(usize, plan.edge_count) orelse return null;
-        const node_count = std.math.cast(usize, plan.node_count) orelse return null;
-        if (plan.edge_page_count != self.graphMetricDegreeScanPageCount(edge_count) or
-            plan.node_page_count != self.graphMetricDegreeReducePageCount(node_count))
-        {
-            return null;
-        }
-        var offset: usize = 36;
-        const edge_boundary_count: usize = if (plan.edge_count == 0) 0 else plan.edge_page_count;
-        const node_boundary_count: usize = if (plan.node_count == 0) 0 else plan.node_page_count;
-        for (0..edge_boundary_count) |_| {
-            if (offset > payload_end or payload_end - offset < 4) return null;
-            const key_len: usize = std.mem.readInt(u32, raw[offset..][0..4], .little);
-            offset += 4;
-            if (key_len == 0 or key_len > payload_end - offset) return null;
-            const key = try self.alloc.dupe(u8, raw[offset .. offset + key_len]);
-            plan.edge_boundaries.append(self.alloc, key) catch |err| {
-                self.alloc.free(key);
-                return err;
-            };
-            offset += key_len;
-        }
-        for (0..node_boundary_count) |_| {
-            if (offset > payload_end or payload_end - offset < 4) return null;
-            const key_len: usize = std.mem.readInt(u32, raw[offset..][0..4], .little);
-            offset += 4;
-            if (key_len == 0 or key_len > payload_end - offset) return null;
-            const key = try self.alloc.dupe(u8, raw[offset .. offset + key_len]);
-            plan.node_boundaries.append(self.alloc, key) catch |err| {
-                self.alloc.free(key);
-                return err;
-            };
-            offset += key_len;
-        }
-        for (0..plan.edge_page_count) |_| {
-            if (offset > payload_end or payload_end - offset < 8) return null;
-            try plan.edge_page_units.append(self.alloc, std.mem.readInt(u64, raw[offset..][0..8], .little));
-            offset += 8;
-        }
-        for (plan.edge_boundaries.items, 0..) |boundary, i| {
-            if (i > 0 and std.mem.order(u8, plan.edge_boundaries.items[i - 1], boundary) != .lt) return null;
-            var parsed = (try parseMetricReverseEdgeKeyView(self.alloc, boundary, self.index_name)) orelse return null;
+    }
+
+    fn materializeGraphMetricPartitionPlan(self: *GraphIndex, txn: anytype, key: []const u8, plan: *GraphMetricPartitionPlan) !void {
+        var state = partition_census.State{
+            .generation = plan.edge_generation,
+            .edge_count = plan.edge_count,
+            .node_count = plan.node_count,
+            .persisted_edges = if (plan.edge_count == 0) 0 else plan.edge_page_count,
+            .persisted_nodes = if (plan.node_count == 0) 0 else plan.node_page_count,
+        };
+        defer state.deinit(self.alloc);
+        try state.materializeBoundaries(self.alloc, txn, key);
+        if (!std.mem.eql(u8, &state.boundaryDigest(), &plan.boundary_digest)) return error.InvalidGraphMetricBuildManifest;
+        for (state.edge_boundaries.items) |boundary| {
+            var parsed = (try parseMetricReverseEdgeKeyView(self.alloc, boundary, self.index_name)) orelse return error.InvalidGraphMetricBuildManifest;
             parsed.deinit(self.alloc);
         }
-        for (plan.node_boundaries.items, 0..) |boundary, i| {
-            if (i > 0 and std.mem.order(u8, plan.node_boundaries.items[i - 1], boundary) != .lt) return null;
-        }
-        var planned_edge_units: u64 = 0;
-        for (plan.edge_page_units.items, 0..) |units, i| {
-            const expected_units: u64 = @intCast(graphMetricPartitionSpan(edge_count, plan.edge_page_count, i).len);
-            if (units != expected_units) return null;
-            planned_edge_units = std.math.add(u64, planned_edge_units, units) catch return null;
-        }
-        if (planned_edge_units != plan.edge_count) return null;
-        if (offset != payload_end) return null;
-        plan_owned = false;
-        return plan;
+        std.mem.swap(std.ArrayListUnmanaged([]u8), &plan.edge_boundaries, &state.edge_boundaries);
+        std.mem.swap(std.ArrayListUnmanaged([]u8), &plan.node_boundaries, &state.node_boundaries);
+        for (0..plan.edge_page_count) |page| try plan.edge_page_units.append(self.alloc, graphMetricPartitionSpan(@intCast(plan.edge_count), plan.edge_page_count, page).len);
     }
 
-    fn putGraphMetricPartitionPlanInBatch(self: *GraphIndex, batch: anytype, plan: GraphMetricPartitionPlan) !void {
-        return self.putGraphMetricPartitionPlanAtKeyInBatch(batch, graph_metric_partition_plan_key, plan);
-    }
-
-    fn putGraphMetricPartitionPlanAtKeyInBatch(self: *GraphIndex, batch: anytype, storage_key: []const u8, plan: GraphMetricPartitionPlan) !void {
-        const expected_edge_boundaries: usize = if (plan.edge_count == 0) 0 else plan.edge_page_count;
-        const expected_node_boundaries: usize = if (plan.node_count == 0) 0 else plan.node_page_count;
-        if (plan.edge_boundaries.items.len != expected_edge_boundaries or
-            plan.edge_page_units.items.len != plan.edge_page_count or
-            plan.node_boundaries.items.len != expected_node_boundaries)
-        {
-            return error.InvalidGraphMetricBuildManifest;
-        }
-        const encoded = try self.alloc.alloc(u8, try plan.encodedLen());
-        defer self.alloc.free(encoded);
+    /// Bounded census checkpoints already wrote the boundary slots. Sealing
+    /// publishes only this small record in the generation/checkpoint CAS.
+    fn putGraphMetricPartitionPlanAtKeyInBatch(self: *GraphIndex, batch: anytype, key: []const u8, plan: GraphMetricPartitionPlan) !void {
+        _ = self;
+        var encoded: [76]u8 = undefined;
         std.mem.writeInt(u32, encoded[0..4], graph_metric_partition_plan_version, .little);
         std.mem.writeInt(u64, encoded[4..12], plan.edge_generation, .little);
         std.mem.writeInt(u64, encoded[12..20], plan.edge_count, .little);
         std.mem.writeInt(u64, encoded[20..28], plan.node_count, .little);
         std.mem.writeInt(u32, encoded[28..32], @intCast(plan.edge_page_count), .little);
         std.mem.writeInt(u32, encoded[32..36], @intCast(plan.node_page_count), .little);
-        var offset: usize = 36;
-        for (plan.edge_boundaries.items) |key| {
-            std.mem.writeInt(u32, encoded[offset..][0..4], @intCast(key.len), .little);
-            offset += 4;
-            @memcpy(encoded[offset .. offset + key.len], key);
-            offset += key.len;
-        }
-        for (plan.node_boundaries.items) |key| {
-            std.mem.writeInt(u32, encoded[offset..][0..4], @intCast(key.len), .little);
-            offset += 4;
-            @memcpy(encoded[offset .. offset + key.len], key);
-            offset += key.len;
-        }
-        for (plan.edge_page_units.items) |units| {
-            std.mem.writeInt(u64, encoded[offset..][0..8], units, .little);
-            offset += 8;
-        }
-        std.mem.writeInt(
-            u64,
-            encoded[offset..][0..8],
-            std.hash.Wyhash.hash(graph_metric_partition_plan_checksum_seed, encoded[0..offset]),
-            .little,
-        );
-        offset += 8;
-        std.debug.assert(offset == encoded.len);
-        try batch.put(storage_key, encoded);
+        @memcpy(encoded[36..68], &plan.boundary_digest);
+        std.mem.writeInt(u64, encoded[68..76], std.hash.Wyhash.hash(graph_metric_partition_plan_checksum_seed, encoded[0..68]), .little);
+        try batch.put(key, &encoded);
     }
 
     /// Read the immutable partition boundaries before opening the lease write
@@ -3054,6 +2965,9 @@ pub const GraphIndex = struct {
         var plan = (try self.decodeGraphMetricPartitionPlanAlloc(try self.graphMetricPartitionPlanRaw(&txn, cfg))) orelse return error.GraphMetricBuildSnapshotChanged;
         errdefer plan.deinit(self.alloc);
         try plan.validateMetricSnapshot(self, &txn, cfg, try self.graphMetricFilterGeneration(&txn, cfg.edge_filter));
+        const key = try self.graphMetricPartitionPlanKeyAlloc(cfg.edge_filter);
+        defer self.alloc.free(key);
+        try self.materializeGraphMetricPartitionPlan(&txn, key, &plan);
         return plan;
     }
 
@@ -3131,6 +3045,7 @@ pub const GraphIndex = struct {
             if (complete) try state.materializeBoundaries(self.alloc, &txn, key);
         }
         defer state.deinit(self.alloc);
+        const boundary_digest = if (complete) state.boundaryDigest() else @as([32]u8, @splat(0));
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
         const current = batch.get(key) catch |err| switch (err) {
@@ -3144,6 +3059,7 @@ pub const GraphIndex = struct {
         if (complete) {
             var plan = GraphMetricPartitionPlan{
                 .edge_generation = state.generation,
+                .boundary_digest = boundary_digest,
                 .edge_count = state.edge_count,
                 .node_count = state.node_count,
                 .edge_page_count = self.graphMetricDegreeScanPageCount(@intCast(state.edge_count)),
@@ -3153,8 +3069,8 @@ pub const GraphIndex = struct {
             };
             defer plan.edge_page_units.deinit(self.alloc);
             for (0..plan.edge_page_count) |page| try plan.edge_page_units.append(self.alloc, graphMetricPartitionSpan(@intCast(state.edge_count), plan.edge_page_count, page).len);
+            try state.persistBoundaries(self.alloc, &batch, key);
             try self.putGraphMetricPartitionPlanAtKeyInBatch(&batch, key, plan);
-            try partition_census.State.deleteBoundaries(self.alloc, &batch, key);
         } else {
             try state.persistBoundaries(self.alloc, &batch, key);
             state.phase = phase;
@@ -3212,6 +3128,16 @@ pub const GraphIndex = struct {
         }
     }
 
+    /// Read-only benchmark oracle for the former control-plus-boundaries path.
+    pub fn benchmarkPartitionPlanControl(self: *GraphIndex, reference: bool) !u64 {
+        var txn = try self.beginReadReverseTxn();
+        defer txn.abort();
+        var plan = (try self.decodeGraphMetricPartitionPlanAlloc(try txn.get(graph_metric_partition_plan_key))) orelse return error.InvalidGraphMetricBuildManifest;
+        defer plan.deinit(self.alloc);
+        if (reference) try self.materializeGraphMetricPartitionPlan(&txn, graph_metric_partition_plan_key, &plan);
+        return std.mem.readInt(u64, plan.boundary_digest[0..8], .little) ^ plan.edge_count ^ plan.node_count;
+    }
+
     fn cachedGraphMetricPartitionPlan(self: *GraphIndex) !GraphMetricPartitionPlan {
         var txn = try self.beginReadReverseTxn();
         defer txn.abort();
@@ -3222,6 +3148,7 @@ pub const GraphIndex = struct {
         var plan = (try self.decodeGraphMetricPartitionPlanAlloc(raw)) orelse return error.GraphMetricBuildSnapshotChanged;
         errdefer plan.deinit(self.alloc);
         try plan.validateSnapshot(&txn, try readU64OrZero(&txn, graph_edge_generation_key));
+        try self.materializeGraphMetricPartitionPlan(&txn, graph_metric_partition_plan_key, &plan);
         return plan;
     }
 
@@ -3264,9 +3191,10 @@ pub const GraphIndex = struct {
                 else => return err,
             }
             complete = try self.advanceGraphMetricPartitionCensus(&txn, &state, max_records);
-            if (complete) try state.materializeBoundaries(self.alloc, &txn, graph_metric_partition_census_key);
+            if (complete) try state.materializeBoundaries(self.alloc, &txn, graph_metric_partition_plan_key);
         }
         defer state.deinit(self.alloc);
+        const boundary_digest = if (complete) state.boundaryDigest() else @as([32]u8, @splat(0));
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
         const current = batch.get(graph_metric_partition_census_key) catch |err| switch (err) {
@@ -3282,6 +3210,7 @@ pub const GraphIndex = struct {
         if (complete) {
             var plan = GraphMetricPartitionPlan{
                 .edge_generation = state.generation,
+                .boundary_digest = boundary_digest,
                 .edge_count = state.edge_count,
                 .node_count = state.node_count,
                 .edge_page_count = self.graphMetricDegreeScanPageCount(@intCast(state.edge_count)),
@@ -3292,14 +3221,14 @@ pub const GraphIndex = struct {
             // Boundaries stay owned by the census until this transaction ends.
             defer plan.edge_page_units.deinit(self.alloc);
             for (0..plan.edge_page_count) |page| try plan.edge_page_units.append(self.alloc, graphMetricPartitionSpan(@intCast(state.edge_count), plan.edge_page_count, page).len);
-            try self.putGraphMetricPartitionPlanInBatch(&batch, plan);
-            try partition_census.State.deleteBoundaries(self.alloc, &batch, graph_metric_partition_census_key);
+            try state.persistBoundaries(self.alloc, &batch, graph_metric_partition_plan_key);
+            try self.putGraphMetricPartitionPlanAtKeyInBatch(&batch, graph_metric_partition_plan_key, plan);
             batch.delete(graph_metric_partition_census_key) catch |err| switch (err) {
                 error.NotFound => {},
                 else => return err,
             };
         } else {
-            try state.persistBoundaries(self.alloc, &batch, graph_metric_partition_census_key);
+            try state.persistBoundaries(self.alloc, &batch, graph_metric_partition_plan_key);
             const encoded = try state.encodeAlloc(self.alloc);
             defer self.alloc.free(encoded);
             try batch.put(graph_metric_partition_census_key, encoded);
@@ -3458,9 +3387,7 @@ pub const GraphIndex = struct {
         job: GraphMetricBuildJob,
         partition_plan: GraphMetricPartitionPlan,
     ) !void {
-        const partition_key = try self.graphMetricPartitionPlanKeyAlloc(cfg.edge_filter);
-        defer self.alloc.free(partition_key);
-        try self.putGraphMetricPartitionPlanAtKeyInBatch(batch, partition_key, partition_plan);
+        // The generation-fenced census has already sealed this plan.
         const phases = graphMetricBuildManifestPhases(cfg.kind);
         const planned_edge_count = std.math.cast(usize, partition_plan.edge_count) orelse return error.GraphMetricBuildBudgetExceeded;
         const planned_node_count = std.math.cast(usize, partition_plan.node_count) orelse return error.GraphMetricBuildBudgetExceeded;
@@ -3956,14 +3883,18 @@ pub const GraphIndex = struct {
             if (active) |work| if (work.counts[index] == 0) continue;
             const id = graph_metric_build_summary_leaf_base + index;
             if (try self.metricBuildPage(batch, metric_name, job.job_id, phase, iteration, id)) |_| continue;
+            const template = if (iteration != 0)
+                try self.metricBuildPage(batch, metric_name, job.job_id, phase, 0, id) orelse return error.InvalidGraphMetricBuildManifest
+            else
+                null;
             try self.putGraphMetricBuildPageInBatch(batch, metric_name, .{
                 .job_id = job.job_id,
                 .phase = phase,
                 .iteration = iteration,
                 .page_id = id,
                 .range_kind = .summary,
-                .range_lower = if (index < plan.node_boundaries.items.len) plan.node_boundaries.items[index] else "",
-                .range_upper = if (index + 1 < plan.node_boundaries.items.len) plan.node_boundaries.items[index + 1] else "",
+                .range_lower = if (template) |page| page.range_lower else if (index < plan.node_boundaries.items.len) plan.node_boundaries.items[index] else "",
+                .range_upper = if (template) |page| page.range_upper else if (index + 1 < plan.node_boundaries.items.len) plan.node_boundaries.items[index + 1] else "",
                 .output_prefix = output_prefix,
                 .total_units = if (active) |work| work.counts[index] else graphMetricPartitionSpan(@intCast(plan.node_count), count, index).len,
             });
@@ -7718,7 +7649,7 @@ pub const GraphIndex = struct {
     // v17 seals checksummed ordinal coverage and resumes numerical node work
     // by completed-unit offsets instead of borrowed/string dictionary cursors.
     // Older in-flight jobs must restart; published score layout is unchanged.
-    const graph_metric_build_execution_schema_version: u64 = 19;
+    const graph_metric_build_execution_schema_version: u64 = 20;
 
     const GraphMetricBuildManifest = struct {
         execution_schema_version: u64 = graph_metric_build_execution_schema_version,
@@ -18161,18 +18092,21 @@ test "graph metric status exposes queued and active local build lease" {
         );
         try std.testing.expect((try graph.decodeGraphMetricPartitionPlanAlloc(malformed_count)) == null);
 
-        const malformed_boundary = try alloc.dupe(u8, cached_raw);
-        defer alloc.free(malformed_boundary);
-        // Header + first boundary length points at the first reverse-edge key.
-        malformed_boundary[40] = 0xff;
-        const boundary_checksum_offset = malformed_boundary.len - 8;
-        std.mem.writeInt(
-            u64,
-            malformed_boundary[boundary_checksum_offset..][0..8],
-            std.hash.Wyhash.hash(graph_metric_partition_plan_checksum_seed, malformed_boundary[0..boundary_checksum_offset]),
-            .little,
-        );
-        try std.testing.expect((try graph.decodeGraphMetricPartitionPlanAlloc(malformed_boundary)) == null);
+        try std.testing.expectEqual(@as(usize, 76), cached_raw.len);
+        const control_copy = try alloc.dupe(u8, cached_raw);
+        defer alloc.free(control_copy);
+        try graph.materializeGraphMetricPartitionPlan(&job_txn, graph_metric_partition_plan_key, &cached_plan);
+        try std.testing.expect(cached_plan.edge_boundaries.items.len > 0);
+        cached_plan.boundary_digest[0] ^= 1;
+        try std.testing.expectError(error.InvalidGraphMetricBuildManifest, graph.materializeGraphMetricPartitionPlan(&job_txn, graph_metric_partition_plan_key, &cached_plan));
+        // Control validation remains allocation-free even with persisted data.
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        const saved_allocator = graph.alloc;
+        graph.alloc = failing.allocator();
+        defer graph.alloc = saved_allocator;
+        var header_only = (try graph.decodeGraphMetricPartitionPlanAlloc(control_copy)).?;
+        defer header_only.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), header_only.edge_boundaries.items.len);
     }
 
     try graph.updateGraphMetricBuildLeaseProgressWithCursor("degree", .computing, 5, "edge-page:0007", 7, 20);

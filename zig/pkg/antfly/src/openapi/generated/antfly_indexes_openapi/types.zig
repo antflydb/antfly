@@ -915,6 +915,8 @@ pub const CreateGraphIndexRequest = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index.
     enrichments: ?[]const EnrichmentConfig = null,
+    /// Named published graph metrics. Serverless supports background refresh only and limits configurations to 16 metrics per graph, 64 total per publication, 64 types per filter, and 128 UTF-8 bytes per metric name.
+    metrics: ?std.json.ArrayHashMap(GraphMetricConfig) = null,
     /// Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Artifact names must be unique within the array because the artifact name is the source identity. Earlier sources win when multiple sources materialize the same edge identity. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     sources: ?[]const GraphArtifactSourceConfig = null,
     /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
@@ -938,6 +940,7 @@ pub const CreateGraphIndexRequest = struct {
         .{ "description", "description", true },
         .{ "version", "version", true },
         .{ "enrichments", "enrichments", true },
+        .{ "metrics", "metrics", true },
         .{ "sources", "sources", true },
         .{ "summarizer", "summarizer", false },
         .{ "template", "template", true },
@@ -970,6 +973,10 @@ pub const CreateGraphIndexRequest = struct {
         }
         if (self.enrichments) |value| {
             try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        if (self.metrics) |value| {
+            try jw.objectField("metrics");
             try jw.write(value);
         }
         if (self.sources) |value| {
@@ -1816,6 +1823,7 @@ pub const CreatedGraphIndex = struct {
     version: ?i64 = null,
     /// Normalized inline managed enrichment definitions required by this index.
     enrichments: ?[]const CreatedEnrichmentConfig = null,
+    metrics: ?std.json.ArrayHashMap(GraphMetricConfig) = null,
     summarizer: ?CreatedProviderConfig = null,
     template: ?[]const u8 = null,
     edge_types: ?[]const EdgeTypeConfig = null,
@@ -1833,6 +1841,7 @@ pub const CreatedGraphIndex = struct {
         .{ "description", "description", true },
         .{ "version", "version", true },
         .{ "enrichments", "enrichments", true },
+        .{ "metrics", "metrics", true },
         .{ "summarizer", "summarizer", true },
         .{ "template", "template", true },
         .{ "edge_types", "edge_types", true },
@@ -1866,6 +1875,10 @@ pub const CreatedGraphIndex = struct {
         }
         if (self.enrichments) |value| {
             try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        if (self.metrics) |value| {
+            try jw.objectField("metrics");
             try jw.write(value);
         }
         if (self.summarizer) |value| {
@@ -1908,6 +1921,7 @@ pub const CreatedGraphIndex = struct {
 
 /// Credential-free normalized graph configuration returned after creation.
 pub const CreatedGraphIndexConfig = struct {
+    metrics: ?std.json.ArrayHashMap(GraphMetricConfig) = null,
     summarizer: ?CreatedProviderConfig = null,
     template: ?[]const u8 = null,
     edge_types: ?[]const EdgeTypeConfig = null,
@@ -1920,6 +1934,7 @@ pub const CreatedGraphIndexConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "metrics", "metrics", true },
         .{ "summarizer", "summarizer", true },
         .{ "template", "template", true },
         .{ "edge_types", "edge_types", true },
@@ -1940,6 +1955,10 @@ pub const CreatedGraphIndexConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.metrics) |value| {
+            try jw.objectField("metrics");
+            try jw.write(value);
+        }
         if (self.summarizer) |value| {
             try jw.objectField("summarizer");
             try jw.write(value);
@@ -5122,6 +5141,8 @@ pub const GraphIdentityNodeSelector = struct {
 
 /// Configuration for graph index type
 pub const GraphIndexConfig = struct {
+    /// Named published graph metrics. Serverless supports background refresh only and limits configurations to 16 metrics per graph, 64 total per publication, 64 types per filter, and 128 UTF-8 bytes per metric name.
+    metrics: ?std.json.ArrayHashMap(GraphMetricConfig) = null,
     /// Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Artifact names must be unique within the array because the artifact name is the source identity. Earlier sources win when multiple sources materialize the same edge identity. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     sources: ?[]const GraphArtifactSourceConfig = null,
     /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
@@ -5141,6 +5162,7 @@ pub const GraphIndexConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "metrics", "metrics", true },
         .{ "sources", "sources", true },
         .{ "summarizer", "summarizer", false },
         .{ "template", "template", true },
@@ -5162,6 +5184,10 @@ pub const GraphIndexConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.metrics) |value| {
+            try jw.objectField("metrics");
+            try jw.write(value);
+        }
         if (self.sources) |value| {
             try jw.objectField("sources");
             try jw.write(value);
@@ -5919,6 +5945,103 @@ pub const GraphMetricBuildPageStatus = struct {
         }
         if (self.last_error) |value| {
             try jw.objectField("last_error");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Published metric configuration. If kind is omitted, the metric name must be a supported kind.
+pub const GraphMetricConfig = struct {
+    enabled: ?bool = null,
+    kind: ?[]const u8 = null,
+    /// Serverless accepts background only.
+    refresh: ?[]const u8 = null,
+    damping: ?f64 = null,
+    tolerance: ?f64 = null,
+    max_iterations: ?i32 = null,
+    edge_filter: ?GraphMetricEdgeFilter = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "enabled", "enabled", true },
+        .{ "kind", "kind", true },
+        .{ "refresh", "refresh", true },
+        .{ "damping", "damping", true },
+        .{ "tolerance", "tolerance", true },
+        .{ "max_iterations", "max_iterations", true },
+        .{ "edge_filter", "edge_filter", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.enabled) |value| {
+            try jw.objectField("enabled");
+            try jw.write(value);
+        }
+        if (self.kind) |value| {
+            try jw.objectField("kind");
+            try jw.write(value);
+        }
+        if (self.refresh) |value| {
+            try jw.objectField("refresh");
+            try jw.write(value);
+        }
+        if (self.damping) |value| {
+            try jw.objectField("damping");
+            try jw.write(value);
+        }
+        if (self.tolerance) |value| {
+            try jw.objectField("tolerance");
+            try jw.write(value);
+        }
+        if (self.max_iterations) |value| {
+            try jw.objectField("max_iterations");
+            try jw.write(value);
+        }
+        if (self.edge_filter) |value| {
+            try jw.objectField("edge_filter");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Omitting this object selects all edge types. A types list selects only those types; mode and types cannot both be supplied.
+pub const GraphMetricEdgeFilter = struct {
+    mode: ?[]const u8 = null,
+    types: ?[]const GraphEdgeType = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "mode", "mode", true },
+        .{ "types", "types", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.types) |value| {
+            try jw.objectField("types");
             try jw.write(value);
         }
         try jw.endObject();
@@ -7948,6 +8071,8 @@ pub const IndexConfig = struct {
     chunk_size: ?i64 = null,
     /// Non-semantic execution policy for shorthand-created chunking or embedding producers.
     execution: ?IndexExecutionConfig = null,
+    /// Named published graph metrics. Serverless supports background refresh only and limits configurations to 16 metrics per graph, 64 total per publication, 64 types per filter, and 128 UTF-8 bytes per metric name.
+    metrics: ?std.json.ArrayHashMap(GraphMetricConfig) = null,
     /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
     summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
     /// List of edge types with their configurations
@@ -7989,6 +8114,7 @@ pub const IndexConfig = struct {
         .{ "min_weight", "min_weight", true },
         .{ "chunk_size", "chunk_size", true },
         .{ "execution", "execution", true },
+        .{ "metrics", "metrics", true },
         .{ "summarizer", "summarizer", false },
         .{ "edge_types", "edge_types", true },
         .{ "max_edges_per_document", "max_edges_per_document", true },
@@ -8099,6 +8225,10 @@ pub const IndexConfig = struct {
         }
         if (self.execution) |value| {
             try jw.objectField("execution");
+            try jw.write(value);
+        }
+        if (self.metrics) |value| {
+            try jw.objectField("metrics");
             try jw.write(value);
         }
         if (self.summarizer) |value| {

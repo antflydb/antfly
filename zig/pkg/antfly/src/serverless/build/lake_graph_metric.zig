@@ -98,36 +98,9 @@ pub const BuildResult = struct {
     }
 };
 
-const CompiledEdge = struct {
-    source: u32,
-    target: u32,
-};
-
-/// Filter-independent, ordinal topology compiled once per immutable graph
-/// artifact. Node and edge-type strings are owned here so the much larger
-/// decoded adjacency object can be released before projections and kernels run.
-const CompiledTopology = struct {
-    node_ids: []const []const u8,
-    edge_types: []const []const u8,
-    string_bytes: []u8,
-    /// Counting-sort boundaries for `edges`, indexed by interned edge type.
-    /// Narrow filters therefore visit only admitted edge ranges instead of
-    /// rescanning every edge for every distinct metric configuration.
-    edge_type_offsets: []const u32,
-    edges: []const CompiledEdge,
-    source_node_count: usize,
-    source_edge_count: usize,
-    retained_bytes: usize,
-
-    fn deinit(self: *CompiledTopology, alloc: Allocator) void {
-        alloc.free(self.node_ids);
-        alloc.free(self.edge_types);
-        alloc.free(self.string_bytes);
-        alloc.free(self.edge_type_offsets);
-        alloc.free(self.edges);
-        self.* = undefined;
-    }
-};
+const indexed_topology = @import("../graph_segment/topology_reader.zig");
+const CompiledEdge = indexed_topology.Edge;
+const CompiledTopology = indexed_topology.Topology;
 
 /// One authenticated and decoded topology artifact. Publication orchestrators
 /// may reuse this across graph-index aliases that identify the same immutable
@@ -398,6 +371,29 @@ pub fn publishManyFromGraphArtifactWithBudgetAlloc(
         provenance,
         runtime,
     );
+}
+
+fn prepareSelectedGraphArtifactAlloc(alloc: Allocator, artifacts: *artifact_store.ArtifactStore, source: artifact_ref.ArtifactRef, configs: []const graph_mod.GraphMetricConfig, cancellation: CancellationToken, limits: Limits, budget: *graph_metric_policy.Budget) !?PreparedGraphArtifact {
+    if (source.byte_len > limits.max_graph_payload_bytes) return error.GraphMetricBuildBudgetExceeded;
+    var limiter = try bounded_decode.AllocationLimiter.init(alloc, limits.max_peak_memory_bytes);
+    var remaining: u64 = limits.max_total_graph_payload_bytes -| budget.graph_payload_bytes;
+    const before = remaining;
+    defer budget.graph_payload_bytes += @intCast(before - remaining);
+    var topology = (indexed_topology.readAlloc(limiter.allocator(), artifacts, source, configs, limits, cancellation, &remaining) catch |err| {
+        if (err == error.OutOfMemory and limiter.limit_exceeded) return error.GraphMetricBuildBudgetExceeded;
+        return err;
+    }) orelse return null;
+    errdefer topology.deinit(alloc);
+    const id = limiter.allocator().dupe(u8, source.artifact_id) catch |err| {
+        if (err == error.OutOfMemory and limiter.limit_exceeded) return error.GraphMetricBuildBudgetExceeded;
+        return err;
+    };
+    errdefer alloc.free(id);
+    const checksum = limiter.allocator().dupe(u8, source.checksum) catch |err| {
+        if (err == error.OutOfMemory and limiter.limit_exceeded) return error.GraphMetricBuildBudgetExceeded;
+        return err;
+    };
+    return .{ .source_artifact_id = id, .source_checksum = checksum, .source_byte_len = source.byte_len, .topology = topology };
 }
 
 pub fn prepareGraphArtifactAlloc(
@@ -943,7 +939,7 @@ fn readTopologyDirectoryAlloc(alloc: Allocator, artifacts: *artifact_store.Artif
     const trailer = wire.decodeTopologyTrailer(trailer_raw, source.byte_len) catch return null;
     if (trailer.source_nodes > budget.limits.max_nodes or trailer.source_edges > budget.limits.max_edges) return null;
     if (trailer.directory_len > budget.limits.max_peak_memory_bytes - wire.topology_trailer_len) return null;
-    const raw = artifacts.getVerifiedRangeAllocWithBudget(alloc, source.artifact_id, source.byte_len, source.checksum, trailer.body_len, trailer.directory_len, cancellation, &remaining) catch |err| switch (err) {
+    const raw = artifacts.getVerifiedRangeAllocWithBudget(alloc, source.artifact_id, source.byte_len, source.checksum, trailer.body_len + trailer.topology_len, trailer.directory_len, cancellation, &remaining) catch |err| switch (err) {
         error.ArtifactReadBudgetExceeded, error.FileNotFound, error.InvalidArtifactId, error.InvalidRange, error.ArtifactIntegrityMismatch, error.ArtifactIdentityUnavailable => return null,
         else => return err,
     };
@@ -1047,6 +1043,10 @@ pub fn publishRequestsWithPriorAlloc(
         const built = build: {
             var prepared = prepare: {
                 if (first.source_graph.byte_len > limits.max_graph_payload_bytes) break :prepare null;
+                if (prepareSelectedGraphArtifactAlloc(alloc, artifacts, first.source_graph, configs.items, cancellation, limits, budget) catch |err| switch (err) {
+                    error.GraphMetricBuildBudgetExceeded => break :prepare null,
+                    else => return err,
+                }) |selected| break :prepare selected;
                 budget.chargeGraphPayload(first.source_graph.artifact_id, first.source_graph.checksum, first.source_graph.byte_len) catch break :prepare null;
                 break :prepare prepareGraphArtifactAlloc(alloc, artifacts, first.source_graph, cancellation, limits) catch |err| switch (err) {
                     error.GraphMetricBuildBudgetExceeded => null,
@@ -1411,6 +1411,22 @@ fn compilePackedTopologyAlloc(alloc: Allocator, payload: []const u8, cancellatio
 
 /// Benchmark/reference oracle only. Both paths read the same current wire;
 /// the reference intentionally recreates the former unpack/hash preparation.
+pub const SelectedPreparationBenchmark = struct { edges: usize, retained_nodes: usize, read_bytes: usize, digest: [32]u8 };
+
+/// Source preparation plus the semantic identity step performed by publication.
+/// Both paths must produce exactly the same selected topology digest.
+pub fn benchmarkSelectedArtifactPreparation(alloc: Allocator, artifacts: *artifact_store.ArtifactStore, source: artifact_ref.ArtifactRef, config: graph_mod.GraphMetricConfig, reference: bool) !SelectedPreparationBenchmark {
+    var budget = graph_metric_policy.Budget{ .limits = .{} };
+    var prepared = if (reference) blk: {
+        try budget.chargeGraphPayload(source.artifact_id, source.checksum, source.byte_len);
+        break :blk try prepareGraphArtifactAlloc(alloc, artifacts, source, .none, budget.limits);
+    } else (try prepareSelectedGraphArtifactAlloc(alloc, artifacts, source, &.{config}, .none, budget.limits, &budget)) orelse return error.InvalidBenchmarkResult;
+    defer prepared.deinit(alloc);
+    const checksums = try typeChecksumsAlloc(alloc, prepared.topology, budget.limits, .none);
+    defer alloc.free(checksums);
+    return .{ .edges = try selectedEdgeCount(prepared.topology, config.edge_filter, .none), .retained_nodes = prepared.topology.node_ids.len, .read_bytes = budget.graph_payload_bytes, .digest = selectedTopologyChecksum(prepared.topology, checksums, config.edge_filter) };
+}
+
 pub fn benchmarkPreparation(alloc: Allocator, payload: []const u8, reference: bool) !usize {
     if (!reference) {
         var topology = try prepareTopologyFromPackedAlloc(alloc, payload, .none, .{});
@@ -2976,6 +2992,61 @@ test "serverless graph metric topology does not alias qualified endpoints with l
     try std.testing.expectEqual(@as(usize, 0), compact.outgoing_targets.len);
 }
 
+test "serverless graph metric indexed preparation selects topology and cleans up allocation failures" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/indexed-topology", .{tmp.sub_path});
+    defer alloc.free(root);
+    var fs = try fs_artifact_store.FsStore.init(alloc, root);
+    var artifacts = fs.artifactStore();
+    defer artifacts.deinit();
+    var builder = graph_segment.Builder{ .alloc = alloc };
+    defer builder.deinit();
+    try builder.addEdge("a", "b", "selected", 1, null);
+    try builder.addEdge("b", "a", "selected", 1, null);
+    try builder.addEdge("a", "foreign", "selected", 1, "elsewhere");
+    for (0..4096) |i| {
+        const node = try std.fmt.allocPrint(alloc, "unrelated-{d:0>8}", .{i});
+        defer alloc.free(node);
+        try builder.addEdge(node, node, "noise", 1, null);
+    }
+    const payload = try builder.encodeAlloc(16 * 1024 * 1024, .none);
+    defer alloc.free(payload);
+    var metadata = try artifacts.put(payload);
+    defer metadata.deinit(alloc);
+    const source = artifact_ref.ArtifactRef{ .kind = .graph_segment, .name = "graph", .artifact_id = metadata.artifact_id, .checksum = metadata.checksum, .byte_len = metadata.byte_len };
+    // Prime full identity verification, which is independently required on a
+    // cold object store. Selective reads below measure warm pinned identity.
+    try artifacts.verifyContentWithCancellationUsingAllocator(alloc, source.artifact_id, source.byte_len, source.checksum, .none);
+    const config = graph_mod.GraphMetricConfig{ .name = "degree", .kind = .degree, .edge_filter = .{ .mode = .types, .types = &.{"selected"} } };
+    const reference = try benchmarkSelectedArtifactPreparation(alloc, &artifacts, source, config, true);
+    const indexed = try benchmarkSelectedArtifactPreparation(alloc, &artifacts, source, config, false);
+    try std.testing.expectEqualSlices(u8, &reference.digest, &indexed.digest);
+    try std.testing.expectEqual(@as(usize, 2), indexed.edges);
+    try std.testing.expectEqual(@as(usize, 2), indexed.retained_nodes);
+    try std.testing.expect(indexed.read_bytes < source.byte_len / 4);
+    var cold_fs = try fs_artifact_store.FsStore.init(alloc, root);
+    var cold_artifacts = cold_fs.artifactStore();
+    defer cold_artifacts.deinit();
+    var cold_budget = graph_metric_policy.Budget{ .limits = .{ .max_total_graph_payload_bytes = indexed.read_bytes } };
+    // Range-only allowance is insufficient on a new verifier: the source's
+    // complete identity must be authenticated before any selected data is used.
+    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, prepareSelectedGraphArtifactAlloc(alloc, &cold_artifacts, source, &.{config}, .none, cold_budget.limits, &cold_budget));
+    const Runner = struct {
+        fn run(failing: Allocator, store: *artifact_store.ArtifactStore, ref: artifact_ref.ArtifactRef, cfg: graph_mod.GraphMetricConfig) !void {
+            var budget = graph_metric_policy.Budget{ .limits = .{} };
+            var prepared = (try prepareSelectedGraphArtifactAlloc(failing, store, ref, &.{cfg}, .none, budget.limits, &budget)).?;
+            prepared.deinit(failing);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{ &artifacts, source, config });
+    var tiny = graph_metric_policy.Budget{ .limits = .{ .max_peak_memory_bytes = 128 } };
+    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, prepareSelectedGraphArtifactAlloc(alloc, &artifacts, source, &.{config}, .none, tiny.limits, &tiny));
+    var no_reads = graph_metric_policy.Budget{ .limits = .{ .max_total_graph_payload_bytes = 0 } };
+    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, prepareSelectedGraphArtifactAlloc(alloc, &artifacts, source, &.{config}, .none, no_reads.limits, &no_reads));
+}
+
 test "serverless graph metric semantic reuse authenticates current provenance and skips numerical work" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3917,10 +3988,13 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
         for (baseline) |ref| freeArtifactRef(alloc, ref);
         alloc.free(baseline);
     }
-    try std.testing.expectEqual(@as(usize, 2), counting.reads);
+    try std.testing.expectEqual(@as(usize, 0), counting.reads);
+    const preparation_ranges = counting.header_reads;
+    try std.testing.expectEqual(@as(usize, 8), preparation_ranges);
     try std.testing.expectEqual(@as(usize, 5), counting.writes);
     counting.reads = 0;
     counting.writes = 0;
+    counting.header_reads = 0;
     var planned_budget = graph_metric_policy.Budget{ .limits = .{
         .max_total_work_items = baseline_budget.work_items,
         .max_total_graph_payload_bytes = baseline_budget.graph_payload_bytes,
@@ -3931,7 +4005,8 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
         for (planned) |ref| freeArtifactRef(alloc, ref);
         alloc.free(planned);
     }
-    try std.testing.expectEqual(@as(usize, 2), counting.reads);
+    try std.testing.expectEqual(@as(usize, 0), counting.reads);
+    try std.testing.expectEqual(preparation_ranges, counting.header_reads);
     try std.testing.expectEqual(@as(usize, 5), counting.writes);
     try std.testing.expectEqual(baseline_budget.work_items, planned_budget.work_items);
     try std.testing.expectEqualStrings(planned[0].artifact_id, planned[3].artifact_id);

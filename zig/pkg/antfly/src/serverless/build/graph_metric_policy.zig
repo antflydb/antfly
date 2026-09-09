@@ -23,8 +23,8 @@ const bounded_decode = @import("../bounded_decode.zig");
 
 /// Increment whenever an implementation change can alter admission or output
 /// without changing the user-visible metric configuration.
-// Epoch 19 separates optional semantic-identity hashing from cold-work admission.
-pub const materializer_epoch: u32 = 20;
+// Addressable topology changes cold read/work admission, not metric semantics.
+pub const materializer_epoch: u32 = 21;
 const max_tracked_graph_indexes: usize = 16;
 
 pub const Limits = struct {
@@ -32,10 +32,10 @@ pub const Limits = struct {
     // artifact contract. Larger topology artifacts cannot be served safely by
     // this runtime and are represented by durable rejected metric sidecars.
     max_graph_payload_bytes: usize = (bounded_decode.Limits{}).max_artifact_bytes,
-    // Unique topology payloads are charged once per table publication. Two
-    // maximum-sized graphs may be materialized in one run; additional graphs
-    // receive durable budget-rejection sidecars instead of consuming several
-    // GiB of background I/O and decode CPU.
+    // Publication charges topology reads, including cold full-content range
+    // authentication. Warm indexed reads charge only requested ranges; explicit
+    // source-wide preparation reserves each unique complete payload once.
+    // Excess work receives durable rejection sidecars, not unbounded I/O.
     max_total_graph_payload_bytes: usize = 512 * 1024 * 1024,
     max_metric_payload_bytes: usize = 256 * 1024 * 1024,
     max_total_metric_payload_bytes: usize = 512 * 1024 * 1024,

@@ -207,6 +207,7 @@ pub fn main(init: std.process.Init) !void {
     if (indexing_only) {
         try benchmarkGraphIndexConstruction(&output);
         try benchmarkTypedEdgeScans(init.io, &output);
+        try benchmarkSelectedTopologyReads(init.io, &output);
         return benchmarkSemanticMetricReuse(init.io, &output);
     }
     if (score_join_only) return benchmarkScoreJoin(&output);
@@ -553,6 +554,93 @@ fn benchmarkTypedEdgeScans(io: std.Io, out: anytype) !void {
         try out.interface.writeAll(json);
         try out.interface.writeByte('\n');
         try out.flush();
+    }
+    const control_oracle = try index.benchmarkPartitionPlanControl(true);
+    for ([_]bool{ true, false }) |reference| {
+        var samples: [5]u64 = undefined;
+        for (0..6) |sample| {
+            const started = antfly.platform_time.monotonicNs();
+            for (0..128) |_| if (try index.benchmarkPartitionPlanControl(reference) != control_oracle) return error.InvalidBenchmarkResult;
+            if (sample != 0) samples[sample - 1] = (antfly.platform_time.monotonicNs() - started) / 128;
+        }
+        std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+        const json = try std.json.Stringify.valueAlloc(fixture, .{
+            .mode = if (reference) "stateful_plan_with_boundaries" else "stateful_plan_control_only",
+            .median_ns = samples[2],
+            .control_bytes = 76,
+            .note = "default durable LSM; same validated plan identity; 128 reads per sample; reference includes addressed boundary loading and validation; no writes",
+        }, .{});
+        try out.interface.writeAll(json);
+        try out.interface.writeByte('\n');
+        try out.flush();
+    }
+}
+
+fn benchmarkSelectedTopologyReads(io: std.Io, out: anytype) !void {
+    const alloc = std.heap.smp_allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const fixture = arena.allocator();
+    const root = try std.fmt.allocPrint(fixture, "/tmp/antfly-selected-topology-{d}", .{antfly.platform_time.monotonicNs()});
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var fs = try antfly.serverless.artifacts.FsStore.init(alloc, root);
+    var artifacts = fs.artifactStore();
+    defer artifacts.deinit();
+    var builder = graph.Builder{ .alloc = alloc };
+    defer builder.deinit();
+    const ids = try fixture.alloc([]const u8, 16384);
+    for (ids, 0..) |*id, i| id.* = try std.fmt.allocPrint(fixture, "node-{d:0>8}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", .{i});
+    for (ids, 0..) |id, i| {
+        for (0..16) |j| try builder.addEdge(id, ids[(i + j + 1) % ids.len], "noise", 1, null);
+        if (i < 256) try builder.addEdge(id, ids[(i + 1) % 256], "selected", 1, null);
+    }
+    const payload = try builder.encodeAlloc(256 * 1024 * 1024, .none);
+    defer alloc.free(payload);
+    var metadata = try artifacts.put(payload);
+    defer metadata.deinit(alloc);
+    const source = antfly.serverless.manifest.ArtifactRef{ .kind = .graph_segment, .name = "graph", .artifact_id = metadata.artifact_id, .checksum = metadata.checksum, .byte_len = metadata.byte_len };
+    try artifacts.verifyContentWithCancellationUsingAllocator(alloc, source.artifact_id, source.byte_len, source.checksum, .none);
+    for ([_]bool{ true, false }) |sparse| {
+        const config = antfly.graph.GraphMetricConfig{ .name = "degree", .kind = .degree, .edge_filter = if (sparse) .{ .mode = .types, .types = &.{"selected"} } else .{} };
+        const oracle = try metric.benchmarkSelectedArtifactPreparation(alloc, &artifacts, source, config, true);
+        for ([_][2]bool{ .{ true, true }, .{ false, true }, .{ true, false }, .{ false, false } }) |mode| {
+            const reference = mode[0];
+            const warm = mode[1];
+            var samples: [5]u64 = undefined;
+            var measured: PhaseAllocStats = undefined;
+            var result: metric.SelectedPreparationBenchmark = undefined;
+            for (0..6) |sample| {
+                var cold_fs = try antfly.serverless.artifacts.FsStore.init(alloc, root);
+                var cold_store = cold_fs.artifactStore();
+                defer cold_store.deinit();
+                var stats = PhaseAllocStats{};
+                var tracker = PhaseTrackingAllocator{ .backing = alloc, .stats = &stats };
+                const started = antfly.platform_time.monotonicNs();
+                result = try metric.benchmarkSelectedArtifactPreparation(tracker.allocator(), if (warm) &artifacts else &cold_store, source, config, reference);
+                const elapsed = antfly.platform_time.monotonicNs() - started;
+                if (stats.current_bytes != 0 or result.edges != oracle.edges or !std.mem.eql(u8, &result.digest, &oracle.digest)) return error.InvalidBenchmarkResult;
+                if (sample != 0) samples[sample - 1] = elapsed;
+                measured = stats;
+            }
+            std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+            const json = try std.json.Stringify.valueAlloc(fixture, .{
+                .mode = if (reference) "serverless_sourcewide_preparation" else "serverless_addressed_preparation",
+                .sparse = sparse,
+                .warm_identity = warm,
+                .source_bytes = source.byte_len,
+                .selected_edges = result.edges,
+                .retained_nodes = result.retained_nodes,
+                .read_bytes = result.read_bytes,
+                .median_ns = samples[2],
+                .peak_bytes = measured.peak_bytes,
+                .allocations = measured.alloc_count,
+                .note = "local source; cold identity uses a new verifier per sample, not a cold OS page cache; includes preparation and semantic identity, excludes fixture and numerical kernel; six samples, first discarded; digest parity",
+            }, .{});
+            try out.interface.writeAll(json);
+            try out.interface.writeByte('\n');
+            try out.flush();
+        }
     }
 }
 

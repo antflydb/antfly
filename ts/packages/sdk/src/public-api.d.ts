@@ -9697,6 +9697,41 @@ export interface components {
         };
         /** @description Durable graph edge type. Values must be valid UTF-8 and encode to at most 64 KiB; `maxLength` is the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-byte limit. */
         GraphEdgeType: string;
+        /** @description Omitting this object selects all edge types. A types list selects only those types; mode and types cannot both be supplied. */
+        GraphMetricEdgeFilter: {
+            /** @enum {string} */
+            mode?: "all";
+            types?: components["schemas"]["GraphEdgeType"][];
+        };
+        /** @description Published metric configuration. If kind is omitted, the metric name must be a supported kind. */
+        GraphMetricConfig: {
+            /** @default true */
+            enabled?: boolean;
+            /** @enum {string} */
+            kind?: "pagerank" | "degree" | "eigenvector" | "hits_authority" | "hits_hub";
+            /**
+             * @description Serverless accepts background only.
+             * @default background
+             * @enum {string}
+             */
+            refresh?: "background" | "manual";
+            /**
+             * Format: double
+             * @default 0.85
+             */
+            damping?: number;
+            /**
+             * Format: double
+             * @default 0.000001
+             */
+            tolerance?: number;
+            /**
+             * Format: int32
+             * @default 50
+             */
+            max_iterations?: number;
+            edge_filter?: components["schemas"]["GraphMetricEdgeFilter"];
+        };
         /** @description A literal string or finite numeric value, or a Handlebars template evaluated for each materialized graph item. */
         GraphTemplateValue: string | number;
         /** @description Maps each artifact item to graph node identifiers. */
@@ -10008,6 +10043,10 @@ export interface components {
         };
         /** @description Configuration for graph index type */
         GraphIndexConfig: {
+            /** @description Named published graph metrics. Serverless supports background refresh only and limits configurations to 16 metrics per graph, 64 total per publication, 64 types per filter, and 128 UTF-8 bytes per metric name. */
+            metrics?: {
+                [key: string]: components["schemas"]["GraphMetricConfig"];
+            };
             /** @description Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Artifact names must be unique within the array because the artifact name is the source identity. Earlier sources win when multiple sources materialize the same edge identity. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             sources?: components["schemas"]["GraphArtifactSourceConfig"][];
             /** @description Configuration for generating node summaries (enables tree navigation in Retrieval Agent) */
@@ -10499,6 +10538,9 @@ export interface components {
         };
         /** @description Credential-free normalized graph configuration returned after creation. */
         CreatedGraphIndexConfig: {
+            metrics?: {
+                [key: string]: components["schemas"]["GraphMetricConfig"];
+            };
             summarizer?: components["schemas"]["CreatedProviderConfig"];
             template?: string;
             edge_types?: components["schemas"]["EdgeTypeConfig"][];
