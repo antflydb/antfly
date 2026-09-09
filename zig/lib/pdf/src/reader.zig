@@ -37,7 +37,7 @@ const ImageSampleRows = struct {
     current: []u8 = &.{},
     previous: []u8 = &.{},
     predictor: i64 = 1,
-    checksum: std.hash.Adler32 = .{},
+    checksum: @import("antfly_hash").Adler32 = .{},
     components: usize,
     remaining: usize,
 
@@ -137,7 +137,7 @@ const ImageSampleRows = struct {
         // a hard work bound, not permission to drain a decompression bomb.
         const n = self.stream().readSliceShort(&extra) catch return error.InvalidFlateStream;
         if (n != 0) return error.InvalidPdfImageData;
-        if (self.inflate) |*inflate| if (inflate.container_metadata.zlib.adler != self.checksum.adler) return error.InvalidFlateStream;
+        if (self.inflate) |*inflate| if (inflate.container_metadata.zlib.adler != self.checksum.final()) return error.InvalidFlateStream;
     }
 
     fn destroy(self: *@This()) void {
@@ -20001,6 +20001,38 @@ test "image row streaming preserves predictors masks and native pixels above str
         try std.testing.expectError(error.DecodedStreamTooLarge, reader.readDecodedStreamData(&obj));
         reader.decode_limits.max_working_set_bytes = 1024;
         try std.testing.expectError(error.PdfDecodeWorkingSetTooLarge, reader.decodeImageToRgbaAlloc(&obj));
+    }
+}
+
+test "image row streaming checksum spans vector tails reduction blocks and read chunks" {
+    const alloc = std.testing.allocator;
+    // RGB rows straddle the shared checksum's 16-byte lanes and 5552-byte
+    // reduction blocks, plus the row reader's 64-KiB cancellation slices.
+    for ([_]u32{ 1, 5, 6, 1850, 1851, 21846 }) |width| {
+        const stride = @as(usize, width) * 3;
+        const pixels = try alloc.alloc(u8, stride * 3);
+        defer alloc.free(pixels);
+        for (pixels, 0..) |*byte, index| byte.* = @truncate(index * 31 + index / 17);
+        var compressed: std.Io.Writer.Allocating = .init(alloc);
+        defer compressed.deinit();
+        var history: [std.compress.flate.max_window_len]u8 = undefined;
+        var compressor = try std.compress.flate.Compress.init(&compressed.writer, &history, .zlib, .default);
+        try compressor.writer.writeAll(pixels);
+        try compressor.finish();
+        const object = try std.fmt.allocPrint(alloc, "1 0 obj\n<< /Width {d} /Height 3 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ width, compressed.written().len, compressed.written() });
+        defer alloc.free(object);
+        const pdf = try buildImageDecodeTestPdfAlloc(alloc, &.{object});
+        defer alloc.free(pdf);
+        var reader = try Reader.init(alloc, pdf);
+        defer reader.deinit();
+        reader.decode_limits.max_decoded_stream_bytes = stride;
+        var obj = try reader.readIndirectObject(.{ .id = 1, .gen = 0 });
+        defer obj.deinit(alloc);
+        const rows = try ImageSampleRows.create(&reader, &obj, width, 3, 3);
+        defer rows.destroy();
+        for (0..3) |y| try std.testing.expectEqualSlices(u8, pixels[y * stride ..][0..stride], try rows.next());
+        try rows.finish();
+        try std.testing.expectEqual(std.hash.Adler32.hash(pixels), rows.checksum.final());
     }
 }
 

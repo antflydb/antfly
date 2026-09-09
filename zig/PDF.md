@@ -5257,6 +5257,22 @@ storage/commit work. Smaller configured lanes fail explicitly at activation.
 Lane statistics expose registrations, active/class counts, peaks, dispatches and
 dispatch retries. No capacity error is converted into a larger thread ceiling.
 
+Dedicated service workers are part of the same `BackendRuntimeLaneLimits`
+profile, not an additional independent pool allowance. `worker_capacity`
+reserves 32 slots for Raft senders, listeners, observers and other service owners;
+API and inference lanes default to 48 each, while durable work remains 48,
+Raft inbound/outbound remain 32 each, control remains 8 and PDF rendering remains
+4. The combined default is 252 under the 256-slot aggregate ceiling. Validation
+rejects overcommitted profiles before allocating executors. Worker reservations
+remain lazy and isolated, with capacity returned only after executor teardown;
+unused sibling capacity cannot be borrowed and starve dependencies. A zero
+worker capacity explicitly disables dedicated worker admission.
+
+The bounded image-row decoder uses the shared vectorized `antfly_hash.Adler32`
+implementation and validates its finalized checksum against the zlib trailer.
+Native, test, benchmark and WASM PDF modules all import the shared checksum
+module; malformed/truncated stream checks and predictor handling are unchanged.
+
 Registration handles are lifetime leases. Stop detaches queued work and joins
 active callbacks before the owner is freed; cancellation-sensitive compaction
 also cancels its active I/O future. Runtime shutdown closes registration and

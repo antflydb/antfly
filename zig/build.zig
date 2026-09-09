@@ -1938,6 +1938,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     pdf_mod.addImport("antfly_image", image_mod);
+    pdf_mod.addImport("antfly_hash", hash_mod);
     pdf_mod.addImport("antfly_font", font_mod);
     pdf_mod.addImport("pdf_standard_fonts", pdf_standard_fonts_mod);
     if (target.result.os.tag == .macos) {
@@ -1967,6 +1968,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     wasm_pdf_mod.addImport("antfly_image", wasm_image_mod);
+    wasm_pdf_mod.addImport("antfly_hash", wasm_hash_mod);
     wasm_pdf_mod.addImport("antfly_font", wasm_font_mod);
     wasm_pdf_mod.addImport("pdf_standard_fonts", wasm_pdf_standard_fonts_mod);
 
@@ -3294,6 +3296,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     pdf_test_mod.addImport("antfly_image", image_mod);
+    pdf_test_mod.addImport("antfly_hash", hash_mod);
     pdf_test_mod.addImport("antfly_font", font_mod);
     pdf_test_mod.addImport("pdf_standard_fonts", pdf_standard_fonts_mod);
     if (target.result.os.tag == .macos) {
@@ -3365,6 +3368,7 @@ pub fn build(b: *std.Build) void {
         .optimize = pdf_bench_optimize,
     });
     pdf_bench_pdf_mod.addImport("antfly_image", pdf_bench_image_mod);
+    pdf_bench_pdf_mod.addImport("antfly_hash", hash_bench_mod);
     pdf_bench_pdf_mod.addImport("antfly_font", pdf_bench_font_mod);
     pdf_bench_pdf_mod.addImport("pdf_standard_fonts", pdf_bench_standard_fonts_mod);
     if (target.result.os.tag == .macos) {

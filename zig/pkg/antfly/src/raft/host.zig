@@ -3004,7 +3004,7 @@ test "http host starts listener and serves health route" {
 
 test "http host reserves service workers through its runtime and rolls back overcommit" {
     for (0..5) |capacity| {
-        var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{ .worker_capacity = capacity });
+        var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{ .lane_limits = .{ .worker_capacity = @intCast(capacity) } });
         defer runtime.deinit();
         try std.testing.expectError(error.WorkerCapacityExceeded, HttpHost.init(std.testing.allocator, .{
             .host = .{ .local_node_id = 1 },
@@ -3013,7 +3013,7 @@ test "http host reserves service workers through its runtime and rolls back over
         try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().reserved_workers);
         try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().worker_active_leases);
     }
-    var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{ .worker_capacity = 5 });
+    var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{ .lane_limits = .{ .worker_capacity = 5 } });
     defer runtime.deinit();
     var host = try HttpHost.init(std.testing.allocator, .{
         .host = .{ .local_node_id = 1 },

@@ -457,12 +457,11 @@ pub const IoImpl = if (builtin.os.tag == .freestanding) void else Io.Threaded;
 pub const default_io_concurrent_limit: u32 = threaded_io_limits.backend_runtime_durable_background;
 
 pub const Config = struct {
-    /// Aggregate ceiling for dedicated service-worker reservations.
-    worker_capacity: usize = threaded_io_limits.service,
     backend: Backend = runtime_backend.defaultExecutorBackend(),
     /// Value-semantic executor limits. Separate lanes preserve isolation for
     /// nested submissions; validation keeps their simultaneously activatable
-    /// total and every individual lane under the aggregate process ceiling.
+    /// total, including dedicated worker reservations, under the aggregate
+    /// process ceiling.
     lane_limits: threaded_io_limits.BackendRuntimeLaneLimits = .{},
     /// Optional caller-owned I/O interfaces. These make the production
     /// runtime usable with deterministic `std.Io` implementations without
@@ -841,7 +840,6 @@ pub const BackendRuntime = struct {
     pdf_render_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
     pdf_render_lane_rejections_total: std.atomic.Value(u64) = .init(0),
     worker_lane_gate: LaneLeaseGate = .{},
-    worker_capacity: usize = threaded_io_limits.service,
     reserved_workers: std.atomic.Value(usize) = .init(0),
     peak_reserved_workers: std.atomic.Value(usize) = .init(0),
     control_lane_gate: LaneLeaseGate = .{},
@@ -881,7 +879,6 @@ pub const BackendRuntime = struct {
             .native_storage_pool = native_storage_pool,
             .lsm_owner_clone_registry = LsmOwnerCloneRegistry.init(alloc),
             .borrowed_filesystem_io = config.filesystem_io,
-            .worker_capacity = config.worker_capacity,
             .durable_jobs = undefined,
             .borrowed_io = config.borrowed_io,
             .borrowed_storage = if (config.borrowed_io) |borrowed| storage_io.IoStorage.init(borrowed.general) else null,
@@ -1516,7 +1513,7 @@ pub const BackendRuntime = struct {
         if (options.capacity == 0) return error.InvalidWorkerCapacity;
         var reserved = self.reserved_workers.load(.acquire);
         while (true) {
-            if (options.capacity > self.worker_capacity -| reserved) return error.WorkerCapacityExceeded;
+            if (options.capacity > self.lane_limits.worker_capacity -| reserved) return error.WorkerCapacityExceeded;
             if (self.reserved_workers.cmpxchgWeak(reserved, reserved + options.capacity, .acq_rel, .acquire)) |actual| {
                 reserved = actual;
             } else break;
@@ -1566,7 +1563,7 @@ pub const BackendRuntime = struct {
         return .{
             .limits = self.lane_limits,
             .maintenance = if (self.maintenance_scheduler.load(.acquire)) |scheduler| scheduler.snapshot() else null,
-            .worker_capacity = self.worker_capacity,
+            .worker_capacity = self.lane_limits.worker_capacity,
             .reserved_workers = self.reserved_workers.load(.acquire),
             .peak_reserved_workers = self.peak_reserved_workers.load(.acquire),
             .worker_active_leases = self.worker_lane_gate.active(),
@@ -2739,7 +2736,7 @@ test "backend runtime borrows backend-agnostic std.Io lanes" {
 
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{
         .backend = .manual,
-        .worker_capacity = 2,
+        .lane_limits = .{ .worker_capacity = 2 },
         .borrowed_io = .{
             .general = general,
             .api = api,
@@ -3025,6 +3022,7 @@ test "backend runtime honors reduced per-lane limits under the aggregate ceiling
         .inference = 4,
         .control = 1,
         .pdf_render = 1,
+        .worker_capacity = 3,
     };
     try limits.validate();
     try std.testing.expect(limits.total() <= threaded_io_limits.backend_runtime_aggregate);
@@ -3047,6 +3045,15 @@ test "backend runtime honors reduced per-lane limits under the aggregate ceiling
     defer control_lease.release();
     var pdf_lease = try runtime.acquirePdfRenderLane();
     defer pdf_lease.release();
+    // Activate dedicated workers alongside every fixed lane. Their ceiling
+    // belongs to the same profile, but unused sibling capacity is not stolen.
+    var workers = try runtime.acquireWorkers(.{ .capacity = limits.worker_capacity });
+    defer workers.release();
+    try std.testing.expectEqual(@as(usize, limits.worker_capacity), runtime.laneStats().worker_capacity);
+    try std.testing.expectEqual(@as(usize, limits.worker_capacity), runtime.laneStats().reserved_workers);
+    try std.testing.expectError(error.WorkerCapacityExceeded, runtime.acquireWorkers(.{}));
+    workers.release();
+    try std.testing.expectEqual(@as(usize, 0), runtime.laneStats().reserved_workers);
     try std.testing.expectEqual(limits.api, api_lease.concurrentCapacity());
     try std.testing.expectEqual(limits.inference, inference_lease.concurrentCapacity());
     try std.testing.expectEqual(limits.control, control_lease.concurrentCapacity());
@@ -3056,6 +3063,19 @@ test "backend runtime honors reduced per-lane limits under the aggregate ceiling
         std.testing.allocator,
         .{ .lane_limits = .{ .control = 0 } },
     ));
+}
+
+test "backend runtime rejects aggregate worker overcommit before allocating executors" {
+    if (builtin.os.tag == .freestanding) return;
+    var limits = threaded_io_limits.BackendRuntimeLaneLimits{};
+    const fixed_lanes = limits.total() - limits.worker_capacity;
+    limits.worker_capacity = @intCast(threaded_io_limits.backend_runtime_aggregate - fixed_lanes + 1);
+    var no_allocations = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.InvalidBackendRuntimeLaneLimits, BackendRuntime.init(
+        no_allocations.allocator(),
+        .{ .lane_limits = limits },
+    ));
+    try std.testing.expectEqual(@as(usize, 0), no_allocations.alloc_index);
 }
 
 test "backend runtime separates native operation IO from outbound network IO" {
@@ -3577,7 +3597,7 @@ test "backend runtime threaded worker releases payload before reaper joins" {
 
 test "backend runtime worker reservations isolate capacity and reject overcommit" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
-    var runtime = try BackendRuntimeHandle.init(std.testing.allocator, .{ .worker_capacity = 2 });
+    var runtime = try BackendRuntimeHandle.init(std.testing.allocator, .{ .lane_limits = .{ .worker_capacity = 2 } });
     defer runtime.deinit();
     var first = try runtime.ptr().acquireWorkers(.{});
     defer first.release();
@@ -3689,7 +3709,7 @@ test "lane release retains its lifetime count while shutdown owns the drain lock
 test "backend runtime worker allocation failure returns its capacity and lifetime lease" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    var handle = try BackendRuntimeHandle.init(failing.allocator(), .{ .worker_capacity = 1 });
+    var handle = try BackendRuntimeHandle.init(failing.allocator(), .{ .lane_limits = .{ .worker_capacity = 1 } });
     defer handle.deinit();
     failing.fail_index = failing.alloc_index;
     try std.testing.expectError(error.OutOfMemory, handle.ptr().acquireWorkers(.{}));
