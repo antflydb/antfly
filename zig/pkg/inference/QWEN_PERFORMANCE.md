@@ -140,92 +140,57 @@ ReleaseFast performance, other-GPU qualification, final-head CI, or independent
 reranker score parity. Later build wiring and OCR admission fixes did not change
 the measured reranker or Metal implementation.
 
-## Reproduce branch A/B workloads
+## Reproduce endpoint measurements
 
-Run commands from `zig/pkg/inference`. Set `models_dir`, `embedding_gguf`,
-`embedding_tokenizer`, `vl_model_dir`, and `baseline_server` to the exact local
-artifacts and an immutable baseline executable. Use ReleaseFast for both sides
-of new performance comparisons and for PR metrics. The historical ReleaseSafe
-results above require remeasurement before making ReleaseFast claims.
-The focused target uses the production parser, supervisor, model manager,
-admission controls, and HTTP routes. This checked-in runner reproduces the
-original paired branch A/B protocol. The latest 50-request-per-campaign
-llama.cpp confirmations use separate launchers and paired-block analysis in
-the evidence directory below; the checker here does not reproduce their
-confidence intervals or stricter repeated-win criterion.
+Use ReleaseFast for both sides of new performance comparisons and for PR
+metrics. From `zig/pkg/inference`, build the focused server with
+`zig build bench-server -j1 -Doptimize=ReleaseFast -Dmetal=true`. It uses the
+production parser, supervisor, model manager, admission controls, and HTTP
+routes. The historical ReleaseSafe results require remeasurement before
+making ReleaseFast claims.
 
-```sh
-zig build bench-server -j1 -Doptimize=ReleaseFast -Dmetal=true
-campaign_dir=$(mktemp -d /tmp/qwen-campaign.XXXXXX)
+The retained endpoint tools accept separately launched resident servers and
+record model/build identities, paired timings, and output checks:
 
-# The checked-in recipe has 24 prefixes, enough for 3 warmups + 20 pairs.
-# Generate one 128-prefix fixture for the entire campaign, including confirmation.
-# This requires the pinned Python environment's tokenizers package, not weights.
-python3 scripts/qwen3_embedding/generate_exact_token_fixture.py \
-  --fixture scripts/qwen3_embedding/fixtures/qwen3_embedding_0_6b_exact_tokens.json \
-  --tokenizer-file "$embedding_tokenizer" --prefixes 128 \
-  --output "$campaign_dir/embedding-fixture.json"
+- [Embedding endpoint benchmark](scripts/qwen3_embedding/benchmark_qwen3_embedding_endpoint.py)
+  follows [the embedding protocol](scripts/qwen3_embedding/BASELINE.md). The
+  checked-in exact-token recipe covers 20, 256, 511, 2551, 4096, and 8192 tokens
+  with 24 distinct prefixes per length, enough for three warmups and 20 pairs.
+- [OCR endpoint benchmark](scripts/qwen3vl/benchmark_qwen3vl_ocr_endpoint.py)
+  checks complete `/ai/v1/read` responses against the frozen
+  [fixtures](scripts/qwen3vl/fixtures/ocr/fixture.json) and
+  [Q4_K_M golden](scripts/qwen3vl/fixtures/ocr/golden_q4_k_m.json). Supply
+  `--fixture`, `--golden`, `--url`, `--model`, and candidate process provenance;
+  add `--reference-url` and reference provenance for a paired Antfly comparison.
+  It does not implement a llama.cpp OCR comparison.
+- [Resource guard](scripts/benchmark_resources.py) wraps the launcher so both
+  servers, clients, and inference workers share bounded resource accounting.
 
-for run in 1 2; do
-  python3 scripts/benchmark_resources.py \
-    --output "$campaign_dir/embedding-run${run}-resources.json" --timeout 2400 -- \
-    python3 scripts/benchmark_qwen_pair.py \
-    --baseline "$baseline_server" --candidate zig-out/bin/antfly-inference-bench-server \
-    --models-dir "$models_dir" --model-file "$embedding_gguf" --phase embedding \
-    --fixture "$campaign_dir/embedding-fixture.json" \
-    --length 20 --length 256 --length 511 --length 2551 --length 4096 --length 8192 \
-    --batch-lengths 20,511 --batch-lengths 20,256,511,2551 \
-    --warmup 3 --iters 20 --output "$campaign_dir/embedding-run${run}"
-
-  python3 scripts/benchmark_resources.py \
-    --output "$campaign_dir/ocr-run${run}-resources.json" --timeout 7200 -- \
-    python3 scripts/benchmark_qwen_pair.py \
-    --baseline "$baseline_server" --candidate zig-out/bin/antfly-inference-bench-server \
-    --models-dir "$models_dir" --model-dir "$vl_model_dir" --phase ocr \
-    --golden scripts/qwen3vl/fixtures/ocr/golden_q4_k_m.json \
-    --warmup 3 --iters 20 --output "$campaign_dir/ocr-run${run}"
-done
-```
-
-Repeat the embedding command with only `--length 8192`, no `--batch-lengths`,
-and `--iters 100`, writing `embedding-confirm-8192`. Repeat OCR with
-`--case portrait --iters 100`, writing `ocr-confirm-portrait`. Keep the same
-fixture and other arguments; write each adjacent `<run>-resources.json` too.
-
-```sh
-python3 scripts/check_qwen_performance.py --campaign-dir "$campaign_dir" \
-  --output "$campaign_dir/retention-gates.json"
-```
-
-The checker reproduces statistics from every raw pair and verifies identity,
-workload coverage, parity, and resource limits. Primary wins require at least
-5% lower median latency and a paired 95% interval excluding no improvement;
-confirmed regressions above 3% median or 5% p95 fail. A runner's `pass` field
-alone only establishes output parity.
+Use each tool's `--help` for its full CLI. A passing endpoint report establishes
+its output and provenance checks; performance claims also require independent
+campaigns, paired analysis, and successful resource guards. The latest
+50-request-per-campaign llama.cpp confirmations use the separate launchers and
+paired-block analysis preserved with their evidence below. Historical campaign
+orchestration, fixture expansion, and retention gates are archived below rather
+than maintained as a second checked-in benchmark interface.
 
 ## Rollback and attribution
 
-| Optimization | Baseline-only environment setting | OCR ablation label |
-| --- | --- | --- |
-| Q4_K high-row matrices | `TERMITE_METAL_DISABLE_Q4_K_HIGH_ROW_MM=1` | `q4` |
-| Q6_K high-row matrices | `TERMITE_METAL_DISABLE_Q6_K_HIGH_ROW_MM=1` | `q6` |
-| Cross-layer eager decode frame | `TERMITE_METAL_ENABLE_QWEN3VL_FORWARD_DECODE_FRAME=0` | `decode_frame` |
-| 128-wide dense causal attention | `TERMITE_METAL_DISABLE_DENSE_CAUSAL_HD128=1` | — |
-| BF16 simdgroup matrices | `TERMITE_METAL_DISABLE_BF16_MM=1` | — |
-| Dense Qwen3 embedding/reranker prepared prefill | `TERMITE_METAL_DISABLE_QWEN3_PREPARED_PREFILL=1` | — |
-| BF16 vector loads | `TERMITE_METAL_DISABLE_BF16_VECTOR_LOADS=1` | — |
-| BF16 gate/up/SiLU fusion | `TERMITE_METAL_DISABLE_BF16_FUSED_GATE_UP=1` | — |
+| Optimization | Baseline-only environment setting |
+| --- | --- |
+| Q4_K high-row matrices | `TERMITE_METAL_DISABLE_Q4_K_HIGH_ROW_MM=1` |
+| Q6_K high-row matrices | `TERMITE_METAL_DISABLE_Q6_K_HIGH_ROW_MM=1` |
+| Cross-layer eager decode frame | `TERMITE_METAL_ENABLE_QWEN3VL_FORWARD_DECODE_FRAME=0` |
+| 128-wide dense causal attention | `TERMITE_METAL_DISABLE_DENSE_CAUSAL_HD128=1` |
+| BF16 simdgroup matrices | `TERMITE_METAL_DISABLE_BF16_MM=1` |
+| Dense Qwen3 embedding/reranker prepared prefill | `TERMITE_METAL_DISABLE_QWEN3_PREPARED_PREFILL=1` |
+| BF16 vector loads | `TERMITE_METAL_DISABLE_BF16_VECTOR_LOADS=1` |
+| BF16 gate/up/SiLU fusion | `TERMITE_METAL_DISABLE_BF16_FUSED_GATE_UP=1` |
 
-For each OCR ablation, pass the candidate binary as both endpoints and set only
-that control with `--baseline-env SETTING`. Use `--case portrait --warmup 3
---iters 20`, repeat in fresh processes, and save
-`ocr-ablation-<label>-run{1,2}` plus adjacent resource reports. Keep the same
-candidate and settings as `ocr-run2`, which supplies the default-path reference.
-
-```sh
-python3 scripts/check_qwen_performance.py --ocr-ablations \
-  --campaign-dir "$campaign_dir" --output "$campaign_dir/ocr-ablation-gates.json"
-```
+For an OCR ablation, launch the same candidate binary for both endpoints with
+only the selected control set on the reference server. Use the OCR endpoint
+tool with `--case portrait --warmup 3 --iters 20`, repeat in fresh processes,
+and retain the resource reports and exact model/build/fixture identities.
 
 In the historical ReleaseSafe campaign, two runs of each individual OCR
 ablation passed: Q4_K reduced median latency 31.2–31.4%, Q6_K 19.9–20.2%, and
@@ -246,8 +211,9 @@ failed or interrupted reports; never relax these limits to obtain a speedup.
 
 The frozen OCR PNGs, manifest, and golden responses are test inputs. Keep their
 bytes unchanged for comparisons; use the endpoint tool's `--capture-golden`
-only when deliberately establishing a new baseline. The embedding generator
-verifies every expanded token sequence, including EOS. See
+only when deliberately establishing a new baseline. The embedding fixture
+records tokenizer verification including EOS, and its loader verifies the
+expanded text/token digest. See
 [the embedding protocol](scripts/qwen3_embedding/BASELINE.md) for tokenizer,
 pooling, normalization, and independent-reference requirements.
 
@@ -290,6 +256,15 @@ the reports, referenced launchers, raw results and guards with the PR evidence.
 | llama.cpp b8990, revision `660b1b4bdc6fedc18e8c3d87a945ffb51f91c547` | `8eee1b1fa1c65d919c94116dd286134a4a9498059c21c1ee448c45fb87f2c590` |
 
 ### Historical archives
+
+The retired campaign launcher, retention checker, fixture-expansion utility,
+and their tests are preserved with Python dependencies, fixtures, and the
+original reproduction instructions in
+`/tmp/qwen-script-campaign-tools-2026-09-09.tar.gz`
+(SHA-256 `5a1c9d5eb15bff9cc628d4b222b215f400d33df3a69e0b741d0a6c89343a887f`).
+Its `CLEANUP.json` records source commit `284312c84e` and per-file checksums.
+This is a local source archive; raw benchmark evidence remains in the separate
+artifacts below. Preserve the archive with those artifacts when sharing the PR.
 
 The earlier comparison report and reranker checks are in
 `qwen-performance-report-evidence-2026-09-08.tar.gz`

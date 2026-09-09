@@ -145,7 +145,6 @@ def measure_case(
     warmup: int,
     iters: int,
     timeout: float,
-    on_pair=None,
 ) -> dict:
     samples = {label: [] for label in targets}
     pairs = []
@@ -168,8 +167,6 @@ def measure_case(
             if iteration >= warmup:
                 samples[label].append(elapsed)
         pairs.append(pair)
-        if on_pair is not None:
-            on_pair(pair)
     result = {
         "id": case["id"],
         "fixture": case["fixture"],
