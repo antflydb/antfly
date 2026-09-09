@@ -677,6 +677,8 @@ test "PDF image embedding has a media-sized batch byte default" {
 
 const GeneratedTextBatchPolicy = struct {
     max_items: usize,
+    /// Only speculative windows defer scratch failures until their predecessor drains.
+    defer_render_pressure: bool = false,
     /// Shared preparation width; never changes the executing model's limits.
     render_items: ?usize = null,
     max_bytes: usize,
@@ -6576,6 +6578,9 @@ const SharedPdfWindowScheduler = struct {
         window_lease: ?*PdfWindowCompositeLease,
         prefetch: ?*PdfWindowPrefetchStart,
     ) !?*WindowWork {
+        if (runtimeReadProfileEnabled()) std.log.info("read-profile phase=pdf_shared_window owner={d} requests={d} pages={d}", .{ self.current, self.requests.len, switch (rendered) {
+            inline else => |value| value.results.len,
+        } });
         if (self.current + 1 >= self.requests.len) return null;
         try self.ensureConsumers();
         const work = try self.runtime.alloc.create(WindowWork);
@@ -6608,6 +6613,7 @@ const SharedPdfWindowScheduler = struct {
                     continue;
                 };
                 if (consumer.text != text_pass) continue;
+                if (runtimeReadProfileEnabled()) std.log.info("read-profile phase=pdf_shared_consumer owner={d} consumer={d} enabled={} source_match={} transform_match={} batch_items={d}", .{ self.current, index, consumer.enabled, consumer.source_identity != null and std.meta.eql(source_identity, consumer.source_identity.?), consumer.enabled and transform.canSupply(consumer.transform), consumer.max_items });
                 if (!consumer.enabled or !std.meta.eql(source_identity, consumer.source_identity.?) or
                     !std.mem.eql(u8, credentials, consumer.config.credentials) or
                     !transform.canSupply(consumer.transform) or page_count > consumer.max_pages) continue;
@@ -11905,12 +11911,59 @@ pub fn runNativePdfOcrCoordinatorIntegration(
 
     try verifySharedPdfWindowConsumers(alloc, batch, window_lease, &coordinator.session);
 
+    // A speculative pressure failure must replay only that page after the
+    // preceding window has drained, keeping completed attachment ownership.
+    {
+        const first_pointer = batch.results[0].rendered.?.png.ptr;
+        const expected_second = try alloc.dupe(u8, batch.results[1].rendered.?.png);
+        defer alloc.free(expected_second);
+        const plans = [_]document_extraction_mod.PreparedPdfPageRenderPlan{
+            try coordinator.session.preparePageRenderPlan(.{ .page_number = 1, .requested_dpi = 72 }),
+            try coordinator.session.preparePageRenderPlan(.{ .page_number = 2, .requested_dpi = 72 }),
+        };
+        batch.results[1].deinit(window_lease.allocator());
+        batch.results[1] = .{ .page_number = 2, .failure = error.RenderWorkerMemoryLimitExceeded };
+        var rendered = RuntimePdfRenderBatch{ .encoded = batch };
+        var deferred = try PdfDeferredRenderRetry.capture(alloc, &plans, rendered, .{
+            .max_batch_pages = 2,
+            .max_parallel_pages = 2,
+            .max_inflight_bytes = available_bytes,
+            .max_retained_png_bytes = 16 * 1024 * 1024,
+            .profile = .ocr,
+        }, available_bytes);
+        defer if (deferred) |*retry| retry.deinit(alloc);
+        try std.testing.expectEqualSlices(usize, &.{1}, deferred.?.indices);
+        var runtime = EnrichmentRuntime{
+            .alloc = alloc,
+            .io_impl = null,
+            .store = undefined,
+            .owns_store = false,
+            .change_journal = undefined,
+            .replay_source = undefined,
+            .index_manager = undefined,
+            .write_ctx = undefined,
+            .write_fn = undefined,
+            .notify_ctx = undefined,
+            .notify_fn = undefined,
+            .config = .{},
+            .ownership = undefined,
+        };
+        try PdfDeferredRenderRetry.retryAfterRelease(&deferred, &runtime, &coordinator.session, window_lease, &rendered, coordinator.deadline.probe());
+        batch = rendered.encoded;
+        try std.testing.expect(deferred == null and window_lease.rendering_finished);
+        try std.testing.expectEqual(@as(usize, 0), window_lease.scratchBytesPerWindow());
+        try std.testing.expectEqual(first_pointer, batch.results[0].rendered.?.png.ptr);
+        try std.testing.expectEqualSlices(u8, expected_second, batch.results[1].rendered.?.png);
+        try std.testing.expect(!isPdfScratchPressure(error.DecodedStreamTooLarge));
+    }
+
     // A conservative estimate can exceed the remaining owned grant. Preserve
     // one page's geometry and let the bounded renderer attempt that grant.
     {
         const plan = try coordinator.session.preparePageRenderPlan(.{ .page_number = 1, .requested_dpi = 150 });
         const plans: []const document_extraction_mod.PreparedPdfPageRenderPlan = &.{plan};
-        const requested = try planPdfRenderWave(&coordinator.session, plans, 1, available_bytes);
+        var requested = try planPdfRenderWave(&coordinator.session, plans, 1, available_bytes);
+        requested.scratch_bytes = @max(requested.scratch_bytes, 32 * 1024 * 1024);
         const output_bytes = try pdfRgbaBytesForPixels(plan.geometry().pixels) + 4096;
         var budgets = resource_manager_mod.Options.defaultBudgets();
         budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = requested.scratch_bytes - 1 + output_bytes };
@@ -12738,8 +12791,10 @@ const RuntimePdfRenderWindow = struct {
     batch: RuntimePdfRenderBatch,
     lease: *PdfWindowCompositeLease,
     page_output_bytes_cap: usize,
+    deferred_render: ?PdfDeferredRenderRetry = null,
 
     fn deinit(self: *@This()) void {
+        if (self.deferred_render) |*retry| retry.deinit(self.metadata_alloc);
         switch (self.batch) {
             inline else => |*batch| batch.deinit(self.lease.allocator()),
         }
@@ -13780,6 +13835,7 @@ fn renderAdmittedPdfWindowBatchAlloc(
     options: document_extraction_mod.PdfPageRenderBatchOptions,
     use_rasters: bool,
     max_scratch_bytes: usize,
+    deferred: ?*?PdfDeferredRenderRetry,
 ) !RuntimePdfRenderBatch {
     const Growth = struct {
         lease: *PdfWindowCompositeLease,
@@ -13812,13 +13868,102 @@ fn renderAdmittedPdfWindowBatchAlloc(
                 .{ .encoded = try renderPreparedPdfWindowBatchAlloc(self.runtime, self.session, alloc, active_plans, opts) };
         }
     };
-    return renderPdfWindowWithScratchRetry(Render{
+    var batch = try renderPdfWindowWithScratchRetry(Render{
         .runtime = runtime,
         .session = session,
         .plans = plans,
         .use_rasters = use_rasters,
     }, lease, admitted_options, max_scratch_bytes);
+    errdefer batch.deinit(lease.allocator());
+    if (deferred) |slot| slot.* = try PdfDeferredRenderRetry.capture(lease.owner_alloc, plans, batch, options, max_scratch_bytes);
+    return batch;
 }
+
+fn isPdfScratchPressure(err: anyerror) bool {
+    return err == error.RenderWorkerMemoryLimitExceeded or err == error.RenderBatchAdmissionExceeded;
+}
+
+/// Window-scoped metadata only: successful media stays in its original owner.
+/// A speculative render cannot turn temporary competition with the preceding
+/// window into a durable per-page failure. Replay occurs once, after that
+/// window is released, using new admission and the original page transforms.
+const PdfDeferredRenderRetry = struct {
+    plans: []document_extraction_mod.PreparedPdfPageRenderPlan,
+    indices: []usize,
+    options: document_extraction_mod.PdfPageRenderBatchOptions,
+    maximum: usize,
+
+    fn capture(alloc: Allocator, plans: []const document_extraction_mod.PreparedPdfPageRenderPlan, batch: RuntimePdfRenderBatch, options: document_extraction_mod.PdfPageRenderBatchOptions, maximum: usize) !?@This() {
+        var count: usize = 0;
+        switch (batch) {
+            inline else => |value| for (value.results) |result| {
+                if (result.failure) |err| if (isPdfScratchPressure(err)) {
+                    count += 1;
+                };
+            },
+        }
+        if (count == 0) return null;
+        const selected = try alloc.alloc(document_extraction_mod.PreparedPdfPageRenderPlan, count);
+        errdefer alloc.free(selected);
+        const indices = try alloc.alloc(usize, count);
+        var cursor: usize = 0;
+        switch (batch) {
+            inline else => |value| for (value.results, 0..) |result, index| {
+                if (result.failure) |err| if (isPdfScratchPressure(err)) {
+                    selected[cursor] = plans[index];
+                    indices[cursor] = index;
+                    cursor += 1;
+                };
+            },
+        }
+        var saved_options = options;
+        // Invocation-local callback contexts must never escape their stack.
+        saved_options.cancellation = .{};
+        saved_options.scratch_growth = null;
+        return .{ .plans = selected, .indices = indices, .options = saved_options, .maximum = maximum };
+    }
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.plans);
+        alloc.free(self.indices);
+        self.* = undefined;
+    }
+
+    fn retryAfterRelease(slot: *?@This(), runtime: *EnrichmentRuntime, session: *document_extraction_mod.PdfRenderSession, lease: *PdfWindowCompositeLease, batch: *RuntimePdfRenderBatch, cancellation: document_extraction_mod.PdfCancellationProbe) !void {
+        var retry = slot.* orelse return;
+        slot.* = null; // Includes cancellation/error paths: never retry forever.
+        defer retry.deinit(lease.owner_alloc);
+        try cancellation.check();
+        std.debug.assert(lease.rendering_finished and lease.consumer_count == 0);
+        lease.rendering_finished = false;
+        defer lease.finishRendering();
+        if (!try lease.admitScratchRetry(retry.maximum)) return error.DocumentExtractionWorkingSetTooLarge;
+        var options = retry.options;
+        options.max_inflight_bytes = lease.scratchBytesPerWindow();
+        options.max_parallel_pages = 1;
+        options.cancellation = cancellation;
+        var replacement = try renderAdmittedPdfWindowBatchAlloc(runtime, session, lease, retry.plans, options, batch.* == .raster, retry.maximum, null);
+        defer replacement.deinit(lease.allocator());
+        switch (batch.*) {
+            inline else => |*value, tag| {
+                if (std.meta.activeTag(replacement) != tag) return error.InvalidPdfRenderWindow;
+                const results = &@field(replacement, @tagName(tag));
+                if (results.results.len != retry.indices.len) return error.InvalidPdfRenderWindow;
+                for (results.results, retry.indices) |*result, index| {
+                    if (result.page_number != value.results[index].page_number) return error.InvalidPdfRenderWindow;
+                    const elapsed = value.results[index].render_elapsed_ns;
+                    value.results[index].deinit(lease.allocator());
+                    value.results[index] = result.*;
+                    value.results[index].render_elapsed_ns +|= elapsed;
+                    result.rendered = null;
+                }
+                inline for (.{ "peak_launched_workers", "peak_parallelism", "peak_admitted_pixels", "peak_admitted_bytes", "peak_worker_scratch_bytes" }) |field|
+                    @field(value, field) = @max(@field(value, field), @field(results, field));
+                value.thread_spawn_fallbacks +|= results.thread_spawn_fallbacks;
+            },
+        }
+    }
+};
 
 fn renderPdfWindowWithScratchRetry(renderer: anytype, lease: *PdfWindowCompositeLease, options: document_extraction_mod.PdfPageRenderBatchOptions, max_scratch_bytes: usize) !RuntimePdfRenderBatch {
     var batch = try renderer.run(lease.allocator(), options, null);
@@ -13828,14 +13973,16 @@ fn renderPdfWindowWithScratchRetry(renderer: anytype, lease: *PdfWindowComposite
     switch (batch) {
         inline else => |value| {
             for (value.results, 0..) |result, index| {
-                if (result.failure) |err| if (err == error.RenderWorkerMemoryLimitExceeded) try failed.append(lease.owner_alloc, index);
+                if (result.failure) |err| if (isPdfScratchPressure(err)) try failed.append(lease.owner_alloc, index);
             }
         },
     }
     if (failed.items.len == 0) return batch;
     const already_grown = lease.scratchBytesPerWindow() > options.max_inflight_bytes;
     const admitted = try lease.admitScratchRetry(max_scratch_bytes);
-    if (!admitted and !already_grown) return batch;
+    // Parallel lanes may exhaust a shared grant that is sufficient for one
+    // page. Retry only failed identities serially even when growth is denied.
+    if (!admitted and !already_grown and options.max_parallel_pages <= 1) return batch;
     // A single page that already consumed its admitted growth cannot benefit
     // from replaying with the same grant. Multi-page windows can shed other
     // lanes' caches by retrying only the failed pages serially.
@@ -13921,11 +14068,11 @@ test "PDF render scratch retry admits delta and preserves completed results" {
         }
     };
     for ([_]bool{ false, true }) |raster| {
-        for (0..5) |scenario| {
+        for (0..6) |scenario| {
             var budgets = resource_manager_mod.Options.defaultBudgets();
             budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
                 .soft_limit_bytes = 0,
-                .hard_limit_bytes = if (scenario == 2) 4196 else if (scenario == 4) 4246 else 4296,
+                .hard_limit_bytes = if (scenario == 2 or scenario == 5) 4196 else if (scenario == 4) 4246 else 4296,
             };
             var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
             defer manager.deinit(std.testing.allocator);
@@ -13934,7 +14081,7 @@ test "PDF render scratch retry admits delta and preserves completed results" {
             var fake = Fake{ .lease = lease, .raster = raster, .persistent_failure = scenario == 1, .throw_on_retry = scenario == 3 };
             const result = renderPdfWindowWithScratchRetry(&fake, lease, .{
                 .max_inflight_bytes = 100,
-                .max_parallel_pages = 2,
+                .max_parallel_pages = if (scenario == 5) 1 else 2,
                 .max_retained_raster_bytes = 4096,
             }, 200);
             if (scenario == 3) {
@@ -13949,12 +14096,12 @@ test "PDF render scratch retry admits delta and preserves completed results" {
                         try std.testing.expectEqual(@as(usize, 8), value.results[1].page_number);
                         const preserved = value.results[1].rendered.?;
                         try std.testing.expectEqualStrings("keep", if (@hasField(@TypeOf(preserved), "bytes")) preserved.bytes else preserved.png);
-                        try std.testing.expectEqual(scenario == 1 or scenario == 2, value.results[0].failure != null);
+                        try std.testing.expectEqual(scenario == 1 or scenario == 5, value.results[0].failure != null);
                     },
                 }
             }
-            try std.testing.expectEqual(@as(usize, if (scenario == 2) 1 else 2), fake.calls);
-            try std.testing.expectEqual(@as(u64, if (scenario == 2) 4196 else if (scenario == 4) 4246 else 4296), manager.sliceStats(.document_extraction_working_set).used_bytes);
+            try std.testing.expectEqual(@as(usize, if (scenario == 5) 1 else 2), fake.calls);
+            try std.testing.expectEqual(@as(u64, if (scenario == 2 or scenario == 5) 4196 else if (scenario == 4) 4246 else 4296), manager.sliceStats(.document_extraction_working_set).used_bytes);
             lease.finishRendering();
             try std.testing.expectEqual(@as(u64, 4096), manager.sliceStats(.document_extraction_working_set).used_bytes);
         }
@@ -14295,6 +14442,8 @@ fn renderRuntimePdfWindow(
     };
     const lease = window_lease orelse return error.DocumentExtractionWorkingSetTooLarge;
     admission_phase = "render";
+    var deferred_render: ?PdfDeferredRenderRetry = null;
+    errdefer if (deferred_render) |*retry| retry.deinit(alloc);
     var batch = try renderAdmittedPdfWindowBatchAlloc(runtime, session, lease, prepared_plans[0..requests.items.len], .{
         .max_batch_pages = max_pages,
         .max_parallel_pages = parallel_pages,
@@ -14305,7 +14454,7 @@ fn renderRuntimePdfWindow(
         .profile = .ocr,
         .cancellation = render_cancellation.probe(),
         .executor_io = runtime.config.io,
-    }, use_borrowed_rasters, max_inflight_bytes);
+    }, use_borrowed_rasters, max_inflight_bytes, if (batch_policy.defer_render_pressure) &deferred_render else null);
     errdefer switch (batch) {
         inline else => |*value| value.deinit(lease.allocator()),
     };
@@ -14317,6 +14466,7 @@ fn renderRuntimePdfWindow(
         .batch = batch,
         .lease = lease,
         .page_output_bytes_cap = requests.items[0].max_output_bytes orelse 1,
+        .deferred_render = deferred_render,
     };
     prototype_parts_owned = false;
     window_lease = null;
@@ -14353,10 +14503,16 @@ const RuntimePdfRenderWindowPreparer = struct {
     }
 
     fn prepare(self: *const @This(), start_index: usize) !RuntimePdfRenderWindow {
+        return self.prepareMode(start_index, false);
+    }
+
+    fn prepareMode(self: *const @This(), start_index: usize, speculative: bool) !RuntimePdfRenderWindow {
         if (self.cancel_requested.load(.acquire)) return error.Canceled;
         self.coordinator.beginOperation(self.runtime.syncWaitTimeoutMs());
         self.coordinator.session.setCancellationProbe(self.cancellationProbe());
         const available_bytes = try self.coordinator.availableRenderBytes();
+        var policy = self.batch_policy;
+        policy.defer_render_pressure = speculative;
         var window = try renderRuntimePdfWindow(
             self.runtime,
             std.heap.smp_allocator,
@@ -14364,7 +14520,7 @@ const RuntimePdfRenderWindowPreparer = struct {
             &self.coordinator.session,
             self.config,
             available_bytes,
-            self.batch_policy,
+            policy,
             self.producer_type,
             self.producer_config_json,
             self.route_type,
@@ -14412,7 +14568,7 @@ const RuntimePdfRenderWindowPrefetch = struct {
 
     fn run(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        self.window = self.preparer.prepare(self.start_index) catch |err| {
+        self.window = self.preparer.prepareMode(self.start_index, true) catch |err| {
             self.err = err;
             return;
         };
@@ -14650,6 +14806,8 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
                             return err;
                         };
                     }
+                    if (pdf_render_window.?.deferred_render != null) preparer.coordinator.beginOperation(runtime.syncWaitTimeoutMs());
+                    try PdfDeferredRenderRetry.retryAfterRelease(&pdf_render_window.?.deferred_render, runtime, &preparer.coordinator.session, pdf_render_window.?.lease, &pdf_render_window.?.batch, preparer.cancellationProbe());
                     logRuntimePdfRenderWindowProfile(runtime, source_fingerprint, units, pdf_render_window.?.unit_indices, &pdf_render_window.?, null, window_started_ns);
                     pdf_render_cursor = 0;
 
@@ -20511,8 +20669,10 @@ const PdfEmbeddingPreparedWindow = struct {
     count: usize,
     lease: *PdfWindowCompositeLease,
     rendered: PdfEmbeddingRenderedWindow,
+    deferred_render: ?PdfDeferredRenderRetry = null,
 
     fn deinit(self: *@This()) void {
+        if (self.deferred_render) |*retry| retry.deinit(self.lease.owner_alloc);
         self.rendered.deinit(self.lease.allocator());
         self.lease.destroy();
         self.* = undefined;
@@ -20547,6 +20707,10 @@ const PdfEmbeddingWindowPreparer = struct {
     }
 
     fn prepare(self: *const @This(), first_item: usize) !PdfEmbeddingPreparedWindow {
+        return self.prepareMode(first_item, false);
+    }
+
+    fn prepareMode(self: *const @This(), first_item: usize, speculative: bool) !PdfEmbeddingPreparedWindow {
         // A speculative window is prepared on an Io worker while the
         // enrichment worker consumes and stages the current window. Keep all
         // allocations reachable from that task on a thread-safe allocator;
@@ -20695,6 +20859,8 @@ const PdfEmbeddingWindowPreparer = struct {
             .cancellation = self.cancellationProbe(),
             .executor_io = self.runtime.config.io,
         };
+        var deferred_render: ?PdfDeferredRenderRetry = null;
+        errdefer if (deferred_render) |*retry| retry.deinit(lease.owner_alloc);
         var rendered = try renderAdmittedPdfWindowBatchAlloc(
             self.runtime,
             &self.coordinator.session,
@@ -20703,6 +20869,7 @@ const PdfEmbeddingWindowPreparer = struct {
             render_options,
             self.use_borrowed_rasters,
             available_bytes,
+            if (speculative) &deferred_render else null,
         );
         errdefer rendered.deinit(lease.allocator());
         lease.finishRendering();
@@ -20711,6 +20878,7 @@ const PdfEmbeddingWindowPreparer = struct {
             .count = count,
             .lease = lease,
             .rendered = rendered,
+            .deferred_render = deferred_render,
         };
     }
 };
@@ -20723,7 +20891,7 @@ const PdfEmbeddingWindowPrefetch = struct {
 
     fn run(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        self.window = self.preparer.prepare(self.first_item) catch |err| {
+        self.window = self.preparer.prepareMode(self.first_item, true) catch |err| {
             self.err = err;
             return;
         };
@@ -21240,6 +21408,8 @@ fn processPdfPageImageEmbeddingWithAllocator(
     while (current_window) |*current| {
         try heartbeatEnrichmentLease(runtime);
         try checkProviderFailureGuard(runtime);
+        if (current.deferred_render != null) coordinator.beginOperation(runtime.syncWaitTimeoutMs());
+        try PdfDeferredRenderRetry.retryAfterRelease(&current.deferred_render, runtime, &coordinator.session, current.lease, &current.rendered, window_preparer.cancellationProbe());
         const next_first_item = current.first_item + current.count;
         std.debug.assert(prefetch_job.window == null);
         prefetch_job = .{ .preparer = &window_preparer, .first_item = next_first_item };

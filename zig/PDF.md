@@ -1,5 +1,35 @@
 # Bounded document preparation and multimodal inference
 
+## September 2026 render-control verification
+
+The initial source-build ablation exposed two admission defects: reserving every
+lane's 128 MiB decode ceiling made parallel rendering impossible under the
+default 256 MiB renderer cap, and speculative partial grants below that ceiling
+were incorrectly returned as page failures before launching a worker.
+
+The revised design separates hard decode limits from scheduling estimates.
+Raster/fork estimates and measured per-document worker peaks choose concurrency;
+every allocation still passes through the admitted, shared physical-memory cap.
+Underestimated parallel work retries only failed identities serially, even when
+no extra grant is available. Successful page buffers retain their owners.
+
+Speculative windows carry bounded retry metadata for scratch-pressure failures.
+After the prior window's consumers finish and release its grant, the coordinator
+acquires fresh scratch admission and retries only those failed pages once. The
+same mechanism serves OCR/generation and visual embedding. It preserves page
+geometry, deadlines/cancellation and output credit, retains no invocation-local
+callback pointers, and does not retry deterministic decode-limit violations.
+Foreground failures do not create another speculative replay cycle.
+
+Source tests and production qualification must verify these changes separately.
+The 51-page corpus also includes an approximately 98.7 MB decoded image that
+exceeds the unchanged 64 MiB per-stream ceiling. Supporting that input at low
+memory requires a bounded streaming image decoder, not relaxing benchmark gates
+or silently reducing requested DPI. See `scripts/bench/pdf/` for the retained
+failed experiments, render-control matrix and multi-consumer qualification.
+
+## Implementation status
+
 Status: bounded document preparation, indexed reader execution, multimodal
 generation transport, distributed model-aware routing, lease-fenced durable
 page-image embedding, observed remote execution, and post-review batching

@@ -953,11 +953,10 @@ pub fn estimatePreparedPageRenderWaveScratchBytes(
 ) !usize {
     if (plans.len == 0 or max_parallel_pages == 0 or bytes_per_pixel_reserve < 4)
         return error.InvalidRenderBatchOptions;
-    const worker_fixed = std.math.add(
-        usize,
-        try parsed.renderForkMetadataBytes(),
-        parsed.decode_limits.max_working_set_bytes,
-    ) catch return error.RenderBatchAdmissionExceeded;
+    // A decode ceiling is not a reservation: most pages use much less. The
+    // shared allocator charges every backing byte, including decoded streams,
+    // and rejects growth beyond the independently admitted aggregate grant.
+    const worker_fixed = try parsed.renderForkMetadataBytes();
     const wave_width = @min(max_parallel_pages, plans.len);
     var wave_bytes: usize = 0;
     var peak_bytes: usize = 0;
@@ -1820,11 +1819,7 @@ fn prepareRenderPageForAdmission(
     output_kind: RenderBatchOutputKind,
     request_index: usize,
 ) !PreparedRenderPage {
-    const fixed_bytes = std.math.add(
-        usize,
-        try parsed.renderForkMetadataBytes(),
-        parsed.decode_limits.max_working_set_bytes,
-    ) catch return error.RenderBatchAdmissionExceeded;
+    const fixed_bytes = try parsed.renderForkMetadataBytes();
     if (fixed_bytes >= options.max_inflight_bytes) return error.RenderBatchAdmissionExceeded;
     const adjusted = request;
     const geometry = if (planned_geometry) |planned|
@@ -1844,8 +1839,7 @@ fn prepareRenderPageForAdmission(
     const admitted_bytes = try renderPageReservedBytes(parsed, geometry.pixels, options);
     // The estimate is not a quality ceiling. A serial page may reserve the
     // full configured grant; the allocator still enforces the hard limit.
-    const worker_limit_bytes = @min(options.max_inflight_bytes, std.math.add(usize, admitted_bytes, parsed.decode_limits.max_working_set_bytes) catch
-        return error.RenderBatchAdmissionExceeded);
+    const worker_limit_bytes = @min(options.max_inflight_bytes, admitted_bytes);
     if (geometry.pixels > options.max_inflight_pixels or worker_limit_bytes > options.max_inflight_bytes)
         return error.RenderBatchAdmissionExceeded;
     if (output_kind == .raster and request.max_output_bytes != null and
@@ -2053,10 +2047,10 @@ fn renderParsedPageWorkBatchAlloc(
         while (next_request < request_count and wave_len < worker_capacity) : (next_request += 1) {
             const candidate = prepared[next_request] orelse continue;
             const next_pixels = std.math.add(u64, wave_pixels, candidate.pixels) catch break;
-            // Account for the raster/fork reservation and the page's bounded
-            // decode working set. The shared allocator enforces the same
-            // aggregate ceiling at runtime, so an admitted wave cannot depend
-            // on all workers avoiding their declared scratch limit at once.
+            // Schedule by estimated raster/fork working sets, not by summing
+            // per-stream safety ceilings. All concurrent scratch still passes
+            // through one hard-bounded allocator; estimates may fail without
+            // exceeding that grant or changing page geometry.
             const next_bytes = std.math.add(usize, wave_bytes, candidate.worker_limit_bytes) catch break;
             if (wave_len > 0 and (next_pixels > options.max_inflight_pixels or next_bytes > options.max_inflight_bytes)) break;
             wave[wave_len] = candidate;
@@ -5162,12 +5156,12 @@ test "prepared page plans preserve batch output and reject another source" {
     }
     const serial_scratch = try estimatePreparedPageRenderWaveScratchBytes(&parsed, &plans, 1, 12);
     const parallel_scratch = try estimatePreparedPageRenderWaveScratchBytes(&parsed, &plans, 2, 12);
-    try std.testing.expect(serial_scratch > parsed.decode_limits.max_working_set_bytes);
+    try std.testing.expect(serial_scratch > try parsed.renderForkMetadataBytes());
     try std.testing.expect(parallel_scratch > serial_scratch);
     var uneven = [_]PreparedPageRenderPlan{plans[0]} ** 6;
     const uneven_pixels = [_]u64{ 1, 1, 100, 100, 1, 1 };
     for (&uneven, uneven_pixels) |*plan, pixels| plan._geometry.pixels = pixels;
-    const worker_fixed = try parsed.renderForkMetadataBytes() + parsed.decode_limits.max_working_set_bytes;
+    const worker_fixed = try parsed.renderForkMetadataBytes();
     try std.testing.expectEqual(
         worker_fixed * 3 + 201 * 12,
         try estimatePreparedPageRenderWaveScratchBytes(&parsed, &uneven, 3, 12),
@@ -5457,20 +5451,19 @@ test "bounded render batch derives viable geometry from a partial native grant" 
     try std.testing.expect(batch.peak_admitted_pixels <= raster_budget / 12);
 }
 
-test "bounded render batch admits decode working sets per page" {
+test "bounded render batch does not reserve each lane's decode ceiling" {
     const alloc = std.testing.allocator;
     const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
     var parsed = try reader.Reader.init(alloc, fixture);
     defer parsed.deinit();
     try parsed.setDecodeLimits(.{
-        .max_working_set_bytes = 4 * 1024 * 1024,
-        .max_decoded_stream_bytes = 4 * 1024 * 1024,
+        .max_working_set_bytes = 128 * 1024 * 1024,
+        .max_decoded_stream_bytes = 128 * 1024 * 1024,
     });
 
-    // At 72 DPI, both pages' raster reservations fit together in 6 MiB, but
-    // their independent 4 MiB decode working sets do not. They must therefore
-    // execute in separate one-page waves even when two lanes are available.
-    const max_inflight_bytes = 6 * 1024 * 1024;
+    // The aggregate physical grant is smaller than even one stream ceiling.
+    // Neither page approaches that ceiling: both can safely execute together.
+    const max_inflight_bytes = 32 * 1024 * 1024;
     var batch = try renderParsedPagesBatchAlloc(alloc, &parsed, &.{
         .{ .page_number = 1, .requested_dpi = 72 },
         .{ .page_number = 2, .requested_dpi = 72 },
@@ -5483,9 +5476,10 @@ test "bounded render batch admits decode working sets per page" {
 
     try std.testing.expect(batch.results[0].failure == null);
     try std.testing.expect(batch.results[1].failure == null);
-    try std.testing.expectEqual(@as(usize, 1), batch.peak_parallelism);
+    try std.testing.expectEqual(@as(usize, 2), batch.peak_launched_workers);
+    try std.testing.expect(batch.peak_parallelism <= 2);
     try std.testing.expect(batch.peak_admitted_bytes <= max_inflight_bytes);
-    try std.testing.expect(batch.peak_admitted_bytes >= parsed.decode_limits.max_working_set_bytes);
+    try std.testing.expect(batch.peak_worker_scratch_bytes <= max_inflight_bytes);
 }
 
 test "render worker budget releases freed temporary memory" {
@@ -5660,7 +5654,8 @@ test "prepared windows retain page geometry failures and compact successful scra
     const plans = [_]PreparedPageRenderPlan{ good, bad, good };
     const scratch = try estimatePreparedPageRenderWaveScratchBytes(&parsed, &plans, 2, default_render_bytes_per_pixel_reserve);
     try std.testing.expectEqual(2 * try estimatePreparedPageRenderWaveScratchBytes(&parsed, &.{good}, 1, default_render_bytes_per_pixel_reserve), scratch);
-    var batch = try renderPreparedPagesBatchAlloc(alloc, &parsed, &plans, .{ .max_parallel_pages = 2, .max_inflight_bytes = scratch });
+    // The geometry estimate is not a promise that font/decode scratch fits.
+    var batch = try renderPreparedPagesBatchAlloc(alloc, &parsed, &plans, .{ .max_parallel_pages = 2, .max_inflight_bytes = @max(scratch, 32 * 1024 * 1024) });
     defer batch.deinit(alloc);
     try std.testing.expect(batch.results[0].rendered != null and batch.results[2].rendered != null);
     try std.testing.expectEqual(error.InvalidPageBox, batch.results[1].failure.?);
