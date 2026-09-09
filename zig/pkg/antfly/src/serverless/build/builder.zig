@@ -32,14 +32,19 @@ const sparse_segment_mod = @import("../sparse_segment/mod.zig");
 const vector_segment_mod = @import("../vector_segment/mod.zig");
 const vector_index = @import("vector_index.zig");
 const publication_plan = @import("publication_plan.zig");
+const work_lease = @import("work_lease.zig");
+const maintenance_cancellation = @import("../maintenance_cancellation.zig");
 const external_source_manifest = @import("external_source_manifest.zig");
 const external_source_publication = @import("external_source_publication.zig");
 const enrichment_pipeline = @import("../enrichment/pipeline.zig");
+const enrichment_operation_id = @import("../enrichment/operation_id.zig");
 const api_codec = @import("../api/codec.zig");
 const api_types = @import("../api/types.zig");
 const full_text_indexes = @import("../../api/full_text_indexes.zig");
 const tables_api = @import("../../api/tables.zig");
 const shared_vector = @import("antfly_vector").vector;
+const objectstore = @import("objectstore");
+const manifest_object_store = @import("../manifest/object_store.zig");
 
 const FullTextIndexSpec = full_text_indexes.FullTextIndexSpec;
 const FullTextSourceMode = full_text_indexes.FullTextSourceMode;
@@ -86,12 +91,33 @@ pub const NamedVectorBuildPolicy = struct {
     policy: ?vector_index.BuildPolicy = null,
 };
 
+/// Production-neutral suspension and observation seam for an immutable
+/// manifest publication. The hook runs after the candidate manifest is
+/// durable and before the progress-store compare-and-swap makes it visible.
+/// It is unset in production; deterministic runtimes may park here to expose
+/// a concurrent generation change without replacing either storage owner.
+pub const PublicationLifecycleEvent = struct {
+    namespace: []const u8,
+    expected_head: ?u64,
+    candidate_version: u64,
+};
+
+pub const PublicationLifecycleHook = struct {
+    ptr: *anyopaque,
+    reach_fn: *const fn (ptr: *anyopaque, event: PublicationLifecycleEvent) anyerror!void,
+
+    pub fn reach(self: PublicationLifecycleHook, event: PublicationLifecycleEvent) !void {
+        try self.reach_fn(self.ptr, event);
+    }
+};
+
 pub const Builder = struct {
     alloc: Allocator,
     artifacts: *artifacts_mod.ArtifactStore,
     manifests: *manifest_mod.ManifestStore,
     progress: *catalog_mod.ProgressStore,
     wal: *wal_mod.WalStore,
+    publication_lifecycle_hook: ?PublicationLifecycleHook = null,
 
     const CurrentHeadManifest = struct {
         progress_version: u64 = 0,
@@ -118,6 +144,34 @@ pub const Builder = struct {
             .progress = progress,
             .wal = wal,
         };
+    }
+
+    pub fn setPublicationLifecycleHook(
+        self: *Builder,
+        hook: ?PublicationLifecycleHook,
+    ) void {
+        self.publication_lifecycle_hook = hook;
+    }
+
+    fn compareAndSwapPublishedHead(
+        self: *Builder,
+        namespace: []const u8,
+        expected: ?u64,
+        candidate_version: u64,
+        publication_guard: ?work_lease.PublicationGuard,
+    ) !bool {
+        if (self.publication_lifecycle_hook) |hook| try hook.reach(.{
+            .namespace = namespace,
+            .expected_head = expected,
+            .candidate_version = candidate_version,
+        });
+        return try compareAndSwapHeadGuarded(
+            self.progress,
+            namespace,
+            expected,
+            candidate_version,
+            publication_guard,
+        );
     }
 
     fn loadCurrentHeadManifestAlloc(self: *Builder, namespace: []const u8) !CurrentHeadManifest {
@@ -231,6 +285,39 @@ pub const Builder = struct {
         vector_metric: shared_vector.DistanceMetric,
         plan: publication_plan.TablePublicationPlan,
     ) !BuildResult {
+        return try self.publishNamespaceWithMetricAndPlanGuarded(
+            namespace,
+            vector_metric,
+            plan,
+            null,
+        );
+    }
+
+    pub fn publishNamespaceWithMetricAndPlanGuarded(
+        self: *Builder,
+        namespace: []const u8,
+        vector_metric: shared_vector.DistanceMetric,
+        plan: publication_plan.TablePublicationPlan,
+        publication_guard: ?work_lease.PublicationGuard,
+    ) !BuildResult {
+        return try self.publishNamespaceWithMetricAndPlanGuardedUntil(
+            namespace,
+            vector_metric,
+            plan,
+            publication_guard,
+            null,
+        );
+    }
+
+    pub fn publishNamespaceWithMetricAndPlanGuardedUntil(
+        self: *Builder,
+        namespace: []const u8,
+        vector_metric: shared_vector.DistanceMetric,
+        plan: publication_plan.TablePublicationPlan,
+        publication_guard: ?work_lease.PublicationGuard,
+        cancellation: ?maintenance_cancellation.Token,
+    ) !BuildResult {
+        try maintenance_cancellation.check(cancellation);
         const targets = plan.targets;
         var head = try self.loadCurrentHeadManifestAlloc(namespace);
         defer head.deinit(self.alloc);
@@ -242,21 +329,51 @@ pub const Builder = struct {
 
         const records = try self.wal.readFromAlloc(namespace, start_lsn);
         defer wal_mod.freeRecords(self.alloc, records);
+        try maintenance_cancellation.check(cancellation);
 
-        if (records.len != 0 and publicationPlanHasExternalBaseSource(plan)) {
+        const applicable_records = try applicableWalRecordsForHeadAlloc(self.alloc, records, current_head);
+        defer self.alloc.free(applicable_records);
+
+        if (applicable_records.len != 0 and publicationPlanHasExternalBaseSource(plan)) {
             return error.ExternalTableReadOnly;
         }
 
         if (records.len == 0) {
             if (plan.external_source_plan) |external_plan| {
                 if (current_manifest == null or !externalSourcePlanMatchesManifest(external_plan, current_manifest.?)) {
-                    return try self.publishExternalManifestWithoutWal(namespace, current_head, next_version, start_lsn, plan);
+                    return try self.publishExternalManifestWithoutWal(
+                        namespace,
+                        current_head,
+                        next_version,
+                        start_lsn,
+                        plan,
+                        publication_guard,
+                        cancellation,
+                        null,
+                    );
                 }
             } else if (current_head == 0 and plan.table_definition.base_source != null) {
-                return try self.publishExternalManifestWithoutWal(namespace, current_head, next_version, start_lsn, plan);
+                return try self.publishExternalManifestWithoutWal(
+                    namespace,
+                    current_head,
+                    next_version,
+                    start_lsn,
+                    plan,
+                    publication_guard,
+                    cancellation,
+                    null,
+                );
             }
             if (current_head != 0 and plan.forceRepublishFromHead()) {
-                return try self.republishHeadWithPlan(namespace, current_head, vector_metric, plan);
+                return try self.republishHeadWithPlan(
+                    namespace,
+                    current_head,
+                    vector_metric,
+                    plan,
+                    publication_guard,
+                    cancellation,
+                    null,
+                );
             }
             return .{
                 .namespace = try self.alloc.dupe(u8, namespace),
@@ -268,6 +385,50 @@ pub const Builder = struct {
             };
         }
 
+        // A derived mutation is scoped to the immutable HEAD from which its
+        // full document body was produced. Normal publishers and enrichers
+        // share a namespace lease, but this durable check also covers a crash,
+        // an administrative HEAD publication, or a mixed-version edge. Consume
+        // stale records without rebuilding unchanged artifacts so they cannot
+        // wedge an external/read-only table or overwrite a newer generation.
+        if (applicable_records.len == 0) {
+            const current = current_manifest orelse return error.StaleEnrichmentWithoutPublishedHead;
+            const last_record = records[records.len - 1];
+            if (plan.external_source_plan) |external_plan| {
+                if (!externalSourcePlanMatchesManifest(external_plan, current)) {
+                    return try self.publishExternalManifestWithoutWal(
+                        namespace,
+                        current_head,
+                        next_version,
+                        start_lsn,
+                        plan,
+                        publication_guard,
+                        cancellation,
+                        last_record,
+                    );
+                }
+            }
+            if (plan.forceRepublishFromHead()) {
+                return try self.republishHeadWithPlan(
+                    namespace,
+                    current_head,
+                    vector_metric,
+                    plan,
+                    publication_guard,
+                    cancellation,
+                    last_record,
+                );
+            }
+            return try self.publishHeadConsumingIgnoredWal(
+                namespace,
+                current_head,
+                current,
+                last_record,
+                publication_guard,
+                cancellation,
+            );
+        }
+
         const inline_document_rebase = if (current_manifest) |current|
             shouldInlineDocumentRebase(current, next_version, plan.policy)
         else
@@ -276,10 +437,11 @@ pub const Builder = struct {
         const mutation_entries = if (inline_document_rebase)
             try self.alloc.alloc(segment_mod.Entry, 0)
         else if (current_manifest) |current|
-            try mergeManifestMutationEntriesWithRecordsAlloc(self.alloc, self.artifacts, current, records)
+            try mergeManifestMutationEntriesWithRecordsAlloc(self.alloc, self.artifacts, current, applicable_records)
         else
-            try allocMutationEntriesFromRecords(self.alloc, records);
+            try allocMutationEntriesFromRecords(self.alloc, applicable_records);
         defer segment_mod.freeEntries(self.alloc, mutation_entries);
+        try maintenance_cancellation.check(cancellation);
 
         const mutation_artifact = if (inline_document_rebase)
             null
@@ -294,11 +456,13 @@ pub const Builder = struct {
             var owned = artifact;
             owned.deinit(self.alloc);
         };
+        try maintenance_cancellation.check(cancellation);
 
-        const materialized = try materializeWalDocumentsAlloc(self, namespace, current_head, records, targets.include_graph);
+        const materialized = try materializeWalDocumentsAlloc(self, namespace, current_head, applicable_records, targets.include_graph);
         defer freeMaterializerMutations(self.alloc, materialized.mutations);
         defer query_mod.freeMaterializedDocuments(self.alloc, materialized.base_documents);
         defer query_mod.freeMaterializedDocuments(self.alloc, materialized.documents);
+        try maintenance_cancellation.check(cancellation);
 
         const document_ref = blk: {
             const entries = try allocDocumentSegmentEntries(self.alloc, materialized.documents);
@@ -310,9 +474,10 @@ pub const Builder = struct {
             break :blk try artifactRefFromMetadataAlloc(self.alloc, .document_segment, artifact);
         };
         defer freeArtifactRef(self.alloc, document_ref);
+        try maintenance_cancellation.check(cancellation);
         const text_index_specs = try resolvePublishedTextIndexSpecsAlloc(self.alloc, plan.table_definition, plan.full_text_index_actions);
         defer full_text_indexes.freeFullTextIndexSpecs(self.alloc, text_index_specs);
-        const text_refs = try buildTextArtifactRefsForMaterializedDocsAlloc(
+        const text_refs = try buildTextArtifactRefsForMaterializedDocsAllocUntil(
             self.alloc,
             self.artifacts,
             current_manifest,
@@ -320,9 +485,11 @@ pub const Builder = struct {
             materialized.documents,
             materialized.mutations,
             text_index_specs,
+            cancellation,
         );
         defer freeArtifactRefs(self.alloc, text_refs);
-        const sparse_refs = try buildSparseArtifactRefsForMaterializedDocsAlloc(
+        try maintenance_cancellation.check(cancellation);
+        const sparse_refs = try buildSparseArtifactRefsForMaterializedDocsAllocUntil(
             self.alloc,
             self.artifacts,
             current_manifest,
@@ -330,9 +497,11 @@ pub const Builder = struct {
             materialized.documents,
             materialized.mutations,
             targets.published_search_sources,
+            cancellation,
         );
         defer freeArtifactRefs(self.alloc, sparse_refs);
-        const vector_refs = try buildVectorArtifactRefsForMaterializedDocsAlloc(
+        try maintenance_cancellation.check(cancellation);
+        const vector_refs = try buildVectorArtifactRefsForMaterializedDocsAllocUntil(
             self.alloc,
             self.artifacts,
             current_manifest,
@@ -343,11 +512,13 @@ pub const Builder = struct {
             null,
             &.{},
             targets.published_search_sources,
+            cancellation,
         );
         defer freeArtifactRefs(self.alloc, vector_refs);
+        try maintenance_cancellation.check(cancellation);
         const graph_index_names = try listGraphIndexNamesAlloc(self.alloc, plan.table_definition.indexes_json);
         defer freeOwnedStrings(self.alloc, graph_index_names);
-        const graph_refs = try buildGraphArtifactRefsForMaterializedDocsAlloc(
+        const graph_refs = try buildGraphArtifactRefsForMaterializedDocsAllocUntil(
             self.alloc,
             self.artifacts,
             namespace,
@@ -357,8 +528,10 @@ pub const Builder = struct {
             materialized.mutations,
             graph_index_names,
             targets.include_graph,
+            cancellation,
         );
         defer freeArtifactRefs(self.alloc, graph_refs);
+        try maintenance_cancellation.check(cancellation);
 
         const wal_end_lsn = records[records.len - 1].lsn;
         const built_at_ns = records[records.len - 1].timestamp_ns;
@@ -369,6 +542,7 @@ pub const Builder = struct {
             .{},
         );
         defer search_sources.deinitMaterializedDerivedOutputs(self.alloc, &derived_outputs);
+        try maintenance_cancellation.check(cancellation);
         const document_base_version = if (!inline_document_rebase) blk: {
             if (current_manifest) |current| {
                 if (findArtifactIndex(current, .document_segment) != null) {
@@ -419,20 +593,66 @@ pub const Builder = struct {
             );
         defer manifest.deinit(self.alloc);
         try attachResolvedExternalSourcePlanIfPresent(self.alloc, &manifest, plan);
+        try maintenance_cancellation.check(cancellation);
 
-        self.manifests.put(manifest) catch |err| switch (err) {
-            error.ManifestVersionAlreadyExists => return error.HeadChanged,
-            else => return err,
-        };
-        const published = try self.progress.compareAndSwapHead(namespace, if (current_head == 0) null else current_head, next_version);
+        const published_version = try putManifestForPublication(
+            self.manifests,
+            &manifest,
+            if (current_head == 0) null else current_head,
+        );
+        const published = try self.compareAndSwapPublishedHead(
+            namespace,
+            if (current_head == 0) null else current_head,
+            published_version,
+            publication_guard,
+        );
         if (!published) return error.HeadChanged;
 
         return .{
             .namespace = try self.alloc.dupe(u8, namespace),
             .published = true,
-            .version = next_version,
+            .version = published_version,
             .wal_start_lsn = if (inline_document_rebase) wal_end_lsn else start_lsn,
             .wal_end_lsn = wal_end_lsn,
+            .artifact_count = manifest.artifacts.len,
+        };
+    }
+
+    fn publishHeadConsumingIgnoredWal(
+        self: *Builder,
+        namespace: []const u8,
+        current_head: u64,
+        current: manifest_mod.Manifest,
+        last_record: wal_mod.Record,
+        publication_guard: ?work_lease.PublicationGuard,
+        cancellation: ?maintenance_cancellation.Token,
+    ) !BuildResult {
+        try maintenance_cancellation.check(cancellation);
+        var manifest = try manifest_mod.cloneManifest(self.alloc, current);
+        defer manifest.deinit(self.alloc);
+        manifest.version = std.math.add(u64, current_head, 1) catch return error.ManifestVersionExhausted;
+        manifest.built_at_ns = last_record.timestamp_ns;
+        // The cloned artifacts are already a complete published snapshot and
+        // do not depend on any of the ignored mutations. Advance the retained
+        // WAL boundary with the consumed tail so repeated stale work cannot
+        // pin the namespace's entire historical log.
+        manifest.wal_start_lsn = last_record.lsn;
+        manifest.wal_end_lsn = last_record.lsn;
+
+        const published_version = try putManifestForPublication(self.manifests, &manifest, current_head);
+        const published = try self.compareAndSwapPublishedHead(
+            namespace,
+            current_head,
+            published_version,
+            publication_guard,
+        );
+        if (!published) return error.HeadChanged;
+        return .{
+            .namespace = try self.alloc.dupe(u8, namespace),
+            .published = true,
+            .version = published_version,
+            .wal_start_lsn = manifest.wal_start_lsn,
+            .wal_end_lsn = manifest.wal_end_lsn,
             .artifact_count = manifest.artifacts.len,
         };
     }
@@ -444,28 +664,40 @@ pub const Builder = struct {
         version: u64,
         start_lsn: u64,
         plan: publication_plan.TablePublicationPlan,
+        publication_guard: ?work_lease.PublicationGuard,
+        cancellation: ?maintenance_cancellation.Token,
+        consumed_record: ?wal_mod.Record,
     ) !BuildResult {
+        try maintenance_cancellation.check(cancellation);
         var manifest = try buildEmptyExternalManifestAlloc(self.alloc, namespace, version, start_lsn, plan);
         defer manifest.deinit(self.alloc);
+        if (consumed_record) |record| {
+            manifest.built_at_ns = record.timestamp_ns;
+            manifest.wal_start_lsn = record.lsn;
+            manifest.wal_end_lsn = record.lsn;
+        }
         try attachResolvedExternalSourcePlanIfPresent(self.alloc, &manifest, plan);
 
-        self.manifests.put(manifest) catch |err| switch (err) {
-            error.ManifestVersionAlreadyExists => return error.HeadChanged,
-            else => return err,
-        };
-        const published = try self.progress.compareAndSwapHead(
+        try maintenance_cancellation.check(cancellation);
+        const published_version = try putManifestForPublication(
+            self.manifests,
+            &manifest,
+            if (current_head == 0) null else current_head,
+        );
+        const published = try self.compareAndSwapPublishedHead(
             namespace,
             if (current_head == 0) null else current_head,
-            version,
+            published_version,
+            publication_guard,
         );
         if (!published) return error.HeadChanged;
 
         return .{
             .namespace = try self.alloc.dupe(u8, namespace),
             .published = true,
-            .version = version,
-            .wal_start_lsn = start_lsn,
-            .wal_end_lsn = start_lsn - 1,
+            .version = published_version,
+            .wal_start_lsn = manifest.wal_start_lsn,
+            .wal_end_lsn = manifest.wal_end_lsn,
             .artifact_count = manifest.artifacts.len,
         };
     }
@@ -480,7 +712,7 @@ pub const Builder = struct {
         return try self.republishHeadWithPlan(namespace, current_head, vector_metric, .{
             .targets = targets,
             .metadata_republish = .{ .published_search_sources_changed = true },
-        });
+        }, null, null, null);
     }
 
     fn republishHeadWithPlan(
@@ -489,7 +721,11 @@ pub const Builder = struct {
         current_head: u64,
         vector_metric: shared_vector.DistanceMetric,
         plan: publication_plan.TablePublicationPlan,
+        publication_guard: ?work_lease.PublicationGuard,
+        cancellation: ?maintenance_cancellation.Token,
+        consumed_record: ?wal_mod.Record,
     ) !BuildResult {
+        try maintenance_cancellation.check(cancellation);
         const targets = plan.targets;
         var current = try self.manifests.getAlloc(namespace, current_head);
         defer current.deinit(self.alloc);
@@ -520,6 +756,7 @@ pub const Builder = struct {
             break :blk try artifactRefFromMetadataAlloc(self.alloc, .document_segment, document_artifact);
         };
         defer freeArtifactRef(self.alloc, document_ref);
+        try maintenance_cancellation.check(cancellation);
 
         const text_index_specs = try resolvePublishedTextIndexSpecsAlloc(self.alloc, plan.table_definition, plan.full_text_index_actions);
         defer full_text_indexes.freeFullTextIndexSpecs(self.alloc, text_index_specs);
@@ -548,9 +785,11 @@ pub const Builder = struct {
                 text_index_specs,
                 plan.full_text_index_actions,
                 effective_full_text_action,
+                cancellation,
             );
         };
         defer freeArtifactRefs(self.alloc, text_refs);
+        try maintenance_cancellation.check(cancellation);
 
         const republish_docs = if (plan.artifact_actions.sparse_vector == .drop and plan.artifact_actions.dense_vector == .drop)
             &.{}
@@ -564,8 +803,10 @@ pub const Builder = struct {
             targets.published_search_sources,
             plan.sparse_index_actions,
             plan.artifact_actions.sparse_vector,
+            cancellation,
         );
         defer freeArtifactRefs(self.alloc, sparse_refs);
+        try maintenance_cancellation.check(cancellation);
 
         const vector_refs = try buildVectorArtifactRefsForRepublishAlloc(
             self.alloc,
@@ -576,8 +817,10 @@ pub const Builder = struct {
             targets.published_search_sources,
             plan.vector_index_actions,
             plan.artifact_actions.dense_vector,
+            cancellation,
         );
         defer freeArtifactRefs(self.alloc, vector_refs);
+        try maintenance_cancellation.check(cancellation);
 
         const graph_index_names = try listGraphIndexNamesAlloc(self.alloc, plan.table_definition.indexes_json);
         defer freeOwnedStrings(self.alloc, graph_index_names);
@@ -594,8 +837,10 @@ pub const Builder = struct {
             graph_index_names,
             plan.artifact_actions.graph,
             targets.include_graph,
+            cancellation,
         );
         defer freeArtifactRefs(self.alloc, graph_refs);
+        try maintenance_cancellation.check(cancellation);
 
         var scanned_derived_outputs: ?search_sources.MaterializedDerivedOutputs = null;
         defer if (scanned_derived_outputs) |*outputs| search_sources.deinitMaterializedDerivedOutputs(self.alloc, outputs);
@@ -623,13 +868,15 @@ pub const Builder = struct {
             plan.derived_output_actions,
         );
         defer search_sources.deinitMaterializedDerivedOutputs(self.alloc, &derived_outputs);
+        try maintenance_cancellation.check(cancellation);
 
         const next_version = current_head + 1;
+        const wal_end_lsn = if (consumed_record) |record| record.lsn else current.wal_end_lsn;
         var manifest = try buildCompactedManifestFromRefsAlloc(
             self.alloc,
             namespace,
             next_version,
-            current.wal_end_lsn,
+            wal_end_lsn,
             @intCast(current.stats.document_count),
             if (plan.artifact_actions.document_segment == .reuse)
                 if (current.stats.document_base_version != 0) current.stats.document_base_version else current.version
@@ -646,21 +893,29 @@ pub const Builder = struct {
             plan.table_definition,
         );
         defer manifest.deinit(self.alloc);
+        if (consumed_record) |record| manifest.built_at_ns = record.timestamp_ns;
         try attachResolvedExternalSourcePlanIfPresent(self.alloc, &manifest, plan);
 
-        self.manifests.put(manifest) catch |err| switch (err) {
-            error.ManifestVersionAlreadyExists => return error.HeadChanged,
-            else => return err,
-        };
-        const published = try self.progress.compareAndSwapHead(namespace, current_head, next_version);
+        try maintenance_cancellation.check(cancellation);
+        const published_version = try putManifestForPublication(
+            self.manifests,
+            &manifest,
+            current_head,
+        );
+        const published = try self.compareAndSwapPublishedHead(
+            namespace,
+            current_head,
+            published_version,
+            publication_guard,
+        );
         if (!published) return error.HeadChanged;
 
         return .{
             .namespace = try self.alloc.dupe(u8, namespace),
             .published = true,
-            .version = next_version,
-            .wal_start_lsn = current.wal_end_lsn,
-            .wal_end_lsn = current.wal_end_lsn,
+            .version = published_version,
+            .wal_start_lsn = manifest.wal_start_lsn,
+            .wal_end_lsn = manifest.wal_end_lsn,
             .artifact_count = manifest.artifacts.len,
         };
     }
@@ -849,6 +1104,113 @@ pub const Builder = struct {
         };
     }
 };
+
+pub fn compareAndSwapHeadGuarded(
+    progress: *catalog_mod.ProgressStore,
+    namespace: []const u8,
+    expected: ?u64,
+    version: u64,
+    publication_guard: ?work_lease.PublicationGuard,
+) !bool {
+    if (publication_guard) |guard| {
+        if (try guard.preparePublication(namespace)) |fence| {
+            return try progress.compareAndSwapHeadFenced(namespace, expected, version, fence);
+        }
+    }
+    return try progress.compareAndSwapHead(namespace, expected, version);
+}
+
+fn applicableWalRecordsForHeadAlloc(
+    alloc: Allocator,
+    records: []const wal_mod.Record,
+    current_head: u64,
+) ![]wal_mod.Record {
+    const applicable = try alloc.alloc(wal_mod.Record, records.len);
+    errdefer alloc.free(applicable);
+    var count: usize = 0;
+    for (records) |record| {
+        const source_head = try enrichment_operation_id.sourceHeadVersion(record.operation_id);
+        if (source_head != null and source_head.? != current_head) continue;
+        applicable[count] = record;
+        count += 1;
+    }
+    return alloc.realloc(applicable, count);
+}
+
+/// Store an immutable manifest without letting an abandoned version wedge all
+/// later publications. The common path is one PUT; listing is only needed when
+/// an earlier publisher left different contents at the same version.
+pub fn putManifestForPublication(
+    manifests: *manifest_mod.ManifestStore,
+    manifest: *manifest_mod.Manifest,
+    expected_head: ?u64,
+) !u64 {
+    manifest.publication_lineage_tracked = true;
+    manifest.publication_parent_version = expected_head;
+    while (true) {
+        manifests.put(manifest.*) catch |err| switch (err) {
+            error.ManifestVersionAlreadyExists => {
+                const versions = try manifests.listVersionsAlloc(manifest.namespace);
+                defer manifests.allocator.free(versions);
+                var maximum = manifest.version;
+                for (versions) |version| maximum = @max(maximum, version);
+                const replacement = std.math.add(u64, maximum, 1) catch
+                    return error.ManifestVersionExhausted;
+                if (manifest.stats.document_base_version == manifest.version) {
+                    manifest.stats.document_base_version = replacement;
+                }
+                manifest.version = replacement;
+                continue;
+            },
+            else => return err,
+        };
+        return manifest.version;
+    }
+}
+
+test "serverless publication advances past a conflicting orphan manifest" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var manifest_impl = try manifest_object_store.ObjectStore.initWithClient(
+        alloc,
+        memory.client(),
+        "manifests",
+        "tenant",
+    );
+    var manifests = manifest_impl.manifestStore();
+    defer manifests.deinit();
+
+    try manifests.put(.{
+        .namespace = "docs",
+        .version = 1,
+        .built_at_ns = 100,
+        .wal_start_lsn = 1,
+        .wal_end_lsn = 1,
+        .stats = .{ .document_count = 1, .document_base_version = 1 },
+        .artifacts = &.{},
+    });
+    var candidate = manifest_mod.Manifest{
+        .namespace = "docs",
+        .version = 1,
+        .built_at_ns = 200,
+        .wal_start_lsn = 1,
+        .wal_end_lsn = 1,
+        .stats = .{ .document_count = 2, .document_base_version = 1 },
+        .artifacts = &.{},
+    };
+    try std.testing.expectEqual(
+        @as(u64, 2),
+        try putManifestForPublication(&manifests, &candidate, null),
+    );
+    try std.testing.expectEqual(@as(u64, 2), candidate.version);
+    try std.testing.expectEqual(@as(u64, 2), candidate.stats.document_base_version);
+    try std.testing.expect(candidate.publication_lineage_tracked);
+    try std.testing.expectEqual(@as(?u64, null), candidate.publication_parent_version);
+    var stored = try manifests.getAlloc("docs", 2);
+    defer stored.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), stored.stats.document_count);
+}
 
 fn buildManifestAlloc(
     alloc: Allocator,
@@ -1248,21 +1610,108 @@ fn externalSourcePlanMatchesManifest(
         else => false,
     };
     if (!sources_match or plan.artifacts.len == 0) return false;
+
+    // External plans own the external metadata refs, while a published
+    // manifest may also carry unrelated document and search artifacts. Match
+    // the owned refs as an exact multiset so
+    // a logical rename, removal, duplicate, or replacement cannot be mistaken
+    // for an unchanged plan, while a harmless order change does not force a
+    // new publication.
+    for (plan.artifacts) |artifact| {
+        if (artifact.kind != .external_base_source) return false;
+    }
+    var current_external_count: usize = 0;
+    for (manifest.artifacts) |current_artifact| {
+        if (current_artifact.kind == .external_base_source) current_external_count += 1;
+    }
+    if (current_external_count != plan.artifacts.len) return false;
     for (plan.artifacts) |planned_artifact| {
-        var found = false;
-        for (manifest.artifacts) |current_artifact| {
-            if (planned_artifact.kind == current_artifact.kind and
-                std.mem.eql(u8, planned_artifact.artifact_id, current_artifact.artifact_id) and
-                planned_artifact.byte_len == current_artifact.byte_len and
-                std.mem.eql(u8, planned_artifact.checksum, current_artifact.checksum))
-            {
-                found = true;
-                break;
-            }
+        var planned_occurrences: usize = 0;
+        for (plan.artifacts) |candidate| {
+            if (artifactRefEql(planned_artifact, candidate)) planned_occurrences += 1;
         }
-        if (!found) return false;
+        var current_occurrences: usize = 0;
+        for (manifest.artifacts) |candidate| {
+            if (artifactRefEql(planned_artifact, candidate)) current_occurrences += 1;
+        }
+        if (planned_occurrences != current_occurrences) return false;
     }
     return true;
+}
+
+fn artifactRefEql(left: manifest_mod.ArtifactRef, right: manifest_mod.ArtifactRef) bool {
+    return left.kind == right.kind and
+        std.mem.eql(u8, left.name, right.name) and
+        std.mem.eql(u8, left.artifact_id, right.artifact_id) and
+        left.byte_len == right.byte_len and
+        std.mem.eql(u8, left.checksum, right.checksum);
+}
+
+test "serverless external source plan matching is exact over owned artifacts" {
+    const base_source = manifest_mod.BaseSourceDescriptor{ .external_parquet = .{
+        .format = .parquet_prefix,
+        .source_uri = "s3://bucket/events",
+        .snapshot_id = "snapshot-1",
+        .schema_fingerprint = "schema-v1",
+        .file_inventory_artifact = "inventory-1",
+        .row_group_metadata_artifact = "row-groups-1",
+    } };
+    var planned_artifacts = [_]manifest_mod.ArtifactRef{
+        .{
+            .kind = .external_base_source,
+            .name = "events.external-files",
+            .artifact_id = "inventory-1",
+            .byte_len = 128,
+            .checksum = "sha256:inventory-1",
+        },
+        .{
+            .kind = .external_base_source,
+            .name = "events.row-groups",
+            .artifact_id = "row-groups-1",
+            .byte_len = 32,
+            .checksum = "sha256:row-groups-1",
+        },
+    };
+    var current_artifacts = [_]manifest_mod.ArtifactRef{
+        .{
+            .kind = .document_segment,
+            .artifact_id = "documents-1",
+            .byte_len = 64,
+            .checksum = "sha256:documents-1",
+        },
+        planned_artifacts[1],
+        planned_artifacts[0],
+        .{
+            .kind = .external_base_source,
+            .name = "events.deletes",
+            .artifact_id = "deletes-1",
+            .byte_len = 16,
+            .checksum = "sha256:deletes-1",
+        },
+    };
+    const plan = external_source_manifest.Plan{
+        .base_source = base_source,
+        .artifacts = planned_artifacts[0..],
+    };
+    var manifest = manifest_mod.Manifest{
+        .namespace = "events",
+        .version = 1,
+        .built_at_ns = 1,
+        .wal_start_lsn = 1,
+        .wal_end_lsn = 0,
+        .stats = .{},
+        .artifacts = current_artifacts[0..3],
+        .base_source = base_source,
+    };
+
+    try std.testing.expect(externalSourcePlanMatchesManifest(plan, manifest));
+    planned_artifacts[0].name = "events.renamed-files";
+    try std.testing.expect(!externalSourcePlanMatchesManifest(plan, manifest));
+    planned_artifacts[0].name = "events.external-files";
+    manifest.artifacts = current_artifacts[0..2];
+    try std.testing.expect(!externalSourcePlanMatchesManifest(plan, manifest));
+    manifest.artifacts = current_artifacts[0..];
+    try std.testing.expect(!externalSourcePlanMatchesManifest(plan, manifest));
 }
 
 fn externalSourceDescriptorMatches(
@@ -1708,8 +2157,8 @@ fn buildDocumentSegmentAlloc(
     };
 }
 
-fn buildTextSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMaterializedDocument, spec: FullTextIndexSpec) ![]u8 {
-    var segment = try allocTextSegmentAlloc(alloc, docs, spec);
+fn buildTextSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMaterializedDocument, spec: FullTextIndexSpec, cancellation: ?maintenance_cancellation.Token) ![]u8 {
+    var segment = try allocTextSegmentAlloc(alloc, docs, spec, cancellation);
     defer text_segment_mod.freeSegment(alloc, &segment);
     return try text_segment_mod.encodeAlloc(alloc, segment);
 }
@@ -1718,7 +2167,7 @@ fn buildSparseSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMateri
     payload: ?[]u8,
     feature_count: usize,
 } {
-    return try buildSparseSegmentAllocForSource(alloc, docs, search_sources.defaultPublishedSearchSources().findSparse());
+    return try buildSparseSegmentAllocForSource(alloc, docs, search_sources.defaultPublishedSearchSources().findSparse(), null);
 }
 
 fn walEndAsBuiltAtNs(wal_end_lsn: u64) u64 {
@@ -1729,12 +2178,13 @@ fn buildSparseSegmentAllocForSource(
     alloc: Allocator,
     docs: []const query_mod.QueryMaterializedDocument,
     sparse_source: ?search_sources.SparseSourceDescriptor,
+    cancellation: ?maintenance_cancellation.Token,
 ) !struct {
     payload: ?[]u8,
     feature_count: usize,
 } {
     if (sparse_source == null) return .{ .payload = null, .feature_count = 0 };
-    var segment = try allocSparseSegmentAlloc(alloc, docs, sparse_source.?);
+    var segment = try allocSparseSegmentAlloc(alloc, docs, sparse_source.?, cancellation);
     defer if (segment) |*value| sparse_segment_mod.freeSegment(alloc, value);
     if (segment) |value| {
         var total_features: usize = 0;
@@ -1756,18 +2206,41 @@ pub fn buildSparseArtifactRefsForMaterializedDocsAlloc(
     mutations: []const query_mod.QueryMaterializerMutation,
     published_search_sources: search_sources.PublishedSearchSources,
 ) ![]manifest_mod.ArtifactRef {
+    return try buildSparseArtifactRefsForMaterializedDocsAllocUntil(
+        alloc,
+        artifacts,
+        current,
+        before_docs,
+        docs,
+        mutations,
+        published_search_sources,
+        null,
+    );
+}
+
+pub fn buildSparseArtifactRefsForMaterializedDocsAllocUntil(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    current: ?manifest_mod.Manifest,
+    before_docs: []const query_mod.QueryMaterializedDocument,
+    docs: []const query_mod.QueryMaterializedDocument,
+    mutations: []const query_mod.QueryMaterializerMutation,
+    published_search_sources: search_sources.PublishedSearchSources,
+    cancellation: ?maintenance_cancellation.Token,
+) ![]manifest_mod.ArtifactRef {
     const sparse_sources = try search_sources.listSparseSourcesAlloc(alloc, published_search_sources);
     defer search_sources.freeSparseSourceDescriptors(alloc, sparse_sources);
 
     var refs = std.ArrayListUnmanaged(manifest_mod.ArtifactRef).empty;
     errdefer freeArtifactRefs(alloc, refs.items);
     for (sparse_sources) |source| {
+        try maintenance_cancellation.check(cancellation);
         if (current) |manifest| {
             if (!try sparseProjectionChangedForMutationsAlloc(alloc, before_docs, docs, mutations, source)) {
                 if (try appendReusedNamedArtifactRefAlloc(alloc, &refs, manifest, .sparse_segment, source.index_name)) continue;
             }
         }
-        const built = try buildSparseSegmentAllocForSource(alloc, docs, source);
+        const built = try buildSparseSegmentAllocForSource(alloc, docs, source, cancellation);
         defer if (built.payload) |payload| alloc.free(payload);
         if (built.payload) |payload| {
             var artifact = try artifacts.put(payload);
@@ -2591,6 +3064,28 @@ pub fn buildTextArtifactRefsForMaterializedDocsAlloc(
     mutations: []const query_mod.QueryMaterializerMutation,
     text_index_specs: []const FullTextIndexSpec,
 ) ![]manifest_mod.ArtifactRef {
+    return try buildTextArtifactRefsForMaterializedDocsAllocUntil(
+        alloc,
+        artifacts,
+        current,
+        before_docs,
+        docs,
+        mutations,
+        text_index_specs,
+        null,
+    );
+}
+
+pub fn buildTextArtifactRefsForMaterializedDocsAllocUntil(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    current: ?manifest_mod.Manifest,
+    before_docs: []const query_mod.QueryMaterializedDocument,
+    docs: []const query_mod.QueryMaterializedDocument,
+    mutations: []const query_mod.QueryMaterializerMutation,
+    text_index_specs: []const FullTextIndexSpec,
+    cancellation: ?maintenance_cancellation.Token,
+) ![]manifest_mod.ArtifactRef {
     const refs = try alloc.alloc(manifest_mod.ArtifactRef, text_index_specs.len);
     errdefer alloc.free(refs);
     var initialized: usize = 0;
@@ -2599,6 +3094,7 @@ pub fn buildTextArtifactRefsForMaterializedDocsAlloc(
     }
 
     for (text_index_specs, 0..) |spec, idx| {
+        try maintenance_cancellation.check(cancellation);
         if (current) |manifest| {
             if (!try textProjectionChangedForMutationsAlloc(alloc, before_docs, docs, mutations, spec)) {
                 if (try cloneNamedArtifactRefAlloc(alloc, manifest, .text_segment, spec.name)) |artifact| {
@@ -2608,7 +3104,7 @@ pub fn buildTextArtifactRefsForMaterializedDocsAlloc(
                 }
             }
         }
-        const payload = try buildTextSegmentAlloc(alloc, docs, spec);
+        const payload = try buildTextSegmentAlloc(alloc, docs, spec, cancellation);
         defer alloc.free(payload);
         var artifact = try artifacts.put(payload);
         defer artifact.deinit(alloc);
@@ -2626,6 +3122,7 @@ fn buildTextArtifactRefsForRepublishAlloc(
     text_index_specs: []const FullTextIndexSpec,
     planned_actions: []const publication_plan.FullTextIndexAction,
     fallback_action: publication_plan.ArtifactAction,
+    cancellation: ?maintenance_cancellation.Token,
 ) ![]manifest_mod.ArtifactRef {
     const refs = try alloc.alloc(manifest_mod.ArtifactRef, text_index_specs.len);
     errdefer alloc.free(refs);
@@ -2635,6 +3132,7 @@ fn buildTextArtifactRefsForRepublishAlloc(
     }
 
     for (text_index_specs, 0..) |spec, idx| {
+        try maintenance_cancellation.check(cancellation);
         const action = fullTextActionForName(planned_actions, spec.name, fallback_action);
         if (action == .reuse) {
             if (findNamedArtifactIndex(current, .text_segment, spec.name)) |artifact_index| {
@@ -2644,7 +3142,7 @@ fn buildTextArtifactRefsForRepublishAlloc(
                 continue;
             }
         }
-        const payload = try buildTextSegmentAlloc(alloc, docs, spec);
+        const payload = try buildTextSegmentAlloc(alloc, docs, spec, cancellation);
         defer alloc.free(payload);
         var artifact = try artifacts.put(payload);
         defer artifact.deinit(alloc);
@@ -2798,7 +3296,7 @@ fn freeQueryMutations(alloc: Allocator, mutations: []query_mod.QueryMaterializer
     freeMaterializerMutations(alloc, mutations);
 }
 
-fn allocTextSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMaterializedDocument, spec: FullTextIndexSpec) !text_segment_mod.Segment {
+fn allocTextSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMaterializedDocument, spec: FullTextIndexSpec, cancellation: ?maintenance_cancellation.Token) !text_segment_mod.Segment {
     const doc_entries = try alloc.alloc(text_segment_mod.DocumentEntry, docs.len);
     errdefer alloc.free(doc_entries);
 
@@ -2814,6 +3312,7 @@ fn allocTextSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMaterial
     }
 
     for (docs, 0..) |doc, doc_index| {
+        if (doc_index % 64 == 0) try maintenance_cancellation.check(cancellation);
         var projection = try document_projection.parseAlloc(alloc, doc.body);
         defer projection.deinit(alloc);
         const source_text = try selectTextSourceAlloc(alloc, doc.body, &projection, spec);
@@ -2827,6 +3326,7 @@ fn allocTextSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMaterial
 
         var token_iter = std.mem.tokenizeAny(u8, normalized_text, " ");
         while (token_iter.next()) |token| {
+            if (token_count % 256 == 0) try maintenance_cancellation.check(cancellation);
             token_count += 1;
             const gop = try per_doc.getOrPut(alloc, token);
             if (!gop.found_existing) gop.value_ptr.* = 0;
@@ -2858,6 +3358,7 @@ fn allocTextSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMaterial
     }
 
     for (term_map.keys(), 0..) |term, idx| {
+        if (idx % 64 == 0) try maintenance_cancellation.check(cancellation);
         term_entries[idx] = .{
             .term = try alloc.dupe(u8, term),
             .postings = try term_map.values()[idx].toOwnedSlice(alloc),
@@ -2947,6 +3448,7 @@ fn buildVectorSegmentAlloc(
     docs: []const query_mod.QueryMaterializedDocument,
     policy: ?vector_index.BuildPolicy,
     vector_source: ?search_sources.VectorSourceDescriptor,
+    cancellation: ?maintenance_cancellation.Token,
 ) !struct {
     payload: ?[]u8,
     vector_count: usize,
@@ -2955,7 +3457,8 @@ fn buildVectorSegmentAlloc(
     const metric = vector_source.?.distance_metric orelse fallback_metric;
     var dims: ?usize = null;
     var count: usize = 0;
-    for (docs) |doc| {
+    for (docs, 0..) |doc, doc_index| {
+        if (doc_index % 64 == 0) try maintenance_cancellation.check(cancellation);
         var projection = try document_projection.parseAlloc(alloc, doc.body);
         defer projection.deinit(alloc);
         switch (search_sources.selectVectorSource(&projection, vector_source.?)) {
@@ -2982,7 +3485,8 @@ fn buildVectorSegmentAlloc(
         for (entries[0..initialized]) |*entry| entry.deinit(alloc);
     }
 
-    for (docs) |doc| {
+    for (docs, 0..) |doc, doc_index| {
+        if (doc_index % 64 == 0) try maintenance_cancellation.check(cancellation);
         var projection = try document_projection.parseAlloc(alloc, doc.body);
         defer projection.deinit(alloc);
         switch (search_sources.selectVectorSource(&projection, vector_source.?)) {
@@ -3006,10 +3510,14 @@ fn buildVectorSegmentAlloc(
         }
     }
 
-    var segment = if (policy) |value|
-        try vector_index.buildClusteredSegmentWithPolicyAlloc(alloc, metric, @intCast(dims.?), entries, value)
-    else
-        try vector_index.buildClusteredSegmentAlloc(alloc, metric, @intCast(dims.?), entries);
+    var segment = try vector_index.buildClusteredSegmentWithPolicyAllocUntil(
+        alloc,
+        metric,
+        @intCast(dims.?),
+        entries,
+        policy orelse .{},
+        cancellation,
+    );
     defer vector_segment_mod.freeSegment(alloc, &segment);
     return .{
         .payload = try vector_segment_mod.encodeAlloc(alloc, segment),
@@ -3029,12 +3537,41 @@ pub fn buildVectorArtifactRefsForMaterializedDocsAlloc(
     named_policies: []const NamedVectorBuildPolicy,
     published_search_sources: search_sources.PublishedSearchSources,
 ) ![]manifest_mod.ArtifactRef {
+    return try buildVectorArtifactRefsForMaterializedDocsAllocUntil(
+        alloc,
+        artifacts,
+        current,
+        metric,
+        before_docs,
+        docs,
+        mutations,
+        policy,
+        named_policies,
+        published_search_sources,
+        null,
+    );
+}
+
+pub fn buildVectorArtifactRefsForMaterializedDocsAllocUntil(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    current: ?manifest_mod.Manifest,
+    metric: shared_vector.DistanceMetric,
+    before_docs: []const query_mod.QueryMaterializedDocument,
+    docs: []const query_mod.QueryMaterializedDocument,
+    mutations: []const query_mod.QueryMaterializerMutation,
+    policy: ?vector_index.BuildPolicy,
+    named_policies: []const NamedVectorBuildPolicy,
+    published_search_sources: search_sources.PublishedSearchSources,
+    cancellation: ?maintenance_cancellation.Token,
+) ![]manifest_mod.ArtifactRef {
     const vector_sources = try search_sources.listVectorSourcesAlloc(alloc, published_search_sources);
     defer search_sources.freeVectorSourceDescriptors(alloc, vector_sources);
 
     var refs = std.ArrayListUnmanaged(manifest_mod.ArtifactRef).empty;
     errdefer freeArtifactRefs(alloc, refs.items);
     for (vector_sources) |source| {
+        try maintenance_cancellation.check(cancellation);
         if (current) |manifest| {
             if (!try vectorProjectionChangedForMutationsAlloc(alloc, before_docs, docs, mutations, source)) {
                 if (try appendReusedNamedArtifactRefAlloc(alloc, &refs, manifest, .vector_segment, source.index_name)) continue;
@@ -3046,6 +3583,7 @@ pub fn buildVectorArtifactRefsForMaterializedDocsAlloc(
             docs,
             namedVectorBuildPolicyForName(named_policies, source.index_name, policy),
             source,
+            cancellation,
         );
         defer if (built.payload) |payload| alloc.free(payload);
         if (built.payload) |payload| {
@@ -3081,6 +3619,7 @@ fn buildSparseArtifactRefsForRepublishAlloc(
     published_search_sources: search_sources.PublishedSearchSources,
     named_actions: []const publication_plan.NamedArtifactAction,
     fallback_action: publication_plan.ArtifactAction,
+    cancellation: ?maintenance_cancellation.Token,
 ) ![]manifest_mod.ArtifactRef {
     const sparse_sources = try search_sources.listSparseSourcesAlloc(alloc, published_search_sources);
     defer search_sources.freeSparseSourceDescriptors(alloc, sparse_sources);
@@ -3091,6 +3630,7 @@ fn buildSparseArtifactRefsForRepublishAlloc(
     var refs = std.ArrayListUnmanaged(manifest_mod.ArtifactRef).empty;
     errdefer freeArtifactRefs(alloc, refs.items);
     for (sparse_sources) |source| {
+        try maintenance_cancellation.check(cancellation);
         const action = namedArtifactActionForName(named_actions, source.index_name, fallback_action);
         if (action == .drop) continue;
         if (action == .reuse) {
@@ -3110,7 +3650,7 @@ fn buildSparseArtifactRefsForRepublishAlloc(
                 }
             }
         }
-        const built = try buildSparseSegmentAllocForSource(alloc, docs, source);
+        const built = try buildSparseSegmentAllocForSource(alloc, docs, source, cancellation);
         defer if (built.payload) |payload| alloc.free(payload);
         if (built.payload) |payload| {
             var artifact = try artifacts.put(payload);
@@ -3135,6 +3675,7 @@ fn buildVectorArtifactRefsForRepublishAlloc(
     published_search_sources: search_sources.PublishedSearchSources,
     named_actions: []const publication_plan.NamedArtifactAction,
     fallback_action: publication_plan.ArtifactAction,
+    cancellation: ?maintenance_cancellation.Token,
 ) ![]manifest_mod.ArtifactRef {
     const vector_sources = try search_sources.listVectorSourcesAlloc(alloc, published_search_sources);
     defer search_sources.freeVectorSourceDescriptors(alloc, vector_sources);
@@ -3145,6 +3686,7 @@ fn buildVectorArtifactRefsForRepublishAlloc(
     var refs = std.ArrayListUnmanaged(manifest_mod.ArtifactRef).empty;
     errdefer freeArtifactRefs(alloc, refs.items);
     for (vector_sources) |source| {
+        try maintenance_cancellation.check(cancellation);
         const action = namedArtifactActionForName(named_actions, source.index_name, fallback_action);
         if (action == .drop) continue;
         if (action == .reuse) {
@@ -3164,7 +3706,7 @@ fn buildVectorArtifactRefsForRepublishAlloc(
                 }
             }
         }
-        const built = try buildVectorSegmentAlloc(alloc, metric, docs, null, source);
+        const built = try buildVectorSegmentAlloc(alloc, metric, docs, null, source, cancellation);
         defer if (built.payload) |payload| alloc.free(payload);
         if (built.payload) |payload| {
             var artifact = try artifacts.put(payload);
@@ -3191,6 +3733,32 @@ pub fn buildGraphArtifactRefsForMaterializedDocsAlloc(
     graph_index_names: []const []u8,
     include_graph: bool,
 ) ![]manifest_mod.ArtifactRef {
+    return try buildGraphArtifactRefsForMaterializedDocsAllocUntil(
+        alloc,
+        artifacts,
+        source_table,
+        current,
+        before_docs,
+        docs,
+        mutations,
+        graph_index_names,
+        include_graph,
+        null,
+    );
+}
+
+pub fn buildGraphArtifactRefsForMaterializedDocsAllocUntil(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    source_table: []const u8,
+    current: ?manifest_mod.Manifest,
+    before_docs: []const query_mod.QueryMaterializedDocument,
+    docs: []const query_mod.QueryMaterializedDocument,
+    mutations: []const query_mod.QueryMaterializerMutation,
+    graph_index_names: []const []u8,
+    include_graph: bool,
+    cancellation: ?maintenance_cancellation.Token,
+) ![]manifest_mod.ArtifactRef {
     if (!include_graph) return try alloc.alloc(manifest_mod.ArtifactRef, 0);
 
     const changed = try graphProjectionChangedForMutationsAlloc(alloc, before_docs, docs, mutations);
@@ -3205,7 +3773,7 @@ pub fn buildGraphArtifactRefsForMaterializedDocsAlloc(
                 }
             }
         }
-        const built = try buildGraphSegmentAlloc(alloc, source_table, docs, true);
+        const built = try buildGraphSegmentAllocUntil(alloc, source_table, docs, true, cancellation);
         defer if (built.payload) |payload| alloc.free(payload);
         if (built.payload) |payload| {
             var artifact = try artifacts.put(payload);
@@ -3231,7 +3799,7 @@ pub fn buildGraphArtifactRefsForMaterializedDocsAlloc(
         }
     }
 
-    const built = try buildGraphSegmentAlloc(alloc, source_table, docs, true);
+    const built = try buildGraphSegmentAllocUntil(alloc, source_table, docs, true, cancellation);
     defer if (built.payload) |payload| alloc.free(payload);
     if (built.payload) |payload| {
         var artifact = try artifacts.put(payload);
@@ -3260,6 +3828,7 @@ fn buildGraphArtifactRefsForRepublishAlloc(
     graph_index_names: []const []u8,
     action: publication_plan.ArtifactAction,
     include_graph: bool,
+    cancellation: ?maintenance_cancellation.Token,
 ) ![]manifest_mod.ArtifactRef {
     if (!include_graph or action == .drop) return try alloc.alloc(manifest_mod.ArtifactRef, 0);
 
@@ -3272,7 +3841,7 @@ fn buildGraphArtifactRefsForRepublishAlloc(
                 return refs;
             }
         }
-        const built = try buildGraphSegmentAlloc(alloc, source_table, docs, true);
+        const built = try buildGraphSegmentAllocUntil(alloc, source_table, docs, true, cancellation);
         defer if (built.payload) |payload| alloc.free(payload);
         if (built.payload) |payload| {
             var artifact = try artifacts.put(payload);
@@ -3296,7 +3865,7 @@ fn buildGraphArtifactRefsForRepublishAlloc(
         freeArtifactRefs(alloc, refs.items);
     }
 
-    const built = try buildGraphSegmentAlloc(alloc, source_table, docs, true);
+    const built = try buildGraphSegmentAllocUntil(alloc, source_table, docs, true, cancellation);
     defer if (built.payload) |payload| alloc.free(payload);
     if (built.payload) |payload| {
         var artifact = try artifacts.put(payload);
@@ -3523,15 +4092,27 @@ fn predictDerivedOutputAction(
     };
 }
 
+pub const GraphSegmentBuildResult = struct {
+    payload: ?[]u8,
+    edge_count: usize,
+};
+
 pub fn buildGraphSegmentAlloc(
     alloc: Allocator,
     source_table: []const u8,
     docs: []const query_mod.QueryMaterializedDocument,
     include_graph: bool,
-) !struct {
-    payload: ?[]u8,
-    edge_count: usize,
-} {
+) !GraphSegmentBuildResult {
+    return try buildGraphSegmentAllocUntil(alloc, source_table, docs, include_graph, null);
+}
+
+pub fn buildGraphSegmentAllocUntil(
+    alloc: Allocator,
+    source_table: []const u8,
+    docs: []const query_mod.QueryMaterializedDocument,
+    include_graph: bool,
+    cancellation: ?maintenance_cancellation.Token,
+) !GraphSegmentBuildResult {
     if (!include_graph) return .{ .payload = null, .edge_count = 0 };
     var node_map = std.StringArrayHashMapUnmanaged(NodeEdges).empty;
     defer deinitNodeMap(alloc, &node_map);
@@ -3539,7 +4120,8 @@ pub fn buildGraphSegmentAlloc(
     defer deinitNeighborTableMap(alloc, &neighbor_tables);
     var total_edges: usize = 0;
 
-    for (docs) |doc| {
+    for (docs, 0..) |doc, doc_index| {
+        if (doc_index % 64 == 0) try maintenance_cancellation.check(cancellation);
         _ = try ensureNode(alloc, &node_map, doc.doc_id);
         const parsed_edges = try parseGraphEdgesAlloc(alloc, doc.body);
         defer freeParsedGraphEdges(alloc, parsed_edges);
@@ -3576,7 +4158,7 @@ pub fn buildGraphSegmentAlloc(
 
     if (total_edges == 0) return .{ .payload = null, .edge_count = 0 };
 
-    var segment = try nodeMapToSegmentAlloc(alloc, &node_map, &neighbor_tables);
+    var segment = try nodeMapToSegmentAlloc(alloc, &node_map, &neighbor_tables, cancellation);
     defer graph_segment_mod.freeSegment(alloc, &segment);
     return .{
         .payload = try graph_segment_mod.encodeAlloc(alloc, segment),
@@ -3676,6 +4258,7 @@ fn nodeMapToSegmentAlloc(
     alloc: Allocator,
     node_map: *std.StringArrayHashMapUnmanaged(NodeEdges),
     neighbor_table_map: *const std.StringArrayHashMapUnmanaged(void),
+    cancellation: ?maintenance_cancellation.Token,
 ) !graph_segment_mod.Segment {
     const neighbor_tables = try alloc.alloc([]u8, neighbor_table_map.count());
     errdefer if (neighbor_tables.len > 0) alloc.free(neighbor_tables);
@@ -3693,6 +4276,7 @@ fn nodeMapToSegmentAlloc(
     }
 
     for (node_map.keys(), node_map.values(), 0..) |node_id, *node_edges, idx| {
+        if (idx % 64 == 0) try maintenance_cancellation.check(cancellation);
         sortGraphEdges(node_edges.out_edges.items);
         sortGraphEdges(node_edges.in_edges.items);
         adjacencies[idx] = .{
@@ -3769,9 +4353,11 @@ fn allocSparseSegmentAlloc(
     alloc: Allocator,
     docs: []const query_mod.QueryMaterializedDocument,
     sparse_source: search_sources.SparseSourceDescriptor,
+    cancellation: ?maintenance_cancellation.Token,
 ) !?sparse_segment_mod.Segment {
     var sparse_doc_count: usize = 0;
-    for (docs) |doc| {
+    for (docs, 0..) |doc, doc_index| {
+        if (doc_index % 64 == 0) try maintenance_cancellation.check(cancellation);
         var projection = try document_projection.parseAlloc(alloc, doc.body);
         defer projection.deinit(alloc);
         if (search_sources.selectSparseSource(&projection, sparse_source) != null) sparse_doc_count += 1;
@@ -3792,7 +4378,8 @@ fn allocSparseSegmentAlloc(
         term_map.deinit(alloc);
     }
 
-    for (docs) |doc| {
+    for (docs, 0..) |doc, doc_index| {
+        if (doc_index % 64 == 0) try maintenance_cancellation.check(cancellation);
         var projection = try document_projection.parseAlloc(alloc, doc.body);
         defer projection.deinit(alloc);
         const sparse_embedding = search_sources.selectSparseSource(&projection, sparse_source) orelse continue;
@@ -5610,6 +6197,53 @@ test "serverless builder publishes initial external manifest without wal records
     try std.testing.expect(!unchanged.published);
     try std.testing.expectEqual(@as(u64, 1), unchanged.version);
 
+    // A content-addressed inventory can retain the same bytes while its
+    // logical manifest name changes. Consume a stale enrichment record in the
+    // same publication and prove the renamed external plan is not mistaken
+    // for the current plan merely because its content identity is unchanged.
+    try std.testing.expectEqual(
+        @as(?u64, 1),
+        try wal_store.appendIdempotentIfLatest(
+            "events",
+            99,
+            "ignored-stale-enrichment",
+            "enrich-v1/2/1/0/1",
+            0,
+        ),
+    );
+    var renamed_plan = try external_source_manifest.planAlloc(
+        alloc,
+        .parquet_prefix,
+        "s3://bucket/events",
+        "snapshot-1",
+        "schema-v1",
+        .{
+            .artifact_id = "external-inventory-1",
+            .byte_len = 128,
+            .checksum = "sha256:inventory-1",
+            .name = "events.external-files",
+        },
+    );
+    defer renamed_plan.deinit(alloc);
+    var renamed = try builder.publishNamespaceWithMetricAndPlan("events", .cosine, .{
+        .targets = .{ .published_search_sources = search_sources.defaultPublishedSearchSources() },
+        .external_source_plan = renamed_plan,
+        .table_definition = .{
+            .schema_json = @constCast("{\"storage_mode\":\"relational\"}"),
+            .read_schema_json = @constCast("{}"),
+            .indexes_json = @constCast("{}"),
+        },
+    });
+    defer renamed.deinit(alloc);
+    try std.testing.expect(renamed.published);
+    try std.testing.expectEqual(@as(u64, 2), renamed.version);
+    try std.testing.expectEqual(@as(u64, 1), renamed.wal_start_lsn);
+    try std.testing.expectEqual(@as(u64, 1), renamed.wal_end_lsn);
+    var renamed_manifest = try manifest_store.getAlloc("events", 2);
+    defer renamed_manifest.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), renamed_manifest.artifacts.len);
+    try std.testing.expectEqualStrings("events.external-files", renamed_manifest.artifacts[0].name);
+
     var updated_plan = try external_source_manifest.planAlloc(
         alloc,
         .parquet_prefix,
@@ -5620,6 +6254,7 @@ test "serverless builder publishes initial external manifest without wal records
             .artifact_id = "external-inventory-2",
             .byte_len = 144,
             .checksum = "sha256:inventory-2",
+            .name = "events.external-files",
         },
     );
     defer updated_plan.deinit(alloc);
@@ -5634,9 +6269,9 @@ test "serverless builder publishes initial external manifest without wal records
     });
     defer updated.deinit(alloc);
     try std.testing.expect(updated.published);
-    try std.testing.expectEqual(@as(u64, 2), updated.version);
+    try std.testing.expectEqual(@as(u64, 3), updated.version);
 
-    var updated_manifest = try manifest_store.getAlloc("events", 2);
+    var updated_manifest = try manifest_store.getAlloc("events", 3);
     defer updated_manifest.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), updated_manifest.artifacts.len);
     try std.testing.expectEqualStrings("external-inventory-2", updated_manifest.artifacts[0].artifact_id);
@@ -5658,7 +6293,7 @@ test "serverless builder publishes initial external manifest without wal records
             .indexes_json = @constCast("{}"),
         },
     }));
-    try std.testing.expectEqual(@as(u64, 2), try progress_store.getHead("events"));
+    try std.testing.expectEqual(@as(u64, 3), try progress_store.getHead("events"));
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

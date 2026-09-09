@@ -203,13 +203,7 @@ pub const ScratchHandle = struct {
 };
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) {
-        if (builtin.os.tag == .freestanding) {
-            std.atomic.spinLoopHint();
-        } else {
-            std.Thread.yield() catch {};
-        }
-    }
+    @import("antfly_platform").sync.lockYielding(mutex);
 }
 
 fn nodeCacheValueType(self: anytype) type {

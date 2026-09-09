@@ -1057,6 +1057,7 @@ test "catalog route fence dispatch is strict and fail closed" {
         },
     };
     fence.admission_deadline_ns = 999;
+    fence.admission_deadline_io = @import("../runtime_io_abi.zig").Borrow.init(&std.testing.io);
     fence.admission_cancellation = CancellationToken.fromAtomic(&wire_cancellation);
     const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, fence, .{});
     defer std.testing.allocator.free(encoded);

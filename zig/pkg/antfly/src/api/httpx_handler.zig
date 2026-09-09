@@ -649,11 +649,14 @@ pub const AntflyApiHandler = struct {
 
     fn recordRequest(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
         self.api_server.recordHandledRequest();
+        try self.api_server.reachRequestLifecycle(.ingress, null);
         establishInternalTxnPreDecisionDeadline(ctx);
         establishInternalTxnStatusDeadline(ctx);
         establishInternalBackupDeadline(ctx);
         establishCatalogRouteFenceDeadline(ctx);
-        return next.call(ctx) catch |err| mapIngressError(ctx, err);
+        const response = next.call(ctx) catch |err| try mapIngressError(ctx, err);
+        try self.api_server.reachRequestLifecycle(.response_ready, null);
+        return response;
     }
 
     fn decodeRequestContent(_: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
@@ -687,7 +690,8 @@ pub const AntflyApiHandler = struct {
         else
             metadata_api.catalog_route_default_deadline_ms;
         const bounded_ms = @max(@as(u32, 1), @min(budget_ms, metadata_api.catalog_route_max_deadline_ms));
-        ctx.application_deadline_ns = platform_time.monotonicNs() +|
+        ctx.application_deadline_io = ctx.io;
+        ctx.application_deadline_ns = @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, ctx.io).nanoseconds))) +|
             @as(u64, bounded_ms) *| std.time.ns_per_ms;
     }
 
@@ -704,7 +708,8 @@ pub const AntflyApiHandler = struct {
             ctx.application_deadline_invalid = true;
             return;
         }
-        ctx.application_deadline_ns = platform_time.monotonicNs() +|
+        ctx.application_deadline_io = ctx.io;
+        ctx.application_deadline_ns = @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, ctx.io).nanoseconds))) +|
             @as(u64, budget_ms) *| std.time.ns_per_ms;
     }
 
@@ -796,12 +801,24 @@ pub const AntflyApiHandler = struct {
     /// application configuration or error classification.
     pub fn dispatchLinkedRoute(self: *AntflyApiHandler, ctx: *httpx.Context, route_handler: httpx.Handler) !httpx.Response {
         self.api_server.recordHandledRequest();
+        try self.api_server.reachRequestLifecycle(.ingress, null);
         establishInternalTxnPreDecisionDeadline(ctx);
-        if (try self.haMutationRejection(ctx)) |response| return response;
-        if (try self.internalServiceAuthRejection(ctx)) |response| return response;
-        if (ctx.application_deadline_invalid)
-            return textResponse(ctx, 400, "invalid transaction deadline");
-        return route_handler.invoke(ctx) catch |err| mapIngressError(ctx, err);
+        if (try self.haMutationRejection(ctx)) |response| {
+            try self.api_server.reachRequestLifecycle(.response_ready, null);
+            return response;
+        }
+        if (try self.internalServiceAuthRejection(ctx)) |response| {
+            try self.api_server.reachRequestLifecycle(.response_ready, null);
+            return response;
+        }
+        if (ctx.application_deadline_invalid) {
+            const response = try textResponse(ctx, 400, "invalid transaction deadline");
+            try self.api_server.reachRequestLifecycle(.response_ready, null);
+            return response;
+        }
+        const response = route_handler.invoke(ctx) catch |err| try mapIngressError(ctx, err);
+        try self.api_server.reachRequestLifecycle(.response_ready, null);
+        return response;
     }
 
     /// Applies the kernel-owned internal-service boundary to a host-registered
@@ -1490,6 +1507,7 @@ pub const AntflyApiHandler = struct {
                 }.call,
             } else .none,
             .deadline_ns = ctx.application_deadline_ns,
+            .deadline_io = if (ctx.application_deadline_io) |io| @import("../runtime_io_abi.zig").Borrow.init(&io) else null,
             .request_id = ctx.header("x-request-id") orelse "",
             .principal = if (identity) |authenticated| .{
                 .kind = .user,
@@ -1868,8 +1886,8 @@ pub const AntflyApiHandler = struct {
             error.Unsupported => textResponse(ctx, 405, "method not allowed"),
             error.TopologyChanged => textResponse(ctx, 409, "topology changed"),
             error.IdentityReadGenerationChanged => textResponse(ctx, 409, "identity read generation changed"),
-            error.StorageReadTemporarilyUnavailable => textResponse(ctx, 503, "storage read temporarily unavailable"),
             error.GroupLeaderUnavailable => textResponse(ctx, 503, "group leader unavailable"),
+            error.StorageReadTemporarilyUnavailable => textResponse(ctx, 503, "storage read temporarily unavailable"),
             error.Unavailable => textResponse(ctx, 503, "temporarily unavailable"),
             error.Canceled => textResponse(ctx, 408, "request canceled"),
             error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
@@ -3058,12 +3076,23 @@ pub const AntflyApiHandler = struct {
     ) !?httpx.Response {
         const class = comptime request_admission_policy.publicOperationClass(operation_id) orelse
             @compileError("public operation is missing an admission policy: " ++ operation_id);
-        return switch (class) {
+        const acquired = switch (class) {
             .none => @compileError("operation does not use foreground admission: " ++ operation_id),
-            .query => if (self.api_server.tryAcquireQuery()) null else try queryOverloadedResponse(ctx),
-            .write => if (self.api_server.tryAcquireWrite()) null else try writeOverloadedResponse(ctx),
-            .inference => if (self.api_server.tryAcquireInference()) null else try inferenceOverloadedResponse(ctx),
+            .query => self.api_server.tryAcquireQuery(),
+            .write => self.api_server.tryAcquireWrite(),
+            .inference => self.api_server.tryAcquireInference(),
         };
+        if (!acquired) return switch (class) {
+            .none => unreachable,
+            .query => try queryOverloadedResponse(ctx),
+            .write => try writeOverloadedResponse(ctx),
+            .inference => try inferenceOverloadedResponse(ctx),
+        };
+        self.api_server.reachRequestLifecycle(.admission_acquired, operation_id) catch |err| {
+            self.releasePublicOperation(operation_id);
+            return err;
+        };
+        return null;
     }
 
     fn releasePublicOperation(self: *AntflyApiHandler, comptime operation_id: []const u8) void {
@@ -5610,11 +5639,38 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(503);
                 return ctx.text("standby read unavailable");
             },
+            error.NotLeader,
+            error.LeaderUnavailable,
+            error.GroupLeaderUnavailable,
+            error.UnknownGroup,
+            => {
+                _ = ctx.status(503);
+                return ctx.text("group leader unavailable");
+            },
             error.PersistentDescriptorAdmissionExhausted,
+            error.ResourceBudgetExceeded,
+            error.WriterLocked,
+            error.LsmRootWriterAlreadyOpen,
+            error.ResidentDbRetryRequired,
             error.StorageReadTemporarilyUnavailable,
             => {
                 var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
                 return respondOwnedApiResponse(ctx, &response);
+            },
+            error.TopologyChanged,
+            error.IdentityReadGenerationChanged,
+            error.DocIdentityNamespaceMismatch,
+            => {
+                _ = ctx.status(409);
+                return ctx.text("read topology changed");
+            },
+            error.Timeout, error.DeadlineExceeded => {
+                _ = ctx.status(504);
+                return ctx.text("request deadline exceeded");
+            },
+            error.Cancelled, error.Canceled => {
+                _ = ctx.status(408);
+                return ctx.text("request canceled");
             },
             else => return err,
         }) orelse {
@@ -5671,11 +5727,38 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(503);
                 return ctx.text("standby read unavailable");
             },
+            error.NotLeader,
+            error.LeaderUnavailable,
+            error.GroupLeaderUnavailable,
+            error.UnknownGroup,
+            => {
+                _ = ctx.status(503);
+                return ctx.text("group leader unavailable");
+            },
             error.PersistentDescriptorAdmissionExhausted,
+            error.ResourceBudgetExceeded,
+            error.WriterLocked,
+            error.LsmRootWriterAlreadyOpen,
+            error.ResidentDbRetryRequired,
             error.StorageReadTemporarilyUnavailable,
             => {
                 var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
                 return respondOwnedApiResponse(ctx, &response);
+            },
+            error.TopologyChanged,
+            error.IdentityReadGenerationChanged,
+            error.DocIdentityNamespaceMismatch,
+            => {
+                _ = ctx.status(409);
+                return ctx.text("read topology changed");
+            },
+            error.Timeout, error.DeadlineExceeded => {
+                _ = ctx.status(504);
+                return ctx.text("request deadline exceeded");
+            },
+            error.Cancelled, error.Canceled => {
+                _ = ctx.status(408);
+                return ctx.text("request canceled");
             },
             else => return err,
         }) orelse {
@@ -6694,7 +6777,7 @@ const HttpxE2eServer = struct {
     io_impl: std.Io.Threaded,
     server: httpx.Server,
     handler: AntflyApiHandler,
-    thread: ?std.Thread = null,
+    thread: ?std.Io.Future(void) = null,
 
     fn init(self: *HttpxE2eServer, allocator: std.mem.Allocator, api_server: *ApiHttpServer) !void {
         return self.initWithLimits(allocator, api_server, 32, 1_000);
@@ -6736,13 +6819,13 @@ const HttpxE2eServer = struct {
         try self.handler.registerRoutes(&self.server);
 
         try self.server.bind();
-        self.thread = try std.Thread.spawn(.{}, listenHttpxE2eServer, .{&self.server});
+        self.thread = try std.testing.io.concurrent(listenHttpxE2eServer, .{&self.server});
     }
 
     fn deinit(self: *HttpxE2eServer) void {
-        if (self.thread) |thread| {
+        if (self.thread) |*thread| {
             self.server.stop();
-            thread.join();
+            thread.await(std.testing.io);
         }
         self.handler.deinitRuntime();
         self.server.deinit();
@@ -7225,6 +7308,27 @@ test "internal transaction HTTP responses prove not-proposed only before decisio
 }
 
 test "internal transaction ingress establishes and validates pre-decision deadline" {
+    // Routed reads use the transport's clock even when the host epoch is
+    // unrelated. Transaction-only ingress retains its native contract.
+    {
+        var sim = try @import("vopr").vopr_io.VoprIo.init(.{});
+        defer sim.deinit();
+        var routed_request = try httpx.Request.init(std.testing.allocator, .GET, "http://node/internal/v1/groups/7/tables/docs/lookup/doc");
+        defer routed_request.deinit();
+        try routed_request.setHeader(metadata_api.catalog_route_fence_header, "{}");
+        try routed_request.setHeader(metadata_api.catalog_route_deadline_ms_header, "250");
+        var routed_ctx = httpx.Context.init(std.testing.allocator, sim.io(), &routed_request);
+        defer routed_ctx.deinit();
+        AntflyApiHandler.establishCatalogRouteFenceDeadline(&routed_ctx);
+        const operation = AntflyApiHandler.operationContext(&routed_ctx, null);
+        try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), operation.deadline_ns.?);
+        try operation.ensureActive();
+        const options = db_mod.types.LookupOptions{ .execution_deadline_ns = operation.deadline_ns, .execution_io = operation.deadline_io };
+        try std.testing.expectEqual(@as(u64, 0), options.executionNowNs());
+        sim.monotonic_ns = 250 * std.time.ns_per_ms;
+        try std.testing.expectError(error.DeadlineExceeded, operation.ensureActive());
+        try std.testing.expect(options.executionNowNs() >= options.execution_deadline_ns.?);
+    }
     const budget_ms: u32 = 250;
     var request = try httpx.Request.init(
         std.testing.allocator,
@@ -7235,9 +7339,9 @@ test "internal transaction ingress establishes and validates pre-decision deadli
     try request.setHeader(distributed_txn_contract.pre_decision_remaining_ms_header, "250");
     var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
     defer ctx.deinit();
-    const before_ns = platform_time.monotonicNs();
+    const before_ns = @as(u64, @intCast(std.Io.Clock.now(.awake, ctx.io).nanoseconds));
     AntflyApiHandler.establishInternalTxnPreDecisionDeadline(&ctx);
-    const after_ns = platform_time.monotonicNs();
+    const after_ns = @as(u64, @intCast(std.Io.Clock.now(.awake, ctx.io).nanoseconds));
     const deadline_ns = ctx.application_deadline_ns.?;
     try std.testing.expect(deadline_ns >= before_ns + budget_ms * std.time.ns_per_ms);
     try std.testing.expect(deadline_ns <= after_ns + budget_ms * std.time.ns_per_ms);
@@ -8443,6 +8547,56 @@ test "httpx owned response preserves retryable JSON metadata" {
     );
 }
 
+test "httpx request lifecycle hook suspends after admission without leaking capacity" {
+    const Probe = struct {
+        calls: usize = 0,
+        fail: bool = false,
+        last_phase: http_server_mod.RequestLifecyclePhase = .ingress,
+        last_operation: ?[]const u8 = null,
+
+        fn hook(self: *@This()) http_server_mod.RequestLifecycleHook {
+            return .{ .ptr = self, .reach_fn = reach };
+        }
+
+        fn reach(ptr: *anyopaque, event: http_server_mod.RequestLifecycleEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.last_phase = event.phase;
+            self.last_operation = event.operation_id;
+            if (self.fail) return error.InjectedLifecycleSuspension;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var probe = Probe{};
+    var source = AuthStatusSource{};
+    var api_server = ApiHttpServer.init(alloc, .{
+        .query_max_concurrent_requests = 1,
+        .request_lifecycle_hook = probe.hook(),
+    }, source.iface(), null, null);
+    defer api_server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &api_server };
+
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/query");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+
+    try std.testing.expect((try handler.acquirePublicOperation(&ctx, "queryTable")) == null);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(http_server_mod.RequestLifecyclePhase.admission_acquired, probe.last_phase);
+    try std.testing.expectEqualStrings("queryTable", probe.last_operation.?);
+    try std.testing.expectEqual(@as(usize, 1), api_server.queryAdmissionStats().in_flight);
+    handler.releasePublicOperation("queryTable");
+
+    probe.fail = true;
+    try std.testing.expectError(
+        error.InjectedLifecycleSuspension,
+        handler.acquirePublicOperation(&ctx, "queryTable"),
+    );
+    try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().in_flight);
+}
+
 test "httpx query admission rejects saturated queries without blocking control routes" {
     const alloc = std.testing.allocator;
     var source = AuthStatusSource{};
@@ -9252,7 +9406,7 @@ test "httpx antfly lookup route preserves projection and headers" {
         .timestamp_ns = 4321,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var source = LookupStatusSource{};
     var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), table_source.source(), null);
 
@@ -9379,7 +9533,7 @@ test "httpx antfly scan honors optional body and documented bad requests" {
         .timestamp_ns = 4321,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var source = LookupStatusSource{};
     var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), table_source.source(), null);
 
@@ -9450,7 +9604,7 @@ test "httpx antfly lookup decodes percent-encoded path keys" {
         .timestamp_ns = 4321,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var source = LookupStatusSource{};
     var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), table_source.source(), null);
 
@@ -9638,7 +9792,7 @@ test "httpx query endpoints accept ndjson multiquery bodies" {
         .timestamp_ns = 4321,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var source = LookupStatusSource{};
     var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), table_source.source(), null);
 

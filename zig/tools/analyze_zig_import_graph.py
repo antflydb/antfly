@@ -53,7 +53,7 @@ CODEGEN_BOUNDARIES = (
     ("metadata/domain.zig", "metadata/runtime.zig"),
     ("data/runtime.zig", "metadata/runtime.zig"),
     ("metadata/runtime.zig", "data/runtime.zig"),
-    ("raft/mod.zig", "metadata/sim_harness.zig"),
+    ("raft/mod.zig", "metadata/vopr_harness.zig"),
     ("standalone/inference_host.zig", "standalone/runtime.zig"),
     ("standalone/inference_host.zig", "data/runtime.zig"),
     ("standalone/inference_host.zig", "metadata/runtime.zig"),

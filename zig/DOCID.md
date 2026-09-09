@@ -1504,8 +1504,8 @@ Status as of 2026-05-19:
 
   ```sh
   zig build antfly-integration-test antfly-storage-db-test antfly-raft-test \
-    antfly-metadata-transition-chaos-test antfly-metadata-public-chaos-test \
-    antfly-storage-lsm-backend-chaos-test
+    lib-metadata-vopr-transition-chaos-test lib-metadata-vopr-public-chaos-test \
+    lib-lsm-backend-chaos-test
   ```
 
   A local operational pass at
@@ -1755,7 +1755,7 @@ Status as of 2026-05-19:
   from the source range's identity domain before opening the destination DB.
   Fresh split handoff rows therefore preserve source-range ordinals instead of
   allocating a destination-range namespace or falling back to the default
-  compatibility namespace. The metadata simulation split runtime now mirrors
+  compatibility namespace. The metadata VOPR split runtime now mirrors
   that behavior by preserving source runtime identity telemetry for the
   destination DB, so transition simulation tests do not hide namespace bugs.
   Existing or restored stores keep their persisted namespace through
@@ -1788,7 +1788,7 @@ Status as of 2026-05-19:
   the merge coordinator for the opt-in transition action, and replays donor
   documents under that receiver namespace during catch-up. The focused DOCID
   gate now depends on the data-runtime split and merge fallback tests plus the
-  fast metadata simulation smoke tests for split namespace derivation and merge
+  fast metadata VOPR smoke tests for split namespace derivation and merge
   reassignment opt-in recording. It also runs the public metadata split/merge
   lifecycle simulations that exercise forwarded public transition requests,
   post-split multi-range read readiness, and post-merge routing over
@@ -1838,7 +1838,7 @@ Status as of 2026-05-19:
   phases does not erase the decision. Merge runtime status reports the persisted
   opt-in as an internal lifecycle fact, the transition-service queue path has
   focused coverage that cloned merge records dispatch the same callback,
-  metadata simulations now record the same transition-runtime callback, and
+  metadata VOPR tests now record the same transition-runtime callback, and
   raft HTTP-host merge simulations now model the callback before accept,
   catch-up, and finalize actions when a queued merge transition carries the
   reassignment opt-in. This keeps the service-lane simulation aligned with the

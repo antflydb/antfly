@@ -465,6 +465,7 @@ test "clip preprocessing encoded production path matches full tensor contract" {
     const alloc = std.testing.allocator;
     const target_size: usize = 224;
     const output = try preprocessClipBatch(
+        std.testing.io,
         alloc,
         &.{&clip_contract_png_16x8},
         target_size,
@@ -572,25 +573,31 @@ test "clip batch preprocessing matches single image preprocessing" {
     const alloc = std.testing.allocator;
     const images = [_][]const u8{ red_png_2x2[0..], red_png_2x2[0..] };
 
-    const batch = try preprocessClipBatch(
-        alloc,
-        &images,
-        2,
-        .{ 0.0, 0.0, 0.0 },
-        .{ 1.0, 1.0, 1.0 },
-    );
-    defer alloc.free(batch);
-    const single = try preprocessClipBatch(
-        alloc,
-        images[0..1],
-        2,
-        .{ 0.0, 0.0, 0.0 },
-        .{ 1.0, 1.0, 1.0 },
-    );
-    defer alloc.free(single);
+    var inline_io = std.Io.Threaded.init(alloc, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
+    defer inline_io.deinit();
+    for ([_]std.Io{ std.testing.io, inline_io.io() }) |io| {
+        const batch = try preprocessClipBatch(
+            io,
+            alloc,
+            &images,
+            2,
+            .{ 0.0, 0.0, 0.0 },
+            .{ 1.0, 1.0, 1.0 },
+        );
+        defer alloc.free(batch);
+        const single = try preprocessClipBatch(
+            std.testing.io,
+            alloc,
+            images[0..1],
+            2,
+            .{ 0.0, 0.0, 0.0 },
+            .{ 1.0, 1.0, 1.0 },
+        );
+        defer alloc.free(single);
 
-    try std.testing.expectEqualSlices(f32, single, batch[0..single.len]);
-    try std.testing.expectEqualSlices(f32, single, batch[single.len .. single.len * 2]);
+        try std.testing.expectEqualSlices(f32, single, batch[0..single.len]);
+        try std.testing.expectEqualSlices(f32, single, batch[single.len .. single.len * 2]);
+    }
 }
 
 test "decode png fixture dimensions are stable" {
@@ -1024,6 +1031,7 @@ pub fn preprocessBatch(
 /// Preprocess CLIP embedding images: resize the shortest edge to target_size,
 /// center crop target_size x target_size, and normalize to CHW f32.
 pub fn preprocessClipBatch(
+    io: std.Io,
     allocator: std.mem.Allocator,
     image_list: []const []const u8,
     target_size: u32,
@@ -1036,7 +1044,7 @@ pub fn preprocessClipBatch(
     errdefer allocator.free(result);
 
     if (image_list.len > 1) {
-        try preprocessClipBatchParallel(image_list, result, per_image, target_size, mean, std_dev);
+        try preprocessClipBatchParallel(io, image_list, result, per_image, target_size, mean, std_dev);
         return result;
     }
 
@@ -1093,6 +1101,7 @@ const ClipPreprocessWorker = struct {
 };
 
 fn preprocessClipBatchParallel(
+    io: std.Io,
     image_list: []const []const u8,
     result: []f32,
     per_image: usize,
@@ -1126,18 +1135,13 @@ fn preprocessClipBatchParallel(
         .std_dev = std_dev,
     };
     var workers: [max_clip_preprocess_threads]ClipPreprocessWorker = undefined;
-    var threads: [max_clip_preprocess_threads]std.Thread = undefined;
-    var spawned: usize = 0;
-
-    while (spawned < thread_count) : (spawned += 1) {
-        workers[spawned] = .{ .batch = &batch };
-        threads[spawned] = std.Thread.spawn(.{}, ClipPreprocessWorker.run, .{&workers[spawned]}) catch |err| {
-            for (threads[0..spawned]) |thread| thread.join();
-            return err;
-        };
-    }
-    for (threads[0..spawned]) |thread| thread.join();
-    for (workers[0..spawned]) |worker| {
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (workers[0..thread_count]) |*worker| worker.* = .{ .batch = &batch };
+    for (workers[0 .. thread_count - 1]) |*worker| group.async(io, ClipPreprocessWorker.run, .{worker});
+    workers[thread_count - 1].run();
+    try group.await(io);
+    for (workers[0..thread_count]) |worker| {
         if (worker.err) |err| return err;
     }
 }
@@ -1302,4 +1306,20 @@ fn toSharedImage(img: Image) ImageU8 {
             else => .rgb8,
         },
     };
+}
+
+test "clip batch preprocessing drains workers before returning an image error" {
+    var inline_io = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
+    defer inline_io.deinit();
+    const images = [_][]const u8{ red_png_2x2[0..], "invalid image", red_png_2x2[0..] };
+    for ([_]std.Io{ std.testing.io, inline_io.io() }) |io| {
+        try std.testing.expectError(error.ImageDecodeFailed, preprocessClipBatch(
+            io,
+            std.testing.allocator,
+            &images,
+            2,
+            .{ 0, 0, 0 },
+            .{ 1, 1, 1 },
+        ));
+    }
 }

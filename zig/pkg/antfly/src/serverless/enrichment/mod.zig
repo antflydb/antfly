@@ -14,6 +14,7 @@
 
 pub const pipeline = @import("pipeline.zig");
 pub const worker = @import("worker.zig");
+pub const operation_id = @import("operation_id.zig");
 
 pub const BuiltinPipeline = pipeline.BuiltinPipeline;
 pub const StageSpec = pipeline.StageSpec;

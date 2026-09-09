@@ -133,13 +133,13 @@ const LatencyStats = struct {
 };
 
 const Barrier = struct {
+    io: std.Io,
     waiting: std.atomic.Value(usize) = .init(0),
-    open: std.atomic.Value(bool) = .init(false),
+    open: std.Io.Event = .unset,
 
     fn wait(self: *@This(), total: usize) void {
-        const previous = self.waiting.fetchAdd(1, .acq_rel);
-        if (previous + 1 == total) self.open.store(true, .release);
-        while (!self.open.load(.acquire)) std.Thread.yield() catch {};
+        if (self.waiting.fetchAdd(1, .acq_rel) + 1 == total) self.open.set(self.io);
+        self.open.waitUncancelable(self.io);
     }
 };
 
@@ -663,15 +663,19 @@ fn benchConcurrentReadHits(
     repeats: usize,
 ) !LatencyStats {
     if (keys.len == 0 or threads_count == 0 or repeats == 0) return .{};
-    var barrier = Barrier{};
+    var worker_io = std.Io.Threaded.init(allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(threads_count) });
+    defer worker_io.deinit();
+    const scheduling_io = worker_io.io();
+    var barrier = Barrier{ .io = scheduling_io };
     const workers = try allocator.alloc(ConcurrentReadWorker, threads_count);
     defer allocator.free(workers);
-    var threads = try allocator.alloc(std.Thread, threads_count);
+    const threads = try allocator.alloc(std.Io.Future(void), threads_count);
     defer allocator.free(threads);
 
     var started: usize = 0;
     errdefer {
-        for (threads[0..started]) |thread| thread.join();
+        barrier.open.set(scheduling_io);
+        for (threads[0..started]) |*future| future.await(scheduling_io);
     }
 
     for (workers, 0..) |*worker, i| {
@@ -681,12 +685,12 @@ fn benchConcurrentReadHits(
             .keys = keys,
             .repeats = repeats,
         };
-        threads[i] = try std.Thread.spawn(.{}, ConcurrentReadWorker.run, .{ worker, threads_count });
+        threads[i] = try scheduling_io.concurrent(ConcurrentReadWorker.run, .{ worker, threads_count });
         started += 1;
     }
 
     var total: LatencyStats = .{};
-    for (threads[0..started]) |thread| thread.join();
+    for (threads[0..started]) |*future| future.await(scheduling_io);
     started = 0;
     for (workers) |worker| {
         if (worker.err) |err| return err;

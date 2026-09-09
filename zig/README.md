@@ -103,7 +103,7 @@ zig build antfly-storage-test
 zig build antfly-metadata-test
 zig build lib-image-test
 zig build antfly-audio-test
-zig build antfly-raft-sim-test
+zig build raft-vopr-test
 zig build inference-test
 ```
 

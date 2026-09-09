@@ -3233,8 +3233,8 @@ test "blocked reconcile preparation does not block existing raft progress" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     const BlockingBootstrapper = struct {
-        entered: std.atomic.Value(bool) = .init(false),
-        release: std.atomic.Value(bool) = .init(false),
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
 
         fn iface(self: *@This()) host_mod.BackupRestoreBootstrapper {
             return .{
@@ -3245,8 +3245,8 @@ test "blocked reconcile preparation does not block existing raft progress" {
 
         fn prepareBackupRestore(ptr: *anyopaque, _: catalog.ReplicaRecord) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            self.entered.set(std.testing.io);
+            self.release.waitUncancelable(std.testing.io);
         }
     };
     const PrepareThread = struct {
@@ -3306,22 +3306,22 @@ test "blocked reconcile preparation does not block existing raft progress" {
     prepared.beginPreparation();
 
     var prepare_thread = PrepareThread{ .prepared = &prepared };
-    const thread = try std.Thread.spawn(.{}, PrepareThread.run, .{&prepare_thread});
+    var thread = try std.testing.io.concurrent(PrepareThread.run, .{&prepare_thread});
     var thread_joined = false;
     defer {
         if (!thread_joined) {
-            bootstrapper.release.store(true, .release);
-            thread.join();
+            bootstrapper.release.set(std.testing.io);
+            thread.await(std.testing.io);
         }
     }
-    while (!bootstrapper.entered.load(.acquire)) std.Thread.yield() catch {};
+    bootstrapper.entered.waitUncancelable(std.testing.io);
 
     const rounds_before = host.metricsSnapshot().runtime_rounds;
     _ = try host.runRound(1, 1);
     try std.testing.expectEqual(rounds_before + 1, host.metricsSnapshot().runtime_rounds);
 
-    bootstrapper.release.store(true, .release);
-    thread.join();
+    bootstrapper.release.set(std.testing.io);
+    thread.await(std.testing.io);
     thread_joined = true;
     try std.testing.expect(prepare_thread.failure == null);
     const result = try prepared.commit();

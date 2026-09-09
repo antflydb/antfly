@@ -851,13 +851,23 @@ pub const EmbeddingPipeline = struct {
                 image.IMAGENET_MEAN,
                 image.IMAGENET_STD,
             ),
-            .clip => try image.preprocessClipBatch(
-                alloc,
-                images,
-                img_size,
-                image.IMAGENET_MEAN,
-                image.IMAGENET_STD,
-            ),
+            .clip => blk: {
+                // The synchronous pipeline owns only the preprocessing phase;
+                // release its bounded workers before entering the model session.
+                var preprocess_io = std.Io.Threaded.init(alloc, .{
+                    .async_limit = .limited(8),
+                    .concurrent_limit = .limited(8),
+                });
+                defer preprocess_io.deinit();
+                break :blk try image.preprocessClipBatch(
+                    preprocess_io.io(),
+                    alloc,
+                    images,
+                    img_size,
+                    image.IMAGENET_MEAN,
+                    image.IMAGENET_STD,
+                );
+            },
         };
         defer alloc.free(pixel_values);
         logEmbedTiming("image.preprocess", batch, preprocess_start);
@@ -2711,11 +2721,7 @@ test "resident masked mean pooling uses backend primitives" {
         .resident_weights = .empty,
         .lazy_weights = .empty,
     };
-    defer {
-        weight_store.resident_weights.deinit(allocator);
-        weight_store.lazy_weights.deinit(allocator);
-        native_mod.deinitPrefetchQueue(&weight_store);
-    }
+    defer weight_store.deinitOwned();
     var compute = native_mod.NativeCompute.init(allocator, &weight_store, null);
     defer compute.deinit();
     var cb = compute.computeBackend();
@@ -2753,11 +2759,7 @@ test "resident text pooling handles flattened batch sequence hidden states" {
         .resident_weights = .empty,
         .lazy_weights = .empty,
     };
-    defer {
-        weight_store.resident_weights.deinit(allocator);
-        weight_store.lazy_weights.deinit(allocator);
-        native_mod.deinitPrefetchQueue(&weight_store);
-    }
+    defer weight_store.deinitOwned();
     var compute = native_mod.NativeCompute.init(allocator, &weight_store, null);
     defer compute.deinit();
     var cb = compute.computeBackend();
@@ -2933,11 +2935,7 @@ test "resident projected input selection supports 3d cls pooling" {
         .resident_weights = .empty,
         .lazy_weights = .empty,
     };
-    defer {
-        weight_store.resident_weights.deinit(allocator);
-        weight_store.lazy_weights.deinit(allocator);
-        native_mod.deinitPrefetchQueue(&weight_store);
-    }
+    defer weight_store.deinitOwned();
     var compute = native_mod.NativeCompute.init(allocator, &weight_store, null);
     defer compute.deinit();
     var cb = compute.computeBackend();
@@ -2988,11 +2986,7 @@ test "resident 2d embedding extraction normalizes before host readback" {
         .resident_weights = .empty,
         .lazy_weights = .empty,
     };
-    defer {
-        weight_store.resident_weights.deinit(allocator);
-        weight_store.lazy_weights.deinit(allocator);
-        native_mod.deinitPrefetchQueue(&weight_store);
-    }
+    defer weight_store.deinitOwned();
     var compute = native_mod.NativeCompute.init(allocator, &weight_store, null);
     defer compute.deinit();
     var cb = compute.computeBackend();
