@@ -1,7 +1,7 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Experimental leaf-local mutation representation, NOT yet an HBC backend.
+//! Leaf-local mutation representation used by the experimental native HBC authority.
 //! A manifest owns ordered references to immutable, mmap-friendly RaBitQ
 //! chunks. Deletion replaces only references; appends encode only new rows.
 //! Chunk identity plus ordinal identifies a vector revision (an ID does not).
@@ -292,8 +292,8 @@ pub const Snapshot = struct {
     }
 
     /// Fused, allocation-free scoring in canonical live order. Consecutive
-    /// ranges of a chunk share one query preparation, rather than repeating
-    /// normalization/quantization for each gap left by a tombstone. A bounded
+    /// chunks share one query preparation against the leaf's retained origin,
+    /// rather than repeating normalization/quantization for each chunk or gap. A bounded
     /// stack wave avoids turning adversarial fragmentation into query scratch.
     /// output.write(vector_id, distance, error_bound) uses the existing selector;
     /// authoritative completion and filter/visibility semantics stay above it.
@@ -301,6 +301,9 @@ pub const Snapshot = struct {
         const q = @import("antfly_vector").quantizer;
         if (cancellation) |token| try token.check();
         if (query.len != quantizer.dims) return error.InvalidPostingRows;
+        if (self.runs.len == 0) return;
+        const origin = self.runs[0].chunk.view.asProto();
+        const prepared = try quantizer.prepareEstimate(&origin, query, scratch, cancellation);
         var ranges: [128]q.ScoreRange = undefined;
         var next: usize = 0;
         while (next < self.runs.len) {
@@ -326,7 +329,7 @@ pub const Snapshot = struct {
                 }
             };
             const set = chunk.view.asProto();
-            try quantizer.estimateDistancesInRangesTo(&set, query, scratch, cancellation, ranges[0..count], Output{ .ids = chunk.view.member_ids, .sink = output });
+            try quantizer.estimatePreparedDistancesInRangesTo(&set, prepared, cancellation, ranges[0..count], Output{ .ids = chunk.view.member_ids, .sink = output });
         }
     }
 
@@ -850,8 +853,11 @@ test "posting row fused scoring matches repacked scores bounds order and cancell
         for ([_][4]f32{ .{ 0.1, 0.9, 0.3, 0.4 }, .{ 0.5, 0.25, 0.1, 0.3 }, .{ 0, 0, 0, 0 } }) |query| {
             var before = Output{};
             var after = Output{};
+            const prepare_epoch = scratch.prepare_epoch;
             try dirty.scoreTo(&quantizer, &query, &scratch, null, &before);
+            try std.testing.expectEqual(prepare_epoch + 1, scratch.prepare_epoch);
             try compact.scoreTo(&quantizer, &query, &scratch, null, &after);
+            try std.testing.expectEqual(prepare_epoch + 2, scratch.prepare_epoch);
             try std.testing.expectEqual(@as(usize, 6), before.count);
             try std.testing.expectEqualSlices(u64, before.ids[0..6], after.ids[0..6]);
             try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(before.distances[0..6]), std.mem.sliceAsBytes(after.distances[0..6]));
@@ -1009,6 +1015,73 @@ test "posting row chunks reject origin aliasing and ambiguous physical identitie
     const replacement = try Chunk.build(a, .{ .incarnation = 72, .leaf = 2, .origin = 11 }, 2, 2, &.{ 30, 40 }, &first.view.asProto());
     defer replacement.release();
     try std.testing.expectError(error.InvalidPostingRows, base.mutate(1, 2, 101, &.{}, replacement));
+}
+
+test "posting row shared query preparation microbenchmark" {
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    // A same-binary kernel comparison, not an end-to-end performance result.
+    const a = std.testing.allocator;
+    const vector = @import("antfly_vector");
+    const dims = 768;
+    const rows = 1024;
+    const iterations = 1000;
+    const data = try a.alloc(f32, rows * dims);
+    defer a.free(data);
+    for (data, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 31)) / 31;
+    var ids: [rows]u64 = undefined;
+    for (&ids, 0..) |*id, i| id.* = i + 1;
+    const origin = [_]f32{0.1} ** dims;
+    const query = [_]f32{0.3} ** dims;
+    var quantizer = try vector.quantizer.RaBitQuantizer.init(a, dims, 42, .cosine);
+    defer quantizer.deinit();
+    var scratch = try vector.quantizer.RaBitQuantizer.EstimateScratch.init(a, dims);
+    defer scratch.deinit(a);
+    const Sink = struct {
+        sum: f64 = 0,
+        pub fn write(self: *@This(), id: u64, distance: f32, bound: f32) void {
+            self.sum += @as(f64, @floatFromInt(id)) + distance + bound;
+        }
+    };
+    const Output = struct {
+        sink: *Sink,
+        ids: []const u64,
+        pub fn write(out: @This(), i: usize, distance: f32, bound: f32) void {
+            out.sink.write(out.ids[i], distance, bound);
+        }
+    };
+    for ([_]usize{ 1, 16, 64 }) |chunk_count| {
+        var runs: [64]Run = undefined;
+        var built: usize = 0;
+        defer for (runs[0..built]) |run| run.chunk.release();
+        const count = rows / chunk_count;
+        for (0..chunk_count) |i| {
+            var set = try quantizer.quantize(&origin, data[i * count * dims ..][0 .. count * dims], count);
+            defer set.deinit(a);
+            const chunk = try Chunk.build(a, test_identity, i + 1, 1, ids[i * count ..][0..count], &set);
+            runs[i] = .{ .chunk = chunk, .start = 0, .len = @intCast(count) };
+            built += 1;
+        }
+        var snapshot = try Snapshot.init(a, test_identity, 1, 100, runs[0..built]);
+        defer snapshot.deinit();
+        var expected_sum: ?f64 = null;
+        for (0..4) |round| for (0..2) |arm| {
+            const shared = (round + arm) % 2 == 1;
+            var sink = Sink{};
+            const started = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+            for (0..iterations) |_| {
+                if (shared) {
+                    try snapshot.scoreTo(&quantizer, &query, &scratch, null, &sink);
+                } else for (snapshot.runs) |run| {
+                    const set = run.chunk.view.asProto();
+                    try quantizer.estimateDistancesInRangesTo(&set, &query, &scratch, null, &.{.{ .start = run.start, .end = run.start + run.len }}, Output{ .sink = &sink, .ids = run.chunk.view.member_ids });
+                }
+            }
+            const elapsed = std.Io.Clock.awake.now(std.testing.io).nanoseconds - started;
+            if (expected_sum) |expected| try std.testing.expectEqual(expected, sink.sum) else expected_sum = sink.sum;
+            std.mem.doNotOptimizeAway(sink.sum);
+            std.debug.print("posting-rows query-preparation chunks={} round={} shared={} ns_per_query={d:.3}\n", .{ chunk_count, round, shared, @as(f64, @floatFromInt(elapsed)) / iterations });
+        };
+    }
 }
 
 test "posting row representation microbenchmark" {
