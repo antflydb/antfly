@@ -11606,6 +11606,15 @@ pub const ProvisionedTableWriteSource = struct {
         self.beginReplicatedApplyOperationLocked(table_name, group_id);
     }
 
+    fn tryBeginReplicatedApplyOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
+        // The Raft owner must not wait for an activity whose resolver backfill
+        // can call back into Raft. Contention is a pre-mutation retry boundary,
+        // including contention on the activity bookkeeping mutex itself.
+        if (!self.table_activity_mutex.tryLock()) return false;
+        defer self.table_activity_mutex.unlock(self.tableActivityIo());
+        return self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id);
+    }
+
     fn beginGroupTransitionOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
         const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
@@ -21723,7 +21732,12 @@ pub const ProvisionedTableWriteSource = struct {
         // generation-pinned readers; making it read-exclusive would deadlock
         // the barrier behind the apply it is waiting for. Structural and
         // generation transitions remain exclusive in the activity gate.
-        self.beginReplicatedApplyOperation(table_name, group_id);
+        if (metadata_source == .local_persisted) {
+            if (!self.tryBeginReplicatedApplyOperation(table_name, group_id))
+                return error.RaftApplyWriterUnavailable;
+        } else {
+            self.beginReplicatedApplyOperation(table_name, group_id);
+        }
         lockAtomic(&self.local_db_mutex);
         self.invalidateReadCache(table_name);
         self.local_db_mutex.unlock();

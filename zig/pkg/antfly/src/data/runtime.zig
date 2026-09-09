@@ -8724,31 +8724,36 @@ pub const DataServer = struct {
     ) anyerror!void {
         const raft = self.data_raft orelse return error.NotLeader;
         const apply_sm = self.data_raft_apply orelse return error.NotLeader;
+        const io = self.dataRaftIo() orelse return error.BackendRuntimeUnavailable;
+        const timeout_ns = @as(u64, @min(timeout_ms orelse 5_000, 5_000)) * std.time.ns_per_ms;
+        const deadline_ns = self.dataRaftMonotonicNs() +| timeout_ns;
+        if (cancellation.isCancelled()) return error.Cancelled;
         _ = request_ctx;
         var context_buffer: [160]u8 = undefined;
         const registration = try apply_sm.read_barriers.register(group_id, &context_buffer);
         var waiter_live = true;
         defer if (waiter_live) apply_sm.read_barriers.cancel(registration.token);
 
-        // RawNode mutation and Ready processing share this owner lock. Release
-        // it before waiting so the Raft driver can deliver the quorum response
-        // and apply the resulting ReadState.
-        lockAtomic(&self.data_raft_mutex);
-        raft.requestReadIndex(group_id, registration.request_ctx) catch |err| {
-            self.data_raft_mutex.unlock();
-            return err;
-        };
-        self.data_raft_mutex.unlock();
+        // Admission is part of the same read budget as quorum/apply. A
+        // resolution callback can arrive while the Raft owner is waiting for
+        // a managed writer or its workers. An unbounded lock wait here defeats
+        // cancellation and can keep both sides of that cycle alive forever.
+        while (true) {
+            if (cancellation.isCancelled()) return error.Cancelled;
+            if (self.dataRaftMonotonicNs() >= deadline_ns) return error.ReadIndexTimeout;
+            if (self.data_raft_mutex.tryLock()) break;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        {
+            defer self.data_raft_mutex.unlock();
+            if (cancellation.isCancelled()) return error.Cancelled;
+            if (self.dataRaftMonotonicNs() >= deadline_ns) return error.ReadIndexTimeout;
+            try raft.requestReadIndex(group_id, registration.request_ctx);
+        }
 
-        const io = self.dataRaftIo() orelse return error.BackendRuntimeUnavailable;
-        const started_ns = self.dataRaftMonotonicNs();
-        const default_timeout_ns: u64 = 5 * std.time.ns_per_s;
-        const timeout_ns = if (timeout_ms) |milliseconds|
-            @min(default_timeout_ns, @as(u64, milliseconds) * std.time.ns_per_ms)
-        else
-            default_timeout_ns;
-        if (cancellation.isCancelled()) return error.Cancelled;
-        while (self.dataRaftMonotonicNs() -| started_ns < timeout_ns) {
+        // Release the owner before waiting for the dedicated Raft driver to
+        // deliver the quorum response and apply its matching ReadState.
+        while (self.dataRaftMonotonicNs() < deadline_ns) {
             if (cancellation.isCancelled()) return error.Cancelled;
             if (apply_sm.read_barriers.takeCompleted(registration.token)) {
                 waiter_live = false;
@@ -24666,6 +24671,78 @@ test "DataServer VOPR background owner executes and cancels maintenance on VoprI
     try std.testing.expect(vopr_io.scheduler().quiescent());
 }
 
+test "data raft read safety deadline and cancellation cover owner lock admission" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/read-owner-admission", .{tmp.sub_path});
+    defer alloc.free(root);
+    var server = try DataServer.initFromMetadataApiUrl(alloc, .{
+        .replica_root_dir = root,
+        .store_registration = .{ .node_id = 1, .store_id = 1, .api_url = "http://127.0.0.1:1" },
+    }, "http://127.0.0.1:2");
+    defer server.deinit();
+
+    const Reader = struct {
+        server: *DataServer,
+        timeout_ms: u32,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.server.waitDataReadSafeWithCancellation(
+                7001,
+                "owner-admission",
+                self.timeout_ms,
+                antfly.db.types.CancellationToken.fromAtomic(&self.cancelled),
+            ) catch |err| {
+                self.failure = err;
+            };
+            self.done.store(true, .release);
+        }
+    };
+    for ([_]bool{ false, true }) |cancel| {
+        var reader = Reader{ .server = &server, .timeout_ms = if (cancel) 5_000 else 10 };
+        lockAtomic(&server.data_raft_mutex);
+        var locked = true;
+        defer if (locked) server.data_raft_mutex.unlock();
+        var task = try std.testing.io.concurrent(Reader.run, .{&reader});
+        // Always release the owner before joining, including on the old
+        // unbounded implementation, so this regression fails without hanging.
+        const watchdog = platform_time.monotonicNs() + std.time.ns_per_s;
+        while (server.data_raft_apply.?.read_barriers.pendingCount() == 0 and
+            !reader.done.load(.acquire) and platform_time.monotonicNs() < watchdog)
+        {
+            std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+        if (cancel) reader.cancelled.store(true, .release);
+        while (!reader.done.load(.acquire) and platform_time.monotonicNs() < watchdog) {
+            std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+        const completed_while_locked = reader.done.load(.acquire);
+        server.data_raft_mutex.unlock();
+        locked = false;
+        task.await(std.testing.io);
+        try std.testing.expect(completed_while_locked);
+        try std.testing.expectEqual(@as(?anyerror, if (cancel) error.Cancelled else error.ReadIndexTimeout), reader.failure);
+        try std.testing.expectEqual(@as(usize, 0), server.data_raft_apply.?.read_barriers.pendingCount());
+    }
+    // Expired/cancelled reads must not submit even when the owner is free.
+    // The nonexistent group would otherwise return a Raft admission error.
+    try std.testing.expectError(error.ReadIndexTimeout, server.waitDataReadSafeWithCancellation(7001, "expired", 0, .none));
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, server.waitDataReadSafeWithCancellation(
+        7001,
+        "cancelled",
+        5_000,
+        antfly.db.types.CancellationToken.fromAtomic(&cancelled),
+    ));
+    try std.testing.expectEqual(@as(usize, 0), server.data_raft_apply.?.read_barriers.pendingCount());
+    try std.testing.expect(server.data_raft_mutex.tryLock());
+    server.data_raft_mutex.unlock();
+}
+
 test "data raft read safety barrier completes only after matching ReadState apply" {
     const alloc = std.testing.allocator;
     var apply_sm = try RaftTableApplyStateMachine.init(
@@ -25177,6 +25254,148 @@ test "data raft source lifecycle commands bypass document db apply while receive
             .delta_sequence = 1,
         },
     }));
+}
+
+test "data raft apply defers refresh contention before mutation and retries exactly once" {
+    const alloc = std.testing.allocator;
+    const group_id: u64 = 78;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-raft-refresh-retry", .{tmp.sub_path});
+    defer alloc.free(replica_root);
+
+    const Catalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metadata_epoch = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 8,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = group_id,
+                    .table_id = 8,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    var storage = antfly.public_api.ProvisionedGroupStorage.init(alloc);
+    defer storage.deinit();
+    var apply_sm = try RaftTableApplyStateMachine.init(alloc, replica_root, Catalog.iface(), null);
+    defer apply_sm.deinit();
+    apply_sm.attachProvisionedStorage(&storage);
+
+    _ = try apply_sm.write_source.applyReplicatedBatchGroupLocal(alloc, group_id, "docs", .{
+        .writes = &.{.{ .key = "doc:counter", .value = "{\"count\":0}" }},
+    });
+    const increment = try data_raft_batch.encode(alloc, "docs", .{
+        .transforms = &.{.{
+            .key = "doc:counter",
+            .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+        }},
+    });
+    defer alloc.free(increment);
+    const entries = [_]raft_engine.core.Entry{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = increment },
+    };
+    try apply_sm.registerApplyOutcomeWaiter(group_id, 1, 1);
+    var context: [96]u8 = undefined;
+    const barrier = try apply_sm.read_barriers.register(group_id, &context);
+    const read_states = [_]raft_engine.core.ReadState{.{
+        .index = 1,
+        .request_ctx = @constCast(barrier.request_ctx),
+    }};
+    const ApplyWorker = struct {
+        sm: *RaftTableApplyStateMachine,
+        entries: []const raft_engine.core.Entry,
+        read_states: []const raft_engine.core.ReadState,
+        done: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            RaftTableApplyStateMachine.applyReady(self.sm, group_id, null, self.entries, self.read_states) catch |err| {
+                self.failure = err;
+            };
+            self.done.store(true, .release);
+        }
+    };
+    // Exercise both the refresh reservation seen in the CI stack and its
+    // bookkeeping mutex. Neither may make the Raft owner wait for a callback
+    // that needs that same owner to service a ReadIndex.
+    for ([_]bool{ false, true }) |hold_mutex| {
+        var refresh: ?antfly.public_api.ProvisionedTableWriteSource.GroupRefreshActivity = null;
+        if (hold_mutex) {
+            apply_sm.write_source.table_activity_mutex.lockUncancelable(std.testing.io);
+        } else {
+            refresh = apply_sm.write_source.tryBeginGroupRefreshActivity("docs", group_id) orelse
+                return error.TestUnexpectedResult;
+        }
+        var locked = true;
+        defer if (locked) {
+            if (refresh) |*activity| activity.deinit() else apply_sm.write_source.table_activity_mutex.unlock(std.testing.io);
+        };
+        var worker = ApplyWorker{ .sm = &apply_sm, .entries = &entries, .read_states = &read_states };
+        var task = try std.testing.io.concurrent(ApplyWorker.run, .{&worker});
+        const watchdog = platform_time.monotonicNs() + std.time.ns_per_s;
+        while (!worker.done.load(.acquire) and platform_time.monotonicNs() < watchdog) {
+            std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+        const completed_while_locked = worker.done.load(.acquire);
+        // Release before joining even on the broken implementation.
+        if (refresh) |*activity| activity.deinit() else apply_sm.write_source.table_activity_mutex.unlock(std.testing.io);
+        locked = false;
+        task.await(std.testing.io);
+        try std.testing.expect(completed_while_locked);
+        try std.testing.expectEqual(@as(?anyerror, error.RaftApplyWriterUnavailable), worker.failure);
+        try std.testing.expectEqual(@as(u64, 0), apply_sm.appliedIndex(group_id));
+        try std.testing.expectEqual(.pending, apply_sm.apply_outcomes.get(.{ .group_id = group_id, .index = 1 }).?.outcome);
+        try std.testing.expect(!apply_sm.read_barriers.takeCompleted(barrier.token));
+        var cached = (try apply_sm.write_source.leaseCachedGroupWriter(alloc, group_id, "docs")) orelse
+            return error.TestUnexpectedResult;
+        defer cached.deinit(alloc);
+        const raw = (try cached.db.get(alloc, "doc:counter")) orelse return error.TestUnexpectedResult;
+        defer alloc.free(raw);
+        try std.testing.expectEqualStrings("{\"count\":0}", raw);
+    }
+    try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &entries, &read_states);
+    try std.testing.expectEqual(@as(u64, 1), apply_sm.appliedIndex(group_id));
+    try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 1).?);
+    try std.testing.expect(apply_sm.read_barriers.takeCompleted(barrier.token));
+    try std.testing.expectEqual(@as(usize, 0), apply_sm.retry_apply_checkpoints.count());
+    // Replaying the same committed entry must not repeat its increment.
+    try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &entries, &.{});
+    var cached = (try apply_sm.write_source.leaseCachedGroupWriter(alloc, group_id, "docs")) orelse
+        return error.TestUnexpectedResult;
+    defer cached.deinit(alloc);
+    const raw = (try cached.db.get(alloc, "doc:counter")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("count").?.integer);
 }
 
 test "data raft retry checkpoints survive changed ready windows and publication failure" {
