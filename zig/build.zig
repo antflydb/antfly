@@ -839,6 +839,11 @@ pub fn build(b: *std.Build) void {
 
     const antfly_imports = AntflyRootImports{
         .build_options = build_options,
+        .embedded_openapi = pkg_antfly_build_codegen.addEmbeddedSpecs(b, .{
+            .root_source_file = b.path("pkg/antfly/src/openapi/embedded_specs.zig"),
+            .schema_root = b.path("../specs/openapi"),
+            .public_spec = b.path("../openapi.yaml"),
+        }),
         .vopr = vopr_mod,
         .lmdb_engine = lmdb_engine_mod,
         .raft_engine = raft_engine_mod,

@@ -28,6 +28,9 @@ the joined public schema into the checked-in trees, including removal of obsolet
 generated files. `make openapi-check` compares them without modifying source files.
 Both use the normal Zig cache; source files, generator options, Python dependency
 locks, and the schema tree supply the inputs. No Git-derived cache key is needed.
+The HTTP API embeds the source schemas through a dedicated module with tracked
+`@embedFile` inputs. Schema contents stay out of shared build options, so artifacts
+that do not import the schema module keep their existing cache entries.
 
 ## Default Tests
 

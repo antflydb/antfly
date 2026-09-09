@@ -14,7 +14,7 @@
 
 const std = @import("std");
 
-pub fn addScriptsPythonCommand(b: *std.Build, script_path: []const u8, args: []const []const u8) *std.Build.Step.Run {
+fn addScriptsPythonCommand(b: *std.Build, script_path: []const u8, args: []const []const u8) *std.Build.Step.Run {
     const run = b.addSystemCommand(&.{
         "uv",
         "run",
@@ -32,7 +32,7 @@ pub fn addScriptsPythonCommand(b: *std.Build, script_path: []const u8, args: []c
 
 /// Joining follows external references throughout this schema tree. Discover
 /// its inputs so a newly referenced schema cannot escape cache invalidation.
-pub fn addOpenApiJoinInputs(b: *std.Build, run: *std.Build.Step.Run) void {
+fn addOpenApiJoinInputs(b: *std.Build, run: *std.Build.Step.Run) void {
     for ([_][]const u8{ "join_openapi.py", "openapi_joiner.py", "public_openapi_overlays.py" }) |script| {
         run.addFileInput(b.path(b.pathJoin(&.{ "../scripts", script })));
     }
@@ -55,12 +55,12 @@ pub fn addOpenApiJoinInputs(b: *std.Build, run: *std.Build.Step.Run) void {
     for (paths.items) |path| run.addFileInput(root.path(b, path));
 }
 
-pub const antfly_zig_type_mapping_args = [_][]const u8{
+const antfly_zig_type_mapping_args = [_][]const u8{
     "raw_json=@import(\"antfly-json\").RawValue",
     "raw_json_object=@import(\"antfly-json\").RawObject",
 };
 
-pub fn addAntflyZigTypeMappings(codegen: *std.Build.Step.Run) void {
+fn addAntflyZigTypeMappings(codegen: *std.Build.Step.Run) void {
     for (antfly_zig_type_mapping_args) |mapping| {
         codegen.addArgs(&.{"--zig-type-mapping"});
         codegen.addArg(mapping);
@@ -72,13 +72,12 @@ fn addGeneratedDirectory(
     openapi_codegen: *std.Build.Step.Compile,
     source_path: std.Build.LazyPath,
     package_name: []const u8,
-    output_dir_name: []const u8,
     generate_what: []const u8,
     import_mappings: []const [2][]const u8,
 ) std.Build.LazyPath {
     const convert = addScriptsPythonCommand(b, "../scripts/yaml_to_json.py", &.{});
     convert.addFileArg(source_path);
-    const json_spec = convert.addOutputFileArg(b.fmt("{s}.json", .{output_dir_name}));
+    const json_spec = convert.addOutputFileArg(b.fmt("{s}.json", .{package_name}));
 
     const codegen = b.addRunArtifact(openapi_codegen);
     codegen.addArgs(&.{"--spec"});
@@ -91,52 +90,7 @@ fn addGeneratedDirectory(
     }
     addAntflyZigTypeMappings(codegen);
     codegen.addArgs(&.{"--output"});
-    return codegen.addOutputDirectoryArg(output_dir_name);
-}
-
-pub fn addOpenApiModuleFromYamlPath(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    openapi_codegen: *std.Build.Step.Compile,
-    source_path: std.Build.LazyPath,
-    package_name: []const u8,
-    output_dir_name: []const u8,
-    generate_what: []const u8,
-    import_mappings: []const [2][]const u8,
-) *std.Build.Module {
-    _ = target;
-    _ = optimize;
-
-    const gen_dir = addGeneratedDirectory(b, openapi_codegen, source_path, package_name, output_dir_name, generate_what, import_mappings);
-
-    return b.addModule(package_name, .{
-        .root_source_file = gen_dir.path(b, "root.zig"),
-    });
-}
-
-pub fn addYamlOpenApiModule(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    openapi_codegen: *std.Build.Step.Compile,
-    source_path: []const u8,
-    package_name: []const u8,
-    output_dir_name: []const u8,
-    generate_what: []const u8,
-    import_mappings: []const [2][]const u8,
-) *std.Build.Module {
-    return addOpenApiModuleFromYamlPath(
-        b,
-        target,
-        optimize,
-        openapi_codegen,
-        b.path(source_path),
-        package_name,
-        output_dir_name,
-        generate_what,
-        import_mappings,
-    );
+    return codegen.addOutputDirectoryArg(package_name);
 }
 
 pub fn addOpenApiRootCheckStep(b: *std.Build) *std.Build.Step.Run {
@@ -146,119 +100,38 @@ pub fn addOpenApiRootCheckStep(b: *std.Build) *std.Build.Step.Run {
     return check;
 }
 
-pub fn addJoinedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
+fn addJoinedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
     const join = addScriptsPythonCommand(b, "../scripts/join_openapi.py", &.{"--joined-only"});
     addOpenApiJoinInputs(b, join);
     return join.addOutputFileArg("openapi.public.joined.yaml");
 }
 
-pub fn addPrefixedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
+fn addPrefixedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
     const join = addScriptsPythonCommand(b, "../scripts/join_public_openapi.py", &.{});
     addOpenApiJoinInputs(b, join);
     return join.addOutputFileArg("openapi.public.prefixed.yaml");
 }
 
-pub fn addPublicOpenApiModule(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    openapi_codegen: *std.Build.Step.Compile,
-) *std.Build.Module {
-    return addOpenApiModuleFromYamlPath(
-        b,
-        target,
-        optimize,
-        openapi_codegen,
-        addJoinedPublicOpenApiSpec(b),
-        "antfly_public_openapi",
-        "antfly_public_openapi",
-        "types,extractors",
-        &.{
-            .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
-            .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
-            .{ "specs/openapi/antfly/sort.yaml", "antfly_sort_openapi" },
-            .{ "specs/openapi/antfly/embeddings.yaml", "antfly_embeddings_openapi" },
-            .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
-            .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
-            .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
-            .{ "specs/openapi/antfly/reranking.yaml", "antfly_reranking_openapi" },
-            .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
-        },
-    );
-}
-
-pub fn addPublicClientOpenApiModule(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    openapi_codegen: *std.Build.Step.Compile,
-    httpx_mod: *std.Build.Module,
-) *std.Build.Module {
-    return addOpenApiModuleWithHttpxFromYamlPath(
-        b,
-        target,
-        optimize,
-        openapi_codegen,
-        addPrefixedPublicOpenApiSpec(b),
-        "antfly_client_openapi",
-        "antfly_client_openapi",
-        "types,client",
-        &.{
-            .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
-            .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
-            .{ "specs/openapi/antfly/sort.yaml", "antfly_sort_openapi" },
-            .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
-            .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
-            .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
-            .{ "specs/openapi/antfly/reranking.yaml", "antfly_reranking_openapi" },
-            .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
-        },
-        httpx_mod,
-    );
-}
-
-/// Like addYamlOpenApiModule but also wires in httpx for client generation.
-pub fn addOpenApiModuleWithHttpxFromYamlPath(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    openapi_codegen: *std.Build.Step.Compile,
-    source_path: std.Build.LazyPath,
-    package_name: []const u8,
-    output_dir_name: []const u8,
-    generate_what: []const u8,
-    import_mappings: []const [2][]const u8,
-    httpx_mod: *std.Build.Module,
-) *std.Build.Module {
-    const mod = addOpenApiModuleFromYamlPath(b, target, optimize, openapi_codegen, source_path, package_name, output_dir_name, generate_what, import_mappings);
-    mod.addImport("httpx", httpx_mod);
-    return mod;
-}
-
-pub fn addYamlOpenApiModuleWithHttpx(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    openapi_codegen: *std.Build.Step.Compile,
-    source_path: []const u8,
-    package_name: []const u8,
-    output_dir_name: []const u8,
-    generate_what: []const u8,
-    import_mappings: []const [2][]const u8,
-    httpx_mod: *std.Build.Module,
-) *std.Build.Module {
-    return addOpenApiModuleWithHttpxFromYamlPath(
-        b,
-        target,
-        optimize,
-        openapi_codegen,
-        b.path(source_path),
-        package_name,
-        output_dir_name,
-        generate_what,
-        import_mappings,
-        httpx_mod,
-    );
+/// Embed source schemas through Zig's ordinary file inputs, independently of
+/// build options. Source reads happen when compiling a schema consumer.
+pub fn addEmbeddedSpecs(b: *std.Build, options: struct {
+    root_source_file: std.Build.LazyPath,
+    schema_root: std.Build.LazyPath,
+    public_spec: std.Build.LazyPath,
+}) *std.Build.Module {
+    const module = b.createModule(.{ .root_source_file = options.root_source_file });
+    const inputs = .{
+        .{ "ard.yaml", options.schema_root.path(b, "ard/api.yaml") },
+        .{ "antfly.yaml", options.public_spec },
+        .{ "metadata.yaml", options.schema_root.path(b, "antfly/metadata.yaml") },
+        .{ "extensions.yaml", options.schema_root.path(b, "extensions/api.yaml") },
+        .{ "auth.yaml", options.schema_root.path(b, "auth/api.yaml") },
+        .{ "inference-config.yaml", options.schema_root.path(b, "inference/config.yaml") },
+    };
+    inline for (inputs) |input| {
+        module.addAnonymousImport(input[0], .{ .root_source_file = input[1] });
+    }
+    return module;
 }
 
 pub fn addCommittedOpenApiModule(
@@ -309,7 +182,7 @@ fn addGeneratedModule(
     };
     const mappings = std.mem.concat(b.allocator, [2][]const u8, &.{ &provider_mappings, import_mappings }) catch @panic("OOM");
     return .{
-        .directory = addGeneratedDirectory(b, openapi_codegen, source_path, package_name, package_name, generate_what, mappings),
+        .directory = addGeneratedDirectory(b, openapi_codegen, source_path, package_name, generate_what, mappings),
         .destination = generated_dir,
     };
 }

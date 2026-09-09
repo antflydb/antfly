@@ -14,8 +14,6 @@
 
 const std = @import("std");
 
-const max_openapi_spec_bytes = 2 * 1024 * 1024;
-
 pub const LmdbBackend = enum {
     c,
     zig,
@@ -62,64 +60,8 @@ pub fn makeRootBuildOptions(
     options.addOption(bool, "lmdb_enabled", lmdb_enabled);
     options.addOption(bool, "bench_minimal_deps", false);
     options.addOption([]const u8, "antfly_version", antfly_version);
-    EmbeddedOpenApiOptions.add(b, options);
     return options;
 }
-
-/// Read embedded source contents only when their options module is needed.
-/// Graph construction must also work when regeneration needs to recreate a
-/// missing openapi.yaml. Keep the emitted option values identical to ordinary
-/// string options so runtime artifacts retain their existing cache identity.
-const EmbeddedOpenApiOptions = struct {
-    step: std.Build.Step,
-    options: *std.Build.Step.Options,
-    base_length: ?usize = null,
-
-    const sources = [_][2][]const u8{
-        .{ "ard_openapi_ard_yaml", "../specs/openapi/ard/api.yaml" },
-        .{ "ard_openapi_antfly_yaml", "../openapi.yaml" },
-        .{ "ard_openapi_metadata_yaml", "../specs/openapi/antfly/metadata.yaml" },
-        .{ "ard_openapi_extensions_yaml", "../specs/openapi/extensions/api.yaml" },
-        .{ "ard_openapi_auth_yaml", "../specs/openapi/auth/api.yaml" },
-        .{ "ard_openapi_inference_config_yaml", "../specs/openapi/inference/config.yaml" },
-    };
-
-    fn add(b: *std.Build, options: *std.Build.Step.Options) void {
-        const embedded = b.allocator.create(EmbeddedOpenApiOptions) catch @panic("OOM");
-        embedded.* = .{
-            .step = std.Build.Step.init(.{
-                .id = .custom,
-                .name = "read embedded OpenAPI schemas",
-                .owner = b,
-                .makeFn = make,
-            }),
-            .options = options,
-        };
-        options.step.dependOn(&embedded.step);
-    }
-
-    fn make(step: *std.Build.Step, _: std.Build.Step.MakeOptions) !void {
-        const embedded: *EmbeddedOpenApiOptions = @fieldParentPtr("step", step);
-        const b = step.owner;
-        // A watch rebuild replaces the previous file contents, rather than
-        // appending duplicate declarations to the options module.
-        if (embedded.base_length) |length| {
-            embedded.options.contents.shrinkRetainingCapacity(length);
-        } else {
-            embedded.base_length = embedded.options.contents.items.len;
-        }
-        const add_inputs = !step.inputs.populated();
-        for (sources) |source| {
-            const path = b.path(source[1]);
-            if (add_inputs) try step.addWatchInput(path);
-            const contents = std.Io.Dir.cwd().readFileAlloc(b.graph.io, path.getPath(b), b.allocator, .limited(max_openapi_spec_bytes)) catch |err| {
-                return step.fail("failed to read build input {s}: {t}", .{ source[1], err });
-            };
-            defer b.allocator.free(contents);
-            embedded.options.addOption([]const u8, source[0], contents);
-        }
-    }
-};
 
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     if (target.result.os.tag != .macos) return;
