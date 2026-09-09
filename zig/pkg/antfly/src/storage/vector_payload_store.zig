@@ -79,6 +79,7 @@ pub const Store = struct {
     read_only: bool,
     poisoned: bool = false,
     budget: ?*resources.BudgetedAllocator = null,
+    wal_admission_bytes: u64 = 64 * 1024 * 1024,
     ann_reference_root: ?[]u8 = null,
     ann_scopes: ?[]u64 = null,
     location_cache: ?*native.ReferenceLocationCache = null,
@@ -91,6 +92,10 @@ pub const Store = struct {
     scan_duty_percent: u8 = 0,
     last_scan_ns: u64 = 0,
     rescue_reappends: bool = false,
+    shared_catalog: bool = false,
+    independent_scan: bool = false,
+    incremental_inventory: bool = false,
+    inventory: Inventory = .{},
     // Test-only pause/clock injection exercises an actual in-flight scan.
     mark_test_hook: if (@import("builtin").is_test) ?*const fn (*Store) void else void = if (@import("builtin").is_test) null else {},
     coalesce_directory: bool = false,
@@ -109,6 +114,113 @@ pub const Store = struct {
     prepare_requests: std.atomic.Value(u64) = .init(0),
 
     directory: ?*@import("source_location_directory.zig").Directory = null,
+
+    /// Rebuildable physical occurrence cache, never commit/ownership authority.
+    /// WAL membership is refreshed at installation, not on every preparation.
+    /// Between installations the normal append counters track new payloads.
+    const Inventory = struct {
+        const Occurrence = struct { dims: u32, count: u64 };
+        counts: std.AutoHashMapUnmanaged(payload.Digest, Occurrence) = .empty,
+        wal: std.AutoHashMapUnmanaged(payload.Digest, void) = .empty,
+        segments: std.AutoHashMapUnmanaged(u128, void) = .empty,
+        bytes: u64 = 0,
+        initialized: bool = false,
+
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            self.counts.deinit(alloc);
+            self.wal.deinit(alloc);
+            self.segments.deinit(alloc);
+            self.* = .{};
+        }
+        fn id(reader: vector_block.Reader) u128 {
+            return (@as(u128, reader.generation) << 64) | reader.shard_id;
+        }
+        fn add(self: *@This(), alloc: Allocator, digest: payload.Digest, dims: u32) !void {
+            const entry = try self.counts.getOrPut(alloc, digest);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = .{ .dims = dims, .count = 1 };
+                self.bytes += @as(u64, dims) * 4;
+            } else {
+                if (entry.value_ptr.dims != dims) return error.VectorReferenceIdentityMismatch;
+                entry.value_ptr.count = try std.math.add(u64, entry.value_ptr.count, 1);
+            }
+        }
+        fn remove(self: *@This(), digest: payload.Digest) !void {
+            const entry = self.counts.getPtr(digest) orelse return error.InvalidVectorInventory;
+            if (entry.count > 1) entry.count -= 1 else {
+                self.bytes -= @as(u64, entry.dims) * 4;
+                _ = self.counts.remove(digest);
+            }
+        }
+        fn addWal(self: *@This(), alloc: Allocator, key: []const u8, dims: u32) !void {
+            if (key.len != 32) return error.InvalidVectorReference;
+            if (!(try self.wal.getOrPut(alloc, key[0..32].*)).found_existing)
+                try self.add(alloc, key[0..32].*, dims);
+        }
+        fn addTree(self: *@This(), alloc: Allocator, node: ?*@import("vector_wal_view.zig").Node) anyerror!void {
+            if (node) |n| {
+                try self.addTree(alloc, n.left);
+                if (n.record.kind == .upsert) try self.addWal(alloc, n.record.key, n.record.dims);
+                try self.addTree(alloc, n.right);
+            }
+        }
+        fn sync(self: *@This(), alloc: Allocator, previous: ?*const native.Opened, next: *const native.Opened, rows: *u64) !void {
+            // Any partial cache edit is discarded. A failed post-publication
+            // install must reopen durable authority before accepting writes.
+            errdefer self.deinit(alloc);
+            var next_segments: std.AutoHashMapUnmanaged(u128, void) = .empty;
+            defer next_segments.deinit(alloc);
+            try next_segments.ensureTotalCapacity(alloc, @intCast(next.readers.len));
+            for (next.readers) |reader| next_segments.putAssumeCapacity(id(reader), {});
+            if (self.initialized) {
+                var wal = self.wal.keyIterator();
+                while (wal.next()) |digest| try self.remove(digest.*);
+                self.wal.clearRetainingCapacity();
+                for (previous.?.readers) |reader| {
+                    if (next_segments.contains(id(reader))) continue;
+                    for (0..reader.count) |i| {
+                        const row = try reader.entryAt(i);
+                        rows.* += 1;
+                        if (row.value != .vector or row.key.len != 32) return error.InvalidVectorReference;
+                        try self.remove(row.key[0..32].*);
+                    }
+                }
+            }
+            for (next.readers) |reader| {
+                if (self.segments.contains(id(reader))) continue;
+                for (0..reader.count) |i| {
+                    const row = try reader.entryAt(i);
+                    rows.* += 1;
+                    if (row.value != .vector or row.key.len != 32) return error.InvalidVectorReference;
+                    try self.add(alloc, row.key[0..32].*, row.value.vector.dims);
+                }
+            }
+            for (next.wal.records.items) |record| {
+                if (record.kind == .upsert) try self.addWal(alloc, record.key, record.dims);
+            }
+            try self.addTree(alloc, next.wal_tree);
+            self.segments.deinit(alloc);
+            self.segments = next_segments;
+            next_segments = .empty;
+            self.initialized = true;
+        }
+    };
+
+    fn prepareOpened(self: *Store, next: *native.Opened) !void {
+        if (self.shared_catalog) try next.shareSegmentCatalog();
+        if (self.incremental_inventory) {
+            const started = time.monotonicNs();
+            defer self.stats.inventory_update_ns += time.monotonicNs() -| started;
+            try self.inventory.sync(self.alloc, &self.opened, next, &self.stats.inventory_rows_scanned);
+            self.stats.inventory_updates += 1;
+        }
+    }
+
+    fn installOpened(self: *Store, next: *native.Opened) !void {
+        try self.prepareOpened(next);
+        self.opened.deinit();
+        self.opened = next.*;
+    }
 
     const PrepareRequest = struct {
         prepared: []const payload.Prepared,
@@ -318,6 +430,7 @@ pub const Store = struct {
         scopes: ?[]u64,
         outside_lock: bool,
         running: bool = false, // source mutex protects lifetime and scan admission
+        cancel_requested: bool = false,
         scan_done: bool = false,
         verification_done: bool = false,
         // Scanner-owned live map; only these bounded discoveries cross back
@@ -482,6 +595,13 @@ pub const Store = struct {
         self.stats.retired_ann_references_skipped += progress.retired;
         if (progress.budget_yield) self.stats.collection_mark_budget_yields += 1;
         if (outside_lock) self.stats.collection_mark_outside_lock_ns += elapsed;
+        if (marking.cancel_requested) {
+            marking.deinit(self.alloc);
+            self.marking = null;
+            self.stats.collection_deferrals += 1;
+            try result;
+            return false;
+        }
         errdefer {
             marking.deinit(self.alloc);
             self.marking = null;
@@ -552,6 +672,18 @@ pub const Store = struct {
         return pause;
     }
 
+    /// An incomplete immutable scan has no DB apply transition to perform.
+    /// Repair metadata can still request its own maintenance pass separately.
+    pub fn continueScanWithoutApply(self: *Store) bool {
+        self.lock();
+        defer self.mutex.unlock();
+        if (!self.independent_scan or !self.mark_outside_lock or self.poisoned or self.stats.unresolved_primary_commits != 0) return false;
+        const marking = self.marking orelse return false;
+        if (marking.scan_done) return false;
+        self.stats.collection_apply_visits_avoided += 1;
+        return true;
+    }
+
     /// No primary publication or catalog access: safe before taking DB.apply.
     /// Only immutable leases and scanner-private state are accessed unlocked.
     pub fn advanceMarkingSnapshot(self: *Store) !void {
@@ -615,11 +747,31 @@ pub const Store = struct {
         return self.opened.store.manifest.?.latest_generation;
     }
 
+    fn initializeInventory(self: *Store, defer_from_receipt: bool) !void {
+        // loadCheckpointReceipt already authenticated the exact durable source
+        // identity and restored its physical inventory totals. Readers and
+        // unchanged writers need no occurrence map. installOpened builds one
+        // from the new durable view before segment installation uses it.
+        std.debug.assert(!self.inventory.initialized);
+        if (defer_from_receipt and self.receipt != null) return;
+        const started = time.monotonicNs();
+        defer self.stats.inventory_update_ns += time.monotonicNs() -| started;
+        try self.inventory.sync(self.alloc, null, &self.opened, &self.stats.inventory_rows_scanned);
+        self.stats.inventory_updates += 1;
+        self.stats.retained_payloads = self.inventory.counts.count();
+        self.stats.retained_payload_bytes = self.inventory.bytes;
+    }
+
     fn configureDirectory(self: *Store) !void {
         self.preparation_alloc = self.alloc;
         self.coalesce_directory = experimentEnabled("ANTFLY_SOURCE_VECTOR_COALESCE_DIRECTORY");
         self.mark_outside_lock = experimentEnabled("ANTFLY_SOURCE_VECTOR_MARK_OUTSIDE_LOCK");
         self.rescue_reappends = experimentEnabled("ANTFLY_SOURCE_VECTOR_RESCUE_REAPPENDS");
+        self.shared_catalog = experimentEnabled("ANTFLY_SOURCE_VECTOR_SHARED_CATALOG");
+        self.independent_scan = experimentEnabled("ANTFLY_SOURCE_VECTOR_INDEPENDENT_SCAN");
+        self.incremental_inventory = experimentEnabled("ANTFLY_SOURCE_VECTOR_INCREMENTAL_INVENTORY");
+        if (self.shared_catalog) try self.opened.shareSegmentCatalog();
+        if (self.incremental_inventory) try self.initializeInventory(experimentEnabled("ANTFLY_SOURCE_VECTOR_LAZY_INVENTORY"));
         if (@import("builtin").link_libc) {
             if (std.c.getenv("ANTFLY_SOURCE_VECTOR_SCAN_DUTY_PERCENT")) |raw| {
                 const duty = std.fmt.parseInt(u8, std.mem.span(raw), 10) catch 0;
@@ -673,6 +825,8 @@ pub const Store = struct {
         store.preparation_alloc = alloc;
         store.preparation_manager = resource_manager;
         store.budget = budget;
+        const limit = resource_manager.sliceStats(.dense_source_payload_state).hard_limit_bytes;
+        if (limit != 0) store.wal_admission_bytes = @min(store.wal_admission_bytes, @max(256 * 1024, limit / 8));
         return store;
     }
 
@@ -692,7 +846,7 @@ pub const Store = struct {
         if (read_only) {
             var result: Store = .{ .alloc = alloc, .opened = try native.Store.openReadOnlyWithBlocks(alloc, storage, root), .read_only = true, .segment_sizing = sizing, .snapshot_reads = snapshot_reads, .checkpoint_receipts = collectionStepBytes() != 0 };
             errdefer result.deinit();
-            if (!try result.loadCheckpointReceipt()) try result.inventoryRetainedPayloads();
+            if (!try result.loadCheckpointReceipt() and !experimentEnabled("ANTFLY_SOURCE_VECTOR_INCREMENTAL_INVENTORY")) try result.inventoryRetainedPayloads();
             try result.configureLocationCache();
             try result.configureDirectory();
             return result;
@@ -705,7 +859,7 @@ pub const Store = struct {
         }
         var result: Store = .{ .alloc = alloc, .opened = try native.Store.openWithBlocks(alloc, storage, root), .read_only = read_only, .segment_sizing = sizing, .snapshot_reads = snapshot_reads, .checkpoint_receipts = collectionStepBytes() != 0 };
         errdefer result.deinit();
-        if (!try result.loadCheckpointReceipt()) try result.inventoryRetainedPayloads();
+        if (!try result.loadCheckpointReceipt() and !experimentEnabled("ANTFLY_SOURCE_VECTOR_INCREMENTAL_INVENTORY")) try result.inventoryRetainedPayloads();
         // This is the table's writable startup owner, before any builder can
         // reserve a generation. A clean liveness receipt must not hide files
         // left by a crash during an unpublished incremental copy.
@@ -730,8 +884,21 @@ pub const Store = struct {
         }
     }
 
+    const InventoryTotals = struct { count: u64, bytes: u64 };
+
     fn inventoryRetainedPayloads(self: *Store) !void {
-        const Inventory = struct {
+        var unique = std.AutoHashMap(payload.Digest, u32).init(self.alloc);
+        defer unique.deinit();
+        const totals = try self.inventoryInto(&self.opened, &unique);
+        self.stats.retained_payloads = totals.count;
+        self.stats.retained_payload_bytes = totals.bytes;
+    }
+
+    fn inventoryInto(self: *Store, opened: *const native.Opened, unique: *std.AutoHashMap(payload.Digest, u32)) !InventoryTotals {
+        const started = time.monotonicNs();
+        defer self.stats.inventory_update_ns += time.monotonicNs() -| started;
+        self.stats.inventory_updates += 1;
+        const FullInventory = struct {
             fn put(map: *std.AutoHashMap(payload.Digest, u32), key: []const u8, dims: u32) !void {
                 if (key.len != 32) return error.InvalidVectorReference;
                 try map.put(key[0..32].*, dims);
@@ -744,26 +911,27 @@ pub const Store = struct {
                 }
             }
         };
-        var unique = std.AutoHashMap(payload.Digest, u32).init(self.alloc);
-        defer unique.deinit();
-        for (self.opened.readers) |reader| for (0..reader.count) |i| {
+        unique.clearRetainingCapacity();
+        for (opened.readers) |reader| for (0..reader.count) |i| {
             const entry = try reader.entryAt(i);
-            if (entry.value == .vector) try Inventory.put(&unique, entry.key, entry.value.vector.dims);
+            self.stats.inventory_rows_scanned += 1;
+            if (entry.value == .vector) try FullInventory.put(unique, entry.key, entry.value.vector.dims);
         };
-        for (self.opened.wal.records.items) |record| {
-            if (record.kind == .upsert) try Inventory.put(&unique, record.key, record.dims);
+        for (opened.wal.records.items) |record| {
+            if (record.kind == .upsert) try FullInventory.put(unique, record.key, record.dims);
         }
-        try Inventory.tree(&unique, self.opened.wal_tree);
-        self.stats.retained_payloads = unique.count();
-        self.stats.retained_payload_bytes = 0;
+        try FullInventory.tree(unique, opened.wal_tree);
+        var bytes: u64 = 0;
         var it = unique.valueIterator();
-        while (it.next()) |dims| self.stats.retained_payload_bytes += @as(u64, dims.*) * 4;
+        while (it.next()) |dims| bytes += @as(u64, dims.*) * 4;
+        return .{ .count = unique.count(), .bytes = bytes };
     }
 
     pub fn deinit(self: *Store) void {
         std.debug.assert(self.stats.active_sessions == 0);
         if (self.marking) |marking| marking.deinit(self.alloc);
         if (self.collection) |collection| collection.deinit(self.alloc);
+        self.inventory.deinit(self.alloc);
         self.opened.deinit();
         if (self.directory) |directory| directory.deinit();
         if (self.location_cache) |cache| cache.deinit();
@@ -783,8 +951,16 @@ pub const Store = struct {
         defer self.mutex.unlock();
         if (self.poisoned) return error.VectorPayloadStorePoisoned;
         var lease = try self.opened.clone(alloc);
+        self.recordCatalogSuccessor();
         lease.reference_location_cache = self.location_cache;
         return lease;
+    }
+
+    fn recordCatalogSuccessor(self: *Store) void {
+        const bytes = self.opened.catalogMetadataBytes();
+        if (self.opened.shared_catalog != null) {
+            self.stats.catalog_metadata_bytes_shared += bytes;
+        } else self.stats.catalog_metadata_bytes_copied += bytes;
     }
 
     pub fn interface(self: *Store) payload.Store {
@@ -890,6 +1066,46 @@ pub const Store = struct {
         while (!self.prepare_queue_mutex.tryLock()) std.Thread.yield() catch {};
     }
 
+    /// Cancelling unpublished work retains every preparation in the WAL.
+    /// An active scanner owns its cursor until it rejoins; callers must defer
+    /// admission rather than free its state or wait while holding this lock.
+    fn discardCollectionForPressureLocked(self: *Store) bool {
+        if (self.marking) |marking| {
+            if (marking.running) {
+                marking.cancel_requested = true;
+                return false;
+            }
+            marking.deinit(self.alloc);
+            self.marking = null;
+            self.stats.collection_deferrals += 1;
+        }
+        if (self.collection) |collection| {
+            if (collection.publication_attempted) return false;
+            collection.deinit(self.alloc);
+            self.collection = null;
+            self.stats.collection_deferrals += 1;
+        }
+        return true;
+    }
+
+    fn reservePreparationLocked(self: *Store, prepared: []const payload.Prepared) !?resources.BudgetedAllocator.ScratchReservation {
+        const budget = self.budget orelse return null;
+        // Decode/encode, immutable WAL successor and metadata coexist until
+        // append succeeds. Maintenance needs a page plus directory scratch.
+        var bytes: usize = 2 * 1024 * 1024;
+        for (prepared) |item| bytes = try std.math.add(usize, bytes, try std.math.add(usize, try std.math.mul(usize, item.reference.dims, 12), 2048));
+        return budget.reserveScratch(bytes) catch |err| {
+            if (err != error.ResourceBudgetExceeded or !self.discardCollectionForPressureLocked()) return err;
+            // A cancelled mark no longer prevents flushing its growing WAL.
+            if (self.walNeedsAdmissionCheckpoint()) try self.checkpointLocked();
+            return try budget.reserveScratch(bytes);
+        };
+    }
+
+    fn walNeedsAdmissionCheckpoint(self: *const Store) bool {
+        return self.opened.store.wal_has_mutations and self.opened.store.wal_committed_bytes >= self.wal_admission_bytes;
+    }
+
     fn prepareBatch(self: *Store, prepared: []const payload.Prepared) !void {
         if (self.read_only) return error.ReadOnly;
         // Decode independent artifact envelopes before entering source writer
@@ -915,7 +1131,20 @@ pub const Store = struct {
         if (self.group_commit) self.stats.decode_outside_lock_ns += lock_started -| decode_started;
         self.stats.prepare_batches += 1;
         defer self.stats.preparation_ns += time.monotonicNs() -| started;
-        if (self.opened.store.shouldCheckpointWal()) try self.checkpointLocked();
+        // The checkpoint threshold is a bound during marking as well. A mark
+        // is retryable from a newer cut; an ever-growing resident WAL is not.
+        if (self.walNeedsAdmissionCheckpoint() and (self.marking != null or self.collection != null)) {
+            if (!self.discardCollectionForPressureLocked()) {
+                // The scanner rejoins without DB.apply. Give it one bounded
+                // suffix window to cancel; do not wait under a primary write
+                // transaction or reject ordinary overlap at the soft bound.
+                const hard_wal_limit = self.wal_admission_bytes + @max(16 * 1024, self.wal_admission_bytes / 4);
+                if (self.opened.store.wal_committed_bytes >= hard_wal_limit) return error.ResourceBudgetExceeded;
+            }
+        }
+        const scratch_reservation = try self.reservePreparationLocked(prepared);
+        defer if (scratch_reservation) |reservation| reservation.release();
+        if (self.walNeedsAdmissionCheckpoint()) try self.checkpointLocked();
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
@@ -971,12 +1200,13 @@ pub const Store = struct {
         defer encoded.deinit();
         var successor = try self.opened.prepareWalSuccessor(self.alloc, &encoded, true);
         errdefer successor.deinit();
+        self.recordCatalogSuccessor();
         // Prepare all reader allocations before the durable append. This sync
         // establishes payload durability before ANY subsequent primary commit
         // or asynchronous primary checkpoint can persist its reference.
         const append_started = time.monotonicNs();
         self.opened.store.appendEncodedBatch(&encoded, records.items, .{ .sync = true }) catch |err| {
-            self.poisoned = true;
+            self.poisoned = self.opened.store.poisoned;
             return err;
         };
         self.stats.durable_append_ns += time.monotonicNs() -| append_started;
@@ -1079,11 +1309,16 @@ pub const Store = struct {
         if (!bootstrap and target_shards <= current_shards) return;
         const started = time.monotonicNs();
         defer self.stats.checkpoint_ns += time.monotonicNs() -| started;
-        errdefer self.poisoned = true;
+        const prior_generation = self.opened.store.manifest.?.latest_generation;
+        errdefer if (self.opened.store.poisoned or self.opened.store.manifest.?.latest_generation != prior_generation) {
+            self.poisoned = true;
+        };
         if (!try self.opened.compactDeltasToBaseWithShardCount(target_shards, 1024 * 1024)) return;
-        const next = try native.Store.openWithBlocksReusing(self.alloc, self.opened.store.storage, self.opened.store.root_dir, &self.opened);
-        self.opened.deinit();
-        self.opened = next;
+        var next = try native.Store.openWithBlocksReusing(self.alloc, self.opened.store.storage, self.opened.store.root_dir, &self.opened);
+        self.installOpened(&next) catch |err| {
+            next.deinit();
+            return err;
+        };
         self.refreshDirectory(false, false);
         self.stats.checkpoint_bytes_read += input_bytes;
         for (self.opened.blocks) |block| self.stats.checkpoint_bytes_written += block.bytes().len;
@@ -1104,16 +1339,20 @@ pub const Store = struct {
             _ = try self.advanceCollectionLocked(@max(1024 * 1024, collectionStepBytes()));
             if (self.collection != null) return;
         }
-        errdefer self.poisoned = true;
         const started = time.monotonicNs();
         defer self.stats.checkpoint_ns += time.monotonicNs() -| started;
         const prior_generation = self.opened.store.manifest.?.latest_generation;
+        errdefer if (self.opened.store.poisoned or self.opened.store.manifest.?.latest_generation != prior_generation) {
+            self.poisoned = true;
+        };
         const input_bytes = self.opened.store.wal_committed_bytes;
         if (!try self.opened.checkpointWalToDeltaWithPolicy(true, self.append_only)) return;
         self.stats.checkpoint_bytes_read += input_bytes;
-        const next = try native.Store.openWithBlocksReusing(self.alloc, self.opened.store.storage, self.opened.store.root_dir, &self.opened);
-        self.opened.deinit();
-        self.opened = next;
+        var next = try native.Store.openWithBlocksReusing(self.alloc, self.opened.store.storage, self.opened.store.root_dir, &self.opened);
+        self.installOpened(&next) catch |err| {
+            next.deinit();
+            return err;
+        };
         self.refreshDirectory(false, false);
         for (self.opened.readers, self.opened.blocks) |reader, block| {
             if (reader.generation > prior_generation) self.stats.checkpoint_bytes_written += block.bytes().len;
@@ -1212,6 +1451,30 @@ pub const Store = struct {
         }
         if (self.collection != null) return self.advanceCollectionLocked(@max(1, budget_bytes));
         if (self.marking != null) return self.advanceMarkingLocked(@max(1, budget_bytes));
+        return self.startMarkingLocked(primary) catch |err| switch (err) {
+            // Setup has released every temporary snapshot before we defer.
+            // A budget rejection is scheduling pressure; backing allocation
+            // failures and durable I/O errors still propagate to the caller.
+            error.CollectionWorkspaceUnavailable => {
+                self.stats.collection_deferrals += 1;
+                return false;
+            },
+            else => return err,
+        };
+    }
+
+    fn markWorkspaceBytes(self: *const Store) !usize {
+        // AutoHashMap's 80% load factor rounds to a power-of-two capacity.
+        // Forty bytes per bucket covers a digest, dimension and metadata;
+        // fixed slack covers the header/alignment and the Marking itself.
+        // Reserve also for the source lease (and full-GC sealing successor).
+        const count = std.math.cast(u32, self.stats.retained_payloads) orelse return error.VectorPayloadCountOverflow;
+        const load_capacity = (try std.math.mul(usize, count, 5)) / 4;
+        const slots = try std.math.ceilPowerOfTwo(usize, @max(8, try std.math.add(usize, load_capacity, 1)));
+        return std.math.add(usize, try std.math.add(usize, try std.math.mul(usize, slots, 40), @sizeOf(Marking) + 4096), try std.math.mul(usize, @intCast(self.opened.catalogMetadataBytes()), 2));
+    }
+
+    fn startMarkingLocked(self: *Store, primary: *erased.Store) !bool {
         const setup_started = time.monotonicNs();
         defer recordDuration(&self.stats.collection_setup_ns, &self.stats.collection_max_setup_ns, time.monotonicNs() -| setup_started);
         // Reclamation must follow durable primary publication. An in-memory
@@ -1262,10 +1525,42 @@ pub const Store = struct {
             null;
         errdefer if (ann) |*opened| opened.deinit();
         if (ann) |*opened| if (opened.baseEncoding() != .artifact_reference) return error.VectorStoreReferenceFormatRequired;
+        // The ANN lease may include a large reference WAL during ingestion.
+        // Admit the complete mark map against that resident lease before
+        // allocating it; otherwise a corpus-sized allocation can cross the
+        // slice limit even with an empty source WAL. Retry after the ANN WAL
+        // checkpoints or other leases release, without pinning this attempt.
+        const mark_scratch = if (self.budget) |budget|
+            budget.reserveScratch(try self.markWorkspaceBytes()) catch return error.CollectionWorkspaceUnavailable
+        else
+            null;
+        defer if (mark_scratch) |reservation| reservation.release();
+        if (!self.selective_gc and self.opened.store.wal_committed_bytes != 0) {
+            // Retain the cut as a sealed extent so full GC can share its
+            // post-cut WAL view too, without rereading or copying that WAL.
+            var successor = try self.opened.clone(self.alloc);
+            var successor_owned = true;
+            defer if (successor_owned) successor.deinit();
+            const sealed = successor.store.sealWal() catch |err| {
+                self.poisoned = successor.store.poisoned;
+                return err;
+            };
+            if (sealed) {
+                self.opened.deinit();
+                self.opened = successor;
+                successor_owned = false;
+            } else try self.checkpointLocked();
+        }
         var source_snapshot = try self.opened.clone(self.alloc);
         errdefer source_snapshot.deinit();
         const scopes = if (self.ann_scopes) |scopes| try self.alloc.dupe(u64, scopes) else null;
         errdefer if (scopes) |copy| self.alloc.free(copy);
+        // The physical inventory bounds the live set at this cut. Allocate
+        // its map once before scanning, avoiding old+new hash-table peaks
+        // midway through a mark while the post-cut WAL is also growing.
+        var live = std.AutoHashMap(payload.Digest, u32).init(self.alloc);
+        errdefer live.deinit();
+        try live.ensureTotalCapacity(std.math.cast(u32, self.stats.retained_payloads) orelse return error.ResourceBudgetExceeded);
         const marking = try self.alloc.create(Marking);
         marking.* = .{
             .source = source_snapshot,
@@ -1278,7 +1573,7 @@ pub const Store = struct {
             .ann = ann,
             .epoch = epoch,
             .ann_digest = ann_digest,
-            .live = .init(self.alloc),
+            .live = live,
             .tail = .init(self.alloc),
             .boundary = .{
                 .generation = self.opened.store.wal_generation,
@@ -1303,6 +1598,12 @@ pub const Store = struct {
         var plan_finished: ?u64 = null;
         defer recordDuration(&self.stats.collection_plan_ns, &self.stats.collection_max_plan_ns, (plan_finished orelse time.monotonicNs()) -| started);
         const marking = self.marking.?;
+        // Planning consumes the mark's live map. On failure, retry from a new
+        // snapshot rather than allowing a completed mark with an empty map.
+        errdefer if (self.marking) |pending| {
+            pending.deinit(self.alloc);
+            self.marking = null;
+        };
         var live = marking.live;
         marking.live = .init(self.alloc);
         defer live.deinit();
@@ -1431,6 +1732,7 @@ pub const Store = struct {
             if (publication_started) |start| recordDuration(&self.stats.collection_publish_ns, &self.stats.collection_max_publish_ns, time.monotonicNs() -| start);
         }
         const collection = self.collection.?;
+        const live_count = collection.live.count();
         // After a failed step, discard unpublished files and restart marking.
         // An ambiguous CURRENT is instead fenced and its files are preserved.
         errdefer {
@@ -1478,24 +1780,38 @@ pub const Store = struct {
             collection.shard += 1;
         }
         publication_started = time.monotonicNs();
+        const publication_scratch = if (self.budget) |budget|
+            try budget.reserveScratch(try std.math.add(usize, 64 * 1024, try std.math.add(usize, try std.math.mul(usize, @intCast(self.opened.catalogMetadataBytes()), 2), try std.math.mul(usize, collection.staged.items.len, 1024))))
+        else
+            null;
+        defer if (publication_scratch) |reservation| reservation.release();
+        var prepared = try self.opened.store.prepareSourceCollection(collection.generation, collection.staged.items, collection.selected, collection.boundary);
+        defer prepared.deinit();
+        var next = try prepared.openReaders(self.alloc, &self.opened);
+        var next_owned = true;
+        defer if (next_owned) next.deinit();
+        // The mark is no longer needed once copying completes. Reuse its
+        // capacity for control-mode physical accounting rather than allocate
+        // another corpus-sized map while retaining the original one.
+        const totals = if (!self.incremental_inventory and collection.selected != null)
+            try self.inventoryInto(&next, &collection.live)
+        else
+            null;
+        try self.prepareOpened(&next);
+        // Inventory is a cache: a failed commit leaves old authority intact
+        // and must discard any precomputed cache for the unpublished view.
+        errdefer if (self.incremental_inventory) self.inventory.deinit(self.alloc);
         collection.publication_attempted = true;
-        if (collection.selected) |selected| {
-            try self.opened.store.publishSelectedSourceSegments(collection.generation, collection.staged.items, selected, collection.boundary);
-        } else {
-            try self.opened.store.publishStagedBasePreservingWalTail(
-                collection.generation,
-                collection.boundary.covered_source_sequence,
-                collection.staged.items,
-                &.{},
-                collection.boundary,
-            );
-        }
-        const next = try native.Store.openWithBlocksReusing(self.alloc, self.opened.store.storage, self.opened.store.root_dir, &self.opened);
+        self.opened.store.commitPrepared(&prepared) catch |err| {
+            collection.publication_attempted = self.opened.store.poisoned;
+            return err;
+        };
         if (self.coalesce_directory) {
             if (self.directory) |directory| directory.removeRetired(&self.opened, &next) catch {};
         }
         self.opened.deinit();
         self.opened = next;
+        next_owned = false;
         if (self.coalesce_directory) {
             self.refreshDirectory(false, false);
             if (self.directory) |directory| directory.saveCoalesced(self.opened.store.storage, self.opened.store.root_dir) catch {};
@@ -1511,18 +1827,30 @@ pub const Store = struct {
         self.stats.unreferenced_payload_bytes_at_collection = self.stats.retained_payload_bytes -| marked_live_bytes;
         self.stats.retained_payloads = collection.items.len + collection.tail.count();
         self.stats.retained_payload_bytes = retained_bytes;
-        if (collection.selected != null) try self.inventoryRetainedPayloads();
+        if (self.incremental_inventory) {
+            self.stats.retained_payloads = self.inventory.counts.count();
+            self.stats.retained_payload_bytes = self.inventory.bytes;
+        } else if (totals) |physical| {
+            self.stats.retained_payloads = physical.count;
+            self.stats.retained_payload_bytes = physical.bytes;
+        }
         // Includes post-cut preparations conservatively; the next mark decides
         // whether those transactions committed or became orphans.
-        self.stats.live_payloads_at_collection = collection.live.count() + collection.tail.count();
+        self.stats.live_payloads_at_collection = live_count + collection.tail.count();
         self.stats.live_payload_bytes_at_collection = marked_live_bytes;
         self.stats.collections += 1;
         const receipt_epoch: ?u64 = if (collection.tail.count() == 0 and collection.selected == null and !collection.rescued) collection.primary_epoch else null;
         const receipt_ann: ?payload.Digest = if (collection.tail.count() == 0 and collection.selected == null and !collection.rescued) collection.ann else null;
-        // All remaining fallible work must precede consuming the builder: the
-        // error cleanup above still owns it until successful return.
-        _ = try self.opened.store.reclaimUnreferencedFiles();
-        try self.saveCheckpointReceipt(receipt_epoch, receipt_ann);
+        // Authority and its serving view are installed. Cleanup and receipt
+        // caching may retry later; neither can invalidate a healthy writer.
+        _ = self.opened.store.reclaimUnreferencedFiles() catch |err| blk: {
+            std.log.warn("source collection cleanup deferred: {s}", .{@errorName(err)});
+            break :blk 0;
+        };
+        self.saveCheckpointReceipt(receipt_epoch, receipt_ann) catch |err| {
+            self.receipt = null;
+            std.log.warn("source collection receipt deferred: {s}", .{@errorName(err)});
+        };
         collection.deinit(self.alloc);
         self.collection = null;
         return true;
@@ -2844,6 +3172,16 @@ test "source vector payloads elapsed marking budget yields before the row cap an
     source.mark_step_rows = 16384;
     source.mark_step_ns = 1;
     source.rescue_reappends = true;
+    // Ensure the one-nanosecond deadline has elapsed before scanning. A fast
+    // optimized scan can otherwise finish verification within one clock tick,
+    // leaving no partial verification for the concurrent-retry assertion.
+    const expire_budget = struct {
+        fn hook(_: *Store) void {
+            const started = time.monotonicNs();
+            while (time.monotonicNs() == started) std.atomic.spinLoopHint();
+        }
+    }.hook;
+    source.mark_test_hook = expire_budget;
     var store = try docs.DocStore.openRuntime(alloc, &raw);
     defer store.close();
     store.payload_store = source.interface();
@@ -2881,7 +3219,7 @@ test "source vector payloads elapsed marking budget yields before the row cap an
             MarkInterleaving.resume_scan.store(true, .release);
             thread.join();
             joined = true;
-            source.mark_test_hook = null;
+            source.mark_test_hook = expire_budget;
             try std.testing.expect(MarkInterleaving.scan_error == null);
             // This digest was already in the immutable cut's live set. A retry
             // must neither rewind verification nor invalidate the cut receipt.
@@ -2899,6 +3237,9 @@ test "source vector payloads elapsed marking budget yields before the row cap an
     try std.testing.expectEqual(@as(u64, 96), stats.live_payload_bytes_at_collection);
     try std.testing.expectEqual(@as(u64, 0), stats.unreferenced_payload_bytes_at_collection);
 
+    // This phase deliberately requests a new cut after the preceding pass
+    // may have certified the unchanged source when receipts are enabled.
+    source.receipt = null;
     // Real post-cut additions rule out the all-live shortcut. Do not scan the
     // complete source inventory merely to reject that shortcut afterward.
     try std.testing.expect(!try source.collectStepDeferredMark(&raw, std.math.maxInt(u64)));
@@ -3000,4 +3341,668 @@ test "source vector payloads active scan scheduling preserves duty and fences" {
     source.marking.?.scan_done = true;
     try std.testing.expect(source.activeScanPauseNs() == null);
     source.cancelMarking();
+}
+
+test "source vector payloads failed planning discards the consumed mark before retry" {
+    const alloc = std.testing.allocator;
+    const mem = @import("mem_backend.zig");
+    const docs = @import("docstore.zig");
+    const keys = @import("internal_keys.zig");
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var backend = mem.Backend.init(alloc, .{});
+    defer backend.close();
+    var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer raw.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/plan-failure", false);
+    defer source.deinit();
+    source.mark_outside_lock = true;
+    source.mark_step_rows = 1;
+    var store = try docs.DocStore.openRuntime(alloc, &raw);
+    defer store.close();
+    store.payload_store = source.interface();
+    const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "a", "model");
+    defer alloc.free(key);
+    const old = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2 });
+    defer alloc.free(old);
+    const current = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &.{ 3, 4 });
+    defer alloc.free(current);
+    try store.put(key, old);
+    try store.put(key, current);
+    try std.testing.expect(!try source.collectStepDeferredMark(&raw, 1));
+    while (!source.marking.?.scan_done) try source.advanceMarkingSnapshot();
+    try std.testing.expectEqual(@as(u32, 1), source.marking.?.live.count());
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    {
+        source.alloc = failing.allocator();
+        defer source.alloc = alloc;
+        try std.testing.expectError(error.OutOfMemory, source.collectStepDeferredMark(&raw, 1));
+    }
+    try std.testing.expect(source.marking == null);
+    try std.testing.expect(source.collection == null);
+    try std.testing.expect(!source.poisoned);
+    // Retry must take a new primary snapshot, not plan from the emptied map.
+    while (!try source.collectStep(&raw, 1)) {}
+    try std.testing.expectEqual(@as(u64, 1), source.stats.retained_payloads);
+    const value = try store.get(alloc, key);
+    defer alloc.free(value);
+    try std.testing.expectEqualSlices(u8, current, value);
+    var reopened = try Store.open(alloc, memory.storage(), "/plan-failure", false);
+    defer reopened.deinit();
+    const ref = try payload.Reference.forArtifact(key, current);
+    const durable = try Store.resolve(&reopened, alloc, key, ref);
+    defer alloc.free(durable);
+    try std.testing.expectEqualSlices(u8, current, durable);
+}
+
+test "source vector payloads shared catalogs preserve old leases across WAL and segment publication" {
+    const alloc = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/shared-catalog", false);
+    var source_live = true;
+    defer if (source_live) source.deinit();
+    source.shared_catalog = true;
+    try source.opened.shareSegmentCatalog();
+    const first = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2 });
+    defer alloc.free(first);
+    const first_ref = try payload.Reference.forArtifact("model-a", first);
+    try Store.prepare(&source, &.{.{ .reference = first_ref, .artifact = first }});
+    try source.checkpoint();
+    var lease = try source.snapshot(alloc);
+    defer lease.deinit();
+    try std.testing.expect(lease.shared_catalog == source.opened.shared_catalog);
+    try std.testing.expect(lease.readers.ptr == source.opened.readers.ptr);
+    try std.testing.expect(lease.store.manifest_segments.ptr == source.opened.store.manifest_segments.ptr);
+    const second = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &.{ 3, 4, 5 });
+    defer alloc.free(second);
+    const second_ref = try payload.Reference.forArtifact("model-b", second);
+    try Store.prepare(&source, &.{.{ .reference = second_ref, .artifact = second }});
+    try std.testing.expect(lease.shared_catalog == source.opened.shared_catalog);
+    try std.testing.expect((try lease.get(&second_ref.digest, std.math.maxInt(u64), null)) == .missing);
+    try source.checkpoint();
+    try std.testing.expect(lease.shared_catalog != source.opened.shared_catalog);
+    source.deinit();
+    source_live = false;
+    // Source hints are table-owned; this raw lease test has no directory.
+    lease.source_directory = null;
+    lease.reference_location_cache = null;
+    const old = try lease.get(&first_ref.digest, std.math.maxInt(u64), null);
+    var decoded: [2]f32 = undefined;
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, try old.vector.decodeInto(&decoded));
+    var reopened = try Store.open(alloc, memory.storage(), "/shared-catalog", false);
+    defer reopened.deinit();
+    const current = try Store.resolve(&reopened, alloc, "model-b", second_ref);
+    defer alloc.free(current);
+    try std.testing.expectEqualSlices(u8, second, current);
+}
+
+test "source vector payloads shared catalog allocation failures preserve original owners" {
+    const alloc = std.testing.allocator;
+    for (0..2) |fail_index| {
+        var memory = lsm.MemoryStorage.init(alloc);
+        defer memory.deinit();
+        var source = try Store.open(alloc, memory.storage(), "/catalog-failure", false);
+        defer source.deinit();
+        // Environment-enabled sources already own a catalog; a fresh native
+        // open gives this test the unshared ownership transition explicitly.
+        var opened = try native.Store.openWithBlocks(alloc, memory.storage(), "/catalog-failure");
+        defer opened.deinit();
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+        opened.store.alloc = failing.allocator();
+        const outcome = opened.shareSegmentCatalog();
+        opened.store.alloc = alloc;
+        try std.testing.expectError(error.OutOfMemory, outcome);
+        try std.testing.expect(opened.shared_catalog == null);
+        try std.testing.expect(opened.store.shared_manifest == null);
+        try opened.shareSegmentCatalog();
+        var failed_clone = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        try std.testing.expectError(error.OutOfMemory, opened.clone(failed_clone.allocator()));
+        var clone = try opened.clone(alloc);
+        defer clone.deinit();
+        try std.testing.expect(clone.shared_catalog == opened.shared_catalog);
+    }
+}
+
+test "source vector payloads incremental inventory matches full inventory after duplicate rescue updates and deletes" {
+    const alloc = std.testing.allocator;
+    const mem = @import("mem_backend.zig");
+    const docs = @import("docstore.zig");
+    const keys = @import("internal_keys.zig");
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var backend = mem.Backend.init(alloc, .{});
+    defer backend.close();
+    var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer raw.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/incremental-inventory", false);
+    defer source.deinit();
+    source.incremental_inventory = true;
+    source.append_only = true;
+    source.selective_gc = true;
+    source.mark_outside_lock = true;
+    source.mark_step_rows = 1;
+    source.rescue_reappends = false;
+    if (!source.inventory.initialized) try source.inventory.sync(alloc, null, &source.opened, &source.stats.inventory_rows_scanned);
+    var store = try docs.DocStore.openRuntime(alloc, &raw);
+    defer store.close();
+    store.payload_store = source.interface();
+    const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model-a");
+    defer alloc.free(key);
+    const first = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2 });
+    defer alloc.free(first);
+    const second = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &.{ 3, 4, 5 });
+    defer alloc.free(second);
+    const first_ref = try payload.Reference.forArtifact(key, first);
+    try store.put(key, first);
+    try source.checkpoint();
+    try store.put(key, second);
+    try std.testing.expect(!try source.collectStepDeferredMark(&raw, 1));
+    // The abandoned old version occurs in a segment and in the post-cut WAL.
+    try Store.prepare(&source, &.{.{ .reference = first_ref, .artifact = first }});
+    for (0..3) |_| {
+        var steps: usize = 0;
+        while (!try source.collectStep(&raw, 1)) : (steps += 1) try std.testing.expect(steps < 2048);
+        const expected_count = source.stats.retained_payloads;
+        const expected_bytes = source.stats.retained_payload_bytes;
+        try source.inventoryRetainedPayloads();
+        try std.testing.expectEqual(expected_count, source.stats.retained_payloads);
+        try std.testing.expectEqual(expected_bytes, source.stats.retained_payload_bytes);
+    }
+    try std.testing.expectEqual(@as(u64, 1), source.stats.retained_payloads);
+    try store.delete(key);
+    while (!try source.collectStep(&raw, 1)) {}
+    while (source.stats.retained_payloads != 0) {
+        while (!try source.collectStep(&raw, 1)) {}
+    }
+    try std.testing.expectEqual(@as(u64, 0), source.inventory.bytes);
+    var reopened = try Store.open(alloc, memory.storage(), "/incremental-inventory", false);
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(u64, 0), reopened.stats.retained_payloads);
+}
+
+test "source vector payloads publication reuses WAL under memory pressure" {
+    try testPublicationMemoryPressure(false);
+    try testPublicationMemoryPressure(true);
+}
+
+test "source vector payloads mark workspace admission releases snapshots and resumes reclamation" {
+    const alloc = std.testing.allocator;
+    const docs = @import("docstore.zig");
+    const mem = @import("mem_backend.zig");
+    const keys = @import("internal_keys.zig");
+    for ([_]bool{ false, true }) |incremental| {
+        var memory = lsm.MemoryStorage.init(alloc);
+        defer memory.deinit();
+        var backend = mem.Backend.init(alloc, .{});
+        defer backend.close();
+        var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer raw.deinit();
+        var budgets = resources.Options.defaultBudgets();
+        const limit = 16 * 1024 * 1024;
+        budgets[@intFromEnum(resources.Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = limit };
+        var manager = resources.ResourceManager.init(.{ .budgets = budgets });
+        defer manager.deinit(alloc);
+        var source = try Store.openManaged(alloc, &manager, memory.storage(), "/mark-admission", false);
+        defer source.deinit();
+        source.append_only = true;
+        source.selective_gc = true;
+        source.incremental_inventory = incremental;
+        source.shared_catalog = incremental;
+        source.mark_outside_lock = incremental;
+        source.mark_step_rows = 64;
+        source.ann_reference_root = try source.alloc.dupe(u8, "/mark-admission-ann");
+        var store = try docs.DocStore.openRuntime(alloc, &raw);
+        defer store.close();
+        store.payload_store = source.interface();
+        const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
+        defer alloc.free(key);
+        const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+        defer alloc.free(artifact);
+        try store.put(key, artifact);
+        const ref = try payload.Reference.forArtifact(key, artifact);
+        for (0..2048) |i| {
+            var identity: [8]u8 = undefined;
+            std.mem.writeInt(u64, &identity, i, .little);
+            const orphan = try payload.Reference.forArtifact(&identity, artifact);
+            try Store.prepare(&source, &.{.{ .reference = orphan, .artifact = artifact }});
+        }
+        try source.checkpoint();
+        var ann = try native.Store.open(alloc, memory.storage(), "/mark-admission-ann");
+        defer ann.deinit();
+        try ann.publishEmptyBase(1, 0, .{ .shard_count = 16, .encoding = .artifact_reference });
+        try ann.appendBatch(1, &.{.{ .kind = .upsert, .key = key, .source_sequence = 1, .revision = 1, .reference = .{ .digest = ref.digest, .dims = 3 } }}, 1, .{});
+        var old_query = try source.snapshot(alloc);
+        defer old_query.deinit();
+        const budget = source.budget.?;
+        budget.reservation.shrink(budget.reservation.bytes - budget.live_bytes);
+        const before_live = budget.live_bytes;
+        const used = manager.sliceStats(.dense_source_payload_state).used_bytes;
+        const workspace = try source.markWorkspaceBytes();
+        var held = try manager.reserve(.dense_source_payload_state, limit - used - workspace / 2);
+        defer held.release();
+        const generation = source.currentGeneration();
+        for (0..3) |_| {
+            try std.testing.expect(!try source.collectStepDeferredMark(&raw, 4096));
+            try std.testing.expect(source.marking == null and source.collection == null);
+            try std.testing.expect(!source.poisoned);
+            try std.testing.expectEqual(generation, source.currentGeneration());
+            // Each denied attempt releases its primary cursor and ANN/source
+            // leases rather than accumulating memory or blocking publication.
+            try std.testing.expectEqual(before_live, budget.live_bytes);
+            const denial = budget.allocationFailureThreadSafe().?;
+            try std.testing.expect(denial.cause == .admission);
+            try std.testing.expectEqual(workspace, denial.requested_bytes);
+        }
+        try std.testing.expect(source.stats.collection_deferrals >= 3);
+        held.release();
+        // Backing allocation failure remains an error, even after a prior
+        // admission denial; a stale receipt must not swallow real OOMs.
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        {
+            budget.backing = failing.allocator();
+            defer budget.backing = alloc;
+            try std.testing.expectError(error.OutOfMemory, source.collectStepDeferredMark(&raw, 4096));
+        }
+        var steps: usize = 0;
+        while (!try source.collectStep(&raw, 4096)) : (steps += 1) try std.testing.expect(steps < 4096);
+        try std.testing.expectEqual(@as(u64, 1), source.stats.retained_payloads);
+        const old = try old_query.get(&ref.digest, std.math.maxInt(u64), 1);
+        var decoded: [3]f32 = undefined;
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3 }, try old.vector.decodeExactInto(&decoded));
+        for (0..2) |_| {
+            var reopened = try Store.open(alloc, memory.storage(), "/mark-admission", false);
+            defer reopened.deinit();
+            const value = try Store.resolve(&reopened, alloc, key, ref);
+            defer alloc.free(value);
+            try std.testing.expectEqualSlices(u8, artifact, value);
+            try std.testing.expectEqual(@as(u64, 1), reopened.stats.retained_payloads);
+        }
+    }
+}
+
+fn testPublicationMemoryPressure(selective: bool) !void {
+    const alloc = std.testing.allocator;
+    const docs = @import("docstore.zig");
+    const mem = @import("mem_backend.zig");
+    const keys = @import("internal_keys.zig");
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var backend = mem.Backend.init(alloc, .{});
+    defer backend.close();
+    var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer raw.deinit();
+    var budgets = resources.Options.defaultBudgets();
+    const limit = 32 * 1024 * 1024;
+    budgets[@intFromEnum(resources.Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = limit };
+    var manager = resources.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    var source = try Store.openManaged(alloc, &manager, memory.storage(), "/publication-memory", false);
+    defer source.deinit();
+    source.append_only = true;
+    source.selective_gc = selective;
+    source.mark_outside_lock = true;
+    source.mark_step_rows = 1;
+    var store = try docs.DocStore.openRuntime(alloc, &raw);
+    defer store.close();
+    store.payload_store = source.interface();
+    const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
+    defer alloc.free(key);
+    const first = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+    defer alloc.free(first);
+    const second = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &.{ 4, 5, 6 });
+    defer alloc.free(second);
+    try store.put(key, first);
+    try store.put(key, second);
+    try std.testing.expect(!try source.collectStepDeferredMark(&raw, 1));
+    while (!source.marking.?.scan_done) try source.advanceMarkingSnapshot();
+    const prefix_bytes = source.marking.?.boundary.committed_bytes;
+    const vector = [_]f32{1} ** 256;
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 3, &vector);
+    defer alloc.free(artifact);
+    for (0..1024) |i| {
+        var identity: [8]u8 = undefined;
+        std.mem.writeInt(u64, &identity, i, .little);
+        const ref = try payload.Reference.forArtifact(&identity, artifact);
+        try Store.prepare(&source, &.{.{ .reference = ref, .artifact = artifact }});
+    }
+    const wal_bytes = source.opened.store.wal_committed_bytes;
+    const budget = source.budget.?;
+    budget.reservation.shrink(budget.reservation.bytes - budget.live_bytes);
+    const used = manager.sliceStats(.dense_source_payload_state).used_bytes;
+    var held = try manager.reserve(.dense_source_payload_state, limit - used - wal_bytes / 2);
+    defer held.release();
+    try std.testing.expect(try source.collectStep(&raw, std.math.maxInt(u64)));
+    try std.testing.expect(!source.poisoned);
+    try std.testing.expectEqual(@as(usize, 0), source.opened.wal_bytes.len);
+    try std.testing.expectEqual(wal_bytes - prefix_bytes, source.opened.store.wal_committed_bytes);
+    try std.testing.expect(budget.allocationFailureThreadSafe() == null);
+    held.release();
+    for (0..2) |_| {
+        var reopened = try Store.open(alloc, memory.storage(), "/publication-memory", false);
+        defer reopened.deinit();
+        var identity: [8]u8 = undefined;
+        std.mem.writeInt(u64, &identity, 1023, .little);
+        const ref = try payload.Reference.forArtifact(&identity, artifact);
+        const resolved = try Store.resolve(&reopened, alloc, &identity, ref);
+        defer alloc.free(resolved);
+        try std.testing.expectEqualSlices(u8, artifact, resolved);
+    }
+    // Actual admission pressure must precede append and leave the current
+    // generation usable. Cancelling the pending mark cannot lose its tail.
+    try std.testing.expect(!try source.collectStepDeferredMark(&raw, 1));
+    budget.reservation.shrink(budget.reservation.bytes - budget.live_bytes);
+    const pressure_used = manager.sliceStats(.dense_source_payload_state).used_bytes;
+    var pressure = try manager.reserve(.dense_source_payload_state, limit - pressure_used - 1024);
+    defer pressure.release();
+    const before_batch = source.opened.store.last_committed_batch;
+    const pressure_ref = try payload.Reference.forArtifact("pressure-retry", artifact);
+    try std.testing.expectError(error.ResourceBudgetExceeded, Store.prepare(&source, &.{.{ .reference = pressure_ref, .artifact = artifact }}));
+    try std.testing.expectEqual(before_batch, source.opened.store.last_committed_batch);
+    try std.testing.expect(!source.poisoned);
+    try std.testing.expect(source.marking == null);
+    pressure.release();
+    try Store.prepare(&source, &.{.{ .reference = pressure_ref, .artifact = artifact }});
+}
+
+test "source vector payloads publication allocation failures preserve usable authority" {
+    const alloc = std.testing.allocator;
+    const docs = @import("docstore.zig");
+    const mem = @import("mem_backend.zig");
+    const keys = @import("internal_keys.zig");
+    var failures: usize = 0;
+    var successes: usize = 0;
+    for ([_]bool{ false, true }) |incremental| for (0..128) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+        var memory = lsm.MemoryStorage.init(alloc);
+        defer memory.deinit();
+        var backend = mem.Backend.init(alloc, .{});
+        defer backend.close();
+        var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer raw.deinit();
+        var source = try Store.open(alloc, memory.storage(), "/publication-failure", false);
+        defer source.deinit();
+        source.append_only = true;
+        source.selective_gc = true;
+        source.mark_outside_lock = true;
+        source.mark_step_rows = 1;
+        source.shared_catalog = incremental;
+        source.incremental_inventory = incremental;
+        var store = try docs.DocStore.openRuntime(alloc, &raw);
+        defer store.close();
+        store.payload_store = source.interface();
+        const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
+        defer alloc.free(key);
+        const old = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2 });
+        defer alloc.free(old);
+        const current = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &.{ 3, 4 });
+        defer alloc.free(current);
+        try store.put(key, old);
+        try store.put(key, current);
+        var old_view = try source.snapshot(alloc);
+        defer old_view.deinit();
+        try std.testing.expect(!try source.collectStepDeferredMark(&raw, 1));
+        while (!source.marking.?.scan_done) try source.advanceMarkingSnapshot();
+        source.alloc = failing.allocator();
+        source.opened.store.alloc = failing.allocator();
+        const result = source.collectStep(&raw, std.math.maxInt(u64));
+        source.alloc = alloc;
+        source.opened.store.alloc = alloc;
+        if (result) |complete| {
+            try std.testing.expect(complete);
+            successes += 1;
+        } else |err| {
+            failures += 1;
+            if (err == error.GenerationPublicationDurabilityUncertain) {
+                @import("../test_error_logs.zig").expectErrorLogs(1);
+                try std.testing.expect(source.poisoned);
+            } else {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                try std.testing.expect(!source.poisoned);
+                // Foreground reads and the next collection remain usable.
+                const value = try store.get(alloc, key);
+                defer alloc.free(value);
+                try std.testing.expectEqualSlices(u8, current, value);
+                while (!try source.collectStep(&raw, 1)) {}
+            }
+        }
+        const old_ref = try payload.Reference.forArtifact(key, old);
+        try std.testing.expect((try old_view.get(&old_ref.digest, std.math.maxInt(u64), null)) == .vector);
+        for (0..2) |_| {
+            var reopened = try Store.open(alloc, memory.storage(), "/publication-failure", false);
+            defer reopened.deinit();
+            const ref = try payload.Reference.forArtifact(key, current);
+            const value = try Store.resolve(&reopened, alloc, key, ref);
+            defer alloc.free(value);
+            try std.testing.expectEqualSlices(u8, current, value);
+        }
+    };
+    try std.testing.expect(failures != 0 and successes != 0);
+}
+
+test "source vector payloads WAL admission cancels unpublished marks and retains every append" {
+    const alloc = std.testing.allocator;
+    const docs = @import("docstore.zig");
+    const mem = @import("mem_backend.zig");
+    const keys = @import("internal_keys.zig");
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var backend = mem.Backend.init(alloc, .{});
+    defer backend.close();
+    var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer raw.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/bounded-wal", false);
+    defer source.deinit();
+    source.append_only = true;
+    source.selective_gc = true;
+    source.mark_outside_lock = true;
+    source.mark_step_rows = 1;
+    source.wal_admission_bytes = 64 * 1024;
+    var store = try docs.DocStore.openRuntime(alloc, &raw);
+    defer store.close();
+    store.payload_store = source.interface();
+    const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
+    defer alloc.free(key);
+    const value = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2 });
+    defer alloc.free(value);
+    try store.put(key, value);
+    try std.testing.expect(!try source.collectStepDeferredMark(&raw, 1));
+    const vector = [_]f32{2} ** 2048;
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &vector);
+    defer alloc.free(artifact);
+    MarkInterleaving.entered.store(false, .release);
+    MarkInterleaving.resume_scan.store(false, .release);
+    MarkInterleaving.scan_error = null;
+    source.mark_test_hook = MarkInterleaving.pause;
+    const scanner = try std.Thread.spawn(.{}, MarkInterleaving.scan, .{&source});
+    var joined = false;
+    defer if (!joined) {
+        MarkInterleaving.resume_scan.store(true, .release);
+        scanner.join();
+    };
+    try MarkInterleaving.awaitFlag(&MarkInterleaving.entered);
+    for (0..12) |i| {
+        if (i == 9) {
+            try std.testing.expect(source.marking.?.cancel_requested);
+            MarkInterleaving.resume_scan.store(true, .release);
+            scanner.join();
+            joined = true;
+            source.mark_test_hook = null;
+            try std.testing.expect(MarkInterleaving.scan_error == null);
+            try std.testing.expect(source.marking == null);
+        }
+        var identity: [8]u8 = undefined;
+        std.mem.writeInt(u64, &identity, i, .little);
+        const ref = try payload.Reference.forArtifact(&identity, artifact);
+        try Store.prepare(&source, &.{.{ .reference = ref, .artifact = artifact }});
+        try std.testing.expect(source.opened.store.wal_committed_bytes < source.wal_admission_bytes + 16 * 1024);
+    }
+    try std.testing.expect(source.marking == null and source.collection == null);
+    try std.testing.expect(source.stats.collection_deferrals > 0);
+    try std.testing.expect(!source.poisoned);
+    var reopened = try Store.open(alloc, memory.storage(), "/bounded-wal", false);
+    defer reopened.deinit();
+    for (0..12) |i| {
+        var identity: [8]u8 = undefined;
+        std.mem.writeInt(u64, &identity, i, .little);
+        const ref = try payload.Reference.forArtifact(&identity, artifact);
+        const resolved = try Store.resolve(&reopened, alloc, &identity, ref);
+        defer alloc.free(resolved);
+        try std.testing.expectEqualSlices(u8, artifact, resolved);
+    }
+    try store.delete(key);
+    while (!try source.collectStep(&raw, std.math.maxInt(u64))) {}
+    while (source.stats.retained_payloads != 0) {
+        while (!try source.collectStep(&raw, std.math.maxInt(u64))) {}
+    }
+}
+
+test "source vector payloads inventory allocation failure discards partial cache and rebuilds" {
+    const alloc = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/inventory-failure", false);
+    defer source.deinit();
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2 });
+    defer alloc.free(artifact);
+    const ref = try payload.Reference.forArtifact("model-a", artifact);
+    try Store.prepare(&source, &.{.{ .reference = ref, .artifact = artifact }});
+    try source.checkpoint();
+    var reached_success = false;
+    for (0..32) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+        var inventory: Store.Inventory = .{};
+        defer inventory.deinit(alloc);
+        var rows: u64 = 0;
+        inventory.sync(failing.allocator(), null, &source.opened, &rows) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(!inventory.initialized);
+            try std.testing.expectEqual(@as(u32, 0), inventory.counts.count());
+            try inventory.sync(alloc, null, &source.opened, &rows);
+            try std.testing.expectEqual(@as(u64, 8), inventory.bytes);
+            continue;
+        };
+        reached_success = true;
+        break;
+    }
+    try std.testing.expect(reached_success);
+}
+
+test "source vector payloads deferred inventory preserves receipt totals and builds on installation" {
+    const alloc = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const first = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2 });
+    defer alloc.free(first);
+    const second = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &.{ 3, 4, 5 });
+    defer alloc.free(second);
+    const first_ref = try payload.Reference.forArtifact("model-a", first);
+    const second_ref = try payload.Reference.forArtifact("model-b", second);
+    {
+        var source = try Store.open(alloc, memory.storage(), "/deferred-inventory", false);
+        defer source.deinit();
+        source.checkpoint_receipts = true;
+        try Store.prepare(&source, &.{.{ .reference = first_ref, .artifact = first }});
+        try source.checkpoint();
+        try source.saveCheckpointReceipt(null, null);
+    }
+    var source = try Store.open(alloc, memory.storage(), "/deferred-inventory", false);
+    defer source.deinit();
+    source.checkpoint_receipts = true;
+    try std.testing.expect(try source.loadCheckpointReceipt());
+    source.incremental_inventory = true;
+    source.inventory.deinit(alloc);
+    const updates = source.stats.inventory_updates;
+    try source.initializeInventory(true);
+    try std.testing.expect(!source.inventory.initialized);
+    try std.testing.expectEqual(updates, source.stats.inventory_updates);
+    try std.testing.expectEqual(@as(u64, 1), source.stats.retained_payloads);
+    try std.testing.expectEqual(@as(u64, 8), source.stats.retained_payload_bytes);
+    var lease = try source.snapshot(alloc);
+    defer lease.deinit();
+    const value = try Store.resolve(&source, alloc, "model-a", first_ref);
+    defer alloc.free(value);
+    try std.testing.expectEqualSlices(u8, first, value);
+    try Store.prepare(&source, &.{.{ .reference = second_ref, .artifact = second }});
+    try std.testing.expect(!source.inventory.initialized);
+    try std.testing.expectEqual(@as(u64, 2), source.stats.retained_payloads);
+    // A failed first map construction consumes neither the old source nor next.
+    var next = try source.opened.clone(alloc);
+    defer next.deinit();
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    {
+        source.alloc = failing.allocator();
+        defer source.alloc = alloc;
+        try std.testing.expectError(error.OutOfMemory, source.installOpened(&next));
+    }
+    try std.testing.expect(!source.inventory.initialized);
+    try source.checkpoint();
+    try std.testing.expect(source.inventory.initialized);
+    try std.testing.expectEqual(@as(u32, 2), source.inventory.counts.count());
+    try std.testing.expectEqual(@as(u64, 20), source.inventory.bytes);
+    try source.inventoryRetainedPayloads();
+    try std.testing.expectEqual(source.inventory.bytes, source.stats.retained_payload_bytes);
+    try std.testing.expectEqual(@as(u64, source.inventory.counts.count()), source.stats.retained_payloads);
+    try std.testing.expect((try lease.get(&first_ref.digest, std.math.maxInt(u64), null)) == .vector);
+    try std.testing.expect((try lease.get(&second_ref.digest, std.math.maxInt(u64), null)) == .missing);
+}
+
+test "source vector payloads deferred inventory rejects corrupt and stale receipts" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |corrupt| {
+        var memory = lsm.MemoryStorage.init(alloc);
+        defer memory.deinit();
+        const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2 });
+        defer alloc.free(artifact);
+        const first_ref = try payload.Reference.forArtifact("model-a", artifact);
+        const second_ref = try payload.Reference.forArtifact("model-b", artifact);
+        {
+            var source = try Store.open(alloc, memory.storage(), "/invalid-receipt-inventory", false);
+            defer source.deinit();
+            source.checkpoint_receipts = true;
+            try Store.prepare(&source, &.{.{ .reference = first_ref, .artifact = artifact }});
+            try source.checkpoint();
+            try source.saveCheckpointReceipt(null, null);
+            if (corrupt) {
+                try memory.storage().writeFileAbsolute("/invalid-receipt-inventory/SOURCE_CHECKPOINT", "corrupt");
+            } else {
+                try Store.prepare(&source, &.{.{ .reference = second_ref, .artifact = artifact }});
+            }
+        }
+        var reopened = try Store.open(alloc, memory.storage(), "/invalid-receipt-inventory", false);
+        defer reopened.deinit();
+        reopened.checkpoint_receipts = true;
+        try std.testing.expect(!try reopened.loadCheckpointReceipt());
+        try std.testing.expect(reopened.receipt == null);
+        reopened.inventory.deinit(alloc);
+        try reopened.initializeInventory(true);
+        try std.testing.expect(reopened.inventory.initialized);
+        try std.testing.expectEqual(@as(u64, if (corrupt) 1 else 2), reopened.stats.retained_payloads);
+        try std.testing.expectEqual(@as(u64, if (corrupt) 8 else 16), reopened.stats.retained_payload_bytes);
+    }
+}
+
+test "source vector payloads independent scan skips apply only before planning and outside fences" {
+    const alloc = std.testing.allocator;
+    const mem = @import("mem_backend.zig");
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var backend = mem.Backend.init(alloc, .{});
+    defer backend.close();
+    var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer raw.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/independent-scan", false);
+    defer source.deinit();
+    source.mark_outside_lock = true;
+    source.independent_scan = true;
+    try std.testing.expect(!source.continueScanWithoutApply());
+    try std.testing.expect(!try source.collectStepDeferredMark(&raw, 1));
+    try std.testing.expect(source.continueScanWithoutApply());
+    source.stats.unresolved_primary_commits = 1;
+    try std.testing.expect(!source.continueScanWithoutApply());
+    source.stats.unresolved_primary_commits = 0;
+    try source.advanceMarkingSnapshot();
+    try std.testing.expect(!source.continueScanWithoutApply());
+    try std.testing.expect(try source.collectStepDeferredMark(&raw, 1));
+    try std.testing.expectEqual(@as(u64, 1), source.stats.collection_apply_visits_avoided);
 }

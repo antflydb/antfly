@@ -16168,6 +16168,17 @@ pub const DB = struct {
                 var updated = try self.loadIndexRepairEntryById(alloc, repair_id);
                 defer updated.deinit(alloc);
                 result.next_retry_at_ms = updated.intent.next_retry_at_ms;
+                if (entry.intent.last_error == null or
+                    !std.mem.eql(u8, entry.intent.last_error.?, "disk_admission_unavailable"))
+                {
+                    std.log.info("dense generation repair waiting for disk capacity index={s} available_bytes={?} requested_growth_bytes={} retry_at_ms={} reason={s}", .{
+                        entry.intent.index_name,
+                        first_capacity.available_bytes,
+                        remaining_disk_claim,
+                        result.next_retry_at_ms,
+                        @errorName(err),
+                    });
+                }
                 return result;
             },
             else => return err,
@@ -24158,6 +24169,10 @@ pub const DB = struct {
         // The mark owns immutable primary/ANN/source leases. Scan before
         // taking apply; only setup, planning, and publication need that fence.
         if (self.source_vectors) |source| try source.advanceMarkingSnapshot();
+        return self.runArtifactRepairMetadataMaintenanceAfterScan();
+    }
+
+    fn runArtifactRepairMetadataMaintenanceAfterScan(self: *DB) !bool {
         lockApply(self);
         defer self.core.unlockApply();
 
@@ -24227,16 +24242,37 @@ pub const DB = struct {
     }
 
     fn artifactRepairMetadataWorkerMain(self: *DB) void {
+        var metadata_due: u64 = 0;
+        var metadata_pending = true;
         while (true) {
-            const active = self.artifactRepairMetadataRebuildPending() or
+            const independent = if (self.source_vectors) |source| source.independent_scan else false;
+            if (!independent or monotonicTimeNs() >= metadata_due)
+                metadata_pending = self.artifactRepairMetadataRebuildPending();
+            const active = metadata_pending or
                 (if (self.source_vectors) |source| source.collectionPending() else false);
             const scan_pause = if (self.source_vectors) |source| source.activeScanPauseNs() else null;
             if (!self.sleepArtifactRepairMetadataWorker(scan_pause orelse if (active) artifact_repair_metadata_active_poll_ns else artifact_repair_metadata_poll_ns)) return;
             if (self.artifact_repair_metadata_stop.load(.acquire)) return;
-            _ = self.runArtifactRepairMetadataMaintenancePass() catch |err| {
-                std.log.warn("artifact repair metadata maintenance pass failed: {}", .{err});
-                continue;
-            };
+            if (independent) {
+                const source = self.source_vectors.?;
+                source.advanceMarkingSnapshot() catch |err| {
+                    std.log.warn("source vector scan failed: {}", .{err});
+                    continue;
+                };
+                // Active immutable scans need no repeated apply/catalog work.
+                // Metadata maintenance keeps the existing 100 ms cadence.
+                if (monotonicTimeNs() < metadata_due and source.continueScanWithoutApply()) continue;
+                metadata_due = monotonicTimeNs() +| artifact_repair_metadata_active_poll_ns;
+                _ = self.runArtifactRepairMetadataMaintenanceAfterScan() catch |err| {
+                    std.log.warn("artifact repair metadata maintenance pass failed: {}", .{err});
+                    continue;
+                };
+            } else {
+                _ = self.runArtifactRepairMetadataMaintenancePass() catch |err| {
+                    std.log.warn("artifact repair metadata maintenance pass failed: {}", .{err});
+                    continue;
+                };
+            }
         }
     }
 
@@ -24654,9 +24690,10 @@ pub const DB = struct {
             );
             if (posting_capture) |lease| if (posting_capture_owned) {
                 // Repair chunks are independently recoverable. Keep their WAL
-                // bounded, but do not claim source coverage until the complete
-                // scan has succeeded.
-                try self.core.index_manager.finishDensePostingSidecarCaptureLeaseByName(entry.config.name, lease, 0);
+                // bounded at their existing capture boundary. Zero would regress
+                // a reopened native generation; retaining the base does not
+                // claim additional source coverage for an incomplete scan.
+                try self.core.index_manager.finishDensePostingSidecarCaptureLeaseByName(entry.config.name, lease, lease.capture.base_coverage);
                 posting_capture_owned = false;
             };
             try mutated_indexes.put(alloc, entry.config.name, {});
@@ -25411,9 +25448,11 @@ pub const DB = struct {
 
         // Initial materialization and artifact repair share physical
         // validation helpers, but they are distinct durable job classes. An
-        // exact admission intent already owns this incarnation; independently
-        // planning its temporary cardinality gap here duplicates work and can
-        // move a resident writer into read-exclusive startup recovery.
+        // exact admission or generation-repair intent already owns this
+        // incarnation. Its cardinality gap must not launch an in-place rebuild
+        // while the durable owner is waiting for capacity or constructing its
+        // replacement. Broad startup debt runs ahead of the repair lane, so
+        // competing here can both mutate its predecessor and starve its owner.
         var repair_state = self.loadIndexRepairState(alloc) catch |err| switch (err) {
             error.FileNotFound, error.DurableIndexRepairStateUnavailable => null,
             else => return err,
@@ -25424,7 +25463,9 @@ pub const DB = struct {
             const physical_migration_required =
                 try self.core.index_manager.denseNativePhysicalMigrationRequired(entry.config.name);
             if (repair_state) |*state| {
-                if (self.currentInitialBuildIntentMatches(state, entry.config)) {
+                if (self.currentInitialBuildIntentMatches(state, entry.config) or
+                    self.currentNonInitialRepairIntentMatches(state, entry.config))
+                {
                     clearTargetAdvanceMaintenanceDebt(self.async_context, entry.config.name);
                     continue;
                 }
@@ -25469,14 +25510,9 @@ pub const DB = struct {
                 },
                 applied_sequence,
             );
-            const active_repair_owns_incarnation = if (repair_state) |*state|
-                self.currentNonInitialRepairIntentMatches(state, entry.config)
-            else
-                false;
             const incomplete_generated_hash = incomplete_generated_hashes.get(entry.config.name);
             const ordinary_generated_build = incomplete_generated_hash != null and
                 incomplete_generated_hash.? == config_hash and
-                !active_repair_owns_incarnation and
                 !watermark_regressed and
                 !generation_repair_pending and
                 !checkpoint_config_mismatch and
@@ -48897,6 +48933,36 @@ fn collectDenseEmbeddingReplacementKeys(
     return try keys.toOwnedSlice(alloc);
 }
 
+/// One ordered delete set for one index/source transaction. Do not broaden
+/// chunk identity deletes to parent documents; callers supply only the keys
+/// permitted by the projection's existing lifecycle policy.
+fn collectDenseReplayDeleteKeys(alloc: Allocator, deleted: []const []const u8, replacements: []const []const u8, overwritten: []const []const u8) ![]const []const u8 {
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer keys.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    for ([_][]const []const u8{ deleted, replacements, overwritten }) |source| {
+        for (source) |key| try appendUniqueBorrowedKeyWithSet(alloc, &keys, &seen, key);
+    }
+    return try keys.toOwnedSlice(alloc);
+}
+
+test "dense replay delete plan preserves ordered union and chunk boundaries" {
+    const alloc = std.testing.allocator;
+    const keys = try collectDenseReplayDeleteKeys(alloc, &.{ "deleted", "shared" }, &.{ "shared", "replacement", "replacement" }, &.{ "replacement", "parent" });
+    defer alloc.free(keys);
+    try std.testing.expectEqual(@as(usize, 4), keys.len);
+    for (keys, [_][]const u8{ "deleted", "shared", "replacement", "parent" }) |actual, expected| try std.testing.expectEqualStrings(expected, actual);
+    const chunks = try collectDenseReplayDeleteKeys(alloc, &.{"parent/chunk-1"}, &.{"parent/chunk-2"}, &.{});
+    defer alloc.free(chunks);
+    try std.testing.expectEqual(@as(usize, 2), chunks.len);
+    try std.testing.expectEqualStrings("parent/chunk-1", chunks[0]);
+    try std.testing.expectEqualStrings("parent/chunk-2", chunks[1]);
+    const empty = try collectDenseReplayDeleteKeys(alloc, &.{}, &.{}, &.{});
+    defer alloc.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
 fn collectDenseEmbeddingWrites(alloc: Allocator, embeddings: []const derived_types.DerivedDenseEmbeddingWrite, index_name: []const u8) ![]mapper.DenseEmbeddingWrite {
     var filtered = std.ArrayListUnmanaged(mapper.DenseEmbeddingWrite).empty;
     defer filtered.deinit(alloc);
@@ -48933,36 +48999,6 @@ fn collectDenseEmbeddingWritesForArtifacts(
     const index_ref = index_manager_mod.ManagedIndexRef{ .name = index_name, .kind = .dense_vector };
     for (artifact_keys) |artifact_key| {
         var identity = (try decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc(alloc, index_manager, index_ref, artifact_key)) orelse continue;
-/// One ordered delete set for one index/source transaction. Do not broaden
-/// chunk identity deletes to parent documents; callers supply only the keys
-/// permitted by the projection's existing lifecycle policy.
-fn collectDenseReplayDeleteKeys(alloc: Allocator, deleted: []const []const u8, replacements: []const []const u8, overwritten: []const []const u8) ![]const []const u8 {
-    var keys = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer keys.deinit(alloc);
-    var seen = std.StringHashMapUnmanaged(void).empty;
-    defer seen.deinit(alloc);
-    for ([_][]const []const u8{ deleted, replacements, overwritten }) |source| {
-        for (source) |key| try appendUniqueBorrowedKeyWithSet(alloc, &keys, &seen, key);
-    }
-    return try keys.toOwnedSlice(alloc);
-}
-
-test "dense replay delete plan preserves ordered union and chunk boundaries" {
-    const alloc = std.testing.allocator;
-    const keys = try collectDenseReplayDeleteKeys(alloc, &.{ "deleted", "shared" }, &.{ "shared", "replacement", "replacement" }, &.{ "replacement", "parent" });
-    defer alloc.free(keys);
-    try std.testing.expectEqual(@as(usize, 4), keys.len);
-    for (keys, [_][]const u8{ "deleted", "shared", "replacement", "parent" }) |actual, expected| try std.testing.expectEqualStrings(expected, actual);
-    const chunks = try collectDenseReplayDeleteKeys(alloc, &.{"parent/chunk-1"}, &.{"parent/chunk-2"}, &.{});
-    defer alloc.free(chunks);
-    try std.testing.expectEqual(@as(usize, 2), chunks.len);
-    try std.testing.expectEqualStrings("parent/chunk-1", chunks[0]);
-    try std.testing.expectEqualStrings("parent/chunk-2", chunks[1]);
-    const empty = try collectDenseReplayDeleteKeys(alloc, &.{}, &.{}, &.{});
-    defer alloc.free(empty);
-    try std.testing.expectEqual(@as(usize, 0), empty.len);
-}
-
         var identity_transferred = false;
         errdefer if (!identity_transferred) identity.deinit(alloc);
         try filtered.append(alloc, .{
@@ -109263,4 +109299,109 @@ test "source vector table retains artifacts after dropping last consumer and reb
     var map = try @import("../vector_block_store.zig").Store.openReadOnlyWithBlocks(alloc, db.core.index_manager.vector_block_storage.?, map_root);
     defer map.deinit();
     try std.testing.expectEqual(.artifact_reference, map.baseEncoding());
+}
+
+test "db capacity deferred dense repairs exclusively own both model generations across restart" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    const configs = [_]types.IndexConfig{
+        .{ .name = "model_a", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}" },
+        .{ .name = "model_b", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}" },
+    };
+    const options: OpenOptions = .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    };
+    var repair_ids: [2]u128 = undefined;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), options);
+        defer db.close();
+        for (configs) |cfg| try db.addIndex(cfg);
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"model_a\":[1,0,0],\"model_b\":[0,1]}}" }},
+            .sync_level = .write,
+        });
+        for (configs, 0..) |cfg, i| {
+            // Reproduce a publication cursor ahead of an empty canonical ANN
+            // generation. Durable shadow repair owns the missing artifacts.
+            try db.core.saveAppliedSequence(cfg.name, 1);
+            try db.core.saveProjectionCheckpoint(cfg.name, .{
+                .applied_sequence = 1,
+                .status = .rebuilding,
+                .generation = 1,
+                .config_hash = types.indexConfigHash(cfg),
+            });
+            repair_ids[i] = try db.createOperatorGenerationRepairIntent(alloc, cfg, 0, 0);
+            const step = try db.advanceIndexRepairIntent(alloc, repair_ids[i], .{
+                .capacity_domain_id = 77,
+                .capacity_observation = .{ .available_bytes = 1, .capacity_bytes = 1 },
+            });
+            try std.testing.expect(step.disk_wait);
+            try std.testing.expect(step.deferred);
+            try std.testing.expectEqual(@as(u64, 0), db.core.index_manager.denseIndex(cfg.name).?.index.stats().active_count);
+        }
+        var plan = try db.collectDenseArtifactRebuildPlan(alloc);
+        defer plan.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), plan.targets.len);
+        try std.testing.expectEqual(@as(usize, 0), plan.generation_repairs.len);
+    }
+    var db = try DB.open(alloc, std.mem.span(path), options);
+    defer db.close();
+    {
+        var plan = try db.collectDenseArtifactRebuildPlan(alloc);
+        defer plan.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), plan.targets.len);
+        try std.testing.expectEqual(@as(usize, 0), plan.generation_repairs.len);
+    }
+    for (configs, repair_ids) |cfg, repair_id| {
+        try db.updateIndexRepairIntent(alloc, repair_id, .{ .next_retry_at_ms = 0 });
+        var repaired = false;
+        for (0..16) |_| {
+            const step = try db.advanceIndexRepairIntent(alloc, repair_id, repair_completion_test_options);
+            try std.testing.expect(!step.terminal);
+            if (step.repaired) {
+                repaired = true;
+                break;
+            }
+        }
+        try std.testing.expect(repaired);
+        try std.testing.expectEqual(@as(u64, 1), db.core.index_manager.denseIndex(cfg.name).?.index.stats().active_count);
+    }
+}
+
+test "db dense artifact rebuild chunks retain nonzero posting capture coverage" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    const name = "dense_idx";
+    try db.addIndex(.{
+        .name = name,
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"dense_idx\":[1,0,0]}}" }},
+        .sync_level = .full_index,
+    });
+    const dense = db.core.index_manager.denseIndex(name).?;
+    const covered = dense.index.experimentalPostingDurableAppliedSequence() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(covered > 0);
+    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", name);
+    defer alloc.free(artifact_key);
+    try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, artifact_key, null, &.{ 0, 1, 0 });
+    try std.testing.expectEqual(@as(usize, 1), try db.rebuildDenseIndexesFromStoredEmbeddingArtifacts(alloc));
+    try std.testing.expectEqual(@as(?u64, covered), dense.index.experimentalPostingDurableAppliedSequence());
+    try std.testing.expectEqual(covered, try db.core.loadAppliedSequence(alloc, name));
+    try std.testing.expectEqual(@as(u64, 1), dense.index.stats().active_count);
 }

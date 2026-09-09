@@ -12109,6 +12109,30 @@ components:
         collection_plan_ns:
           type: integer
           format: int64
+        collection_apply_visits_avoided:
+          type: integer
+          format: int64
+          description: Incomplete scan turns advanced without entering DB apply; metadata maintenance retains its own cadence.
+        inventory_rows_scanned:
+          type: integer
+          format: int64
+          description: Segment entries visited during full physical inventory scans or incremental updates; excludes WAL entries.
+        catalog_metadata_bytes_shared:
+          type: integer
+          format: int64
+          description: Logical immutable catalog bytes shared instead of copied by successful source snapshot and WAL-successor allocations; not resident bytes.
+        catalog_metadata_bytes_copied:
+          type: integer
+          format: int64
+          description: Immutable catalog array bytes copied by successful source snapshot and WAL-successor allocations; excludes object and root-path allocations.
+        inventory_updates:
+          type: integer
+          format: int64
+          description: Full physical inventory scans and incremental occurrence-cache updates; this cache is not ownership authority.
+        inventory_update_ns:
+          type: integer
+          format: int64
+          description: Time spent on full physical inventory scans or incremental occurrence-cache updates.
         collection_locked_ns:
           type: integer
           format: int64

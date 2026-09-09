@@ -16,6 +16,8 @@ import sys
 import time
 
 from vector_store_experiment_settings import ALL_FLAGS, TREATMENTS, configure
+from vector_store_capacity import observe as observe_capacity, require_capacity
+from vector_store_qualification_errors import inspect_workload_errors
 
 
 def digest(path: Path) -> str:
@@ -48,6 +50,8 @@ def verify_50k_gate(root, binary_hash, refinement, pairs, environment, settings)
             if flag not in command or command[command.index(flag) + 1] != str(value):
                 raise ValueError("50K workload setting does not match: " + flag)
         arm_root = root / f"Performance1536D50K-{arm['pair']}-{arm['mode']}"
+        if not inspect_workload_errors(arm_root)["qualified"]:
+            raise ValueError("50K workload logs contain errors/retries or are missing")
         if not (arm_root / "qualification-summary.json").is_file():
             raise ValueError("50K qualification summary is missing")
         if not json.loads((arm_root / "source-enrichment.json").read_text()).get("qualified"):
@@ -73,6 +77,7 @@ def main() -> None:
     parser.add_argument("--memory-budget-mb", type=int, default=4096)
     parser.add_argument("--vdbbench-root", type=Path)
     parser.add_argument("--vdbbench-python", type=Path)
+    parser.add_argument("--after-arm-hook", type=Path, help="Run a pinned Python lifecycle hook after each successful arm and before starting the next.")
     args = parser.parse_args()
     if args.pairs < 2:
         parser.error("at least two pairs are needed to alternate run order")
@@ -117,6 +122,8 @@ def main() -> None:
                     f"measurement script changed during experiment: {path}"
                 )
 
+    hook = args.after_arm_hook.resolve(strict=True) if args.after_arm_hook else None
+    hook_hash = digest(hook) if hook else None
     results = []
     cases = ["Performance768D1M"] if args.only_1m else ["Performance1536D50K"]
     if args.include_1m:
@@ -179,10 +186,17 @@ def main() -> None:
                     "binary_sha256": expected_hash,
                     "started_at": time.time(),
                     "measurement_scripts_sha256": expected_scripts,
+                    "capacity_preflight": observe_capacity(args.root, case),
                 }
                 results.append(receipt)
                 index = args.root / "ab-runs.json"
                 index.write_text(json.dumps(results, indent=2) + "\n")
+                try:
+                    require_capacity(receipt["capacity_preflight"])
+                except RuntimeError as exc:
+                    receipt.update(exit_code=1, invalid_reason=str(exc), finished_at=time.time())
+                    index.write_text(json.dumps(results, indent=2) + "\n")
+                    raise
                 with (args.root / f"{run.name}.log").open("w") as log:
                     sampler = None
                     if sys.platform == "darwin":
@@ -217,6 +231,33 @@ def main() -> None:
                     raise RuntimeError(
                         f"{run.name} failed; later arms and scale-up are gated"
                     )
+                # The benchmark client retries failed writes and may exit zero
+                # after OOM or writer poisoning. Preserve those attempts, but
+                # do not promote them into clean A/B or scale qualification.
+                workload_errors = inspect_workload_errors(run)
+                (run / "workload-errors.json").write_text(
+                    json.dumps(workload_errors, indent=2) + "\n"
+                )
+                receipt["workload_errors"] = workload_errors
+                if not workload_errors["qualified"]:
+                    receipt["invalid_reason"] = "workload errors/retries or missing logs"
+                index.write_text(json.dumps(results, indent=2) + "\n")
+                if receipt.get("invalid_reason"):
+                    raise RuntimeError(f"{run.name}: workload error gate failed")
+                if hook is not None:
+                    if digest(hook) != hook_hash:
+                        raise RuntimeError("lifecycle hook changed during experiment")
+                    hook_command = [sys.executable, "-B", str(hook), str(args.root.resolve()), run.name]
+                    receipt["after_arm_hook"] = {"command": hook_command, "sha256": hook_hash}
+                    index.write_text(json.dumps(results, indent=2) + "\n")
+                    with (args.root / f"{run.name}-lifecycle.log").open("w") as log:
+                        followup = subprocess.run(hook_command, stdout=log, stderr=subprocess.STDOUT)
+                    receipt["after_arm_hook"]["exit_code"] = followup.returncode
+                    if followup.returncode or digest(hook) != hook_hash:
+                        receipt["invalid_reason"] = "lifecycle hook failed or changed"
+                    index.write_text(json.dumps(results, indent=2) + "\n")
+                    if receipt.get("invalid_reason"):
+                        raise RuntimeError(f"{run.name}: lifecycle hook failed or changed; later arms are gated")
 
 
 if __name__ == "__main__":

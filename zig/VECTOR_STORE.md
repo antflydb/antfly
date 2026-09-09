@@ -358,7 +358,131 @@ are in `.benchmark-results/vector-foreground-gc/RESULTS.md`.
 
 ## Active scan progress and protected reuse experiment
 
-The next implementation is under `.benchmark-results/vector-progress-dedup/`.
+The [2026-09-08 correctness and design review](VECTOR_STORE_REVIEW.md) records
+the remaining audit boundaries and larger opportunities after these measurements.
+
+The three structural follow-ups are now implemented under
+`.benchmark-results/vector-structural/`: `ANTFLY_SOURCE_VECTOR_INDEPENDENT_SCAN=1`
+separates incomplete scan turns from DB metadata maintenance,
+`ANTFLY_SOURCE_VECTOR_SHARED_CATALOG=1` shares immutable segment and manifest
+arrays across source leases/WAL successors, and
+`ANTFLY_SOURCE_VECTOR_INCREMENTAL_INVENTORY=1` maintains rebuildable physical
+occurrence counts across changed segments and WAL membership. They remain
+independent experimental controls. Inventory counts handle duplicate physical
+locations and never replace primary/ANN ownership authority; they add resident
+metadata. All 35 source tests pass with switches off and with all three plus
+ownership indexing enabled; 32 native tests and five public API lifecycle checks
+pass on the pinned release. All 12 fresh 50K timed arms and 12 reclamation clones
+pass. Two inventory candidates also reopen with incremental inventory and
+checkpoint inventory restoration disabled: full scans independently recover
+50,000 unique payloads / 307,200,000 raw bytes before collection publication.
+
+The independent A/B and B/A comparisons do not make all three clear wins:
+
+| Treatment | Median paired result | Decision |
+|---|---|---|
+| Independent scan | Readiness +8.1%, mixed queries +0.1%, mixed writes -1.9% | Keep experimental; avoided apply visits did not produce an overall improvement. |
+| Shared catalog | C1 queries +20.4%, mixed writes +4.1%, churn time -7.8%, mixed RSS +22.2% | Strongest next candidate; attribute the repeatable RSS increase before promotion. |
+| Incremental inventory | Publication-stage time -51.9%, mixed writes +6.7%, mixed queries -3.5% | Keep experimental; fewer segment visits cost more total inventory bookkeeping. |
+
+Shared-catalog readiness is outlier-sensitive. Inventory readiness and RSS change
+direction across pairs; its roughly 93% reduction in segment rows excludes WAL
+traversal and map work. Inventory candidate reclamation settles in 2.93/2.90 s
+versus 7.19/9.53 s for controls, with different starting layouts/debt. These are
+lifecycle results, not identical-input GC microbenchmarks. No defaults change.
+Profile shared-catalog residency and inventory WAL/map costs, then qualify a
+selected subset against the stronger locked row-bounded baseline before 1M.
+See [the complete measurement record](../.benchmark-results/vector-structural/RESULTS.md).
+
+The memory investigation is recorded under
+`.benchmark-results/vector-structural-refined/`. Identical-data memory-map
+diagnostics did not reproduce a retained-catalog heap or mapping increase, so
+shared-catalog ownership stays unchanged. Original phase-matched process samples
+show mixed physical footprint +6.6% versus RSS +22.2%; fresh qualification must
+continue reporting both. A separate WAL-membership prototype passed four 50K
+arms, four reclamation checks, and two independent inventory audits, but did not
+establish an overall performance win. That prototype remains in its frozen
+experiment snapshot and is excluded from the current implementation.
+
+
+The subsequent [source publication memory fix](../.benchmark-results/vector-source-memory-fix/README.md)
+reproduces the suspected OOM as a source-budget rejection of a second WAL-sized
+allocation during GC preparation. Full and selective GC now prepare readers and
+inventory before publication, reuse the committed WAL suffix, and preserve the
+current generation on pre-publication failure. Scratch admission and a
+budget-derived WAL bound protect foreground progress; ambiguous durable writes
+still require recovery. The controlled memory test now succeeds, and validation
+covers allocation failures, old readers, retry, update/delete and repeated restart.
+That revision passes fresh 50K ABBA and its lifecycle checks, but the second
+1M candidate logs one maintenance OOM and is excluded. A same-binary diagnostic
+identifies a separate 77,594,648-byte mark-map allocation with 332,745,026 live
+bytes against the 402,653,184-byte source slice. The
+[mark-workspace follow-up](../.benchmark-results/vector-source-memory-admission/README.md)
+admits the map and source leases against the resident ANN snapshot before map
+allocation. Rejected setup releases its temporary snapshots and retries later;
+backing allocation and I/O failures still propagate. Its regression verifies
+repeated deferral without retained memory, reclamation after pressure clears,
+old readers and repeated reopen. Fresh qualification of this follow-up is
+pending. Earlier failed arms remain excluded and no defaults are promoted.
+
+The completed isolated deferred-inventory 50K ABBA passes all four timed and
+reclamation arms and both independent full inventories, but it is not selected:
+median paired mixed writes fall 25.6%, churn time rises 12.9%, and mixed physical
+footprint rises 15.8% despite RSS falling 13.7%. The completed comparison under
+`.benchmark-results/vector-structural-selected/` combines shared catalogs with
+**eager** incremental inventory against the earlier locked baseline; lazy
+inventory is disabled. It uses the same recovery-qualified binary and a separate
+frozen harness, preserving prior measurements. Combined 50K passes all four
+timed/reclamation arms and both independent inventory audits. Median paired mixed
+writes improve 3.3%, churn time 2.1%, and mixed p99 4.0%; query and
+physical-footprint directions vary by pair.
+
+All four 1M attempts finished lifecycle checks, including both independent
+candidate inventories, but **1M performance qualification is incomplete**.
+The last control encountered three out-of-memory errors and source-store
+poisoning during ingestion; the client retried four HTTP 500s and exited
+successfully. That control is excluded, leaving three clean arms and only one
+complete clean pair. In that pair mixed queries improve 7.5%, writes 7.4%, p99
+13.6%, and fixed churn time 5.4%; mixed RSS rises 27.0% and physical footprint
+6.4%. These are single-pair observations, not a repeated scale win or evidence
+for promotion.
+
+The benchmark now rejects write errors/retries even when the client exits zero,
+and the 1M gate rechecks historical 50K logs. Four regression tests pass; an audit
+of all twelve timed arms in this revision finds only the last 1M control affected.
+Its failed-run data and original receipts are preserved. Source heap rose during
+collection before the errors, but the failing allocation is not identified.
+Next, reproduce memory admission/collection scratch pressure with allocation
+evidence, fix it while preserving publication and recovery fences, then rerun
+fresh 1M ABBA. No defaults change. See the
+[full results](../.benchmark-results/vector-structural-selected/RESULTS.md) and
+[memory-failure evidence](../.benchmark-results/vector-structural-selected/MEMORY_FAILURE.md).
+
+The current refinement is under `.benchmark-results/vector-structural-recovery/`.
+`ANTFLY_SOURCE_VECTOR_LAZY_INVENTORY=1` lets an incremental-inventory store use
+the totals from a validated checkpoint receipt without eagerly constructing its
+occurrence map. Segment installation constructs the map before using it for
+physical accounting. Missing, corrupt, or stale receipts retain full
+reconstruction; preparation counters, ownership authority, payload validation,
+and publication failure fences remain unchanged. All 37 source checks pass with
+defaults and with shared catalogs, incremental/lazy inventory, ownership indexing,
+and checkpoint receipts enabled. Investigation of the API timeout found that
+both default and explicit settings already enable native ANN storage. A simulated
+low-space test reproduced capacity-deferred backfill and exposed competing
+in-place startup reconstruction, which failed by publishing a chunk at sequence
+zero. Durable generation-repair ownership now excludes that reconstruction;
+independent rebuild chunks retain their existing capture coverage. Five focused
+checks pass, including restart and both model generations. The saved failed
+database, capacity simulation, source patch and qualification receipts are in
+[the recovery record](../.benchmark-results/vector-structural-recovery/README.md).
+The pinned release passes both five-case public API suites, saved-database
+recovery with update/delete and two further restarts, and both controlled
+capacity/restart/resume cases without another write. The isolated and combined
+50K comparisons and incomplete 1M qualification are recorded above. Per-arm disk checks include the native safety
+reserve; host quietness is not required. No defaults change solely because these
+switches are implemented.
+
+The implementation and measurements are under `.benchmark-results/vector-progress-dedup/`.
 `ANTFLY_SOURCE_VECTOR_SCAN_DUTY_PERCENT=50` replaces the fixed active-scan pause
 with a pause equal to the preceding scan's wall duration (minimum 100 microseconds).
 This policy applies only to unlocked marking; idle maintenance and planned copying
@@ -372,9 +496,10 @@ copy plan is finalized. Verification iterators are invalidated before that map
 can grow. This permits reuse through GC publication without another payload WAL
 append. Once copying is planned, the normal append fallback remains. Cancellation
 retains the original durable authority, and ambiguous primary outcomes still
-fence publication. A mark containing protected preparations cannot certify its
-old primary epoch as fully live: some preparations may be abandoned, so a later
-mark must revisit reachability.
+fence publication. A mark containing newly protected payloads absent from the cut's live set cannot
+certify its old primary epoch as fully live: some preparations may be abandoned,
+so a later mark must revisit reachability. Already-live retries preserve both
+verification progress and the original checkpoint proof.
 
 New cumulative and maximum timings distinguish source lock holds, setup, planning,
 copying, and publication; setup includes checkpoints, while publication includes
@@ -382,9 +507,25 @@ directory refresh, inventory, receipts, and reclamation. Avoided payload/byte an
 requested-duty-pause counters expose the cost tradeoff. Nested stage totals must
 not be added to the overall lock-hold total.
 
-Scheduling, protected reuse, and their combination are independently measurable
-against the same 2 ms unlocked-marking baseline. Recovery and fresh 50K A/B and
-B/A qualification are in progress; all settings remain experimental.
+Scheduling, protected reuse, and their combination were measured independently
+against the same 2 ms unlocked-marking baseline. All 12 timed 50K arms and all 12
+exact-reclamation clones passed. The measured release passed 61 distinct storage
+checks and five API lifecycle tests. Final review added a planning-allocation
+failure cleanup guard and retry/reopen regression; the final source suite passes
+30 checks with ownership indexing off and on, alongside the earlier 32 native
+checks. The guard's separate post-measurement receipt preserves the measured binary.
+
+Protected reuse alone reduced churn logical write I/O by 21.6%, but increased
+mixed RSS by 30.9% and reduced C1 query throughput by 20.2%. The combination
+completed post-workload reclamation in 8.18/8.20 seconds versus 271.37/69.77 seconds
+for its controls, while readiness was 14.3% slower and C1 throughput 25.8% lower
+(median paired ratios). Physical layouts and starting reclamation debt differ;
+these are lifecycle comparisons rather than identical-state GC microbenchmarks.
+Remaining source lock work is dominated by setup and publication, warranting
+finer checkpoint/directory/inventory profiling. No performance winner is promoted;
+the stronger row-bounded baseline comparison and new 1M runs remain gated.
+Per-arm measurements and limitations are in
+`.benchmark-results/vector-progress-dedup/RESULTS.md`. All settings remain experimental.
 
 ## Second experiment round: six independent controls
 

@@ -38,6 +38,29 @@ def resource_totals(path):
                 'process_peak_phys_footprint_bytes': peak_footprint}
 
 
+def phase_resource_peaks(path, phases_path):
+    if not path.exists() or not phases_path.exists():
+        return {}
+    phases = {row['phase']: row['wall_time'] for row in
+              (json.loads(line) for line in phases_path.read_text().splitlines())}
+    samples = [json.loads(line) for line in path.read_text().splitlines()]
+    result = {}
+    for label, begin, end in [('mixed', 'mixed_profile_start', 'mixed_profile_end'),
+                              ('read_only', 'public_profile_start', 'public_profile_end')]:
+        if begin not in phases or end not in phases:
+            continue
+        selected = [row for row in samples if phases[begin] <= row['wall_time_s'] <= phases[end]]
+        if not selected or len({(row['pid'], row['start_abstime']) for row in selected}) != 1:
+            continue
+        # A phase peak must use instantaneous demand, not the process's lifetime
+        # high-water mark, which can belong to a different workload phase.
+        for key in ('rss_bytes', 'phys_footprint_bytes'):
+            if all(key in row for row in selected):
+                result[label + '_sampled_' + key] = max(row[key] for row in selected)
+        result[label + '_resource_samples'] = len(selected)
+    return result
+
+
 def churn_resource_envelope(path, phases_path):
     if not path.exists() or not phases_path.exists():
         return {}
@@ -188,6 +211,7 @@ for case in sorted({r['case'] for r in receipts}):
             **churn_counters(churn),
             **churn_source_envelope(churn),
             **churn_resource_envelope(args.root / (root.name + '-resources.jsonl'), root / 'phases.jsonl'),
+            **phase_resource_peaks(args.root / (root.name + '-resources.jsonl'), root / 'phases.jsonl'),
             **resource_totals(args.root / (root.name + '-resources.jsonl'))}
         arms.append(arm)
     if not arms:

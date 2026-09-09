@@ -32227,6 +32227,18 @@ pub const VectorSourceStorageStatus = struct {
     collection_mark_max_step_rows: ?i64 = null,
     collection_mark_max_step_ns: ?i64 = null,
     collection_plan_ns: ?i64 = null,
+    /// Incomplete scan turns advanced without entering DB apply; metadata maintenance retains its own cadence.
+    collection_apply_visits_avoided: ?i64 = null,
+    /// Segment entries visited during full physical inventory scans or incremental updates; excludes WAL entries.
+    inventory_rows_scanned: ?i64 = null,
+    /// Logical immutable catalog bytes shared instead of copied by successful source snapshot and WAL-successor allocations; not resident bytes.
+    catalog_metadata_bytes_shared: ?i64 = null,
+    /// Immutable catalog array bytes copied by successful source snapshot and WAL-successor allocations; excludes object and root-path allocations.
+    catalog_metadata_bytes_copied: ?i64 = null,
+    /// Full physical inventory scans and incremental occurrence-cache updates; this cache is not ownership authority.
+    inventory_updates: ?i64 = null,
+    /// Time spent on full physical inventory scans or incremental occurrence-cache updates.
+    inventory_update_ns: ?i64 = null,
     /// Total time inside the source writer lock for collection entry points; includes nested stages.
     collection_locked_ns: ?i64 = null,
     /// Longest collection entry point hold of the source writer lock.
@@ -32320,6 +32332,12 @@ pub const VectorSourceStorageStatus = struct {
         .{ "collection_mark_max_step_rows", "collection_mark_max_step_rows", true },
         .{ "collection_mark_max_step_ns", "collection_mark_max_step_ns", true },
         .{ "collection_plan_ns", "collection_plan_ns", true },
+        .{ "collection_apply_visits_avoided", "collection_apply_visits_avoided", true },
+        .{ "inventory_rows_scanned", "inventory_rows_scanned", true },
+        .{ "catalog_metadata_bytes_shared", "catalog_metadata_bytes_shared", true },
+        .{ "catalog_metadata_bytes_copied", "catalog_metadata_bytes_copied", true },
+        .{ "inventory_updates", "inventory_updates", true },
+        .{ "inventory_update_ns", "inventory_update_ns", true },
         .{ "collection_locked_ns", "collection_locked_ns", true },
         .{ "collection_max_locked_ns", "collection_max_locked_ns", true },
         .{ "collection_setup_ns", "collection_setup_ns", true },
@@ -32444,6 +32462,30 @@ pub const VectorSourceStorageStatus = struct {
         }
         if (self.collection_plan_ns) |value| {
             try jw.objectField("collection_plan_ns");
+            try jw.write(value);
+        }
+        if (self.collection_apply_visits_avoided) |value| {
+            try jw.objectField("collection_apply_visits_avoided");
+            try jw.write(value);
+        }
+        if (self.inventory_rows_scanned) |value| {
+            try jw.objectField("inventory_rows_scanned");
+            try jw.write(value);
+        }
+        if (self.catalog_metadata_bytes_shared) |value| {
+            try jw.objectField("catalog_metadata_bytes_shared");
+            try jw.write(value);
+        }
+        if (self.catalog_metadata_bytes_copied) |value| {
+            try jw.objectField("catalog_metadata_bytes_copied");
+            try jw.write(value);
+        }
+        if (self.inventory_updates) |value| {
+            try jw.objectField("inventory_updates");
+            try jw.write(value);
+        }
+        if (self.inventory_update_ns) |value| {
+            try jw.objectField("inventory_update_ns");
             try jw.write(value);
         }
         if (self.collection_locked_ns) |value| {

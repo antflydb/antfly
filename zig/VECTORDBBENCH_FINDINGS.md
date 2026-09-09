@@ -8,6 +8,138 @@ ingest throughput.
 
 ## Benchmark contract
 
+The subsequent [source publication memory fix](../.benchmark-results/vector-source-memory-fix/README.md)
+reproduces the suspected OOM as a source-budget rejection of a second WAL-sized
+allocation during GC preparation. Full and selective GC now prepare readers and
+inventory before publication, reuse the committed WAL suffix, and preserve the
+current generation on pre-publication failure. Scratch admission and a
+budget-derived WAL bound protect foreground progress; ambiguous durable writes
+still require recovery. The controlled memory test now succeeds, and validation
+covers allocation failures, old readers, retry, update/delete and repeated restart.
+That revision passes fresh 50K ABBA and its lifecycle checks, but the second
+1M candidate logs one maintenance OOM and is excluded. A same-binary diagnostic
+identifies a separate 77,594,648-byte mark-map allocation with 332,745,026 live
+bytes against the 402,653,184-byte source slice. The
+[mark-workspace follow-up](../.benchmark-results/vector-source-memory-admission/README.md)
+admits the map and source leases against the resident ANN snapshot before map
+allocation. Rejected setup releases its temporary snapshots and retries later;
+backing allocation and I/O failures still propagate. Its regression verifies
+repeated deferral without retained memory, reclamation after pressure clears,
+old readers and repeated reopen. Fresh qualification of this follow-up is
+pending. Earlier failed arms remain excluded and no defaults are promoted.
+
+The completed isolated deferred-inventory 50K ABBA passes all four timed and
+reclamation arms and both independent full inventories, but it is not selected:
+median paired mixed writes fall 25.6%, churn time rises 12.9%, and mixed physical
+footprint rises 15.8% despite RSS falling 13.7%. The completed comparison under
+`.benchmark-results/vector-structural-selected/` combines shared catalogs with
+**eager** incremental inventory against the earlier locked baseline; lazy
+inventory is disabled. It uses the same recovery-qualified binary and a separate
+frozen harness, preserving prior measurements. Combined 50K passes all four
+timed/reclamation arms and both independent inventory audits. Median paired mixed
+writes improve 3.3%, churn time 2.1%, and mixed p99 4.0%; query and
+physical-footprint directions vary by pair.
+
+All four 1M attempts finished lifecycle checks, including both independent
+candidate inventories, but **1M performance qualification is incomplete**.
+The last control encountered three out-of-memory errors and source-store
+poisoning during ingestion; the client retried four HTTP 500s and exited
+successfully. That control is excluded, leaving three clean arms and only one
+complete clean pair. In that pair mixed queries improve 7.5%, writes 7.4%, p99
+13.6%, and fixed churn time 5.4%; mixed RSS rises 27.0% and physical footprint
+6.4%. These are single-pair observations, not a repeated scale win or evidence
+for promotion.
+
+The benchmark now rejects write errors/retries even when the client exits zero,
+and the 1M gate rechecks historical 50K logs. Four regression tests pass; an audit
+of all twelve timed arms in this revision finds only the last 1M control affected.
+Its failed-run data and original receipts are preserved. Source heap rose during
+collection before the errors, but the failing allocation is not identified.
+Next, reproduce memory admission/collection scratch pressure with allocation
+evidence, fix it while preserving publication and recovery fences, then rerun
+fresh 1M ABBA. No defaults change. See the
+[full results](../.benchmark-results/vector-structural-selected/RESULTS.md) and
+[memory-failure evidence](../.benchmark-results/vector-structural-selected/MEMORY_FAILURE.md).
+
+The catalog/inventory investigation is under
+`.benchmark-results/vector-structural-refined/`. Identical-data memory-map captures
+did not reproduce extra source-catalog heap or mapped-file retention. Reanalysis
+of the original shared-catalog receipts gives mixed physical footprint +6.6% and
+whole-run peak footprint +0.6%, versus mixed RSS +22.2%; both memory metrics must
+remain visible. A separate WAL-membership prototype passed four timed 50K arms,
+four reclamation checks, and two independent full-inventory reopens. Readiness
+worsened 5.1% and fixed churn time 21.5% in median paired ratios, while mixed
+query/write tradeoffs reversed between pairs. It is not selected.
+
+Reopen diagnostics processed zero WAL rows while spending about a second on
+inventory reconstruction. The current revision under
+`.benchmark-results/vector-structural-lazy/` therefore defers occurrence-map
+construction when validated checkpoint totals suffice, building the map before
+segment installation needs it. Its 37 source checks pass in both configurations,
+including checkpoint receipts. The follow-up under
+`.benchmark-results/vector-structural-recovery/` investigates the API timeout:
+default settings already use native ANN storage. Low-space simulation reproduces
+capacity-deferred backfill and exposes competing in-place startup reconstruction
+at an invalid posting sequence. The ownership/sequence fixes pass five focused
+checks. The new pinned release passes both five-case public API suites, saved
+database recovery with update/delete and repeated restart, and both controlled
+capacity/restart/resume cases without another write. Initial saved recovery takes
+6.04 seconds; capacity restoration resumes after 109.1 seconds in primary_lsm and
+10.2 seconds in vector_store according to existing retry deadlines. Those are
+lifecycle observations, not A/B timing. The subsequent 50K and incomplete 1M
+qualification are recorded above. Capacity checks now include the native safety reserve;
+a disk admission wait is not treated as a storage-throughput measurement.
+
+The three structural vector-store experiments are complete under
+`.benchmark-results/vector-structural/`: independent active scanning, shared
+immutable segment catalogs, and incremental physical inventory. Each changes one
+switch against the prior 2 ms unlocked, 50%-duty source-store baseline. All 12 fresh
+50K A/B and B/A arms and all 12 reclamation clones pass, following 35 source checks
+in both configurations, 32 native checks, and five API lifecycle checks. Two
+inventory candidates also pass independent full-inventory reopen audits with the
+cache and checkpoint inventory restoration disabled. No defaults change.
+
+Median paired changes show different tradeoffs:
+
+- Independent scanning: readiness +8.1%, mixed queries +0.1%, mixed writes -1.9%.
+  Avoiding repeated apply visits did not produce an overall benefit.
+- Shared catalogs: C1 queries +20.4%, mixed writes +4.1%, fixed churn time -7.8%,
+  mixed RSS +22.2%. Those throughput/churn gains and the RSS increase repeat in
+  both orders. The readiness median is dominated by an unusually slow first
+  control; its cause is not established.
+- Incremental inventory: publication-stage time -51.9%, mixed writes +6.7%, mixed
+  queries -3.5%, churn logical writes -3.2%. Segment rows fall about 93%, but total
+  inventory bookkeeping time rises; WAL traversal/map work is outside the row
+  counter. Readiness and RSS changes reverse direction across pairs.
+
+Inventory candidate reclamation settles in 2.93/2.90 seconds versus 7.19/9.53
+seconds for controls. Starting layouts/debt differ, and all initial samples with
+inventory already report 50,000 unique payloads, so this is a restart/reclamation
+lifecycle comparison. Shared-catalog memory attribution and inventory WAL/map
+cost are the next targets. A selected subset still needs comparison against the
+stronger locked row-bounded baseline before new 1M qualification. Full tables,
+missing-counter limitations, and audit receipts are in
+[the structural results](../.benchmark-results/vector-structural/RESULTS.md).
+
+Active scan scheduling, protected reuse, and their combined experiment are complete under
+`.benchmark-results/vector-progress-dedup/`: active scan scheduling proportional
+to scan duration, protected reuse of durable payloads during marking, and locked
+GC stage profiling. All 12 timed 50K arms and all 12 exact-reclamation clones pass.
+The measured release passed 61 distinct storage checks and five API lifecycle
+checks. Post-measurement review fixed cleanup after planning allocation failure;
+its retry/reopen regression brings the source suite to 30 passing checks with
+ownership indexing off and on. The measured source/binary remain frozen.
+
+Protected reuse alone cut churn logical write I/O 21.6%, with mixed RSS +30.9%
+and C1 throughput -20.2%. Combined scheduling/reuse settled reclamation in
+8.18/8.20 seconds versus 271.37/69.77 seconds for controls, with readiness +14.3%
+and C1 throughput -25.8% (median paired ratios). Reclamation starting layouts/debt
+differ, so these are end-to-end lifecycle results. Setup and publication dominate
+remaining source lock work. No defaults are changed or performance winner selected.
+The independent comparisons use the same 2 ms unlocked baseline; stronger locked
+row-bounded comparisons and new 1M runs remain gated. Full tables and limitations
+are in `.benchmark-results/vector-progress-dedup/RESULTS.md`.
+
 The foreground-marking follow-up is implemented and qualified for correctness under
 `.benchmark-results/vector-foreground-gc/`: cooperative elapsed budgeting and
 primary/ANN/source snapshot scanning outside both the source writer and DB apply

@@ -31,12 +31,17 @@ def main():
     parser.add_argument('output', type=Path)
     parser.add_argument('--port', type=int, default=18138)
     parser.add_argument('--timeout', type=float, default=300)
+    parser.add_argument('--arm', help='Qualify one completed arm between timed runs; does not qualify an incomplete comparison.')
     parser.add_argument('--recovery-binary', type=Path, help='Test a correction against cloned saved data; preserve the original measurement binary receipt.')
     args = parser.parse_args()
     recovery_binary = args.recovery_binary.resolve(strict=True) if args.recovery_binary else None
     recovery_hash = digest(recovery_binary) if recovery_binary else None
     arms = json.loads((args.qualification_root / 'ab-runs.json').read_text())
-    if len(arms) < 4 or any(a.get('exit_code') != 0 or a.get('invalid_reason') for a in arms):
+    if args.arm:
+        arms = [a for a in arms if f"{a['case']}-{a['pair']}-{a['mode']}" == args.arm]
+        if len(arms) != 1:
+            parser.error('--arm must identify exactly one recorded arm')
+    if (not args.arm and len(arms) < 4) or any(a.get('exit_code') != 0 or a.get('invalid_reason') for a in arms):
         parser.error('all timed qualification arms must complete successfully first')
     args.output.mkdir(parents=True, exist_ok=False)
     results = []

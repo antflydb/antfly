@@ -3039,6 +3039,17 @@ pub const Reservation = struct {
 /// backing allocator. One operation may make bounded progress above the normal
 /// hard limit only while it is the slice's sole user.
 pub const BudgetedAllocator = struct {
+    pub const AllocationFailure = struct {
+        cause: enum { admission, backing },
+        requested_bytes: usize,
+        live_bytes: u64,
+        slice_used_bytes: u64,
+        slice_limit_bytes: u64,
+        aggregate_used_bytes: u64,
+        aggregate_limit_bytes: u64,
+        return_address: usize,
+    };
+
     allocator_mutex: std.atomic.Mutex = .unlocked,
     backing: std.mem.Allocator,
     reservation: Reservation,
@@ -3046,6 +3057,67 @@ pub const BudgetedAllocator = struct {
     live_bytes: u64 = 0,
     credit_quantum: u64,
     budget_denied: bool = false,
+    last_allocation_failure: ?AllocationFailure = null,
+    reservation_floor: u64 = 0,
+
+    pub const ScratchReservation = struct {
+        owner: *BudgetedAllocator,
+        previous_floor: u64,
+
+        pub fn release(self: ScratchReservation) void {
+            lockAtomic(&self.owner.allocator_mutex);
+            defer self.owner.allocator_mutex.unlock();
+            self.owner.reservation_floor = self.previous_floor;
+            self.owner.releaseBytes(0);
+        }
+    };
+
+    /// Admit an operation's temporary working set before durable mutation.
+    /// Allocations consume these same credits instead of being charged twice.
+    /// Scopes nest and release in reverse order under owner serialization.
+    pub fn reserveScratch(self: *BudgetedAllocator, bytes: usize) !ScratchReservation {
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        const previous_floor = self.reservation_floor;
+        if (!self.reserveGrowth(bytes)) {
+            self.recordAllocationFailure(.admission, bytes, @returnAddress());
+            return error.ResourceBudgetExceeded;
+        }
+        self.reservation_floor = @max(previous_floor, self.live_bytes);
+        self.live_bytes -= bytes;
+        return .{ .owner = self, .previous_floor = previous_floor };
+    }
+
+    pub fn allocationFailureThreadSafe(self: *BudgetedAllocator) ?AllocationFailure {
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        return self.last_allocation_failure;
+    }
+
+    fn recordAllocationFailure(self: *BudgetedAllocator, cause: @FieldType(AllocationFailure, "cause"), bytes: usize, ret_addr: usize) void {
+        const snapshot = self.reservation.manager.snapshot();
+        const slice = snapshot.slices[@intFromEnum(self.reservation.slice)];
+        self.last_allocation_failure = .{
+            .cause = cause,
+            .requested_bytes = bytes,
+            .live_bytes = self.live_bytes,
+            .slice_used_bytes = slice.used_bytes,
+            .slice_limit_bytes = slice.hard_limit_bytes,
+            .aggregate_used_bytes = snapshot.memory.used_bytes,
+            .aggregate_limit_bytes = snapshot.memory.hard_limit_bytes,
+            .return_address = ret_addr,
+        };
+        // Opt-in stack diagnostics allocate through the debug runtime, never
+        // this allocator. Normal admission records only a bounded receipt.
+        if (@import("builtin").link_libc and self.reservation.slice == .dense_source_payload_state) {
+            if (std.c.getenv("ANTFLY_SOURCE_VECTOR_ALLOCATION_DIAGNOSTICS")) |raw| {
+                if (std.mem.eql(u8, std.mem.span(raw), "1")) {
+                    std.log.warn("source allocation denied cause={s} requested={d} live={d} slice_used={d} slice_limit={d} aggregate_used={d} aggregate_limit={d} caller=0x{x}", .{ @tagName(cause), bytes, self.live_bytes, slice.used_bytes, slice.hard_limit_bytes, snapshot.memory.used_bytes, snapshot.memory.hard_limit_bytes, ret_addr });
+                    std.debug.dumpCurrentStackTrace(.{});
+                }
+            }
+        }
+    }
 
     pub fn init(
         manager: *ResourceManager,
@@ -3175,23 +3247,27 @@ pub const BudgetedAllocator = struct {
     fn releaseBytes(self: *BudgetedAllocator, bytes: usize) void {
         const amount = std.math.cast(u64, bytes) orelse std.math.maxInt(u64);
         self.live_bytes -|= amount;
-        if (self.live_bytes == 0) {
+        if (self.live_bytes == 0 and self.reservation_floor == 0) {
             self.reservation.shrink(self.reservation.bytes);
             return;
         }
         const spare = self.reservation.bytes -| self.live_bytes;
         if (spare < self.credit_quantum *| 2) return;
         const retained_spare = @min(self.credit_quantum, self.reservation.bytes);
-        const target = self.live_bytes +| retained_spare;
+        const target = @max(self.reservation_floor, self.live_bytes +| retained_spare);
         if (self.reservation.bytes > target)
             self.reservation.shrink(self.reservation.bytes - target);
     }
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
-        if (!self.reserveGrowth(len)) return null;
+        if (!self.reserveGrowth(len)) {
+            self.recordAllocationFailure(.admission, len, ret_addr);
+            return null;
+        }
         return self.backing.rawAlloc(len, alignment, ret_addr) orelse {
             self.releaseBytes(len);
+            self.recordAllocationFailure(.backing, len, ret_addr);
             return null;
         };
     }
@@ -3243,6 +3319,33 @@ pub const BudgetedAllocator = struct {
         self.releaseBytes(memory.len);
     }
 };
+
+test "source vector payloads scratch admission accounts credits and records denial cause" {
+    const alloc = std.testing.allocator;
+    var budgets = Options.defaultBudgets();
+    budgets[@intFromEnum(Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = 4096 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    var budget = BudgetedAllocator.init(&manager, .dense_source_payload_state, alloc, 1);
+    defer budget.deinit();
+    {
+        const scratch = try budget.reserveScratch(1024);
+        defer scratch.release();
+        const buffer = try budget.threadSafeAllocator().alloc(u8, 512);
+        budget.threadSafeAllocator().free(buffer);
+        try std.testing.expect(budget.reservation.bytes >= 1024);
+        try std.testing.expectError(error.ResourceBudgetExceeded, budget.reserveScratch(4097));
+        try std.testing.expectEqual(@as(usize, 4097), budget.allocationFailureThreadSafe().?.requested_bytes);
+        try std.testing.expect(budget.allocationFailureThreadSafe().?.cause == .admission);
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.dense_source_payload_state).used_bytes);
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    var denied_backing = BudgetedAllocator.init(&manager, .dense_source_payload_state, failing.allocator(), 1);
+    defer denied_backing.deinit();
+    try std.testing.expectError(error.OutOfMemory, denied_backing.threadSafeAllocator().alloc(u8, 1));
+    try std.testing.expect(denied_backing.allocationFailureThreadSafe().?.cause == .backing);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.dense_source_payload_state).used_bytes);
+}
 
 test "default tokenizer cache budget is aligned with its resource slice" {
     const budgets = Options.defaultBudgets();

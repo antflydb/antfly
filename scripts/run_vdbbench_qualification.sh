@@ -534,6 +534,10 @@ wait_public_index_ready() {
       return 1
     fi
     attempts=$((attempts + 1))
+    if (( attempts % 30 == 1 )); then
+      python3 "$script_dir/vector_store_capacity.py" "$run_root" \
+        --output "$run_root/readiness-capacity${suffix}.json" || return 1
+    fi
     if curl -fsS "http://127.0.0.1:$port/db/v1/tables/vdbbench/indexes/vec" >"$status_path" 2>/dev/null &&
       python3 - "$status_path" <<'PY'
 import json

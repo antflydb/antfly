@@ -70,6 +70,32 @@ for name, flags in {
 }.items():
     TREATMENTS[name] = flags
     CONTROLS[name] = {**CONTROLS['foreground_gc'], **TREATMENTS['foreground_gc']}
+# A selected treatment must also beat the prior row-bounded locked baseline;
+# improving the previously regressed 2 ms combination alone is insufficient.
+for name in ('scan_progress', 'rescue_reappends', 'scan_progress_rescue'):
+    TREATMENTS[name + '_baseline'] = {**TREATMENTS['foreground_gc'], **TREATMENTS[name]}
+    CONTROLS[name + '_baseline'] = dict(CONTROLS['foreground_gc'])
+# Structural experiments hold the same active-scan policy constant. No reuse.
+for name, flag in {
+    'independent_scan': 'ANTFLY_SOURCE_VECTOR_INDEPENDENT_SCAN',
+    'shared_catalog': 'ANTFLY_SOURCE_VECTOR_SHARED_CATALOG',
+    'incremental_inventory': 'ANTFLY_SOURCE_VECTOR_INCREMENTAL_INVENTORY',
+}.items():
+    TREATMENTS[name] = {flag: '1'}
+    CONTROLS[name] = {**CONTROLS['scan_progress'], **TREATMENTS['scan_progress']}
+# Defer occurrence-map reconstruction when authenticated receipt totals suffice.
+TREATMENTS['inventory_lazy'] = {'ANTFLY_SOURCE_VECTOR_LAZY_INVENTORY': '1'}
+CONTROLS['inventory_lazy'] = {**CONTROLS['incremental_inventory'], **TREATMENTS['incremental_inventory']}
+TREATMENTS['catalog_inventory'] = {
+    **TREATMENTS['shared_catalog'], **TREATMENTS['incremental_inventory'],
+    **TREATMENTS['inventory_lazy'],
+}
+CONTROLS['catalog_inventory'] = dict(CONTROLS['shared_catalog'])
+TREATMENTS['catalog_inventory_baseline'] = {
+    **TREATMENTS['foreground_gc'], **TREATMENTS['scan_progress'],
+    **TREATMENTS['catalog_inventory'],
+}
+CONTROLS['catalog_inventory_baseline'] = dict(CONTROLS['foreground_gc'])
 ALL_FLAGS = sorted({key for flags in [*TREATMENTS.values(), *CONTROLS.values()] for key in flags})
 
 

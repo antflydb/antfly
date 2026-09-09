@@ -312,6 +312,8 @@ pub const Store = struct {
     manifest: ?vector_manifest.Manifest = null,
     manifest_segments: []vector_manifest.Segment = &.{},
     manifest_coverages: []vector_manifest.Coverage = &.{},
+    shared_manifest: ?*SharedManifest = null,
+
     wal_generation: u64 = 1,
     wal_committed_bytes: u64 = 0,
     wal_has_mutations: bool = false,
@@ -322,11 +324,58 @@ pub const Store = struct {
     segment_covered_source_sequence: u64 = 0,
     poisoned: bool = false,
 
+    const SharedManifest = struct {
+        refs: std.atomic.Value(usize) = .init(1),
+        alloc: Allocator,
+        segments: []vector_manifest.Segment,
+        coverages: []vector_manifest.Coverage,
+
+        fn retain(self: *@This()) *@This() {
+            _ = self.refs.fetchAdd(1, .monotonic);
+            return self;
+        }
+        fn release(self: *@This()) void {
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            const alloc = self.alloc;
+            alloc.free(self.segments);
+            alloc.free(self.coverages);
+            alloc.destroy(self);
+        }
+    };
+
+    fn shareManifest(self: *Store) !void {
+        if (self.shared_manifest != null) return;
+        const shared = try self.alloc.create(SharedManifest);
+        shared.* = .{ .alloc = self.alloc, .segments = self.manifest_segments, .coverages = self.manifest_coverages };
+        self.shared_manifest = shared;
+    }
+
+    fn ownManifest(self: *Store) !void {
+        const shared = self.shared_manifest orelse return;
+        const segments = try self.alloc.dupe(vector_manifest.Segment, self.manifest_segments);
+        errdefer self.alloc.free(segments);
+        const coverages = try self.alloc.dupe(vector_manifest.Coverage, self.manifest_coverages);
+        shared.release();
+        self.shared_manifest = null;
+        self.manifest_segments = segments;
+        self.manifest_coverages = coverages;
+        if (self.manifest) |*manifest| {
+            manifest.segments = segments;
+            manifest.coverages = coverages;
+        }
+    }
     /// Clone the already validated writer state without invoking recovery.
     /// Callers serialize append/publication against the original generation.
     pub fn clone(self: *const Store, alloc: Allocator) !Store {
         const root = try alloc.dupe(u8, self.root_dir);
         errdefer alloc.free(root);
+        if (self.shared_manifest) |shared| {
+            var result = self.*;
+            result.alloc = alloc;
+            result.root_dir = root;
+            result.shared_manifest = shared.retain();
+            return result;
+        }
         const segments = try alloc.dupe(vector_manifest.Segment, self.manifest_segments);
         errdefer alloc.free(segments);
         const coverages = try alloc.dupe(vector_manifest.Coverage, self.manifest_coverages);
@@ -383,8 +432,10 @@ pub const Store = struct {
     }
 
     pub fn deinit(self: *Store) void {
-        if (self.manifest_segments.len != 0) self.alloc.free(self.manifest_segments);
-        if (self.manifest_coverages.len != 0) self.alloc.free(self.manifest_coverages);
+        if (self.shared_manifest) |shared| shared.release() else {
+            if (self.manifest_segments.len != 0) self.alloc.free(self.manifest_segments);
+            if (self.manifest_coverages.len != 0) self.alloc.free(self.manifest_coverages);
+        }
         self.alloc.free(self.root_dir);
         self.* = undefined;
     }
@@ -517,7 +568,7 @@ pub const Store = struct {
         try self.storage.syncFileContentsAbsolute(active_path);
         try atomicReplace(self.alloc, self.storage, next_path, &.{});
         generation_publication.publishControlFile(self.alloc, self.storage, current_path, encoded) catch |err| {
-            self.poisoned = true;
+            self.poisoned = err == error.GenerationPublicationDurabilityUncertain;
             return err;
         };
         self.manifest = manifest;
@@ -575,6 +626,7 @@ pub const Store = struct {
     /// following source-capture WAL transaction before readiness is certified.
     pub fn declareArtifactScopes(self: *Store, scope_hashes: []const u64) !bool {
         if (self.poisoned) return error.VectorBlockStoreRequiresReopen;
+        try self.ownManifest();
         const manifest = self.manifest orelse return error.MissingVectorBlockManifest;
         var previous_scope: ?u64 = null;
         for (scope_hashes) |scope_hash| {
@@ -891,6 +943,18 @@ pub const Store = struct {
         return self.publishStagedGenerationMode(generation, boundary.covered_source_sequence, staged, .{ .replace_selected = selected }, null, boundary, false, null);
     }
 
+    /// Prepare source GC's durable authority and its next reader view before
+    /// publication. The caller owns staged-file cleanup until commit starts.
+    pub fn prepareSourceCollection(self: *Store, generation: u64, staged: []const StagedBlock, selected: ?[]const vector_manifest.Segment, boundary: WalPrefixBoundary) !PreparedPublication {
+        if (selected) |segments| {
+            const manifest = self.manifest orelse return error.MissingVectorBlockManifest;
+            for (segments) |segment| if (segment.generation == manifest.base_generation) return error.InvalidVectorBlockPublicationBoundary;
+        }
+        return self.prepareStagedGenerationMode(generation, boundary.covered_source_sequence, staged, if (selected) |segments| .{ .replace_selected = segments } else .replace_base, if (selected == null) &.{} else null, boundary, false, null);
+    }
+
+    const WalReuse = union(enum) { all, after_batch: u64 };
+
     pub const PreparedPublication = struct {
         next: Store,
         encoded: []u8,
@@ -898,7 +962,7 @@ pub const Store = struct {
         obsolete_paths: std.ArrayListUnmanaged([]u8),
         boundary: WalPrefixBoundary,
         previous_generation: u64,
-        wal_after_batch: ?u64 = null,
+        wal_reuse: ?WalReuse = null,
         committed: bool = false,
 
         pub fn deinit(self: *PreparedPublication) void {
@@ -914,7 +978,7 @@ pub const Store = struct {
             const reuse_after = if (previous) |old|
                 if (old.wal_tree_initialized and old.store.storage.ptr == self.next.storage.ptr and
                     old.store.storage.vtable == self.next.storage.vtable and std.mem.eql(u8, old.store.root_dir, self.next.root_dir) and
-                    std.meta.eql(old.store.walPrefixBoundary(), self.boundary)) self.wal_after_batch else null
+                    std.meta.eql(old.store.walPrefixBoundary(), self.boundary)) self.wal_reuse else null
             else
                 null;
             return openInternalWithState(alloc, self.next.storage, self.next.root_dir, true, previous, &self.next, reuse_after, false);
@@ -953,7 +1017,7 @@ pub const Store = struct {
             (if (self.manifest) |manifest| manifest.latest_generation else 0) != prepared.previous_generation)
             return error.InvalidVectorBlockPublicationBoundary;
         generation_publication.publishControlFile(self.alloc, self.storage, prepared.current_path, prepared.encoded) catch |err| {
-            self.poisoned = true;
+            self.poisoned = err == error.GenerationPublicationDurabilityUncertain;
             return err;
         };
         std.mem.swap(Store, self, &prepared.next);
@@ -1101,7 +1165,14 @@ pub const Store = struct {
         var next_covered_source_sequence = covered_source_sequence;
         if (flattened_wal) |boundary| if (self.manifest) |manifest| {
             if (boundary.covered_source_sequence == covered_source_sequence) {
-                if (manifest.sealed_wals.afterPrefix(boundary.committed_bytes, boundary.covered_source_sequence)) |tail| {
+                // A checkpointed source cut has an empty WAL. Every later
+                // transaction is already the retained suffix; reading and
+                // rewriting it would duplicate the entire resident WAL.
+                const suffix = if (boundary.committed_bytes == 0)
+                    manifest.sealed_wals
+                else
+                    manifest.sealed_wals.afterPrefix(boundary.committed_bytes, boundary.covered_source_sequence);
+                if (suffix) |tail| {
                     var nonoverlapping = true;
                     for (tail.slice()) |extent| if (extent.min_mutation_sequence) |minimum| {
                         if (minimum <= covered_source_sequence) nonoverlapping = false;
@@ -1226,8 +1297,8 @@ pub const Store = struct {
             .obsolete_paths = obsolete_paths,
             .boundary = self.walPrefixBoundary(),
             .previous_generation = if (self.manifest) |manifest| manifest.latest_generation else 0,
-            .wal_after_batch = if (retained_wals) |tail|
-                self.manifest.?.sealed_wals.items[self.manifest.?.sealed_wals.count - tail.count - 1].last_batch
+            .wal_reuse = if (retained_wals) |tail|
+                if (flattened_wal.?.committed_bytes == 0) .all else .{ .after_batch = self.manifest.?.sealed_wals.items[self.manifest.?.sealed_wals.count - tail.count - 1].last_batch }
             else
                 null,
         };
@@ -1936,6 +2007,8 @@ pub const Opened = struct {
     /// order inside each group. Queries walk only one shard, newest first.
     reader_order: []usize,
     shard_offsets: []usize,
+    shared_catalog: ?*SegmentCatalog = null,
+
     wal_bytes: []u8,
     wal: vector_wal.Replay,
     wal_order: std.ArrayListUnmanaged(usize),
@@ -1948,6 +2021,47 @@ pub const Opened = struct {
     /// Only immutable digest-keyed source stores may attach this hint index.
     source_directory: ?*@import("source_location_directory.zig").Directory = null,
 
+    const SegmentCatalog = struct {
+        refs: std.atomic.Value(usize) = .init(1),
+        alloc: Allocator,
+        blocks: []RetainedBlock,
+        readers: []vector_block.Reader,
+        reader_order: []usize,
+        shard_offsets: []usize,
+
+        fn retain(self: *@This()) *@This() {
+            _ = self.refs.fetchAdd(1, .monotonic);
+            return self;
+        }
+        fn release(self: *@This()) void {
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            const alloc = self.alloc;
+            for (self.blocks) |*block| block.deinit(alloc);
+            alloc.free(self.blocks);
+            alloc.free(self.readers);
+            alloc.free(self.reader_order);
+            alloc.free(self.shard_offsets);
+            alloc.destroy(self);
+        }
+    };
+
+    /// Transfer immutable arrays to a single retained owner. Publication makes
+    /// a new catalog; WAL-only successors and reader leases share this one.
+    pub fn shareSegmentCatalog(self: *Opened) !void {
+        if (self.shared_catalog != null) return;
+        const catalog = try self.store.alloc.create(SegmentCatalog);
+        errdefer self.store.alloc.destroy(catalog);
+        try self.store.shareManifest();
+        catalog.* = .{ .alloc = self.store.alloc, .blocks = self.blocks, .readers = self.readers, .reader_order = self.reader_order, .shard_offsets = self.shard_offsets };
+        self.shared_catalog = catalog;
+    }
+
+    pub fn catalogMetadataBytes(self: *const Opened) u64 {
+        return self.blocks.len * @sizeOf(RetainedBlock) + self.readers.len * @sizeOf(vector_block.Reader) +
+            (self.reader_order.len + self.shard_offsets.len) * @sizeOf(usize) +
+            self.store.manifest_segments.len * @sizeOf(vector_manifest.Segment) +
+            self.store.manifest_coverages.len * @sizeOf(vector_manifest.Coverage);
+    }
     pub fn clone(self: *const Opened, alloc: Allocator) !Opened {
         var unchanged = vector_wal.Writer.initAfterCommitted(alloc, self.store.last_committed_batch, self.store.covered_source_sequence);
         defer unchanged.deinit();
@@ -1973,6 +2087,20 @@ pub const Opened = struct {
         if (writer.min_mutation_sequence) |sequence|
             store.active_wal_min_mutation_sequence = @min(store.active_wal_min_mutation_sequence orelse sequence, sequence);
         if (has_mutations) store.wal_latest_mutation_sequence = writer.covered_source_sequence;
+        if (self.shared_catalog) |catalog| return .{
+            .store = store,
+            .blocks = self.blocks,
+            .readers = self.readers,
+            .reader_order = self.reader_order,
+            .shard_offsets = self.shard_offsets,
+            .shared_catalog = catalog.retain(),
+            .wal_bytes = &.{},
+            .wal = .{ .alloc = alloc },
+            .wal_order = .empty,
+            .wal_tree = tree,
+            .wal_tree_initialized = true,
+            .source_directory = self.source_directory,
+        };
         const blocks = try alloc.alloc(RetainedBlock, self.blocks.len);
         errdefer alloc.free(blocks);
         const readers = try alloc.dupe(vector_block.Reader, self.readers);
@@ -2167,11 +2295,13 @@ pub const Opened = struct {
     pub fn deinit(self: *Opened) void {
         const alloc = self.store.alloc;
         self.store.deinit();
-        for (self.blocks) |*block| block.deinit(alloc);
-        alloc.free(self.blocks);
-        alloc.free(self.readers);
-        alloc.free(self.reader_order);
-        alloc.free(self.shard_offsets);
+        if (self.shared_catalog) |catalog| catalog.release() else {
+            for (self.blocks) |*block| block.deinit(alloc);
+            alloc.free(self.blocks);
+            alloc.free(self.readers);
+            alloc.free(self.reader_order);
+            alloc.free(self.shard_offsets);
+        }
         self.wal.deinit();
         alloc.free(self.wal_bytes);
         self.wal_order.deinit(alloc);
@@ -3872,7 +4002,7 @@ fn openInternalWithState(
     retain_blocks: bool,
     previous: ?*const Opened,
     prepared: ?*const Store,
-    reuse_wal_after_batch: ?u64,
+    reuse_wal: ?Store.WalReuse,
     read_only: bool,
 ) !Opened {
     var store: Store = if (prepared) |state| try state.clone(alloc) else blk: {
@@ -3920,13 +4050,13 @@ fn openInternalWithState(
         try alloc.alloc(RetainedBlock, store.manifest_segments.len)
     else
         try alloc.alloc(RetainedBlock, 0);
-    const readers = try alloc.alloc(vector_block.Reader, blocks.len);
-    errdefer alloc.free(readers);
     var block_count: usize = 0;
     errdefer {
         for (blocks[0..block_count]) |*block| block.deinit(alloc);
         alloc.free(blocks);
     }
+    const readers = try alloc.alloc(vector_block.Reader, blocks.len);
+    errdefer alloc.free(readers);
     if (retain_blocks) for (store.manifest_segments) |descriptor| {
         if (previous) |old| {
             if (reusableBlockIndex(old, descriptor)) |old_index| {
@@ -3957,8 +4087,11 @@ fn openInternalWithState(
         shard_cursors[shard] += 1;
     }
 
-    if (reuse_wal_after_batch) |batch| {
-        const tree = try wal_view.Node.afterBatch(alloc, previous.?.wal_tree, batch);
+    if (reuse_wal) |reuse| {
+        const tree = switch (reuse) {
+            .all => if (previous.?.wal_tree) |node| node.retain() else null,
+            .after_batch => |batch| try wal_view.Node.afterBatch(alloc, previous.?.wal_tree, batch),
+        };
         return .{
             .store = store,
             .blocks = blocks,
@@ -4973,6 +5106,35 @@ fn testNativeCompactionSuffix(sealed: bool) !void {
     try std.testing.expect((try restarted.get("b", 2, null)) == .tombstone);
 }
 
+test "vector block empty cut preserves batch zero in reused publication readers" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    const root = "/empty-cut-zero-batch";
+    var store = try Store.open(alloc, memory.storage(), root);
+    defer store.deinit();
+    try store.publishEmptyBase(1, 0, .{ .shard_count = 1, .encoding = .float32 });
+    const boundary = store.walPrefixBoundary();
+    try store.appendBatch(0, &.{.{ .kind = .upsert, .key = "a", .source_sequence = 1, .revision = 1, .vector = &.{3.0} }}, 1, .{});
+    var disk = try Store.openWithBlocks(alloc, memory.storage(), root);
+    defer disk.deinit();
+    var live = try disk.clone(alloc);
+    defer live.deinit();
+    var output = try store.beginStreamingBlock(2, 0, 0, 1, .float32);
+    defer output.deinit();
+    const staged = try output.finish();
+    var prepared = try store.prepareSourceCollection(2, &.{staged}, &.{}, boundary);
+    defer prepared.deinit();
+    var readers = try prepared.openReaders(alloc, &live);
+    defer readers.deinit();
+    try std.testing.expectEqual(@as(usize, 0), readers.wal_bytes.len);
+    try std.testing.expect((try readers.get("a", 1, 1)) == .vector);
+    try store.commitPrepared(&prepared);
+    var reopened = try Store.openWithBlocks(alloc, memory.storage(), root);
+    defer reopened.deinit();
+    try std.testing.expect((try reopened.get("a", 1, 1)) == .vector);
+}
+
 test "sealed vector WAL recovers multiple extents and trims only active torn suffix" {
     const alloc = std.testing.allocator;
     var memory = lsm_backend.MemoryStorage.init(alloc);
@@ -5009,6 +5171,7 @@ test "sealed vector WAL recovers multiple extents and trims only active torn suf
 }
 
 test "sealed vector WAL poisons ambiguous append-target publication" {
+    @import("../test_error_logs.zig").expectErrorLogs(1);
     const alloc = std.testing.allocator;
     var memory = lsm_backend.MemoryStorage.init(alloc);
     defer memory.deinit();
@@ -5028,7 +5191,7 @@ test "sealed vector WAL poisons ambiguous append-target publication" {
     try recovered.appendCoverage(2, 2, .{});
 }
 
-test "empty vector authority declares a new scope without rewriting WAL or blocks" {
+test "vector block store shared manifest declares a new scope without changing old leases" {
     const alloc = std.testing.allocator;
     var memory = lsm_backend.MemoryStorage.init(alloc);
     defer memory.deinit();
@@ -5048,7 +5211,12 @@ test "empty vector authority declares a new scope without rewriting WAL or block
     }}, 7, .{});
     const wal_generation = store.wal_generation;
     const wal_bytes = store.wal_committed_bytes;
+    try store.shareManifest();
+    var prior = try store.clone(alloc);
+    defer prior.deinit();
     try std.testing.expect(try store.declareArtifactScopes(&.{ scope_a, scope_b }));
+    try std.testing.expectEqual(@as(usize, 1), prior.manifest.?.coverages.len);
+    try std.testing.expectEqual(scope_a, prior.manifest.?.coverages[0].scope_hash);
     try std.testing.expect(!try store.declareArtifactScopes(&.{scope_b}));
     try std.testing.expectEqual(wal_generation, store.wal_generation);
     try std.testing.expectEqual(wal_bytes, store.wal_committed_bytes);
@@ -5165,6 +5333,7 @@ test "owned staged base can reset a restored source epoch" {
 }
 
 test "vector block store poisons ambiguous CURRENT publication" {
+    @import("../test_error_logs.zig").expectErrorLogs(1);
     const alloc = std.testing.allocator;
     var memory = lsm_backend.MemoryStorage.init(alloc);
     defer memory.deinit();
@@ -5227,6 +5396,7 @@ test "owned staged base removes blocks after pre-CURRENT rejection" {
 }
 
 test "owned staged base survives ambiguous CURRENT publication" {
+    @import("../test_error_logs.zig").expectErrorLogs(1);
     const alloc = std.testing.allocator;
     var memory = lsm_backend.MemoryStorage.init(alloc);
     defer memory.deinit();
