@@ -167,9 +167,12 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
         // Keep the erased executor ABI identical in unit/minimal builds even
         // though the rendering functions themselves are stubbed.
         pub const PageRenderExecutor = @import("antfly_pdf").PageRenderExecutor;
+        pub const RenderResolutionPolicy = @import("antfly_pdf").RenderResolutionPolicy;
+        pub const RenderScratchGrowth = @import("antfly_pdf").RenderScratchGrowth;
         pub const PageRenderRequest = struct {
             page_number: usize,
             requested_dpi: u16 = 150,
+            resolution_policy: RenderResolutionPolicy = .requested_dpi,
             max_pixels: u64 = 40_000_000,
             max_dimension: u32 = 4096,
             preferred_width: ?u32 = null,
@@ -208,6 +211,7 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
             max_parallel_pages: usize = 1,
             max_inflight_pixels: u64 = 50_000_000,
             max_inflight_bytes: usize = 512 * 1024 * 1024,
+            scratch_growth: ?RenderScratchGrowth = null,
             max_retained_png_bytes: usize = 64 * 1024 * 1024,
             max_retained_raster_bytes: usize = 256 * 1024 * 1024,
             bytes_per_pixel_reserve: usize = 12,
@@ -225,6 +229,10 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
             rendered: ?RenderedPagePng = null,
             failure: ?anyerror = null,
             render_elapsed_ns: u64 = 0,
+            pub fn deinit(self: *@This(), alloc: Allocator) void {
+                if (self.rendered) |*page| page.deinit(alloc);
+                self.* = undefined;
+            }
         };
         pub const RenderedPageBatch = struct {
             results: []PageRenderResult,
@@ -233,6 +241,7 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
             peak_parallelism: usize,
             peak_admitted_pixels: u64,
             peak_admitted_bytes: usize,
+            peak_worker_scratch_bytes: usize = 0,
             thread_spawn_fallbacks: usize,
 
             pub fn deinit(self: *RenderedPageBatch, alloc: Allocator) void {
@@ -522,6 +531,9 @@ pub fn recordPdfRenderQualityWarningAlloc(alloc: Allocator, unit: *Unit, rendere
 pub const PdfRenderSession = struct {
     parsed: pdf.reader.Reader,
     render_fork_template: ?pdf.reader.RenderForkTemplate = null,
+    /// A document-local high-water hint, not a new limit or a global cache.
+    /// Includes actual allocator backing/fragmentation, fonts and page work.
+    render_worker_scratch_hint: usize = 0,
 
     pub fn init(alloc: Allocator, pdf_bytes: []const u8) !PdfRenderSession {
         return try initWithDecodeLimits(alloc, pdf_bytes, .{});
@@ -587,12 +599,14 @@ pub const PdfRenderSession = struct {
         max_parallel_pages: usize,
         bytes_per_pixel_reserve: usize,
     ) !usize {
-        return try pdf.estimatePreparedPageRenderWaveScratchBytes(
+        const geometry_estimate = try pdf.estimatePreparedPageRenderWaveScratchBytes(
             &self.parsed,
             plans,
             max_parallel_pages,
             bytes_per_pixel_reserve,
         );
+        const learned_estimate = std.math.mul(usize, self.render_worker_scratch_hint, @min(plans.len, max_parallel_pages)) catch return error.RenderBatchAdmissionExceeded;
+        return @max(geometry_estimate, learned_estimate);
     }
 
     pub fn renderPagePngAlloc(self: *PdfRenderSession, alloc: Allocator, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
@@ -607,21 +621,31 @@ pub const PdfRenderSession = struct {
         try self.ensureRenderForkTemplate(options.cancellation);
         var cached_options = options;
         cached_options.fork_template = &self.render_fork_template.?;
-        return try pdf.renderParsedPagesBatchAlloc(alloc, &self.parsed, requests, cached_options);
+        const batch = try pdf.renderParsedPagesBatchAlloc(alloc, &self.parsed, requests, cached_options);
+        self.recordRenderScratch(batch.peak_worker_scratch_bytes);
+        return batch;
     }
 
     pub fn renderPreparedPagesBatchAlloc(self: *PdfRenderSession, alloc: Allocator, plans: []const PreparedPdfPageRenderPlan, options: PdfPageRenderBatchOptions) !RenderedPdfPageBatch {
         try self.ensureRenderForkTemplate(options.cancellation);
         var cached_options = options;
         cached_options.fork_template = &self.render_fork_template.?;
-        return try pdf.renderPreparedPagesBatchAlloc(alloc, &self.parsed, plans, cached_options);
+        const batch = try pdf.renderPreparedPagesBatchAlloc(alloc, &self.parsed, plans, cached_options);
+        self.recordRenderScratch(batch.peak_worker_scratch_bytes);
+        return batch;
     }
 
     pub fn renderPreparedPagesRasterBatchAlloc(self: *PdfRenderSession, alloc: Allocator, plans: []const PreparedPdfPageRenderPlan, options: PdfPageRenderBatchOptions) !RenderedPdfPageRasterBatch {
         try self.ensureRenderForkTemplate(options.cancellation);
         var cached_options = options;
         cached_options.fork_template = &self.render_fork_template.?;
-        return try pdf.renderPreparedPagesRasterBatchAlloc(alloc, &self.parsed, plans, cached_options);
+        const batch = try pdf.renderPreparedPagesRasterBatchAlloc(alloc, &self.parsed, plans, cached_options);
+        self.recordRenderScratch(batch.peak_worker_scratch_bytes);
+        return batch;
+    }
+
+    fn recordRenderScratch(self: *PdfRenderSession, peak: usize) void {
+        self.render_worker_scratch_hint = @max(self.render_worker_scratch_hint, peak +| (peak / 8));
     }
 
     fn ensureRenderForkTemplate(self: *PdfRenderSession, cancellation: PdfCancellationProbe) !void {
@@ -793,6 +817,7 @@ pub const Config = struct {
     ocr_prompt_policy: OcrPromptPolicy = .florence,
     ocr_config_json: []const u8 = "",
     ocr_render_dpi: u16 = 150,
+    ocr_render_resolution: pdf.RenderResolutionPolicy = .requested_dpi,
     ocr_max_rendered_pixels: u64 = 40_000_000,
     ocr_max_rendered_dimension: u32 = 4096,
     ocr_prompt: []const u8 = "",
@@ -832,6 +857,17 @@ pub const Config = struct {
         self.* = undefined;
     }
 };
+
+test "document extraction parses explicit render resolution policy" {
+    var default_config = try parseConfig(std.testing.allocator, "{}");
+    defer default_config.deinit(std.testing.allocator);
+    try std.testing.expectEqual(pdf.RenderResolutionPolicy.requested_dpi, default_config.ocr_render_resolution);
+    var adaptive = try parseConfig(std.testing.allocator, "{\"ocr\":{\"render_resolution\":\"model_input\"}}");
+    defer adaptive.deinit(std.testing.allocator);
+    try std.testing.expectEqual(pdf.RenderResolutionPolicy.model_input, adaptive.ocr_render_resolution);
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(std.testing.allocator, "{\"ocr\":{\"render_resolution\":\"automatic\"}}"));
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(std.testing.allocator, "{\"ocr\":{\"render_resolution\":123}}"));
+}
 
 pub const OcrMode = enum {
     auto,
@@ -1418,7 +1454,11 @@ fn parseOcrOptions(alloc: Allocator, object: std.json.ObjectMap, config: *Config
     const value = object.get("ocr") orelse return;
     if (value != .object) return;
     const ocr = value.object;
-    try rejectUnknownFields(ocr, &.{ "enabled", "executor", "config", "mode", "render_dpi", "max_rendered_pixels", "max_rendered_dimension", "prompt", "prompt_policy", "quality" });
+    try rejectUnknownFields(ocr, &.{ "enabled", "executor", "config", "mode", "render_dpi", "render_resolution", "max_rendered_pixels", "max_rendered_dimension", "prompt", "prompt_policy", "quality" });
+    if (ocr.get("render_resolution")) |resolution| {
+        if (resolution != .string) return error.InvalidDocumentExtractionConfig;
+        config.ocr_render_resolution = std.meta.stringToEnum(pdf.RenderResolutionPolicy, resolution.string) orelse return error.InvalidDocumentExtractionConfig;
+    }
     if (ocr.get("executor")) |executor| {
         if (executor != .string) return error.InvalidDocumentExtractionConfig;
         config.ocr_executor = if (std.mem.eql(u8, executor.string, "reader"))
@@ -1786,7 +1826,7 @@ pub fn metadataFingerprintAlloc(
         config.last_modified.len == 0) return null;
 
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hashField(&hasher, "kind", "document_extraction_metadata_fingerprint_v1");
+    hashField(&hasher, "kind", "document_extraction_metadata_fingerprint_v2");
     hashField(&hasher, "source_url", source_url);
     hashField(&hasher, "config_json", config_json);
     hashField(&hasher, "filename", config.filename);

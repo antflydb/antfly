@@ -7,10 +7,42 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import benchmark
-from benchmark import artifact_errors, coverage_ready
+from benchmark import artifact_errors, coverage_ready, unit_text_hashes
 
 
 class CompletionTests(unittest.TestCase):
+    def test_unit_hashes_compare_text_not_volatile_metadata(self):
+        manifest = {
+            "scan.pdf": {
+                "unit_count": 1,
+                "state_json": json.dumps({"unit_keys": ["key"]}),
+            }
+        }
+        first = unit_text_hashes(
+            manifest,
+            lambda _: {
+                "unit_id": "page:000001",
+                "text": "A short note",
+                "generation": 1,
+            },
+        )
+        second = unit_text_hashes(
+            manifest,
+            lambda _: {
+                "unit_id": "page:000001",
+                "text": "A short note",
+                "generation": 2,
+            },
+        )
+        changed = unit_text_hashes(
+            manifest, lambda _: {"unit_id": "page:000001", "text": "different"}
+        )
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, changed)
+        manifest["scan.pdf"]["unit_count"] = 2
+        with self.assertRaises(ValueError):
+            unit_text_hashes(manifest, lambda _: {})
+
     def setUp(self):
         self.status = {
             "searchable_vectors": 8,

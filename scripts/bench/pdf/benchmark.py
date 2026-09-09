@@ -1,15 +1,18 @@
 """Internal OHR raw-PDF ingest comparison; no external parsing in the timed path."""
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
 import time
 import zipfile
 from pathlib import Path
+from urllib.parse import quote
 
 ROOT = None
 CIRCUS = None
@@ -116,6 +119,39 @@ def artifact_errors(selected, manifests):
     return errors
 
 
+def unit_text_hashes(manifests, fetch_unit, geometry=None):
+    """Verify equivalent retained page text outside the measured interval."""
+    hashes = {}
+    for source, manifest in sorted(manifests.items()):
+        state = json.loads(manifest["state_json"])
+        keys = state["unit_keys"]
+        if len(keys) != manifest["unit_count"] or len(set(keys)) != len(keys):
+            raise ValueError(f"{source}: incomplete or duplicate unit keys")
+        units = {}
+        if geometry is not None:
+            geometry[source] = {}
+        for key in keys:
+            unit = fetch_unit(key)
+            identity = unit["unit_id"]
+            text = unit["text"]
+            if identity in units or not isinstance(text, str):
+                raise ValueError(f"{source}: invalid unit text or identity")
+            units[identity] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            if geometry is not None:
+                geometry[source][identity] = {
+                    field: unit.get(field)
+                    for field in (
+                        "page_number",
+                        "page_bbox",
+                        "page_rotation",
+                        "ocr_render_dpi",
+                        "ocr_effective_render_dpi",
+                    )
+                }
+        hashes[source] = units
+    return hashes
+
+
 def run(args):
     out = ROOT / args.name
     out.mkdir()  # Never reuse a previous database or overwrite a run.
@@ -148,6 +184,9 @@ def run_created(args, out):
         selected = [r for r in selected if r["role"] == "ocr_required"]
     elif args.suite == "text":
         roles = {"render_7_pages", "born_digital", "textbook_qa"}
+        selected = [r for r in selected if r["role"] in roles]
+    elif args.suite == "embedded":
+        roles = {"render_7_pages", "born_digital"}
         selected = [r for r in selected if r["role"] in roles]
     for row in selected:
         if sha256(ROOT / "corpus" / row["path"]) != row["sha256"]:
@@ -187,6 +226,8 @@ def run_created(args, out):
         environment.pop(key)
     if args.read_profile:
         environment["ANTFLY_INFERENCE_READ_PROFILE"] = "1"
+    if args.reader_batch_size is not None:
+        environment["ANTFLY_INFERENCE_READ_BATCH_SIZE"] = str(args.reader_batch_size)
     provenance = {
         "binary": str(binary),
         "binary_sha256": sha256(binary),
@@ -199,6 +240,8 @@ def run_created(args, out):
         "filesystem_cache": "uncontrolled/warm; no system cache flush",
         "removed_environment_keys": sorted(overrides),
         "read_profile": args.read_profile,
+        "reader_batch_size": args.reader_batch_size,
+        "verify_unit_text": args.verify_unit_text,
         "platform": (
             os.uname()._asdict() if hasattr(os.uname(), "_asdict") else list(os.uname())
         ),
@@ -318,6 +361,19 @@ def run_created(args, out):
             finished = wait_until(complete, args.timeout, proc)
             elapsed = time.perf_counter() - started
             errors = artifact_errors(selected, finished["manifests"])
+            text_hashes = None
+            render_geometry = {} if args.verify_unit_text else None
+            if args.verify_unit_text:
+                try:
+                    text_hashes = unit_text_hashes(
+                        finished["manifests"],
+                        lambda key, table_url=table_url: api.json_request(
+                            "GET", table_url + "/documents/" + quote(key, safe="")
+                        ),
+                        render_geometry,
+                    )
+                except (KeyError, TypeError, ValueError, OSError, RuntimeError) as exc:
+                    errors.append(f"Unit text verification failed: {exc}")
             if args.mode == "always" and any(
                 finished["manifests"][r["path"]].get("ocr_attempted_count")
                 != r["pages"]
@@ -355,6 +411,8 @@ def run_created(args, out):
                 passed=not errors,
                 errors=errors,
                 load=os.getloadavg(),
+                unit_text_sha256=text_hashes,
+                unit_render_geometry=render_geometry,
                 **finished,
             )
             results.append(result)
@@ -392,6 +450,13 @@ def run_created(args, out):
 
 
 if __name__ == "__main__":
+
+    def terminate(signum, _frame):
+        # Let run_created's finally block stop its Antfly child and byte origin
+        # when the paired driver is interrupted.
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, terminate)
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=["prepare", "run"])
     parser.add_argument(
@@ -412,12 +477,20 @@ if __name__ == "__main__":
     parser.add_argument("--name")
     parser.add_argument("--port", type=int, default=29680)
     parser.add_argument(
-        "--suite", choices=["scan", "text", "small", "qualification"], default="small"
+        "--suite",
+        choices=["scan", "embedded", "text", "small", "qualification"],
+        default="small",
     )
     parser.add_argument("--ocr-model", default="antflydb/Florence-2-base:safetensors")
     parser.add_argument("--embed-model", default="BAAI/bge-small-en-v1.5:safetensors")
     parser.add_argument("--mode", choices=["auto", "always"], default="auto")
     parser.add_argument("--batch", action="store_true")
+    parser.add_argument("--reader-batch-size", type=int, choices=[1, 2, 4, 8, 16])
+    parser.add_argument(
+        "--verify-unit-text",
+        action="store_true",
+        help="Hash retained page text after timing for exact A/B output checks",
+    )
     parser.add_argument(
         "--read-profile",
         action="store_true",

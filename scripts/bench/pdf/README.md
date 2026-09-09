@@ -61,6 +61,9 @@ An existing run directory is rejected. Only this harness's child process is
 terminated. The fixed default ports are 29680/29681; use `--port` to change them.
 
 - `--suite scan`: the single required-OCR scan, for quick model qualification.
+- `--suite embedded`: the seven-page document and newspaper, 8 pages total.
+  A separate embedded-text diagnostic; not a replacement for reporting failures
+  or unequal OCR output in the mixed suites.
 - `--suite text`: 3 text-bearing/mixed PDFs, 9 pages. Includes the seven-page
   document, newspaper, and textbook page. Auto mode can still invoke OCR.
 - `--suite small`: 4 PDFs, 10 pages, including a required-OCR scan and a
@@ -72,6 +75,9 @@ terminated. The fixed default ports are 29680/29681; use `--port` to change them
 - `--ocr-model` and `--embed-model`: explicit model identities; defaults pin the
   Florence and BGE safetensors variants. Embedding dimension remains BGE's 384.
 - `--batch`: submit all source rows together; omit for one request per PDF.
+- `--reader-batch-size`: explicitly pin reader microbatch capacity to 1, 2, 4,
+  8 or 16 on both subjects; omitted uses each subject's default. Record separate
+  experiments for each size, including any output divergence.
 - `--read-profile`: enable per-stage reader diagnostics and record the override
   in provenance. Use for failure diagnosis, not timing comparisons.
 - `--trials`: fresh tables within one server process. Model/runtime caches can
@@ -107,3 +113,36 @@ controlled. This harness does not claim peak-memory measurements.
 ```sh
 python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py' -v
 ```
+
+## Paired main-versus-PR comparison
+
+Use frozen source worktrees for both subjects. Finish both matched Metal builds
+before starting timing; pin full commit SHAs and preserve binary hashes. The PR
+should contain the exact baseline main commit so unrelated main changes do not
+confound attribution.
+
+```sh
+/path/to/venv/bin/python scripts/bench/pdf/compare.py \
+  --work-dir /path/to/pdf-assets --circus-dir /path/to/antfly-circus \
+  --main-binary /path/to/main/antfly --main-revision FULL_MAIN_SHA \
+  --pr-binary /path/to/pr/antfly --pr-revision FULL_PR_SHA \
+  --name main-pr-text-always --suite text --mode always --pairs 2 --trials 3
+```
+
+Pairs alternate `main, PR` then `PR, main`, always using fresh server processes;
+trials within each process use fresh tables. Run `--mode auto` separately for
+normal extraction and `--mode always` for forced rendering/OCR. The driver uses
+the existing harness with `--batch --verify-unit-text`. Retained unit text is
+hashed after the timed interval; volatile metadata is excluded from those hashes.
+Both subjects must have identical per-document page/chunk/OCR counts, total
+published vectors, retained-text hashes and page/DPI metadata. Corpus, model, table and server
+configuration must match, and runtime logs must confirm Metal for invoked models.
+Every requested pair must finish successfully; failed/unequal-output pairs are
+retained, not silently removed. No speedup is calculated for such an experiment.
+
+Each experiment retains commands, per-process logs, full results and
+`summary.json`. The summary separates first-process-trial timings from per-process
+medians of warm trials, records paired ratios, and rejects binary/model drift
+between pairs. These are not cold-filesystem measurements or OCR accuracy scores.
+Host load remains uncontrolled and must be reported; use more alternating pairs
+on a quiet host before making performance claims.

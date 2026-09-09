@@ -98,11 +98,16 @@ pub const RenderProfile = enum {
     ocr,
 };
 
+pub const RenderResolutionPolicy = enum { requested_dpi, model_input };
+
 pub const PageRenderRequest = struct {
     page_number: usize,
     requested_dpi: u16 = 150,
     max_pixels: u64 = 40_000_000,
     max_dimension: u32 = 4096,
+    /// Model input dimensions are not a quality guarantee. Direct rendering
+    /// to those dimensions changes text antialiasing and requires opt-in.
+    resolution_policy: RenderResolutionPolicy = .requested_dpi,
     /// Optional downstream fixed raster target. When both are set, geometry
     /// planning chooses the lowest DPI that supplies at least this many source
     /// samples on both axes. If the configured DPI/caps cannot reach it, the
@@ -151,11 +156,22 @@ pub const PageRenderExecutor = struct {
 /// this API cannot accidentally retain a whole large document in memory.
 pub const default_render_bytes_per_pixel_reserve: usize = 12;
 
+/// Called at most once, with concurrent worker calls serialized by the batch.
+/// Must admit memory without waiting for another invocation or reclaiming it.
+/// Returns the new total grant, never above max_bytes. The caller owns that
+/// grant until all workers and their scratch allocations have been destroyed.
+pub const RenderScratchGrowth = struct {
+    context: *anyopaque,
+    max_bytes: usize,
+    grow_fn: *const fn (*anyopaque) usize,
+};
+
 pub const PageRenderBatchOptions = struct {
     max_batch_pages: usize = 8,
     max_parallel_pages: usize = 1,
     max_inflight_pixels: u64 = 50_000_000,
     max_inflight_bytes: usize = 512 * 1024 * 1024,
+    scratch_growth: ?RenderScratchGrowth = null,
     max_retained_png_bytes: usize = 64 * 1024 * 1024,
     /// Hard bound for raw raster bytes retained after completed workers leave
     /// the batch scratch budget. This is intentionally separate from encoded
@@ -212,6 +228,7 @@ pub const RenderedPageBatch = struct {
     /// Worst-case live worker memory admitted in one wave, including raster
     /// reservations, render-fork metadata, and per-page decode working sets.
     peak_admitted_bytes: usize,
+    peak_worker_scratch_bytes: usize = 0,
     thread_spawn_fallbacks: usize,
 
     pub fn deinit(self: *RenderedPageBatch, alloc: Allocator) void {
@@ -240,6 +257,7 @@ pub const RenderedPageRasterBatch = struct {
     peak_parallelism: usize,
     peak_admitted_pixels: u64,
     peak_admitted_bytes: usize,
+    peak_worker_scratch_bytes: usize = 0,
     thread_spawn_fallbacks: usize,
 
     pub fn deinit(self: *RenderedPageRasterBatch, alloc: Allocator) void {
@@ -1057,6 +1075,7 @@ fn adaptiveRenderGeometryForBox(
         }
     }
     const highest = best orelse return error.RenderedPageTooLarge;
+    if (request.resolution_policy == .requested_dpi) return highest;
     const preferred_width = request.preferred_width orelse return highest;
     const preferred_height = request.preferred_height.?;
     if (highest.width < preferred_width or highest.height < preferred_height)
@@ -1114,11 +1133,19 @@ fn renderGeometryAtDpi(
 const RenderBatchBudget = struct {
     live_bytes: std.atomic.Value(usize) = .init(0),
     max_live_bytes: usize,
+    growth: ?RenderScratchGrowth = null,
+    extra_bytes: std.atomic.Value(usize) = .init(0),
+    growth_state: std.atomic.Value(u8) = .init(0),
     limit_exceeded: std.atomic.Value(bool) = .init(false),
 
     fn reserve(self: *@This(), bytes: usize) bool {
         var current = self.live_bytes.load(.acquire);
-        while (bytes <= self.max_live_bytes -| current) {
+        while (true) {
+            if (bytes > self.limit() -| current) {
+                if (!self.grow()) break;
+                current = self.live_bytes.load(.acquire);
+                if (bytes > self.limit() -| current) break;
+            }
             if (self.live_bytes.cmpxchgWeak(current, current + bytes, .acq_rel, .acquire)) |observed| {
                 current = observed;
                 continue;
@@ -1129,16 +1156,57 @@ const RenderBatchBudget = struct {
         return false;
     }
 
+    fn limit(self: *@This()) usize {
+        return self.max_live_bytes + self.extra_bytes.load(.acquire);
+    }
+
+    fn grow(self: *@This()) bool {
+        const growth = self.growth orelse return false;
+        if (self.growth_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
+            const granted = @min(growth.max_bytes, growth.grow_fn(growth.context));
+            self.extra_bytes.store(granted -| self.max_live_bytes, .release);
+            self.growth_state.store(2, .release);
+        } else {
+            while (self.growth_state.load(.acquire) == 1) std.atomic.spinLoopHint();
+        }
+        return self.extra_bytes.load(.acquire) > 0;
+    }
+
     fn release(self: *@This(), bytes: usize) void {
         const previous = self.live_bytes.fetchSub(bytes, .acq_rel);
         std.debug.assert(previous >= bytes);
     }
 };
 
+test "render scratch growth is admitted once and obeys its hard ceiling" {
+    const Grow = struct {
+        calls: usize = 0,
+        grant: usize,
+        fn run(context: *anyopaque) usize {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            return self.grant;
+        }
+    };
+    for ([_]usize{ 64, 100, 1000 }) |grant| {
+        var growth = Grow{ .grant = grant };
+        var budget = RenderBatchBudget{ .max_live_bytes = 64, .growth = .{ .context = &growth, .max_bytes = 128, .grow_fn = Grow.run } };
+        try std.testing.expect(budget.reserve(64));
+        const grew = budget.reserve(1);
+        try std.testing.expectEqual(grant > 64, grew);
+        try std.testing.expect(!budget.reserve(129));
+        try std.testing.expectEqual(@as(usize, 1), growth.calls);
+        try std.testing.expectEqual(@min(grant, 128), budget.limit());
+        budget.release(if (grew) 65 else 64);
+        try std.testing.expectEqual(@as(usize, 0), budget.live_bytes.load(.acquire));
+    }
+}
+
 const RenderWorkerBudgetAllocator = struct {
     backing: Allocator,
     shared: ?*RenderBatchBudget = null,
     live_bytes: usize = 0,
+    peak_live_bytes: usize = 0,
     max_live_bytes: usize,
     limit_exceeded: bool = false,
 
@@ -1169,6 +1237,7 @@ const RenderWorkerBudgetAllocator = struct {
             return null;
         };
         self.live_bytes += len;
+        self.peak_live_bytes = @max(self.peak_live_bytes, self.live_bytes);
         return ptr;
     }
 
@@ -1193,6 +1262,7 @@ const RenderWorkerBudgetAllocator = struct {
         } else {
             self.live_bytes += growth;
         }
+        self.peak_live_bytes = @max(self.peak_live_bytes, self.live_bytes);
         return true;
     }
 
@@ -1217,6 +1287,7 @@ const RenderWorkerBudgetAllocator = struct {
         } else {
             self.live_bytes += growth;
         }
+        self.peak_live_bytes = @max(self.peak_live_bytes, self.live_bytes);
         return ptr;
     }
 
@@ -1244,11 +1315,99 @@ const RenderWorkerBudgetAllocator = struct {
 /// allocations reuse already-admitted backing pages while parsed font state
 /// remains live across joined waves. The backing allocator, rather than each
 /// logical suballocation, is charged to the aggregate render budget.
-const RenderLaneHeap = std.heap.DebugAllocator(.{
-    .stack_trace_frames = 0,
-    .safety = false,
-    .thread_safe = false,
-});
+const RenderLaneHeap = @import("render_heap.zig").Heap;
+
+/// Reuse backing pages after the lane heap releases an empty size-class
+/// bucket. Without this, transient scanner tokens repeatedly mmap/munmap a
+/// whole bucket. Cached pages remain charged to the scratch budget, are
+/// evicted before reporting allocation failure, and never outlive the lane.
+const RenderLanePageCache = struct {
+    backing: Allocator,
+    entries: [16]?Entry = @splat(null),
+    const Entry = struct { bytes: []u8, alignment: std.mem.Alignment };
+
+    fn allocator(self: *@This()) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn deinit(self: *@This()) void {
+        for (&self.entries) |*slot| if (slot.*) |entry| {
+            self.backing.rawFree(entry.bytes, entry.alignment, @returnAddress());
+            slot.* = null;
+        };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        for (&self.entries) |*slot| if (slot.*) |entry| {
+            if (entry.bytes.len == len and entry.alignment == alignment) {
+                slot.* = null;
+                return entry.bytes.ptr;
+            }
+        };
+        if (self.backing.rawAlloc(len, alignment, ret_addr)) |ptr| return ptr;
+        self.deinit();
+        return self.backing.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.backing.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.backing.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (memory.len <= 256 * 1024) {
+            for (&self.entries) |*slot| if (slot.* == null) {
+                slot.* = .{ .bytes = memory, .alignment = alignment };
+                return;
+            };
+        }
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "render lane page cache retains accounting and evicts under pressure" {
+    var budget = RenderWorkerBudgetAllocator{ .backing = std.testing.allocator, .max_live_bytes = 32 };
+    var cache = RenderLanePageCache{ .backing = budget.allocator() };
+    defer cache.deinit();
+    const alloc = cache.allocator();
+    const first = try alloc.alloc(u8, 16);
+    alloc.free(first);
+    try std.testing.expectEqual(@as(usize, 16), budget.live_bytes);
+    const reused = try alloc.alloc(u8, 16);
+    try std.testing.expectEqual(first.ptr, reused.ptr);
+    alloc.free(reused);
+    const larger = try alloc.alloc(u8, 32);
+    try std.testing.expectEqual(@as(usize, 32), budget.live_bytes);
+    alloc.free(larger);
+    cache.deinit();
+    try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+}
+
+test "render heap evicts idle slabs without invalidating live fonts" {
+    var budget = RenderWorkerBudgetAllocator{ .backing = std.testing.allocator, .max_live_bytes = 512 * 1024 };
+    {
+        var heap = RenderLaneHeap{ .backing_allocator = budget.allocator() };
+        defer heap.deinit();
+        const alloc = heap.allocator();
+        const pinned = try alloc.alloc(u8, 12);
+        defer alloc.free(pinned);
+        @memset(pinned, 42);
+        const transient = try alloc.alloc(u8, 9000);
+        alloc.free(transient);
+        const large = try alloc.alloc(u8, 200000);
+        defer alloc.free(large);
+        for (pinned) |byte| try std.testing.expectEqual(@as(u8, 42), byte);
+        try std.testing.expect(budget.live_bytes <= budget.max_live_bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+}
 
 pub const RenderBatchOutputKind = enum { png, raster };
 
@@ -1382,6 +1541,7 @@ const PageRenderWorker = struct {
     profile: RenderProfile,
     scratch_budget: RenderWorkerBudgetAllocator,
     scratch_heap: RenderLaneHeap = .init,
+    scratch_pages: RenderLanePageCache = undefined,
     output_budget: RenderWorkerBudgetAllocator,
     fork_template: *const reader.RenderForkTemplate,
     shared_budget: *RenderBatchBudget,
@@ -1493,13 +1653,15 @@ const PageRenderWorker = struct {
             self.scratch_budget = .{
                 .backing = backing,
                 .shared = self.shared_budget,
-                .max_live_bytes = self.shared_budget.max_live_bytes,
+                .max_live_bytes = if (self.shared_budget.growth) |growth| @max(growth.max_bytes, self.shared_budget.max_live_bytes) else self.shared_budget.max_live_bytes,
             };
             self.scratch_heap = .init;
-            self.scratch_heap.backing_allocator = self.scratch_budget.allocator();
+            self.scratch_pages = .{ .backing = self.scratch_budget.allocator() };
+            self.scratch_heap.backing_allocator = self.scratch_pages.allocator();
             self.parsed = self.fork_template.instantiate(self.scratch_heap.allocator(), self.wave_control.probe()) catch |err| {
                 self.recordRenderFailure(err);
                 _ = self.scratch_heap.deinit();
+                self.scratch_pages.deinit();
                 std.debug.assert(self.scratch_budget.live_bytes == 0);
                 return;
             };
@@ -1532,6 +1694,7 @@ const PageRenderWorker = struct {
         if (self.parsed) |*parsed| parsed.deinit();
         self.parsed = null;
         _ = self.scratch_heap.deinit();
+        self.scratch_pages.deinit();
         std.debug.assert(self.scratch_budget.live_bytes == 0);
         self.scratch_initialized = false;
     }
@@ -1663,26 +1826,7 @@ fn prepareRenderPageForAdmission(
         parsed.decode_limits.max_working_set_bytes,
     ) catch return error.RenderBatchAdmissionExceeded;
     if (fixed_bytes >= options.max_inflight_bytes) return error.RenderBatchAdmissionExceeded;
-    const raster_budget = options.max_inflight_bytes - fixed_bytes;
-    const memory_pixels = raster_budget / options.bytes_per_pixel_reserve;
-    if (memory_pixels == 0) return error.RenderBatchAdmissionExceeded;
-
-    var adjusted = request;
-    if (output_kind == .raster) if (request.max_output_bytes) |output_limit| {
-        const retained_pixels = output_limit / PixelFormat.rgba8.bytesPerPixel();
-        if (retained_pixels == 0) return error.RenderedPageOutputTooLarge;
-        adjusted.max_pixels = @min(
-            adjusted.max_pixels,
-            std.math.cast(u64, retained_pixels) orelse std.math.maxInt(u64),
-        );
-    };
-    adjusted.max_pixels = @min(
-        adjusted.max_pixels,
-        @min(
-            options.max_inflight_pixels,
-            std.math.cast(u64, memory_pixels) orelse std.math.maxInt(u64),
-        ),
-    );
+    const adjusted = request;
     const geometry = if (planned_geometry) |planned|
         if (planned.pixels <= adjusted.max_pixels and
             planned.width <= adjusted.max_dimension and
@@ -1692,9 +1836,16 @@ fn prepareRenderPageForAdmission(
             try adaptiveRenderGeometry(parsed, adjusted)
     else
         try adaptiveRenderGeometry(parsed, adjusted);
+    // Scheduling may shorten a wave, never silently change its page pixels.
+    if (geometry.pixels > options.max_inflight_pixels) return error.RenderBatchAdmissionExceeded;
+    if (output_kind == .raster) if (request.max_output_bytes) |output_limit| {
+        if (geometry.pixels > output_limit / PixelFormat.rgba8.bytesPerPixel()) return error.RenderedPageOutputTooLarge;
+    };
     const admitted_bytes = try renderPageReservedBytes(parsed, geometry.pixels, options);
-    const worker_limit_bytes = std.math.add(usize, admitted_bytes, parsed.decode_limits.max_working_set_bytes) catch
-        return error.RenderBatchAdmissionExceeded;
+    // The estimate is not a quality ceiling. A serial page may reserve the
+    // full configured grant; the allocator still enforces the hard limit.
+    const worker_limit_bytes = @min(options.max_inflight_bytes, std.math.add(usize, admitted_bytes, parsed.decode_limits.max_working_set_bytes) catch
+        return error.RenderBatchAdmissionExceeded);
     if (geometry.pixels > options.max_inflight_pixels or worker_limit_bytes > options.max_inflight_bytes)
         return error.RenderBatchAdmissionExceeded;
     if (output_kind == .raster and request.max_output_bytes != null and
@@ -1855,7 +2006,7 @@ fn renderParsedPageWorkBatchAlloc(
     defer alloc.free(wave);
     const executor_contexts = try alloc.alloc(*anyopaque, worker_capacity);
     defer alloc.free(executor_contexts);
-    var shared_budget = RenderBatchBudget{ .max_live_bytes = options.max_inflight_bytes };
+    var shared_budget = RenderBatchBudget{ .max_live_bytes = options.max_inflight_bytes, .growth = options.scratch_growth };
     defer std.debug.assert(shared_budget.live_bytes.load(.acquire) == 0);
     const max_retained_output_bytes = if (output_kind == .png)
         options.max_retained_png_bytes
@@ -2029,7 +2180,14 @@ fn renderParsedPageWorkBatchAlloc(
         .peak_launched_workers = peak_launched_workers,
         .peak_parallelism = peak_parallelism,
         .peak_admitted_pixels = peak_admitted_pixels,
-        .peak_admitted_bytes = peak_admitted_bytes,
+        .peak_admitted_bytes = @max(peak_admitted_bytes, if (shared_budget.extra_bytes.load(.acquire) > 0) shared_budget.limit() else 0),
+        .peak_worker_scratch_bytes = blk: {
+            var peak: usize = 0;
+            for (workers) |worker| if (worker.scratch_initialized) {
+                peak = @max(peak, worker.scratch_budget.peak_live_bytes);
+            };
+            break :blk peak;
+        },
         .thread_spawn_fallbacks = thread_spawn_fallbacks,
     };
 }
@@ -2260,6 +2418,7 @@ test "adaptive geometry stops once a fixed model target is supplied on both axes
             .max_dimension = 4096,
             .preferred_width = 768,
             .preferred_height = 768,
+            .resolution_policy = .model_input,
         },
     );
     try std.testing.expectEqual(@as(u16, 91), geometry.effective_dpi);
@@ -2275,6 +2434,16 @@ test "adaptive geometry stops once a fixed model target is supplied on both axes
             .{ .page_number = 1, .preferred_width = 768 },
         ),
     );
+}
+
+test "model target cannot silently lower requested render quality" {
+    const geometry = try adaptiveRenderGeometryForBox(
+        .{ .min_x = 0, .min_y = 0, .max_x = 612, .max_y = 792 },
+        .none,
+        false,
+        .{ .page_number = 1, .requested_dpi = 150, .preferred_width = 768, .preferred_height = 768 },
+    );
+    try std.testing.expectEqual(@as(u16, 150), geometry.effective_dpi);
 }
 
 fn dupTextRunAlloc(alloc: Allocator, run: reader.TextRun) !reader.TextRun {
@@ -4927,9 +5096,9 @@ test "bounded raw raster batch preserves order, plans, and output byte limits" {
     const alloc = std.testing.allocator;
     const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
     const requests = [_]PageRenderRequest{
-        .{ .page_number = 2, .requested_dpi = 150, .max_dimension = 1200, .max_output_bytes = 100_000 },
+        .{ .page_number = 2, .requested_dpi = 150, .max_dimension = 1200, .max_pixels = 25_000, .max_output_bytes = 100_000 },
         .{ .page_number = 99 },
-        .{ .page_number = 1, .requested_dpi = 150, .max_dimension = 1200, .max_output_bytes = 100_000 },
+        .{ .page_number = 1, .requested_dpi = 150, .max_dimension = 1200, .max_pixels = 25_000, .max_output_bytes = 100_000 },
     };
     var parsed = try reader.Reader.init(alloc, fixture);
     defer parsed.deinit();
@@ -5426,7 +5595,7 @@ test "bounded render batch enforces window admission and retained output limits"
     }));
 }
 
-test "bounded render batch adapts geometry to the inflight pixel window" {
+test "bounded render batch rejects insufficient pixel admission without lowering DPI" {
     const alloc = std.testing.allocator;
     const fixture = @embedFile("../testdata/two_page_text_fixture.pdf");
     var parsed = try reader.Reader.init(alloc, fixture);
@@ -5442,11 +5611,9 @@ test "bounded render batch adapts geometry to the inflight pixel window" {
     });
     defer batch.deinit(alloc);
 
-    try std.testing.expect(batch.results[0].failure == null);
-    const rendered = batch.results[0].rendered.?;
-    try std.testing.expect(@as(u64, rendered.width) * @as(u64, rendered.height) <= pixel_window);
-    try std.testing.expect(rendered.effective_dpi < rendered.requested_dpi);
-    try std.testing.expect(batch.peak_admitted_pixels <= pixel_window);
+    try std.testing.expectEqual(error.RenderBatchAdmissionExceeded, batch.results[0].failure.?);
+    try std.testing.expect(batch.results[0].rendered == null);
+    try std.testing.expectEqual(@as(u64, 0), batch.peak_admitted_pixels);
 }
 
 test "admitted prepared geometry is identical at execution under pixel and scratch limits" {
@@ -5457,24 +5624,22 @@ test "admitted prepared geometry is identical at execution under pixel and scrat
     const requested = try prepareParsedPageRenderPlan(&parsed, request);
     const fixed = try std.math.add(usize, try parsed.renderForkMetadataBytes(), parsed.decode_limits.max_working_set_bytes);
     for ([_]PageRenderBatchOptions{
-        .{ .max_inflight_pixels = 50_000 },
+        .{ .max_inflight_pixels = requested.geometry().pixels },
         .{ .max_inflight_bytes = fixed + 50_000 * default_render_bytes_per_pixel_reserve },
     }) |options| {
         const plan = try prepareAdmittedPageRenderPlan(&parsed, request, options, .png);
-        try std.testing.expect(plan.geometry().pixels <= 50_000);
-        try std.testing.expect(plan.geometry().pixels < requested.geometry().pixels);
+        try std.testing.expectEqual(requested.geometry().pixels, plan.geometry().pixels);
         var rendered = try renderPreparedPagesBatchAlloc(alloc, &parsed, &.{plan}, options);
         defer rendered.deinit(alloc);
         const page = rendered.results[0].rendered orelse return error.MissingAdmittedPage;
         try std.testing.expectEqual(plan.geometry().width, page.width);
         try std.testing.expectEqual(plan.geometry().height, page.height);
         try std.testing.expectEqual(plan.geometry().effective_dpi, page.effective_dpi);
-        try std.testing.expectEqual(try estimatePreparedPageRenderWaveScratchBytes(&parsed, &.{plan}, 1, options.bytes_per_pixel_reserve), rendered.peak_admitted_bytes);
+        try std.testing.expectEqual(@min(options.max_inflight_bytes, try estimatePreparedPageRenderWaveScratchBytes(&parsed, &.{plan}, 1, options.bytes_per_pixel_reserve)), rendered.peak_admitted_bytes);
     }
     var raw = request;
     raw.max_output_bytes = 40_000 * 4;
-    const plan = try prepareAdmittedPageRenderPlan(&parsed, raw, .{}, .raster);
-    try std.testing.expect(plan.geometry().pixels <= 40_000);
+    try std.testing.expectError(error.RenderedPageOutputTooLarge, prepareAdmittedPageRenderPlan(&parsed, raw, .{}, .raster));
     try std.testing.expectError(error.InvalidRenderBatchOptions, prepareAdmittedPageRenderPlan(&parsed, request, .{ .bytes_per_pixel_reserve = 0 }, .png));
 }
 

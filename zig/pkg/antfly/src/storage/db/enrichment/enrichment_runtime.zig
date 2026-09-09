@@ -6222,6 +6222,7 @@ fn runForegroundCatchUpPassOwned(
 /// prompts and output types deliberately do not participate in render sharing.
 const SharedPdfTransform = struct {
     dpi: u16,
+    resolution_policy: @FieldType(document_extraction_mod.Config, "ocr_render_resolution"),
     max_pixels: u64,
     max_dimension: u32,
     width: ?u32,
@@ -6236,10 +6237,11 @@ const SharedPdfTransform = struct {
     fn init(config: document_extraction_mod.Config, pixels: u64, width: ?u32, height: ?u32, output_bytes: usize, raster: bool) @This() {
         return .{
             .dpi = config.ocr_render_dpi,
+            .resolution_policy = config.ocr_render_resolution,
             .max_pixels = @min(@min(config.ocr_max_rendered_pixels, @as(u64, config.ocr_max_rendered_dimension) * config.ocr_max_rendered_dimension), pixels),
             .max_dimension = config.ocr_max_rendered_dimension,
-            .width = width,
-            .height = height,
+            .width = if (config.ocr_render_resolution == .model_input) width else null,
+            .height = if (config.ocr_render_resolution == .model_input) height else null,
             .output_bytes = if (raster) 0 else output_bytes,
             .raster = raster,
             .decode_stream_bytes = config.pdf_decode_limits.max_decoded_stream_bytes,
@@ -7951,7 +7953,10 @@ const RuntimePdfPageTextSpool = struct {
 test "shared PDF transform identity includes decoder and spatial limits" {
     var config = document_extraction_mod.Config{};
     const baseline = SharedPdfTransform.init(config, 1_000_000, null, null, 100, false);
+    try std.testing.expect(std.meta.eql(baseline, SharedPdfTransform.init(config, 1_000_000, 224, 224, 100, false)));
+    config.ocr_render_resolution = .model_input;
     try std.testing.expect(!std.meta.eql(baseline, SharedPdfTransform.init(config, 1_000_000, 224, 224, 100, false)));
+    config.ocr_render_resolution = .requested_dpi;
     try std.testing.expect(!std.meta.eql(baseline, SharedPdfTransform.init(config, 1_000_000, null, null, 99, false)));
     try std.testing.expect(!std.meta.eql(baseline, SharedPdfTransform.init(config, 1_000_000, null, null, 100, true)));
     config.pdf_decode_limits.max_working_set_bytes -= 1;
@@ -8925,11 +8930,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             defer clipped.deinit();
             try std.testing.expectEqual(@as(usize, 1), clipped.count);
             physical_limit.render_config.pdf_render_max_inflight_pixels = pixel_caps.batch.max_decoded_pixels.? / 2;
-            var downscaled = try physical_limit.prepare(0);
-            defer downscaled.deinit();
-            try std.testing.expectEqual(@as(usize, 1), downscaled.count);
-            const small = downscaled.rendered.encoded.results[0].rendered.?;
-            try std.testing.expect(@as(u64, small.width) * small.height <= physical_limit.render_config.pdf_render_max_inflight_pixels);
+            try std.testing.expectError(error.RenderBatchAdmissionExceeded, physical_limit.prepare(0));
             var transport_limit = preparer;
             transport_limit.use_borrowed_rasters = true;
             transport_limit.capabilities.attachment_payload_max_bytes = @intCast(pixel_caps.batch.max_decoded_pixels.? * 2);
@@ -8969,12 +8970,9 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             try std.testing.expectEqual(@as(usize, 2), limited.unit_indices.len);
             var small_config = config;
             small_config.pdf_render_max_inflight_pixels = pixels / 2;
-            var downscaled = try renderRuntimePdfWindow(&runtime, alloc, producer, session, small_config, config.pdf_render_max_inflight_bytes, .{ .max_items = 1, .render_items = 2, .max_bytes = 64 * 1024 * 1024 }, .reader, "{}", "pdf", "application/pdf", "render-sharing", &.{
+            try std.testing.expectError(error.RenderBatchAdmissionExceeded, renderRuntimePdfWindow(&runtime, alloc, producer, session, small_config, config.pdf_render_max_inflight_bytes, .{ .max_items = 1, .render_items = 2, .max_bytes = 64 * 1024 * 1024 }, .reader, "{}", "pdf", "application/pdf", "render-sharing", &.{
                 .{ .unit_id = @constCast("page:000001"), .unit_type = @constCast("page"), .text = @constCast(""), .method = @constCast("pdf_text"), .page_number = 1, .extraction_status = @constCast("pending_ocr") },
-            }, 0, false, .{});
-            defer downscaled.deinit();
-            const small = downscaled.batch.encoded.results[0].rendered.?;
-            try std.testing.expect(@as(u64, small.width) * small.height <= small_config.pdf_render_max_inflight_pixels);
+            }, 0, false, .{}));
         }
         {
             // Exercise the actual OCR owner loop: two pages are retained in
@@ -13755,17 +13753,35 @@ fn renderAdmittedPdfWindowBatchAlloc(
     use_rasters: bool,
     max_scratch_bytes: usize,
 ) !RuntimePdfRenderBatch {
+    const Growth = struct {
+        lease: *PdfWindowCompositeLease,
+        maximum: usize,
+        fn grow(context: *anyopaque) usize {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            _ = self.lease.admitScratchRetry(self.maximum) catch return self.lease.scratchBytesPerWindow();
+            return self.lease.scratchBytesPerWindow();
+        }
+    };
+    var growth = Growth{ .lease = lease, .maximum = max_scratch_bytes };
+    var admitted_options = options;
+    admitted_options.scratch_growth = .{ .context = &growth, .max_bytes = max_scratch_bytes, .grow_fn = Growth.grow };
     const Render = struct {
         runtime: *EnrichmentRuntime,
         session: *document_extraction_mod.PdfRenderSession,
         plans: []const document_extraction_mod.PreparedPdfPageRenderPlan,
         use_rasters: bool,
 
-        fn run(self: @This(), alloc: Allocator, opts: document_extraction_mod.PdfPageRenderBatchOptions) !RuntimePdfRenderBatch {
+        fn run(self: @This(), alloc: Allocator, opts: document_extraction_mod.PdfPageRenderBatchOptions, indices: ?[]const usize) !RuntimePdfRenderBatch {
+            const selected = if (indices) |items| try alloc.alloc(document_extraction_mod.PreparedPdfPageRenderPlan, items.len) else null;
+            defer if (selected) |items| alloc.free(items);
+            if (selected) |items| for (items, indices.?) |*plan, index| {
+                plan.* = self.plans[index];
+            };
+            const active_plans = selected orelse self.plans;
             return if (self.use_rasters)
-                .{ .raster = try renderPreparedPdfRasterWindowBatchAlloc(self.runtime, self.session, alloc, self.plans, opts) }
+                .{ .raster = try renderPreparedPdfRasterWindowBatchAlloc(self.runtime, self.session, alloc, active_plans, opts) }
             else
-                .{ .encoded = try renderPreparedPdfWindowBatchAlloc(self.runtime, self.session, alloc, self.plans, opts) };
+                .{ .encoded = try renderPreparedPdfWindowBatchAlloc(self.runtime, self.session, alloc, active_plans, opts) };
         }
     };
     return renderPdfWindowWithScratchRetry(Render{
@@ -13773,34 +13789,62 @@ fn renderAdmittedPdfWindowBatchAlloc(
         .session = session,
         .plans = plans,
         .use_rasters = use_rasters,
-    }, lease, options, max_scratch_bytes);
+    }, lease, admitted_options, max_scratch_bytes);
 }
 
 fn renderPdfWindowWithScratchRetry(renderer: anytype, lease: *PdfWindowCompositeLease, options: document_extraction_mod.PdfPageRenderBatchOptions, max_scratch_bytes: usize) !RuntimePdfRenderBatch {
-    var batch = try renderer.run(lease.allocator(), options);
-    const needs_retry = switch (batch) {
-        inline else => |value| blk: {
-            for (value.results) |result| {
-                if (result.failure) |err| if (err == error.RenderWorkerMemoryLimitExceeded) break :blk true;
+    var batch = try renderer.run(lease.allocator(), options, null);
+    errdefer batch.deinit(lease.allocator());
+    var failed = std.ArrayListUnmanaged(usize).empty;
+    defer failed.deinit(lease.owner_alloc);
+    switch (batch) {
+        inline else => |value| {
+            for (value.results, 0..) |result, index| {
+                if (result.failure) |err| if (err == error.RenderWorkerMemoryLimitExceeded) try failed.append(lease.owner_alloc, index);
             }
-            break :blk false;
         },
-    };
-    if (!needs_retry) return batch;
-    const admitted = lease.admitScratchRetry(max_scratch_bytes) catch |err| {
-        batch.deinit(lease.allocator());
-        return err;
-    };
-    if (!admitted) return batch;
-    batch.deinit(lease.allocator());
+    }
+    if (failed.items.len == 0) return batch;
+    const already_grown = lease.scratchBytesPerWindow() > options.max_inflight_bytes;
+    const admitted = try lease.admitScratchRetry(max_scratch_bytes);
+    if (!admitted and !already_grown) return batch;
+    // A single page that already consumed its admitted growth cannot benefit
+    // from replaying with the same grant. Multi-page windows can shed other
+    // lanes' caches by retrying only the failed pages serially.
+    if (already_grown and switch (batch) {
+        inline else => |value| value.results.len == 1,
+    }) return batch;
     var retry_options = options;
     retry_options.max_inflight_bytes = lease.scratchBytesPerWindow();
     retry_options.max_parallel_pages = 1;
-    // Keep the original deadline, page identities, transforms and output caps.
-    return renderer.run(lease.allocator(), retry_options);
+    retry_options.scratch_growth = null;
+    // Preserve completed pages and replay only failed identities, with the
+    // original deadline, transforms and output caps. The joined first attempt
+    // has released all scratch; its successful outputs remain admitted.
+    var retry = try renderer.run(lease.allocator(), retry_options, failed.items);
+    defer retry.deinit(lease.allocator());
+    switch (batch) {
+        inline else => |*value, tag| {
+            if (std.meta.activeTag(retry) != tag) return error.InvalidPdfRenderWindow;
+            const replacement = &@field(retry, @tagName(tag));
+            if (replacement.results.len != failed.items.len) return error.InvalidPdfRenderWindow;
+            for (replacement.results, failed.items) |*result, index| {
+                if (result.page_number != value.results[index].page_number) return error.InvalidPdfRenderWindow;
+                const elapsed = value.results[index].render_elapsed_ns;
+                value.results[index].deinit(lease.allocator());
+                value.results[index] = result.*;
+                value.results[index].render_elapsed_ns +|= elapsed;
+                result.rendered = null;
+            }
+            inline for (.{ "peak_launched_workers", "peak_parallelism", "peak_admitted_pixels", "peak_admitted_bytes", "peak_worker_scratch_bytes" }) |field|
+                @field(value, field) = @max(@field(value, field), @field(replacement, field));
+            value.thread_spawn_fallbacks +|= replacement.thread_spawn_fallbacks;
+        },
+    }
+    return batch;
 }
 
-test "PDF render scratch retry admits delta and releases first attempt before replay" {
+test "PDF render scratch retry admits delta and preserves completed results" {
     const Fake = struct {
         lease: *PdfWindowCompositeLease,
         calls: usize = 0,
@@ -13808,8 +13852,9 @@ test "PDF render scratch retry admits delta and releases first attempt before re
         persistent_failure: bool,
         throw_on_retry: bool = false,
 
-        fn run(self: *@This(), alloc: Allocator, options: document_extraction_mod.PdfPageRenderBatchOptions) !RuntimePdfRenderBatch {
-            try std.testing.expectEqual(@as(usize, 0), self.lease.output_limit.liveBytes());
+        fn run(self: *@This(), alloc: Allocator, options: document_extraction_mod.PdfPageRenderBatchOptions, indices: ?[]const usize) !RuntimePdfRenderBatch {
+            if (self.calls == 0) try std.testing.expectEqual(@as(usize, 0), self.lease.output_limit.liveBytes());
+            if (indices) |items| try std.testing.expectEqualSlices(usize, &.{0}, items);
             try std.testing.expectEqual(self.lease.scratchBytesPerWindow(), options.max_inflight_bytes);
             try std.testing.expectEqual(@as(usize, 4096), options.max_retained_raster_bytes);
             self.calls += 1;
@@ -13821,11 +13866,18 @@ test "PDF render scratch retry admits delta and releases first attempt before re
                 if (self.raster == (tag == .raster)) {
                     const Batch = @FieldType(RuntimePdfRenderBatch, @tagName(tag));
                     const Result = std.meta.Child(@FieldType(Batch, "results"));
-                    const results = try alloc.alloc(Result, 1);
+                    const results = try alloc.alloc(Result, if (indices == null) 2 else 1);
+                    errdefer alloc.free(results);
                     results[0] = .{
                         .page_number = 7,
                         .failure = if (self.calls == 1 or self.persistent_failure) error.RenderWorkerMemoryLimitExceeded else null,
                     };
+                    if (indices == null) {
+                        results[1] = .{ .page_number = 8, .rendered = if (tag == .raster)
+                            .{ .bytes = try alloc.dupe(u8, "keep"), .pixel_format = .rgba8, .width = 1, .height = 1, .stride = 4, .requested_dpi = 150, .effective_dpi = 150 }
+                        else
+                            .{ .png = try alloc.dupe(u8, "keep"), .width = 1, .height = 1, .requested_dpi = 150, .effective_dpi = 150 } };
+                    }
                     return @unionInit(RuntimePdfRenderBatch, @tagName(tag), .{
                         .results = results,
                         .requested_parallelism = options.max_parallel_pages,
@@ -13865,6 +13917,10 @@ test "PDF render scratch retry admits delta and releases first attempt before re
                 switch (batch) {
                     inline else => |value| {
                         try std.testing.expectEqual(@as(usize, 7), value.results[0].page_number);
+                        try std.testing.expectEqual(@as(usize, 2), value.results.len);
+                        try std.testing.expectEqual(@as(usize, 8), value.results[1].page_number);
+                        const preserved = value.results[1].rendered.?;
+                        try std.testing.expectEqualStrings("keep", if (@hasField(@TypeOf(preserved), "bytes")) preserved.bytes else preserved.png);
                         try std.testing.expectEqual(scenario == 1 or scenario == 2, value.results[0].failure != null);
                     },
                 }
@@ -13972,6 +14028,7 @@ fn renderRuntimePdfWindow(
             .page_number = unit.page_number orelse 1,
             .requested_dpi = config.ocr_render_dpi,
             .max_pixels = @min(@min(config.ocr_max_rendered_pixels, dimension_pixels), batch_policy.max_pixels),
+            .resolution_policy = config.ocr_render_resolution,
             .max_dimension = config.ocr_max_rendered_dimension,
             .preferred_width = batch_policy.preferred_image_width,
             .preferred_height = batch_policy.preferred_image_height,
@@ -13980,7 +14037,7 @@ fn renderRuntimePdfWindow(
             else
                 maximum_pdf_page_inline_png_bytes,
             .min_output_dimension = minimum_pdf_page_render_dimension,
-            .max_output_attempts = maximum_pdf_page_render_attempts,
+            .max_output_attempts = if (config.ocr_render_resolution == .requested_dpi) 1 else maximum_pdf_page_render_attempts,
         });
         try unit_indices.append(alloc, idx);
     }
@@ -14116,6 +14173,7 @@ fn renderRuntimePdfWindow(
                     candidate_parallel_pages,
                     document_extraction_mod.default_pdf_render_bytes_per_pixel_reserve,
                 );
+                if (candidate_parallel_pages == 1) required_scratch_bytes = @min(required_scratch_bytes, max_inflight_bytes);
                 if (required_scratch_bytes <= max_inflight_bytes) break;
             }
             if (candidate_parallel_pages == 0) {
@@ -20271,7 +20329,7 @@ fn appendFullTextDeleteDocumentToWindow(
     });
 }
 
-const pdf_page_embedding_identity_version = "antfly-pdf-page-embedding-v3";
+const pdf_page_embedding_identity_version = "antfly-pdf-page-embedding-v4";
 
 fn updatePdfPageEmbeddingHashInt(hasher: *std.hash.XxHash64, comptime T: type, value: T) void {
     var encoded: [@sizeOf(T)]u8 = undefined;
@@ -20301,6 +20359,7 @@ fn pdfPageEmbeddingSourceHash(
     hasher.update(content_sha256);
     updatePdfPageEmbeddingHashInt(&hasher, u64, @intCast(page_number));
     updatePdfPageEmbeddingHashInt(&hasher, u16, render_config.ocr_render_dpi);
+    updatePdfPageEmbeddingHashInt(&hasher, u8, @intFromEnum(render_config.ocr_render_resolution));
     updatePdfPageEmbeddingHashInt(&hasher, u64, render_config.ocr_max_rendered_pixels);
     updatePdfPageEmbeddingHashInt(&hasher, u32, render_config.ocr_max_rendered_dimension);
     updatePdfPageEmbeddingHashInt(&hasher, u64, render_config.pdf_render_max_inflight_pixels);
@@ -20473,13 +20532,14 @@ const PdfEmbeddingWindowPreparer = struct {
         for (requests, 0..) |*page_request, i| page_request.* = .{
             .page_number = self.pending_pages[first_item + i],
             .requested_dpi = self.render_config.ocr_render_dpi,
+            .resolution_policy = self.render_config.ocr_render_resolution,
             .max_pixels = @min(self.render_config.ocr_max_rendered_pixels, model_pixel_cap),
             .max_dimension = self.render_config.ocr_max_rendered_dimension,
             .preferred_width = if (self.capabilities.image_transform) |transform| transform.target_width else null,
             .preferred_height = if (self.capabilities.image_transform) |transform| transform.target_height else null,
             .max_output_bytes = null,
             .min_output_dimension = minimum_dimension,
-            .max_output_attempts = maximum_pdf_page_render_attempts,
+            .max_output_attempts = if (self.render_config.ocr_render_resolution == .requested_dpi) 1 else maximum_pdf_page_render_attempts,
         };
         const prepared_plans = try concurrent_alloc.alloc(
             document_extraction_mod.PreparedPdfPageRenderPlan,
@@ -20543,6 +20603,7 @@ const PdfEmbeddingWindowPreparer = struct {
                     candidate_parallel_pages,
                     document_extraction_mod.default_pdf_render_bytes_per_pixel_reserve,
                 );
+                if (candidate_parallel_pages == 1) required_scratch_bytes = @min(required_scratch_bytes, available_bytes);
                 if (required_scratch_bytes <= available_bytes) break;
             }
             if (candidate_parallel_pages == 0) {
@@ -22787,7 +22848,7 @@ fn documentExtractionFingerprintFromDigestAlloc(
     content_digest: *const [std.crypto.hash.sha2.Sha256.digest_length]u8,
 ) ![]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("antfly.document-extraction.fingerprint.v2\x00");
+    hasher.update("antfly.document-extraction.fingerprint.v3\x00");
     hasher.update(source_identity);
     for ([_][]const u8{ config_json, configured_content_type, configured_filename, downloaded_content_type }) |field| {
         var size: [8]u8 = undefined;

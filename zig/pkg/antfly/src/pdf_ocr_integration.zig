@@ -227,8 +227,8 @@ pub fn main(init: std.process.Init) !void {
     defer session.deinit();
     try session.prepareForBatchRendering();
     var rendered = try session.renderPagesBatchAlloc(alloc, &.{
-        .{ .page_number = 1, .max_output_bytes = 4 * 1024 * 1024 },
-        .{ .page_number = 2, .max_output_bytes = 4 * 1024 * 1024 },
+        .{ .page_number = 1, .max_pixels = 1024 * 1024, .max_output_bytes = 4 * 1024 * 1024 },
+        .{ .page_number = 2, .max_pixels = 1024 * 1024, .max_output_bytes = 4 * 1024 * 1024 },
     }, .{
         .max_batch_pages = 2,
         .max_parallel_pages = 1,
@@ -330,8 +330,8 @@ fn runRealModelQualification(alloc: std.mem.Allocator, client: *httpx.Client) !v
     defer session.deinit();
     try session.prepareForBatchRendering();
     var rendered = try session.renderPagesBatchAlloc(alloc, &.{
-        .{ .page_number = 1, .max_output_bytes = 8 * 1024 * 1024 },
-        .{ .page_number = 2, .max_output_bytes = 8 * 1024 * 1024 },
+        .{ .page_number = 1, .max_pixels = 2 * 1024 * 1024, .max_output_bytes = 8 * 1024 * 1024 },
+        .{ .page_number = 2, .max_pixels = 2 * 1024 * 1024, .max_output_bytes = 8 * 1024 * 1024 },
     }, .{
         .max_batch_pages = 2,
         .max_parallel_pages = 1,

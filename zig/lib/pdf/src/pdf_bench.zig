@@ -40,7 +40,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, subcommand, "render-window")) {
         const path = args.next() orelse return BenchError.InvalidArguments;
-        const dimension = try parseIterations(args.next(), 768);
+        const dimension = try parseIterations(args.next(), 0);
         try benchRenderWindow(alloc, path, dimension, try parseIterations(args.next(), 0));
         return;
     }
@@ -108,7 +108,7 @@ fn printUsage(argv0: []const u8) void {
         \\  {s} extract-text <pdf-path> [iterations]
         \\  {s} render-first-page <pdf-path> [iterations]
         \\  {s} render-pages <pdf-path> [dpi]
-        \\  {s} render-window <pdf-path> [model-image-dimension] [scratch-bytes (0=estimate)]
+        \\  {s} render-window <pdf-path> [model-image-dimension (0=requested DPI)] [scratch-bytes (0=estimate)]
         \\  {s} dump-text <pdf-path> <output-path>
         \\
     , .{ argv0, argv0, argv0, argv0, argv0, argv0 });
@@ -125,8 +125,9 @@ fn benchRenderWindow(alloc: std.mem.Allocator, path: []const u8, dimension: usiz
     defer parsed.deinit();
     const plan = try pdf.prepareAdmittedPageRenderPlan(&parsed, .{
         .page_number = 1,
-        .preferred_width = @intCast(dimension),
-        .preferred_height = @intCast(dimension),
+        .preferred_width = if (dimension == 0) null else @intCast(dimension),
+        .preferred_height = if (dimension == 0) null else @intCast(dimension),
+        .resolution_policy = if (dimension == 0) .requested_dpi else .model_input,
     }, .{ .max_inflight_bytes = 256 * 1024 * 1024 }, .raster);
     const scratch = if (scratch_override > 0) scratch_override else try pdf.estimatePreparedPageRenderWaveScratchBytes(&parsed, &.{plan}, 1, pdf.default_render_bytes_per_pixel_reserve);
     const output = plan.geometry().pixels * 4;
@@ -137,6 +138,7 @@ fn benchRenderWindow(alloc: std.mem.Allocator, path: []const u8, dimension: usiz
             return .{ .peak_parallelism = 1 };
         }
     };
+    const started = monotonicNowNs();
     var batch = try pdf.renderPreparedPagesRasterBatchAlloc(alloc, &parsed, &.{plan}, .{
         .max_inflight_bytes = scratch,
         .max_retained_raster_bytes = @intCast(output),
@@ -146,7 +148,7 @@ fn benchRenderWindow(alloc: std.mem.Allocator, path: []const u8, dimension: usiz
     });
     defer batch.deinit(alloc);
     if (batch.results[0].failure) |err| return err;
-    std.debug.print("render-window bytes={d} quality={s}\n", .{ batch.results[0].rendered.?.bytes.len, @tagName(batch.results[0].rendered.?.quality) });
+    std.debug.print("render-window bytes={d} quality={s} elapsed_ms={d:.3} scratch_admitted={d} worker_scratch_peak={d}\n", .{ batch.results[0].rendered.?.bytes.len, @tagName(batch.results[0].rendered.?.quality), @as(f64, @floatFromInt(monotonicNowNs() - started)) / std.time.ns_per_ms, batch.peak_admitted_bytes, batch.peak_worker_scratch_bytes });
 }
 
 fn parseIterations(maybe_value: ?[]const u8, default_value: usize) !usize {

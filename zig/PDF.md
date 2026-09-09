@@ -10,6 +10,58 @@ JPEG-to-CHW writes, prepared tokenizer inputs, lease-renewed and
 transaction-fenced attempt storage, and bounded concurrent proxy partitions
 are also implemented.
 
+## Quality-preserving rendering and scratch admission
+
+`ocr.render_resolution` defaults to `"requested_dpi"`: render at `render_dpi`
+subject to the declared spatial caps, then apply the model's preprocessing.
+The explicit `"model_input"` policy permits direct rendering near the model's
+preferred input dimensions. It is an opt-in quality/performance tradeoff, not
+an automatic consequence of resolving model capabilities. Rasterizing text at
+low DPI is not equivalent to high-DPI rasterization followed by resampling.
+The same policy applies to page-image embedding and OCR generators/readers.
+
+Aggregate pixel pressure shortens windows; scratch pressure reduces renderer
+concurrency. Neither changes the prepared page geometry. Insufficient
+single-page admission is an explicit failure. Under `requested_dpi`, encoded
+output limits cannot trigger repeated render/downscale attempts. Spatial caps
+and provider input limits remain explicit constraints on admissible geometry.
+
+Render lanes use private freeing size-class slabs with immediate slot reuse,
+not a debug allocator. Backing pages, including cached empty pages, are charged
+to the hard scratch grant. Idle slabs/pages are evicted before allocation
+failure; all lane memory is released after joined execution. Small scanner
+allocations therefore avoid repeated system mappings and allocator quarantine
+fragmentation without sharing mutable PDF readers across threads.
+
+An underestimated window may request one non-blocking resource-manager grant
+up to its configured scratch ceiling while the page is still rendering. The
+callback cannot reclaim memory or wait for another invocation's grant. Workers
+share one atomic byte budget and serialize this growth operation. Output and
+model reservations remain live throughout. If a larger grant requires a
+replay, only failed page identities are retried, serially, under the original
+deadline; completed page buffers are preserved. A single page that already
+failed after growth is not replayed with the same grant.
+
+Each prepared document records a measured per-worker scratch high-water hint,
+including allocator backing and content-dependent font/path work, with 12.5%
+headroom for subsequent windows. Hints affect reservations only, never quality,
+and remain subordinate to the node's hard limit. They are document-local and
+do not create an unbounded global cache.
+
+Resolution policy participates in shared-transform and page-embedding
+identities. Document metadata/content fingerprint domains and page-embedding
+identity versions are advanced so pre-policy completed artifacts cannot pass
+the normal unchanged-source checks on subsequent processing. This does not
+automatically schedule a cluster-wide reindex.
+
+Validation requires equivalent page text and geometry, bounded memory,
+per-item ownership/cancellation tests, and paired end-to-end measurements.
+Use `scripts/bench/pdf/compare.py` to alternate frozen baseline/candidate
+processes. Separate `auto` and `always` OCR, and sweep `--reader-batch-size`
+1/2/4/8 independently of renderer concurrency. Keep failed or unequal-output
+runs in the report; never turn them into speedup claims. The renderer-only
+`render-window` diagnostic accepts dimension `0` for requested-DPI rendering.
+
 This document describes how Antfly turns documents into bounded inference work.
 PDF extraction, page rendering, OCR, generation, and embedding share document
 preparation, media transport, scheduling, admission, identity, and failure
