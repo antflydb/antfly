@@ -228,8 +228,8 @@ validation, and error behavior aligned with the product API.
 ## Verification
 
 - `zig build lib-mcp-test`
-- `zig build raft-transport-test`
-- `zig build lib-api-auth-test`
+- `zig build antfly-raft-transport-test`
+- `zig build antfly-api-auth-test`
 - `zig build root-test -- --test-filter "api http server serves fielded full-text search through mcp tools"`
 
 The API auth test bucket includes HTTP-level coverage for MCP initialize. It also covers MCP session response headers

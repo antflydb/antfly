@@ -91,12 +91,12 @@ const BenchResult = struct {
     reranked_vectors: u64,
 };
 
-pub fn main(init: std.process.Init) !void {
+pub fn run(_: std.process.Init, args: *std.process.Args.Iterator) !void {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
     const alloc = gpa_state.allocator();
 
-    const cfg = try parseArgs(init.minimal.args);
+    const cfg = try parseArgs(args);
     const dataset = try makeDataset(alloc, cfg);
     defer alloc.free(dataset);
     const queries = try makeQueries(alloc, dataset, cfg);
@@ -131,25 +131,23 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-fn parseArgs(args_in: std.process.Args) !BenchConfig {
+fn parseArgs(args: *std.process.Args.Iterator) !BenchConfig {
     var cfg = BenchConfig{};
-    var args = std.process.Args.Iterator.init(args_in);
-    _ = args.skip();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--docs")) {
-            cfg.docs = try parseNextUsize(&args, "--docs");
+            cfg.docs = try parseNextUsize(args, "--docs");
         } else if (std.mem.eql(u8, arg, "--dims")) {
-            cfg.dims = try parseNextUsize(&args, "--dims");
+            cfg.dims = try parseNextUsize(args, "--dims");
         } else if (std.mem.eql(u8, arg, "--queries")) {
-            cfg.queries = try parseNextUsize(&args, "--queries");
+            cfg.queries = try parseNextUsize(args, "--queries");
         } else if (std.mem.eql(u8, arg, "--k")) {
-            cfg.k = try parseNextUsize(&args, "--k");
+            cfg.k = try parseNextUsize(args, "--k");
         } else if (std.mem.eql(u8, arg, "--search-repeats")) {
-            cfg.search_repeats = try parseNextUsize(&args, "--search-repeats");
+            cfg.search_repeats = try parseNextUsize(args, "--search-repeats");
         } else if (std.mem.eql(u8, arg, "--warm-queries")) {
-            cfg.warm_queries = try parseNextUsize(&args, "--warm-queries");
+            cfg.warm_queries = try parseNextUsize(args, "--warm-queries");
         } else if (std.mem.eql(u8, arg, "--seed")) {
-            cfg.seed = try parseNextU64(&args, "--seed");
+            cfg.seed = try parseNextU64(args, "--seed");
         } else if (std.mem.eql(u8, arg, "--compare-hilbert")) {
             cfg.compare_hilbert = true;
         } else if (std.mem.eql(u8, arg, "--disable-reranking")) {

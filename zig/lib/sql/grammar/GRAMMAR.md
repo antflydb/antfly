@@ -201,7 +201,7 @@ Generator choices should be measured.
 - Compile parse tables into the binary; do not load grammar files at runtime.
 - Avoid production double-parsing except for explicit migration/debug paths.
 
-Use `zig build sql-parser-bench -- <iterations>` for the pre-tokenized parser
+Use `zig build lib-sql-parser-bench && ./zig-out/bin/lib-sql-parser-bench <iterations>` for the pre-tokenized parser
 hot path, or add `--mode all` to measure both parsing and end-to-end lexing plus
 parsing. The benchmark runs optimized code and emits one JSON object per mode
 with throughput, latency percentiles, allocation totals, peak live bytes, and

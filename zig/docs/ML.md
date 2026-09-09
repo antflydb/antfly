@@ -147,7 +147,7 @@ cd zig
 zig build lib-ml-tabular-test
 
 zig build inference-test -Dmetal=false     # registry + HTTP handlers
-zig build fuzz-tabular-loader              # loader fuzz target
+zig build lib-ml-tabular-fuzz-test              # loader fuzz target
 ```
 
 ## What's wired today
@@ -162,7 +162,7 @@ Engine layer (`lib/ml/tabular/`) — **complete and tested.**
 - Converter modules (XGBoost JSON, LightGBM text, native-Zig ONNX-ML
   parser with inline protobuf reader, auto-detect)
 - Top-level build wiring (`ml_tabular` module, `lib-ml-tabular-test` step,
-  `fuzz-tabular-loader` step)
+  `lib-ml-tabular-fuzz-test` step)
 
 Service layer (`pkg/inference/src/tabular/`) — **fully wired, tested end-to-end.**
 - `registry.zig` — TTL-based eviction + atomic ref-count + orphan-on-evict;
@@ -181,7 +181,7 @@ End-to-end coverage:
 - `zig build lib-ml-tabular-test` — IR / loader / scalar+SIMD tree /
   linear / SVM / preprocessing / optimiser / converter tests
 - `zig build inference-test` — registry, http handler logic, name allowlist
-- `zig build fuzz-tabular-loader` — loader fuzz target
+- `zig build lib-ml-tabular-fuzz-test` — loader fuzz target
 - `e2e/inference/test_tabular.py` — Python pytest suite that spins up a
   real `antfly inference run`, runs the iris classifier end-to-end, and
   converts + predicts tiny XGBoost / LightGBM fixtures, plus an ONNX-ML

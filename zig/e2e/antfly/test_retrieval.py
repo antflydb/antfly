@@ -1292,6 +1292,9 @@ def test_retrieval_agent_streaming_fallback_progress(backup_api):
 
     body = response.text
     assert response.headers["Content-Type"].startswith("text/event-stream")
+    # The fixture requests closure. Advertising keep-alive here lets the next
+    # request reuse the retiring stream socket and race table cleanup.
+    assert response.headers["Connection"].lower() == "close"
     assert "event: step_progress" in body
     assert '"phase":"evaluate"' in body
     assert '"selection_source":"evaluation"' in body

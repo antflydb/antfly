@@ -63,17 +63,17 @@ data structure, not elapsed wall-clock time.
    - No simulation campaigns by default.
    - Simulation smoke coverage belongs in focused `*-sim-test` steps until the
      harnesses have TigerBeetle-style virtual time and bounded tick budgets.
-   - Broad unit coverage belongs in focused `unit-test` buckets, not in one
+   - Broad unit coverage belongs in focused `antfly-unit-test` buckets, not in one
      monolithic root-module run that can hit the test runner response timeout.
 
-2. `sim-test`
+2. `antfly-sim-test`
    - Mocked-time simulation scenarios only.
    - Uses virtual time and deterministic transport.
    - Does not run real HTTP listener/client forwarding scenarios.
    - Does not run storage workload simulations that still exercise real LMDB/WAL
      I/O instead of modeled I/O.
 
-3. `chaos-test`
+3. `antfly-chaos-test`
    - Longer fault campaigns: partitions, restarts, delayed delivery, and
      liveness recovery.
    - Still deterministic and replayable.
@@ -81,11 +81,11 @@ data structure, not elapsed wall-clock time.
 4. Real network integration tests
    - Keep direct std HTTP listener/executor coverage focused and small.
    - Do not use real sleeps to simulate latency in unit-style simulation tests.
-   - Run through `integration-test` or narrower focused steps, not `sim-test`.
+   - Run through `antfly-integration-test` or narrower focused steps, not `antfly-sim-test`.
 
 5. Real storage workload simulations
    - Keep deterministic seed/replay behavior.
-   - Run through `storage-sim-test` or narrower focused steps until they have a
+   - Run through `antfly-storage-sim-test` or narrower focused steps until they have a
      modeled storage scheduler and virtual I/O.
    - Longer storage campaigns stay in `storage-sim-soak`.
 
@@ -98,7 +98,7 @@ data structure, not elapsed wall-clock time.
 
 2. Add simulator controls to the test runner.
    - Allow `root-test` to skip known slow chaos scenarios by default.
-   - Keep the skipped scenarios reachable through `chaos-test` and explicit
+   - Keep the skipped scenarios reachable through `antfly-chaos-test` and explicit
      filters.
 
 3. Introduce a virtual transport queue.
@@ -121,8 +121,8 @@ data structure, not elapsed wall-clock time.
    - Store minimal failing state in logs, not large generated fixtures.
 
 7. Classify existing simulation tests.
-   - Fast deterministic: stays in `sim-test` and may be part of `unit-test`.
-   - Long chaos/liveness: moves to `chaos-test`.
+   - Fast deterministic: stays in `antfly-sim-test` and may be part of `antfly-unit-test`.
+   - Long chaos/liveness: moves to `antfly-chaos-test`.
    - Real I/O integration: gets a focused integration step.
 
 ## Immediate Fix
@@ -146,14 +146,14 @@ Implemented now:
   `recall-harness` rather than the default unit path.
 - `root-test` defaults to root-module compile smoke filters instead of compiling
   and running every test reachable from `root.zig`.
-- `sim-test` owns only fast mocked-time simulation steps. At the moment that
-  means the narrowed `lib-raft-sim-test` virtual-time smoke/invariant bucket
-  and `lib-metadata-sim-smoke-test`, which runs a small metadata virtual Raft
-  transport smoke set. It now also depends on `storage-vopr-test`, so modeled
+- `antfly-sim-test` owns only fast mocked-time simulation steps. At the moment that
+  means the narrowed `antfly-raft-sim-test` virtual-time smoke/invariant bucket
+  and `antfly-metadata-sim-smoke-test`, which runs a small metadata virtual Raft
+  transport smoke set. It now also depends on `antfly-storage-vopr-test`, so modeled
   storage I/O coverage is part of the default fast sim bucket.
-- `lib-raft-sim-test` is narrowed to quick deterministic Raft smoke/invariant
+- `antfly-raft-sim-test` is narrowed to quick deterministic Raft smoke/invariant
   scenarios; longer restart, real-HTTP, and multi-transition Raft campaigns are
-  reachable through `lib-raft-chaos-test` and `chaos-test`.
+  reachable through `antfly-raft-chaos-test` and `antfly-chaos-test`.
 - `go/pkg/antfly/lib/raft` runtime scheduling now exposes explicit virtual time:
   `Scheduler.advanceVirtualTime`, `MultiRaft.virtualRound`, and
   `MultiRaft.virtualTimeMs`. `runRound` advances this mocked time and passes it
@@ -161,14 +161,14 @@ Implemented now:
 - The standard HTTP listener shutdown path wakes the accept loop before closing
   the listening socket, avoiding debug `BADF` panics during focused real-HTTP
   tests.
-- `integration-test` owns the focused real HTTP metadata/public API suites that
+- `antfly-integration-test` owns the focused real HTTP metadata/public API suites that
   are not deterministic VOPR-style simulations yet.
-- `lib-metadata-sim-core-test` owns the full deterministic metadata
+- `antfly-metadata-sim-core-test` owns the full deterministic metadata
   virtual-transport scenario set. It is no longer real network backed, but it is
-  still too broad for the default `sim-test` runtime budget.
-- `storage-sim-test` owns the deterministic storage workload simulations that
+  still too broad for the default `antfly-sim-test` runtime budget.
+- `antfly-storage-sim-test` owns the deterministic storage workload simulations that
   still use real storage I/O.
-- `unit-test-progress` no longer runs the core metadata real-HTTP sim bucket.
+- `antfly-unit-test -Dtest-progress=true` labels the ordinary unit suite; core metadata real-HTTP simulations remain in the simulation suite.
 - The metadata cluster harness now injects a `VirtualHttpNetwork` into each
   simulated Raft node. Raft frames still go through the HTTP codec/server route,
   but delivery is in-process through `sim://raft-node/<id>` endpoints instead
@@ -188,16 +188,16 @@ Implemented now:
 - Raft frame sends now carry `source_id` through the frame driver and HTTP
   request, so the virtual network can model directed source-to-target link
   partitions without inferring source nodes from target URIs.
-- `lib-metadata-vopr-test` now runs a seeded metadata VOPR campaign over the
+- `antfly-metadata-vopr-test` now runs a seeded metadata VOPR campaign over the
   virtual HTTP/Raft transport. Each seed generates deterministic transport
   faults, restarts, heals the cluster for a liveness phase, creates table
   topology, drives a split intent through the control loop, and prints seed,
   operation index, action, and replay command on failure.
-- `lib-metadata-vopr-chaos-test` runs the expanded metadata VOPR generated
-  workload behind `chaos-test`, including table lifecycle, merge, placement
+- `antfly-metadata-vopr-chaos-test` runs the expanded metadata VOPR generated
+  workload behind `antfly-chaos-test`, including table lifecycle, merge, placement
   churn, topology updates, multi-operation partitions, and leader restart
   during split.
-- `sim-test` includes the fast metadata VOPR campaign alongside metadata smoke,
+- `antfly-sim-test` includes the fast metadata VOPR campaign alongside metadata smoke,
   Raft sim, and modeled storage VOPR coverage.
 - The metadata cluster harness now has metadata-aware `runUntil` and
   `assertProgress` helpers. The common metadata leader/status wait helpers use
@@ -232,8 +232,8 @@ Implemented now:
   - [x] Generate store/node topology changes.
   - [x] Inject leader restart during a transition.
   - [x] Support multi-operation partitions with explicit heal operations.
-- [x] Move longer metadata VOPR/chaos campaigns behind `chaos-test`, keeping
-  `sim-test` bounded and replayable.
+- [x] Move longer metadata VOPR/chaos campaigns behind `antfly-chaos-test`, keeping
+  `antfly-sim-test` bounded and replayable.
 
 ## Storage Modeled I/O Plan
 
@@ -244,7 +244,7 @@ promotion, and LMDB/WAL/persistent/index-manager/DB-split workflow details, use
 The storage sims are currently deterministic workload generators running
 against real storage implementations. They use real files, real LMDB/WAL paths,
 real async commit backends, and some real sleeps/backoff. They should stay in
-`storage-sim-test` until their I/O substrate is modeled.
+`antfly-storage-sim-test` until their I/O substrate is modeled.
 
 ### Storage VOPR Task List
 
@@ -253,7 +253,7 @@ real async commit backends, and some real sleeps/backoff. They should stay in
 - [x] Add a modeled in-memory storage device with explicit volatile/durable
   state and crash behavior.
 - [x] Add focused build targets for modeled storage work:
-  `storage-sim-runtime-test`, `wal-vopr-test`, and `storage-vopr-test`.
+  `antfly-storage-sim-runtime-test`, `wal-vopr-test`, and `antfly-storage-vopr-test`.
 - [x] Inject a virtual clock into WAL without changing production defaults.
 - [x] Prove WAL group-commit coalescing can advance modeled time instead of
   sleeping the host.
@@ -266,7 +266,7 @@ real async commit backends, and some real sleeps/backoff. They should stay in
 - [x] Add WAL modeled replay/crash runners that reuse the existing action
   vocabulary on virtual storage.
 - [x] Add a fast deterministic WAL modeled-storage VOPR campaign to
-  `storage-vopr-test`.
+  `antfly-storage-vopr-test`.
 - [x] Add a WAL commit-completion scheduler seam so modeled tests advance
   completion delays through the virtual runtime event queue.
 - [x] Run existing WAL replay fixtures against modeled LSM storage and virtual
@@ -304,12 +304,12 @@ real async commit backends, and some real sleeps/backoff. They should stay in
     - [x] Full-text persistent segment storage now covers segment write fault,
       catalog sync fault, post-catalog-publish crash/reopen, and old segment
       cleanup fault with a modeled device.
-  - [x] Keep a fast seeded compaction smoke in `sim-test` and longer randomized
-    compaction campaigns in `chaos-test`.
-    - [x] Fast seeded compaction smoke is covered by `storage-vopr-test` through
+  - [x] Keep a fast seeded compaction smoke in `antfly-sim-test` and longer randomized
+    compaction campaigns in `antfly-chaos-test`.
+    - [x] Fast seeded compaction smoke is covered by `antfly-storage-vopr-test` through
       the existing LSM backend simulation target.
     - [x] Longer randomized LSM compaction campaigns are wired into
-      `chaos-test`.
+      `antfly-chaos-test`.
 
 1. Add `StorageSimRuntime`
    - Own virtual time, deterministic RNG, an event queue, and the fault schedule.
@@ -355,11 +355,11 @@ real async commit backends, and some real sleeps/backoff. They should stay in
    - Move LSM after the device API can model block/cache/storage I/O.
 
 7. Keep test buckets honest
-   - `sim-test`: fast mocked-time/model-I/O smoke and invariant checks.
-   - `storage-sim-test`: legacy deterministic but real-I/O storage workload
+   - `antfly-sim-test`: fast mocked-time/model-I/O smoke and invariant checks.
+   - `antfly-storage-sim-test`: legacy deterministic but real-I/O storage workload
      sims kept out of the default fast sim bucket.
-   - `storage-vopr-test`: modeled-I/O randomized and smoke campaigns included
-     by `sim-test`.
+   - `antfly-storage-vopr-test`: modeled-I/O randomized and smoke campaigns included
+     by `antfly-sim-test`.
    - `storage-sim-soak`: longer real or modeled campaigns, never default.
 
 8. Add compaction VOPR coverage
@@ -380,10 +380,10 @@ real async commit backends, and some real sleeps/backoff. They should stay in
      publish, after publish but before old segment cleanup, during cleanup, and
      during reopen. Recovery must never expose both old and new versions as
      live, lose acknowledged data, or resurrect deleted documents.
-   - Fast coverage belongs in `storage-vopr-test`/`sim-test` with small seeds and
+   - Fast coverage belongs in `antfly-storage-vopr-test`/`antfly-sim-test` with small seeds and
      bounded operation counts. Larger generated compaction campaigns, aggressive
      fault matrices, and multi-level full-text segment churn belong in
-     `chaos-test`.
+     `antfly-chaos-test`.
 
 The design rule is that simulation time and persistence must be data in the
 harness, not effects of the host OS. Once WAL has this seam, the rest of the

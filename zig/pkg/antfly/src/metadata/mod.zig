@@ -138,6 +138,7 @@ pub const TransitionStepResult = transition_driver.StepResult;
 pub const TransitionDriver = transition_driver.TransitionDriver;
 
 test "metadata module compiles" {
+    _ = runtime_status_protocol;
     _ = storage;
     _ = runtime;
     _ = api;

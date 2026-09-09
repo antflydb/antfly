@@ -26,7 +26,9 @@ fn validateExpectedErrorLogs(filter: []const u8, count_value: []const u8) error{
 }
 
 fn isTestControl(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, "--test-filter") or
+    return std.mem.eql(u8, arg, "--list-tests") or
+        std.mem.eql(u8, arg, "--allow-empty-test-filter") or
+        std.mem.eql(u8, arg, "--test-filter") or
         std.mem.startsWith(u8, arg, "--test-filter=") or
         std.mem.eql(u8, arg, "--skip-test-filter") or
         std.mem.startsWith(u8, arg, "--skip-test-filter=") or
@@ -85,7 +87,9 @@ pub fn select(
             validateExpectedErrorLogs(args[i + 1], args[i + 2]) catch
                 @panic("invalid --expect-error-logs test filter or count");
             i += 2;
-        } else if (std.mem.startsWith(u8, arg, "--seed=") or
+        } else if (std.mem.eql(u8, arg, "--list-tests") or
+            std.mem.eql(u8, arg, "--allow-empty-test-filter") or
+            std.mem.startsWith(u8, arg, "--seed=") or
             std.mem.startsWith(u8, arg, "--cache-dir=") or
             std.mem.eql(u8, arg, "--listen=-"))
         {
@@ -142,7 +146,9 @@ pub fn addRuntimeControls(
                 @panic("invalid --expect-error-logs test filter or count");
             run.addArgs(args[i .. i + 3]);
             i += 2;
-        } else if (std.mem.startsWith(u8, arg, "--seed=") or
+        } else if (std.mem.eql(u8, arg, "--list-tests") or
+            std.mem.eql(u8, arg, "--allow-empty-test-filter") or
+            std.mem.startsWith(u8, arg, "--seed=") or
             std.mem.startsWith(u8, arg, "--cache-dir=") or
             std.mem.eql(u8, arg, "--listen=-"))
         {
@@ -255,4 +261,11 @@ test "expected error log controls require a named test and positive exact count"
         error.InvalidExpectedErrorLogCount,
         validateExpectedErrorLogs("expected failure path", "many"),
     );
+}
+
+test "list mode preserves an independently requested runtime selection" {
+    const filters = select(std.testing.allocator, &.{ "--list-tests", "--test-filter", "cutover" }, &.{"suite"});
+    defer std.testing.allocator.free(filters);
+    try std.testing.expectEqual(@as(usize, 1), filters.len);
+    try std.testing.expectEqualStrings("cutover", filters[0]);
 }

@@ -1,16 +1,16 @@
 // Copyright 2026 Antfly, Inc.
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 const std = @import("std");
 
@@ -26,9 +26,9 @@ const default_roots = [_][]const u8{
     "pkg/antfly/src/storage/db",
 };
 
-pub fn main(init: std.process.Init) !void {
-    const alloc = init.gpa;
-    const io = init.io;
+test "algebraic planner owns production tensor construction" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
     var violations = std.ArrayListUnmanaged(Violation).empty;
     defer {
         for (violations.items) |violation| {
@@ -38,21 +38,8 @@ pub fn main(init: std.process.Init) !void {
         violations.deinit(alloc);
     }
 
-    var args = std.process.Args.Iterator.init(init.minimal.args);
-    _ = args.skip();
-    var scanned_roots: usize = 0;
-    while (args.next()) |root| {
+    for (default_roots) |root| {
         try scanRoot(alloc, io, root, &violations);
-        scanned_roots += 1;
-    }
-    if (scanned_roots == 0) {
-        for (default_roots) |root| {
-            try scanRoot(alloc, io, root, &violations);
-            scanned_roots += 1;
-        }
-    } else {
-        // Arguments are interpreted only as roots to keep this guardrail easy
-        // to wire into build steps and CI jobs.
     }
 
     if (violations.items.len > 0) {
@@ -65,8 +52,6 @@ pub fn main(init: std.process.Init) !void {
         }
         return error.AlgebraicPlannerOwnershipViolation;
     }
-
-    std.debug.print("algebraic_planner_ownership_guardrail ok scanned_roots={d}\n", .{scanned_roots});
 }
 
 fn scanRoot(
@@ -133,7 +118,8 @@ fn scanFile(
 
 fn isPlannerOwnedSource(path: []const u8) bool {
     return std.mem.endsWith(u8, path, "pkg/antfly/src/storage/db/algebraic/planner.zig") or
-        std.mem.endsWith(u8, path, "pkg/antfly/src/storage/db/algebraic/ir.zig");
+        std.mem.endsWith(u8, path, "pkg/antfly/src/storage/db/algebraic/ir.zig") or
+        std.mem.endsWith(u8, path, "pkg/antfly/src/storage/db/algebraic/ownership_test.zig");
 }
 
 fn startsTestBlock(trimmed: []const u8) bool {

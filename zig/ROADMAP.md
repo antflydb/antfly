@@ -36,10 +36,10 @@ Use these build targets for the current test split:
 - `make unit-test`
   - focused fast/unit-style buckets, storage, auth, serverless, and other
     non-chaos lanes
-- `zig build sim-test`
+- `zig build antfly-sim-test`
   - deterministic metadata simulation and public parity suites without
     delayed/restart/partition chaos
-- `zig build chaos-test`
+- `zig build antfly-chaos-test`
   - delayed transport, restart, partition, and long-running metadata chaos
     coverage
 - `make test`
