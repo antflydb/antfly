@@ -69,5 +69,13 @@ const workflow_commands = [_]common.CommandSpec{
 };
 
 pub fn register(ctx: common.Context) void {
-    for (workflow_commands) |spec| common.addCommand(ctx, spec);
+    for (workflow_commands) |spec| _ = common.addCommand(ctx, spec);
+}
+
+/// Construct an existing tool without publishing the standalone tool catalog.
+pub fn create(ctx: common.Context, name: []const u8) *@import("std").Build.Step.Run {
+    for (workflow_commands) |spec| {
+        if (@import("std").mem.eql(u8, spec.name, name)) return common.addCommand(ctx, spec);
+    }
+    @panic("unknown inference finetune workflow");
 }

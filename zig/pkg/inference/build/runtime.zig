@@ -184,12 +184,12 @@ pub fn create(config: Config) Graph {
         .target = target,
         .optimize = optimize,
     }).module("jinja");
-    const protobuf_dep = b.dependency("protobuf", .{
+    const protobuf_dep = if (shared.protobuf == null or shared.sentencepiece_proto == null) b.dependency("protobuf", .{
         .target = target,
         .optimize = optimize,
-    });
-    const protobuf_mod = shared.protobuf orelse protobuf_dep.module("protobuf");
-    const sentencepiece_proto_mod = shared.sentencepiece_proto orelse addSentencePieceProtoModule(b, protobuf_dep, paths, config.register_public_modules);
+    }) else null;
+    const protobuf_mod = shared.protobuf orelse protobuf_dep.?.module("protobuf");
+    const sentencepiece_proto_mod = shared.sentencepiece_proto orelse addSentencePieceProtoModule(b, protobuf_dep.?, paths, config.register_public_modules);
     const ml_mod = shared.ml orelse blk: {
         const mod = createSharedModuleNamed(config, "ml", "lib/ml/src/root.zig");
         mod.addImport("antfly_platform", platform_mod);
@@ -393,6 +393,7 @@ pub fn create(config: Config) Graph {
 pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, inference_root: []const u8, link_libc: bool) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
         .name = "antfly-inference",
+        .max_rss = 7 * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = b.path(pathJoin(b, inference_root, "src/main.zig")),
             .target = target,
@@ -404,7 +405,6 @@ pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.Re
     exe.root_module.addImport("structlog", graph.structlog_mod);
     exe.root_module.addImport("antfly_platform", graph.platform_mod);
     exe.root_module.link_libc = link_libc;
-    b.installArtifact(exe);
     return exe;
 }
 
@@ -501,7 +501,7 @@ fn sourceBundleSha256Hex(b: *std.Build, paths: []const []const u8) []const u8 {
     return b.allocator.dupe(u8, &hex) catch @panic("out of memory hashing JIT identity source bundle");
 }
 
-fn addBuildOptions(b: *std.Build, backend: BackendOptions, paths: Paths) *std.Build.Step.Options {
+pub fn addBuildOptions(b: *std.Build, backend: BackendOptions, paths: Paths) *std.Build.Step.Options {
     const options = b.addOptions();
     addCommonOptions(options, backend);
     options.addOption(bool, "enable_ffmpeg_audio", backend.enable_ffmpeg_audio);

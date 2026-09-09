@@ -77,8 +77,17 @@ Run only the inference package tests:
 zig build inference-test
 ```
 
-`inference-test` delegates to `pkg/inference` by running `zig build test` in that
-package with the root build's relevant backend options forwarded.
+`inference-test` uses the same constructors as `zig build test` inside
+`pkg/inference`. Inference and platform checks participate directly in the root
+build graph, so the root scheduler, memory budget, and build runner govern them.
+Root inference targets use the root's resolved backend options and shared modules;
+package-local commands retain the standalone defaults. Runtime arguments follow
+`--`, and package-relative fixtures run with an explicit package working directory.
+
+Root inference installs use `zig/zig-out` (or the root `--prefix`). Package-local
+installs continue to use `pkg/inference/zig-out`. The root default install remains
+Antfly and its assets; constructing inference targets does not build or install
+the standalone inference CLI.
 
 ## Antfly Tiers
 

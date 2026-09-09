@@ -1,0 +1,54 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+const std = @import("std");
+const Context = @import("context.zig").Context;
+const benches = @import("benches.zig");
+const checks = @import("checks.zig");
+const tests = @import("tests.zig");
+const finetune = @import("finetune/common.zig");
+
+pub const Steps = struct {
+    inference_test: *std.Build.Step,
+    inference_finetune_test: *std.Build.Step,
+};
+
+/// The root publishes its supported inference surface, using the same owner
+/// constructors as the standalone package. No package-local step lookup or
+/// nested build process is needed.
+pub fn add(ctx: Context, wasm_jinja: *std.Build.Module, wasm_platform: *std.Build.Module) Steps {
+    _ = @import("commands.zig").addCommands(ctx, false);
+    benches.addPagedAttention(ctx);
+    benches.addTrainingAndLinalg(ctx);
+    benches.addGliner(ctx);
+    benches.addAudio(ctx);
+
+    var finetune_ctx = finetune.fromWorkflow(ctx);
+    finetune_ctx.publish_targets = false;
+    const finetune_step = @import("finetune/tests.zig").addTests(finetune_ctx, "inference-finetune-test");
+    const readiness = @import("finetune/workflows.zig").create(finetune_ctx, "gliner2-entity-training-readiness");
+    ctx.step("gliner2-entity-training-readiness", "Run GLiNER2 entity training readiness").dependOn(&readiness.step);
+
+    const suite = tests.create(ctx);
+    const bge = benches.createBge(ctx).bge_m3_e2e_bench_exe;
+    const bge_tests = ctx.b.addTest(.{ .root_module = bge.root_module });
+    const test_step = tests.addDefault(ctx, suite, .{
+        .codegen = checks.createCodegen(ctx).quant_kernel_codegen_test_check,
+        .cuda_source = checks.createCudaSourceCheck(ctx).cuda_artifact_source_policy_check,
+        .metal_runtime = checks.createMetalRuntimeTests(ctx).run_quant_kernel_metal_runtime_check_tests,
+        .bge_benchmark = ctx.addRunArtifact(bge_tests),
+    });
+    _ = @import("wasm.zig").addWasm(ctx, wasm_jinja, wasm_platform);
+    return .{ .inference_test = test_step, .inference_finetune_test = finetune_step };
+}

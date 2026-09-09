@@ -408,5 +408,5 @@ const commands = [_]common.CommandSpec{
 };
 
 pub fn register(ctx: common.Context) void {
-    for (commands) |spec| common.addCommand(ctx, spec);
+    for (commands) |spec| _ = common.addCommand(ctx, spec);
 }

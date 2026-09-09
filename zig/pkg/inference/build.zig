@@ -13,6 +13,10 @@
 // limitations under the License.
 
 const std = @import("std");
+const workflows_wasm = @import("build/wasm.zig");
+const workflows_tests = @import("build/tests.zig");
+const workflows_checks = @import("build/checks.zig");
+const workflows_benches = @import("build/benches.zig");
 const builtin = @import("builtin");
 const build_test_filters = @import("build/test_filters.zig");
 const runtime_build = @import("build/runtime.zig");
@@ -214,7 +218,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = link_libc,
     }).module("antfly_platform");
 
-    const runtime_graph = runtime_build.create(.{
+    const runtime_config: runtime_build.Config = .{
         .b = b,
         .target = target,
         .optimize = optimize,
@@ -245,7 +249,18 @@ pub fn build(b: *std.Build) void {
             .inference_version = antfly_version,
             .enable_native_quant_dispatch_stats = enable_native_quant_dispatch_stats,
         },
-    });
+    };
+    const runtime_graph = runtime_build.create(runtime_config);
+    const workflow_ctx = @import("build/context.zig").Context{
+        .b = b,
+        .target = target,
+        .optimize = optimize,
+        .paths = runtime_config.paths,
+        .backend = runtime_config.backend,
+        .graph = runtime_graph,
+        .args = b.args,
+        .runtime_test_filter = b.option(bool, "runtime-test-filter", "Build unit tests with a simple runtime-filtering test runner") orelse false,
+    };
     const build_options_mod = runtime_graph.build_options_mod;
     const audio_open_corpus_build_options_mod = runtime_graph.audio_open_corpus_build_options_mod;
     const jinja_mod = runtime_graph.jinja_mod;
@@ -255,7 +270,6 @@ pub fn build(b: *std.Build) void {
     const onnx_graph_mod = runtime_graph.onnx_graph_mod;
     const pjrt_mod = runtime_graph.pjrt_mod;
     const httpx_mod = runtime_graph.httpx_mod;
-    const platform_mod = runtime_graph.platform_mod;
     const antfly_scraping_mod = runtime_graph.scraping_mod;
     const antfly_jsonschema_mod = runtime_graph.jsonschema_mod;
     const antfly_image_mod = runtime_graph.image_mod;
@@ -268,26 +282,10 @@ pub fn build(b: *std.Build) void {
     const inference_fixed_tokenizer_data_mod = runtime_graph.inference_fixed_tokenizer_data_mod;
     const inference_audio_mod = runtime_graph.inference_audio_mod;
     const inference_chunker_mod = runtime_graph.inference_chunker_mod;
-    const generating_openapi_mod = runtime_graph.generating_openapi_mod;
-    const extraction_openapi_mod = runtime_graph.extraction_openapi_mod;
-    const extracting_mod = runtime_graph.extracting_mod;
     const client_mod = runtime_graph.inference_client_mod;
     const inference_internal_mod = runtime_graph.inference_internal_mod;
 
-    const exe = runtime_build.addStandaloneExecutable(b, runtime_graph, target, optimize, "", link_libc);
-    const install_exe = b.addInstallArtifact(exe, .{
-        .dest_sub_path = "antfly-inference",
-    });
-    b.getInstallStep().dependOn(&install_exe.step);
-
-    const run_exe = b.addRunArtifact(exe);
-    run_exe.step.dependOn(&install_exe.step);
-    if (b.args) |args| {
-        run_exe.addArgs(args);
-    }
-    const run_step = b.step("run", "Run the Antfly inference server");
-    run_step.dependOn(&run_exe.step);
-
+    const exe = @import("build/commands.zig").addCommands(workflow_ctx, true);
     const kernel_jit_package_exe = b.addExecutable(.{
         .name = "antfly-kernel-jit-package",
         .root_module = b.createModule(.{
@@ -322,24 +320,11 @@ pub fn build(b: *std.Build) void {
     kernel_jit_package_step.dependOn(&kernel_jit_package_exe.step);
     kernel_jit_package_step.dependOn(&run_kernel_jit_package.step);
 
-    const quant_kernel_codegen_exe = b.addExecutable(.{
-        .name = "antfly-quant-kernel-codegen",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/quant_kernel_codegen_main.zig"),
-            .target = b.graph.host,
-            .optimize = optimize,
-        }),
-    });
-    quant_kernel_codegen_exe.root_module.addImport("build_options", build_options_mod);
-    quant_kernel_codegen_exe.root_module.link_libc = link_libc;
-    const quant_kernel_codegen_check = b.addRunArtifact(quant_kernel_codegen_exe);
-    if (b.args) |args| {
-        quant_kernel_codegen_check.addArgs(args);
-    } else {
-        quant_kernel_codegen_check.addArg("--check");
-    }
-    const quant_kernel_codegen_test_check = b.addRunArtifact(quant_kernel_codegen_exe);
-    quant_kernel_codegen_test_check.addArg("--check");
+    const codegen = workflows_checks.createCodegen(workflow_ctx);
+    const quant_kernel_codegen_exe = codegen.quant_kernel_codegen_exe;
+    const quant_kernel_codegen_check = codegen.quant_kernel_codegen_check;
+    const quant_kernel_codegen_test_check = codegen.quant_kernel_codegen_test_check;
+
     const quant_kernel_codegen_step = b.step("quant-kernel-codegen", "Verify dev-generated quant kernel sources are fresh");
     quant_kernel_codegen_step.dependOn(&quant_kernel_codegen_check.step);
 
@@ -579,15 +564,9 @@ pub fn build(b: *std.Build) void {
         quant_kernel_metal_blocker_evidence_step.dependOn(metal_unavailable_step);
         quant_kernel_metal_blocker_strict_step.dependOn(metal_unavailable_step);
     }
-    const quant_kernel_metal_runtime_check_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/quant_kernel_metal_runtime_check.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-        .filters = &.{"quant kernel metal runtime"},
-    });
-    const run_quant_kernel_metal_runtime_check_tests = b.addRunArtifact(quant_kernel_metal_runtime_check_tests);
+    const metal_runtime_tests = workflows_checks.createMetalRuntimeTests(workflow_ctx);
+    const run_quant_kernel_metal_runtime_check_tests = metal_runtime_tests.run_quant_kernel_metal_runtime_check_tests;
+
     if (target.result.os.tag == .macos and targetRunsOnBuildHost(b, target)) {
         if (quant_kernel_metal_production_regression_run_step) |production_regression_step| {
             production_regression_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);
@@ -595,11 +574,9 @@ pub fn build(b: *std.Build) void {
         quant_kernel_metal_runtime_check_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);
     }
 
-    const cuda_artifact_source_policy_check = b.addSystemCommand(&.{
-        "bash",
-        "scripts/regen-cuda-artifacts.sh",
-        "--check-source-policy",
-    });
+    const cuda_source_check = workflows_checks.createCudaSourceCheck(workflow_ctx);
+    const cuda_artifact_source_policy_check = cuda_source_check.cuda_artifact_source_policy_check;
+
     const cuda_artifacts_freshness_check = b.addSystemCommand(&.{
         "bash",
         "scripts/regen-cuda-artifacts.sh",
@@ -1236,37 +1213,7 @@ pub fn build(b: *std.Build) void {
         quant_kernel_metal_local_check_step.dependOn(q4_pair_route_tail);
     }
 
-    const run_finetune = b.addRunArtifact(exe);
-    run_finetune.step.dependOn(b.getInstallStep());
-    run_finetune.addArg("finetune");
-    if (b.args) |args| {
-        run_finetune.addArgs(args);
-    }
-    const finetune_step = b.step("finetune", "Run Antfly inference finetune");
-    finetune_step.dependOn(&run_finetune.step);
-
-    const bench_exe = b.addExecutable(.{
-        .name = "antfly-inference-paged-attention-bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/paged_attention_bench.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    bench_exe.root_module.addImport("build_options", build_options_mod);
-    bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
-    if (enable_system_blas) {
-        configureSystemBlas(b, bench_exe.root_module, target, blas_root);
-    }
-    configureMetal(b, bench_exe.root_module, target, enable_metal);
-    bench_exe.root_module.link_libc = true;
-
-    const run_bench = b.addRunArtifact(bench_exe);
-    if (b.args) |args| {
-        run_bench.addArgs(args);
-    }
-    const bench_step = b.step("bench-paged-attention", "Run the native paged-attention benchmark");
-    bench_step.dependOn(&run_bench.step);
+    workflows_benches.addPagedAttention(workflow_ctx);
 
     const turboquant_distortion_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-turboquant-distortion-bench",
@@ -1283,38 +1230,7 @@ pub fn build(b: *std.Build) void {
     const turboquant_distortion_bench_step = b.step("bench-turboquant-distortion", "Run TurboQuant dot-product distortion benchmark");
     turboquant_distortion_bench_step.dependOn(&run_turboquant_distortion_bench.step);
 
-    const training_bench_exe = b.addExecutable(.{
-        .name = "antfly-inference-training-bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench/training_bench.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const linalg_bench_exe = b.addExecutable(.{
-        .name = "antfly-inference-linalg-bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/linalg_bench.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-        }),
-    });
-    training_bench_exe.root_module.addImport("build_options", build_options_mod);
-    training_bench_exe.root_module.addImport("ml", ml_mod);
-    configureNativeTool(b, training_bench_exe, target, enable_system_blas, blas_root, enable_metal);
-    const run_training_bench = b.addRunArtifact(training_bench_exe);
-    if (b.args) |args| {
-        run_training_bench.addArgs(args);
-    }
-    const training_bench_step = b.step("bench-training", "Run the native training benchmark");
-    training_bench_step.dependOn(&run_training_bench.step);
-    linalg_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
-    const run_linalg_bench = b.addRunArtifact(linalg_bench_exe);
-    if (b.args) |args| {
-        run_linalg_bench.addArgs(args);
-    }
-    const linalg_bench_step = b.step("bench-linalg", "Run the shared linalg benchmark");
-    linalg_bench_step.dependOn(&run_linalg_bench.step);
+    workflows_benches.addTrainingAndLinalg(workflow_ctx);
 
     const clipclap_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-clipclap-kernels-bench",
@@ -1338,36 +1254,7 @@ pub fn build(b: *std.Build) void {
     clipclap_bench_step.dependOn(&run_clipclap_bench.step);
 
     // GLiNER2 end-to-end native bench: random weights, real eager forward.
-    const gliner2_bench_exe = b.addExecutable(.{
-        .name = "antfly-inference-gliner2-native-bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench/gliner2_native.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-        }),
-    });
-    gliner2_bench_exe.root_module.addImport("build_options", build_options_mod);
-    gliner2_bench_exe.root_module.addImport("ml", ml_mod);
-    gliner2_bench_exe.root_module.addImport("pjrt", pjrt_mod);
-    gliner2_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
-    gliner2_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
-    gliner2_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
-    gliner2_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
-    gliner2_bench_exe.root_module.addImport("protobuf", protobuf_mod);
-    gliner2_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
-    gliner2_bench_exe.root_module.addImport("antfly_platform", platform_mod);
-    gliner2_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    // inference_internal already owns the native backend linkage, including
-    // metal_kernels.m. Linking it again at the executable root produces
-    // duplicate Metal symbols in these standalone benchmark tools.
-    gliner2_bench_exe.root_module.link_libc = true;
-    configureOnnxRuntime(b, gliner2_bench_exe.root_module, enable_onnx, effective_onnx_root);
-    const run_gliner2_bench = b.addRunArtifact(gliner2_bench_exe);
-    if (b.args) |args| {
-        run_gliner2_bench.addArgs(args);
-    }
-    const gliner2_bench_step = b.step("bench-gliner2-native", "Run an end-to-end GLiNER2 bench against the native backend with random weights");
-    gliner2_bench_step.dependOn(&run_gliner2_bench.step);
+    workflows_benches.addGliner(workflow_ctx);
 
     const gliner2_e2e_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-gliner2-e2e-bench",
@@ -1452,59 +1339,9 @@ pub fn build(b: *std.Build) void {
     const clipclap_e2e_bench_step = b.step("bench-clipclap-e2e", "Run real-bundle CLIP/CLAP embedding E2E benchmarks");
     clipclap_e2e_bench_step.dependOn(&run_clipclap_e2e_bench.step);
 
-    const bge_m3_e2e_bench_exe = b.addExecutable(.{
-        .name = "antfly-inference-bge-m3-e2e-bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench/bge_m3_e2e.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const bge_m3_runtime_mod = b.createModule(.{
-        .root_source_file = b.path("src/bge_m3_runtime.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    runtime_build.addInferenceRootImports(bge_m3_runtime_mod, .{
-        .build_options_mod = build_options_mod,
-        .json_mod = runtime_graph.json_mod,
-        .httpx_mod = httpx_mod,
-        .inference_api_mod = inference_api_mod,
-        .inference_audio_mod = inference_audio_mod,
-        .inference_chunker_mod = inference_chunker_mod,
-        .jinja_mod = jinja_mod,
-        .inference_tokenizer_mod = inference_tokenizer_mod,
-        .inference_hf_tokenizer_mod = inference_hf_tokenizer_mod,
-        .inference_linalg_mod = inference_linalg_mod,
-        .inference_fixed_tokenizer_data_mod = inference_fixed_tokenizer_data_mod,
-        .jsonschema_mod = antfly_jsonschema_mod,
-        .scraping_mod = antfly_scraping_mod,
-        .image_mod = antfly_image_mod,
-        .ml_mod = ml_mod,
-        .ml_tabular_mod = runtime_graph.ml_tabular_mod,
-        .prometheus_mod = prometheus_mod,
-        .structlog_mod = structlog_mod,
-        .onnx_graph_mod = onnx_graph_mod,
-        .pjrt_mod = pjrt_mod,
-        .platform_mod = platform_mod,
-        .protobuf_mod = protobuf_mod,
-        .inference_client_mod = client_mod,
-    });
-    bge_m3_runtime_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    bge_m3_runtime_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
-    bge_m3_runtime_mod.addImport("antfly_extracting", extracting_mod);
-    bge_m3_e2e_bench_exe.root_module.addImport("build_options", build_options_mod);
-    bge_m3_e2e_bench_exe.root_module.addImport("ml", ml_mod);
-    bge_m3_e2e_bench_exe.root_module.addImport("pjrt", pjrt_mod);
-    bge_m3_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
-    bge_m3_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
-    bge_m3_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
-    bge_m3_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
-    bge_m3_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
-    bge_m3_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
-    bge_m3_e2e_bench_exe.root_module.addImport("bge_m3_runtime", bge_m3_runtime_mod);
-    configureNativeTool(b, bge_m3_e2e_bench_exe, target, enable_system_blas, blas_root, enable_metal);
-    configureOnnxRuntime(b, bge_m3_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
+    const bge_benchmark = workflows_benches.createBge(workflow_ctx);
+    const bge_m3_e2e_bench_exe = bge_benchmark.bge_m3_e2e_bench_exe;
+
     const run_bge_m3_e2e_bench = b.addRunArtifact(bge_m3_e2e_bench_exe);
     if (b.args) |args| {
         run_bge_m3_e2e_bench.addArgs(args);
@@ -1595,93 +1432,12 @@ pub fn build(b: *std.Build) void {
     const reranker_e2e_bench_step = b.step("bench-reranker-e2e", "Run real-bundle text reranker E2E benchmarks");
     reranker_e2e_bench_step.dependOn(&run_reranker_e2e_bench.step);
 
-    const audio_bench_exe = b.addExecutable(.{
-        .name = "antfly-inference-audio-bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/audio_bench.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-        }),
-    });
-    audio_bench_exe.root_module.addImport("build_options", build_options_mod);
-    audio_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
-    audio_bench_exe.root_module.link_libc = true;
-    const run_audio_bench = b.addRunArtifact(audio_bench_exe);
-    if (b.args) |args| {
-        run_audio_bench.addArgs(args);
-    }
-    const audio_bench_step = b.step("bench-audio", "Run the checked-in audio decode and synthesis benchmark");
-    audio_bench_step.dependOn(&run_audio_bench.step);
+    workflows_benches.addAudio(workflow_ctx);
 
     // Tests
-    const runtime_test_filter = b.option(bool, "runtime-test-filter", "Build unit tests with a simple runtime-filtering test runner") orelse false;
-    const selected_test_filters = selectTestFilters(b, &.{});
-    const main_test_filters = if (runtime_test_filter) &.{} else selected_test_filters;
-    const runtime_filter_test_runner: std.Build.Step.Compile.TestRunner = .{
-        .path = b.path("src/test_runner_filter.zig"),
-        .mode = .simple,
-    };
-    const tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/inference.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-        .filters = main_test_filters,
-        .test_runner = runtime_filter_test_runner,
-    });
-    tests.root_module.addImport("build_options", build_options_mod);
-    tests.root_module.addImport("antfly-json", runtime_graph.json_mod);
-    tests.root_module.addImport("httpx", httpx_mod);
-    tests.root_module.addImport("inference_api", inference_api_mod);
-    tests.root_module.addImport("antfly_generating_openapi", generating_openapi_mod);
-    tests.root_module.addImport("antfly_extraction_openapi", extraction_openapi_mod);
-    tests.root_module.addImport("antfly_extracting", extracting_mod);
-    tests.root_module.addImport("inference_audio", inference_audio_mod);
-    tests.root_module.addImport("inference_chunker", inference_chunker_mod);
-    tests.root_module.addImport("jinja", jinja_mod);
-    tests.root_module.addImport("inference_tokenizer", inference_tokenizer_mod);
-    tests.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
-    tests.root_module.addImport("inference_linalg", inference_linalg_mod);
-    tests.root_module.addImport("inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod);
-    tests.root_module.addImport("antfly_jsonschema", antfly_jsonschema_mod);
-    tests.root_module.addImport("antfly_scraping", antfly_scraping_mod);
-    tests.root_module.addImport("antfly_image", antfly_image_mod);
-    tests.root_module.addImport("ml", ml_mod);
-    tests.root_module.addImport("ml_tabular", runtime_graph.ml_tabular_mod);
-    tests.root_module.addImport("onnx_graph", onnx_graph_mod);
-    tests.root_module.addImport("pjrt", pjrt_mod);
-    tests.root_module.addImport("prometheus", prometheus_mod);
-    tests.root_module.addImport("structlog", structlog_mod);
-    tests.root_module.addImport("antfly_platform", platform_mod);
-    tests.root_module.addImport("inference_internal", tests.root_module);
-    if (client_mod) |mod| {
-        tests.root_module.addImport("inference_client", mod);
-    }
-    if (enable_system_blas) {
-        configureSystemBlas(b, tests.root_module, target, blas_root);
-    }
-    configureMetal(b, tests.root_module, target, enable_metal);
-    configureOnnxRuntime(b, tests.root_module, enable_onnx, effective_onnx_root);
-    tests.root_module.link_libc = link_libc;
-
-    // Keep the standalone server's CLI and configuration parsing covered too.
-    // `src/inference.zig` does not import `src/main.zig`, so tests declared by
-    // the executable root otherwise compile only when invoked manually.
-    const cli_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-        .filters = main_test_filters,
-        .test_runner = runtime_filter_test_runner,
-    });
-    cli_tests.root_module.addImport("inference", runtime_graph.inference_mod);
-    cli_tests.root_module.addImport("build_options", build_options_mod);
-    cli_tests.root_module.addImport("structlog", structlog_mod);
-    cli_tests.root_module.addImport("antfly_platform", platform_mod);
-    cli_tests.root_module.link_libc = link_libc;
+    const suite = workflows_tests.create(workflow_ctx);
+    const tests = suite.tests;
+    const run_cli_tests = suite.run_cli_tests;
 
     const bge_m3_e2e_bench_tests = b.addTest(.{
         .root_module = bge_m3_e2e_bench_exe.root_module,
@@ -1693,43 +1449,14 @@ pub fn build(b: *std.Build) void {
     );
     bge_m3_e2e_bench_test_step.dependOn(&run_bge_m3_e2e_bench_tests.step);
 
-    const run_cli_tests = b.addRunArtifact(cli_tests);
-    for (selected_test_filters) |filter| {
-        run_cli_tests.addArgs(&.{ "--test-filter", filter });
-    }
-    build_test_filters.addRuntimeControls(run_cli_tests, b.args orelse &.{});
     const cli_test_step = b.step("test-cli", "Run standalone inference CLI and configuration tests");
     cli_test_step.dependOn(&run_cli_tests.step);
 
-    const finetune_ctx = finetune_common.Context{
-        .b = b,
-        .target = target,
-        .optimize = optimize,
-        .build_options_mod = build_options_mod,
-        .jinja_mod = jinja_mod,
-        .ml_mod = ml_mod,
-        .onnx_graph_mod = onnx_graph_mod,
-        .inference_internal_mod = inference_internal_mod,
-        .inference_tokenizer_mod = inference_tokenizer_mod,
-        .inference_hf_tokenizer_mod = inference_hf_tokenizer_mod,
-        .antfly_image_mod = antfly_image_mod,
-        .pjrt_mod = pjrt_mod,
-        .protobuf_mod = protobuf_mod,
-        .inference_linalg_mod = inference_linalg_mod,
-        .antfly_platform_mod = platform_mod,
-        .enable_system_blas = enable_system_blas,
-        .blas_root = blas_root,
-        .enable_metal = enable_metal,
-    };
+    const finetune_ctx = finetune_common.fromWorkflow(workflow_ctx);
     finetune_tools.register(finetune_ctx);
     finetune_workflows.register(finetune_ctx);
     finetune_tests.register(finetune_ctx);
 
-    const run_tests = b.addRunArtifact(tests);
-    for (selected_test_filters) |filter| {
-        run_tests.addArgs(&.{ "--test-filter", filter });
-    }
-    build_test_filters.addRuntimeControls(run_tests, b.args orelse &.{});
     const run_quant_kernel_compiler_tests = b.addRunArtifact(tests);
     run_quant_kernel_compiler_tests.addArg("--test-filter");
     run_quant_kernel_compiler_tests.addArg("quant kernel compiler");
@@ -1750,37 +1477,12 @@ pub fn build(b: *std.Build) void {
         run_quant_kernel_cuda_microbench_tests.addArg("cuda microbench");
         quant_kernel_local_check_step.dependOn(&run_quant_kernel_cuda_microbench_tests.step);
     }
-    const test_step = b.step("test", "Run unit tests");
-    const cancellation_e2e_step = b.step("test-cancellation-e2e", "Run HTTP inference cancellation and worker recovery E2E tests");
-    if (targetRunsOnBuildHost(b, target) and (target.result.os.tag == .linux or target.result.os.tag == .macos)) {
-        const fixture = b.addExecutable(.{
-            .name = "inference-cancellation-fixture",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("tests/cancellation_fixture.zig"),
-                .target = target,
-                .optimize = optimize,
-            }),
-        });
-        fixture.root_module.addImport("inference", runtime_graph.inference_mod);
-        fixture.root_module.addImport("httpx", httpx_mod);
-        fixture.root_module.addImport("antfly_platform", platform_mod);
-        fixture.root_module.link_libc = true;
-        const integration = b.addSystemCommand(&.{"python3"});
-        integration.addFileArg(b.path("tests/test_cancellation_e2e.py"));
-        integration.addArtifactArg(fixture);
-        cancellation_e2e_step.dependOn(&integration.step);
-        if (selected_test_filters.len == 0) test_step.dependOn(cancellation_e2e_step);
-    }
-    test_step.dependOn(&quant_kernel_codegen_test_check.step);
-    test_step.dependOn(&cuda_artifact_source_policy_check.step);
-    test_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);
-    test_step.dependOn(&run_tests.step);
-    // A focused server/library filter need not match an executable-root test.
-    // The default aggregate still owns the complete executable-root suites.
-    if (selected_test_filters.len == 0) {
-        test_step.dependOn(&run_cli_tests.step);
-        test_step.dependOn(&run_bge_m3_e2e_bench_tests.step);
-    }
+    _ = workflows_tests.addDefault(workflow_ctx, suite, .{
+        .codegen = quant_kernel_codegen_test_check,
+        .cuda_source = cuda_artifact_source_policy_check,
+        .metal_runtime = run_quant_kernel_metal_runtime_check_tests,
+        .bge_benchmark = run_bge_m3_e2e_bench_tests,
+    });
     const install_tests = b.addInstallArtifact(tests, .{
         .dest_sub_path = "antfly-inference-tests",
     });
@@ -2336,118 +2038,10 @@ pub fn build(b: *std.Build) void {
     const onnx_graph_test_step = b.step("test-onnx-graph", "Run ONNX graph converter tests");
     onnx_graph_test_step.dependOn(&run_onnx_graph_tests.step);
 
-    // WASM library target for browser inference
     if (enable_wasm) {
-        const is_wasm64 = std.mem.eql(u8, wasm_memory_model, "wasm64");
-        const wasm_target = b.resolveTargetQuery(.{
-            .cpu_arch = if (is_wasm64) .wasm64 else .wasm32,
-            .os_tag = .freestanding,
-            .cpu_features_add = std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory, .simd128 }),
-        });
-        const wasm_root = if (is_wasm64)
-            "src/wasm_entry_wasm64.zig"
-        else
-            "src/wasm_entry_wasm32.zig";
-        const wasm_install_name = if (is_wasm64) "antfly-inference-wasm64.wasm" else "antfly-inference-wasm32.wasm";
-        const wasm_jinja_dep = b.dependency("jinja", .{
-            .target = wasm_target,
-            .optimize = .ReleaseSafe,
-        });
-
-        const wasm_lib = b.addExecutable(.{
-            .name = if (is_wasm64) "antfly-inference-wasm64" else "antfly-inference-wasm32",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(wasm_root),
-                .target = wasm_target,
-                .optimize = .ReleaseSafe,
-                .single_threaded = true,
-            }),
-        });
-        wasm_lib.root_module.addImport("build_options", build_options_mod);
-        wasm_lib.entry = .disabled;
-        wasm_lib.rdynamic = true;
-        // ReleaseSafe: works around LLVM WASM backend miscompilation at -Os/-O3
-        // that produces NaN in BERT encoder FFN linear ops. 1.2 MB binary.
-
-        // Tokenizer modules for WASM target (pure Zig, no C deps)
-        const wasm_tokenizer_mod = b.createModule(.{
-            .root_source_file = b.path(b.fmt("{s}/lib/tokenizer/src/tokenizer.zig", .{shared_lib_root})),
-            .target = wasm_target,
-            .optimize = .ReleaseSafe,
-            .single_threaded = true,
-        });
-        const wasm_hf_tokenizer_mod = b.createModule(.{
-            .root_source_file = b.path(b.fmt("{s}/lib/tokenizer/src/hf_root.zig", .{shared_lib_root})),
-            .target = wasm_target,
-            .optimize = .ReleaseSafe,
-            .single_threaded = true,
-        });
-        const wasm_audio_mod = b.createModule(.{
-            .root_source_file = b.path(b.fmt("{s}/lib/audio/src/mod.zig", .{shared_lib_root})),
-            .target = wasm_target,
-            .optimize = .ReleaseSafe,
-            .single_threaded = true,
-        });
-        const wasm_image_mod = b.createModule(.{
-            .root_source_file = b.path(b.fmt("{s}/lib/image/src/mod.zig", .{shared_lib_root})),
-            .target = wasm_target,
-            .optimize = .ReleaseSafe,
-            .single_threaded = true,
-        });
-        const wasm_hash_mod = b.createModule(.{
-            .root_source_file = b.path(b.fmt("{s}/lib/hash/src/mod.zig", .{shared_lib_root})),
-            .target = wasm_target,
-            .optimize = .ReleaseSafe,
-        });
-        wasm_image_mod.addImport("antfly_hash", wasm_hash_mod);
-        const wasm_platform_mod = b.dependency("antfly_platform", .{
-            .target = wasm_target,
-            .optimize = .ReleaseSafe,
-            .link_libc = false,
-        }).module("antfly_platform");
-        wasm_platform_mod.single_threaded = true;
-        const wasm_linalg_mod = b.createModule(.{
-            .root_source_file = b.path(b.fmt("{s}/lib/linalg/src/mod.zig", .{shared_lib_root})),
-            .target = wasm_target,
-            .optimize = .ReleaseSafe,
-            .single_threaded = true,
-        });
-        const wasm_ml_mod = b.createModule(.{
-            .root_source_file = b.path(b.fmt("{s}/lib/ml/src/root.zig", .{shared_lib_root})),
-            .target = wasm_target,
-            .optimize = .ReleaseSafe,
-            .single_threaded = true,
-        });
-        wasm_ml_mod.addImport("antfly_platform", wasm_platform_mod);
-        const wasm_onnx_graph_mod = b.createModule(.{
-            .root_source_file = b.path(b.fmt("{s}/lib/onnx/src/root.zig", .{shared_lib_root})),
-            .target = wasm_target,
-            .optimize = .ReleaseSafe,
-            .single_threaded = true,
-        });
-        wasm_onnx_graph_mod.addImport("protobuf", protobuf_mod);
-        wasm_onnx_graph_mod.addImport("ml", wasm_ml_mod);
-        wasm_tokenizer_mod.addImport("sentencepiece_proto", sentencepiece_proto_mod);
-        wasm_hf_tokenizer_mod.addImport("inference_tokenizer", wasm_tokenizer_mod);
-        wasm_lib.root_module.addImport("jinja", wasm_jinja_dep.module("jinja"));
-        wasm_lib.root_module.addImport("inference_audio", wasm_audio_mod);
-        wasm_lib.root_module.addImport("inference_tokenizer", wasm_tokenizer_mod);
-        wasm_lib.root_module.addImport("inference_hf_tokenizer", wasm_hf_tokenizer_mod);
-        wasm_lib.root_module.addImport("inference_linalg", wasm_linalg_mod);
-        wasm_lib.root_module.addImport("antfly_image", wasm_image_mod);
-        wasm_lib.root_module.addImport("antfly_platform", wasm_platform_mod);
-        wasm_lib.root_module.addImport("ml", wasm_ml_mod);
-        wasm_lib.root_module.addImport("onnx_graph", wasm_onnx_graph_mod);
-
-        const wasm_install = b.addInstallArtifact(wasm_lib, .{
-            .dest_sub_path = wasm_install_name,
-        });
-
-        const wasm_step = b.step("wasm", "Build WASM module for browser inference");
-        wasm_step.dependOn(&wasm_install.step);
-        if (!is_wasm64) {
-            const wasm_compat_install = b.addInstallFile(wasm_lib.getEmittedBin(), "antfly-inference.wasm");
-            wasm_step.dependOn(&wasm_compat_install.step);
-        }
+        const wasm_target = workflows_wasm.resolveTarget(workflow_ctx);
+        const wasm_jinja = b.dependency("jinja", .{ .target = wasm_target, .optimize = .ReleaseSafe }).module("jinja");
+        const wasm_platform = b.dependency("antfly_platform", .{ .target = wasm_target, .optimize = .ReleaseSafe, .link_libc = false }).module("antfly_platform");
+        _ = workflows_wasm.addWasm(workflow_ctx, wasm_jinja, wasm_platform);
     }
 }

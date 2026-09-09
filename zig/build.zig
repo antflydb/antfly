@@ -127,120 +127,6 @@ fn addLocalHttpxModule(
     });
 }
 
-const inference_delegated_steps = [_][]const u8{
-    "run",
-    "finetune",
-    "bench-paged-attention",
-    "bench-training",
-    "bench-linalg",
-    "bench-audio",
-    "bench-gliner2-native",
-    "gliner2-entity-training-readiness",
-    "test-finetune",
-    "test-cancellation-e2e",
-    "test",
-    "wasm",
-};
-
-const DelegatedPackageStep = struct {
-    run: *std.Build.Step.Run,
-    step: *std.Build.Step,
-};
-
-const DelegatedInferenceBuildSteps = struct {
-    inference_test: *std.Build.Step,
-    inference_finetune_test: *std.Build.Step,
-};
-
-fn addDelegatedPackageStep(
-    b: *std.Build,
-    public_step_name: []const u8,
-    package_dir: []const u8,
-    step_name: []const u8,
-    package_name: []const u8,
-) DelegatedPackageStep {
-    const run = b.addSystemCommand(&.{
-        b.graph.zig_exe,
-        "build",
-        step_name,
-    });
-    run.setCwd(b.path(package_dir));
-    const delegated = b.step(
-        public_step_name,
-        b.fmt("Delegate to {s} zig build {s}", .{ package_name, step_name }),
-    );
-    delegated.dependOn(&run.step);
-    return .{
-        .run = run,
-        .step = delegated,
-    };
-}
-
-fn forwardBuildArgs(b: *std.Build, run: *std.Build.Step.Run) void {
-    if (b.args) |args| {
-        run.addArg("--");
-        run.addArgs(args);
-    }
-}
-
-fn addDelegatedInferenceOptions(
-    b: *std.Build,
-    run: *std.Build.Step.Run,
-    enable_metal: bool,
-    enable_onnx: bool,
-    onnx_root: []const u8,
-    enable_cuda: bool,
-    cuda_artifacts: []const u8,
-    enable_pjrt: bool,
-    enable_system_blas: bool,
-    blas_root: ?[]const u8,
-) void {
-    run.addArg("-Dshared-lib-root=../..");
-    run.addArg(if (enable_metal) "-Dmetal=true" else "-Dmetal=false");
-    run.addArg(if (enable_onnx) "-Donnx=true" else "-Donnx=false");
-    if (enable_onnx) {
-        run.addArg(b.fmt("-Donnx-root={s}", .{onnx_root}));
-    }
-    run.addArg(if (enable_cuda) "-Dcuda=true" else "-Dcuda=false");
-    run.addArg(b.fmt("-Dcuda-artifacts={s}", .{cuda_artifacts}));
-    run.addArg(if (enable_pjrt) "-Dpjrt=true" else "-Dpjrt=false");
-    run.addArg(if (enable_system_blas) "-Dsystem-blas=true" else "-Dsystem-blas=false");
-    if (enable_system_blas) {
-        if (blas_root) |root| run.addArg(b.fmt("-Dblas-root={s}", .{root}));
-    }
-}
-
-fn addDelegatedInferenceBuildSteps(
-    b: *std.Build,
-    enable_metal: bool,
-    enable_onnx: bool,
-    onnx_root: []const u8,
-    enable_cuda: bool,
-    cuda_artifacts: []const u8,
-    enable_pjrt: bool,
-    enable_system_blas: bool,
-    blas_root: ?[]const u8,
-) DelegatedInferenceBuildSteps {
-    var test_step: ?*std.Build.Step = null;
-    var finetune_test_step: ?*std.Build.Step = null;
-    for (inference_delegated_steps) |step_name| {
-        const public_name = if (std.mem.eql(u8, step_name, "test-finetune")) "inference-finetune-test" else b.fmt("inference-{s}", .{step_name});
-        const delegated = addDelegatedPackageStep(b, public_name, "pkg/inference", step_name, "pkg/inference");
-        const run = delegated.run;
-        addDelegatedInferenceOptions(b, run, enable_metal, enable_onnx, onnx_root, enable_cuda, cuda_artifacts, enable_pjrt, enable_system_blas, blas_root);
-        forwardBuildArgs(b, run);
-        if (std.mem.eql(u8, step_name, "test")) {
-            test_step = delegated.step;
-        } else if (std.mem.eql(u8, step_name, "test-finetune")) {
-            finetune_test_step = delegated.step;
-        }
-    }
-    return .{
-        .inference_test = test_step.?,
-        .inference_finetune_test = finetune_test_step.?,
-    };
-}
-
 pub fn build(b: *std.Build) void {
     const api_bench_standalone = b.option(bool, "api-bench-standalone", "Build only the API benchmark for an existing server process") orelse false;
     const conformance_fetch = b.option(bool, "conformance-fetch", "Fetch missing external conformance fixtures") orelse true;
@@ -777,6 +663,8 @@ pub fn build(b: *std.Build) void {
             .cuda_artifacts = inference_cuda_artifacts,
             .enable_pjrt = inference_enable_pjrt,
             .enable_native = true,
+            .wasm_memory_model = b.option([]const u8, "wasm-memory-model", "Inference WASM memory model: wasm32 or wasm64") orelse "wasm32",
+            .enable_webgpu = b.option(bool, "webgpu", "Enable WebGPU for inference WASM") orelse false,
             .enable_system_blas = inference_enable_system_blas,
             .blas_root = inference_blas_root,
             .enable_ffmpeg_audio = inference_ffmpeg_paths != null,
@@ -878,17 +766,31 @@ pub fn build(b: *std.Build) void {
     synthesizing_mod.addImport("antfly_audio_openapi", audio_openapi_mod);
     synthesizing_mod.addImport("httpx", httpx_mod);
 
-    const inference_steps = addDelegatedInferenceBuildSteps(
-        b,
-        inference_enable_metal,
-        inference_enable_onnx,
-        inference_onnx_root,
-        inference_enable_cuda,
-        inference_cuda_artifacts,
-        inference_enable_pjrt,
-        inference_enable_system_blas,
-        inference_blas_root,
-    );
+    const inference_workflow = @import("pkg/inference/build/context.zig").Context{
+        .b = b,
+        .target = target,
+        .optimize = optimize,
+        .paths = inference_config.paths,
+        .backend = inference_config.backend,
+        .graph = inference_graph,
+        .args = b.args,
+        .step_prefix = "inference-",
+        .runtime_test_filter = b.option(bool, "runtime-test-filter", "Build inference tests once and filter them at runtime") orelse false,
+    };
+    const inference_wasm_target = @import("pkg/inference/build/wasm.zig").resolveTarget(inference_workflow);
+    const inference_wasm_jinja = b.createModule(.{
+        .root_source_file = b.path("lib/jinja/src/jinja.zig"),
+        .target = inference_wasm_target,
+        .optimize = .ReleaseSafe,
+    });
+    const inference_wasm_platform = platform_build.createModule(b, .{
+        .root_source_file = b.path("lib/platform/src/root.zig"),
+        .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
+        .target = inference_wasm_target,
+        .optimize = .ReleaseSafe,
+        .link_libc = false,
+    });
+    const inference_steps = @import("pkg/inference/build/integration.zig").add(inference_workflow, inference_wasm_jinja, inference_wasm_platform);
 
     const antfly_imports = AntflyRootImports{
         .build_options = build_options,

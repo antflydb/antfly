@@ -375,9 +375,12 @@ jobs:
           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
 
-      - name: Check inference kernel generator
-        working-directory: zig/pkg/inference
-        run: zig build quant-kernel-local-check -Dmetal=false -Dcuda=false
+      - name: Check inference kernels through the root build graph
+        working-directory: zig
+        run: >-
+          zig build inference-test -Dmetal=false -Dcuda=false --
+          --test-filter "quant kernel compiler"
+          --test-filter "metal renderer"
 
       - name: Run inference benchmark and release contract tests
         working-directory: zig/pkg/inference
