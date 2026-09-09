@@ -673,51 +673,19 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const dense_stack_bench_step = b.step("dense-stack-bench", "Build and install dense_stack_bench");
     dense_stack_bench_step.dependOn(&b.addInstallArtifact(dense_stack_bench, .{}).step);
 
-    const replay_bench_build_options = b.addOptions();
-    replay_bench_build_options.addOption([]const u8, "lmdb_backend", @tagName(lmdb_backend));
-    replay_bench_build_options.addOption(bool, "lmdb_evented_async_io", lmdb_evented_async_io);
-    replay_bench_build_options.addOption(bool, "storage_sim_soak", false);
-    replay_bench_build_options.addOption(bool, "with_tla", with_tla);
-    replay_bench_build_options.addOption(bool, "link_libc", true);
-    replay_bench_build_options.addOption(bool, "standalone_runtime_focused_test", false);
-    replay_bench_build_options.addOption(bool, "lmdb_enabled", true);
-    replay_bench_build_options.addOption(bool, "bench_minimal_deps", true);
-
     const replay_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/replay_bench.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
     const replay_bench_root_mod = b.createModule(.{
-        .root_source_file = b.path(replay_bench_root),
+        .root_source_file = b.path(storage_bench_root),
         .target = target,
         .optimize = .ReleaseFast,
     });
-    replay_bench_root_mod.addOptions("build_options", replay_bench_build_options);
-    replay_bench_root_mod.addImport("lmdb_engine", lmdb_engine_mod);
-    replay_bench_root_mod.addImport("antfly-json", antfly_imports.json);
-    replay_bench_root_mod.addImport("bloom", bloom_mod);
-    replay_bench_root_mod.addImport("antfly_vector", vector_mod);
-    replay_bench_root_mod.addImport("antfly_vectorindex", vectorindex_mod);
-    replay_bench_root_mod.addImport("antfly_matcher", antfly_imports.matcher);
-    replay_bench_root_mod.addImport("antfly_resolver", antfly_imports.resolver);
-    replay_bench_root_mod.addImport("antfly_vellum", vellum_mod);
-    replay_bench_root_mod.addImport("antfly_regex", antfly_imports.regex);
-    replay_bench_root_mod.addImport("antfly_reranking", antfly_imports.reranking);
-    replay_bench_root_mod.addImport("antfly_scraping", antfly_imports.scraping);
-    replay_bench_root_mod.addImport("antfly_reader_config", antfly_imports.reader_config);
-    replay_bench_root_mod.addImport("antfly_transcribing", antfly_imports.transcribing);
-    replay_bench_root_mod.addImport("httpx", httpx_mod);
-    replay_bench_root_mod.addImport("antfly_pdf", antfly_imports.pdf);
-    replay_bench_root_mod.addImport("antfly_image", antfly_imports.image);
-    replay_bench_root_mod.addImport("antfly_font", antfly_imports.font);
-    replay_bench_root_mod.addImport("structlog", antfly_imports.structlog);
-    replay_bench_root_mod.addImport("antfly_platform", platform_mod);
-    // This root also reaches image/chunker through the runtime imports. Share
-    // their checksum module; duplicate roots for one file cannot be compiled
-    // together. -Doptimize=ReleaseFast optimizes the complete shared graph.
-    replay_bench_root_mod.addImport("antfly_hash", antfly_imports.hash);
-    addSnowballModule(b, replay_bench_root_mod);
+    // Use the same production storage graph as the combined benchmark. Explicit
+    // deterministic providers in the workloads remain local benchmark fixtures.
+    antfly_imports.configureRuntime(b, replay_bench_root_mod, false, true, false);
     replay_bench_mod.addImport("antfly-zig", replay_bench_root_mod);
 
     const replay_bench = b.addExecutable(.{

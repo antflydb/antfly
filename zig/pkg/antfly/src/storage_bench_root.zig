@@ -23,6 +23,11 @@ pub const resource_manager = @import("storage/resource_manager.zig");
 pub const roaring = @import("encoding/roaring.zig");
 
 pub const db = struct {
+    pub const OpenMode = @import("storage/db/db.zig").OpenMode;
+    pub const ReplayProgress = @import("storage/db/db.zig").ReplayProgress;
+    pub const embedder = @import("storage/db/enrichment/embedder.zig");
+    pub const replay_stream = @import("storage/db/derived/replay_stream.zig");
+    pub const backfill_state = @import("storage/db/backfill_state.zig");
     pub const freeDBStats = @import("storage/db/types.zig").freeDBStats;
     pub const doc_identity = @import("storage/db/doc_identity.zig");
     pub const doc_set = @import("storage/db/doc_set.zig");
