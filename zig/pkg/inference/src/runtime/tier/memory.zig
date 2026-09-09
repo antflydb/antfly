@@ -646,6 +646,18 @@ pub const AdmissionAmounts = struct {
     fn scratchTotalBytesChecked(self: @This()) !usize {
         return std.math.add(usize, self.host_scratch_bytes, self.backend_scratch_bytes);
     }
+
+    pub fn fitsLimits(self: @This(), limits: Limits) !bool {
+        const host = try self.hostTotalBytesChecked();
+        const device = try self.backendTotalBytesChecked();
+        const combined = try std.math.add(usize, host, device);
+        const scratch = try self.scratchTotalBytesChecked();
+        const kv = try self.kvTotalBytesChecked();
+        inline for (.{ .{ host, limits.host_limit_bytes }, .{ device, limits.backend_limit_bytes }, .{ combined, limits.combined_limit_bytes }, .{ scratch, limits.scratch_limit_bytes }, .{ kv, limits.kv_limit_bytes } }) |pair| {
+            if (pair[1] != 0 and pair[0] > pair[1]) return false;
+        }
+        return true;
+    }
 };
 
 /// Optional process-owner bridge for coordinating inference admission with a

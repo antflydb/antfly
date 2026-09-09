@@ -82,6 +82,10 @@ pub const Context = struct {
     model_manager: *model_manager_mod.ModelManager,
     execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
     reader_resolver: ?*ReaderResolver = null,
+    gliner_pipeline_factory: ?struct {
+        ptr: *anyopaque,
+        create: *const fn (*anyopaque, std.mem.Allocator, *model_manager_mod.LoadedModel) @import("../pipelines/gliner.zig").GlinerPipeline,
+    } = null,
     reader_discovery_override: if (builtin.is_test) ?ReaderDiscoveryOverride else void = if (builtin.is_test) null else {},
     reader_text_override: if (builtin.is_test) ?ReaderTextOverride else void = if (builtin.is_test) null else {},
 };
@@ -379,6 +383,16 @@ pub const Extractor = union(enum) {
         }
     }
 
+    /// Concrete model selected by the resolver. Executor-boundary admission
+    /// uses this path to derive the same manifest contract published in model
+    /// discovery before any task-specific inference begins.
+    pub fn modelPath(self: *const Extractor) []const u8 {
+        return switch (self.*) {
+            .recognizer => |recognizer| recognizer.model_path,
+            .reader => |reader| reader.model_path,
+        };
+    }
+
     pub fn extractText(
         self: *Extractor,
         ctx: Context,
@@ -443,7 +457,7 @@ const RecognizerExtractor = struct {
         if (!model.isGlinerModel() or !model.supportsExtraction()) return error.InvalidModelForExtraction;
         if (!model_caps.modelAcceptsInput(&model.manifest, "text")) return error.UnsupportedInput;
 
-        var gliner = model.glinerPipeline(ctx.allocator);
+        var gliner = if (ctx.gliner_pipeline_factory) |factory| factory.create(factory.ptr, ctx.allocator, model) else model.glinerPipeline(ctx.allocator);
         gliner.execution_control = ctx.execution_control;
         var extraction_config = config;
         extraction_config.cleanup_model = try model.getCleanupHead();
@@ -490,6 +504,11 @@ const ReaderExtractor = struct {
             ctx.execution_control,
         );
         defer reader.deinit();
+
+        if (config.max_input_tokens_per_item) |limit| {
+            const input_tokens = try reader.inputTokenCount(read_options);
+            if (input_tokens > limit) return error.InferenceInputTokensExceeded;
+        }
 
         var controlled_options = read_options;
         controlled_options.execution_control = ctx.execution_control;

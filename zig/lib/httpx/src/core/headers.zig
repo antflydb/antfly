@@ -108,6 +108,7 @@ pub const Headers = struct {
         const owned_name = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(owned_name);
         const owned_value = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(owned_value);
         try self.entries.append(self.allocator, .{
             .name = owned_name,
             .value = owned_value,
@@ -543,6 +544,18 @@ test "Headers isChunked token matching" {
 
     try headers.set("Transfer-Encoding", "chunkedx");
     try std.testing.expect(!headers.isChunked());
+}
+
+test "Headers append frees both copies when list allocation fails" {
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var headers = Headers.init(alloc);
+            defer headers.deinit();
+            try headers.append("Accept", "application/json");
+            try std.testing.expectEqualStrings("application/json", headers.get("Accept").?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "Headers Connection close detection" {
