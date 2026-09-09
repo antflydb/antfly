@@ -39,20 +39,21 @@ pub const Scenario = struct {
 
     const State = struct {
         allocator: std.mem.Allocator,
-        sim: vopr.vopr_io.VoprIo,
+        vopr_io: vopr.vopr_io.VoprIo,
         sound: bool = true,
         complete: bool = false,
         progress: u64 = 0,
 
         fn admit(self: *@This()) !void {
-            try data_format.ensureCompatible(self.allocator, self.sim.io(), "/startup");
+            try data_format.ensureCompatible(self.allocator, self.vopr_io.io(), "/startup");
             self.progress += 1;
         }
 
         fn provision(self: *@This()) !provisioner.ProvisionSummary {
             var runtime = try background_runtime.BackendRuntime.init(self.allocator, .{
                 .backend = .manual,
-                .borrowed_io = .{ .general = self.sim.io() },
+                .borrowed_io = .{ .general = self.vopr_io.io() },
+                .filesystem_io = self.vopr_io.io(),
             });
             defer runtime.deinit();
             const summary = try provisioner.reconcileReplicaRootWithOptions(
@@ -62,7 +63,7 @@ pub const Scenario = struct {
                 &.{ 100, 2001 },
                 &.{.{ .table_id = 7, .name = "docs", .indexes_json = "{}" }},
                 &.{.{ .group_id = 2001, .table_id = 7, .start_key = "", .end_key = null }},
-                .{ .io = self.sim.io(), .backend_runtime = &runtime },
+                .{ .io = self.vopr_io.io(), .backend_runtime = &runtime },
             );
             self.progress += 1;
             return summary;
@@ -83,10 +84,10 @@ pub const Scenario = struct {
                     self.sound = first.dbs_opened == 1 and second.dbs_opened == 1 and second.indexes_added == 0;
                 },
                 .partial_marker => {
-                    try fs_paths.createDirPathPortable(self.sim.io(), "/startup");
-                    try std.Io.Dir.cwd().writeFile(self.sim.io(), .{ .sub_path = "/startup/" ++ data_format.marker_file_name, .data = "{" });
-                    data_format.ensureCompatible(self.allocator, self.sim.io(), "/startup") catch {
-                        try std.Io.Dir.cwd().deleteFile(self.sim.io(), "/startup/" ++ data_format.marker_file_name);
+                    try fs_paths.createDirPathPortable(self.vopr_io.io(), "/startup");
+                    try std.Io.Dir.cwd().writeFile(self.vopr_io.io(), .{ .sub_path = "/startup/" ++ data_format.marker_file_name, .data = "{" });
+                    data_format.ensureCompatible(self.allocator, self.vopr_io.io(), "/startup") catch {
+                        try std.Io.Dir.cwd().deleteFile(self.vopr_io.io(), "/startup/" ++ data_format.marker_file_name);
                         try self.admit();
                         self.complete = true;
                         return;
@@ -94,8 +95,8 @@ pub const Scenario = struct {
                     self.sound = false;
                 },
                 .legacy_rejected => {
-                    try fs_paths.createDirPathPortable(self.sim.io(), "/startup/store");
-                    data_format.ensureCompatible(self.allocator, self.sim.io(), "/startup") catch |err| {
+                    try fs_paths.createDirPathPortable(self.vopr_io.io(), "/startup/store");
+                    data_format.ensureCompatible(self.allocator, self.vopr_io.io(), "/startup") catch |err| {
                         self.sound = err == data_format.Error.IncompatibleAntflyDataDir;
                         self.progress += 1;
                         self.complete = true;
@@ -104,8 +105,8 @@ pub const Scenario = struct {
                     self.sound = false;
                 },
                 .write_fault_retry => {
-                    self.sim.failNextFileWrite();
-                    data_format.ensureCompatible(self.allocator, self.sim.io(), "/startup") catch {
+                    self.vopr_io.failNextFileWrite();
+                    data_format.ensureCompatible(self.allocator, self.vopr_io.io(), "/startup") catch {
                         try self.admit();
                         self.complete = true;
                         return;
@@ -114,7 +115,7 @@ pub const Scenario = struct {
                 },
                 .crash_restart => {
                     try self.admit();
-                    try self.sim.crashFileSystem();
+                    try self.vopr_io.crashFileSystem();
                     try self.admit();
                 },
             }
@@ -127,12 +128,12 @@ pub const Scenario = struct {
         errdefer allocator.destroy(state);
         state.* = .{
             .allocator = allocator,
-            .sim = try vopr.vopr_io.VoprIo.init(.{ .seed = 0x570a_7a, .required = .of(&.{ .files, .task_scheduling, .synchronization, .deterministic_entropy, .clock_read }) }),
+            .vopr_io = try vopr.vopr_io.VoprIo.init(.{ .seed = 0x570a_7a, .required = .of(&.{ .files, .task_scheduling, .synchronization, .deterministic_entropy, .clock_read }) }),
         };
         return .{ .state = state };
     }
     pub fn deinit(world: *World, allocator: std.mem.Allocator) void {
-        world.state.sim.deinit();
+        world.state.vopr_io.deinit();
         allocator.destroy(world.state);
         world.* = undefined;
     }
@@ -162,7 +163,7 @@ pub const Scenario = struct {
         try sink.check(allocator, complete_id, world.state.complete);
     }
     pub fn healthSnapshot(world: *World) vopr.health.Snapshot {
-        return .{ .progress_expected = true, .progress_units = world.state.progress, .active_tasks = world.state.sim.tasks.activeTaskCount(), .cleanup_complete = world.state.complete };
+        return .{ .progress_expected = true, .progress_units = world.state.progress, .active_tasks = world.state.vopr_io.tasks.activeTaskCount(), .cleanup_complete = world.state.complete };
     }
     pub fn done(world: *World) bool {
         return world.state.complete;

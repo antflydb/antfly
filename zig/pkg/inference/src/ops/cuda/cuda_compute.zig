@@ -8867,6 +8867,56 @@ fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     };
 }
 
+fn acquireWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const weight = tensorFromCt(try getWeight(ctx, name));
+    const handle = try self.allocator.create(CudaTensor);
+    errdefer self.allocator.destroy(handle);
+    handle.* = borrowedSlotTensor(weight);
+    // The resident/streaming store owns device storage. The graph owns only
+    // this handle and its shape, never the store's tensor metadata.
+    handle.shape = try self.allocator.dupe(i64, weight.shape);
+    handle.owns_shape = true;
+    handle.owned_by_tensor = true;
+    return @ptrCast(handle);
+}
+
+fn testAcquiredWeightHandle(allocator: std.mem.Allocator) !void {
+    // No driver is needed: acquired handles may free their metadata, but must
+    // never attempt to free the resident model's device allocations.
+    var self: CudaCompute = undefined;
+    self.allocator = allocator;
+    self.a4b_runtime = null;
+    self.resident_weights = .empty;
+    defer self.resident_weights.deinit(allocator);
+    self.lazy_device_epochs = .empty;
+    var shape = [_]i64{ 2, 2 };
+    try self.resident_weights.put(allocator, "weight", .{
+        .buffer = .{ .ptr = 0x1234, .len = 16 },
+        .dtype = .f32,
+        .shape = &shape,
+        .elem_count = 4,
+        .owned_by_tensor = false,
+    });
+    const borrowed = try getWeight(&self, "weight");
+    const first = try acquireWeight(&self, "weight");
+    defer freeTensor(&self, first);
+    const second = try acquireWeight(&self, "weight");
+    defer freeTensor(&self, second);
+    try std.testing.expect(first != second and first != borrowed and second != borrowed);
+    const handle = tensorFromCt(second);
+    try std.testing.expect(!handle.owns_buffer and !handle.owns_tc_quant and !handle.owns_bf16_mirror and !handle.owns_training_upload_host);
+    try std.testing.expect(handle.owns_shape and handle.owned_by_tensor);
+    try std.testing.expect(handle.shape.ptr != shape[0..].ptr);
+    try std.testing.expectEqualSlices(i64, &shape, handle.shape);
+    try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0x1234), handle.buffer.ptr);
+}
+
+test "CUDA acquired weight handles have independent metadata and borrowed storage" {
+    try testAcquiredWeightHandle(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAcquiredWeightHandle, .{});
+}
+
 fn prefetchWeightHint(ctx: *anyopaque, name: []const u8, hint: u32) void {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (self.resident_weights.contains(name)) return;
@@ -22476,6 +22526,7 @@ const vtable = ops.ComputeBackend.VTable{
     .convertDType = &convertDTypeOp,
     .provisionKvDeviceWriteHook = &provisionKvDeviceWriteHook,
     .getWeight = &getWeight,
+    .acquireWeight = &acquireWeight,
     .prefetchWeightHint = &prefetchWeightHint,
     .drainPrefetchBudget = &drainPrefetchBudget,
     .debugProfileCheckpoint = &debugProfileCheckpoint,

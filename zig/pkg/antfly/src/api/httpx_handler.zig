@@ -708,7 +708,8 @@ pub const AntflyApiHandler = struct {
             ctx.application_deadline_invalid = true;
             return;
         }
-        ctx.application_deadline_ns = platform_time.monotonicNs() +|
+        ctx.application_deadline_io = ctx.io;
+        ctx.application_deadline_ns = @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, ctx.io).nanoseconds))) +|
             @as(u64, budget_ms) *| std.time.ns_per_ms;
     }
 
@@ -4835,6 +4836,10 @@ pub const AntflyApiHandler = struct {
                 error.UnsupportedAgentToolProvider => return jsonErrorResponse(ctx, 400, "agent tools require an Antfly or OpenAI tool-capable generator"),
                 error.GenerateRequestFailed, error.EmptyResponse => return jsonErrorResponse(ctx, 502, "agent generation failed"),
                 error.RateLimit => return jsonErrorResponse(ctx, 429, "agent generation rate limited"),
+                error.GenerationCapacityUnavailable => {
+                    try ctx.setHeader("Retry-After", "1");
+                    return ctx.status(503).json(.{ .@"error" = "GenerationCapacityUnavailable", .retryable = true, .reason = "inference_capacity" });
+                },
                 error.TableNotFound => {
                     _ = ctx.status(404);
                     return ctx.text("not found");
@@ -7334,9 +7339,9 @@ test "internal transaction ingress establishes and validates pre-decision deadli
     try request.setHeader(distributed_txn_contract.pre_decision_remaining_ms_header, "250");
     var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
     defer ctx.deinit();
-    const before_ns = platform_time.monotonicNs();
+    const before_ns = @as(u64, @intCast(std.Io.Clock.now(.awake, ctx.io).nanoseconds));
     AntflyApiHandler.establishInternalTxnPreDecisionDeadline(&ctx);
-    const after_ns = platform_time.monotonicNs();
+    const after_ns = @as(u64, @intCast(std.Io.Clock.now(.awake, ctx.io).nanoseconds));
     const deadline_ns = ctx.application_deadline_ns.?;
     try std.testing.expect(deadline_ns >= before_ns + budget_ms * std.time.ns_per_ms);
     try std.testing.expect(deadline_ns <= after_ns + budget_ms * std.time.ns_per_ms);

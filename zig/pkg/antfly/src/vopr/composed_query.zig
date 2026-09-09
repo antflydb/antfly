@@ -110,8 +110,17 @@ pub const Scenario = struct {
                 .total_hits = 1,
             };
 
+            errdefer self.allocator.free(graph_results[0].name);
+            const empty_graph_results = try self.allocator.alloc(db_types.GraphSearchResult, 1);
+            errdefer self.allocator.free(empty_graph_results);
+            empty_graph_results[0] = .{
+                .name = try self.allocator.dupe(u8, "neighbors"),
+                .hits = &.{},
+                .total_hits = 0,
+            };
+
             return .{
-                .{ .alloc = self.allocator, .hits = text_hits, .total_hits = 1 },
+                .{ .alloc = self.allocator, .hits = text_hits, .total_hits = 1, .graph_results = empty_graph_results },
                 .{ .alloc = self.allocator, .hits = vector_hits, .total_hits = 1, .graph_results = graph_results },
             };
         }
@@ -144,6 +153,15 @@ pub const Scenario = struct {
                     .full_text = .{ .match_all = {} },
                     .dense = .{ .vector = @constCast(&[_]f32{ 1.0, 0.0 }), .k = 3 },
                     .limit = 3,
+                    .graph_queries = &.{.{
+                        .name = "neighbors",
+                        .query = .{
+                            .query_type = .neighbors,
+                            .index_name = "graph_idx",
+                            .start_nodes = .{ .keys = &.{"doc:text"} },
+                            .params = .{},
+                        },
+                    }},
                 },
                 &inputs,
                 0,

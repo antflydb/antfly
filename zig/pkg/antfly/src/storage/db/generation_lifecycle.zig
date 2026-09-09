@@ -1964,17 +1964,27 @@ pub fn hasPublishedGenerationReadWithIo(path: []const u8, io: std.Io) !bool {
 
 test "generation lifecycle serializes the same root and validates capability target" {
     const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Keep roots inside the fixture so cleanup also removes their sibling locks.
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-a", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_alias = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/../{s}/table-a", .{ tmp.sub_path, tmp.sub_path });
+    defer alloc.free(path_alias);
+    const other_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-b", .{tmp.sub_path});
+    defer alloc.free(other_path);
+
     var manager = Manager.init(alloc);
     defer manager.deinit();
 
-    var first = try manager.beginExclusive("/tmp/table-a");
+    var first = try manager.beginExclusive(path);
     defer first.deinit();
-    try first.validate("/tmp/table-a");
-    try std.testing.expectError(error.InvalidGenerationTransition, first.validate("/tmp/table-b"));
-    try std.testing.expectError(error.GenerationTransitionActive, manager.beginExclusive("/tmp/table-a"));
-    try std.testing.expectError(error.GenerationTransitionActive, manager.beginExclusive("/tmp/../tmp/table-a"));
+    try first.validate(path);
+    try std.testing.expectError(error.InvalidGenerationTransition, first.validate(other_path));
+    try std.testing.expectError(error.GenerationTransitionActive, manager.beginExclusive(path));
+    try std.testing.expectError(error.GenerationTransitionActive, manager.beginExclusive(path_alias));
 
-    var other = try manager.beginExclusive("/tmp/table-b");
+    var other = try manager.beginExclusive(other_path);
     other.deinit();
 }
 
@@ -2034,27 +2044,38 @@ test "generation lifecycle returns cross-manager filesystem lock contention" {
 
 test "generation lifecycle retains shared readers until the final owner closes" {
     const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-readers", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_alias = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/../{s}/table-readers", .{ tmp.sub_path, tmp.sub_path });
+    defer alloc.free(path_alias);
+
     var manager = Manager.init(alloc);
     defer manager.deinit();
 
-    var first = try manager.beginRead("/tmp/table-readers");
-    var second = try manager.beginRead("/tmp/../tmp/table-readers");
+    var first = try manager.beginRead(path);
+    var second = try manager.beginRead(path_alias);
     try std.testing.expectEqual(@as(usize, 1), manager.path_states.count());
     const state = manager.path_states.get(first.path_key) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 2), state.readers);
-    try std.testing.expectError(error.GenerationTransitionActive, manager.beginExclusive("/tmp/table-readers"));
+    try std.testing.expectError(error.GenerationTransitionActive, manager.beginExclusive(path));
 
     first.deinit();
-    try std.testing.expectError(error.GenerationTransitionActive, manager.beginExclusive("/tmp/table-readers"));
+    try std.testing.expectError(error.GenerationTransitionActive, manager.beginExclusive(path));
     second.deinit();
     try std.testing.expectEqual(@as(usize, 0), manager.path_states.count());
 
-    var transition = try manager.beginExclusive("/tmp/table-readers");
+    var transition = try manager.beginExclusive(path);
     transition.deinit();
 }
 
 test "serving reconciliation serializes with exclusive generation transition" {
-    const path = "/tmp/antfly-generation-reconciliation-serialization";
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/reconciliation-serialization", .{tmp.sub_path});
+    defer alloc.free(path);
     var reconciliation = (try process_manager.beginReconciliation(path)) orelse return error.TestUnexpectedResult;
     defer reconciliation.deinit();
 
@@ -2092,17 +2113,23 @@ test "reconciliation cache canonicalizes aliases for transition invalidation" {
 
 test "reconciliation cache expires when the final reader drains" {
     const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/reconciliation-reader-cache", .{tmp.sub_path});
+    defer alloc.free(path);
+    const canonical_path = try canonicalPathAlloc(alloc, path);
+    defer alloc.free(canonical_path);
+
     var manager = Manager.init(alloc);
     defer manager.deinit();
 
-    const path = "/tmp/antfly-generation-reconciliation-reader-cache";
     var reconciliation = (try manager.beginReconciliation(path)) orelse return error.TestUnexpectedResult;
     try manager.promoteReconciliationToRead(path, reconciliation.id, true);
     reconciliation.active = false;
     try std.testing.expect(manager.reconciled_paths.contains(reconciliation.path_key));
 
     manager.finishRead(path, reconciliation.id);
-    try std.testing.expect(!manager.reconciled_paths.contains(path));
+    try std.testing.expect(!manager.reconciled_paths.contains(canonical_path));
     try std.testing.expect((try manager.beginReadIfReconciled(path)) == null);
 }
 

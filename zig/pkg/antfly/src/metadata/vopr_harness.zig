@@ -198,16 +198,16 @@ pub const VoprSplitRuntime = struct {
                     }
                 }
             }
-            // New or interrupted initialization needs a fixture owner even
-            // before a destination DB exists. Failed initialization retries
-            // here; merely having a cached entry is not terminal evidence.
+            // Observation may initialize missing fixture stores, but a
+            // follower that only observes must not retain the destination
+            // writer after the split is retired from the catalog. Only
+            // mutating workflow steps retain a coordinator across calls.
+            defer self.releaseCoordinator(self.entryFor(transition_id, attempt_epoch, source_group_id, destination_group_id));
             const status = try (try self.withCoordinator(transition_id, attempt_epoch, source_group_id, destination_group_id, struct {
                 fn call(coord: *data_mod.SplitSyncCoordinator) !data_mod.storage.db_split_handoff.SplitSyncStatus {
                     return try coord.status();
                 }
             }.call, .{}));
-            if (status.phase == .finalized or status.phase == .rolled_back)
-                self.releaseCoordinator(self.entryFor(transition_id, attempt_epoch, source_group_id, destination_group_id));
             return fromStorageStatus(status);
         }
         return self.entryFor(transition_id, attempt_epoch, source_group_id, destination_group_id).status;
@@ -569,6 +569,15 @@ test "metadata VOPR split runtime preserves source identity namespace" {
     // A failed initialization leaves a retryable entry, not a terminal one.
     const initial = try split.observeStatus(7001, 1, 701, 702);
     try std.testing.expect(!initial.bootstrapped);
+    // An observer must release its temporary writer before public traffic
+    // acquires the destination, even if it never executes a split step.
+    {
+        var destination = try db_mod.DB.open(alloc, destination_root_dir, .{
+            .identity_namespace = source_namespace,
+            .start_index_workers = false,
+        });
+        destination.close();
+    }
     try std.testing.expect(try split.prepareSource(7001, 1, 701, 702, "doc:m", "doc:z"));
     const prepared = try split.observeStatus(7001, 1, 701, 702);
     try std.testing.expect(!prepared.bootstrapped);
@@ -665,7 +674,8 @@ fn ensureGroupTextIndexProgressPredicate(cluster: *MetadataHttpClusterVopr, ptr:
     };
     defer read_db.close();
 
-    if (read_db.core.index_manager.textIndex(ctx.index_name) != null) return true;
+    if (read_db.core.index_manager.textIndex(ctx.index_name) != null)
+        return !read_db.core.index_manager.repairUnavailable(ctx.index_name);
 
     var db = db_mod.DB.open(cluster.alloc, path, .{
         .identity_namespace = identity_namespace,
@@ -1204,6 +1214,19 @@ pub fn mirrorGroupBatchToActiveReplicas(
         if (cluster.node(i).status(group_id) != .active) continue;
         var response = try client.fetchGroupBatch(base_uri, group_id, table_name, body);
         defer response.deinit(std.heap.page_allocator);
+        // This coarse fixture has no DataServer repair scheduler. Own the
+        // bounded initial-index materialization through the production repair
+        // endpoint before treating the mirrored replica as query-ready.
+        for (0..40) |_| {
+            var repair = try client.fetchGroupArtifactRepairRun(base_uri, group_id, table_name,
+                \\{"target":"index","index_name":"full_text_index_v0","limit":16}
+            );
+            defer repair.deinit(std.heap.page_allocator);
+            var result = try std.json.parseFromSlice(struct { debt_remaining: bool, has_more: bool }, cluster.alloc, repair.body, .{ .ignore_unknown_fields = true });
+            defer result.deinit();
+            if (!result.value.debt_remaining and !result.value.has_more) break;
+            try cluster.stepAll();
+        } else return error.VoprIndexMaterializationIncomplete;
     }
 }
 
@@ -1970,7 +1993,9 @@ fn verifyComposedMergePublicTraffic(
 
     try acknowledged_model.verify(cluster, client, client_base, table_name, cfg.lookup_rounds);
     if (cfg.expect_profile) {
-        try std.testing.expect(try waitForHelloCountProfile(cluster, client, client_base, table_name, @intCast(acknowledged_model.len), 1, true, cfg.lookup_rounds));
+        // The merged table now routes to one shard, so query execution has
+        // no cross-shard merge stage even though a range merge preceded it.
+        try std.testing.expect(try waitForHelloCountProfile(cluster, client, client_base, table_name, @intCast(acknowledged_model.len), 1, false, cfg.lookup_rounds));
     }
 }
 
@@ -4634,9 +4659,10 @@ pub const MetadataHttpClusterVopr = struct {
             for (backend_runtimes[0..backend_runtime_count]) |*runtime| runtime.deinit();
             alloc.free(backend_runtimes);
         }
-        for (backend_runtimes) |*runtime| {
+        for (backend_runtimes, deps) |*runtime, dep| {
             runtime.* = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{
                 .backend = .manual,
+                .borrowed_io = if (dep.borrowed_io) |io| .{ .general = io } else null,
                 .filesystem_io = std.testing.io,
             });
             backend_runtime_count += 1;
@@ -6229,6 +6255,9 @@ const PublicApiLinearizableReadDriver = struct {
     cluster: ?*MetadataHttpClusterVopr = null,
     node_index: usize,
     downstream: ?raft_state_machine.ReadStateObserver = null,
+    // A logical namespace, stable across replay. Additional drivers sharing
+    // a node use distinct scopes; process addresses never enter Raft frames.
+    request_scope: u64 = 0,
     ensure_mutex: std.Io.Mutex = .init,
     completion_mutex: std.Io.Mutex = .init,
     max_rounds: usize = 48,
@@ -6238,11 +6267,16 @@ const PublicApiLinearizableReadDriver = struct {
     completed_request_sequence: u64 = 0,
     completed_read_index: u64 = 0,
 
+    fn io(self: *const @This()) std.Io {
+        const cluster = self.cluster orelse return std.Options.debug_io;
+        return cluster.backendRuntime(self.node_index).io() orelse std.Options.debug_io;
+    }
+
     fn requestContext(self: *const @This(), buf: []u8, sequence: u64) ![]u8 {
         return try std.fmt.bufPrint(
             buf,
             "public-api-linearizable-read/{x}/{d}/{d}",
-            .{ @intFromPtr(self), self.node_index, sequence },
+            .{ self.request_scope, self.node_index, sequence },
         );
     }
 
@@ -6255,9 +6289,9 @@ const PublicApiLinearizableReadDriver = struct {
 
     fn onReadStates(ptr: *anyopaque, group_id: u64, read_states: []const raft_engine.core.ReadState) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        self.completion_mutex.lockUncancelable(std.Options.debug_io);
+        self.completion_mutex.lockUncancelable(self.io());
         {
-            defer self.completion_mutex.unlock(std.Options.debug_io);
+            defer self.completion_mutex.unlock(self.io());
             if (group_id == self.active_group_id) {
                 const request_sequence = self.active_request_sequence;
                 var request_context_buf: [96]u8 = undefined;
@@ -6281,8 +6315,8 @@ const PublicApiLinearizableReadDriver = struct {
     }
 
     fn activateRequest(self: *@This(), group_id: u64) !u64 {
-        self.completion_mutex.lockUncancelable(std.Options.debug_io);
-        defer self.completion_mutex.unlock(std.Options.debug_io);
+        self.completion_mutex.lockUncancelable(self.io());
+        defer self.completion_mutex.unlock(self.io());
         // Never recycle a generation: doing so could make an extremely old
         // delayed response indistinguishable from the active request.
         if (self.request_sequence == std.math.maxInt(u64))
@@ -6297,8 +6331,8 @@ const PublicApiLinearizableReadDriver = struct {
     }
 
     fn completedReadIndex(self: *@This(), sequence: u64) ?u64 {
-        self.completion_mutex.lockUncancelable(std.Options.debug_io);
-        defer self.completion_mutex.unlock(std.Options.debug_io);
+        self.completion_mutex.lockUncancelable(self.io());
+        defer self.completion_mutex.unlock(self.io());
         if (self.completed_request_sequence != sequence) return null;
         return self.completed_read_index;
     }
@@ -6308,8 +6342,8 @@ const PublicApiLinearizableReadDriver = struct {
     }
 
     fn ensureUntil(self: *@This(), deadline_ns: ?u64) !PublicApiLinearizableReadProof {
-        self.ensure_mutex.lockUncancelable(std.Options.debug_io);
-        defer self.ensure_mutex.unlock(std.Options.debug_io);
+        self.ensure_mutex.lockUncancelable(self.io());
+        defer self.ensure_mutex.unlock(self.io());
         const cluster = self.cluster orelse return error.MetadataLinearizableReadTimeout;
         cluster.scheduler_gate.lock();
         defer cluster.scheduler_gate.unlock();
@@ -6359,12 +6393,16 @@ const PublicApiLinearizableReadDriver = struct {
 
 test "public api linearizable read driver ignores a delayed earlier generation" {
     var driver = PublicApiLinearizableReadDriver{ .node_index = 2 };
-    var peer_driver = PublicApiLinearizableReadDriver{ .node_index = 2 };
+    var peer_driver = PublicApiLinearizableReadDriver{ .node_index = 2, .request_scope = 1 };
     const group_id: u64 = 91;
 
     const earlier_sequence = try driver.activateRequest(group_id);
     var earlier_context_buf: [96]u8 = undefined;
     const earlier_context = try driver.requestContext(&earlier_context_buf, earlier_sequence);
+    var replay_driver = PublicApiLinearizableReadDriver{ .node_index = 2 };
+    const replay_sequence = try replay_driver.activateRequest(group_id);
+    var replay_context_buf: [96]u8 = undefined;
+    try std.testing.expectEqualStrings(earlier_context, try replay_driver.requestContext(&replay_context_buf, replay_sequence));
     const peer_sequence = try peer_driver.activateRequest(group_id);
     var peer_context_buf: [96]u8 = undefined;
     const peer_context = try peer_driver.requestContext(&peer_context_buf, peer_sequence);
@@ -7034,6 +7072,7 @@ fn startPublicApiServers(
         _ = write_sources[i].withInternalServiceAuth(vopr_internal_service_secret, "metadata-vopr");
         attachHostedSourcesBackendRuntimeForVopr(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
         var server_config: api_http_server.ApiHttpServerConfig = .{
+            .backend_runtime = cluster.backendRuntime(i),
             .internal_service_secret = vopr_internal_service_secret,
             .internal_service_issuer = "metadata-vopr",
         };
@@ -7461,6 +7500,9 @@ pub const VoprPublicClusterFixture = struct {
         // startAll publishes the harness's default in-process routes. Do that
         // before replacing them with concrete httpx listener targets so the
         // wire routes remain authoritative throughout bootstrap.
+        // Teardown owns partially started hosts too; quorum formation may
+        // be canceled after their maintenance tasks have already parked.
+        self.cluster_started = true;
         try self.cluster.startAll();
         self.cluster.virtual_network.useSerializedDrains();
         self.bootstrap_phase = .metadata_runtime_ready;
@@ -7504,7 +7546,6 @@ pub const VoprPublicClusterFixture = struct {
             self.factories[index].merge_runtime.backend_runtime = self.cluster.backendRuntime(index);
         }
         self.metadata_leader_index = try finishBootstrappedMetadataCluster(&self.cluster, 48, true);
-        self.cluster_started = true;
         self.bootstrap_phase = .metadata_quorum_ready;
 
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
@@ -8054,6 +8095,32 @@ pub const VoprPublicClusterFixture = struct {
         defer response.deinit(self.alloc);
         self.write_sound = response.status >= 200 and response.status < 300 and
             std.mem.indexOf(u8, response.body, "\"inserted\":3") != null;
+        if (self.write_sound) self.materializeHostedGraphIndexes() catch |err| {
+            self.write_sound = false;
+            self.request_errors +|= 1;
+            self.last_request_error_code = @intFromError(err);
+        };
+    }
+
+    fn materializeHostedGraphIndexes(self: *VoprPublicClusterFixture) !void {
+        // This hosted fixture has no DataServer maintenance scheduler. After
+        // identity bootstrap and writes, drive the production repair endpoint
+        // to completion before releasing the graph reader.
+        for ([_]u64{ data_group_id, graph_data_group_id }) |group_id| {
+            for (self.api_base_uris[0..self.uri_count], 0..) |base_uri, node_index| {
+                if (self.cluster.node(node_index).status(group_id) != .active) continue;
+                for (0..40) |_| {
+                    var response = try self.client.fetchGroupArtifactRepairRun(base_uri, group_id, "docs",
+                        \\{"target":"index","index_name":"graph_idx","limit":16}
+                    );
+                    defer response.deinit(self.alloc);
+                    var result = try std.json.parseFromSlice(struct { debt_remaining: bool, has_more: bool }, self.alloc, response.body, .{ .ignore_unknown_fields = true });
+                    defer result.deinit();
+                    if (!result.value.debt_remaining and !result.value.has_more) break;
+                    try self.cluster.stepAll();
+                } else return error.VoprIndexMaterializationIncomplete;
+            }
+        }
     }
 
     fn runReader(self: *VoprPublicClusterFixture) void {
@@ -8132,9 +8199,9 @@ pub const VoprPublicClusterFixture = struct {
 
         self.graph_fault_workload_ready.waitUncancelable(self.sim.io());
         if (self.fault_mode == .graph_transport_failure) {
-            while (!self.read_finished or !self.tenant_read_finished) self.sim.io().sleep(.fromNanoseconds(1), .awake) catch return;
+            while (!self.read_finished or !self.tenant_read_finished) self.sim.io().sleep(.fromMilliseconds(1), .awake) catch return;
         } else if (self.fault_mode != .graph_inflight_restart and self.fault_mode != .graph_topology_churn) {
-            while (!self.fault_finished) self.sim.io().sleep(.fromNanoseconds(1), .awake) catch return;
+            while (!self.fault_finished) self.sim.io().sleep(.fromMilliseconds(1), .awake) catch return;
         }
         const query_body = test_contract_helpers.encodeGraphTraverseQueryRequest(
             self.alloc,
@@ -8291,7 +8358,7 @@ pub const VoprPublicClusterFixture = struct {
 
     fn restartNonHost(self: *VoprPublicClusterFixture) void {
         self.write_done.waitUncancelable(self.sim.io());
-        while (!self.read_finished) self.sim.io().sleep(.fromNanoseconds(1), .awake) catch {
+        while (!self.read_finished) self.sim.io().sleep(.fromMilliseconds(1), .awake) catch {
             self.request_errors +|= 1;
             self.fault_finished = true;
             return;
@@ -8307,7 +8374,7 @@ pub const VoprPublicClusterFixture = struct {
 
     fn restartGraphLeaderDuringQuery(self: *VoprPublicClusterFixture) void {
         self.graph_round_paused.waitUncancelable(self.sim.io());
-        while (!self.read_finished or !self.tenant_read_finished) self.sim.io().sleep(.fromNanoseconds(1), .awake) catch {
+        while (!self.read_finished or !self.tenant_read_finished) self.sim.io().sleep(.fromMilliseconds(1), .awake) catch {
             self.request_errors +|= 1;
             self.fault_finished = true;
             self.graph_fault_recovered.set(self.sim.io());
@@ -8333,7 +8400,7 @@ pub const VoprPublicClusterFixture = struct {
 
     fn mergeGraphRangesDuringQuery(self: *VoprPublicClusterFixture) void {
         self.graph_round_paused.waitUncancelable(self.sim.io());
-        while (!self.read_finished or !self.tenant_read_finished) self.sim.io().sleep(.fromNanoseconds(1), .awake) catch {
+        while (!self.read_finished or !self.tenant_read_finished) self.sim.io().sleep(.fromMilliseconds(1), .awake) catch {
             self.request_errors +|= 1;
             self.fault_finished = true;
             self.graph_fault_recovered.set(self.sim.io());
@@ -8523,10 +8590,12 @@ pub const VoprPublicClusterFixture = struct {
     }
 
     fn shutdownWhenComplete(self: *VoprPublicClusterFixture) void {
+        // Match the millisecond service cadence. A nanosecond poll becomes
+        // the earliest virtual timer and starves real retry/transport timers.
         while (!self.write_finished or !self.read_finished or !self.tenant_write_finished or
             !self.tenant_read_finished or !self.graph_read_finished or !self.fault_finished)
         {
-            self.sim.io().sleep(.fromNanoseconds(1), .awake) catch {
+            self.sim.io().sleep(.fromMilliseconds(1), .awake) catch {
                 self.request_errors +|= 1;
                 return;
             };
@@ -8601,15 +8670,18 @@ pub const VoprPublicClusterFixture = struct {
     pub fn beginTeardown(self: *VoprPublicClusterFixture) void {
         if (self.teardown_started) return;
         self.teardown_started = true;
+        if (self.stack_live) for (&self.write_sources) |*source| source.beginTeardown();
         if (self.client_executor_live) self.client_http_executor.beginShutdown();
         if (self.forward_executor_live) self.forward_http_executor.beginShutdown();
         if (self.stack_live) for (self.listeners[0..self.uri_count]) |*listener|
             listener.requestStop();
         for (self.raft_wire_runtimes[0..self.raft_wire_runtime_count]) |*runtime|
             runtime.requestStop();
-        if (self.cluster_started) {
+        if (self.cluster_live) {
             for (self.cluster.cluster.nodes) |*node|
                 node.runtime.svc.beginTransportShutdown();
+        }
+        if (self.cluster_started) {
             self.cluster.stopAll();
             self.cluster_started = false;
         }
@@ -16469,9 +16541,9 @@ test "metadata VOPR http cluster load balanced backup retries a real election" {
         makeHostVoprConfig(3, 4973, root_c, cat_c),
     };
     var read_drivers = [_]PublicApiLinearizableReadDriver{
-        .{ .node_index = 0 },
-        .{ .node_index = 1 },
-        .{ .node_index = 2 },
+        .{ .node_index = 0, .request_scope = 1 },
+        .{ .node_index = 1, .request_scope = 1 },
+        .{ .node_index = 2, .request_scope = 1 },
     };
     var deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),

@@ -3331,26 +3331,31 @@ pub fn build(b: *std.Build) void {
     const bench_image_step = b.step("bench-image", "Run lib/image decode benchmarks");
     bench_image_step.dependOn(&run_lib_image_bench.step);
 
+    const pdf_bench_optimize = b.option(
+        std.builtin.OptimizeMode,
+        "pdf-optimize",
+        "Optimization for the isolated PDF executable",
+    ) orelse .ReleaseFast;
     const pdf_bench_image_mod = b.createModule(.{
         .root_source_file = b.path("lib/image/src/mod.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = pdf_bench_optimize,
     });
     pdf_bench_image_mod.addImport("antfly_hash", hash_bench_mod);
     const pdf_bench_font_mod = b.createModule(.{
         .root_source_file = b.path("lib/font/src/mod.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = pdf_bench_optimize,
     });
     const pdf_bench_pdf_mod = b.createModule(.{
         .root_source_file = b.path("lib/pdf/src/mod.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = pdf_bench_optimize,
     });
     const pdf_bench_standard_fonts_mod = b.createModule(.{
         .root_source_file = b.path("pdf_standard_fonts.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = pdf_bench_optimize,
     });
     pdf_bench_pdf_mod.addImport("antfly_image", pdf_bench_image_mod);
     pdf_bench_pdf_mod.addImport("antfly_font", pdf_bench_font_mod);
@@ -3363,13 +3368,19 @@ pub fn build(b: *std.Build) void {
     const pdf_bench_mod = b.createModule(.{
         .root_source_file = b.path("lib/pdf/src/pdf_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = pdf_bench_optimize,
     });
     pdf_bench_mod.addImport("antfly_pdf", pdf_bench_pdf_mod);
     const lib_pdf_bench = b.addExecutable(.{
         .name = "lib-pdf-bench",
         .root_module = pdf_bench_mod,
     });
+    const install_lib_pdf_bench = b.addInstallArtifact(lib_pdf_bench, .{});
+    const lib_pdf_bench_build_step = b.step(
+        "lib-pdf-bench-install",
+        "Install the lib/pdf benchmark executable (pdf-only dependency closure)",
+    );
+    lib_pdf_bench_build_step.dependOn(&install_lib_pdf_bench.step);
     const run_lib_pdf_bench = b.addRunArtifact(lib_pdf_bench);
     if (b.args) |args| {
         run_lib_pdf_bench.addArgs(args);
@@ -3790,6 +3801,18 @@ pub fn build(b: *std.Build) void {
     const run_embedded_tests = addFilteredTestRunArtifact(b, embedded_tests);
     const embedded_test_step = b.step("embedded-test", "Run embedded API tests");
     embedded_test_step.dependOn(&run_embedded_tests.step);
+    // Imported module roots do not collect their own tests through the package
+    // surface test, so run the API fixtures in their owning module as well.
+    const embedded_api_tests = b.addTest(.{
+        .root_module = embedded_api_mod,
+        .filters = &.{
+            "embedded api round-trips batch lookup scan and search over memory-backed durable lsm",
+            "embedded api hosted profile drains derived indexing without native runtimes",
+            "embedded api hosted profile persists text index across reopen over storage",
+        },
+    });
+    const run_embedded_api_tests = addFilteredTestRunArtifact(b, embedded_api_tests);
+    embedded_test_step.dependOn(&run_embedded_api_tests.step);
 
     const antfly_embedded_pkg_tests = b.addTest(.{
         .root_module = antfly_embedded_pkg_mod,
@@ -8049,6 +8072,7 @@ pub fn build(b: *std.Build) void {
     const vopr_cli_registry_tests = b.addTest(.{
         .root_module = vopr_cli_mod,
         .filters = &.{"VOPR scenario registry"},
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 7) * 1024 * 1024 * 1024,
     });
     const run_vopr_cli_registry_tests = b.addRunArtifact(vopr_cli_registry_tests);
     const vopr_registry_test_step = b.step("vopr-registry-test", "Record and exact-replay every context-free VOPR scenario through the CLI registry");
@@ -8256,6 +8280,28 @@ pub fn build(b: *std.Build) void {
     // one honest shared amount so the build scheduler cannot co-schedule them
     // under stale per-mode estimates. Linux retains its measured 7 GiB bound.
     const full_cluster_vopr_max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024;
+    const migration_regression_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "metadata VOPR distributed data survives split partition node restart and modeled storage crash",
+            "metadata VOPR split runtime preserves source identity namespace",
+            "public api linearizable read driver ignores a delayed earlier generation",
+            "table transaction identities borrow runtime entropy and realtime",
+            "transaction attempt budgets follow the borrowed transport clock",
+            "pre-decision context deadline has typed admission provenance",
+            "internal transaction ingress establishes and validates pre-decision deadline",
+            "table reads translate request deadlines into the routing clock",
+            "catalog route fence dispatch is strict and fail closed",
+            "db modeled index repair adopts replacements with the serving allocator",
+            "full cluster production data plane VOPR bounded cutoff exact replay",
+            "full cluster VOPR exact replays the composed deployment and recovery",
+        },
+        .max_rss = full_cluster_vopr_max_rss,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_migration_regressions = b.addRunArtifact(migration_regression_tests);
+    b.step("vopr-migration-regression-test", "Run VOPR I/O migration ownership and replay regressions").dependOn(&run_migration_regressions.step);
+
     const full_cluster_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster VOPR exact replays"},
@@ -9624,6 +9670,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     storage_vopr_runtime_test_mod.addImport("antfly_platform", platform_mod);
+    storage_vopr_runtime_test_mod.addImport("antfly_hash", hash_mod);
     const storage_vopr_runtime_tests = b.addTest(.{
         .root_module = storage_vopr_runtime_test_mod,
     });

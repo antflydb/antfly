@@ -85,8 +85,12 @@ pub const Lane = struct {
     }
 
     pub fn stats(self: *const Lane) Stats {
+        var pending: usize = 0;
+        for (self.entries.items) |entry| if (!entry.finished) {
+            pending += 1;
+        };
         return .{
-            .pending_jobs = self.entries.items.len,
+            .pending_jobs = pending,
             .completed_jobs = self.completed_jobs,
             .failed_jobs = self.failed_jobs,
             .last_error_name = self.last_error_name,
@@ -98,6 +102,7 @@ pub const Lane = struct {
         if (job.owner_id == 0) return error.InvalidBackgroundOwner;
         if (self.closed_owners.contains(job.owner_id)) return error.BackgroundOwnerClosed;
         if (self.paused_owners.contains(job.owner_id)) return error.BackgroundOwnerPaused;
+        _ = try poll(self, self.entries.items.len);
 
         const entry = try self.allocator.create(Entry);
         errdefer self.allocator.destroy(entry);
@@ -151,9 +156,23 @@ pub const Lane = struct {
         try self.registerOwner(owner_id);
     }
 
-    fn poll(_: *anyopaque, _: usize) !usize {
-        // Execution is exclusively controlled by SchedulerPort choices.
-        return 0;
+    fn poll(ptr: *anyopaque, max_jobs: usize) !usize {
+        const self: *Lane = @ptrCast(@alignCast(ptr));
+        var reaped: usize = 0;
+        var index: usize = 0;
+        while (index < self.entries.items.len and reaped < max_jobs) {
+            const entry = self.entries.items[index];
+            if (!entry.finished) {
+                index += 1;
+                continue;
+            }
+            // Only reclaim completed groups. Job execution remains entirely
+            // controlled by SchedulerPort choices, including cancellation.
+            entry.group.await(self.io) catch {};
+            self.removeAndDestroyEntry(entry);
+            reaped += 1;
+        }
+        return reaped;
     }
 
     fn findOwnerEntry(self: *Lane, owner_id: u64) ?*Entry {
@@ -225,7 +244,11 @@ test "VOPR durable job lane runs the production LSM background executor as a sch
     try std.testing.expectEqual(@as(usize, 1), context.runs);
     try std.testing.expectEqual(@as(usize, 1), context.deinits);
     try std.testing.expectEqual(@as(u64, 1), adapter.stats().completed_jobs);
+    try std.testing.expectEqual(@as(usize, 0), adapter.stats().pending_jobs);
+    try std.testing.expectEqual(@as(usize, 1), try adapter.lane().poll(1));
+    try std.testing.expectEqual(@as(usize, 0), try adapter.lane().poll(1));
     adapter.lane().drainOwner(41);
+    try std.testing.expectEqual(@as(usize, 1), context.deinits);
     try std.testing.expectEqual(@as(usize, 0), adapter.stats().pending_jobs);
 }
 

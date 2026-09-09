@@ -120,6 +120,10 @@ pub const CatalogSource = struct {
         return self.budget(null).deadlineFrom(source);
     }
 
+    pub fn routeFenceDeadline(self: CatalogSource, fence: metadata_api.CatalogRouteFence) ?u64 {
+        return self.deadlineFrom(.{ .deadline_ns = fence.admission_deadline_ns, .io = fence.admission_deadline_io });
+    }
+
     pub const VTable = struct {
         /// Snapshot slices and all transitively referenced bytes must remain
         /// valid until the matching `free_admin_snapshot` call returns.

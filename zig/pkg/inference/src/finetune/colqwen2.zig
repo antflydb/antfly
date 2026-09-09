@@ -1075,6 +1075,7 @@ pub fn trainLoRABundleOneStep(
         .lazy_weights = .{},
     };
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
     var optimizer_state = optimizers.OptimizerState.init(allocator);
     defer optimizer_state.deinit();

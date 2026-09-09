@@ -330,7 +330,7 @@ pub const DataPlaneScenario = struct {
 
     const Stage = enum { admit, route, packet, persist, apply, acknowledge, split_copy, split_cutover, read, terminal };
     const State = struct {
-        sim: vopr.vopr_io.VoprIo,
+        vopr_io: vopr.vopr_io.VoprIo,
         pair: [2]std.Io.net.Socket,
         raft_log: std.Io.File,
         stage: Stage = .admit,
@@ -352,9 +352,9 @@ pub const DataPlaneScenario = struct {
     pub fn init(allocator: Allocator) !World {
         const state = try allocator.create(State);
         errdefer allocator.destroy(state);
-        state.sim = try .init(.{ .required = .of(&.{ .files, .sockets, .task_scheduling, .resources }) });
-        errdefer state.sim.deinit();
-        const io = state.sim.io();
+        state.vopr_io = try .init(.{ .required = .of(&.{ .files, .sockets, .task_scheduling, .resources }) });
+        errdefer state.vopr_io.deinit();
+        const io = state.vopr_io.io();
         state.pair = try std.Io.net.Socket.createPair(io, .{});
         errdefer {
             state.pair[0].close(io);
@@ -379,18 +379,18 @@ pub const DataPlaneScenario = struct {
     }
     pub fn deinit(world: *World, allocator: Allocator) void {
         const state = world.state;
-        const io = state.sim.io();
+        const io = state.vopr_io.io();
         state.raft_log.close(io);
         state.pair[0].close(io);
         state.pair[1].close(io);
-        state.sim.deinit();
+        state.vopr_io.deinit();
         allocator.destroy(state);
         world.* = undefined;
     }
     pub fn enumerate(world: *World, list: *vopr.transition.List, allocator: Allocator) !void {
         const state = world.state;
         if (state.stage == .packet) {
-            try state.sim.scheduler().enumerateReady(list, allocator);
+            try state.vopr_io.scheduler().enumerateReady(list, allocator);
             return;
         }
         switch (state.stage) {
@@ -414,15 +414,15 @@ pub const DataPlaneScenario = struct {
     }
     pub fn execute(world: *World, selected: vopr.transition.Transition, events: *vopr.event.Sink, allocator: Allocator) !vopr.outcome.TransitionOutcome {
         const state = world.state;
-        const io = state.sim.io();
+        const io = state.vopr_io.io();
         if (selected.id == admit_id) {
             state.request_admitted = true;
             state.stage = .route;
         } else if (selected.id == drop_id) {
-            state.sim.dropNextNetworkPacket();
+            state.vopr_io.dropNextNetworkPacket();
             state.drop_injected = true;
         } else if (selected.id == duplicate_id) {
-            state.sim.duplicateNextNetworkPacket();
+            state.vopr_io.duplicateNextNetworkPacket();
             state.duplicate_injected = true;
         } else if (selected.id == route_id) {
             var stream = std.Io.net.Stream{ .socket = state.pair[0] };
@@ -433,8 +433,8 @@ pub const DataPlaneScenario = struct {
             state.stage = .packet;
         } else if (state.stage == .packet) {
             const dropped = std.mem.eql(u8, selected.name, "vopr-io.packet_drop");
-            try state.sim.scheduler().executeReady(selected.id, events, allocator);
-            if (state.sim.scheduler().quiescent()) state.stage = if (dropped) .route else .persist;
+            try state.vopr_io.scheduler().executeReady(selected.id, events, allocator);
+            if (state.vopr_io.scheduler().quiescent()) state.stage = if (dropped) .route else .persist;
         } else if (selected.id == persist_id) {
             try state.raft_log.writeStreamingAll(io, "put:a=1");
             try state.raft_log.sync(io);
@@ -565,7 +565,7 @@ pub const DerivedWorkflowScenario = struct {
         fn deinit(_: *anyopaque) void {}
     };
     const State = struct {
-        sim: vopr.vopr_io.VoprIo,
+        vopr_io: vopr.vopr_io.VoprIo,
         lane: durable_job_lane.Lane,
         contexts: [5]JobContext,
         stage: Stage = .provider,
@@ -584,9 +584,9 @@ pub const DerivedWorkflowScenario = struct {
     pub fn init(allocator: Allocator) !World {
         const state = try allocator.create(State);
         errdefer allocator.destroy(state);
-        state.sim = try .init(.{ .required = .of(&.{.task_scheduling}) });
-        errdefer state.sim.deinit();
-        state.lane = .init(allocator, state.sim.io());
+        state.vopr_io = try .init(.{ .required = .of(&.{.task_scheduling}) });
+        errdefer state.vopr_io.deinit();
+        state.lane = .init(allocator, state.vopr_io.io());
         errdefer state.lane.deinit();
         state.stage = .provider;
         state.owner_id = 1;
@@ -603,13 +603,13 @@ pub const DerivedWorkflowScenario = struct {
     }
     pub fn deinit(world: *World, allocator: Allocator) void {
         world.state.lane.deinit();
-        world.state.sim.deinit();
+        world.state.vopr_io.deinit();
         allocator.destroy(world.state);
         world.* = undefined;
     }
     pub fn enumerate(world: *World, list: *vopr.transition.List, allocator: Allocator) !void {
         const state = world.state;
-        try state.sim.scheduler().enumerateReady(list, allocator);
+        try state.vopr_io.scheduler().enumerateReady(list, allocator);
         switch (state.stage) {
             .provider => try add(list, allocator, provider_id, name ++ ".provider_result", .workload),
             .checkpoint_ready => try add(list, allocator, checkpoint_id, name ++ ".checkpoint_submit", .maintenance),
@@ -643,7 +643,7 @@ pub const DerivedWorkflowScenario = struct {
             try state.lane.registerOwner(state.owner_id);
             state.canceled = true;
             state.stage = .cleanup_ready;
-        } else try state.sim.scheduler().executeReady(selected.id, events, allocator);
+        } else try state.vopr_io.scheduler().executeReady(selected.id, events, allocator);
         try events.emitNamed(allocator, .domain, selected.name, @intFromEnum(state.stage));
         return .applied();
     }
@@ -868,7 +868,7 @@ pub const ClockLeaseTtlScenario = struct {
     const timer_id = transitionId(name, "timer_delivery");
     const stabilize_id = transitionId(name, "stabilize_and_cleanup");
     const State = struct {
-        sim: vopr.vopr_io.VoprIo,
+        vopr_io: vopr.vopr_io.VoprIo,
         clock: vopr.clock_fault.Domain,
         steps: u8 = 0,
         lease_deadline_real: i96 = 100,
@@ -882,9 +882,9 @@ pub const ClockLeaseTtlScenario = struct {
     pub fn init(allocator: Allocator) !World {
         const state = try allocator.create(State);
         errdefer allocator.destroy(state);
-        state.sim = try .init(.{ .required = .of(&.{ .clock_read, .sleep }), .realtime_ns = 50 });
-        errdefer state.sim.deinit();
-        state.clock = try .init(&state.sim, .{ .fault_budget = 4 });
+        state.vopr_io = try .init(.{ .required = .of(&.{ .clock_read, .sleep }), .realtime_ns = 50 });
+        errdefer state.vopr_io.deinit();
+        state.clock = try .init(&state.vopr_io, .{ .fault_budget = 4 });
         state.steps = 0;
         state.lease_deadline_real = 100;
         state.ttl_deadline_real = 120;
@@ -895,7 +895,7 @@ pub const ClockLeaseTtlScenario = struct {
         return .{ .state = state };
     }
     pub fn deinit(world: *World, allocator: Allocator) void {
-        world.state.sim.deinit();
+        world.state.vopr_io.deinit();
         allocator.destroy(world.state);
         world.* = undefined;
     }
@@ -918,7 +918,7 @@ pub const ClockLeaseTtlScenario = struct {
         const state = world.state;
         if (selected.id == forward_id) try state.clock.jumpRealtime(30) else if (selected.id == backward_id) try state.clock.jumpRealtime(-20) else if (selected.id == monotonic_id) try state.clock.advance(25) else if (selected.id == frequency_id) try state.clock.setRate(if (state.clock.rate_ppm == vopr.clock_fault.normal_rate_ppm) 1_500_000 else vopr.clock_fault.normal_rate_ppm) else if (selected.id == pause_id) try state.clock.setPaused(!state.clock.paused) else if (selected.id == timer_id) try state.clock.deliverTimers() else if (selected.id == stabilize_id) {
             try state.clock.stabilize();
-            const now_real = std.Io.Clock.real.now(state.sim.io()).toNanoseconds();
+            const now_real = std.Io.Clock.real.now(state.vopr_io.io()).toNanoseconds();
             if (now_real < 130) try state.clock.advance(@intCast(130 - now_real));
             state.takeover = true;
             state.deleted = true;
@@ -929,15 +929,15 @@ pub const ClockLeaseTtlScenario = struct {
     }
     pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: Allocator) !void {
         const state = world.state;
-        try builder.addNamed(allocator, name ++ ".real", @intCast(std.Io.Clock.real.now(state.sim.io()).toNanoseconds()));
-        try builder.addNamed(allocator, name ++ ".monotonic", @intCast(std.Io.Clock.awake.now(state.sim.io()).toNanoseconds()));
+        try builder.addNamed(allocator, name ++ ".real", @intCast(std.Io.Clock.real.now(state.vopr_io.io()).toNanoseconds()));
+        try builder.addNamed(allocator, name ++ ".monotonic", @intCast(std.Io.Clock.awake.now(state.vopr_io.io()).toNanoseconds()));
         try builder.addNamed(allocator, name ++ ".rate_ppm", state.clock.rate_ppm);
         try builder.addNamed(allocator, name ++ ".paused", @intFromBool(state.clock.paused));
         try builder.addNamed(allocator, name ++ ".stable", @intFromBool(state.stable));
     }
     pub fn evaluate(world: *World, sink: *vopr.property.Sink, allocator: Allocator) !void {
         const state = world.state;
-        const now = std.Io.Clock.real.now(state.sim.io()).toNanoseconds();
+        const now = std.Io.Clock.real.now(state.vopr_io.io()).toNanoseconds();
         if (state.takeover and now < state.lease_deadline_real) state.early_action = true;
         if (state.deleted and now < state.ttl_deadline_real) state.early_action = true;
         try sink.check(allocator, safe_id, !state.early_action);

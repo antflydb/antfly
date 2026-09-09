@@ -213,6 +213,7 @@ test "GLiNER2 e2e: loss decreases over training steps" {
 
     // 2. Create compute backend.
     var native = NativeCompute.init(allocator, &weight_store, null);
+    defer native.deinit();
     var cb = native.computeBackend();
 
     // 3. Create the RealAutodiffTrainer with LoRA targeting query_proj + value_proj.
@@ -359,6 +360,7 @@ test "GLiNER2 inference: fixed text produces deterministic token logits" {
     try populateGliner2Weights(allocator, &weight_store, rng);
 
     var native = NativeCompute.init(allocator, &weight_store, null);
+    defer native.deinit();
     var cb = native.computeBackend();
 
     const lora_targets = [_][]const u8{ "query_proj", "value_proj" };

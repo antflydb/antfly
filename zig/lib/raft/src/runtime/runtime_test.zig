@@ -1800,7 +1800,10 @@ test "multi raft fetches snapshot through snapshot transport and steps it into t
 
     var transport_recorder = TransportRecorder{ .alloc = std.testing.allocator };
 
-    const root_dir = "/tmp/antflydb-raft-runtime-fetch-snapshot";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_dir);
     var snapshot_transport = try runtime.LocalSnapshotTransport.init(std.testing.allocator, root_dir);
     defer snapshot_transport.deinit();
 
@@ -1927,7 +1930,10 @@ test "multi raft ensureReplica can fetch snapshot bootstrap" {
     var store = core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
 
-    const root_dir = "/tmp/antflydb-raft-runtime-ensure-fetch-snapshot";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_dir);
     var snapshot_transport = try runtime.LocalSnapshotTransport.init(std.testing.allocator, root_dir);
     defer snapshot_transport.deinit();
 
@@ -1999,7 +2005,10 @@ test "multi raft rejects snapshot bootstrap above aggregate ownership budget" {
     var store = core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
 
-    const root_dir = "/tmp/antflydb-raft-runtime-reject-fetch-snapshot";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_dir);
     var snapshot_transport = try runtime.LocalSnapshotTransport.init(std.testing.allocator, root_dir);
     defer snapshot_transport.deinit();
     var voters = [_]core.types.NodeId{ 1, 2 };
@@ -2111,7 +2120,10 @@ test "multi raft limit backpressure denies oversized snapshot ready" {
     defer storage_recorder.deinit();
     try storage_recorder.registerStore(134, &store);
 
-    const root_dir = "/tmp/antflydb-raft-runtime-limit-backpressure";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_dir);
     var snapshot_transport = try runtime.LocalSnapshotTransport.init(std.testing.allocator, root_dir);
     defer snapshot_transport.deinit();
 
@@ -3013,7 +3025,10 @@ test "runtime control plane restore_replicas can rejoin via snapshot bootstrap" 
     defer factory.deinit();
     try factory.registerStore(142, &store);
 
-    const root_dir = "/tmp/antflydb-raft-runtime-catalog-rejoin";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_dir);
     var snapshot_transport = try runtime.LocalSnapshotTransport.init(std.testing.allocator, root_dir);
     defer snapshot_transport.deinit();
 

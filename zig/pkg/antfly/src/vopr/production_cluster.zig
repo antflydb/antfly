@@ -131,6 +131,7 @@ const PublicAuthorizationExecutor = struct {
             .ptr = self,
             .vtable = &.{ .execute = execute },
             .realtime_ns_fn = if (self.inner.realtime_ns_fn != null) realtimeNs else null,
+            .clock_io = self.inner.clock_io,
         };
     }
 

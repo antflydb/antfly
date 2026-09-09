@@ -1290,6 +1290,7 @@ test "HuggingFace ModernBERT fused checkpoint omits layer zero attention norm an
     var store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitTestWeightStore(allocator, &store);
     var compute = native_compute.NativeCompute.init(allocator, &store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     // This is the exact public checkpoint structure in miniature: bare

@@ -180,7 +180,7 @@ pub const DB = struct {
 
     pub fn liteStatus(self: *DB, alloc: Allocator) !LiteStatus {
         const backend = if (self.owned_lite_backend) |*lite_backend| lite_backend else return error.NotLiteDatabase;
-        var status = try backend.fullStatus(alloc, &self.inner, self.profile);
+        var status = try backend.fullStatus(alloc, self.inner, self.profile);
         status.inference = self.lite_inference_status orelse status.inference;
         status.capabilities = support.lite.backend.capabilitiesForProfileWithInferenceStatus(self.profile, status.inference);
         return status;

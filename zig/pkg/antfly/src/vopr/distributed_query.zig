@@ -111,7 +111,7 @@ pub const Scenario = struct {
         owner_allocator: std.mem.Allocator,
         fixture_allocator: FixtureAllocator,
         allocator: std.mem.Allocator,
-        sim: vopr.vopr_io.VoprIo,
+        vopr_io: vopr.vopr_io.VoprIo,
         service_rate_model: vopr.service_rate.Model = undefined,
         service_rate_adapter: ServiceRateAdapter = undefined,
         mode: ?Mode = null,
@@ -139,15 +139,15 @@ pub const Scenario = struct {
                 .owner_allocator = owner_allocator,
                 .fixture_allocator = .init,
                 .allocator = undefined,
-                .sim = undefined,
+                .vopr_io = undefined,
             };
             errdefer _ = self.fixture_allocator.deinit();
             self.allocator = self.fixture_allocator.allocator();
-            self.sim = try vopr.vopr_io.VoprIo.init(.{
+            self.vopr_io = try vopr.vopr_io.VoprIo.init(.{
                 .seed = 0x4451_5259,
                 .instrumentation = .{ .enabled = false, .map_digest = 0x4451_5259 },
             });
-            errdefer self.sim.deinit();
+            errdefer self.vopr_io.deinit();
             self.service_rate_model = try vopr.service_rate.Model.init(
                 self.allocator,
                 &service_nodes,
@@ -155,13 +155,13 @@ pub const Scenario = struct {
             );
             errdefer self.service_rate_model.deinit();
             for (&self.service_rate_adapter.ports, service_nodes) |*port, node|
-                port.* = try self.service_rate_model.port(self.sim.io(), node.id);
+                port.* = try self.service_rate_model.port(self.vopr_io.io(), node.id);
             return self;
         }
 
         fn deinit(self: *State) void {
             self.service_rate_model.deinit();
-            self.sim.deinit();
+            self.vopr_io.deinit();
             const owner_allocator = self.owner_allocator;
             std.debug.assert(self.fixture_allocator.deinit() == .ok);
             owner_allocator.destroy(self);
@@ -189,6 +189,9 @@ pub const Scenario = struct {
             return .{ .ptr = self, .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = routingSnapshot,
+                .linearizable_routing_snapshot = routingSnapshot,
+                .free_routing_snapshot = freeRoutingSnapshot,
             } };
         }
 
@@ -212,6 +215,13 @@ pub const Scenario = struct {
 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 
+        fn routingSnapshot(ptr: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const snapshot = try adminSnapshot(ptr);
+            return .{ .tables = snapshot.tables, .ranges = snapshot.ranges };
+        }
+
+        fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+
         fn worker(self: *State) distributed_graph.Worker {
             return .{
                 .ptr = self,
@@ -226,7 +236,7 @@ pub const Scenario = struct {
 
         fn fanoutIo(ptr: *anyopaque) ?std.Io {
             const self: *State = @ptrCast(@alignCast(ptr));
-            return self.sim.io();
+            return self.vopr_io.io();
         }
 
         fn executeGraphExpand(
@@ -253,7 +263,7 @@ pub const Scenario = struct {
                 },
                 .cancel_in_flight => {
                     std.debug.assert(active > 0);
-                    try self.sim.io().sleep(.fromNanoseconds(20), .awake);
+                    try self.vopr_io.io().sleep(.fromNanoseconds(20), .awake);
                 },
                 else => {},
             }
@@ -293,7 +303,7 @@ pub const Scenario = struct {
         ) !distributed_graph.GraphHydrateResponse {
             const self: *State = @ptrCast(@alignCast(ptr));
             _ = self.hydrate_calls.fetchAdd(1, .monotonic);
-            if (self.mode.? == .cancel_in_flight) try self.sim.io().sleep(.fromNanoseconds(20), .awake);
+            if (self.mode.? == .cancel_in_flight) try self.vopr_io.io().sleep(.fromNanoseconds(20), .awake);
             if (self.cancellation.load(.monotonic)) return error.Cancelled;
             const hits = try alloc.alloc(db_types.SearchHit, req.keys.len);
             var initialized: usize = 0;
@@ -447,7 +457,7 @@ pub const Scenario = struct {
             try list.append(allocator, .{ .id = cancel_id, .name = name ++ ".cancel-outstanding-fanout", .kind = .fault });
         if (state.mode.? == .service_rate and state.slowdown_pass_complete and !state.slowdown_healed)
             try list.append(allocator, .{ .id = heal_service_rate_id, .name = name ++ ".heal-service-rate", .kind = .fault, .fault_phase = .end });
-        if (!state.sim.scheduler().quiescent()) try state.sim.scheduler().enumerateReady(list, allocator);
+        if (!state.vopr_io.scheduler().quiescent()) try state.vopr_io.scheduler().enumerateReady(list, allocator);
     }
 
     pub fn execute(world: *World, selected: vopr.transition.Transition, events: *vopr.event.Sink, allocator: std.mem.Allocator) !vopr.outcome.TransitionOutcome {
@@ -461,7 +471,7 @@ pub const Scenario = struct {
                     .node_id = service_nodes[1].id,
                     .multiplier_ppm = 4 * vopr.service_rate.parts_per_million,
                 });
-                _ = state.sim.io().async(State.runTask, .{state});
+                _ = state.vopr_io.io().async(State.runTask, .{state});
                 found = true;
             };
             if (!found) return error.InvalidDistributedQueryMode;
@@ -471,9 +481,9 @@ pub const Scenario = struct {
         } else if (selected.id == heal_service_rate_id) {
             try state.service_rate_model.heal(service_rate_fault_id);
             state.slowdown_healed = true;
-            _ = state.sim.io().async(State.runTask, .{state});
+            _ = state.vopr_io.io().async(State.runTask, .{state});
         } else {
-            try state.sim.scheduler().executeReady(selected.id, events, allocator);
+            try state.vopr_io.scheduler().executeReady(selected.id, events, allocator);
         }
         try events.emitNamed(allocator, .domain, selected.name, state.expand_calls.load(.monotonic));
         return .applied();
@@ -496,13 +506,13 @@ pub const Scenario = struct {
         try sink.check(allocator, generation_id, state.generation_sound);
         try sink.check(allocator, authorization_id, state.authorization_sound);
         try sink.check(allocator, service_rate_id, state.service_rate_sound);
-        try sink.check(allocator, cleanup_id, !state.complete or state.sim.resourceSnapshot().active_tasks == 0);
+        try sink.check(allocator, cleanup_id, !state.complete or state.vopr_io.resourceSnapshot().active_tasks == 0);
         try sink.check(allocator, complete_id, state.complete);
     }
 
     pub fn healthSnapshot(world: *World) vopr.health.Snapshot {
         const state = world.state;
-        return state.sim.healthSnapshot(.{
+        return state.vopr_io.healthSnapshot(.{
             .progress_expected = state.mode != null,
             .progress_units = state.expand_calls.load(.monotonic) + state.hydrate_calls.load(.monotonic),
             .recovery_expected = state.mode != null and switch (state.mode.?) {
@@ -511,12 +521,12 @@ pub const Scenario = struct {
             },
             .recovery_complete = state.complete,
             .consistency_valid = state.result_sound and state.retry_sound and state.cancellation_sound and state.generation_sound and state.authorization_sound and state.service_rate_sound,
-            .cleanup_complete = state.complete and state.sim.resourceSnapshot().active_tasks == 0,
+            .cleanup_complete = state.complete and state.vopr_io.resourceSnapshot().active_tasks == 0,
         });
     }
 
     pub fn done(world: *World) bool {
-        return world.state.complete and world.state.sim.scheduler().quiescent();
+        return world.state.complete and world.state.vopr_io.scheduler().quiescent();
     }
 };
 

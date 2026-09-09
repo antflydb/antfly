@@ -14,6 +14,7 @@ const vopr = @import("vopr");
 const generating_runtime = @import("../generating/mod.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
+const provider_limits = @import("../common/provider_limits.zig");
 const reranking = @import("../reranking/mod.zig");
 
 const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
@@ -32,8 +33,10 @@ const remote_fallback_routes = [_]httpx.TestRoute{
 const remote_generation_malformed_routes = [_]httpx.TestRoute{
     .{ .method = .POST, .path = "/generate", .respond = .{ .body = "{not-json" } },
 };
+// Generation sets a five-minute provider deadline over the client default.
+// Virtual time makes exercising that production deadline inexpensive.
 const remote_generation_timeout_routes = [_]httpx.TestRoute{
-    .{ .method = .POST, .path = "/generate", .respond = .{ .body = valid_remote_generation, .delay_ns = 50 * std.time.ns_per_ms } },
+    .{ .method = .POST, .path = "/generate", .respond = .{ .body = valid_remote_generation, .delay_ns = 301 * std.time.ns_per_s } },
 };
 const remote_generation_cancel_routes = [_]httpx.TestRoute{
     .{ .method = .POST, .path = "/generate", .respond = .{ .body = valid_remote_generation, .delay_ns = 50 * std.time.ns_per_ms } },
@@ -113,8 +116,9 @@ pub const Scenario = struct {
         owner_allocator: std.mem.Allocator,
         fixture_allocator: FixtureAllocator,
         allocator: std.mem.Allocator,
-        sim: vopr.vopr_io.VoprIo,
+        vopr_io: vopr.vopr_io.VoprIo,
         http: httpx.Client,
+        limits: provider_limits.Registry,
         mode: ?Mode = null,
         attempts: u32 = 0,
         fallback_used: bool = false,
@@ -139,26 +143,30 @@ pub const Scenario = struct {
                 .owner_allocator = owner_allocator,
                 .fixture_allocator = .init,
                 .allocator = undefined,
-                .sim = undefined,
+                .vopr_io = undefined,
                 .http = undefined,
+                .limits = undefined,
             };
             errdefer _ = self.fixture_allocator.deinit();
             self.allocator = self.fixture_allocator.allocator();
-            self.sim = try vopr.vopr_io.VoprIo.init(.{
+            self.limits = provider_limits.Registry.init(self.allocator);
+            errdefer self.limits.deinit();
+            self.vopr_io = try vopr.vopr_io.VoprIo.init(.{
                 .seed = 0x4745_4e52,
                 .tasks = .{ .stack_size = 32 * 1024 * 1024 },
                 .network = .{ .max_sockets = 32 },
                 .required = .of(&.{ .clock_read, .sockets, .task_scheduling, .synchronization, .sleep }),
                 .instrumentation = .{ .enabled = false, .map_digest = 0x4745_4e52 },
             });
-            errdefer self.sim.deinit();
-            self.http = httpx.Client.initWithConfig(self.allocator, self.sim.io(), .{ .keep_alive = false });
+            errdefer self.vopr_io.deinit();
+            self.http = httpx.Client.initWithConfig(self.allocator, self.vopr_io.io(), .{ .keep_alive = false });
             return self;
         }
 
         fn deinit(self: *State) void {
             self.http.deinit();
-            self.sim.deinit();
+            self.limits.deinit();
+            self.vopr_io.deinit();
             const owner_allocator = self.owner_allocator;
             std.debug.assert(self.fixture_allocator.deinit() == .ok);
             owner_allocator.destroy(self);
@@ -204,6 +212,7 @@ pub const Scenario = struct {
             model: []const u8,
             roles: []const []const u8,
             contents: []const []const u8,
+            _: @import("../inference/types.zig").GenerationOptions,
         ) ![]u8 {
             const self: *State = @ptrCast(@alignCast(ptr));
             self.local_generation_calls += 1;
@@ -274,11 +283,11 @@ pub const Scenario = struct {
             content: ?[]u8 = null,
 
             fn run(self: *@This()) anyerror!void {
-                var result = try generating_runtime.executeChainWithAntflyProvider(
+                var result = try generating_runtime.executeChainWithOptions(
                     self.state.allocator,
                     self.client,
                     self.chain,
-                    self.local_provider,
+                    .{ .antfly_provider = self.local_provider, .limits = &self.state.limits },
                     &.{.{ .role = .user, .content = .{ .text = "query" } }},
                 );
                 defer result.deinit();
@@ -299,11 +308,11 @@ pub const Scenario = struct {
             scores: ?[]f32 = null,
 
             fn run(self: *@This()) anyerror!void {
-                self.scores = try reranking.rerankDocumentsWithAntflyProvider(
+                self.scores = try reranking.rerankDocumentsWithOptions(
                     self.state.allocator,
                     self.client,
                     self.config,
-                    self.local_provider,
+                    .{ .antfly_provider = self.local_provider, .limits = &self.state.limits },
                     "query",
                     &.{ "doc-a", "doc-b" },
                 );
@@ -334,7 +343,7 @@ pub const Scenario = struct {
         }
 
         fn awaitRoute(self: *State, server: *const httpx.TestServer, route_index: usize) !void {
-            while (server.routeHitCount(route_index) == 0) try self.sim.io().sleep(.fromNanoseconds(1), .awake);
+            while (server.routeHitCount(route_index) == 0) try self.vopr_io.io().sleep(.fromNanoseconds(1), .awake);
         }
 
         fn runGeneration(self: *State) !void {
@@ -359,7 +368,7 @@ pub const Scenario = struct {
                 &[_]generating.ChainLink{primary};
             var result = generating.executeChainWithIo(
                 self.allocator,
-                self.sim.io(),
+                self.vopr_io.io(),
                 chain,
                 self.factory(),
                 &.{.{ .role = .user, .content = .{ .text = "query" } }},
@@ -370,7 +379,7 @@ pub const Scenario = struct {
             };
             defer result.deinit();
             self.retry_wait_observed = self.mode.? != .generation_retry or
-                std.Io.Clock.awake.now(self.sim.io()).toNanoseconds() >= std.time.ns_per_ms;
+                std.Io.Clock.awake.now(self.vopr_io.io()).toNanoseconds() >= std.time.ns_per_ms;
             self.generation_sound = if (self.mode.? == .generation_timeout_fallback or self.mode.? == .generation_rate_limit_fallback)
                 self.fallback_used and std.mem.eql(u8, result.content, "fallback-result")
             else
@@ -385,11 +394,11 @@ pub const Scenario = struct {
                 .embed_sparse_texts = sparse,
                 .rerank_texts = rerank,
             };
-            const scores = reranking.rerankDocumentsWithAntflyProvider(
+            const scores = reranking.rerankDocumentsWithOptions(
                 self.allocator,
                 &self.http,
                 .{ .provider = .antfly, .field = "body" },
-                local,
+                .{ .antfly_provider = local, .limits = &self.limits },
                 "query",
                 &.{ "doc-a", "doc-b" },
             ) catch |err| {
@@ -407,9 +416,9 @@ pub const Scenario = struct {
         }
 
         fn runRemoteFallback(self: *State) !bool {
-            var server = try httpx.TestServer.start(self.allocator, self.sim.io(), &remote_fallback_routes);
+            var server = try httpx.TestServer.start(self.allocator, self.vopr_io.io(), &remote_fallback_routes);
             defer server.deinit();
-            var client = httpx.Client.initWithConfig(self.allocator, self.sim.io(), clientConfig(0));
+            var client = httpx.Client.initWithConfig(self.allocator, self.vopr_io.io(), clientConfig(0));
             defer client.deinit();
             const openai_url = try std.fmt.allocPrint(self.allocator, "{s}/openai", .{server.baseUrl()});
             defer self.allocator.free(openai_url);
@@ -425,10 +434,10 @@ pub const Scenario = struct {
             var call = GenerationCall{ .state = self, .client = &client, .chain = &chain };
             defer call.deinit();
             var server_call = ServerCall{ .server = &server, .requests = 2 };
-            var request_future = self.sim.io().async(GenerationCall.run, .{&call});
-            var server_future = self.sim.io().async(ServerCall.run, .{&server_call});
-            request_future.await(self.sim.io()) catch return false;
-            server_future.await(self.sim.io());
+            var request_future = self.vopr_io.io().async(GenerationCall.run, .{&call});
+            var server_future = self.vopr_io.io().async(ServerCall.run, .{&server_call});
+            request_future.await(self.vopr_io.io()) catch return false;
+            server_future.await(self.vopr_io.io());
             self.remote_requests += @intCast(server.routeHitCount(0) + server.routeHitCount(1));
             return server_call.error_value == null and
                 std.mem.eql(u8, call.content orelse "", "remote-fallback") and
@@ -441,9 +450,9 @@ pub const Scenario = struct {
             request_timeout_ms: u64,
             cancel_after_hit: bool,
         ) !ErrorClass {
-            var server = try httpx.TestServer.start(self.allocator, self.sim.io(), routes);
+            var server = try httpx.TestServer.start(self.allocator, self.vopr_io.io(), routes);
             defer server.deinit();
-            var client = httpx.Client.initWithConfig(self.allocator, self.sim.io(), clientConfig(request_timeout_ms));
+            var client = httpx.Client.initWithConfig(self.allocator, self.vopr_io.io(), clientConfig(request_timeout_ms));
             defer client.deinit();
             const chain = [_]generating.ChainLink{.{
                 .generator = generating.GeneratorConfig.fromAntfly(.{ .model = "remote", .url = server.baseUrl() }),
@@ -451,26 +460,26 @@ pub const Scenario = struct {
             var call = GenerationCall{ .state = self, .client = &client, .chain = &chain };
             defer call.deinit();
             var server_call = ServerCall{ .server = &server, .requests = 1 };
-            var request_future = self.sim.io().async(GenerationCall.run, .{&call});
-            var server_future = self.sim.io().async(ServerCall.run, .{&server_call});
+            var request_future = self.vopr_io.io().async(GenerationCall.run, .{&call});
+            var server_future = self.vopr_io.io().async(ServerCall.run, .{&server_call});
             const request_error: ?anyerror = if (cancel_after_hit) blk: {
                 try self.awaitRoute(&server, 0);
-                request_future.cancel(self.sim.io()) catch |err| break :blk err;
+                request_future.cancel(self.vopr_io.io()) catch |err| break :blk err;
                 break :blk null;
             } else blk: {
-                request_future.await(self.sim.io()) catch |err| break :blk err;
+                request_future.await(self.vopr_io.io()) catch |err| break :blk err;
                 break :blk null;
             };
-            server_future.await(self.sim.io());
+            server_future.await(self.vopr_io.io());
             self.remote_requests += @intCast(server.routeHitCount(0));
             if (server.routeHitCount(0) != 1) return error.RemoteGenerationDidNotComplete;
             return classifyError(request_error);
         }
 
         fn runGenerationReplacement(self: *State) !bool {
-            var server = try httpx.TestServer.start(self.allocator, self.sim.io(), &remote_generation_replacement_routes);
+            var server = try httpx.TestServer.start(self.allocator, self.vopr_io.io(), &remote_generation_replacement_routes);
             defer server.deinit();
-            var client = httpx.Client.initWithConfig(self.allocator, self.sim.io(), clientConfig(0));
+            var client = httpx.Client.initWithConfig(self.allocator, self.vopr_io.io(), clientConfig(0));
             defer client.deinit();
             var chain = [_]generating.ChainLink{.{
                 .generator = generating.GeneratorConfig.fromAntfly(.{ .model = "remote-before-replacement", .url = server.baseUrl() }),
@@ -478,24 +487,24 @@ pub const Scenario = struct {
             var remote_call = GenerationCall{ .state = self, .client = &client, .chain = &chain };
             defer remote_call.deinit();
             var server_call = ServerCall{ .server = &server, .requests = 1 };
-            var remote_future = self.sim.io().async(GenerationCall.run, .{&remote_call});
-            var server_future = self.sim.io().async(ServerCall.run, .{&server_call});
+            var remote_future = self.vopr_io.io().async(GenerationCall.run, .{&remote_call});
+            var server_future = self.vopr_io.io().async(ServerCall.run, .{&server_call});
             try self.awaitRoute(&server, 0);
 
             // Replacement is request-scoped: the already-created production
             // backend retains its remote provider while the next request sees
             // the new embedded-provider route through the same factory path.
             chain[0] = .{ .generator = generating.GeneratorConfig.fromAntfly(.{ .model = "local-replacement" }) };
-            var local_result = try generating_runtime.executeChainWithAntflyProvider(
+            var local_result = try generating_runtime.executeChainWithOptions(
                 self.allocator,
                 &client,
                 &chain,
-                self.localProvider(),
+                .{ .antfly_provider = self.localProvider(), .limits = &self.limits },
                 &.{.{ .role = .user, .content = .{ .text = "query" } }},
             );
             defer local_result.deinit();
-            remote_future.await(self.sim.io()) catch return false;
-            server_future.await(self.sim.io());
+            remote_future.await(self.vopr_io.io()) catch return false;
+            server_future.await(self.vopr_io.io());
             self.remote_requests += @intCast(server.routeHitCount(0));
             return server_call.error_value == null and
                 std.mem.eql(u8, remote_call.content orelse "", "remote-before-replacement") and
@@ -509,9 +518,9 @@ pub const Scenario = struct {
             request_timeout_ms: u64,
             cancel_after_hit: bool,
         ) !RerankingCallResult {
-            var server = try httpx.TestServer.start(self.allocator, self.sim.io(), routes);
+            var server = try httpx.TestServer.start(self.allocator, self.vopr_io.io(), routes);
             defer server.deinit();
-            var client = httpx.Client.initWithConfig(self.allocator, self.sim.io(), clientConfig(request_timeout_ms));
+            var client = httpx.Client.initWithConfig(self.allocator, self.vopr_io.io(), clientConfig(request_timeout_ms));
             defer client.deinit();
             var call = RerankingCall{
                 .state = self,
@@ -520,17 +529,17 @@ pub const Scenario = struct {
             };
             defer call.deinit();
             var server_call = ServerCall{ .server = &server, .requests = 1 };
-            var request_future = self.sim.io().async(RerankingCall.run, .{&call});
-            var server_future = self.sim.io().async(ServerCall.run, .{&server_call});
+            var request_future = self.vopr_io.io().async(RerankingCall.run, .{&call});
+            var server_future = self.vopr_io.io().async(ServerCall.run, .{&server_call});
             const request_error: ?anyerror = if (cancel_after_hit) blk: {
                 try self.awaitRoute(&server, 0);
-                request_future.cancel(self.sim.io()) catch |err| break :blk err;
+                request_future.cancel(self.vopr_io.io()) catch |err| break :blk err;
                 break :blk null;
             } else blk: {
-                request_future.await(self.sim.io()) catch |err| break :blk err;
+                request_future.await(self.vopr_io.io()) catch |err| break :blk err;
                 break :blk null;
             };
-            server_future.await(self.sim.io());
+            server_future.await(self.vopr_io.io());
             self.remote_requests += @intCast(server.routeHitCount(0));
             if (server.routeHitCount(0) != 1) return error.RemoteRerankingDidNotComplete;
             const scores_sound = if (call.scores) |scores|
@@ -546,9 +555,9 @@ pub const Scenario = struct {
         };
 
         fn runRerankingReplacement(self: *State) !bool {
-            var server = try httpx.TestServer.start(self.allocator, self.sim.io(), &remote_reranking_replacement_routes);
+            var server = try httpx.TestServer.start(self.allocator, self.vopr_io.io(), &remote_reranking_replacement_routes);
             defer server.deinit();
-            var client = httpx.Client.initWithConfig(self.allocator, self.sim.io(), clientConfig(0));
+            var client = httpx.Client.initWithConfig(self.allocator, self.vopr_io.io(), clientConfig(0));
             defer client.deinit();
             var next_config = reranking.Config{
                 .provider = .antfly,
@@ -565,23 +574,23 @@ pub const Scenario = struct {
             };
             defer remote_call.deinit();
             var server_call = ServerCall{ .server = &server, .requests = 1 };
-            var remote_future = self.sim.io().async(RerankingCall.run, .{&remote_call});
-            var server_future = self.sim.io().async(ServerCall.run, .{&server_call});
+            var remote_future = self.vopr_io.io().async(RerankingCall.run, .{&remote_call});
+            var server_future = self.vopr_io.io().async(ServerCall.run, .{&server_call});
             try self.awaitRoute(&server, 0);
 
             next_config.model = "";
             next_config.url = "";
-            const local_scores = try reranking.rerankDocumentsWithAntflyProvider(
+            const local_scores = try reranking.rerankDocumentsWithOptions(
                 self.allocator,
                 &self.http,
                 next_config,
-                self.localProvider(),
+                .{ .antfly_provider = self.localProvider(), .limits = &self.limits },
                 "query",
                 &.{ "doc-a", "doc-b" },
             );
             defer self.allocator.free(local_scores);
-            remote_future.await(self.sim.io()) catch return false;
-            server_future.await(self.sim.io());
+            remote_future.await(self.vopr_io.io()) catch return false;
+            server_future.await(self.vopr_io.io());
             self.remote_requests += @intCast(server.routeHitCount(0));
 
             const remote_scores_sound = if (remote_call.scores) |scores|
@@ -661,7 +670,7 @@ pub const Scenario = struct {
             });
             return;
         }
-        if (!state.sim.scheduler().quiescent()) try state.sim.scheduler().enumerateReady(list, allocator);
+        if (!state.vopr_io.scheduler().quiescent()) try state.vopr_io.scheduler().enumerateReady(list, allocator);
     }
 
     pub fn execute(world: *World, selected: vopr.transition.Transition, events: *vopr.event.Sink, allocator: std.mem.Allocator) !vopr.outcome.TransitionOutcome {
@@ -670,12 +679,12 @@ pub const Scenario = struct {
             var found = false;
             inline for (std.meta.tags(Mode), mode_ids) |mode, id| if (selected.id == id) {
                 state.mode = mode;
-                _ = state.sim.io().async(State.runTask, .{state});
+                _ = state.vopr_io.io().async(State.runTask, .{state});
                 found = true;
             };
             if (!found) return error.InvalidGenerationRerankingMode;
         } else {
-            try state.sim.scheduler().executeReady(selected.id, events, allocator);
+            try state.vopr_io.scheduler().executeReady(selected.id, events, allocator);
         }
         try events.emitNamed(allocator, .domain, selected.name, state.attempts);
         return .applied();
@@ -702,24 +711,24 @@ pub const Scenario = struct {
         try sink.check(allocator, replacement_id, state.replacement_sound);
         try sink.check(allocator, routing_id, state.routing_sound);
         try sink.check(allocator, cancellation_id, state.cancellation_sound);
-        try sink.check(allocator, cleanup_id, !state.complete or state.sim.resourceSnapshot().active_tasks == 0);
+        try sink.check(allocator, cleanup_id, !state.complete or state.vopr_io.resourceSnapshot().active_tasks == 0);
         try sink.check(allocator, complete_id, state.complete);
     }
 
     pub fn healthSnapshot(world: *World) vopr.health.Snapshot {
         const state = world.state;
-        return state.sim.healthSnapshot(.{
+        return state.vopr_io.healthSnapshot(.{
             .progress_expected = state.mode != null,
             .progress_units = @intFromBool(state.complete),
             .consistency_valid = state.generation_sound and state.reranking_sound and state.error_sound and
                 state.remote_http_sound and state.replacement_sound and state.routing_sound and state.cancellation_sound and
                 state.task_error == null,
-            .cleanup_complete = state.complete and state.sim.resourceSnapshot().active_tasks == 0,
+            .cleanup_complete = state.complete and state.vopr_io.resourceSnapshot().active_tasks == 0,
         });
     }
 
     pub fn done(world: *World) bool {
-        return world.state.complete and world.state.sim.scheduler().quiescent();
+        return world.state.complete and world.state.vopr_io.scheduler().quiescent();
     }
 };
 

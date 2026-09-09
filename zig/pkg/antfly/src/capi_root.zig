@@ -35,3 +35,4 @@ pub const raft = @import("raft/mod.zig");
 pub const storage_maintenance = @import("storage/maintenance.zig");
 pub const transactions = @import("storage/transactions.zig");
 pub const traversal = @import("graph/traversal.zig");
+pub const testing = @import("common/test_directory.zig");

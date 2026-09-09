@@ -24375,11 +24375,11 @@ test "data runtime module compiles" {
 test "DataServer LSM maintenance owner runs on borrowed VoprIo" {
     const vopr = @import("vopr");
     const alloc = std.testing.allocator;
-    var sim = try vopr.vopr_io.VoprIo.init(.{
+    var vopr_io = try vopr.vopr_io.VoprIo.init(.{
         .required = .of(&.{ .clock_read, .task_scheduling, .synchronization, .sleep }),
     });
-    defer sim.deinit();
-    const io = sim.io();
+    defer vopr_io.deinit();
+    const io = vopr_io.io();
 
     var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
@@ -24445,7 +24445,7 @@ test "DataServer LSM maintenance owner runs on borrowed VoprIo" {
     defer enabled.deinit(alloc);
     var events: vopr.event.Sink = .{};
     defer events.deinit(alloc);
-    const scheduler = sim.scheduler();
+    const scheduler = vopr_io.scheduler();
     var transitions: usize = 0;
     while (!scheduler.quiescent()) {
         enabled.items.clearRetainingCapacity();
@@ -24454,7 +24454,7 @@ test "DataServer LSM maintenance owner runs on borrowed VoprIo" {
         if (enabled.items.items.len == 0) return error.VoprLsmMaintenanceOwnerDeadlock;
         var selected = enabled.items.items[0];
         for (enabled.items.items) |candidate| {
-            if (!std.mem.eql(u8, candidate.name, "sim-io.time_advance")) {
+            if (!std.mem.eql(u8, candidate.name, "vopr-io.time_advance")) {
                 selected = candidate;
                 break;
             }
@@ -24465,15 +24465,15 @@ test "DataServer LSM maintenance owner runs on borrowed VoprIo" {
     }
     try std.testing.expect(lifecycle_done);
     if (lifecycle_failure) |err| return err;
-    try sim.ensureNoCapabilityViolation();
+    try vopr_io.ensureNoCapabilityViolation();
 }
 
 test "DataServer LSM maintenance cost port composes and heals on borrowed VoprIo" {
     const vopr = @import("vopr");
     const alloc = std.testing.allocator;
-    var sim = try vopr.vopr_io.VoprIo.init(.{});
-    defer sim.deinit();
-    const io = sim.io();
+    var vopr_io = try vopr.vopr_io.VoprIo.init(.{});
+    defer vopr_io.deinit();
+    const io = vopr_io.io();
 
     var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
@@ -24573,12 +24573,12 @@ test "DataServer LSM maintenance cost port composes and heals on borrowed VoprIo
     var events: vopr.event.Sink = .{};
     defer events.deinit(alloc);
     var transitions: usize = 0;
-    while (!sim.scheduler().quiescent()) {
+    while (!vopr_io.scheduler().quiescent()) {
         enabled.items.clearRetainingCapacity();
-        try sim.scheduler().enumerateReady(&enabled, alloc);
+        try vopr_io.scheduler().enumerateReady(&enabled, alloc);
         try enabled.canonicalize();
         if (enabled.items.items.len == 0) return error.VoprLsmMaintenanceCostDeadlock;
-        try sim.scheduler().executeReady(enabled.items.items[0].id, &events, alloc);
+        try vopr_io.scheduler().executeReady(enabled.items.items[0].id, &events, alloc);
         transitions += 1;
         if (transitions > 1_000) return error.VoprLsmMaintenanceCostTransitionBudgetExceeded;
     }
@@ -24588,19 +24588,19 @@ test "DataServer LSM maintenance cost port composes and heals on borrowed VoprIo
     try std.testing.expectEqual(@as(u64, 2), usage.charges);
     try std.testing.expectEqual(@as(u64, 2), usage.units);
     try std.testing.expectEqual(@as(u64, 200), usage.charged_ns);
-    try sim.ensureNoCapabilityViolation();
+    try vopr_io.ensureNoCapabilityViolation();
 }
 
 test "DataServer VOPR background owner executes and cancels maintenance on VoprIo" {
     const vopr = @import("vopr");
     const durable_job_lane = @import("../storage/vopr_durable_job_lane.zig");
     const alloc = std.testing.allocator;
-    var sim = try vopr.vopr_io.VoprIo.init(.{
+    var vopr_io = try vopr.vopr_io.VoprIo.init(.{
         .required = .of(&.{.task_scheduling}),
         .task_allocator = alloc,
     });
-    defer sim.deinit();
-    const io = sim.io();
+    defer vopr_io.deinit();
+    const io = vopr_io.io();
 
     var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
@@ -24646,11 +24646,14 @@ test "DataServer VOPR background owner executes and cancels maintenance on VoprI
     defer enabled.deinit(alloc);
     var events: vopr.event.Sink = .{};
     defer events.deinit(alloc);
-    try sim.scheduler().enumerateReady(&enabled, alloc);
-    const selected = for (enabled.items.items) |candidate| {
-        if (std.mem.eql(u8, candidate.name, "antfly.maintenance")) break candidate;
-    } else return error.VoprDataServerBackgroundJobNotScheduled;
-    try sim.scheduler().executeReady(selected.id, &events, alloc);
+    for (0..32) |_| {
+        if (background_jobs.stats().pending_jobs == 0) break;
+        enabled.items.clearRetainingCapacity();
+        try vopr_io.scheduler().enumerateReady(&enabled, alloc);
+        try enabled.canonicalize();
+        if (enabled.items.items.len == 0) return error.VoprDataServerBackgroundJobNotScheduled;
+        try vopr_io.scheduler().executeReady(enabled.items.items[0].id, &events, alloc);
+    }
     try std.testing.expect(!server.provisioned_warmup_active.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), background_jobs.stats().pending_jobs);
     try std.testing.expectEqual(@as(u64, 1), background_jobs.stats().completed_jobs);
@@ -24660,7 +24663,7 @@ test "DataServer VOPR background owner executes and cancels maintenance on VoprI
     server.stopDataServerBackgroundJobs();
     try std.testing.expect(!server.provisioned_warmup_active.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), background_jobs.stats().pending_jobs);
-    try std.testing.expect(sim.scheduler().quiescent());
+    try std.testing.expect(vopr_io.scheduler().quiescent());
 }
 
 test "data raft read safety barrier completes only after matching ReadState apply" {
@@ -34863,11 +34866,11 @@ test "raft batch protocol activation cleanup preserves in flight references" {
 test "data raft retry clock and sleep borrow VoprIo" {
     const vopr = @import("vopr");
     const alloc = std.testing.allocator;
-    var sim = try vopr.vopr_io.VoprIo.init(.{
+    var vopr_io = try vopr.vopr_io.VoprIo.init(.{
         .required = .of(&.{ .clock_read, .sleep, .task_scheduling }),
     });
-    defer sim.deinit();
-    const io = sim.io();
+    defer vopr_io.deinit();
+    const io = vopr_io.io();
     var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
         .borrowed_io = .{
@@ -34913,17 +34916,17 @@ test "data raft retry clock and sleep borrow VoprIo" {
     defer enabled.deinit(alloc);
     var events: vopr.event.Sink = .{};
     defer events.deinit(alloc);
-    while (!sim.scheduler().quiescent()) {
+    while (!vopr_io.scheduler().quiescent()) {
         enabled.items.clearRetainingCapacity();
-        try sim.scheduler().enumerateReady(&enabled, alloc);
+        try vopr_io.scheduler().enumerateReady(&enabled, alloc);
         try enabled.canonicalize();
         if (enabled.items.items.len == 0) return error.VoprDataRaftRetryDeadlock;
-        try sim.scheduler().executeReady(enabled.items.items[0].id, &events, alloc);
+        try vopr_io.scheduler().executeReady(enabled.items.items[0].id, &events, alloc);
     }
     if (worker.failure) |err| return err;
     try std.testing.expect(worker.done);
     try std.testing.expectEqual(2 * data_raft_batch_leader_retry_sleep_ns, server.dataRaftMonotonicNs());
-    try sim.ensureNoCapabilityViolation();
+    try vopr_io.ensureNoCapabilityViolation();
 }
 
 test "production DataServer replicated merge actions run on VoprIo" {
@@ -34942,7 +34945,7 @@ test "production DataServer replicated merge actions run on VoprIo" {
     // DataServer, both Raft groups, their retry clocks, and both transition
     // actions share one scheduler. Only the current LSM byte store remains a
     // host-backed differential boundary; no native thread drives consensus.
-    var sim = try vopr.vopr_io.VoprIo.init(.{
+    var vopr_io = try vopr.vopr_io.VoprIo.init(.{
         .seed = 0x4441_5441_4d45_5247,
         .tasks = .{ .stack_size = 8 * 1024 * 1024 },
         .required = .of(&.{
@@ -34953,8 +34956,8 @@ test "production DataServer replicated merge actions run on VoprIo" {
             .deterministic_entropy,
         }),
     });
-    defer sim.deinit();
-    const io = sim.io();
+    defer vopr_io.deinit();
+    const io = vopr_io.io();
 
     var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
@@ -35335,7 +35338,7 @@ test "production DataServer replicated merge actions run on VoprIo" {
     var transitions: usize = 0;
     while (!shared.done or !shared.driver_done) {
         enabled.items.clearRetainingCapacity();
-        try sim.scheduler().enumerateReady(&enabled, alloc);
+        try vopr_io.scheduler().enumerateReady(&enabled, alloc);
         try enabled.canonicalize();
         if (enabled.items.items.len == 0) {
             if (shared.driver_failure) |err| {
@@ -35352,8 +35355,8 @@ test "production DataServer replicated merge actions run on VoprIo" {
                     shared.done,
                     shared.stop_driver,
                     shared.driver_done,
-                    sim.resourceSnapshot().active_tasks,
-                    sim.resourceSnapshot().total_tasks,
+                    vopr_io.resourceSnapshot().active_tasks,
+                    vopr_io.resourceSnapshot().total_tasks,
                     server.dataRaftMonotonicNs(),
                 },
             );
@@ -35362,12 +35365,12 @@ test "production DataServer replicated merge actions run on VoprIo" {
         var selected = enabled.items.items[0];
         var non_time_count: usize = 0;
         for (enabled.items.items) |candidate| {
-            if (!std.mem.eql(u8, candidate.name, "sim-io.time_advance")) non_time_count += 1;
+            if (!std.mem.eql(u8, candidate.name, "vopr-io.time_advance")) non_time_count += 1;
         }
         if (non_time_count != 0) {
             var desired = transitions % non_time_count;
             for (enabled.items.items) |candidate| {
-                if (std.mem.eql(u8, candidate.name, "sim-io.time_advance")) continue;
+                if (std.mem.eql(u8, candidate.name, "vopr-io.time_advance")) continue;
                 if (desired == 0) {
                     selected = candidate;
                     break;
@@ -35375,7 +35378,7 @@ test "production DataServer replicated merge actions run on VoprIo" {
                 desired -= 1;
             }
         }
-        try sim.scheduler().executeReady(selected.id, &events, alloc);
+        try vopr_io.scheduler().executeReady(selected.id, &events, alloc);
         transitions += 1;
         if (transitions > 50_000) return error.VoprDataServerMergeTransitionBudgetExceeded;
     }
@@ -35423,7 +35426,7 @@ test "production DataServer replicated merge actions run on VoprIo" {
     defer @import("../graph/graph.zig").GraphIndex.freeEdges(alloc, edges);
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("doc:z", edges[0].target);
-    try sim.ensureNoCapabilityViolation();
+    try vopr_io.ensureNoCapabilityViolation();
 }
 
 const MultiOwnerReplayStep = struct {
@@ -35461,7 +35464,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         root_count += 1;
     }
 
-    var sim = try vopr.vopr_io.VoprIo.init(.{
+    var vopr_io = try vopr.vopr_io.VoprIo.init(.{
         .seed = 0x4d55_4c54_4944_4154,
         .tasks = .{ .stack_size = 8 * 1024 * 1024 },
         .network = .{ .max_sockets = 16_384 },
@@ -35474,8 +35477,8 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             .sockets,
         }),
     });
-    defer sim.deinit();
-    const io = sim.io();
+    defer vopr_io.deinit();
+    const io = vopr_io.io();
 
     const raft_round_operation = vopr.service_rate.Operation.named(
         "data-runtime-vopr.raft-round",
@@ -35817,7 +35820,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         receiver.close();
     }
     for (&servers) |*server| try server.syncDataRaftFromSnapshot(&snapshot);
-    if (sim.firstCapabilityViolation()) |violation| {
+    if (vopr_io.firstCapabilityViolation()) |violation| {
         std.log.err("multi-owner DataServer VOPR pre-schedule capability violation operation={s}", .{
             @tagName(violation.operation),
         });
@@ -36846,7 +36849,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
     var replay_failure: ?anyerror = null;
     while (!shared.done or !std.mem.allEqual(bool, &shared.driver_done, true)) {
         enabled.items.clearRetainingCapacity();
-        try sim.scheduler().enumerateReady(&enabled, alloc);
+        try vopr_io.scheduler().enumerateReady(&enabled, alloc);
         try enabled.canonicalize();
         if (enabled.items.items.len == 0) {
             if (shared.driver_failure) |err| return err;
@@ -36863,7 +36866,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             if (replay_trace) |trace| if (replay_failure == null) {
                 const expected = if (replay_index < trace.len) trace[replay_index] else null;
                 for (enabled.items.items) |candidate| {
-                    const candidate_clock_only = std.mem.eql(u8, candidate.name, "sim-io.time_advance");
+                    const candidate_clock_only = std.mem.eql(u8, candidate.name, "vopr-io.time_advance");
                     if (expected != null and
                         (candidate.id == expected.?.id or
                             expected.?.clock_only and candidate_clock_only))
@@ -36882,7 +36885,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                 // within the bounded stutter allowance.
                 var time_only: ?vopr.transition.Transition = null;
                 for (enabled.items.items) |candidate| {
-                    if (std.mem.eql(u8, candidate.name, "sim-io.time_advance"))
+                    if (std.mem.eql(u8, candidate.name, "vopr-io.time_advance"))
                         time_only = candidate;
                 }
                 if (time_only != null and replay_stutters < 50_000) {
@@ -36898,7 +36901,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                     .{ candidate.id, candidate.name, candidate.actor_id, candidate.resource_id, candidate.parameter },
                 );
                 for (&driver_futures, 0..) |*future, i| {
-                    const task = sim.futureTaskSnapshot(future.any_future orelse continue) orelse continue;
+                    const task = vopr_io.futureTaskSnapshot(future.any_future orelse continue) orelse continue;
                     std.log.err("multi-owner replay driver={} task={} status={s} parameter_hint={}", .{
                         i + 1,
                         task.id,
@@ -36907,7 +36910,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                     });
                 }
                 if (action_future.any_future) |future| {
-                    if (sim.futureTaskSnapshot(future)) |task| std.log.err(
+                    if (vopr_io.futureTaskSnapshot(future)) |task| std.log.err(
                         "multi-owner replay action task={} status={s}",
                         .{ task.id, @tagName(task.status) },
                     );
@@ -36922,7 +36925,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             var selected_count: u64 = std.math.maxInt(u64);
             var time_candidate: ?vopr.transition.Transition = null;
             for (enabled.items.items) |candidate| {
-                if (std.mem.eql(u8, candidate.name, "sim-io.time_advance")) {
+                if (std.mem.eql(u8, candidate.name, "vopr-io.time_advance")) {
                     time_candidate = candidate;
                     continue;
                 }
@@ -36947,12 +36950,12 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                     .actor_id = candidate_selected.actor_id,
                     .resource_id = candidate_selected.resource_id,
                     .parameter = candidate_selected.parameter,
-                    .clock_only = std.mem.eql(u8, candidate_selected.name, "sim-io.time_advance"),
+                    .clock_only = std.mem.eql(u8, candidate_selected.name, "vopr-io.time_advance"),
                 });
             }
             break :selection candidate_selected;
         };
-        try sim.scheduler().executeReady(selected.id, &events, alloc);
+        try vopr_io.scheduler().executeReady(selected.id, &events, alloc);
         transitions += 1;
         if (transitions > 400_000) {
             std.log.err(
@@ -36994,7 +36997,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                 std.log.err("multi-owner enabled transition name={s} id={}", .{ candidate.name, candidate.id });
             }
             for (&driver_futures, 0..) |*future, i| {
-                const task = sim.futureTaskSnapshot(future.any_future orelse continue) orelse continue;
+                const task = vopr_io.futureTaskSnapshot(future.any_future orelse continue) orelse continue;
                 std.log.err("multi-owner driver={} task={} status={s} sleep={?} futex={} external={?}", .{
                     i + 1,
                     task.id,
@@ -37005,7 +37008,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                 });
             }
             if (action_future.any_future) |future| {
-                if (sim.futureTaskSnapshot(future)) |task| std.log.err(
+                if (vopr_io.futureTaskSnapshot(future)) |task| std.log.err(
                     "multi-owner action task={} status={s} sleep={?} futex={} external={?}",
                     .{ task.id, @tagName(task.status), task.sleep_deadline_ns, task.waiting_on_futex, task.external_resource_id },
                 );
@@ -37037,13 +37040,13 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
     const split_observation = shared.split_observation orelse return error.MissingSplitObservation;
     try std.testing.expectEqual(.finalized, split_observation.status.phase);
 
-    if (sim.firstCapabilityViolation()) |violation| {
+    if (vopr_io.firstCapabilityViolation()) |violation| {
         std.log.err("multi-owner DataServer VOPR capability violation operation={s} sequence={}", .{
             @tagName(violation.operation),
             violation.sequence,
         });
     }
-    try sim.ensureNoCapabilityViolation();
+    try vopr_io.ensureNoCapabilityViolation();
 }
 
 test "three production DataServers compose replicated merge and split across public writes failover and restart on VoprIo" {
@@ -39815,8 +39818,8 @@ test "remote metadata source shares backend runtime io across a bounded executor
 
 test "remote routing capture cache and session share a virtual deadline clock" {
     const alloc = std.testing.allocator;
-    var sim = try @import("vopr").vopr_io.VoprIo.init(.{});
-    defer sim.deinit();
+    var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{});
+    defer vopr_io.deinit();
     const Stub = struct {
         calls: usize = 0,
         fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
@@ -39838,7 +39841,7 @@ test "remote routing capture cache and session share a virtual deadline clock" {
         }
     };
     var stub = Stub{};
-    var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{"http://metadata.test"}, &.{.{ .ptr = &stub, .vtable = &.{ .execute = Stub.execute } }}, sim.io());
+    var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{"http://metadata.test"}, &.{.{ .ptr = &stub, .vtable = &.{ .execute = Stub.execute } }}, vopr_io.io());
     defer source.deinit();
     const deadline = std.time.ns_per_s;
     var captured = try source.remoteRoutingSnapshotWithMode(deadline, false);
@@ -39852,11 +39855,11 @@ test "remote routing capture cache and session share a virtual deadline clock" {
     defer session.deinit();
     try std.testing.expectEqual(@as(u64, 0), session.catalog().budget(deadline).nowNs());
     try session.catalog().budget(deadline).checkpoint();
-    sim.monotonic_ns = deadline;
+    vopr_io.monotonic_ns = deadline;
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, session.catalog().budget(deadline).checkpoint());
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, source.remoteRoutingSnapshotWithMode(deadline, false));
-    sim.monotonic_ns += metadata_snapshot_cache_ttl_ms * std.time.ns_per_ms;
-    var refreshed = try source.remoteRoutingSnapshotWithMode(@intCast(sim.monotonic_ns + std.time.ns_per_s), false);
+    vopr_io.monotonic_ns += metadata_snapshot_cache_ttl_ms * std.time.ns_per_ms;
+    var refreshed = try source.remoteRoutingSnapshotWithMode(@intCast(vopr_io.monotonic_ns + std.time.ns_per_s), false);
     defer RemoteMetadataSource.remoteFreeRoutingSnapshot(&source, &refreshed);
     try std.testing.expect(stub.calls > calls_after_capture + 1);
 }

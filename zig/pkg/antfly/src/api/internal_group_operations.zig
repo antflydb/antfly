@@ -131,6 +131,7 @@ pub const Operations = struct {
             error.UnsupportedCatalogRouteFence => return error.Unsupported,
             else => return error.InvalidArgument,
         };
+        if (reads.route_fence) |*fence| fence.admission_deadline_io = request.deadline_io;
         return reads;
     }
 
@@ -336,6 +337,7 @@ pub const Operations = struct {
             parsed_fence.?.value.validate() catch return error.InvalidArgument;
             if (parsed_fence.?.value.route.group_id != group_id) return error.InvalidArgument;
             parsed_fence.?.value.admission_deadline_ns = request.deadline_ns;
+            parsed_fence.?.value.admission_deadline_io = request.deadline_io;
             parsed_fence.?.value.admission_cancellation = request.cancellation;
             break :fence .{ .catalog = parsed_fence.?.value };
         } else if (input.transaction) |transaction| transaction: {
@@ -453,6 +455,7 @@ pub const Operations = struct {
             writes.vtable.txn_begin_group_local_with_pre_decision_context != null;
         _ = (writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.begin_timestamp, input.topology_epoch, input.retain_terminal, input.participants, .{
             .deadline_ns = request.deadline_ns,
+            .deadline_io = request.deadline_io,
             .cancellation = request.cancellation,
         }) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidArgument,
@@ -488,6 +491,7 @@ pub const Operations = struct {
         };
         _ = (writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.topology_epoch, input.req, .{
             .deadline_ns = request.deadline_ns,
+            .deadline_io = request.deadline_io,
             .cancellation = request.cancellation,
         }) catch |err| switch (err) {
             error.Canceled, error.Cancelled => return error.Canceled,
