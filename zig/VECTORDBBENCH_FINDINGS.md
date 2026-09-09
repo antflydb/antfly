@@ -10198,3 +10198,60 @@ candidate; do not open old experimental row files with the new executable.
 Per-leaf maintenance debt and durable progress across newer manifests remain
 separate follow-ups. Main's release-script follow-up at `167d2bd27` was merged
 after the larger reconciliation above.
+
+#### Revision-scoped debt and durable row-reference translation (2026-09-08)
+
+Implemented behind the existing default-off posting-row experiment, on top of
+shared origins (`d260570b4`). These changes do not establish a performance win.
+
+- AFRM V2 manifests persist physical-work statistics and their first outstanding
+  maintenance revision. Immutable generation-local observations replace the
+  index-wide mutation epoch, repack flag and shared age clock. Aborted captures
+  cannot change committed debt. Reader staging preserves ages for unchanged
+  leaf/origin/debt identities; full checkpoints no longer age every leaf as due.
+- Delta maintenance selects the oldest due leaves, bounded to 64 leaves and
+  64 MiB of described input per pass. An individual leaf can make progress on
+  its own. Worker preparation validates each selected identity/revision. A
+  conservative cached deadline may trigger an extra preparation after a debt
+  disappears, but does not clear or postpone another leaf's debt.
+- AFRR redirects bind original chunk identities/checksums and ordinal ranges
+  to a compact chunk. They are written in the same checkpoint publication as
+  that chunk. A newer source WAL manifest therefore resolves to compacted rows
+  after CURRENT publication and recovery, without copying/replaying that WAL
+  or rewriting the source manifest on the writer lane. Full checkpoints retain
+  the required small redirect closure instead of the old scoring payload.
+  Delta files still retain their older physical segments until consolidation;
+  this does not introduce independent per-chunk file reclamation.
+- Old query views keep independent backing/origin leases. New views preserve
+  row order, source coverage and exact revision identity, including replacement
+  of a vector with the same ID. Missing dependencies, stale rows and malformed
+  mappings fail closed; redirect traversal is bounded. A compact base plus a
+  previously admitted source tail may temporarily retain up to twice the
+  64-MiB per-leaf physical threshold. Reads accept this bounded overlap; new
+  mutations retain the strict admission limit until maintenance drains it.
+- Whole-old-chunk deletion needs special treatment: a source manifest that
+  previously looked physically clean can become a subset of the compact base.
+  Small layout descriptors recover/schedule this debt without scanning scoring
+  pages. Worker normalization writes the effective physical references even
+  when another repack is unnecessary.
+
+Review also found that the optional nonquantized split-prefix path could feed
+AFRM into the protobuf decoder. It now dispatches that format before decoding.
+The protobuf tag reader separately returns Overflow for an out-of-range field
+number rather than trapping on its checked cast.
+
+Validation: the native integration fixture covers ten successive repack/update
+races per metric, delta-chain consolidation, old leases, deletes/replacements,
+reopen and flag-off readability. It asserts that published newer views actually
+retain the compact chunk (not merely correct search results). Component tests
+cover shared origins, metadata debt, stale/missing/corrupt redirects, whole-chunk
+deletion, score/order/bound parity and allocation failures. The vector libraries
+passed 228 tests with three skips; protobuf wire tests passed nine tests. Native
+row component tests cross-compile for amd64 and arm64 Linux. The final 10K Debug
+replay/reopen check passed without leaks; it is not a load-time result.
+
+AFRM V1, like AFRC V1, was an unreleased experiment. Keep frozen baseline data
+with its frozen binary; qualification of this format must use fresh roots.
+The preserved matched 50K/1M control remains the comparison target. No new public
+50K/1M latency, QPS, RSS, footprint, disk or recall result is claimed here.
+Concurrent source-vector edits are being preserved separately from this commit.

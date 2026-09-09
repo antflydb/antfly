@@ -17,6 +17,7 @@ const runtime = @import("hbc_runtime.zig");
 const proto = @import("antfly_vector").proto;
 
 const header_len = 80;
+const manifest_header_len = 104;
 const run_len = 40;
 const max_encoded_bytes = 64 * 1024 * 1024;
 
@@ -25,15 +26,87 @@ pub fn isManifest(bytes: []const u8) bool {
 }
 
 /// Recovery can schedule bounded deferred work without touching code pages.
-/// A compact chunk is stamped with its manifest revision; a later deletion
-/// advances only the manifest. Multiple runs also imply deferred packing work.
+/// The manifest explicitly names its first outstanding maintenance revision.
 pub fn manifestHasDebt(bytes: []const u8) !bool {
-    try validateFrame(bytes, "AFRM");
-    const count = get(u64, bytes, 64);
-    if (count > Policy.hard_runs or bytes.len != header_len + count * run_len or get(u64, bytes, 72) != 0)
-        return error.InvalidPostingRows;
-    return count > 1 or (count == 1 and (get(u64, bytes, 40) > get(u64, bytes, header_len + 8) or get(u32, bytes, header_len + 28) != 0));
+    return (try ManifestStats.decode(bytes)).first_debt_revision != 0;
 }
+
+/// Checksummed maintenance metadata, readable without touching scoring pages.
+/// It describes this exact leaf/origin/revision, never aggregate index debt.
+pub const ManifestStats = struct {
+    identity: Identity,
+    revision: u64,
+    first_debt_revision: u64,
+    rows: u64,
+    runs: usize,
+    chunks: usize,
+    physical_rows: u64,
+    physical_bytes: u64,
+
+    pub const Layout = struct { identity: Identity, serial: u64, revision: u64, rows: u64, bytes: u64 };
+
+    /// The newest compact physical base named by this manifest. Reading this
+    /// descriptor does not resolve or fault any scoring payload.
+    pub fn compactLayout(bytes: []const u8) !?Layout {
+        const stats = try decode(bytes);
+        var result: ?Layout = null;
+        for (0..stats.runs) |i| {
+            const off = manifest_header_len + i * run_len;
+            const serial = get(u64, bytes, off);
+            if (serial & (@as(u64, 1) << 63) == 0) continue;
+            if (result) |old| if (serial <= old.serial) continue;
+            result = .{ .identity = stats.identity, .serial = serial, .revision = get(u64, bytes, off + 8), .rows = stats.physical_rows, .bytes = stats.physical_bytes };
+        }
+        return result;
+    }
+
+    /// A clean old manifest can become a subset of a compact chunk after
+    /// handoff. Conservatively schedule that leaf for normalization without
+    /// decoding candidate planes on the writer lane or during recovery.
+    pub fn withLayoutDebt(stats: ManifestStats, bytes: []const u8, layout: ?Layout) ManifestStats {
+        const compact = layout orelse return stats;
+        if (!std.meta.eql(stats.identity, compact.identity) or stats.revision < compact.revision) return stats;
+        for (0..stats.runs) |i| {
+            const off = manifest_header_len + i * run_len;
+            if (get(u64, bytes, off) == compact.serial or get(u64, bytes, off + 8) > compact.revision) continue;
+            var result = stats;
+            result.first_debt_revision = @max(stats.first_debt_revision, compact.revision);
+            result.physical_rows = @max(stats.physical_rows, compact.rows);
+            result.physical_bytes = @max(stats.physical_bytes, compact.bytes);
+            return result;
+        }
+        return stats;
+    }
+
+    pub fn decode(bytes: []const u8) !ManifestStats {
+        try validateFrame(bytes, "AFRM");
+        if (bytes.len < manifest_header_len) return error.InvalidPostingRows;
+        const result: ManifestStats = .{
+            .identity = readIdentity(bytes),
+            .revision = get(u64, bytes, 40),
+            .first_debt_revision = get(u64, bytes, 72),
+            .rows = get(u64, bytes, 56),
+            .runs = std.math.cast(usize, get(u64, bytes, 64)) orelse return error.InvalidPostingRows,
+            .chunks = get(u32, bytes, 96),
+            .physical_rows = get(u64, bytes, 88),
+            .physical_bytes = get(u64, bytes, 80),
+        };
+        if (!result.identity.valid() or result.revision == 0 or result.first_debt_revision > result.revision or
+            result.runs > Policy.hard_runs or result.chunks > Policy.hard_chunks or result.chunks > result.runs or
+            result.physical_bytes > Policy.hard_bytes or result.rows > result.physical_rows or
+            bytes.len != manifest_header_len + result.runs * run_len or get(u32, bytes, 100) != 0 or
+            (result.first_debt_revision != 0) != (result.chunks > 1 or result.physical_rows > result.rows)) return error.InvalidPostingRows;
+        return result;
+    }
+
+    pub fn needsRepack(self: ManifestStats, policy: Policy, age_ns: u64) bool {
+        const removed = self.physical_rows -| self.rows;
+        return self.runs > policy.soft_runs or self.chunks > policy.soft_chunks or
+            (self.first_debt_revision != 0 and self.physical_bytes > policy.soft_bytes) or
+            (removed != 0 and removed *| 100 >= self.physical_rows *| policy.tombstone_percent) or
+            (self.first_debt_revision != 0 and age_ns >= policy.max_age_ns);
+    }
+};
 
 /// A committed allocator value lives at native row-chunk key zero. Serial
 /// zero is never a chunk. Replaying this value with the rest of the capture
@@ -73,6 +146,111 @@ pub const RowRef = struct {
     chunk: u64,
     row: u32,
 };
+
+/// An authenticated physical reference, independent of a vector ID. Redirects
+/// preserve it across repacking; an update with the same ID is a different row.
+pub const Reference = struct {
+    serial: u64,
+    revision: u64,
+    bytes: u64,
+    checksum: u32,
+    start: u32,
+    len: u32,
+
+    pub fn fromRun(run: Run) Reference {
+        return .{ .serial = run.chunk.serial, .revision = run.chunk.revision, .bytes = run.chunk.bytes.len, .checksum = run.chunk.checksum, .start = run.start, .len = run.len };
+    }
+};
+
+/// Durable translation of captured row revisions, published in the same
+/// segment as their replacement chunk. Newer WAL manifests can still name
+/// the old rows without undoing the compact layout or retaining their payload.
+/// A gap denotes an already deleted revision; resolving it fails closed.
+pub const Redirect = struct {
+    bytes: []const u8,
+    pub const range_len = 40;
+    pub const max_hops = 8;
+
+    pub fn isRedirect(bytes: []const u8) bool {
+        return bytes.len >= 4 and std.mem.eql(u8, bytes[0..4], "AFRR");
+    }
+
+    pub fn init(bytes: []const u8) !Redirect {
+        try validateFrame(bytes, "AFRR");
+        const range_count = get(u32, bytes, 72);
+        if (!readIdentity(bytes).valid() or get(u64, bytes, 40) == 0 or get(u64, bytes, 48) == 0 or
+            range_count == 0 or range_count > Policy.hard_runs or bytes.len != header_len + @as(usize, range_count) * range_len or get(u32, bytes, 76) != 0)
+            return error.InvalidPostingRows;
+        const self: Redirect = .{ .bytes = bytes };
+        var previous_end: u64 = 0;
+        for (0..range_count) |i| {
+            const off = header_len + i * range_len;
+            const range_start = get(u32, bytes, off);
+            const ref = self.target(i);
+            const end = @as(u64, range_start) + ref.len;
+            if (range_start < previous_end or ref.len == 0 or end > get(u32, bytes, 68) or
+                ref.serial == 0 or ref.serial == get(u64, bytes, 40) or ref.revision < get(u64, bytes, 48) or
+                ref.bytes < header_len or @as(u64, ref.start) + ref.len > std.math.maxInt(u32)) return error.InvalidPostingRows;
+            previous_end = end;
+        }
+        return self;
+    }
+
+    pub fn validateReference(self: Redirect, identity: Identity, ref: Reference) !void {
+        if (!std.meta.eql(identity, readIdentity(self.bytes)) or ref.serial != get(u64, self.bytes, 40) or
+            ref.revision != get(u64, self.bytes, 48) or ref.bytes != get(u64, self.bytes, 56) or ref.checksum != get(u32, self.bytes, 64) or
+            ref.len == 0 or @as(u64, ref.start) + ref.len > get(u32, self.bytes, 68)) return error.PostingChunkIdentityConflict;
+    }
+
+    pub fn count(self: Redirect) usize {
+        return get(u32, self.bytes, 72);
+    }
+
+    pub fn start(self: Redirect, i: usize) u32 {
+        return get(u32, self.bytes, header_len + i * range_len);
+    }
+
+    pub fn target(self: Redirect, i: usize) Reference {
+        const off = header_len + i * range_len;
+        return .{ .len = get(u32, self.bytes, off + 4), .serial = get(u64, self.bytes, off + 8), .revision = get(u64, self.bytes, off + 16), .bytes = get(u64, self.bytes, off + 24), .checksum = get(u32, self.bytes, off + 32), .start = get(u32, self.bytes, off + 36) };
+    }
+};
+
+/// Resolving metadata never loads authoritative vectors. The resolver owns
+/// borrowed frames/chunks until Snapshot.init takes independent chunk leases.
+pub fn resolveReference(alloc: Allocator, identity: Identity, ref: Reference, resolver: anytype, runs: *std.ArrayListUnmanaged(Run), depth: usize) anyerror!bool {
+    if (depth >= Redirect.max_hops) return error.PostingRowRedirectDepthExceeded;
+    const Resolver = switch (@typeInfo(@TypeOf(resolver))) {
+        .pointer => |p| p.child,
+        else => @TypeOf(resolver),
+    };
+    if (comptime @hasDecl(Resolver, "redirect")) {
+        if (try resolver.redirect(ref.serial)) |redirect| {
+            try redirect.validateReference(identity, ref);
+            var next = ref.start;
+            const end = @as(u64, next) + ref.len;
+            for (0..redirect.count()) |i| {
+                var target = redirect.target(i);
+                const start = redirect.start(i);
+                const range_end = @as(u64, start) + target.len;
+                if (range_end <= next) continue;
+                if (next == end) break;
+                if (start > next) return error.StalePostingRow;
+                target.start += next - start;
+                target.len = @intCast(@min(end, range_end) - next);
+                _ = try resolveReference(alloc, identity, target, resolver, runs, depth + 1);
+                next += target.len;
+            }
+            if (next != end) return error.StalePostingRow;
+            return true;
+        }
+    }
+    const chunk = (try resolver.get(ref.serial)) orelse return error.MissingPostingChunk;
+    if (chunk.revision != ref.revision or chunk.bytes.len != ref.bytes or chunk.checksum != ref.checksum) return error.PostingChunkIdentityConflict;
+    if (!std.meta.eql(identity, chunk.identity) or ref.len == 0 or ref.start > chunk.view.count or ref.len > chunk.view.count - ref.start) return error.InvalidPostingRows;
+    try appendRun(alloc, runs, .{ .chunk = chunk, .start = ref.start, .len = ref.len });
+    return false;
+}
 
 /// One physical chunk; serials must never be reused within an incarnation.
 /// The byte buffer can be owned heap memory or a retained mapping. Reader
@@ -319,12 +497,13 @@ pub const Snapshot = struct {
     physical_bytes: u64,
     physical_rows: u64,
     chunk_count: usize,
+    first_debt_revision: u64 = 0,
 
     pub fn init(alloc: Allocator, identity: Identity, revision: u64, coverage: u64, runs: []const Run) !Snapshot {
-        return initValidated(alloc, identity, revision, coverage, runs, true);
+        return initValidated(alloc, identity, revision, coverage, runs, true, false);
     }
 
-    fn initValidated(alloc: Allocator, identity: Identity, revision: u64, coverage: u64, runs: []const Run, comptime validate_ids: bool) !Snapshot {
+    fn initValidated(alloc: Allocator, identity: Identity, revision: u64, coverage: u64, runs: []const Run, comptime validate_ids: bool, redirected: bool) !Snapshot {
         if (!identity.valid() or revision == 0) return error.InvalidPostingRows;
         if (runs.len > Policy.hard_runs) return error.PostingRowBackpressure;
         var ids = std.AutoHashMapUnmanaged(u64, void).empty;
@@ -334,6 +513,12 @@ pub const Snapshot = struct {
         var count: usize = 0;
         var bytes: u64 = if (runs.len == 0) 0 else runs[0].chunk.origin.bytes.len;
         var physical_rows: u64 = 0;
+        // Handoff can retain one compact base plus a source-admitted tail.
+        // Reads/recovery must accept that bounded overlap; fresh mutations
+        // still use the strict limit and backpressure until repacking drains
+        // it. No extra scoring payload is allocated here (only leases).
+        const max_chunks: usize = Policy.hard_chunks + @as(usize, @intFromBool(redirected));
+        const max_bytes: u64 = Policy.hard_bytes * @as(u64, if (redirected) 2 else 1);
         for (runs) |run| {
             const chunk = run.chunk;
             if (!std.meta.eql(identity, chunk.identity) or chunk.revision > revision or
@@ -349,18 +534,18 @@ pub const Snapshot = struct {
                 physical_rows += chunk.view.count;
                 // Reject as soon as the retained-work limit is exceeded, before
                 // validating/allocating IDs for another potentially large chunk.
-                if (chunks.count() > Policy.hard_chunks or bytes > Policy.hard_bytes) return error.PostingRowBackpressure;
+                if (chunks.count() > max_chunks or bytes > max_bytes) return error.PostingRowBackpressure;
             }
             if (validate_ids) for (run.scan().member_ids) |id| {
                 if ((try ids.getOrPut(alloc, id)).found_existing) return error.DuplicatePostingVector;
             };
             count = try std.math.add(usize, count, run.len);
         }
-        if (chunks.count() > Policy.hard_chunks or bytes > Policy.hard_bytes) return error.PostingRowBackpressure;
+        if (chunks.count() > max_chunks or bytes > max_bytes) return error.PostingRowBackpressure;
         // The reference array is small; no candidate payload is copied.
         const owned = try alloc.dupe(Run, runs);
         for (owned) |run| run.chunk.retain();
-        return .{ .alloc = alloc, .identity = identity, .revision = revision, .coverage = coverage, .runs = owned, .row_count = count, .physical_bytes = bytes, .physical_rows = physical_rows, .chunk_count = chunks.count() };
+        return .{ .alloc = alloc, .identity = identity, .revision = revision, .coverage = coverage, .runs = owned, .row_count = count, .physical_bytes = bytes, .physical_rows = physical_rows, .chunk_count = chunks.count(), .first_debt_revision = if (chunks.count() > 1 or physical_rows > count) revision else 0 };
     }
 
     pub fn clone(self: *const Snapshot) !Snapshot {
@@ -488,21 +673,28 @@ pub const Snapshot = struct {
             };
             try appendRun(self.alloc, &runs, .{ .chunk = chunk, .start = 0, .len = @intCast(chunk.view.count) });
         }
-        return initValidated(self.alloc, self.identity, revision, coverage, runs.items, false);
+        var result = try initValidated(self.alloc, self.identity, revision, coverage, runs.items, false, false);
+        if (result.first_debt_revision != 0 and self.first_debt_revision != 0) result.first_debt_revision = self.first_debt_revision;
+        return result;
     }
 
     /// Self-framed, checksummed manifest suitable for a committed posting-WAL
     /// value. No chunk payload is embedded or copied here, including at restart.
     pub fn encode(self: *const Snapshot) ![]u8 {
-        const bytes = try self.alloc.alloc(u8, header_len + self.runs.len * run_len);
+        const bytes = try self.alloc.alloc(u8, manifest_header_len + self.runs.len * run_len);
         @memset(bytes, 0);
         writeHeader(bytes, "AFRM", self.identity);
+        put(u16, bytes, 4, 2);
         put(u64, bytes, 40, self.revision);
         put(u64, bytes, 48, self.coverage);
         put(u64, bytes, 56, self.row_count);
         put(u64, bytes, 64, self.runs.len);
+        put(u64, bytes, 72, self.first_debt_revision);
+        put(u64, bytes, 80, self.physical_bytes);
+        put(u64, bytes, 88, self.physical_rows);
+        put(u32, bytes, 96, @intCast(self.chunk_count));
         for (self.runs, 0..) |run, i| {
-            const off = header_len + i * run_len;
+            const off = manifest_header_len + i * run_len;
             put(u64, bytes, off, run.chunk.serial);
             put(u64, bytes, off + 8, run.chunk.revision);
             put(u64, bytes, off + 16, run.chunk.bytes.len);
@@ -518,23 +710,25 @@ pub const Snapshot = struct {
     /// Repeated lookups of the same serial must return the same Chunk object.
     /// Result retains its own references; missing/corrupt dependencies fail closed.
     pub fn decode(alloc: Allocator, bytes: []const u8, resolver: anytype) !Snapshot {
-        try validateFrame(bytes, "AFRM");
-        const count = get(u64, bytes, 64);
-        if (count > Policy.hard_runs or bytes.len != header_len + count * run_len or get(u64, bytes, 72) != 0)
-            return error.InvalidPostingRows;
-        const runs = try alloc.alloc(Run, @intCast(count));
-        defer alloc.free(runs);
-        for (runs, 0..) |*run, i| {
-            const off = header_len + i * run_len;
-            const chunk = (try resolver.get(get(u64, bytes, off))) orelse return error.MissingPostingChunk;
-            if (chunk.revision != get(u64, bytes, off + 8) or chunk.bytes.len != get(u64, bytes, off + 16) or
-                chunk.checksum != get(u32, bytes, off + 24) or get(u32, bytes, off + 36) != 0)
-                return error.PostingChunkIdentityConflict;
-            run.* = .{ .chunk = chunk, .start = get(u32, bytes, off + 28), .len = get(u32, bytes, off + 32) };
+        const stats = try ManifestStats.decode(bytes);
+        const count = stats.runs;
+        var runs = std.ArrayListUnmanaged(Run).empty;
+        defer runs.deinit(alloc);
+        var redirected = false;
+        for (0..count) |i| {
+            const off = manifest_header_len + i * run_len;
+            if (get(u32, bytes, off + 36) != 0) return error.PostingChunkIdentityConflict;
+            redirected = try resolveReference(alloc, readIdentity(bytes), .{ .serial = get(u64, bytes, off), .revision = get(u64, bytes, off + 8), .bytes = get(u64, bytes, off + 16), .checksum = get(u32, bytes, off + 24), .start = get(u32, bytes, off + 28), .len = get(u32, bytes, off + 32) }, resolver, &runs, 0) or redirected;
         }
-        var result = try init(alloc, readIdentity(bytes), get(u64, bytes, 40), get(u64, bytes, 48), runs);
+        var result = try initValidated(alloc, readIdentity(bytes), get(u64, bytes, 40), get(u64, bytes, 48), runs.items, true, redirected);
         errdefer result.deinit();
         if (result.row_count != get(u64, bytes, 56)) return error.InvalidPostingRows;
+        if (!redirected and (result.physical_rows != stats.physical_rows or result.physical_bytes != stats.physical_bytes or result.chunk_count != stats.chunks)) return error.InvalidPostingRows;
+        // A tail may have removed an entire old chunk. Its old physical view
+        // was clean, but a redirect can now select a subset of a compact chunk
+        // containing other captured rows. That introduces real packing debt;
+        // it must not make this otherwise valid durable manifest unreadable.
+        if (result.first_debt_revision != 0 and stats.first_debt_revision != 0) result.first_debt_revision = stats.first_debt_revision;
         return result;
     }
 };
@@ -589,6 +783,50 @@ pub const Policy = struct {
 pub const Repack = struct {
     base: Snapshot,
     compact: ?*Chunk,
+
+    /// One small redirect per physical input chunk. Sort source ranges for
+    /// bounded lookup while retaining canonical destination order. Source
+    /// payloads can be reclaimed once old generation leases drain.
+    pub fn encodeRedirect(self: *const Repack, source: *Chunk) ![]u8 {
+        const compact = self.compact orelse return error.InvalidPostingRows;
+        const Range = struct { start: u32, len: u32, target: u32 };
+        var ranges = std.ArrayListUnmanaged(Range).empty;
+        defer ranges.deinit(self.base.alloc);
+        var next: u32 = 0;
+        for (self.base.runs) |run| {
+            if (run.chunk == source) try ranges.append(self.base.alloc, .{ .start = run.start, .len = run.len, .target = next });
+            next += run.len;
+        }
+        if (ranges.items.len == 0) return error.PostingRowsSuperseded;
+        std.mem.sort(Range, ranges.items, {}, struct {
+            fn less(_: void, a: Range, b: Range) bool {
+                return a.start < b.start;
+            }
+        }.less);
+        const bytes = try self.base.alloc.alloc(u8, header_len + ranges.items.len * Redirect.range_len);
+        errdefer self.base.alloc.free(bytes);
+        @memset(bytes, 0);
+        writeHeader(bytes, "AFRR", source.identity);
+        put(u64, bytes, 40, source.serial);
+        put(u64, bytes, 48, source.revision);
+        put(u64, bytes, 56, source.bytes.len);
+        put(u32, bytes, 64, source.checksum);
+        put(u32, bytes, 68, @intCast(source.view.count));
+        put(u32, bytes, 72, @intCast(ranges.items.len));
+        for (ranges.items, 0..) |range, i| {
+            const off = header_len + i * Redirect.range_len;
+            put(u32, bytes, off, range.start);
+            put(u32, bytes, off + 4, range.len);
+            put(u64, bytes, off + 8, compact.serial);
+            put(u64, bytes, off + 16, compact.revision);
+            put(u64, bytes, off + 24, compact.bytes.len);
+            put(u32, bytes, off + 32, compact.checksum);
+            put(u32, bytes, off + 36, range.target);
+        }
+        seal(bytes);
+        _ = try Redirect.init(bytes);
+        return bytes;
+    }
 
     pub fn prepare(base: *const Snapshot, serial: u64) !Repack {
         var pinned = try base.clone();
@@ -667,7 +905,7 @@ pub const Repack = struct {
                 }
             }
         }
-        return Snapshot.initValidated(current.alloc, current.identity, current.revision, current.coverage, runs.items, false);
+        return Snapshot.initValidated(current.alloc, current.identity, current.revision, current.coverage, runs.items, false, true);
     }
 };
 
@@ -705,7 +943,7 @@ fn seal(bytes: []u8) void {
 
 fn validateFrame(bytes: []const u8, magic: *const [4]u8) !void {
     if (bytes.len < header_len or bytes.len > max_encoded_bytes or !std.mem.eql(u8, bytes[0..4], magic) or
-        get(u16, bytes, 4) != @as(u16, if (std.mem.eql(u8, magic, "AFRC")) 2 else 1) or get(u16, bytes, 6) != 0 or get(u32, bytes, 8) != bytes.len)
+        get(u16, bytes, 4) != @as(u16, if (std.mem.eql(u8, magic, "AFRC") or std.mem.eql(u8, magic, "AFRM")) 2 else 1) or get(u16, bytes, 6) != 0 or get(u32, bytes, 8) != bytes.len)
         return error.InvalidPostingRows;
     if (get(u32, bytes, 12) != checksum(bytes)) return error.PostingRowChecksumMismatch;
 }
@@ -788,6 +1026,85 @@ test "posting row deltas preserve revision identity and old query leases" {
         defer deleted_new.deinit();
         try expectIds(&deleted_new, &.{ 10, 30, 40, 50 });
     }
+}
+
+test "posting row durable redirects preserve repacking across newer manifests" {
+    const a = std.testing.allocator;
+    const chunk = try testChunk(a, 1, 1, &.{ 10, 20, 30, 40, 50 }, .cosine);
+    defer chunk.release();
+    var original = try Snapshot.init(a, test_identity, 1, 100, &.{.{ .chunk = chunk, .start = 0, .len = 5 }});
+    defer original.deinit();
+    var captured = try original.mutate(1, 2, 101, &.{.{ .chunk = 1, .row = 1 }}, null);
+    defer captured.deinit();
+    var repack = try Repack.prepare(&captured, 1000);
+    defer repack.deinit();
+    const redirect_bytes = try repack.encodeRedirect(chunk);
+    defer a.free(redirect_bytes);
+    const extra = try testChunk(a, 2, 3, &.{20}, .cosine);
+    defer extra.release();
+    var tail = try captured.mutate(2, 3, 102, &.{.{ .chunk = 1, .row = 3 }}, extra);
+    defer tail.deinit();
+    const encoded = try tail.encode();
+    defer a.free(encoded);
+    const Resolver = struct {
+        redirect_bytes: []const u8,
+        redirect_serial: u64 = 1,
+        compact: ?*Chunk,
+        extra: *Chunk,
+        pub fn redirect(self: @This(), serial: u64) !?Redirect {
+            return if (serial == self.redirect_serial) try Redirect.init(self.redirect_bytes) else null;
+        }
+        pub fn get(self: @This(), serial: u64) !?*Chunk {
+            if (serial == self.extra.serial) return self.extra;
+            if (self.compact) |value| if (serial == value.serial) return value;
+            // The original scoring payload is deliberately unavailable.
+            return null;
+        }
+    };
+    const resolver = Resolver{ .redirect_bytes = redirect_bytes, .compact = repack.compact, .extra = extra };
+    var reopened = try Snapshot.decode(a, encoded, resolver);
+    defer reopened.deinit();
+    try expectIds(&reopened, &.{ 10, 30, 50, 20 });
+    try std.testing.expectEqual(@as(u64, 102), reopened.coverage);
+    for (reopened.runs) |run| try std.testing.expect(run.chunk.serial != 1);
+    // No resurrection of an already deleted revision, even with a valid CRC.
+    const old_manifest = try original.encode();
+    defer a.free(old_manifest);
+    try std.testing.expectError(error.StalePostingRow, Snapshot.decode(a, old_manifest, resolver));
+    var missing = resolver;
+    missing.compact = null;
+    try std.testing.expectError(error.MissingPostingChunk, Snapshot.decode(a, encoded, missing));
+    const damaged = try a.dupe(u8, redirect_bytes);
+    defer a.free(damaged);
+    damaged[64] ^= 1;
+    try std.testing.expectError(error.PostingRowChecksumMismatch, Redirect.init(damaged));
+    seal(damaged);
+    var wrong = resolver;
+    wrong.redirect_bytes = damaged;
+    try std.testing.expectError(error.PostingChunkIdentityConflict, Snapshot.decode(a, encoded, wrong));
+
+    // Removing whole old chunks may make the source tail look physically
+    // clean. After translation it still retains a subset of a compact base.
+    var second = try Repack.prepare(&tail, (@as(u64, 1) << 63) | 2000);
+    defer second.deinit();
+    const extra_redirect = try second.encodeRedirect(extra);
+    defer a.free(extra_redirect);
+    var only_extra = try tail.mutate(3, 4, 103, &.{ .{ .chunk = 1, .row = 0 }, .{ .chunk = 1, .row = 2 }, .{ .chunk = 1, .row = 4 } }, null);
+    defer only_extra.deinit();
+    try std.testing.expectEqual(@as(u64, 0), only_extra.first_debt_revision);
+    const clean_bytes = try only_extra.encode();
+    defer a.free(clean_bytes);
+    var translated = try Snapshot.decode(a, clean_bytes, Resolver{ .redirect_serial = 2, .redirect_bytes = extra_redirect, .compact = second.compact, .extra = extra });
+    defer translated.deinit();
+    try expectIds(&translated, &.{20});
+    try std.testing.expect(translated.first_debt_revision != 0);
+    var compact = try second.rebase(&tail);
+    defer compact.deinit();
+    const compact_bytes = try compact.encode();
+    defer a.free(compact_bytes);
+    const pending = (try ManifestStats.decode(clean_bytes)).withLayoutDebt(clean_bytes, try ManifestStats.compactLayout(compact_bytes));
+    try std.testing.expect(pending.first_debt_revision != 0);
+    try std.testing.expect(pending.physical_rows >= translated.physical_rows);
 }
 
 test "posting row shared origins remove dimension-scaled chunk duplication" {
@@ -881,11 +1198,11 @@ test "posting row manifests recover independently and reject broken dependencies
     damaged[48] ^= 1;
     try std.testing.expectError(error.PostingRowChecksumMismatch, Snapshot.decode(a, damaged, Resolver{ .chunk = reopened_chunk }));
     @memcpy(damaged, encoded);
-    put(u32, damaged, header_len + 24, chunk.checksum ^ 1);
+    put(u32, damaged, manifest_header_len + 24, chunk.checksum ^ 1);
     seal(damaged);
     try std.testing.expectError(error.PostingChunkIdentityConflict, Snapshot.decode(a, damaged, Resolver{ .chunk = reopened_chunk }));
     @memcpy(damaged, encoded);
-    put(u32, damaged, header_len + 32, std.math.maxInt(u32));
+    put(u32, damaged, manifest_header_len + 32, std.math.maxInt(u32));
     seal(damaged);
     try std.testing.expectError(error.InvalidPostingRows, Snapshot.decode(a, damaged, Resolver{ .chunk = reopened_chunk }));
     // Chunk corruption is checked before creating a lease or exposing slices.
@@ -960,19 +1277,31 @@ test "posting row preparation and recovery are allocation failure safe" {
             defer dirty.deinit();
             var repack = try Repack.prepare(&dirty, 2);
             defer repack.deinit();
+            const redirect_bytes = try repack.encodeRedirect(chunk);
+            defer a.free(redirect_bytes);
             var rebased = try repack.rebase(&dirty);
             defer rebased.deinit();
             const encoded = try rebased.encode();
             defer a.free(encoded);
             const Resolver = struct {
                 chunk: *Chunk,
+                redirect_bytes: []const u8,
+                pub fn redirect(self: @This(), serial: u64) !?Redirect {
+                    return if (serial == 1) try Redirect.init(self.redirect_bytes) else null;
+                }
                 pub fn get(self: @This(), _: u64) !?*Chunk {
                     return self.chunk;
                 }
             };
-            var restored = try Snapshot.decode(a, encoded, Resolver{ .chunk = repack.compact.? });
+            const resolver = Resolver{ .chunk = repack.compact.?, .redirect_bytes = redirect_bytes };
+            var restored = try Snapshot.decode(a, encoded, resolver);
             defer restored.deinit();
             try expectIds(&restored, &.{ 10, 30, 40 });
+            const old_encoded = try dirty.encode();
+            defer a.free(old_encoded);
+            var old_restored = try Snapshot.decode(a, old_encoded, resolver);
+            defer old_restored.deinit();
+            try expectIds(&old_restored, &.{ 10, 30, 40 });
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Attempt.run, .{});

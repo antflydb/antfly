@@ -2670,7 +2670,9 @@ const ExperimentalPostingReadState = struct {
     /// Lower bound: superseded delta serving rows only. Does not count base
     /// rows, patches, or metadata that a retained generation may still need.
     obsolete_delta_scan_bytes: u64 = 0,
-    row_debt: bool = false,
+    row_debts: std.AutoHashMapUnmanaged(u64, NativePostingRowDebt) = .empty,
+    row_layouts: std.AutoHashMapUnmanaged(u64, posting_rows.ManifestStats.Layout) = .empty,
+    row_debt_deadline_ns: u64 = std.math.maxInt(u64),
     scan_admission: vectorindex_quantized_directory.AdmissionStats = .{},
     /// Exact physical scan cost for postings shadowed above the immutable
     /// quantized directory. This is rebuilt from bounded segment/WAL deltas on
@@ -2704,6 +2706,8 @@ const ExperimentalPostingReadState = struct {
         while (values.next()) |slot| if (slot.owned) if (slot.bytes) |owned| self.alloc.free(owned);
         self.materialized.deinit(self.alloc);
         self.leaf_scan_bytes.deinit(self.alloc);
+        self.row_debts.deinit(self.alloc);
+        self.row_layouts.deinit(self.alloc);
         var scan_blocks = self.delta_scan_blocks.valueIterator();
         while (scan_blocks.next()) |block| block.directory.deinit();
         self.delta_scan_blocks.deinit(self.alloc);
@@ -3078,7 +3082,12 @@ const ExperimentalPostingReadState = struct {
         for (self.segments) |*segment| {
             var keys = segment.keys();
             while (try keys.next()) |key| {
-                if (key.kind == .quantized_checkpoint) try ids.put(self.alloc, key.id, {});
+                if (key.kind == .quantized_checkpoint) {
+                    try ids.put(self.alloc, key.id, {});
+                    const bytes = (try segment.getValue(key.id, .quantized_checkpoint)) orelse return error.Corrupted;
+                    if (posting_rows.isManifest(bytes)) if (try posting_rows.ManifestStats.compactLayout(bytes)) |layout|
+                        try self.row_layouts.put(self.alloc, key.id, layout);
+                }
             }
         }
         var values = self.materialized.keyIterator();
@@ -3090,10 +3099,23 @@ const ExperimentalPostingReadState = struct {
         while (iter.next()) |id| {
             var resolved = (try self.resolveValueAlloc(self.alloc, id.*, .quantized_checkpoint)) orelse continue;
             defer resolved.deinit(self.alloc);
-            if (posting_rows.isManifest(resolved.bytes) and try posting_rows.manifestHasDebt(resolved.bytes)) {
-                self.row_debt = true;
-                return;
+            if (posting_rows.isManifest(resolved.bytes)) {
+                const stats = (try posting_rows.ManifestStats.decode(resolved.bytes)).withLayoutDebt(resolved.bytes, self.row_layouts.get(id.*));
+                if (stats.first_debt_revision == 0) continue;
+                if (stats.identity.leaf != id.*) return error.Corrupted;
+                const debt = NativePostingRowDebt.observe(stats, null, nowNs());
+                try self.row_debts.put(self.alloc, id.*, debt);
+                self.row_debt_deadline_ns = @min(self.row_debt_deadline_ns, debt.deadline());
             }
+        }
+    }
+
+    fn inheritRowDebt(self: *@This(), source: *ExperimentalPostingReadGeneration) void {
+        self.row_debt_deadline_ns = std.math.maxInt(u64);
+        var debts = self.row_debts.iterator();
+        while (debts.next()) |entry| {
+            entry.value_ptr.* = NativePostingRowDebt.observe(entry.value_ptr.stats, source.rowDebt(entry.key_ptr.*), entry.value_ptr.observed_ns);
+            self.row_debt_deadline_ns = @min(self.row_debt_deadline_ns, entry.value_ptr.deadline());
         }
     }
 
@@ -3586,6 +3608,63 @@ const ExperimentalPostingValueBlob = struct {
 
 const ExperimentalPostingGenerationValues = std.AutoHashMapUnmanaged(u128, ?*ExperimentalPostingValueBlob);
 
+/// A maintenance receipt belongs to a leaf/origin and its first outstanding
+/// revision. New mutations preserve its age; repacking/recentering starts a
+/// different debt identity. Immutable generations own all observations, so an
+/// aborted source capture cannot mutate scheduling state.
+const NativePostingRowDebt = struct {
+    stats: posting_rows.ManifestStats,
+    observed_ns: u64,
+
+    fn observe(stats: posting_rows.ManifestStats, previous: ?@This(), at_ns: u64) @This() {
+        const observed = if (previous) |old| if (std.meta.eql(stats.identity, old.stats.identity) and
+            stats.first_debt_revision == old.stats.first_debt_revision) old.observed_ns else at_ns else at_ns;
+        return .{ .stats = stats, .observed_ns = observed };
+    }
+
+    fn deadline(self: @This()) u64 {
+        return if (self.stats.needsRepack(.{}, 0)) 0 else self.observed_ns +| (posting_rows.Policy{}).max_age_ns;
+    }
+};
+const NativePostingRowDebts = std.AutoHashMapUnmanaged(u64, ?NativePostingRowDebt);
+
+const NativePostingRowDebtPlan = struct {
+    entries: [64]NativePostingRowDebt = undefined,
+    len: usize = 0,
+
+    fn consider(self: *@This(), debt: NativePostingRowDebt, at_ns: u64) void {
+        if (debt.deadline() > at_ns) return;
+        for (self.entries[0..self.len]) |entry| if (entry.stats.identity.leaf == debt.stats.identity.leaf) return;
+        var position: usize = 0;
+        while (position < self.len) : (position += 1) {
+            const other = self.entries[position];
+            if (debt.observed_ns < other.observed_ns or
+                (debt.observed_ns == other.observed_ns and debt.stats.identity.leaf < other.stats.identity.leaf)) break;
+        }
+        if (position == self.entries.len) return;
+        self.len = @min(self.len + 1, self.entries.len);
+        var i = self.len - 1;
+        while (i > position) : (i -= 1) self.entries[i] = self.entries[i - 1];
+        self.entries[position] = debt;
+    }
+
+    fn boundBytes(self: *@This()) void {
+        var bytes: u64 = 0;
+        for (self.entries[0..self.len], 0..) |entry, i| {
+            bytes +|= entry.stats.physical_bytes;
+            if (i != 0 and bytes > posting_rows.Policy.hard_bytes) {
+                self.len = i;
+                return;
+            }
+        }
+    }
+
+    fn get(self: *const @This(), id: u64) ?NativePostingRowDebt {
+        for (self.entries[0..self.len]) |entry| if (entry.stats.identity.leaf == id) return entry;
+        return null;
+    }
+};
+
 const NativePostingRows = struct {
     alloc: Allocator,
     snapshot: posting_rows.Snapshot,
@@ -3629,6 +3708,7 @@ const NativePostingRowResolver = struct {
     capture: ?*HBCIndex = null,
     chunks: std.AutoHashMapUnmanaged(u64, *posting_rows.Chunk) = .empty,
     origins: std.AutoHashMapUnmanaged(u64, *posting_rows.Origin) = .empty,
+    redirects: std.AutoHashMapUnmanaged(u64, ?[]u8) = .empty,
 
     fn deinit(self: *NativePostingRowResolver) void {
         var values = self.chunks.valueIterator();
@@ -3637,6 +3717,25 @@ const NativePostingRowResolver = struct {
         var origins = self.origins.valueIterator();
         while (origins.next()) |origin| origin.*.release();
         self.origins.deinit(self.alloc);
+        var redirects = self.redirects.valueIterator();
+        while (redirects.next()) |bytes| if (bytes.*) |owned| self.alloc.free(owned);
+        self.redirects.deinit(self.alloc);
+    }
+
+    pub fn redirect(self: *@This(), serial: u64) !?posting_rows.Redirect {
+        if (self.redirects.get(serial)) |cached| return if (cached) |bytes| try posting_rows.Redirect.init(bytes) else null;
+        const key = experimentalPostingValueKey(serial, .row_chunk);
+        var resolved = if (self.capture) |index| blk: {
+            if (index.experimental_posting_captured_values.get(key)) |stored|
+                break :blk ExperimentalPostingResolvedValue{ .bytes = (stored orelse return error.MissingPostingChunk).bytes() };
+            break :blk (try self.generation.resolveValueAlloc(self.alloc, serial, .row_chunk)) orelse return error.MissingPostingChunk;
+        } else (try self.generation.resolveValueAlloc(self.alloc, serial, .row_chunk)) orelse return error.MissingPostingChunk;
+        defer resolved.deinit(self.alloc);
+        const bytes = if (posting_rows.Redirect.isRedirect(resolved.bytes)) try self.alloc.dupe(u8, resolved.bytes) else null;
+        errdefer if (bytes) |owned| self.alloc.free(owned);
+        const result = if (bytes) |owned| try posting_rows.Redirect.init(owned) else null;
+        try self.redirects.put(self.alloc, serial, bytes);
+        return result;
     }
 
     fn originForChunk(self: *@This(), bytes: []const u8) !*posting_rows.Origin {
@@ -3763,6 +3862,10 @@ const ExperimentalPostingReadGeneration = struct {
     /// this MVCC generation. Newest entries shadow parent costs just like the
     /// posting values themselves.
     leaf_scan_bytes: std.AutoHashMapUnmanaged(u64, vectorindex_quantized_directory.ScanBytes) = .empty,
+    row_debts: NativePostingRowDebts = .empty,
+    /// Conservative minimum: deleting the earliest debt can cause one extra
+    /// preparation, never postpone another leaf. A checkpoint rebuilds it.
+    row_debt_deadline_ns: u64 = std.math.maxInt(u64),
     routing_mu: std.atomic.Mutex = .unlocked,
     routing_directory: ?*vectorindex_spfresh_index.FlatCentroidDirectory = null,
     row_mu: std.atomic.Mutex = .unlocked,
@@ -3777,6 +3880,7 @@ const ExperimentalPostingReadGeneration = struct {
             .wal_generation = .init(state.wal_generation),
             .wal_committed_bytes = .init(state.wal_committed_bytes),
             .scan_admission = state.scan_admission,
+            .row_debt_deadline_ns = state.row_debt_deadline_ns,
             .root = state,
         };
         if (state.patch_cache_manager) |manager|
@@ -3799,6 +3903,7 @@ const ExperimentalPostingReadGeneration = struct {
             .wal_generation = .init(wal_generation),
             .wal_committed_bytes = .init(wal_committed_bytes),
             .scan_admission = parent.scan_admission,
+            .row_debt_deadline_ns = parent.row_debt_deadline_ns,
             .overlay_depth = parent.overlay_depth +| 1,
             .parent = parent,
         };
@@ -3905,6 +4010,7 @@ const ExperimentalPostingReadGeneration = struct {
             while (values.next()) |slot| if (slot.*) |blob| blob.release();
             generation.values.deinit(generation.alloc);
             generation.leaf_scan_bytes.deinit(generation.alloc);
+            generation.row_debts.deinit(generation.alloc);
             var row_views = generation.row_views.valueIterator();
             while (row_views.next()) |view| view.*.destroy();
             generation.row_views.deinit(generation.alloc);
@@ -4023,6 +4129,64 @@ const ExperimentalPostingReadGeneration = struct {
         const cost = try resolvedExperimentalPostingLeafScan(self, posting_id, dims, use_quantization);
         try self.leaf_scan_bytes.put(self.alloc, posting_id, cost.bytes);
         self.scan_admission.observeLeaf(cost.vector_count, cost.bytes);
+        if (self.values.get(experimentalPostingValueKey(posting_id, .quantized_checkpoint))) |stored| {
+            const stats = if (stored) |blob| if (posting_rows.isManifest(blob.bytes()))
+                (try posting_rows.ManifestStats.decode(blob.bytes())).withLayoutDebt(blob.bytes(), if (experimentalPostingRootState(self)) |root| root.row_layouts.get(posting_id) else null)
+            else
+                null else null;
+            const previous = if (self.parent) |parent| parent.rowDebt(posting_id) else null;
+            // Ordinary non-row indexes and clean leaves allocate no debt
+            // map. Only a real outstanding debt needs a shadow tombstone.
+            if (stats) |summary| {
+                if (summary.identity.leaf != posting_id) return error.Corrupted;
+                if (summary.first_debt_revision == 0 and previous == null) return;
+            } else if (previous == null) return;
+            const debt: ?NativePostingRowDebt = if (stats) |summary| if (summary.first_debt_revision != 0)
+                NativePostingRowDebt.observe(summary, previous, nowNs())
+            else
+                null else null;
+            try self.row_debts.put(self.alloc, posting_id, debt);
+            if (debt) |pending| self.row_debt_deadline_ns = @min(self.row_debt_deadline_ns, pending.deadline());
+        }
+    }
+
+    fn rowDebt(self: *@This(), id: u64) ?NativePostingRowDebt {
+        var current: ?*@This() = self;
+        while (current) |generation| : (current = generation.parent) {
+            if (generation.row_debts.get(id)) |debt| return debt;
+            if (generation.root) |root| return root.row_debts.get(id);
+        }
+        return null;
+    }
+
+    fn copyRowDebtsUntil(self: *@This(), alloc: Allocator, boundary: *@This()) !NativePostingRowDebts {
+        var result = NativePostingRowDebts.empty;
+        errdefer result.deinit(alloc);
+        var current: ?*@This() = self;
+        while (current) |generation| : (current = generation.parent) {
+            if (generation == boundary) break;
+            var debts = generation.row_debts.iterator();
+            while (debts.next()) |entry| {
+                const slot = try result.getOrPut(alloc, entry.key_ptr.*);
+                if (!slot.found_existing) slot.value_ptr.* = entry.value_ptr.*;
+            }
+        }
+        return result;
+    }
+
+    fn rowDebtPlan(self: *@This(), at_ns: u64) NativePostingRowDebtPlan {
+        var result = NativePostingRowDebtPlan{};
+        var current: ?*@This() = self;
+        while (current) |generation| : (current = generation.parent) {
+            var ids = generation.row_debts.keyIterator();
+            while (ids.next()) |id| if (self.rowDebt(id.*)) |debt| result.consider(debt, at_ns);
+            if (generation.root) |root| {
+                var root_ids = root.row_debts.keyIterator();
+                while (root_ids.next()) |id| if (self.rowDebt(id.*)) |debt| result.consider(debt, at_ns);
+            }
+        }
+        result.boundBytes();
+        return result;
     }
 
     fn overlayValue(self: *const ExperimentalPostingReadGeneration, key: u128) ?*const ?*ExperimentalPostingValueBlob {
@@ -4651,8 +4815,6 @@ const StreamingPostingDeltaWriter = struct {
 /// appended after `flattened_wal_bytes`.
 const ExperimentalPostingCheckpointBuild = struct {
     owner_alloc: Allocator,
-    row_mutation_epoch: u64 = 0,
-    row_repack_due: bool = false,
     source_generation: *ExperimentalPostingReadGeneration,
     metadata: IndexMetadata,
     kind: ExperimentalPostingCheckpointKind,
@@ -4780,6 +4942,8 @@ const ExperimentalPostingCheckpointBuild = struct {
             read_alloc.destroy(state);
         }
         self.staged_readers = try ExperimentalPostingReadGeneration.createRoot(read_alloc, state);
+        state.inheritRowDebt(self.source_generation);
+        self.staged_readers.?.row_debt_deadline_ns = state.row_debt_deadline_ns;
     }
 
     fn runRebase(self: *ExperimentalPostingCheckpointBuild) void {
@@ -4859,7 +5023,7 @@ const ExperimentalPostingCheckpointBuild = struct {
             self.projection_source,
             &writer,
             self.kind == .compact_deltas,
-            .{ .generation = self.segment_generation, .forced = self.row_repack_due },
+            .{ .generation = self.segment_generation },
         );
         if (self.kind == .delta and self.flattened_wal_bytes == 0 and result.source_value_count == 0 and result.scan_build.written_rows == 0) {
             // Abort the temporary writer before fsync/rename. Neither a new
@@ -5129,9 +5293,6 @@ pub const HBCIndex = struct {
     experimental_posting_maintenance_capture_active: bool = false,
     experimental_posting_captured_values: ExperimentalPostingCapturedValues = .empty,
     experimental_posting_captured_rows: std.AutoHashMapUnmanaged(u64, *NativePostingRows) = .empty,
-    row_mutation_epoch: u64 = 0,
-    row_repack_pending: bool = false,
-    row_debt_since_ns: u64 = 0,
     experimental_posting_commit_workspace: PostingCommitWorkspace = .{},
     experimental_exact_vector_capture_enabled: bool = false,
     experimental_exact_vector_mutations: ExperimentalExactVectorMutations = .empty,
@@ -8306,11 +8467,6 @@ pub const HBCIndex = struct {
         self.experimental_posting_read_generation = generation;
         self.experimental_posting_reads_enabled.store(true, .release);
         self.experimental_posting_read_generation_mu.unlock();
-        if (self.row_debt_since_ns == 0) {
-            if (experimentalPostingRootState(generation)) |root| {
-                if (root.row_debt) self.row_debt_since_ns = nowNs();
-            }
-        }
         if (old) |previous| previous.release();
     }
 
@@ -8773,6 +8929,9 @@ pub const HBCIndex = struct {
         const immutable_root = root orelse return error.Corrupted;
         if (newest.parent == immutable_root) return @intCast(newest.values.count());
 
+        var merged_row_debts = try newest.copyRowDebtsUntil(self.alloc, immutable_root);
+        errdefer merged_row_debts.deinit(self.alloc);
+
         var merged: ExperimentalPostingGenerationValues = .empty;
         errdefer merged.deinit(self.alloc);
         try merged.ensureTotalCapacity(self.alloc, @intCast(total_values));
@@ -8805,6 +8964,8 @@ pub const HBCIndex = struct {
         newest.values = merged;
         newest.leaf_scan_bytes.deinit(self.alloc);
         newest.leaf_scan_bytes = merged_leaf_scan_bytes;
+        newest.row_debts.deinit(self.alloc);
+        newest.row_debts = merged_row_debts;
         newest.parent = immutable_root;
         newest.overlay_depth = 1;
         const value_count: u64 = @intCast(newest.values.count());
@@ -8844,6 +9005,10 @@ pub const HBCIndex = struct {
         const root = immutable_root orelse return error.Corrupted;
         if (newest == root) return 0;
         if (newest.parent == root) return @intCast(newest.values.count());
+
+        var merged_row_debts = try newest.copyRowDebtsUntil(self.alloc, root);
+        var merged_row_debts_owned = true;
+        defer if (merged_row_debts_owned) merged_row_debts.deinit(self.alloc);
 
         var merged: ExperimentalPostingGenerationValues = .empty;
         var merged_owned = true;
@@ -8889,6 +9054,9 @@ pub const HBCIndex = struct {
         replacement.leaf_scan_bytes = merged_leaf_scan_bytes;
         merged_leaf_scan_bytes_owned = false;
         replacement.scan_admission = newest.scan_admission;
+        replacement.row_debts = merged_row_debts;
+        merged_row_debts_owned = false;
+        replacement.row_debt_deadline_ns = newest.row_debt_deadline_ns;
         replacement.overlay_depth = root.overlay_depth +| 1;
         const view = newest.search_view;
         if (newest.acquireRoutingDirectory(
@@ -9324,8 +9492,6 @@ pub const HBCIndex = struct {
             return error.PostingSegmentGenerationOverflow;
         };
         build.* = .{
-            .row_mutation_epoch = self.row_mutation_epoch,
-            .row_repack_due = self.rowRepackDue(),
             .owner_alloc = self.alloc,
             .queued_ns = nowNs(),
             .source_generation = source_generation,
@@ -9463,10 +9629,6 @@ pub const HBCIndex = struct {
         defer prepared.deinit();
         const install_started_ns = nowNs();
         try self.installPreparedExperimentalPostingCheckpointRebasedTail(posting_store, &prepared, build.rebase_source orelse build.source_generation, build.staged_readers, build.staged_rebase);
-        if ((build.kind == .full or build.row_repack_due) and build.row_mutation_epoch == self.row_mutation_epoch) {
-            self.row_repack_pending = false;
-            self.row_debt_since_ns = 0;
-        }
         std.log.info("dense checkpoint handoff generation={} sequence={} kind={s} completed_wait_ns={} prepare_ns={} install_ns={} written_bytes={} retained_bytes={}", .{
             build.segment_generation,                 build.covered_source_sequence,                     @tagName(build.kind),
             prepare_started_ns -| build.completed_ns, install_started_ns -| prepare_started_ns,          nowNs() -| install_started_ns,
@@ -9562,6 +9724,7 @@ pub const HBCIndex = struct {
                 prepared.next.covered_source_sequence,
                 captured == null,
             );
+            if (previous) |old| state.inheritRowDebt(old);
             break :create ExperimentalPostingReadGeneration.createRoot(self.alloc, state) catch |err| {
                 state.deinit();
                 self.alloc.destroy(state);
@@ -10742,7 +10905,7 @@ pub const HBCIndex = struct {
         }
     }
 
-    fn appendRowRepack(alloc: Allocator, writer: anytype, sink: anytype, snapshot: *const posting_rows.Snapshot, sequence: u64, serial_namespace: u64, age_ns: u64) !bool {
+    fn appendRowRepack(alloc: Allocator, writer: anytype, sink: anytype, snapshot: *const posting_rows.Snapshot, sequence: u64, serial_namespace: u64, age_ns: u64, emitted: *std.AutoHashMapUnmanaged(u64, void)) !bool {
         if (!(posting_rows.Policy{}).needsRepack(snapshot, age_ns)) return false;
         const posting_id = snapshot.identity.leaf;
         if (serial_namespace >= (@as(u64, 1) << 31) or posting_id > std.math.maxInt(u32)) return error.PostingRowIdentityExhausted;
@@ -10754,13 +10917,19 @@ pub const HBCIndex = struct {
         const manifest = try compact.encode();
         defer alloc.free(manifest);
         if (repack.compact) |chunk| try appendRowCheckpointValue(writer, sink, serial, .row_chunk, sequence, chunk.bytes);
+        for (snapshot.runs) |run| {
+            if ((try emitted.getOrPut(alloc, run.chunk.serial)).found_existing) continue;
+            const redirect = try repack.encodeRedirect(run.chunk);
+            defer alloc.free(redirect);
+            try appendRowCheckpointValue(writer, sink, run.chunk.serial, .row_chunk, sequence, redirect);
+        }
         try appendRowCheckpointValue(writer, sink, posting_id, .quantized_checkpoint, sequence, manifest);
         return true;
     }
 
-    /// Copy the captured manifest's reference closure even when repacking it:
-    /// a source transaction committed after capture may still name these rows.
-    /// A subsequent full checkpoint collects chunks no longer in that closure.
+    /// Preserve captured row identities with small durable redirects, not a
+    /// duplicate scoring plane. Newer WAL manifests resolve onto the compact
+    /// rows; old query leases retain their original immutable backing.
     fn appendRowCheckpoint(
         alloc: Allocator,
         writer: anytype,
@@ -10778,18 +10947,31 @@ pub const HBCIndex = struct {
         var snapshot = try posting_rows.Snapshot.decode(alloc, encoded, &resolver);
         defer snapshot.deinit();
         if (snapshot.identity.leaf != posting_id or snapshot.coverage > sequence) return error.Corrupted;
+        var redirects = resolver.redirects.iterator();
+        while (redirects.next()) |entry| if (entry.value_ptr.*) |bytes| {
+            if (!(try emitted.getOrPut(alloc, entry.key_ptr.*)).found_existing)
+                try appendRowCheckpointValue(writer, sink, entry.key_ptr.*, .row_chunk, sequence, bytes);
+        };
         for (snapshot.runs) |run| {
             if (!(try emitted.getOrPut(alloc, run.chunk.identity.origin)).found_existing) {
                 try appendRowCheckpointValue(writer, sink, run.chunk.identity.origin, .row_chunk, sequence, run.chunk.origin.bytes);
             }
+        }
+        if (segment_generation) |serial_namespace| {
+            const age_ns = if (generation.rowDebt(posting_id)) |debt| nowNs() -| debt.observed_ns else 0;
+            if (try appendRowRepack(alloc, writer, sink, &snapshot, sequence, serial_namespace, age_ns, emitted)) {
+                for (snapshot.runs) |run| if (reclaimer) |pages| pages.observe(run.chunk.bytes);
+                return;
+            }
+        }
+        for (snapshot.runs) |run| {
             if ((try emitted.getOrPut(alloc, run.chunk.serial)).found_existing) continue;
             try appendRowCheckpointValue(writer, sink, run.chunk.serial, .row_chunk, sequence, run.chunk.bytes);
             if (reclaimer) |pages| pages.observe(run.chunk.bytes);
         }
-        if (segment_generation) |serial_namespace| {
-            if (try appendRowRepack(alloc, writer, sink, &snapshot, sequence, serial_namespace, (posting_rows.Policy{}).max_age_ns)) return;
-        }
-        try appendRowCheckpointValue(writer, sink, posting_id, .quantized_checkpoint, sequence, encoded);
+        const normalized = try snapshot.encode();
+        defer alloc.free(normalized);
+        try appendRowCheckpointValue(writer, sink, posting_id, .quantized_checkpoint, sequence, normalized);
     }
 
     /// Rewrites a checkpoint from the already complete immutable query
@@ -11706,7 +11888,7 @@ pub const HBCIndex = struct {
         projection_source: ?vectorindex_hbc_runtime.NativeProjectionBuildSource,
         writer: anytype,
         compact_deltas: bool,
-        row_repack: ?struct { generation: u64, forced: bool },
+        row_repack: ?struct { generation: u64 },
     ) !ExperimentalPostingCheckpointBuildResult {
         var latest: ExperimentalPostingLatestValues = .empty;
         defer latest.deinit(alloc);
@@ -11723,26 +11905,55 @@ pub const HBCIndex = struct {
             for (row_values.items) |*resolved| resolved.deinit(alloc);
             row_values.deinit(alloc);
         }
-        if (row_repack) |policy| if (policy.forced) {
-            // Idle/recovery debt may have no new WAL key. Include only those
-            // current manifests, not every value in the immutable suffix.
-            for (root.segments) |*segment| {
-                var keys = segment.keys();
-                while (try keys.next()) |key| {
-                    if (key.kind != .quantized_checkpoint) continue;
-                    const value_key = experimentalPostingValueKey(key.id, .quantized_checkpoint);
-                    if (latest.contains(value_key)) continue;
-                    var resolved = (try generation.resolveValueAlloc(alloc, key.id, .quantized_checkpoint)) orelse continue;
-                    var owned = true;
-                    defer if (owned) resolved.deinit(alloc);
-                    if (!posting_rows.isManifest(resolved.bytes) or !try posting_rows.manifestHasDebt(resolved.bytes)) continue;
-                    try row_values.append(alloc, resolved);
-                    owned = false;
-                    try latest.put(alloc, value_key, resolved.bytes);
-                }
-            }
-        };
+        const repack_at_ns = nowNs();
+        const row_plan = if (row_repack != null) generation.rowDebtPlan(repack_at_ns) else NativePostingRowDebtPlan{};
+        // Bounded, oldest-first per-leaf work; no broad scan of every segment
+        // and no global age that makes an unrelated new leaf immediately due.
+        for (row_plan.entries[0..row_plan.len]) |debt| {
+            const id = debt.stats.identity.leaf;
+            const value_key = experimentalPostingValueKey(id, .quantized_checkpoint);
+            if (latest.contains(value_key)) continue;
+            var resolved = (try generation.resolveValueAlloc(alloc, id, .quantized_checkpoint)) orelse continue;
+            var owned = true;
+            defer if (owned) resolved.deinit(alloc);
+            try row_values.append(alloc, resolved);
+            owned = false;
+            try latest.put(alloc, value_key, resolved.bytes);
+        }
         var repacked_leaves: usize = 0;
+        var repacked = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer repacked.deinit(alloc);
+        var redirected_chunks = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer redirected_chunks.deinit(alloc);
+        // Prepare replacements before streaming ordinary values, so an input
+        // chunk present in the captured WAL cannot overwrite its redirect.
+        if (row_repack) |policy| {
+            var manifests = latest.iterator();
+            while (manifests.next()) |entry| {
+                if (try experimentalPostingValueKeyKind(entry.key_ptr.*) != .quantized_checkpoint) continue;
+                const bytes = entry.value_ptr.* orelse continue;
+                if (!posting_rows.isManifest(bytes)) continue;
+                const id = experimentalPostingValueKeyId(entry.key_ptr.*);
+                const debt = row_plan.get(id) orelse continue;
+                var resolver = NativePostingRowResolver{ .alloc = alloc, .generation = generation };
+                defer resolver.deinit();
+                var snapshot = try posting_rows.Snapshot.decode(alloc, bytes, &resolver);
+                defer snapshot.deinit();
+                if (snapshot.identity.leaf != id or snapshot.coverage > covered_source_sequence) return error.Corrupted;
+                if (!std.meta.eql(snapshot.identity, debt.stats.identity) or snapshot.revision != debt.stats.revision) return error.PostingRowsSuperseded;
+                if (try appendRowRepack(alloc, writer, null, &snapshot, covered_source_sequence, policy.generation, repack_at_ns -| debt.observed_ns, &redirected_chunks)) {
+                    repacked_leaves += 1;
+                } else {
+                    // A newer manifest may already resolve through durable
+                    // redirects. Normalize its physical references/debt even
+                    // when no scoring rows need to be copied again.
+                    const normalized = try snapshot.encode();
+                    defer alloc.free(normalized);
+                    try appendRowCheckpointValue(writer, null, id, .quantized_checkpoint, covered_source_sequence, normalized);
+                }
+                try repacked.put(alloc, id, {});
+            }
+        }
 
         var posting_count: u64 = 0;
         var patch_count: u64 = 0;
@@ -11775,6 +11986,8 @@ pub const HBCIndex = struct {
             }
             const id = experimentalPostingValueKeyId(entry.key_ptr.*);
             const record_kind = try experimentalPostingValueKeyKind(entry.key_ptr.*);
+            if ((record_kind == .row_chunk and redirected_chunks.contains(id)) or
+                (record_kind == .quantized_checkpoint and repacked.contains(id))) continue;
             var resolved = if (deferred_patches.contains(entry.key_ptr.*))
                 (try root.resolveSegmentValueAlloc(alloc, root.segments.len, id, record_kind)) orelse return error.PostingPatchBaseMismatch
             else
@@ -11782,17 +11995,6 @@ pub const HBCIndex = struct {
             defer if (resolved) |*value| value.deinit(alloc);
             const current_value = if (resolved) |value| value.bytes else entry.value_ptr.*;
             if (current_value) |value_bytes| {
-                if (row_repack) |policy| if (record_kind == .quantized_checkpoint and posting_rows.isManifest(value_bytes)) {
-                    var resolver = NativePostingRowResolver{ .alloc = alloc, .generation = generation };
-                    defer resolver.deinit();
-                    var snapshot = try posting_rows.Snapshot.decode(alloc, value_bytes, &resolver);
-                    defer snapshot.deinit();
-                    if (snapshot.identity.leaf != id or snapshot.coverage > covered_source_sequence) return error.Corrupted;
-                    if (try appendRowRepack(alloc, writer, null, &snapshot, covered_source_sequence, policy.generation, if (policy.forced) (posting_rows.Policy{}).max_age_ns else 0)) {
-                        repacked_leaves += 1;
-                        continue;
-                    }
-                };
                 if (record_kind == .base) if (centroid_directory) |*directory| {
                     const node = try vectorindex_hbc.decodePackedNodeValue(value_bytes);
                     if (node.header.is_leaf and node.ids_bytes.len > 0) {
@@ -16828,10 +17030,6 @@ pub const HBCIndex = struct {
         if (entry.found_existing) entry.value_ptr.*.destroy();
         entry.value_ptr.* = row;
         self.invalidateQuantizedCache(node_id);
-        self.row_mutation_epoch +%= 1;
-        if ((posting_rows.Policy{}).needsRepack(&snapshot, 0)) self.row_repack_pending = true;
-        if (self.row_debt_since_ns == 0 and (snapshot.chunk_count > 1 or snapshot.physical_rows > snapshot.row_count))
-            self.row_debt_since_ns = nowNs();
     }
 
     fn currentPostingRows(self: *HBCIndex, txn: anytype, node_id: u64) !?*NativePostingRows {
@@ -16871,8 +17069,9 @@ pub const HBCIndex = struct {
     }
 
     fn rowRepackDue(self: *const HBCIndex) bool {
-        return self.row_repack_pending or (self.row_debt_since_ns != 0 and
-            nowNs() -| self.row_debt_since_ns >= (posting_rows.Policy{}).max_age_ns);
+        const generation = @constCast(self).retainCurrentExperimentalPostingReadGeneration() orelse return false;
+        defer generation.release();
+        return generation.row_debt_deadline_ns <= nowNs();
     }
 
     fn storeNativePostingRows(self: *HBCIndex, txn: anytype, node_id: u64, qs: *const QuantizedSet) !bool {
@@ -28807,6 +29006,48 @@ test "hbc stable origins replace changed external vector revisions across reopen
     }
 }
 
+test "native posting row debt is revision scoped oldest first and bounded" {
+    const stats: posting_rows.ManifestStats = .{
+        .identity = .{ .incarnation = 1, .leaf = 1, .origin = 1 },
+        .revision = 9,
+        .first_debt_revision = 3,
+        .rows = 100,
+        .runs = 2,
+        .chunks = 2,
+        .physical_rows = 100,
+        .physical_bytes = 4096,
+    };
+    const old = NativePostingRowDebt.observe(stats, null, 100);
+    var later = stats;
+    later.revision = 10;
+    const continued = NativePostingRowDebt.observe(later, old, 200);
+    try std.testing.expectEqual(@as(u64, 100), continued.observed_ns);
+    later.first_debt_revision = 10;
+    const renewed = NativePostingRowDebt.observe(later, old, 200);
+    try std.testing.expectEqual(@as(u64, 200), renewed.observed_ns);
+    later = stats;
+    later.identity.origin += 1;
+    try std.testing.expectEqual(@as(u64, 200), NativePostingRowDebt.observe(later, old, 200).observed_ns);
+    var plan = NativePostingRowDebtPlan{};
+    const at_ns = old.deadline();
+    plan.consider(renewed, at_ns);
+    try std.testing.expectEqual(@as(usize, 0), plan.len);
+    // Reverse arrival order cannot starve the oldest leaves; duplicate
+    // overlay observations do not consume additional slots.
+    for (0..100) |i| {
+        var sample = stats;
+        sample.identity.leaf = 100 - i;
+        const debt = NativePostingRowDebt.observe(sample, null, 100 - i);
+        plan.consider(debt, at_ns);
+        plan.consider(debt, at_ns);
+    }
+    try std.testing.expectEqual(@as(usize, 64), plan.len);
+    for (plan.entries[0..plan.len], 1..) |entry, id| try std.testing.expectEqual(@as(u64, id), entry.stats.identity.leaf);
+    for (plan.entries[0..plan.len]) |*entry| entry.stats.physical_bytes = 40 * 1024 * 1024;
+    plan.boundBytes();
+    try std.testing.expectEqual(@as(usize, 1), plan.len);
+}
+
 test "native posting row integration survives mutation checkpoint and reopen" {
     const alloc = std.testing.allocator;
     var runtime = std.Io.Threaded.init(alloc, .{});
@@ -28851,6 +29092,7 @@ test "native posting row integration survives mutation checkpoint and reopen" {
         const config: HBCConfig = .{ .dims = 4, .leaf_size = 16, .branching_factor = 2, .metric = metric, .search_width = 128, .max_cached_vectors = 0, .stable_posting_origin_max_mutations = std.math.maxInt(u32), .storage_backend = .lsm };
         var context = Fixture{};
         var deleted = [_]u64{ 1, 2, 3, 4, 0, 0 };
+        var sequence: u64 = 67;
         {
             var idx = try HBCIndex.open(alloc, path, config);
             defer idx.close();
@@ -28925,12 +29167,23 @@ test "native posting row integration survives mutation checkpoint and reopen" {
             try idx.beginExperimentalPostingMutationCapture();
             try idx.batchApplyOptions(&.{}, deleted[4..5], .{ .preserve_delete_rows = true, .skip_vector_store = true });
             idx.cancelExperimentalPostingMutationCapture();
+            {
+                const still_committed = idx.retainCurrentExperimentalPostingReadGeneration().?;
+                defer still_committed.release();
+                try std.testing.expectEqualDeep(pinned.rowDebt(leaf), still_committed.rowDebt(leaf));
+            }
             try Fixture.check(&idx, deleted[0..4]);
             try idx.beginExperimentalPostingMutationCapture();
             try idx.batchApplyOptions(&.{}, deleted[4..5], .{ .preserve_delete_rows = true, .skip_vector_store = true });
             try idx.persistExperimentalPostingSidecarAtAppliedSequence(66, .{});
             const checkpoint_kind: ExperimentalPostingCheckpointKind = if (metric == .cosine) .delta else .full;
-            idx.row_repack_pending = true;
+            {
+                const current = idx.retainCurrentExperimentalPostingReadGeneration().?;
+                defer current.release();
+                const debt = current.row_debts.getPtr(leaf).?;
+                debt.*.?.observed_ns = 0;
+                current.row_debt_deadline_ns = 0;
+            }
             try std.testing.expect(try idx.startExperimentalPostingCheckpointBuild(&idx.experimental_posting_write_store.?, checkpoint_kind));
             const build = idx.experimental_posting_checkpoint_build.?;
             build.awaitCompletion();
@@ -28948,10 +29201,12 @@ test "native posting row integration survives mutation checkpoint and reopen" {
             build.completed.store(true, .release);
             completion_gate = false;
             try build.stageReaders();
-            // Old references are needed by the WAL tail even though the
-            // worker published a compact replacement for its captured view.
+            // The old key remains as a small durable translation, not a copy
+            // of the old payload. A newer WAL manifest must use the compact
+            // rows even though it was written before their publication.
             const staged = build.staged_readers.?;
             try std.testing.expect(try staged.hasValue(old_serial, .row_chunk));
+            try std.testing.expect(posting_rows.Redirect.isRedirect((try staged.value(old_serial, .row_chunk)).?));
             if (checkpoint_kind == .delta) try std.testing.expectEqual(
                 experimentalPostingRootState(pinned).?.retained_segments[0].bytes().ptr,
                 experimentalPostingRootState(staged).?.retained_segments[0].bytes().ptr,
@@ -28959,25 +29214,94 @@ test "native posting row integration survives mutation checkpoint and reopen" {
             const compact_rows = (try staged.rowView(leaf)).?;
             try std.testing.expectEqual(@as(usize, 1), compact_rows.snapshot.runs.len);
             try std.testing.expect(compact_rows.snapshot.runs[0].chunk.serial != old_serial);
+            const compact_serial = compact_rows.snapshot.runs[0].chunk.serial;
             // Avoid using `build` after publication destroys its owner.
             try std.testing.expect(try idx.publishReadyExperimentalPostingCheckpointForRecovery());
+            {
+                const published = idx.retainCurrentExperimentalPostingReadGeneration().?;
+                defer published.release();
+                const current_rows = (try published.rowView(leaf)).?;
+                var retained_compact_rows: usize = 0;
+                for (current_rows.snapshot.runs) |run| {
+                    try std.testing.expect(run.chunk.serial != old_serial);
+                    if (run.chunk.serial == compact_serial) retained_compact_rows += run.len;
+                }
+                try std.testing.expect(retained_compact_rows > 0);
+            }
             try std.testing.expectEqual(old_count, old_rows.members.len);
             try Fixture.check(&idx, &deleted);
+            // Repeated newer replacements cannot undo compaction progress,
+            // grow redirect depth without bound, or invalidate old leases.
+            // Cross the normal eight-delta consolidation boundary as well.
+            for (0..10) |_| {
+                sequence += 1;
+                try idx.beginExperimentalPostingMutationCapture();
+                try idx.batchApplyOptions(&.{.{ .vector_id = context.changed_id, .vector = &Fixture.replacement, .metadata = "member" }}, &.{context.changed_id}, .{ .preserve_delete_rows = true, .skip_vector_store = true });
+                // Exercise the real durable capture completion, but schedule
+                // maintenance explicitly so the race has deterministic sides.
+                _ = try idx.finishExperimentalPostingMutationCapture(try idx.experimental_posting_write_store.?.nextBatchId(), sequence, .{});
+                var cycle_leaf: u64 = 0;
+                {
+                    const current = idx.retainCurrentExperimentalPostingReadGeneration().?;
+                    defer current.release();
+                    for (1..idx.metadata.node_count + 1) |id| if (try current.rowView(id)) |rows| {
+                        if (std.mem.indexOfScalar(u64, rows.members, context.changed_id) != null) {
+                            cycle_leaf = id;
+                            break;
+                        }
+                    };
+                    var debt = current.rowDebt(cycle_leaf) orelse return error.MissingTestRowDebt;
+                    debt.observed_ns = 0;
+                    try current.row_debts.put(alloc, cycle_leaf, debt);
+                    current.row_debt_deadline_ns = 0;
+                }
+                // The normal source-completion path may already have queued
+                // this due leaf. Reuse that worker rather than racing it.
+                if (idx.experimental_posting_checkpoint_build == null)
+                    try std.testing.expect(try idx.startExperimentalPostingCheckpointBuild(&idx.experimental_posting_write_store.?, null));
+                const pending = idx.experimental_posting_checkpoint_build.?;
+                pending.awaitCompletion();
+                pending.completed.store(false, .release);
+                var held = true;
+                defer if (held) pending.completed.store(true, .release);
+                sequence += 1;
+                try idx.beginExperimentalPostingMutationCapture();
+                try idx.batchApplyOptions(&.{.{ .vector_id = context.changed_id, .vector = &Fixture.replacement, .metadata = "member" }}, &.{context.changed_id}, .{ .preserve_delete_rows = true, .skip_vector_store = true });
+                try idx.persistExperimentalPostingSidecarAtAppliedSequence(sequence, .{});
+                try Fixture.check(&idx, &deleted);
+                pending.completed.store(true, .release);
+                held = false;
+                try pending.stageReaders();
+                const compact = (try pending.staged_readers.?.rowView(cycle_leaf)).?;
+                try std.testing.expectEqual(@as(usize, 1), compact.snapshot.chunk_count);
+                const serial = compact.snapshot.runs[0].chunk.serial;
+                try std.testing.expect(try idx.publishReadyExperimentalPostingCheckpointForRecovery());
+                const published = idx.retainCurrentExperimentalPostingReadGeneration().?;
+                defer published.release();
+                const rows = (try published.rowView(cycle_leaf)).?;
+                try std.testing.expect(rows.snapshot.chunk_count <= 2);
+                var found = false;
+                for (rows.snapshot.runs) |run| found = found or run.chunk.serial == serial;
+                try std.testing.expect(found);
+                try Fixture.check(&idx, &deleted);
+                try std.testing.expectEqual(old_count, old_rows.members.len);
+            }
         }
         var idx = try HBCIndex.open(alloc, path, config);
         defer idx.close();
         idx.setIo(runtime.io());
         idx.setExternalVectorLoader(&context, Fixture.load);
-        try idx.activateExperimentalPostingReads(67);
+        try idx.activateExperimentalPostingReads(sequence);
         try Fixture.check(&idx, &deleted);
         // The experiment can be disabled without making its durable rows
         // unreadable. The next ordinary mutation materializes/replaces them.
         idx.config.stable_posting_origin_max_mutations = 0;
         try idx.beginExperimentalPostingMutationCapture();
         try idx.batchApplyOptions(&.{.{ .vector_id = deleted[5], .vector = &Fixture.vector(deleted[5]), .metadata = "member" }}, &.{}, .{ .skip_vector_store = true });
-        try idx.persistExperimentalPostingSidecarAtAppliedSequence(68, .{});
+        sequence += 1;
+        try idx.persistExperimentalPostingSidecarAtAppliedSequence(sequence, .{});
         try Fixture.check(&idx, deleted[0..5]);
-        _ = try idx.publishExperimentalPostingCheckpoint(68);
+        _ = try idx.publishExperimentalPostingCheckpoint(sequence);
         try Fixture.check(&idx, deleted[0..5]);
     }
 }

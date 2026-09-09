@@ -911,6 +911,10 @@ fn copyNonQuantizedLeafPayloadPrefix(
 
     var key_buf: [10]u8 = undefined;
     const encoded = self.getNamespaced(txn, .quant, hbc.encodeQuantKey(&key_buf, leaf_id)) catch return null;
+    // Native quantized rows are not a nonquantized protobuf, even when a
+    // split is trying the cached-prefix optimization. Dispatch the format
+    // before decoding; the exact source-vector loader handles this case.
+    if (@import("posting_row_delta.zig").isManifest(encoded)) return null;
     var decoded = proto.NonQuantizedVectorSet.decode(self.alloc, encoded) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return null,
