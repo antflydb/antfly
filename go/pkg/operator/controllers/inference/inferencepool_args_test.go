@@ -16,6 +16,7 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 
@@ -88,6 +89,7 @@ func TestInferenceStatefulSetModelArguments(t *testing.T) {
 func TestInferenceModelArgsValidation(t *testing.T) {
 	for _, config := range []string{
 		`{"models_dir":123}`, `{"models_dir":"relative"}`, `{"models_dir":"/"}`, `{"models_dir":"/config/models"}`,
+		`{"models_dir":"/models","ml_dir":""}`, `{"models_dir":"/models","ml_dir":"relative"}`,
 		`{"models_dir":"/models","max_loaded_models":-1}`, `{"models_dir":"/models","max_loaded_models":1.5}`,
 		`{"models_dir":"/models","preload":[{"kind":"bogus","name":"owner/model"}]}`,
 		`{"models_dir":"/models","preload":[{"backend":"bogus","name":"owner/model"}]}`,
@@ -100,6 +102,51 @@ func TestInferenceModelArgsValidation(t *testing.T) {
 				t.Fatal("expected invalid model configuration to fail")
 			}
 		})
+	}
+}
+
+func TestInferenceResolvedConfigLegacyCompatibility(t *testing.T) {
+	for _, input := range []string{
+		`{"inference":{"preload":[]}}`,
+		`{"inference":{"preload":[{"name":"hf:owner/model","format":"gguf","quantization":"Q4_K","residency_mode":"streamed","memory_budget_mb":4096}]}}`,
+		`{"preload":[{"name":"hf:owner/model","format":"gguf","quantization":"Q4_K","residency_mode":"streamed","memory_budget_mb":4096}]}`,
+	} {
+		t.Run(input, func(t *testing.T) {
+			g := NewWithT(t)
+			pool := &api.InferencePool{Spec: api.InferencePoolSpec{Config: input}}
+			raw, err := (&InferencePoolReconciler{}).generateCompleteConfig(pool)
+			g.Expect(err).NotTo(HaveOccurred())
+			var resolved map[string]any
+			g.Expect(json.Unmarshal([]byte(raw), &resolved)).To(Succeed())
+			g.Expect(resolved).NotTo(HaveKey("inference"))
+			preload := resolved["preload"].([]any)
+			if len(preload) > 0 {
+				model := preload[0].(map[string]any)
+				g.Expect(model["kind"]).To(Equal("generator"))
+				g.Expect(model["name"]).To(Equal("owner/model:gguf:Q4_K"))
+				g.Expect(model["residency_mode"]).To(Equal("streamed"))
+				g.Expect(model["memory_budget_mb"]).To(Equal(float64(4096)))
+			}
+		})
+	}
+}
+
+func TestInferenceResolvedConfigPreservesNonModelSettings(t *testing.T) {
+	g := NewWithT(t)
+	pool := &api.InferencePool{Spec: api.InferencePoolSpec{Config: `{"inference":{"keep_alive_ms":42,"ml_dir":"/traditional-models","preload":[]},"admission":{"inference":{"max_concurrent_requests":3}}}`}}
+	raw, err := (&InferencePoolReconciler{}).generateCompleteConfig(pool)
+	g.Expect(err).NotTo(HaveOccurred())
+	var resolved map[string]any
+	g.Expect(json.Unmarshal([]byte(raw), &resolved)).To(Succeed())
+	g.Expect(resolved["inference"]).To(Equal(map[string]any{"api_url": "", "keep_alive_ms": float64(42)}))
+	g.Expect(resolved["admission"]).To(Equal(map[string]any{"inference": map[string]any{"max_concurrent_requests": float64(3)}}))
+	_, args, err := inferenceModelArgs(raw)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(args).To(Equal([]string{"--models-dir", "/models", "--ml-dir", "/traditional-models"}))
+	for _, invalid := range []string{`{"preload":null}`, `{"preload":[null]}`, `{"preload":[{"name":123}]}`} {
+		pool.Spec.Config = invalid
+		_, err := (&InferencePoolReconciler{}).generateCompleteConfig(pool)
+		g.Expect(err).To(HaveOccurred(), invalid)
 	}
 }
 

@@ -78,6 +78,12 @@ rejected rather than silently selecting another installed artifact.
 This config support is for the next runtime release; v0.2.1 requires explicit
 model CLI flags. The operator continues passing those flags so its fix can be
 released independently of the runtime update.
+For that compatibility, the operator resolves nested model overrides into the
+flat config spelling before emitting JSON or CLI arguments. It writes default
+model kinds (`generator` when omitted in `spec.config.preload`) and normalized
+artifact references into both outputs. Remaining non-model nested settings are
+preserved with the client URL field required by the legacy schema; admission
+settings and flat per-model policies remain intact.
 Config-only per-model policies require the new runtime; releasing the operator
 does not add those capabilities to v0.2.1.
 

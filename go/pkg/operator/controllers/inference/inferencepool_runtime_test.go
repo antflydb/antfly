@@ -40,7 +40,10 @@ func TestInferenceRuntimeContract(t *testing.T) {
 	root := t.TempDir()
 	modelDir := filepath.Join(root, "models")
 	const model = "BAAI/bge-small-en-v1.5"
-	for _, scenario := range []string{"eager", "lazy", "missing-directory-negative-control"} {
+	const generator = "shibatch/tiny1m"
+	const generatorRef = generator + ":gguf:Q4_K_M"
+	downloaded := map[string]bool{}
+	for _, scenario := range []string{"eager", "lazy", "nested-empty", "nested-other-settings", "nested-tagged", "nested-tagged-with-api-url", "omitted-kind", "nested-omitted-kind", "missing-directory-negative-control"} {
 		t.Run(scenario, func(t *testing.T) {
 			g := NewWithT(t)
 			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
@@ -56,6 +59,43 @@ func TestInferenceRuntimeContract(t *testing.T) {
 			if scenario == "eager" {
 				pool.Spec.Models.LoadingStrategy = api.LoadingStrategyEager
 			}
+			warmGenerator := strings.Contains(scenario, "tagged") || strings.Contains(scenario, "omitted-kind")
+			if strings.HasPrefix(scenario, "nested-") || warmGenerator {
+				// Nested overrides must win over flat settings, but the emitted
+				// JSON must remain parseable by v0.2.1's shared config schema.
+				settings := map[string]any{"models_dir": "/nested-models", "max_loaded_models": 0, "preload": []any{}}
+				if scenario == "nested-other-settings" {
+					settings["keep_alive_ms"] = 42
+					settings["ml_dir"] = "/traditional-models"
+				}
+				if warmGenerator {
+					entry := map[string]any{
+						"name": "hf:" + generator, "format": "gguf", "quantization": "Q4_K_M",
+						// Non-default residency budgets are GPU/A4B-only in the
+						// runtime; explicit wire defaults remain CPU-compatible.
+						"residency_mode": "auto", "memory_budget_mb": 0,
+					}
+					if !strings.Contains(scenario, "omitted-kind") {
+						entry["kind"] = "generator"
+					}
+					settings["preload"] = []any{entry}
+					pool.Spec.Models.Preload = append(pool.Spec.Models.Preload, api.ModelSpec{Name: "hf:" + generatorRef, Tasks: []string{"generate"}})
+				}
+				if scenario == "nested-tagged-with-api-url" {
+					settings["api_url"] = ""
+				}
+				config := map[string]any{"admission": map[string]any{"inference": map[string]any{"max_concurrent_requests": 3}}}
+				if strings.HasPrefix(scenario, "nested-") {
+					config["models_dir"], config["inference"] = "/wrong-flat-models", settings
+				} else {
+					for key, value := range settings {
+						config[key] = value
+					}
+				}
+				raw, err := json.Marshal(config)
+				g.Expect(err).NotTo(HaveOccurred())
+				pool.Spec.Config = string(raw)
+			}
 			client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool).Build()
 			r := &InferencePoolReconciler{Client: client, Scheme: scheme}
 			g.Expect(r.reconcileConfigMap(ctx, pool)).To(Succeed())
@@ -70,8 +110,20 @@ func TestInferenceRuntimeContract(t *testing.T) {
 			configPath := filepath.Join(work, "config.json")
 			var config map[string]any
 			g.Expect(json.Unmarshal([]byte(cm.Data["config.json"]), &config)).To(Succeed())
-			g.Expect(config["models_dir"]).To(Equal("/models"))
+			var mountPath string
+			// Resolve the model mount by name; container mount ordering is not a contract.
+			for _, mount := range sts.Spec.Template.Spec.Containers[0].VolumeMounts {
+				if mount.Name == "models" {
+					mountPath = mount.MountPath
+				}
+			}
+			g.Expect(mountPath).NotTo(BeEmpty())
+			g.Expect(config["models_dir"]).To(Equal(mountPath))
 			config["models_dir"] = modelDir
+			if scenario == "nested-other-settings" {
+				g.Expect(config["ml_dir"]).To(Equal("/traditional-models"))
+				config["ml_dir"] = filepath.Join(work, "ml")
+			}
 			if scenario == "missing-directory-negative-control" {
 				// New runtimes also read this path from config. Remove both
 				// sources so the control remains valid across runtime releases.
@@ -91,22 +143,25 @@ func TestInferenceRuntimeContract(t *testing.T) {
 				mapped := append([]string(nil), args...)
 				for i, arg := range mapped {
 					switch arg {
-					case "/models":
+					case mountPath:
 						mapped[i] = modelDir
 					case "/config/config.json":
 						mapped[i] = configPath
+					case "/traditional-models":
+						mapped[i] = filepath.Join(work, "ml")
 					}
 				}
 				return mapped
 			}
-			if scenario == "eager" {
-				for _, init := range sts.Spec.Template.Spec.InitContainers {
+			for _, init := range sts.Spec.Template.Spec.InitContainers {
+				if !downloaded[init.Args[2]] {
 					cmd := exec.CommandContext(ctx, binary, mapArgs(init.Args)...)
 					cmd.Env = env
 					out, err := cmd.CombinedOutput()
 					if err != nil {
 						t.Fatalf("operator model pull failed: %v\n%s", err, out)
 					}
+					downloaded[init.Args[2]] = true
 				}
 			}
 			listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -173,6 +228,11 @@ func TestInferenceRuntimeContract(t *testing.T) {
 				out, err := os.ReadFile(logPath)
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(string(out)).To(ContainSubstring("warmed inference embedder model=" + model))
+			}
+			if warmGenerator {
+				out, err := os.ReadFile(logPath)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(string(out)).To(ContainSubstring("warmed inference generator model=" + generatorRef))
 			}
 			body := bytes.NewBufferString(`{"model":"` + model + `","input":"operator runtime contract smoke test"}`)
 			resp, err := inferenceClient.Post(url+"/ai/v1/embed", "application/json", body)

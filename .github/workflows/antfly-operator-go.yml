@@ -97,7 +97,7 @@ jobs:
           tar -xzf "${runtime_dir}/${archive}" -C "$runtime_dir"
           ANTFLY_RUNTIME_BIN="${runtime_dir}/antfly" GOWORK=off go test \
             -tags runtimeintegration ./controllers/inference \
-            -run '^TestInferenceRuntimeContract$' -count=1 -v -timeout=15m
+            -run '^TestInferenceRuntimeContract$' -count=1 -v -timeout=20m
 
       - name: Run lint
         run: make lint

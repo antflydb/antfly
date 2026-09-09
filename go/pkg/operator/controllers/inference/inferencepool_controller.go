@@ -327,7 +327,18 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 		for _, key := range []string{"models_dir", "ml_dir", "max_loaded_models", "preload"} {
 			if value, exists := nested[key]; exists {
 				config[key] = value
+				delete(nested, key)
 			}
+		}
+		// v0.2.1 validates the nested inference schema even when CLI flags
+		// supply all model options. Keep model policies only in the flat
+		// standalone spelling: the legacy parser ignores them there, while
+		// the new runtime reads them. Preserve unrelated nested settings.
+		if len(nested) == 0 {
+			delete(config, "inference")
+		} else if _, exists := nested["api_url"]; !exists {
+			// The shared legacy schema requires this client-only field.
+			nested["api_url"] = ""
 		}
 	}
 
@@ -367,6 +378,9 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 	if _, exists := config["models_dir"]; !exists {
 		config["models_dir"] = "/models"
 	}
+	if err := normalizeInferencePreloadConfig(config); err != nil {
+		return "", err
+	}
 
 	// Translate Kubernetes durations to the Zig runtime's millisecond setting.
 	if _, exists := config["keep_alive_ms"]; !exists {
@@ -389,7 +403,7 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 	}
 	if _, exists := config["max_loaded_models"]; !exists {
 		preloadCount := len(preload)
-		if explicit, ok := config["preload"].([]any); ok {
+		if explicit, ok := config["preload"].([]map[string]any); ok {
 			preloadCount = len(explicit)
 		}
 		if pool.Spec.Models.MaxLoadedModels != nil {
@@ -409,20 +423,59 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 	return string(configJSON), nil
 }
 
+type inferencePreloadIdentity struct {
+	Kind         string `json:"kind"`
+	Name         string `json:"name"`
+	Backend      string `json:"backend"`
+	Format       string `json:"format"`
+	Quantization string `json:"quantization"`
+}
+
+// Persist defaults and canonical references before either output is generated.
+// Retain policy/extension fields instead of round-tripping through a lossy DTO.
+func normalizeInferencePreloadConfig(config map[string]any) error {
+	raw, exists := config["preload"]
+	if !exists {
+		return nil
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return err
+	}
+	var entries []map[string]any
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return fmt.Errorf("invalid inference preload config: %w", err)
+	}
+	if entries == nil {
+		return fmt.Errorf("preload must be an array")
+	}
+	for i, entry := range entries {
+		data, err := json.Marshal(entry)
+		if err != nil {
+			return err
+		}
+		var model inferencePreloadIdentity
+		if err := json.Unmarshal(data, &model); err != nil {
+			return fmt.Errorf("preload[%d]: %w", i, err)
+		}
+		if err := normalizeInferencePreloadIdentity(&model, i); err != nil {
+			return err
+		}
+		entry["kind"], entry["name"] = model.Kind, model.Name
+	}
+	config["preload"] = entries
+	return nil
+}
+
 // inferenceModelArgs translates the merged model settings to the released CLI
 // contract. New runtimes also read --config, retaining policies for matching
 // CLI preload identities; old runtimes still require these model flags.
 func inferenceModelArgs(configJSON string) (string, []string, error) {
 	var config struct {
-		ModelsDir       string `json:"models_dir"`
-		MaxLoadedModels *int   `json:"max_loaded_models"`
-		Preload         []struct {
-			Kind         string `json:"kind"`
-			Name         string `json:"name"`
-			Backend      string `json:"backend"`
-			Format       string `json:"format"`
-			Quantization string `json:"quantization"`
-		} `json:"preload"`
+		ModelsDir       string                     `json:"models_dir"`
+		MLDir           *string                    `json:"ml_dir"`
+		MaxLoadedModels *int                       `json:"max_loaded_models"`
+		Preload         []inferencePreloadIdentity `json:"preload"`
 	}
 	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
 		return "", nil, fmt.Errorf("invalid inference model config: %w", err)
@@ -432,6 +485,13 @@ func inferenceModelArgs(configJSON string) (string, []string, error) {
 		return "", nil, fmt.Errorf("models_dir must be a clean absolute path outside /config")
 	}
 	args := []string{"--models-dir", config.ModelsDir}
+	if config.MLDir != nil {
+		if !path.IsAbs(*config.MLDir) || path.Clean(*config.MLDir) != *config.MLDir ||
+			*config.MLDir == "/" || *config.MLDir == "/config" || strings.HasPrefix(*config.MLDir, "/config/") {
+			return "", nil, fmt.Errorf("ml_dir must be a clean absolute path outside /config")
+		}
+		args = append(args, "--ml-dir", *config.MLDir)
+	}
 	if config.MaxLoadedModels != nil {
 		if *config.MaxLoadedModels < 0 {
 			return "", nil, fmt.Errorf("max_loaded_models must not be negative")
@@ -439,49 +499,56 @@ func inferenceModelArgs(configJSON string) (string, []string, error) {
 		args = append(args, "--max-loaded-models", strconv.Itoa(*config.MaxLoadedModels))
 	}
 	for i, model := range config.Preload {
-		if model.Kind == "" {
-			model.Kind = "generator"
-		}
-		switch model.Kind {
-		case "embedder", "extractor", "reranker", "classifier", "generator", "reader", "transcriber", "rewriter", "chunker":
-		default:
-			return "", nil, fmt.Errorf("preload[%d]: unsupported kind %q", i, model.Kind)
-		}
-		switch model.Backend {
-		case "", "native", "onnx", "metal", "cuda", "xla", "pjrt", "wasm", "webgpu":
-		default:
-			return "", nil, fmt.Errorf("preload[%d]: unsupported backend %q", i, model.Backend)
-		}
-		name := inferenceWarmModelName(model.Name)
-		if name == "" {
-			return "", nil, fmt.Errorf("preload[%d]: name is required", i)
-		}
-		// Artifact selections are encoded in the CLI model reference, not in
-		// separate flags. Generated entries already include these suffixes.
-		if model.Format != "" || model.Quantization != "" {
-			format, quantization, selected := inferenceArtifactSelection(name)
-			if selected {
-				if (model.Format != "" && model.Format != format) ||
-					(model.Quantization != "" && model.Quantization != quantization) {
-					return "", nil, fmt.Errorf("preload[%d]: artifact selection conflicts with name", i)
-				}
-			} else {
-				if strings.Contains(name, ":") || model.Format == "" {
-					return "", nil, fmt.Errorf("preload[%d]: artifact selection requires an unqualified name and format", i)
-				}
-				name += ":" + model.Format
-				if model.Quantization != "" {
-					name += ":" + model.Quantization
-				}
-			}
+		if err := normalizeInferencePreloadIdentity(&model, i); err != nil {
+			return "", nil, err
 		}
 		value := model.Kind + ":"
 		if model.Backend != "" {
 			value += model.Backend + ":"
 		}
-		args = append(args, "--preload-model", value+name)
+		args = append(args, "--preload-model", value+model.Name)
 	}
 	return config.ModelsDir, args, nil
+}
+
+func normalizeInferencePreloadIdentity(model *inferencePreloadIdentity, i int) error {
+	if model.Kind == "" {
+		model.Kind = "generator"
+	}
+	switch model.Kind {
+	case "embedder", "extractor", "reranker", "classifier", "generator", "reader", "transcriber", "rewriter", "chunker":
+	default:
+		return fmt.Errorf("preload[%d]: unsupported kind %q", i, model.Kind)
+	}
+	switch model.Backend {
+	case "", "native", "onnx", "metal", "cuda", "xla", "pjrt", "wasm", "webgpu":
+	default:
+		return fmt.Errorf("preload[%d]: unsupported backend %q", i, model.Backend)
+	}
+	name := inferenceWarmModelName(model.Name)
+	if name == "" {
+		return fmt.Errorf("preload[%d]: name is required", i)
+	}
+	// Artifact choices must identify the same model in JSON and CLI output.
+	if model.Format != "" || model.Quantization != "" {
+		format, quantization, selected := inferenceArtifactSelection(name)
+		if selected {
+			if (model.Format != "" && model.Format != format) ||
+				(model.Quantization != "" && model.Quantization != quantization) {
+				return fmt.Errorf("preload[%d]: artifact selection conflicts with name", i)
+			}
+		} else {
+			if strings.Contains(name, ":") || model.Format == "" {
+				return fmt.Errorf("preload[%d]: artifact selection requires an unqualified name and format", i)
+			}
+			name += ":" + model.Format
+			if model.Quantization != "" {
+				name += ":" + model.Quantization
+			}
+		}
+	}
+	model.Name = name
+	return nil
 }
 
 func inferenceKeepAliveMillis(pool *antflyaiv1alpha1.InferencePool) (uint64, error) {

@@ -41,11 +41,21 @@ make run
 
 Operator CI runs the generated model-puller and inference-server arguments
 against the checksum-pinned Antfly v0.2.1 Linux GNU release, using the native CPU
-backend and a small public BGE embedding model. It requires eager and lazy
+backend, a small public BGE embedding model, and a tiny GGUF generator
+(`shibatch/tiny1m:gguf:Q4_K_M`). It requires eager and lazy
 readiness plus a finite, nonzero 384-dimensional embedding, verifies eager
 warming before the first request, and checks that removing the model-directory
 flag and config field reproduces an unready server. It needs neither Kubernetes
 nor GPUs.
+
+The same reconciler-generated contract runs against the PR's candidate binary
+in `zig-tests.yml`. Both binaries exercise nested overrides (including empty
+preloads and zero model limits), tagged GGUF preloads with and without a nested
+`api_url`, and omitted `kind`/backend defaults. Generator warming is asserted
+before serving an embedding request. Missing downloads/binaries fail the test.
+The CPU fixture uses policy-neutral `residency_mode: auto` and
+`memory_budget_mb: 0`; non-default GPU/A4B policies retain focused config tests
+and require separate GPU execution validation.
 
 To run locally on Linux or macOS, supply an absolute path to a verified released
 or newly built Antfly binary:
@@ -53,7 +63,7 @@ or newly built Antfly binary:
 ```bash
 ANTFLY_RUNTIME_BIN=/absolute/path/to/antfly GOWORK=off go test \
   -tags runtimeintegration ./controllers/inference \
-  -run '^TestInferenceRuntimeContract$' -count=1 -v -timeout=15m
+  -run '^TestInferenceRuntimeContract$' -count=1 -v -timeout=20m
 ```
 
 This explicit integration target fails if its binary is absent or its model
