@@ -3543,6 +3543,11 @@ pub const Backend = struct {
 
         try clearRunsAndFiles(&dest);
 
+        // Imported runs retain their logical L0 publication sequence. Reserve
+        // the source's sequence space before allocating child runs so later
+        // child flushes (including metadata tombstones) sort ahead of them.
+        dest.next_run_id = @max(dest.next_run_id, self.next_run_id);
+
         var wrote_any = false;
         // L0 precedence is encoded by run ID. Assign replacement IDs oldest
         // first so the child keeps the source's newest-write-wins ordering.
@@ -19578,6 +19583,9 @@ test "lsm backend physical split preserves L0 overwrite and tombstone order" {
     {
         var backend = try Backend.open(alloc, std.mem.span(parent_path), options);
         defer backend.close();
+        // Model an established source whose publication sequence is much
+        // higher than the number of physical files surviving the split.
+        backend.next_run_id = 1000;
         var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
         defer runtime.deinit();
         {
@@ -19624,6 +19632,30 @@ test "lsm backend physical split preserves L0 overwrite and tombstone order" {
         var reopened = try Backend.open(alloc, std.mem.span(if (left) parent_path else child_path), options);
         defer reopened.close();
         try Check.run(&reopened, left);
+    }
+    {
+        var child = try Backend.open(alloc, std.mem.span(child_path), options);
+        defer child.close();
+        var runtime = try child.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+        var txn = try runtime.beginWrite();
+        errdefer txn.abort();
+        try txn.put("doc:z", "child overwrite");
+        try txn.delete("doc:y");
+        try txn.put("doc:x", "child revival");
+        try txn.commit();
+        try child.flushMutable();
+    }
+    {
+        var child = try Backend.open(alloc, std.mem.span(child_path), options);
+        defer child.close();
+        var runtime = try child.runtimeStore(alloc, .{ .name = "docs" });
+        defer runtime.deinit();
+        var txn = try runtime.beginRead();
+        defer txn.abort();
+        try std.testing.expectEqualStrings("child overwrite", try txn.get("doc:z"));
+        try std.testing.expectError(error.NotFound, txn.get("doc:y"));
+        try std.testing.expectEqualStrings("child revival", try txn.get("doc:x"));
     }
 }
 

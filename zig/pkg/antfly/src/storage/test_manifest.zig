@@ -9,6 +9,13 @@
 //! duplicate, stale, or multiply-owned entries before any shard is compiled.
 
 comptime {
+    _ = @import("artifact_payload.zig");
+    _ = @import("dense_work_admission.zig");
+    _ = @import("maintenance_signal.zig");
+    _ = @import("projection_page_cache.zig");
+    _ = @import("projection_read_trace.zig");
+    _ = @import("vector_payload_store.zig");
+    _ = @import("vector_wal_view.zig");
     _ = @import("backend_adapter.zig");
     _ = @import("backend_conformance_test.zig");
     _ = @import("backend_erased.zig");

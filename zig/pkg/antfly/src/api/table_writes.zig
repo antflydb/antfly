@@ -48366,7 +48366,16 @@ test "provisioned table write source read cache overlay preserves live replay st
 
     try std.testing.expectEqual(@as(u64, 1), status.stats.indexes[0].doc_count);
     try std.testing.expect(status.stats.indexes[0].hbc_cache.total_bytes > 0);
-    try std.testing.expect(status.stats.indexes[0].hbc_cache.vector.used_bytes > 0);
+    // Native no-copy queries need not populate the legacy vector cache.
+    // Verify the overlay against the actual reader, not a serving-layout
+    // assumption, while keeping the writer's replay status authoritative.
+    {
+        var lease = try read_cache.getOrOpen(path, NoCatalog.iface(), 7001, 0, "docs");
+        defer lease.release();
+        const visible = try lease.db.stats(alloc);
+        defer db_mod.types.freeDBStats(alloc, visible);
+        try std.testing.expectEqualDeep(visible.indexes[0].hbc_cache, status.stats.indexes[0].hbc_cache);
+    }
     try std.testing.expectEqual(@as(u64, 42), status.stats.indexes[0].replay_applied_sequence);
     try std.testing.expectEqual(@as(u64, 42), status.stats.indexes[0].replay_target_sequence);
     try std.testing.expect(!status.stats.indexes[0].replay_catch_up_required);

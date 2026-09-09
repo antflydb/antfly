@@ -92506,11 +92506,11 @@ test "db status cannot reopen a quarantined generation from an older publication
     try testManagedGenerationRepairAdmission(.quarantine);
 }
 
-test "db status cannot reopen managed admission after shadow build handoff" {
+test "db status retains certified canonical admission during shadow build handoff" {
     try testManagedGenerationRepairAdmission(.shadow_handoff);
 }
 
-test "db initial replay repair cannot reopen admission during shadow reconstruction" {
+test "db initial replay repair retains certified canonical admission during shadow reconstruction" {
     try testManagedGenerationRepairAdmission(.replay_handoff);
 }
 
@@ -92551,6 +92551,7 @@ fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff,
     };
     const admission_id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
     try drainManagedAdmissionSourceReplayForTest(&db, alloc, admission_id);
+    try awaitManagedAdmissionPublicationForTest(&db, alloc, admission_id);
     try std.testing.expect(try db.progressiveManagedGenerationIsQueryable(alloc, cfg.name));
 
     if (mode == .coverage_recovery) {
@@ -92569,7 +92570,13 @@ fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff,
         var recovery = try db.loadIndexRepairEntryById(alloc, recovery_id);
         defer recovery.deinit(alloc);
         try std.testing.expect(try db.managedAdmissionGenerationIsQueryable(alloc, recovery.intent));
-        try std.testing.expect(try db.managedAdmissionGenerationIsServiceable(alloc, recovery.intent));
+        // A safe published snapshot can serve while discovery is pending,
+        // but repair may only retire after source discovery has completed.
+        try std.testing.expect(!try db.managedAdmissionGenerationIsServiceable(alloc, recovery.intent));
+        try db.updateIndexRepairIntent(alloc, recovery_id, .{ .source_replay_state = .complete });
+        var completed = try db.loadIndexRepairEntryById(alloc, recovery_id);
+        defer completed.deinit(alloc);
+        try std.testing.expect(try db.managedAdmissionGenerationIsServiceable(alloc, completed.intent));
     }
 
     if (mode == .late_completion or mode == .coverage_recovery) {
@@ -92603,13 +92610,29 @@ fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff,
     defer types.freeDBStats(alloc, retained);
 
     if (mode == .shadow_handoff or mode == .replay_handoff) {
-        // A scheduler can select reconstruction before the canonical worker
-        // finishes. The worker's later publication does not transfer ownership
-        // back from that shadow build, even when all counters now match.
+        // Selecting shadow work must not revoke a certified, still-resident
+        // canonical snapshot. Serving it does not transfer repair ownership
+        // or certify the replacement generation.
         try db.updateIndexRepairIntent(alloc, admission_id, .{
             .phase = .preflight,
             .trigger = if (mode == .replay_handoff) .replay_artifact_unavailable else null,
         });
+        try db.refreshIndexRepairAvailabilityForIndex(alloc, cfg.name);
+        try std.testing.expect(!db.core.index_manager.repairUnavailable(cfg.name));
+        try std.testing.expect(db.overlayRuntimeStatusBestEffort(alloc, &retained));
+        for (retained.indexes) |item| {
+            if (!std.mem.eql(u8, item.name, cfg.name)) continue;
+            try std.testing.expect(item.serving_snapshot_ready);
+        }
+        var result = try db.search(alloc, .{
+            .index_name = cfg.name,
+            .query = .{ .dense_knn = .{ .vector = &.{ 1.0, 0.0, 0.0 }, .k = 1 } },
+            .limit = 1,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
+        return;
     } else {
         const completed = try db.advanceIndexRepairIntent(alloc, admission_id, .{});
         try std.testing.expect(completed.repaired);
