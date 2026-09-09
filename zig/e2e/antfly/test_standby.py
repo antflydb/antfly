@@ -264,13 +264,15 @@ class HAStandaloneNode:
             )
             raise
 
-    def admin_get_response(self, path: str, **params: Any) -> requests.Response:
+    def admin_get_response(
+        self, path: str, *, request_timeout_s: float = 10.0, **params: Any
+    ) -> requests.Response:
         return self._request(
             "GET",
             f"{self.url}{HA_ADMIN_ROOT}{path}",
             params=params,
             headers=self.admin_headers(),
-            timeout=10,
+            timeout=request_timeout_s,
         )
 
     def admin_post_response(
@@ -577,29 +579,59 @@ def ha_cluster(request: pytest.FixtureRequest) -> HACluster:
         yield cluster
     finally:
         report = getattr(request.node, "rep_call", None)
-        cluster.close(test_failed=bool(report and report.failed))
+        test_failed = bool(report and report.failed)
+        if test_failed:
+            print(cluster.debug_logs())
+        cluster.close(test_failed=test_failed)
 
 
 def _wait_for_standby_applied(
-    cluster: HACluster, lsn: int, *, timeout_s: float = 20.0
+    cluster: HACluster,
+    lsn: int,
+    *,
+    timeout_s: float = 20.0,
+    require_live_replication: bool = False,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_s
     last_snapshot: dict[str, Any] | None = None
     last_error: Exception | None = None
     while time.monotonic() < deadline:
+        proc = cluster.standby.proc
+        if proc is None or proc.poll() is not None:
+            raise AssertionError(
+                f"standby exited while waiting for LSN {lsn}\n{cluster.debug_logs()}"
+            )
         try:
-            status = cluster.standby.admin_get("/standby/status", upstream_lsn=lsn)
+            response = cluster.standby.admin_get_response(
+                "/standby/status",
+                upstream_lsn=lsn,
+                request_timeout_s=max(0.001, min(10.0, deadline - time.monotonic())),
+            )
+            status = cluster.standby._check(response)
         except requests.RequestException as err:
             last_error = err
             time.sleep(0.25)
             continue
         snapshot = status["snapshot"]
         last_snapshot = snapshot
-        if snapshot["received_lsn"] >= lsn and snapshot["applied_lsn"] >= lsn:
+        # Bootstrap/restart restores durable LSNs before the background pull
+        # loop has contacted the primary. A successful round includes the
+        # upstream status acknowledgement; /readyz and restored progress alone
+        # cannot establish that synchronous replication is running.
+        replication_ready = not require_live_replication or (
+            (snapshot.get("last_success_ns") or 0) > 0
+            and snapshot.get("last_error") is None
+        )
+        if (
+            snapshot["received_lsn"] >= lsn
+            and snapshot["applied_lsn"] >= lsn
+            and replication_ready
+        ):
             return snapshot
         time.sleep(0.25)
     raise AssertionError(
-        f"standby did not apply through LSN {lsn}; last={last_snapshot}; last_error={last_error}\n"
+        f"standby did not apply through LSN {lsn}; require_live_replication={require_live_replication}; "
+        f"last={last_snapshot}; last_error={last_error}\n"
         f"{cluster.debug_logs()}"
     )
 
@@ -1015,6 +1047,9 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(
     )
 
     ha_cluster.standby.restart()
+    _wait_for_standby_applied(
+        ha_cluster, seed["backup_lsn"], require_live_replication=True
+    )
 
     ha_cluster.primary.batch_write(table_name, {"doc:first": {"title": "first"}})
     first_lsn = _primary_lsn(ha_cluster)
@@ -1056,7 +1091,9 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(
     assert write_check["decision"]["action"] == "reject_read_only_standby"
 
     ha_cluster.standby.restart()
-    restarted_snapshot = _wait_for_standby_applied(ha_cluster, first_lsn)
+    restarted_snapshot = _wait_for_standby_applied(
+        ha_cluster, first_lsn, require_live_replication=True
+    )
     assert restarted_snapshot["received_lsn"] >= first_lsn
     assert restarted_snapshot["applied_lsn"] >= first_lsn
     restarted_doc = _wait_for_standby_lookup(ha_cluster, table_name, "doc:first")
