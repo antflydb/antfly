@@ -22,9 +22,11 @@ tags:
 
       - **Go**: `github.com/antflydb/antfly/go/pkg/sdk`
 
-      - **TypeScript**: `@antflydb/antfly-ts` (npm)
+      - **TypeScript**: `@antfly/sdk` (npm)
 
-      - **Python**: `antfly-python` (PyPI)
+      - **Python**: `antfly-sdk` (PyPI)
+
+      - **Rust**: `antfly-sdk` (crates.io)
 
 
       All SDKs are type-safe and kept in sync with the API through code generation.
