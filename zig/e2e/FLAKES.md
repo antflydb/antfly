@@ -14,6 +14,83 @@ entries so later failures can be compared with the original signature.
 | `test_cli.py::test_cli_inline_create_load_wait_query_image_and_rag_pipeline` | [PR #658, run 34177703845, job 101916669107](https://github.com/antflydb/antfly/actions/runs/34177703845/job/101916669107?pr=658), head [`96bee1e80`](https://github.com/antflydb/antfly/commit/96bee1e80cf115c2dc636ed065a0378d8cfb27f3) | [`1bf7230cc`](https://github.com/antflydb/antfly/commit/1bf7230cc74c37ba4263964719542c210ff9473d) | Readiness assertion fixed; 30/30 soak runs passed. |
 | Same CLI pipeline, retry-exhaustion phase (`settled_failure is not None`) | [PR #659, run 34182855053, job 101932868141](https://github.com/antflydb/antfly/actions/runs/34182855053/job/101932868141), head [`51ec7a551`](https://github.com/antflydb/antfly/commit/51ec7a551aa3ac5713eb243155a9e2c9d8cfa0ac) | [`19b988108`](https://github.com/antflydb/antfly/commit/19b9881080af1dbc805f9ad5bda096b62bf063b1) | Reproduced in 3/3 concurrent runs with real retry sleeps; corrected-budget soak passed 9/9. |
 | Same three-by-three backup test, initial table create | [PR #664, run 34263167199, job 102199089027](https://github.com/antflydb/antfly/actions/runs/34263167199/job/102199089027?pr=664), merge `d6108b73b85a8e77dfcb740d5518279b2a51d826` | This change | Read waiter clock and pre-admission handling fixed; 100/100 Debug soak runs passed. |
+| `test_quickstart.py::test_public_quickstart_query_string_boolean_controls` | [PR #657, run 34296218257, job 102299245250](https://github.com/antflydb/antfly/actions/runs/34296218257/job/102299245250?pr=657), head `292e5ec9c` | This change | Deterministic fixture mismatch reproduced 9/9; fresh stateful restart fixture passed 30/30 final soak runs. |
+| `test_standby.py::test_standby_streams_public_writes_restarts_and_rejects_writes` | Same #657 job | This change | Live replication startup wait passed 30/30 ordinary and 30/30 delayed-fetch runs. Delayed first fetch reproduces the pending-durability 503 without the wait; original CI delay was not observed locally. |
+
+### Quickstart restart fixture and HA replication startup (#657)
+
+The job reported 376 passed, five skipped, and two failures. The quickstart
+Boolean-query assertions passed, then accessing `backup_api.supports_restart`
+raised `AttributeError`: that fixture does not expose a restart lifecycle.
+The test now uses the existing `stateful_api` restart contract and requests a
+fresh process. All query assertions still run before and after the local
+restart, without restarting a module-shared runtime.
+
+The HA case failed at the first document write after the bootstrapped standby
+restarted with continuous replication enabled. The primary returned HTTP 503,
+`write committed locally; standby durability acknowledgment pending`. That is
+a post-commit outcome and must not be retried as an unadmitted write.
+
+The fixture waited for `/readyz`, but that endpoint does not promise a completed
+upstream replication round. Bootstrap and restart also restore `received_lsn`
+and `applied_lsn` before the background replication loop connects. The test now
+waits for a successful live round (`last_success_ns`), no current replication
+error, and the expected applied LSN before issuing synchronous writes after
+either restart. A successful round includes the upstream status acknowledgement.
+The wait uses the existing 20-second observation budget, caps each read request
+by its remaining time, fails on process exit, and reports the last snapshot
+plus both nodes' logs. Write success, applied data, remote durability, restart
+recovery, and rejection of standby writes remain required. Production policy
+and the two-second synchronous acknowledgement budget are unchanged.
+
+The new `test_standby_replication_startup.py` regression forwards authenticated
+HA requests through a local proxy that delays only the first replication fetch
+by three seconds. Disabling only the live-round requirement reproduces the
+exact pending-durability 503; enabling it passes the complete original HA case.
+Fast harness tests distinguish restored progress from a live round, retain
+applied-LSN requirements, reject unsuccessful replication, bound requests, and
+fail immediately on process exit.
+
+This establishes the missing startup precondition. The original Linux CI log
+contained only primary logs, so it cannot establish what delayed that standby's
+first acknowledgement. All 69 unmodified local HA repetitions passed. A passing
+soak or injected startup delay does not prove the original CI stall's internal
+cause. HA fixture failures now emit both nodes' logs for future comparison.
+
+Validation on 2026-09-08 (America/Los_Angeles), macOS ARM64, based on merged
+`origin/main` commit `50e923cb5`, using one unchanged native Debug executable:
+
+- Native build: 27/27 steps passed. Executable SHA-256:
+  `051121877ef7fe6c5230c00138cc9f0b1b990ffac68a6a4c8a93387bfa0e26e9`.
+- Baseline mixed soak: three workers × three repetitions; quickstart failed
+  9/9 with `AttributeError`, while HA passed 9/9. Additional HA baseline:
+  six workers × ten repetitions, 60/60 passed.
+- Corrected proxy comparison: one failure with the live-round check disabled,
+  one pass with it enabled, using the same executable and three-second delay.
+- 133 fast harness and scheduler checks passed.
+- Final mixed soak: **90/90 passed**, three workers × ten repetitions of each
+  of the two original cases and the delayed-fetch regression (30 per case).
+- `make fmt`, Ruff checks on the three HA test files, and `git diff --check`
+  passed. The quickstart file has an unrelated pre-existing broad-exception
+  lint finding outside this change.
+
+The final mixed soak uses the repository regression loop from the worktree root:
+
+```sh
+SKIP_BUILD=1 ANTFLY_E2E_ENV_LOADED=1 \
+ANTFLY_E2E_REGRESSION_WORKERS=3 ANTFLY_E2E_REGRESSION_REPEATS=10 \
+ANTFLY_E2E_PRESERVE_FAILURE_LIMIT=2 \
+scripts/ci/zig-e2e-regression-loop.sh \
+  e2e/antfly/test_quickstart.py::test_public_quickstart_query_string_boolean_controls \
+  e2e/antfly/test_standby.py::test_standby_streams_public_writes_restarts_and_rejects_writes \
+  e2e/antfly/test_standby_replication_startup.py::test_standby_waits_for_delayed_first_replication
+```
+
+Local evidence is retained in `/private/tmp/antfly-pr657-*.log`, including
+`baseline-soak`, `ha-baseline-soak`, `delayed-before-corrected`,
+`delayed-fixed-proxy`, and `fixed-soak`. The initial proxy prototype omitted
+the GET identity handshake and its failed runs are excluded from the comparison.
+Linux CI remains the cross-platform validation.
 
 ### Retrieval streaming teardown
 
