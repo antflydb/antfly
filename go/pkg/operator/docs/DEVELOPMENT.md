@@ -37,6 +37,33 @@ make run
 
 ## 🔄 Development Workflow
 
+### Inference runtime contract smoke test
+
+Operator CI runs the generated model-puller and inference-server arguments
+against the checksum-pinned Antfly v0.2.1 Linux GNU release, using the native CPU
+backend and a small public BGE embedding model. It requires eager and lazy
+readiness plus a finite, nonzero 384-dimensional embedding, verifies eager
+warming before the first request, and checks that removing the model-directory
+flag reproduces an unready server. It needs neither Kubernetes nor GPUs.
+
+To run locally on Linux or macOS, supply an absolute path to a verified released
+or newly built Antfly binary:
+
+```bash
+ANTFLY_RUNTIME_BIN=/absolute/path/to/antfly GOWORK=off go test \
+  -tags runtimeintegration ./controllers/inference \
+  -run '^TestInferenceRuntimeContract$' -count=1 -v -timeout=15m
+```
+
+This explicit integration target fails if its binary is absent or its model
+cannot be downloaded; ordinary offline unit tests do not run it. Downloads and
+runtime state use isolated temporary directories, and server process groups are
+terminated on completion or timeout. When advancing the supported runtime,
+update both the release version and SHA256 in `antfly-operator-go.yml` and run
+this same target against the candidate binary. This test does not exercise
+container packaging, real Kubernetes scheduling, or GPU execution; retain those
+rollout checks separately.
+
 ### Quick Development Cycle
 
 ```bash
