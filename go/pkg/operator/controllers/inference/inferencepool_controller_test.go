@@ -490,6 +490,9 @@ var _ = Describe("InferencePool Controller", func() {
 				"--port", "8080",
 				"--config", "/config/config.json",
 				"--allow-insecure-public-bind",
+				"--models-dir", "/models",
+				"--preload-model", "generator:model-a:i8",
+				"--preload-model", "generator:model-b",
 			}))
 
 			Expect(k8sClient.Delete(ctx, pool)).Should(Succeed())
