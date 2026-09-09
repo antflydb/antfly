@@ -87,6 +87,18 @@ settings and flat per-model policies remain intact.
 Config-only per-model policies require the new runtime; releasing the operator
 does not add those capabilities to v0.2.1.
 
+For operator-generated eager preloads (the default loading strategy), specify a
+recognized task such as `tasks: [embed]` or `tasks: [generate]` on each model.
+The v0.2.1 warm CLI needs a model kind; an omitted or unrecognized task hint
+does not imply a generator. The operator reports a configuration validation
+failure before creating or updating the workload when that kind is ambiguous.
+Alternatively, supply `spec.config.preload` with an explicit `kind`, or use
+lazy/bounded loading to discover the model task at request time. Per-model
+eager strategy overrides have the same requirement.
+
+Empty or null optional `backend`, `format`, and `quantization` fields in operator
+preload configuration are treated as unspecified in both JSON and CLI output.
+
 ## Pulling Models
 
 Models come from HuggingFace by their full `owner/name` reference; a bare name without an owner is rejected. The `hf:` prefix is accepted.

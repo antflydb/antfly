@@ -56,6 +56,11 @@ before serving an embedding request. Missing downloads/binaries fail the test.
 The CPU fixture uses policy-neutral `residency_mode: auto` and
 `memory_budget_mb: 0`; non-default GPU/A4B policies retain focused config tests
 and require separate GPU execution validation.
+The contract also checks omitted task hints with lazy discovery and an explicit
+eager preload kind, plus empty/null optional identity fields. Unit tests verify
+that ambiguous eager task hints report a validation failure before workload
+creation, including on an operator upgrade with an unchanged pool generation,
+and that correcting the hint allows reconciliation to recover.
 
 To run locally on Linux or macOS, supply an absolute path to a verified released
 or newly built Antfly binary:

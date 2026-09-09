@@ -23,8 +23,13 @@ import (
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	api "github.com/antflydb/antfly/go/pkg/operator/api/inference/v1alpha1"
@@ -105,6 +110,79 @@ func TestInferenceModelArgsValidation(t *testing.T) {
 	}
 }
 
+func TestInferenceEagerPreloadRequiresTaskOrOverride(t *testing.T) {
+	for _, strategy := range []api.LoadingStrategy{"", api.LoadingStrategyEager, api.LoadingStrategyLazy, api.LoadingStrategyBounded} {
+		for _, tasks := range [][]string{nil, {"unknown-task"}} {
+			t.Run(fmt.Sprintf("strategy=%s/tasks=%v", strategy, tasks), func(t *testing.T) {
+				g := NewWithT(t)
+				pool := &api.InferencePool{Spec: api.InferencePoolSpec{Models: api.ModelConfig{
+					LoadingStrategy: strategy,
+					Preload:         []api.ModelSpec{{Name: "BAAI/bge-small-en-v1.5", Tasks: tasks}},
+				}}}
+				r := &InferencePoolReconciler{}
+				_, err := r.generateCompleteConfig(pool)
+				if strategy == "" || strategy == api.LoadingStrategyEager {
+					g.Expect(err).To(MatchError(ContainSubstring("eager loading requires a recognized task")))
+				} else {
+					g.Expect(err).NotTo(HaveOccurred())
+				}
+				// A per-model eager override also needs a kind, even in a lazy pool.
+				pool.Spec.Models.Preload[0].Strategy = api.LoadingStrategyEager
+				_, err = r.generateCompleteConfig(pool)
+				g.Expect(err).To(HaveOccurred())
+				for _, config := range []string{
+					`{"preload":[{"kind":"embedder","name":"BAAI/bge-small-en-v1.5"}]}`,
+					`{"inference":{"preload":[{"kind":"embedder","name":"BAAI/bge-small-en-v1.5"}]}}`,
+					`{"preload":[]}`,
+				} {
+					pool.Spec.Config = config
+					_, err = r.generateCompleteConfig(pool)
+					g.Expect(err).NotTo(HaveOccurred())
+				}
+			})
+		}
+	}
+}
+
+func TestInferenceAmbiguousEagerConfigReportsValidationFailure(t *testing.T) {
+	g := NewWithT(t)
+	scheme := newInferenceUnitTestScheme(g)
+	g.Expect(policyv1.AddToScheme(scheme)).To(Succeed())
+	pool := &api.InferencePool{
+		ObjectMeta: metav1.ObjectMeta{Name: "ambiguous", Namespace: "default", UID: "pool-uid", Generation: 1},
+		Spec: api.InferencePoolSpec{
+			Models:   api.ModelConfig{Preload: []api.ModelSpec{{Name: "BAAI/bge-small-en-v1.5"}}},
+			Replicas: api.ReplicaConfig{Min: 1, Max: 1},
+		},
+		// An operator upgrade must revalidate previously accepted generations.
+		Status: api.InferencePoolStatus{ObservedGeneration: 1, Phase: api.InferencePoolPhaseRunning},
+	}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(pool).WithObjects(pool).Build()
+	r := &InferencePoolReconciler{Client: client, Scheme: scheme, Recorder: events.NewFakeRecorder(10)}
+	ctx := context.Background()
+	key := types.NamespacedName{Name: pool.Name, Namespace: pool.Namespace}
+	result, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+	g.Expect(client.Get(ctx, key, pool)).To(Succeed())
+	condition := meta.FindStatusCondition(pool.Status.Conditions, api.TypeConfigurationValid)
+	g.Expect(condition).NotTo(BeNil())
+	g.Expect(condition.Status).To(Equal(metav1.ConditionFalse))
+	g.Expect(condition.Message).To(ContainSubstring("eager loading requires a recognized task"))
+	g.Expect(errors.IsNotFound(client.Get(ctx, key, &appsv1.StatefulSet{}))).To(BeTrue())
+	g.Expect(errors.IsNotFound(client.Get(ctx, types.NamespacedName{Name: pool.Name + "-config", Namespace: pool.Namespace}, &corev1.ConfigMap{}))).To(BeTrue())
+
+	// Correcting the hint clears the validation failure and creates the workload.
+	pool.Spec.Models.Preload[0].Tasks = []string{"embed"}
+	pool.Generation++
+	g.Expect(client.Update(ctx, pool)).To(Succeed())
+	_, err = r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(client.Get(ctx, key, pool)).To(Succeed())
+	g.Expect(meta.IsStatusConditionTrue(pool.Status.Conditions, api.TypeConfigurationValid)).To(BeTrue())
+	g.Expect(client.Get(ctx, key, &appsv1.StatefulSet{})).To(Succeed())
+}
+
 func TestInferenceResolvedConfigLegacyCompatibility(t *testing.T) {
 	for _, input := range []string{
 		`{"inference":{"preload":[]}}`,
@@ -147,6 +225,33 @@ func TestInferenceResolvedConfigPreservesNonModelSettings(t *testing.T) {
 		pool.Spec.Config = invalid
 		_, err := (&InferencePoolReconciler{}).generateCompleteConfig(pool)
 		g.Expect(err).To(HaveOccurred(), invalid)
+	}
+}
+
+func TestInferenceResolvedConfigOptionalIdentityDefaults(t *testing.T) {
+	for _, nested := range []bool{false, true} {
+		for _, empty := range []string{`""`, `null`} {
+			t.Run(fmt.Sprintf("nested=%t/empty=%s", nested, empty), func(t *testing.T) {
+				g := NewWithT(t)
+				config := fmt.Sprintf(`{"preload":[{"kind":"embedder","name":"hf:owner/model","backend":%s,"format":%s,"quantization":%s,"residency_mode":"auto","memory_budget_mb":0}]}`, empty, empty, empty)
+				if nested {
+					config = `{"inference":` + config + `}`
+				}
+				pool := &api.InferencePool{Spec: api.InferencePoolSpec{Config: config}}
+				raw, err := (&InferencePoolReconciler{}).generateCompleteConfig(pool)
+				g.Expect(err).NotTo(HaveOccurred())
+				var resolved struct {
+					Preload []map[string]any `json:"preload"`
+				}
+				g.Expect(json.Unmarshal([]byte(raw), &resolved)).To(Succeed())
+				g.Expect(resolved.Preload).To(Equal([]map[string]any{{
+					"kind": "embedder", "name": "owner/model", "residency_mode": "auto", "memory_budget_mb": float64(0),
+				}}))
+				_, args, err := inferenceModelArgs(raw)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(args).To(Equal([]string{"--models-dir", "/models", "--preload-model", "embedder:owner/model"}))
+			})
+		}
 	}
 }
 

@@ -120,11 +120,13 @@ func (r *InferencePoolReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	originalConditions := slices.Clone(pool.Status.Conditions)
 
 	// 0. Validate configuration (fallback when webhook is disabled)
-	// Generation guard: skip if spec unchanged since last successful validation.
+	// Revalidate on upgrades too: a previously accepted generation can violate
+	// the runtime contract. Avoid refreshing successful conditions unnecessarily.
+	validationErr := r.validatePool(pool)
 	needsValidation := pool.Status.ObservedGeneration != pool.Generation ||
-		pool.Status.Phase == antflyaiv1alpha1.InferencePoolPhaseDegraded
+		pool.Status.Phase == antflyaiv1alpha1.InferencePoolPhaseDegraded || validationErr != nil
 	if needsValidation {
-		if err := r.validatePool(pool); err != nil {
+		if err := validationErr; err != nil {
 			logger.Error(err, "InferencePool validation failed")
 			meta.SetStatusCondition(&pool.Status.Conditions, metav1.Condition{
 				Type:    antflyaiv1alpha1.TypeConfigurationValid,
@@ -352,14 +354,22 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 	// Accelerator selection is configured independently through
 	// ANTFLY_INFERENCE_PREFERRED_BACKEND.
 	preload := make([]map[string]any, 0, len(pool.Spec.Models.Preload))
-	for _, model := range pool.Spec.Models.Preload {
+	_, preloadOverridden := config["preload"]
+	for i, model := range pool.Spec.Models.Preload {
+		if preloadOverridden {
+			break
+		}
 		modelStrategy := effectiveInferenceLoadingStrategy(model.Strategy, loadingStrategy)
 		if modelStrategy != antflyaiv1alpha1.LoadingStrategyEager {
 			continue
 		}
 
+		kind := zigWarmModelKind(model.Tasks)
+		if kind == "" {
+			return "", fmt.Errorf("spec.models.preload[%d] (%q): eager loading requires a recognized task; set tasks (for example [\"embed\"]), provide spec.config.preload with an explicit kind, or use strategy lazy for automatic discovery", i, model.Name)
+		}
 		entry := map[string]any{
-			"kind": zigWarmModelKind(model.Tasks),
+			"kind": kind,
 			"name": inferenceWarmModelName(model.Name),
 		}
 		if format, quantization, ok := inferenceArtifactSelection(model.Name); ok {
@@ -462,6 +472,17 @@ func normalizeInferencePreloadConfig(config map[string]any) error {
 			return err
 		}
 		entry["kind"], entry["name"] = model.Kind, model.Name
+		// JSON null/empty strings decode as an unspecified CLI option. Emit
+		// that same absence for the runtime's stricter optional-field parser.
+		for key, value := range map[string]string{
+			"backend": model.Backend, "format": model.Format, "quantization": model.Quantization,
+		} {
+			if value == "" {
+				delete(entry, key)
+			} else {
+				entry[key] = value
+			}
+		}
 	}
 	config["preload"] = entries
 	return nil
@@ -601,8 +622,9 @@ func zigWarmModelKind(tasks []string) string {
 			}
 		}
 	}
-	// Preserve the Zig CLI's historical default for untyped model refs.
-	return "generator"
+	// A missing hint does not establish that the model is a generator. The
+	// released warm CLI requires a kind, so eager callers must reject ambiguity.
+	return ""
 }
 
 func inferenceWarmModelName(modelRef string) string {
@@ -1869,7 +1891,15 @@ func (r *InferencePoolReconciler) addProbes(sts *appsv1.StatefulSet, pool *antfl
 // Note: immutability checks require the old object and are only enforced by the
 // admission webhook.
 func (r *InferencePoolReconciler) validatePool(pool *antflyaiv1alpha1.InferencePool) error {
-	return pool.ValidateInferencePool()
+	if err := pool.ValidateInferencePool(); err != nil {
+		return err
+	}
+	config, err := r.generateCompleteConfig(pool)
+	if err != nil {
+		return err
+	}
+	_, _, err = inferenceModelArgs(config)
+	return err
 }
 
 // applySchedulingConstraints applies user-specified scheduling constraints to the pod template.

@@ -43,7 +43,7 @@ func TestInferenceRuntimeContract(t *testing.T) {
 	const generator = "shibatch/tiny1m"
 	const generatorRef = generator + ":gguf:Q4_K_M"
 	downloaded := map[string]bool{}
-	for _, scenario := range []string{"eager", "lazy", "nested-empty", "nested-other-settings", "nested-tagged", "nested-tagged-with-api-url", "omitted-kind", "nested-omitted-kind", "missing-directory-negative-control"} {
+	for _, scenario := range []string{"lazy", "eager", "eager-explicit-kind", "empty-identity-options", "null-identity-options", "nested-empty", "nested-other-settings", "nested-tagged", "nested-tagged-with-api-url", "omitted-kind", "nested-omitted-kind", "missing-directory-negative-control"} {
 		t.Run(scenario, func(t *testing.T) {
 			g := NewWithT(t)
 			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
@@ -58,6 +58,22 @@ func TestInferenceRuntimeContract(t *testing.T) {
 			}
 			if scenario == "eager" {
 				pool.Spec.Models.LoadingStrategy = api.LoadingStrategyEager
+			}
+			if scenario == "lazy" || scenario == "eager-explicit-kind" {
+				// Let the puller discover the model task from its metadata. Eager
+				// warming needs an explicit kind when task hints are absent.
+				pool.Spec.Models.Preload[0].Tasks = nil
+				if scenario == "eager-explicit-kind" {
+					pool.Spec.Models.LoadingStrategy = api.LoadingStrategyEager
+					pool.Spec.Config = fmt.Sprintf(`{"preload":[{"kind":"embedder","name":%q}]}`, model)
+				}
+			}
+			if strings.HasSuffix(scenario, "-identity-options") {
+				empty := `""`
+				if scenario == "null-identity-options" {
+					empty = `null`
+				}
+				pool.Spec.Config = fmt.Sprintf(`{"inference":{"preload":[{"kind":"embedder","name":%q,"backend":%s,"format":%s,"quantization":%s}]}}`, model, empty, empty, empty)
 			}
 			warmGenerator := strings.Contains(scenario, "tagged") || strings.Contains(scenario, "omitted-kind")
 			if strings.HasPrefix(scenario, "nested-") || warmGenerator {
@@ -224,7 +240,7 @@ func TestInferenceRuntimeContract(t *testing.T) {
 				return
 			}
 			g.Eventually(func() int { return status("/readyz") }, 90*time.Second, 250*time.Millisecond).Should(Equal(200))
-			if scenario == "eager" {
+			if scenario == "eager" || scenario == "eager-explicit-kind" || strings.HasSuffix(scenario, "-identity-options") {
 				out, err := os.ReadFile(logPath)
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(string(out)).To(ContainSubstring("warmed inference embedder model=" + model))
