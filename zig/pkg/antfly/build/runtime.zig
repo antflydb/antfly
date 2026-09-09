@@ -80,7 +80,6 @@ pub const AddRuntimeOptions = struct {
     link_libc: bool,
     sanitize_thread: bool,
     runtime_artifact_role: ?RuntimeArtifactRole,
-    production_build_options: *std.Build.Step.Options,
     structlog_mod: *std.Build.Module,
     platform_mod: *std.Build.Module,
     hash_mod: *std.Build.Module,
@@ -102,7 +101,6 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     const link_libc = options.link_libc;
     const sanitize_thread = options.sanitize_thread;
     const runtime_artifact_role = options.runtime_artifact_role;
-    const production_build_options = options.production_build_options;
     const structlog_mod = options.structlog_mod;
     const platform_mod = options.platform_mod;
     const hash_mod = options.hash_mod;
@@ -120,7 +118,8 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     antfly_main_mod.addImport("structlog", structlog_mod);
     antfly_main_mod.addImport("antfly_platform", platform_mod);
     antfly_main_mod.addImport("antfly_hash", hash_mod);
-    antfly_main_mod.addOptions("build_options", production_build_options);
+    production_antfly_imports.build_info.link(antfly_main_mod);
+    production_antfly_imports.build_info.link(libantfly_link_mod);
     addMacosSdkPaths(b, antfly_main_mod, target);
 
     const antfly_main = b.addExecutable(.{
@@ -142,29 +141,31 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             .sanitize_thread = sanitize_thread,
             .pic = if (unit == .distributed) true else null,
         });
-        production_antfly_imports.configureRuntime(
-            b,
-            role_mod,
-            false,
-            link_libc,
-            unit == .inference,
-        );
+        if (unit == .cli) {
+            production_antfly_imports.configureCli(role_mod, link_libc);
+        } else if (unit == .inference) {
+            production_antfly_imports.configureInference(b, role_mod, link_libc);
+        } else {
+            production_antfly_imports.configureRuntime(b, role_mod, false, link_libc, false);
+        }
         // Only the API kernel serves schemas. The other units use its ABI;
         // giving them these file imports would invalidate their caches too.
         if (unit == .api_kernel)
             role_mod.addImport("antfly_openapi_specs", production_antfly_imports.embedded_openapi);
         addMacosSdkPaths(b, role_mod, target);
-        role_mod.addImport("antfly-client", antfly_client_pkg_mod);
+        if (unit == .cli or unit == .distributed) role_mod.addImport("antfly-client", antfly_client_pkg_mod);
         if (unit == .distributed) role_mod.addImport("antfly_storage_root", role_mod);
         role_mod.addOptions("runtime_library_options", unit_options);
-        const role_usermgr_storage_mod = b.createModule(.{
-            .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        role_usermgr_storage_mod.addImport("antfly_root", role_mod);
-        role_usermgr_storage_mod.addImport("antfly_platform", platform_mod);
-        role_mod.addImport("usermgr_storage", role_usermgr_storage_mod);
+        if (unit != .cli and unit != .inference) {
+            const role_usermgr_storage_mod = b.createModule(.{
+                .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            role_usermgr_storage_mod.addImport("antfly_root", role_mod);
+            role_usermgr_storage_mod.addImport("antfly_platform", platform_mod);
+            role_mod.addImport("usermgr_storage", role_usermgr_storage_mod);
+        }
 
         const role_artifact = b.addLibrary(.{
             .name = if (unit == .distributed)
@@ -260,6 +261,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         role_mod.link_libc = link_libc;
         addMacosSdkPaths(b, role_mod, target);
         role_mod.addOptions("runtime_artifact_options", role_options);
+        production_antfly_imports.build_info.link(role_mod);
 
         const role_name = @tagName(role);
         const role_exe = b.addExecutable(.{

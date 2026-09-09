@@ -128,6 +128,17 @@ fn addLocalHttpxModule(
 }
 
 pub fn build(b: *std.Build) void {
+    _ = create(b);
+}
+
+pub const Artifacts = struct {
+    runtime: antfly_runtime_build.AddRuntimeResult,
+    inference: inference_runtime_build.Graph,
+};
+
+/// Compose owners once. Consumers of this constructor can inspect the same
+/// artifacts used by public targets without maintaining a second build graph.
+pub fn create(b: *std.Build) ?Artifacts {
     const api_bench_standalone = b.option(bool, "api-bench-standalone", "Build only the API benchmark for an existing server process") orelse false;
     const conformance_fetch = b.option(bool, "conformance-fetch", "Fetch missing external conformance fixtures") orelse true;
     const conformance_fixtures = b.option([]const u8, "conformance-fixtures", "Cache directory for external conformance fixtures") orelse "/tmp";
@@ -199,6 +210,12 @@ pub fn build(b: *std.Build) void {
     else
         null;
     const antfly_version = b.option([]const u8, "antfly-version", "Antfly version string") orelse "dev";
+    const build_info = @import("lib/build_info/build_support.zig").create(b, .{
+        .root = b.path("lib/build_info"),
+        .target = target,
+        .optimize = optimize,
+        .version = antfly_version,
+    });
     const lite_local_inference_runtime = b.option(bool, "lite-local-inference-runtime", "Advertise an embedded local inference runtime in Antfly Lite status") orelse false;
     if (inference_enable_onnx) {
         const inference_onnx_available = pathExists(b, b.fmt("{s}/include/onnxruntime_c_api.h", .{inference_onnx_root})) and
@@ -219,9 +236,9 @@ pub fn build(b: *std.Build) void {
     if (platform_tests.process) |process| platform_test_step.dependOn(process);
 
     const lmdb_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, true, antfly_version);
-    const standalone_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, lite_local_inference_runtime, true, antfly_version);
-    const production_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, false, antfly_version);
+    const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, true);
+    const standalone_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, lite_local_inference_runtime, true);
+    const production_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, false);
     const lmdb_engine_mod = makeLmdbEngineModule(b, target, optimize, link_libc, lmdb_build_options);
     const lmdb_engine_wasm_mod = makeLmdbEngineModule(b, wasm_target, optimize, false, lmdb_build_options);
     const raft_engine_mod = b.createModule(.{
@@ -242,7 +259,7 @@ pub fn build(b: *std.Build) void {
     });
     addSnowballRegenStep(b);
     addSnowballCheckStep(b);
-    const openapi_build = b.lazyImport(@This(), "openapi") orelse return;
+    const openapi_build = b.lazyImport(@This(), "openapi") orelse return null;
     const openapi_codegen = openapi_build.addCompiler(b, b.path("lib/openapi"), b.graph.host, optimize, addLocalHttpxModule(b, b.graph.host, optimize));
     const openapi_sources = addOpenApiSourceSteps(b, openapi_codegen);
     const update_public_openapi = b.addUpdateSourceFiles();
@@ -653,7 +670,7 @@ pub fn build(b: *std.Build) void {
     });
     const wasm_pdf_mod = pdf_build.createModule(b, b.path("lib/pdf"), wasm_target, optimize, wasm_image_mod, wasm_font_mod, wasm_pdf_standard_fonts_mod);
 
-    const sentencepiece_proto_mod = inference_runtime_build.addSentencePieceProtoModule(b, protobuf_dep, .{ .inference_root = "pkg/inference", .shared_lib_root = "" }, false);
+    const sentencepiece_proto_mod = @import("lib/tokenizer/build_support.zig").addSentencePieceProtoModule(b, protobuf_dep, b.path("lib/tokenizer"));
     const inference_jinja_mod = b.createModule(.{
         .root_source_file = b.path("lib/jinja/src/jinja.zig"),
         .target = target,
@@ -692,6 +709,14 @@ pub fn build(b: *std.Build) void {
     inference_pjrt_mod.addImport("protobuf", protobuf_mod);
     inference_pjrt_mod.addImport("xla_proto", inference_pjrt_xla_proto_mod);
 
+    const tokenizer = @import("lib/tokenizer/build_support.zig").create(b, .{
+        .root = b.path("lib/tokenizer"),
+        .target = target,
+        .optimize = optimize,
+        .protobuf = protobuf_mod,
+        .sentencepiece_proto = sentencepiece_proto_mod,
+    });
+
     const inference_config: inference_runtime_build.Config = .{
         .b = b,
         .target = target,
@@ -719,9 +744,13 @@ pub fn build(b: *std.Build) void {
             } else null,
             .link_libc = link_libc,
             .skip_openapi = false,
-            .inference_version = antfly_version,
         },
         .shared = .{
+            .build_info_mod = build_info.module,
+            .build_info_object = build_info.object,
+            .tokenizer_mod = tokenizer.tokenizer,
+            .hf_tokenizer_mod = tokenizer.huggingface,
+            .fixed_tokenizer_data_mod = tokenizer.fixed_data,
             .json = json_mod,
             .httpx = httpx_mod,
             .platform = platform_mod,
@@ -838,6 +867,7 @@ pub fn build(b: *std.Build) void {
     const inference_steps = @import("pkg/inference/build/integration.zig").add(inference_workflow, inference_wasm_jinja, inference_wasm_platform);
 
     const antfly_imports = AntflyRootImports{
+        .build_info = build_info,
         .build_options = build_options,
         .embedded_openapi = pkg_antfly_build_codegen.addEmbeddedSpecs(b, .{
             .root_source_file = b.path("pkg/antfly/src/openapi/embedded_specs.zig"),
@@ -933,7 +963,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .strip = strip,
         .wasm_target = wasm_target,
-        .antfly_version = antfly_version,
         .lmdb_engine_wasm_mod = lmdb_engine_wasm_mod,
         .protobuf_mod = protobuf_mod,
         .wasm_platform_mod = wasm_platform_mod,
@@ -1434,7 +1463,6 @@ pub fn build(b: *std.Build) void {
         .lmdb_backend = lmdb_backend,
         .lmdb_evented_async_io = lmdb_evented_async_io,
         .with_tla = with_tla,
-        .antfly_version = antfly_version,
         .lite_local_inference_runtime = lite_local_inference_runtime,
         .hash_bench_mod = hash_bench_mod,
         .antfly_imports = antfly_imports,
@@ -1452,7 +1480,6 @@ pub fn build(b: *std.Build) void {
         .link_libc = link_libc,
         .sanitize_thread = sanitize_thread,
         .runtime_artifact_role = runtime_artifact_role,
-        .production_build_options = production_build_options,
         .structlog_mod = structlog_mod,
         .platform_mod = platform_mod,
         .hash_mod = hash_mod,
@@ -1506,6 +1533,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    build_info.link(lite_main_mod);
     lite_main_mod.addOptions("build_options", build_options);
     lite_main_mod.addImport("structlog", structlog_mod);
     lite_main_mod.addImport("antfly_platform", platform_mod);
@@ -1627,4 +1655,5 @@ pub fn build(b: *std.Build) void {
         antfly_tests_build.labelTestRuns(b, unit_test_step);
         antfly_tests_build.labelTestRuns(b, lib_test_step);
     }
+    return .{ .runtime = runtime, .inference = inference_graph };
 }

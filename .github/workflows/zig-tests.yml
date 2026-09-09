@@ -378,7 +378,7 @@ jobs:
           tools/test_run_recall_checks.py
           tools/test_test_runner.py
           tools/test_sync_generated.py
-          tools/test_runtime_schema_cache.py
+          tools/test_runtime_cache.py
 
       - name: Test benchmark orchestration and fixture setup
         run: |
@@ -678,7 +678,7 @@ jobs:
           tools/test_run_recall_checks.py
           tools/test_test_runner.py
           tools/test_sync_generated.py
-          tools/test_runtime_schema_cache.py
+          tools/test_runtime_cache.py
 
       - name: Test benchmark orchestration and fixture setup
         run: |

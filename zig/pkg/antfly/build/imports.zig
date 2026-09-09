@@ -18,6 +18,7 @@ const lmdb_c_flags = @import("storage.zig").lmdb_c_flags;
 const addSnowballModule = @import("snowball.zig").addSnowballModule;
 
 pub const AntflyRootImports = struct {
+    build_info: @import("../../../lib/build_info/build_support.zig").BuildInfo,
     build_options: *std.Build.Step.Options,
     // HTTP schema serving is opt-in at the owning compilation roots.
     embedded_openapi: *std.Build.Module,
@@ -165,6 +166,49 @@ pub const AntflyRootImports = struct {
 
     pub fn configure(self: @This(), b: *std.Build, mod: *std.Build.Module, include_lmdb_c: bool, link_libc: bool) void {
         self.configureRuntime(b, mod, include_lmdb_c, link_libc, true);
+        self.build_info.link(mod);
+    }
+
+    /// Remote commands depend on client contracts and transport. In particular,
+    /// they do not depend on local tokenization, inference, or storage engines.
+    pub fn configureCli(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
+        mod.addImport("antfly_platform", self.platform);
+        mod.addImport("httpx", self.httpx);
+        mod.addImport("antfly-json", self.json);
+        mod.addImport("antfly_metadata_openapi", self.metadata_openapi);
+        mod.addImport("antfly_hash", self.hash);
+        mod.addImport("structlog", self.structlog);
+        mod.addImport("handlebars", self.handlebars);
+        mod.link_libc = link_libc;
+    }
+
+    pub fn configureInference(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
+        // The inference host consumes provider/configuration contracts, not
+        // database engines or storage build settings.
+        const options = b.addOptions();
+        options.addOption(bool, "bench_minimal_deps", false);
+        mod.addOptions("build_options", options);
+        mod.addImport("antfly_platform", self.platform);
+        inline for (.{
+            "httpx",              "common_openapi",  "inference_config_openapi", "logging_openapi",
+            "middleware_openapi", "scraping",        "scraping_openapi",         "s3_openapi",
+            "transcribing",       "readers",         "synthesizing",             "inference_server",
+            "inference_api",      "extracting",      "google",                   "generating",
+            "reranking",          "chunking",        "json",                     "handlebars",
+            "openai_api",         "indexes_openapi", "embeddings_openapi",       "embeddings",
+            "inference_chunker",  "vector",          "structlog",                "hash",
+        }) |field| self.addImport(mod, field);
+        mod.link_libc = link_libc;
+    }
+
+    fn addImport(self: @This(), mod: *std.Build.Module, comptime field: []const u8) void {
+        inline for (import_table) |entry| {
+            if (comptime std.mem.eql(u8, entry.field, field)) {
+                mod.addImport(entry.name, @field(self, field));
+                return;
+            }
+        }
+        @compileError("unknown Antfly dependency: " ++ field);
     }
 
     /// Install the production runtime imports while keeping the heavyweight

@@ -18,6 +18,8 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .tokenizer_build = .{ .path = "../../lib/tokenizer" },
+        .build_info = .{ .path = "../../lib/build_info" },
         .openapi = .{
             .path = "../../lib/openapi",
         },

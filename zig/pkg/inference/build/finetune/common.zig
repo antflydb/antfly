@@ -50,6 +50,9 @@ pub const Context = struct {
 
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    build_info_mod: *std.Build.Module,
+    build_info_object: *std.Build.Step.Compile,
+    identities: @import("../jit_identity.zig").Modules,
     build_options_mod: *std.Build.Module,
     jinja_mod: *std.Build.Module,
     ml_mod: *std.Build.Module,
@@ -201,6 +204,11 @@ fn configureNative(
     native_link: NativeLink,
     imports: []const Import,
 ) void {
+    if (native_link != .none or containsImport(imports, .inference_internal)) {
+        artifact.root_module.addImport("build_info", ctx.build_info_mod);
+        artifact.root_module.addObject(ctx.build_info_object);
+    }
+    if (native_link != .none) ctx.identities.addImports(artifact.root_module);
     // inference_internal already owns the Metal translation unit. Adding it to
     // the importing executable as well makes Zig pass the same object to the
     // linker twice. Keep frameworks on the final artifact, but compile the
@@ -282,6 +290,9 @@ pub fn fromWorkflow(ctx: @import("../context.zig").Context) Context {
         .b = b,
         .target = ctx.target,
         .optimize = ctx.optimize,
+        .build_info_mod = ctx.graph.build_info_mod,
+        .build_info_object = ctx.graph.build_info_object,
+        .identities = ctx.graph.identities,
         .build_options_mod = ctx.graph.build_options_mod,
         .jinja_mod = ctx.graph.jinja_mod,
         .ml_mod = ctx.graph.ml_mod,

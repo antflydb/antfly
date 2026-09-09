@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const build_info = @import("build_info");
 const build_options = @import("build_options");
 
 const grpo = @import("grpo.zig");
@@ -2135,7 +2136,7 @@ fn collectStaticMetadata(allocator: std.mem.Allocator, io: std.Io, recipe: Recip
         .backend = .{
             .requested = recipe.backend,
             .build = .{
-                .inference_version = build_options.inference_version,
+                .inference_version = build_info.version(),
                 .enable_native = build_options.enable_native,
                 .enable_onnx = build_options.enable_onnx,
                 .enable_mlx = false,

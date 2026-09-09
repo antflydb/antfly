@@ -98,6 +98,8 @@ pub fn addGliner(ctx: Context) void {
     gliner2_bench_exe.root_module.addImport("protobuf", ctx.graph.protobuf_mod);
     gliner2_bench_exe.root_module.addImport("onnx_graph", ctx.graph.onnx_graph_mod);
     gliner2_bench_exe.root_module.addImport("antfly_platform", ctx.graph.platform_mod);
+    ctx.graph.linkBuildInfo(gliner2_bench_exe.root_module);
+    ctx.graph.identities.addImports(gliner2_bench_exe.root_module);
     gliner2_bench_exe.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
     // inference_internal already owns the native backend linkage, including
     // metal_kernels.m. Linking it again at the executable root produces
@@ -153,6 +155,8 @@ pub fn createBge(ctx: Context) CreateBgeResult {
         .optimize = ctx.optimize,
     });
     runtime_build.addInferenceRootImports(bge_m3_runtime_mod, .{
+        .build_info_mod = ctx.graph.build_info_mod,
+        .identities = ctx.graph.identities,
         .build_options_mod = ctx.graph.build_options_mod,
         .json_mod = ctx.graph.json_mod,
         .httpx_mod = ctx.graph.httpx_mod,

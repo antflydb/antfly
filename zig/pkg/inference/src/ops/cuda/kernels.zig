@@ -14,6 +14,11 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const cuda_identity = if (build_options.enable_cuda) @import("cuda_jit_identity") else struct {
+    pub const baseline = "0" ** 64;
+    pub const qualification = "0" ** 64;
+    pub const dispatch = "0" ** 64;
+};
 const buffer_mod = @import("buffer.zig");
 const context_mod = @import("context.zig");
 const driver_mod = @import("driver.zig");
@@ -19260,9 +19265,9 @@ fn runtimeJitQualificationKey(
             cuda_artifact.format,
             cuda_artifact.target,
             bundled_image_sha256,
-            build_options.cuda_jit_baseline_implementation_sha256,
-            build_options.cuda_jit_qualification_implementation_sha256,
-            build_options.cuda_jit_dispatch_implementation_sha256,
+            cuda_identity.baseline,
+            cuda_identity.qualification,
+            cuda_identity.dispatch,
             &conformance_hex_buffer,
         },
     ) catch unreachable;
@@ -20133,9 +20138,9 @@ test "CUDA runtime JIT cache misses then reuses exact keyed PTX and qualificatio
             artifact,
         ),
     );
-    try std.testing.expectEqual(@as(usize, 64), build_options.cuda_jit_baseline_implementation_sha256.len);
-    try std.testing.expectEqual(@as(usize, 64), build_options.cuda_jit_qualification_implementation_sha256.len);
-    try std.testing.expectEqual(@as(usize, 64), build_options.cuda_jit_dispatch_implementation_sha256.len);
+    try std.testing.expectEqual(@as(usize, 64), cuda_identity.baseline.len);
+    try std.testing.expectEqual(@as(usize, 64), cuda_identity.qualification.len);
+    try std.testing.expectEqual(@as(usize, 64), cuda_identity.dispatch.len);
 }
 
 fn loadModuleWithJitLog(ctx: *context_mod.CudaContext, module: *driver_mod.CUmodule) driver_mod.Error!void {

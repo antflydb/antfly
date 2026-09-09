@@ -60,7 +60,7 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
             .single_threaded = true,
         }),
     });
-    wasm_lib.root_module.addOptions("build_options", runtime_build.addBuildOptions(b, wasmBackend(ctx.backend), ctx.paths));
+    wasm_lib.root_module.addOptions("build_options", runtime_build.addBuildOptions(b, wasmBackend(ctx.backend)));
     wasm_lib.entry = .disabled;
     wasm_lib.rdynamic = true;
     // ReleaseSafe: works around LLVM WASM backend miscompilation at -Os/-O3

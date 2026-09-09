@@ -218,7 +218,35 @@ pub fn build(b: *std.Build) void {
         .link_libc = link_libc,
     }).module("antfly_platform");
 
+    const tokenizer_build = b.lazyImport(@This(), "tokenizer_build") orelse return;
+    const build_info_build = b.lazyImport(@This(), "build_info") orelse return;
+    const tokenizer_protobuf = b.dependency("protobuf", .{ .target = target, .optimize = optimize });
+    const tokenizer_proto = tokenizer_build.addSentencePieceProtoModule(b, tokenizer_protobuf, b.path(b.pathJoin(&.{ shared_lib_root, "lib/tokenizer" })));
+    const tokenizer = tokenizer_build.create(b, .{
+        .root = b.path(b.pathJoin(&.{ shared_lib_root, "lib/tokenizer" })),
+        .target = target,
+        .optimize = optimize,
+        .protobuf = tokenizer_protobuf.module("protobuf"),
+        .sentencepiece_proto = tokenizer_proto,
+    });
+    const build_info = build_info_build.create(b, .{
+        .root = b.path(b.pathJoin(&.{ shared_lib_root, "lib/build_info" })),
+        .target = target,
+        .optimize = optimize,
+        .version = antfly_version,
+    });
+
     const runtime_config: runtime_build.Config = .{
+        .shared = .{
+            .build_info_mod = build_info.module,
+            .build_info_object = build_info.object,
+            .tokenizer_mod = tokenizer.tokenizer,
+            .hf_tokenizer_mod = tokenizer.huggingface,
+            .fixed_tokenizer_data_mod = tokenizer.fixed_data,
+            .protobuf = tokenizer_protobuf.module("protobuf"),
+            .sentencepiece_proto = tokenizer_proto,
+            .platform = configured_platform_mod,
+        },
         .b = b,
         .target = target,
         .optimize = optimize,
@@ -227,9 +255,6 @@ pub fn build(b: *std.Build) void {
             .shared_lib_root = shared_lib_root,
         },
         .register_public_modules = true,
-        .shared = .{
-            .platform = configured_platform_mod,
-        },
         .backend = .{
             .enable_onnx = enable_onnx,
             .onnx_root = effective_onnx_root,
@@ -246,7 +271,6 @@ pub fn build(b: *std.Build) void {
             .wasm_memory_model = wasm_memory_model,
             .link_libc = link_libc,
             .skip_openapi = skip_openapi,
-            .inference_version = antfly_version,
             .enable_native_quant_dispatch_stats = enable_native_quant_dispatch_stats,
         },
     };
@@ -264,7 +288,6 @@ pub fn build(b: *std.Build) void {
         .runtime_test_filter = b.option(bool, "runtime-test-filter", "Build unit tests with a simple runtime-filtering test runner") orelse false,
     };
     const build_options_mod = runtime_graph.build_options_mod;
-    const audio_open_corpus_build_options_mod = runtime_graph.audio_open_corpus_build_options_mod;
     const jinja_mod = runtime_graph.jinja_mod;
     const protobuf_mod = runtime_graph.protobuf_mod;
     const ml_mod = runtime_graph.ml_mod;
@@ -602,6 +625,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         quant_kernel_cuda_attention_diff_exe.root_module.addImport("build_options", build_options_mod);
+        runtime_graph.identities.addImports(quant_kernel_cuda_attention_diff_exe.root_module);
         quant_kernel_cuda_attention_diff_exe.root_module.link_libc = true;
         const run_quant_kernel_cuda_attention_diff = b.addRunArtifact(quant_kernel_cuda_attention_diff_exe);
         if (b.args) |args| run_quant_kernel_cuda_attention_diff.addArgs(args);
@@ -642,6 +666,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         quant_kernel_cuda_paged_attention_diff_exe.root_module.addImport("build_options", build_options_mod);
+        runtime_graph.identities.addImports(quant_kernel_cuda_paged_attention_diff_exe.root_module);
         quant_kernel_cuda_paged_attention_diff_exe.root_module.link_libc = true;
         const quant_kernel_cuda_paged_attention_diff_tests = b.addTest(.{
             .root_module = b.createModule(.{
@@ -651,6 +676,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         quant_kernel_cuda_paged_attention_diff_tests.root_module.addImport("build_options", build_options_mod);
+        runtime_graph.identities.addImports(quant_kernel_cuda_paged_attention_diff_tests.root_module);
         quant_kernel_cuda_paged_attention_diff_tests.root_module.link_libc = true;
         const run_quant_kernel_cuda_paged_attention_diff_tests = b.addRunArtifact(quant_kernel_cuda_paged_attention_diff_tests);
         const run_quant_kernel_cuda_paged_attention_diff = b.addRunArtifact(quant_kernel_cuda_paged_attention_diff_exe);
@@ -683,6 +709,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         quant_kernel_cuda_paged_prefill_diff_exe.root_module.addImport("build_options", build_options_mod);
+        runtime_graph.identities.addImports(quant_kernel_cuda_paged_prefill_diff_exe.root_module);
         quant_kernel_cuda_paged_prefill_diff_exe.root_module.link_libc = true;
         const quant_kernel_cuda_paged_prefill_diff_tests = b.addTest(.{
             .root_module = b.createModule(.{
@@ -692,6 +719,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         quant_kernel_cuda_paged_prefill_diff_tests.root_module.addImport("build_options", build_options_mod);
+        runtime_graph.identities.addImports(quant_kernel_cuda_paged_prefill_diff_tests.root_module);
         quant_kernel_cuda_paged_prefill_diff_tests.root_module.link_libc = true;
         const run_quant_kernel_cuda_paged_prefill_diff_tests = b.addRunArtifact(quant_kernel_cuda_paged_prefill_diff_tests);
         const run_quant_kernel_cuda_paged_prefill_diff = b.addRunArtifact(quant_kernel_cuda_paged_prefill_diff_exe);
@@ -721,6 +749,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         quant_kernel_cuda_ffn_diff_exe.root_module.addImport("build_options", build_options_mod);
+        runtime_graph.identities.addImports(quant_kernel_cuda_ffn_diff_exe.root_module);
         quant_kernel_cuda_ffn_diff_exe.root_module.link_libc = true;
         const run_quant_kernel_cuda_ffn_diff = b.addRunArtifact(quant_kernel_cuda_ffn_diff_exe);
         if (b.args) |args| run_quant_kernel_cuda_ffn_diff.addArgs(args);
@@ -1054,6 +1083,8 @@ pub fn build(b: *std.Build) void {
     });
     metal_bench_exe.root_module.addImport("build_options", build_options_mod);
     metal_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.linkBuildInfo(metal_bench_exe.root_module);
+    runtime_graph.identities.addImports(metal_bench_exe.root_module);
     // inference_internal already owns the native backend links. Configuring
     // Metal again here compiles metal_kernels.m twice into this executable.
     metal_bench_exe.root_module.link_libc = true;
@@ -1276,6 +1307,8 @@ pub fn build(b: *std.Build) void {
     gliner2_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     gliner2_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     gliner2_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.linkBuildInfo(gliner2_e2e_bench_exe.root_module);
+    runtime_graph.identities.addImports(gliner2_e2e_bench_exe.root_module);
     gliner2_e2e_bench_exe.root_module.link_libc = true;
     configureOnnxRuntime(b, gliner2_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_gliner2_e2e_bench = b.addRunArtifact(gliner2_e2e_bench_exe);
@@ -1303,6 +1336,8 @@ pub fn build(b: *std.Build) void {
     clipclap_native_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     clipclap_native_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     clipclap_native_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.linkBuildInfo(clipclap_native_bench_exe.root_module);
+    runtime_graph.identities.addImports(clipclap_native_bench_exe.root_module);
     // inference_internal already owns the Metal source and frameworks.
     configureNativeTool(b, clipclap_native_bench_exe, target, enable_system_blas, blas_root, false);
     configureOnnxRuntime(b, clipclap_native_bench_exe.root_module, enable_onnx, effective_onnx_root);
@@ -1331,6 +1366,8 @@ pub fn build(b: *std.Build) void {
     clipclap_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     clipclap_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     clipclap_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.linkBuildInfo(clipclap_e2e_bench_exe.root_module);
+    runtime_graph.identities.addImports(clipclap_e2e_bench_exe.root_module);
     // inference_internal already owns the Metal source and frameworks.
     configureNativeTool(b, clipclap_e2e_bench_exe, target, enable_system_blas, blas_root, false);
     configureOnnxRuntime(b, clipclap_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
@@ -1369,6 +1406,8 @@ pub fn build(b: *std.Build) void {
     qwen3_embedding_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     qwen3_embedding_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     qwen3_embedding_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.linkBuildInfo(qwen3_embedding_e2e_bench_exe.root_module);
+    runtime_graph.identities.addImports(qwen3_embedding_e2e_bench_exe.root_module);
     // inference_internal already owns the Metal source and frameworks.
     configureNativeTool(b, qwen3_embedding_e2e_bench_exe, target, enable_system_blas, blas_root, false);
     configureOnnxRuntime(b, qwen3_embedding_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
@@ -1397,6 +1436,8 @@ pub fn build(b: *std.Build) void {
     nomic_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     nomic_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     nomic_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.linkBuildInfo(nomic_e2e_bench_exe.root_module);
+    runtime_graph.identities.addImports(nomic_e2e_bench_exe.root_module);
     // inference_internal already owns the Metal source and frameworks.
     configureNativeTool(b, nomic_e2e_bench_exe, target, enable_system_blas, blas_root, false);
     configureOnnxRuntime(b, nomic_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
@@ -1425,6 +1466,8 @@ pub fn build(b: *std.Build) void {
     reranker_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     reranker_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     reranker_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.linkBuildInfo(reranker_e2e_bench_exe.root_module);
+    runtime_graph.identities.addImports(reranker_e2e_bench_exe.root_module);
     reranker_e2e_bench_exe.root_module.link_libc = true;
     configureOnnxRuntime(b, reranker_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_reranker_e2e_bench = b.addRunArtifact(reranker_e2e_bench_exe);
@@ -1634,7 +1677,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    audio_tests.root_module.addImport("build_options", build_options_mod);
     audio_tests.root_module.addImport("inference_audio", inference_audio_mod);
     audio_tests.root_module.link_libc = true;
     const run_audio_tests = b.addRunArtifact(audio_tests);
@@ -1649,7 +1691,6 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
         }),
     });
-    audio_open_corpus.root_module.addImport("build_options", audio_open_corpus_build_options_mod);
     audio_open_corpus.root_module.link_libc = true;
     const run_audio_open_corpus = b.addRunArtifact(audio_open_corpus);
     if (b.args) |args| run_audio_open_corpus.addArgs(args);
@@ -1664,7 +1705,6 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
         }),
     });
-    audio_xiph_corpora_e2e.root_module.addImport("build_options", audio_open_corpus_build_options_mod);
     audio_xiph_corpora_e2e.root_module.link_libc = true;
     const audio_xiph_corpora_e2e_step = b.step("audio-xiph-corpora-e2e", "Build the lib/audio upstream Xiph corpora e2e runner");
     audio_xiph_corpora_e2e_step.dependOn(&audio_xiph_corpora_e2e.step);
@@ -1690,7 +1730,6 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
         }),
     });
-    audio_misc_corpora_e2e.root_module.addImport("build_options", audio_open_corpus_build_options_mod);
     audio_misc_corpora_e2e.root_module.link_libc = true;
     const audio_misc_corpora_e2e_step = b.step("audio-misc-corpora-e2e", "Build the lib/audio external MP3/AAC/MP4 corpora e2e runner");
     audio_misc_corpora_e2e_step.dependOn(&audio_misc_corpora_e2e.step);
@@ -2002,7 +2041,6 @@ pub fn build(b: *std.Build) void {
             }),
             .filters = &.{filter},
         });
-        audio_module_tests.root_module.addImport("build_options", build_options_mod);
         audio_module_tests.root_module.link_libc = true;
         const run_audio_module_tests = b.addRunArtifact(audio_module_tests);
         audio_module_test_step.dependOn(&run_audio_module_tests.step);
@@ -2015,7 +2053,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    chunker_tests.root_module.addImport("build_options", build_options_mod);
     chunker_tests.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     chunker_tests.root_module.addImport("inference_audio", inference_audio_mod);
     chunker_tests.root_module.addImport("inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod);

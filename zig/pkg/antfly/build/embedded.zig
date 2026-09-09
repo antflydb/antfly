@@ -76,7 +76,6 @@ pub const AddEmbeddedOptions = struct {
     optimize: std.builtin.OptimizeMode,
     strip: bool,
     wasm_target: std.Build.ResolvedTarget,
-    antfly_version: []const u8,
     lmdb_engine_wasm_mod: *std.Build.Module,
     protobuf_mod: *std.Build.Module,
     wasm_platform_mod: *std.Build.Module,
@@ -120,7 +119,6 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const strip = options.strip;
     const wasm_target = options.wasm_target;
     const link_libc = options.antfly_imports.platform_link_libc;
-    const antfly_version = options.antfly_version;
     const build_options = options.antfly_imports.build_options;
     const lmdb_engine_mod = options.antfly_imports.lmdb_engine;
     const lmdb_engine_wasm_mod = options.lmdb_engine_wasm_mod;
@@ -346,7 +344,6 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     inference_wasm_build_options.addOption(bool, "enable_ffmpeg_audio", false);
     inference_wasm_build_options.addOption(bool, "link_libc", false);
     inference_wasm_build_options.addOption(bool, "skip_openapi", false);
-    inference_wasm_build_options.addOption([]const u8, "inference_version", antfly_version);
     inference_wasm_build_options.addOption([]const u8, "wasm_memory_model", "wasm32");
     const inference_wasm_build_options_mod = inference_wasm_build_options.createModule();
 

@@ -32,9 +32,53 @@ The HTTP API embeds the source schemas through a dedicated module with tracked
 `@embedFile` inputs. The API kernel and HTTP-serving test/benchmark roots attach
 that module explicitly; shared imports and build options carry no schema inputs.
 Editing an embedded schema leaves the CLI, distributed, serverless, and inference
-runtime archives cached. CI checks all six schema inputs using the real runtime
-constructor with small probe bodies (`python3 -m unittest tools.test_runtime_schema_cache`
-from `zig/`), including builds with a schema file missing.
+runtime archives cached.
+
+Runtime dependency and cache contracts are checked in CI with
+`python3 -m unittest tools.test_runtime_cache` from `zig/`. The fixture calls the
+real root composition and replaces only the five expensive runtime bodies. It
+keeps external modules, options, generated assets, backend inputs, and final link
+edges; the inference probe also loads the real inference module. The checks cover:
+
+- All six served schemas invalidate only the API kernel; the other archives can
+  build with a schema missing.
+- The remote CLI has no transitive tokenizer, storage-engine, or inference
+  implementation imports. Tokenizer data and generator changes invalidate their
+  local consumers while the CLI remains cached.
+- Audio carries no inference options. GPU identities belong to enabled backends;
+  CPU builds configure and compile with the disabled Metal `.m` and CUDA `.cu`
+  kernel source files absent.
+  Enabled fingerprints match an independent implementation of the qualification
+  identity format and change when their source inputs change.
+- Release versions live in a small `lib/build_info` object. Archives see only a
+  stable accessor module; the object is attached at final executable, shared
+  library, and test links. Version-only changes leave the five runtime archives
+  cached while the resulting binary reports the updated version. ABI constants
+  remain at their interface declarations.
+- Storage options do not invalidate the CLI or inference archives. A real shared
+  implementation edit does invalidate its consumers and changes linked behavior;
+  an unchanged rebuild reuses compilation and generated outputs.
+
+Tokenizer constructors and SentencePiece generation live under `lib/tokenizer`.
+Entrypoints supply the same compatible tokenizer modules to inference and Antfly;
+the inference owner receives the modules rather than reconstructing them. GPU
+source identities use cached host generation with declared file arguments,
+including their original ordered bundle hashing format. There is no eager source
+hashing or separately maintained dependency inventory.
+
+Zig still reads relative `.zig` imports inside disabled branches. Consequently,
+edits to the Metal/CUDA Zig implementations can invalidate the CPU inference
+archive, even though no GPU identity generator runs. Removing that dependency
+requires separate backend modules with shared inference types; the cache contract
+above applies to the kernel source inputs and build graph, not every source file
+inside the inference module.
+
+These checks establish cache boundaries; they do not substitute for production
+compilation or runtime tests. For timing comparisons, hold Zig version, target,
+optimization, backend flags, job limit, and cache policy fixed. Measure cold,
+unchanged, and representative edit builds separately, recording compiler step
+status, elapsed/CPU time, and peak RSS. A smaller import graph primarily improves
+incremental invalidation; the expensive runtime code still dominates clean builds.
 
 ## Default Tests
 
