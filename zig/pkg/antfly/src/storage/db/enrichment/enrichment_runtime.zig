@@ -6267,11 +6267,11 @@ const SharedPdfTransform = struct {
 };
 
 /// Sharing is optional: never exchange a consumer's native batch width for
-/// avoiding a render. A whole short document is safe; an undersized partial
-/// window must leave the consumer on its independent bounded traversal.
-fn sharedPdfWindowPreservesBatching(window_items: usize, document_items: usize, consumer_items: usize) bool {
+/// avoiding a render. A whole short document or terminal tail is safe; an
+/// undersized nonterminal window disables sharing for the rest of this owner.
+fn sharedPdfWindowPreservesBatching(window_items: usize, document_items: usize, consumer_items: usize, terminal: bool) bool {
     if (window_items == 0 or consumer_items == 0) return false;
-    return window_items == document_items or window_items % consumer_items == 0;
+    return terminal or window_items == document_items or window_items % consumer_items == 0;
 }
 
 fn sharedPdfWindowWidth(owner: usize, peer: usize, ceiling: usize) usize {
@@ -6627,7 +6627,13 @@ const SharedPdfWindowScheduler = struct {
                 const window_items = switch (rendered) {
                     inline else => |batch| batch.results.len,
                 };
-                if (!sharedPdfWindowPreservesBatching(window_items, page_count, consumer.max_items)) {
+                const terminal = switch (rendered) {
+                    inline else => |batch| batch.results.len > 0 and batch.results[batch.results.len - 1].page_number == page_count,
+                };
+                // An enrolled consumer's final partial model batch is valid.
+                // A consumer that declined an earlier prefix stays disabled;
+                // reaching the last page never enrolls it again.
+                if (!sharedPdfWindowPreservesBatching(window_items, page_count, consumer.max_items, terminal)) {
                     // Never stage singleton tails after declining the earlier
                     // windows: that can fragment the consumer's eventual batch.
                     // No page buffers survive this callback to fill a wider batch.
@@ -6657,7 +6663,7 @@ const SharedPdfWindowScheduler = struct {
                         pending_count += 1;
                     };
                     if (pending_count == 0) continue;
-                    if (!consumer.text and window_items != page_count and pending_count % consumer.max_items != 0) {
+                    if (!consumer.text and !terminal and window_items != page_count and pending_count % consumer.max_items != 0) {
                         consumer.enabled = false;
                         continue;
                     }
@@ -7389,12 +7395,10 @@ const SharedPdfWindowScheduler = struct {
     }
 
     fn consumeTextWithAllocator(self: *@This(), alloc: Allocator, consumer: *Consumer, index: usize, source: TextSource, rendered: PdfEmbeddingRenderedWindow, window_lease: ?*PdfWindowCompositeLease, pending_mask: ?[]const bool, jobs: *WindowJobs) !void {
-        if (self.precommit != null) {
-            var digest: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(source.fingerprint, &digest, .{});
+        if (self.precommit) |execution| if (execution.current_source_digest) |digest| {
             if (consumer.staged_source_digest) |previous| if (!std.mem.eql(u8, &previous, &digest)) self.precommit.?.clearRows();
             consumer.staged_source_digest = digest;
-        }
+        };
         const runtime = self.runtime;
         const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
         var cancellation: AssetInvocationCancellation = undefined;
@@ -8026,18 +8030,20 @@ test "shared PDF windows preserve wider consumer batches" {
     try std.testing.expectEqual(@as(usize, 16), sharedPdfWindowWidth(4, 16, 32));
     try std.testing.expectEqual(@as(usize, 12), sharedPdfWindowWidth(4, 6, 32));
     try std.testing.expectEqual(@as(usize, 16), sharedPdfWindowWidth(16, 6, 32));
-    try std.testing.expect(!sharedPdfWindowPreservesBatching(1, 32, 16));
-    try std.testing.expect(!sharedPdfWindowPreservesBatching(8, 32, 16));
-    try std.testing.expect(sharedPdfWindowPreservesBatching(16, 32, 16));
-    try std.testing.expect(sharedPdfWindowPreservesBatching(16, 32, 4));
-    try std.testing.expect(sharedPdfWindowPreservesBatching(1, 1, 16));
-    try std.testing.expect(sharedPdfWindowPreservesBatching(3, 3, 16));
+    try std.testing.expect(!sharedPdfWindowPreservesBatching(1, 32, 16, false));
+    try std.testing.expect(!sharedPdfWindowPreservesBatching(8, 32, 16, false));
+    try std.testing.expect(sharedPdfWindowPreservesBatching(16, 32, 16, false));
+    try std.testing.expect(sharedPdfWindowPreservesBatching(16, 32, 4, false));
+    try std.testing.expect(sharedPdfWindowPreservesBatching(1, 1, 16, true));
+    try std.testing.expect(sharedPdfWindowPreservesBatching(3, 3, 16, true));
     // Merely exceeding the consumer width is insufficient: four 16-page
     // windows would force 12 six-item calls instead of the ordinary 11.
-    try std.testing.expect(!sharedPdfWindowPreservesBatching(16, 64, 6));
-    try std.testing.expect(sharedPdfWindowPreservesBatching(12, 64, 6));
-    try std.testing.expect(sharedPdfWindowPreservesBatching(16, 16, 6));
-    try std.testing.expect(!sharedPdfWindowPreservesBatching(0, 0, 6));
+    try std.testing.expect(!sharedPdfWindowPreservesBatching(16, 64, 6, false));
+    try std.testing.expect(sharedPdfWindowPreservesBatching(12, 64, 6, false));
+    try std.testing.expect(sharedPdfWindowPreservesBatching(16, 16, 6, true));
+    try std.testing.expect(!sharedPdfWindowPreservesBatching(0, 0, 6, true));
+    try std.testing.expect(sharedPdfWindowPreservesBatching(3, 7, 4, true));
+    try std.testing.expect(!sharedPdfWindowPreservesBatching(3, 7, 4, false));
 }
 
 test "shared PDF enrollment skips completed metadata and byte fingerprints before provider discovery" {
@@ -8397,6 +8403,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
     {
         const execution = try PrecommitDocumentExecution.create(&runtime, requests[0..3], "{}");
         defer execution.destroy();
+        execution.validateSource(source.fingerprint);
         try execution.scheduler.ensureConsumers();
         for (1..3) |i| {
             execution.scheduler.consumers.?[i] = scheduler.consumers.?[i];
@@ -8426,6 +8433,45 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         try std.testing.expectEqual(@as(usize, 4), execution.rows.count());
         execution.validateSource("different-source-bytes");
         try std.testing.expectEqual(@as(usize, 0), execution.scheduler.consumers.?[2].staged_text_max);
+        try std.testing.expectEqual(@as(usize, 0), execution.rows.count());
+        harness.text_calls = 0;
+    }
+    try std.testing.expectEqual(before, resources.sliceStats(.document_extraction_working_set).used_bytes);
+    {
+        const execution = try PrecommitDocumentExecution.create(&runtime, requests[0..2], "{}");
+        defer execution.destroy();
+        execution.validateSource(source.fingerprint);
+        try execution.scheduler.ensureConsumers();
+        execution.scheduler.consumers.?[1] = scheduler.consumers.?[1];
+        execution.scheduler.consumers.?[1].plans = .empty;
+        execution.scheduler.consumers.?[1].max_items = 2;
+        // One full two-page batch, followed by a one-page terminal tail.
+        try execution.scheduler.emit(PreparedDocumentSourceCache.sourceIdentity("https://example.test/source.pdf"), &digest, "{}", 3, transform, .{ .encoded = batch }, "", source, window_lease);
+        var tail_unit = try cloneDocumentExtractionUnit(alloc, units[0]);
+        defer tail_unit.deinit(alloc);
+        const tail_id = try alloc.dupe(u8, "page:000003");
+        alloc.free(tail_unit.unit_id);
+        tail_unit.unit_id = tail_id;
+        tail_unit.page_number = 3;
+        var tail_result = batch.results[0];
+        tail_result.page_number = 3;
+        var tail_batch = batch;
+        tail_batch.results = @as(*[1]@TypeOf(tail_result), @ptrCast(&tail_result))[0..];
+        const tail_source = SharedPdfWindowScheduler.TextSource{ .config = config, .content_type = source.content_type, .fingerprint = source.fingerprint, .units = @as(*[1]document_extraction_mod.Unit, @ptrCast(&tail_unit))[0..], .indices = &.{0} };
+        try execution.scheduler.emit(PreparedDocumentSourceCache.sourceIdentity("https://example.test/source.pdf"), &digest, "{}", 3, transform, .{ .encoded = tail_batch }, "", tail_source, window_lease);
+        try std.testing.expectEqual(@as(usize, 3), harness.text_calls);
+        try std.testing.expectEqual(@as(usize, 3), execution.rows.count());
+        try std.testing.expect(execution.scheduler.failure(1) == null);
+        // Declining an undersized prefix must not re-enroll on the last page.
+        execution.clearRows();
+        var prefix_batch = batch;
+        prefix_batch.results = batch.results[0..1];
+        var prefix_source = source;
+        prefix_source.indices = &.{0};
+        try execution.scheduler.emit(PreparedDocumentSourceCache.sourceIdentity("https://example.test/source.pdf"), &digest, "{}", 3, transform, .{ .encoded = prefix_batch }, "", prefix_source, window_lease);
+        try std.testing.expect(!execution.scheduler.consumers.?[1].enabled);
+        try execution.scheduler.emit(PreparedDocumentSourceCache.sourceIdentity("https://example.test/source.pdf"), &digest, "{}", 3, transform, .{ .encoded = tail_batch }, "", tail_source, window_lease);
+        try std.testing.expectEqual(@as(usize, 3), harness.text_calls);
         try std.testing.expectEqual(@as(usize, 0), execution.rows.count());
         harness.text_calls = 0;
     }
@@ -11682,8 +11728,10 @@ pub const PrecommitDocumentExecution = struct {
     budgeted: ?resource_manager_mod.BudgetedAllocator = null,
     staging: ReservedWorkingSetAllocator,
     rows: std.StringHashMapUnmanaged([]const u8) = .empty,
+    current_source_digest: ?[32]u8 = null,
 
     pub fn useful(requests: []const enrichment_types.GeneratedEnrichmentRequest) bool {
+        if (builtin.os.tag == .freestanding) return false;
         var consumers: usize = 0;
         for (requests) |request| if (request.kind == .asset) {
             consumers += 1;
@@ -11768,12 +11816,18 @@ pub const PrecommitDocumentExecution = struct {
         pending.clearRetainingCapacity();
     }
 
-    fn validateSource(self: *@This(), fingerprint: []const u8) void {
+    fn validateSource(self: *@This(), source_bytes: []const u8) void {
+        // Bind reuse to full SHA-256, never the short telemetry/model identity.
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(source_bytes, &digest, .{});
+        self.validateSourceDigest(digest);
+    }
+
+    fn validateSourceDigest(self: *@This(), digest: [32]u8) void {
+        self.current_source_digest = digest;
         const consumers = self.scheduler.consumers orelse return;
         const consumer = &consumers[self.scheduler.current];
         const previous = consumer.staged_source_digest orelse return;
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(fingerprint, &digest, .{});
         if (!std.mem.eql(u8, &previous, &digest)) {
             // A remote locator may change between consumers. Never apply
             // previously staged results to different bytes.
@@ -11833,9 +11887,11 @@ pub fn completeDocumentExtractionGeneratedTextForRequestWithMemory(
     if (!generated_text_enabled) return;
     const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
     const batch_policy = requestGeneratedTextBatchPolicy(alloc, request);
-    const source_fingerprint = sourceContentFingerprint(source_bytes);
+    var source_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(source_bytes, &source_digest, .{});
+    const source_fingerprint = sourceContentFingerprintFromDigest(source_digest);
     if (runtime.shared_pdf_windows) |shared| {
-        if (shared.precommit) |execution| execution.validateSource(&source_fingerprint);
+        if (shared.precommit) |execution| execution.validateSourceDigest(source_digest);
     }
     completeRuntimeDocumentExtractionGeneratedTextBatchWithMemory(runtime, alloc, memory.native_backing_alloc orelse alloc, producer, config, batch_policy, source_url, source_bytes, &source_fingerprint, extraction.route_type, source_content_type, extraction.units, .ocr) catch |err| {
         if (!isDocumentWideOcrFailure(err)) return err;
