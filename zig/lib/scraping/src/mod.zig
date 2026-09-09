@@ -1895,6 +1895,16 @@ const TestHttpResponseServer = struct {
 
         var write_buffer: [1024]u8 = undefined;
         var writer = stream.writer(self.io, &write_buffer);
+        // Consume the GET request before closing the connection. Closing with
+        // unread request bytes can reset TCP and truncate the response at the
+        // client, making the decoding and size-limit checks scheduling-dependent.
+        var read_buffer: [4096]u8 = undefined;
+        var reader = stream.reader(self.io, &read_buffer);
+        var http = std.http.Server.init(&reader.interface, &writer.interface);
+        _ = http.receiveHead() catch |err| {
+            self.failure = err;
+            return;
+        };
         writer.interface.writeAll(
             "HTTP/1.1 200 OK\r\n" ++
                 "Content-Type: text/plain; charset=utf-8\r\n" ++
