@@ -79,7 +79,8 @@ pub const AddEmbeddedOptions = struct {
     strip: bool,
     wasm_target: std.Build.ResolvedTarget,
     lmdb_engine_wasm_mod: *std.Build.Module,
-    protobuf_mod: *std.Build.Module,
+    wasm_protobuf_mod: *std.Build.Module,
+    wasm_handlebars_mod: *std.Build.Module,
     wasm_platform_mod: *std.Build.Module,
     wasm_objectstore_mod: *std.Build.Module,
     wasm_vector_mod: *std.Build.Module,
@@ -89,7 +90,7 @@ pub const AddEmbeddedOptions = struct {
     wasm_image_mod: *std.Build.Module,
     wasm_pdf_mod: *std.Build.Module,
     wasm_font_mod: *std.Build.Module,
-    sentencepiece_proto_mod: *std.Build.Module,
+    wasm_sentencepiece_proto_mod: *std.Build.Module,
     antfly_imports: AntflyRootImports,
     antfly_mod: *std.Build.Module,
 };
@@ -133,7 +134,6 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const query_openapi_mod = options.antfly_imports.query_openapi;
     const metadata_openapi_mod = options.antfly_imports.metadata_openapi;
     const handlebars_mod = options.antfly_imports.handlebars;
-    const protobuf_mod = options.protobuf_mod;
     const platform_mod = options.antfly_imports.platform;
     const wasm_platform_mod = options.wasm_platform_mod;
     const objectstore_mod = options.antfly_imports.objectstore;
@@ -160,7 +160,6 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const wasm_image_mod = options.wasm_image_mod;
     const wasm_pdf_mod = options.wasm_pdf_mod;
     const wasm_font_mod = options.wasm_font_mod;
-    const sentencepiece_proto_mod = options.sentencepiece_proto_mod;
     const transcribing_mod = options.antfly_imports.transcribing;
     const reader_config_mod = options.antfly_imports.reader_config;
     const antfly_imports = options.antfly_imports;
@@ -279,7 +278,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         wasm_image_mod,
         wasm_font_mod,
         wasm_pdf_mod,
-        handlebars_mod,
+        options.wasm_handlebars_mod,
     };
 
     const embedded_support_wasm_mod = b.createModule(.{
@@ -345,7 +344,6 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     inference_wasm_build_options.addOption(bool, "enable_system_blas", false);
     inference_wasm_build_options.addOption(bool, "enable_wasm", true);
     inference_wasm_build_options.addOption(bool, "enable_webgpu", true);
-    inference_wasm_build_options.addOption(bool, "enable_ffmpeg_audio", false);
     inference_wasm_build_options.addOption(bool, "link_libc", false);
     inference_wasm_build_options.addOption(bool, "skip_openapi", false);
     inference_wasm_build_options.addOption([]const u8, "wasm_memory_model", "wasm32");
@@ -362,7 +360,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .target = wasm_target,
         .optimize = .ReleaseSafe,
     });
-    wasm_inference_tokenizer_mod.addImport("sentencepiece_proto", sentencepiece_proto_mod);
+    wasm_inference_tokenizer_mod.addImport("sentencepiece_proto", options.wasm_sentencepiece_proto_mod);
     const wasm_inference_hf_tokenizer_mod = b.createModule(.{
         .root_source_file = b.path("lib/tokenizer/src/hf_root.zig"),
         .target = wasm_target,
@@ -387,7 +385,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .optimize = .ReleaseSafe,
         .single_threaded = true,
     });
-    wasm_inference_onnx_graph_mod.addImport("protobuf", protobuf_mod);
+    wasm_inference_onnx_graph_mod.addImport("protobuf", options.wasm_protobuf_mod);
     wasm_inference_onnx_graph_mod.addImport("ml", wasm_inference_ml_mod);
     const wasm_inference_audio_mod = b.createModule(.{
         .root_source_file = b.path("lib/audio/src/mod.zig"),

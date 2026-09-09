@@ -17,6 +17,7 @@
 const std = @import("std");
 const support = @import("build_support.zig");
 pub const create = support.create;
-pub const addSentencePieceProtoModule = support.addSentencePieceProtoModule;
+pub const generateSentencePieceProto = support.generateSentencePieceProto;
+pub const createSentencePieceProtoModule = support.createSentencePieceProtoModule;
 
 pub fn build(_: *std.Build) void {}

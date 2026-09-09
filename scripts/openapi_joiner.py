@@ -22,6 +22,8 @@ from pathlib import Path
 
 import yaml
 
+from openapi_inputs import load_yaml
+
 
 ROOT = Path(__file__).resolve().parent.parent
 METADATA_SPEC = ROOT / "specs/openapi/antfly/metadata.yaml"
@@ -143,14 +145,6 @@ def join_specs(metadata_spec: dict, usermgr_spec: dict) -> dict:
             raise RuntimeError(f"components/{section} conflict")
     joined["components"] = joined_components
     return joined
-
-
-def load_yaml(path: Path) -> dict:
-    with path.open("r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh)
-    if not isinstance(data, dict):
-        raise RuntimeError(f"expected mapping at {path}")
-    return data
 
 
 def resolve_pointer(doc: object, pointer: str) -> object:

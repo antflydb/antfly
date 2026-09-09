@@ -33,6 +33,7 @@ pub fn build(b: *std.Build) void {
     var modules = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
     for (b.top_level_steps.values()) |top| collectSteps(&top.step, &steps, &modules);
     const host_tools = b.step("cache-host-tools", "Compile the actual host generators");
+    const openapi = b.step("cache-openapi", "Exercise the actual schema joins and their discovered inputs");
     const unit_tests = b.step("cache-unit-tests", "Exercise actual test imports with stable metadata");
     unit_tests.dependOn(&b.addRunArtifact(artifacts.runtime.antfly_main_tests).step);
     var template: ?*std.Build.Step.Compile = null;
@@ -40,7 +41,14 @@ pub fn build(b: *std.Build) void {
     var test_count: usize = 0;
     var iterator = steps.keyIterator();
     while (iterator.next()) |entry| {
+        if (entry.*.cast(std.Build.Step.Run)) |run| {
+            if (std.mem.eql(u8, run.step.name, "run uv (openapi.public.joined.yaml)") or
+                std.mem.eql(u8, run.step.name, "run uv (openapi.public.prefixed.yaml)"))
+                openapi.dependOn(&run.step);
+        }
         const artifact = entry.*.cast(std.Build.Step.Compile) orelse continue;
+        var configured = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
+        inspectConfiguration(b, artifact.step.name, artifact.root_module, artifact.root_module.resolved_target.?, inference.inference_mod.optimize.?, &configured);
         if (artifact.kind.isTest()) {
             var seen = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
             rejectMetadata(artifact.root_module, inference.build_info_object, &seen);
@@ -71,7 +79,7 @@ pub fn build(b: *std.Build) void {
             host_count += 1;
         }
     }
-    if (host_count != 4 or test_count == 0) @panic("cache fixture did not inspect the expected production graph");
+    if (host_count != 4 or test_count == 0 or openapi.dependencies.items.len != 2) @panic("cache fixture did not inspect the expected production graph");
     const template_tests = template orelse @panic("missing Antfly template suite");
     template_tests.root_module.root_source_file = sources.add("template_test.zig",
         \\test "unit metadata is stable without a release object" {
@@ -228,4 +236,36 @@ fn isSqlGenerator(b: *std.Build, artifact: *std.Build.Step.Compile) bool {
     var modules = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
     collectSteps(&b.top_level_steps.get("sql-grammar-generated-check").?.step, &steps, &modules);
     return steps.contains(&artifact.step);
+}
+
+// Check the production module graph, including foreign executables, before
+// replacing any bodies. Host generators contain no product runtime modules.
+fn inspectConfiguration(b: *std.Build, consumer: []const u8, module: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, seen: *std.AutoHashMap(*std.Build.Module, void)) void {
+    if ((seen.getOrPut(module) catch @panic("OOM")).found_existing) return;
+    const wasm = target.result.cpu.arch == .wasm32 or target.result.cpu.arch == .wasm64;
+    if (module.root_source_file) |source| switch (source) {
+        .src_path => {
+            const path = source.getPath(b);
+            if (std.mem.endsWith(u8, path, "/lib/protobuf/src/root.zig") or
+                std.mem.endsWith(u8, path, "/lib/handlebars/src/handlebars.zig"))
+            {
+                if (!std.Target.Query.fromTarget(&module.resolved_target.?.result).eql(std.Target.Query.fromTarget(&target.result)))
+                    std.debug.panic("{s} in {s} uses target {any}, expected {any}", .{ path, consumer, module.resolved_target.?.query, target.query });
+                if (module.optimize != (if (wasm) .ReleaseSafe else optimize))
+                    std.debug.panic("{s} uses an unexpected runtime optimization profile", .{path});
+            }
+        },
+        else => {},
+    };
+    for (module.link_objects.items) |object| switch (object) {
+        .system_lib => |lib| {
+            for ([_][]const u8{ "avformat", "avcodec", "avutil", "swresample" }) |name| {
+                if (std.mem.eql(u8, lib.name, name)) @panic("runtime links an unused external FFmpeg library");
+            }
+        },
+        // Linked artifacts have their own compilation profile and are checked
+        // independently by the outer step traversal.
+        else => {},
+    };
+    for (module.import_table.values()) |dependency| inspectConfiguration(b, consumer, dependency, target, optimize, seen);
 }

@@ -15,14 +15,17 @@
 
 from __future__ import annotations
 
-import importlib.util
+import argparse
 import copy
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
 
 import yaml
 from openapi_spec_validator import validate_spec
+
+from openapi_inputs import record_dependencies
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -261,7 +264,7 @@ def configure_for_repo_contracts(module) -> None:
     module.target_schema_name_for_ref = target_schema_name_for_ref
 
 
-def main(argv: list[str]) -> int:
+def generate(argv: list[str]) -> int:
     joiner = load_shared_joiner()
     configure_for_repo_contracts(joiner)
 
@@ -304,6 +307,18 @@ def main(argv: list[str]) -> int:
     print(f"wrote {output}")
     validate_openapi_spec(joined, output)
     return 0
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--depfile", type=Path)
+    options, args = parser.parse_known_args(argv)
+    # Other legacy modes can consult Git for ordering or validate external
+    # references. Only the modular join is a cached build producer.
+    if options.depfile is not None and args[:1] != ["--joined-only"]:
+        parser.error("--depfile requires --joined-only")
+    with record_dependencies(options.depfile):
+        return generate(args)
 
 
 if __name__ == "__main__":

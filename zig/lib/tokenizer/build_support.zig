@@ -52,8 +52,8 @@ pub fn create(b: *std.Build, options: struct {
 
 /// Generation is a declared dependency of the tokenizer module; configuring
 /// unrelated consumers does not execute protoc or the compatibility fixup.
-pub fn addSentencePieceProtoModule(b: *std.Build, protobuf: *std.Build.Dependency, root: std.Build.LazyPath) *std.Build.Module {
-    const codegen = b.addRunArtifact(protobuf.artifact("protoc-zig"));
+pub fn generateSentencePieceProto(b: *std.Build, compiler: *std.Build.Step.Compile, root: std.Build.LazyPath) std.Build.LazyPath {
+    const codegen = b.addRunArtifact(compiler);
     codegen.addArg("--desc");
     codegen.addFileArg(root.path(b, "proto/sentencepiece_model.desc"));
     codegen.addArg("--output");
@@ -69,9 +69,15 @@ pub fn addSentencePieceProtoModule(b: *std.Build, protobuf: *std.Build.Dependenc
     const run = b.addRunArtifact(fixup);
     run.addFileArg(raw_dir.path(b, "root.zig"));
     run.addFileArg(raw_dir.path(b, "sentencepiece.zig"));
-    const output = run.addOutputDirectoryArg("sentencepiece_proto");
+    return run.addOutputDirectoryArg("sentencepiece_proto").path(b, "root.zig");
+}
+
+/// Generated source is target-independent; each runtime gets its configured protobuf.
+pub fn createSentencePieceProtoModule(b: *std.Build, source: std.Build.LazyPath, protobuf: *std.Build.Module) *std.Build.Module {
     return b.createModule(.{
-        .root_source_file = output.path(b, "root.zig"),
-        .imports = &.{.{ .name = "protobuf", .module = protobuf.module("protobuf") }},
+        .root_source_file = source,
+        .target = protobuf.resolved_target,
+        .optimize = protobuf.optimize,
+        .imports = &.{.{ .name = "protobuf", .module = protobuf }},
     });
 }

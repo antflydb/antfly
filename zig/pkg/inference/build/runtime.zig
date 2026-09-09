@@ -15,11 +15,6 @@
 const std = @import("std");
 const jit_identity = @import("jit_identity.zig");
 
-pub const FfmpegPaths = struct {
-    include_dir: []const u8,
-    lib_dir: []const u8,
-};
-
 pub const BackendOptions = struct {
     enable_onnx: bool = false,
     onnx_root: []const u8 = "onnxruntime/unknown-unknown",
@@ -34,8 +29,6 @@ pub const BackendOptions = struct {
     enable_wasm: bool = false,
     enable_webgpu: bool = false,
     wasm_memory_model: []const u8 = "wasm32",
-    enable_ffmpeg_audio: bool = false,
-    ffmpeg_paths: ?FfmpegPaths = null,
     link_libc: bool = true,
     skip_openapi: bool = false,
     enable_native_quant_dispatch_stats: bool = false,
@@ -44,7 +37,7 @@ pub const BackendOptions = struct {
 pub const Paths = struct {
     /// Path from the active build.zig directory to pkg/inference.
     inference_root: []const u8,
-    /// Path from the active build.zig directory to the monorepo root.
+    /// Path from the active build.zig directory to the shared Zig tree (zig/).
     shared_lib_root: []const u8,
 };
 
@@ -75,6 +68,7 @@ pub const SharedModules = struct {
     onnx_graph: ?*std.Build.Module = null,
     pjrt: ?*std.Build.Module = null,
     inference_api: ?*std.Build.Module = null,
+    inference_api_source: ?std.Build.LazyPath = null,
     audio_openapi: ?*std.Build.Module = null,
     s3_openapi: ?*std.Build.Module = null,
     generating_openapi: ?*std.Build.Module = null,
@@ -525,7 +519,6 @@ pub fn addBuildOptions(b: *std.Build, backend: BackendOptions) *std.Build.Step.O
 fn addExplicitBuildOptions(b: *std.Build, backend: BackendOptions) *std.Build.Step.Options {
     const options = b.addOptions();
     addCommonOptions(options, backend);
-    options.addOption(bool, "enable_ffmpeg_audio", backend.enable_ffmpeg_audio);
     options.addOption(bool, "enable_native_quant_dispatch_stats", backend.enable_native_quant_dispatch_stats);
     return options;
 }
@@ -544,6 +537,28 @@ fn addCommonOptions(options: *std.Build.Step.Options, backend: BackendOptions) v
     options.addOption(bool, "link_libc", backend.link_libc);
     options.addOption([]const u8, "wasm_memory_model", backend.wasm_memory_model);
     options.addOption(bool, "skip_openapi", backend.skip_openapi);
+}
+
+/// Entrypoints resolve the scripts owner and share a host compiler when available.
+pub fn addInferenceApiOverride(
+    b: *std.Build,
+    comptime openapi_build: type,
+    scripts_root: std.Build.LazyPath,
+    compiler: ?*std.Build.Step.Compile,
+) ?std.Build.LazyPath {
+    const spec = b.option([]const u8, "inference-openapi-spec", "Path to the inference OpenAPI YAML spec used to generate inference_api") orelse return null;
+    return openapi_build.addGeneratedDirectory(b, .{
+        .compiler = compiler orelse b.dependency("openapi", .{ .target = b.graph.host, .optimize = .ReleaseSafe }).artifact("openapi-zig"),
+        .scripts_root = scripts_root,
+        .spec = b.path(spec),
+        .package_name = "inference_api",
+        .generate = "types,server,client",
+        .import_mappings = &.{
+            .{ "../shared/generating.yaml", "antfly_generating_openapi" },
+            .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" },
+            .{ "../ai/extraction.yaml", "antfly_extraction_openapi" },
+        },
+    });
 }
 
 fn addInferenceApiModule(
@@ -587,13 +602,7 @@ fn addInferenceApiModule(
         return mod;
     }
 
-    const spec_path_override = b.option(
-        []const u8,
-        "inference-openapi-spec",
-        "Path to the inference OpenAPI YAML spec used to generate inference_api",
-    );
-
-    if (spec_path_override == null) {
+    if (shared.inference_api_source == null) {
         const mod = addOrCreateModule(b, register_public_modules, "inference_api", .{
             .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/api/generated/inference_api/root.zig")),
             .target = target,
@@ -606,30 +615,7 @@ fn addInferenceApiModule(
         return mod;
     }
 
-    const openapi_dep = b.dependency("openapi", .{
-        .target = b.graph.host,
-        .optimize = .ReleaseSafe,
-    });
-    const convert = b.addSystemCommand(&.{
-        "uv",
-        "run",
-        "--directory",
-        b.fmt("{s}/scripts", .{paths.shared_lib_root}),
-        "yaml_to_json.py",
-    });
-    convert.addFileArg(b.path(spec_path_override.?));
-    const json_spec = convert.addOutputFileArg("inference.openapi.json");
-    const codegen = b.addRunArtifact(openapi_dep.artifact("openapi-zig"));
-    codegen.addArg("--spec");
-    codegen.addFileArg(json_spec);
-    codegen.addArgs(&.{ "--package", "inference_api" });
-    codegen.addArgs(&.{ "--generate", "types,server,client" });
-    codegen.addArgs(&.{"--import-mapping"});
-    codegen.addArg(b.fmt("{s}={s}", .{ "../shared/generating.yaml", "antfly_generating_openapi" }));
-    codegen.addArg(b.fmt("{s}={s}", .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" }));
-    codegen.addArg(b.fmt("{s}={s}", .{ "../ai/extraction.yaml", "antfly_extraction_openapi" }));
-    codegen.addArg("--output");
-    const gen_dir = codegen.addOutputDirectoryArg("inference_api");
+    const gen_dir = shared.inference_api_source.?;
     const mod = addOrCreateModule(b, register_public_modules, "inference_api", .{
         .root_source_file = gen_dir.path(b, "root.zig"),
         .target = target,
@@ -726,15 +712,6 @@ fn configureRuntimeLinks(
     }
     configureOnnxRuntime(b, module, backend.enable_onnx, backend.onnx_root);
     configureMetal(b, module, target, backend.enable_metal, paths);
-    if (backend.ffmpeg_paths) |ffmpeg_paths| {
-        module.addIncludePath(.{ .cwd_relative = ffmpeg_paths.include_dir });
-        module.addLibraryPath(.{ .cwd_relative = ffmpeg_paths.lib_dir });
-        module.addRPath(.{ .cwd_relative = ffmpeg_paths.lib_dir });
-        module.linkSystemLibrary("avformat", .{});
-        module.linkSystemLibrary("avcodec", .{});
-        module.linkSystemLibrary("avutil", .{});
-        module.linkSystemLibrary("swresample", .{});
-    }
 }
 
 pub fn configureSystemBlas(

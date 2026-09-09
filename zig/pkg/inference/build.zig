@@ -29,7 +29,7 @@ fn resolveSharedLibRoot(b: *std.Build) []const u8 {
     return b.option(
         []const u8,
         "shared-lib-root",
-        "Path to the monorepo root that provides shared generic Zig libraries used by Antfly inference (defaults to ../..)",
+        "Path to the shared Zig library tree used by Antfly inference (defaults to ../..)",
     ) orelse b.option(
         []const u8,
         "antfly-root",
@@ -221,7 +221,8 @@ pub fn build(b: *std.Build) void {
     const tokenizer_build = b.lazyImport(@This(), "tokenizer_build") orelse return;
     const build_info_build = b.lazyImport(@This(), "build_info") orelse return;
     const tokenizer_protobuf = b.dependency("protobuf", .{ .target = target, .optimize = optimize });
-    const tokenizer_proto = tokenizer_build.addSentencePieceProtoModule(b, tokenizer_protobuf, b.path(b.pathJoin(&.{ shared_lib_root, "lib/tokenizer" })));
+    const tokenizer_proto_source = tokenizer_build.generateSentencePieceProto(b, tokenizer_protobuf.artifact("protoc-zig"), b.path(b.pathJoin(&.{ shared_lib_root, "lib/tokenizer" })));
+    const tokenizer_proto = tokenizer_build.createSentencePieceProtoModule(b, tokenizer_proto_source, tokenizer_protobuf.module("protobuf"));
     const tokenizer = tokenizer_build.create(b, .{
         .root = b.path(b.pathJoin(&.{ shared_lib_root, "lib/tokenizer" })),
         .target = target,
@@ -236,6 +237,8 @@ pub fn build(b: *std.Build) void {
         .version = antfly_version,
     });
 
+    const openapi_build = b.lazyImport(@This(), "openapi") orelse return;
+    const inference_api_source = runtime_build.addInferenceApiOverride(b, openapi_build, b.path(b.pathJoin(&.{ shared_lib_root, "../scripts" })), null);
     const runtime_config: runtime_build.Config = .{
         .shared = .{
             .build_info_mod = build_info.module,
@@ -243,6 +246,7 @@ pub fn build(b: *std.Build) void {
             .tokenizer_mod = tokenizer.tokenizer,
             .hf_tokenizer_mod = tokenizer.huggingface,
             .fixed_tokenizer_data_mod = tokenizer.fixed_data,
+            .inference_api_source = inference_api_source,
             .protobuf = tokenizer_protobuf.module("protobuf"),
             .sentencepiece_proto = tokenizer_proto,
             .platform = configured_platform_mod,

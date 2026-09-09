@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+pub const addGeneratedDirectory = @import("build_support.zig").addGeneratedDirectory;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});

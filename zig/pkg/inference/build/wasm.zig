@@ -36,8 +36,6 @@ fn wasmBackend(native: runtime_build.BackendOptions) runtime_build.BackendOption
     backend.enable_onnx = false;
     backend.enable_pjrt = false;
     backend.enable_system_blas = false;
-    backend.enable_ffmpeg_audio = false;
-    backend.ffmpeg_paths = null;
     backend.blas_root = null;
     return backend;
 }
@@ -117,9 +115,17 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
         .optimize = .ReleaseSafe,
         .single_threaded = true,
     });
-    wasm_onnx_graph_mod.addImport("protobuf", ctx.graph.protobuf_mod);
+    const wasm_protobuf = b.dependency("protobuf", .{ .target = wasm_target, .optimize = .ReleaseSafe }).module("protobuf");
+    // Reuse generated source without importing the native runtime module.
+    const wasm_sentencepiece_proto = b.createModule(.{
+        .root_source_file = ctx.graph.sentencepiece_proto_mod.root_source_file,
+        .target = wasm_target,
+        .optimize = .ReleaseSafe,
+        .imports = &.{.{ .name = "protobuf", .module = wasm_protobuf }},
+    });
+    wasm_onnx_graph_mod.addImport("protobuf", wasm_protobuf);
     wasm_onnx_graph_mod.addImport("ml", wasm_ml_mod);
-    wasm_tokenizer_mod.addImport("sentencepiece_proto", ctx.graph.sentencepiece_proto_mod);
+    wasm_tokenizer_mod.addImport("sentencepiece_proto", wasm_sentencepiece_proto);
     wasm_hf_tokenizer_mod.addImport("inference_tokenizer", wasm_tokenizer_mod);
     wasm_lib.root_module.addImport("jinja", wasm_jinja_mod);
     wasm_lib.root_module.addImport("inference_audio", wasm_audio_mod);

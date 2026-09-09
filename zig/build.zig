@@ -14,7 +14,6 @@
 
 const std = @import("std");
 const audio_build = @import("lib/audio/build_support.zig");
-const FfmpegPaths = inference_runtime_build.FfmpegPaths;
 
 const pdf_build = @import("lib/pdf/build_support.zig");
 const image_build = @import("lib/image/build_support.zig");
@@ -83,36 +82,6 @@ fn defaultInferenceOnnxRoot(b: *std.Build, target: std.Build.ResolvedTarget) []c
         else => "unknown",
     };
     return b.fmt("pkg/inference/onnxruntime/{s}-{s}", .{ platform_str, arch_str });
-}
-
-fn detectFfmpegPaths(b: *std.Build, target: std.Build.ResolvedTarget) ?FfmpegPaths {
-    const macos_candidates = [_]FfmpegPaths{
-        .{ .include_dir = "/opt/homebrew/include", .lib_dir = "/opt/homebrew/lib" },
-        .{ .include_dir = "/opt/homebrew/opt/ffmpeg/include", .lib_dir = "/opt/homebrew/opt/ffmpeg/lib" },
-        .{ .include_dir = "/usr/local/include", .lib_dir = "/usr/local/lib" },
-        .{ .include_dir = "/usr/local/opt/ffmpeg/include", .lib_dir = "/usr/local/opt/ffmpeg/lib" },
-    };
-    const linux_candidates = [_]FfmpegPaths{
-        .{ .include_dir = "/usr/include", .lib_dir = "/usr/lib/x86_64-linux-gnu" },
-        .{ .include_dir = "/usr/include", .lib_dir = "/usr/lib/aarch64-linux-gnu" },
-        .{ .include_dir = "/usr/include", .lib_dir = "/usr/lib64" },
-        .{ .include_dir = "/usr/include", .lib_dir = "/usr/lib" },
-        .{ .include_dir = "/usr/local/include", .lib_dir = "/usr/local/lib64" },
-        .{ .include_dir = "/usr/local/include", .lib_dir = "/usr/local/lib" },
-    };
-    const candidates: []const FfmpegPaths = switch (target.result.os.tag) {
-        .macos => macos_candidates[0..],
-        .linux => linux_candidates[0..],
-        else => return null,
-    };
-
-    for (candidates) |candidate| {
-        const header = b.fmt("{s}/libavformat/avformat.h", .{candidate.include_dir});
-        const dylib = b.fmt("{s}/libavformat.dylib", .{candidate.lib_dir});
-        const so = b.fmt("{s}/libavformat.so", .{candidate.lib_dir});
-        if (pathExists(b, header) and (pathExists(b, dylib) or pathExists(b, so))) return candidate;
-    }
-    return null;
 }
 
 fn addLocalHttpxModule(
@@ -261,7 +230,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     addSnowballCheckStep(b);
     const openapi_build = b.lazyImport(@This(), "openapi") orelse return null;
     const openapi_codegen = openapi_build.addCompiler(b, b.path("lib/openapi"), b.graph.host, .ReleaseSafe, addLocalHttpxModule(b, b.graph.host, .ReleaseSafe));
-    const openapi_sources = addOpenApiSourceSteps(b, openapi_codegen);
+    const openapi_sources = addOpenApiSourceSteps(b, openapi_build, openapi_codegen);
     const update_public_openapi = b.addUpdateSourceFiles();
     update_public_openapi.addCopyFileToSource(openapi_sources.public_spec, "../openapi.yaml");
     const openapi_regen_step = b.step("regen-openapi", "Regenerate checked-in OpenAPI sources");
@@ -386,12 +355,14 @@ pub fn create(b: *std.Build) ?Artifacts {
     common_openapi_mod.addImport("antfly_inference_config_openapi", inference_config_openapi_mod);
 
     // Handlebars template engine
-    const handlebars_dep = b.dependency("handlebars", .{});
+    const handlebars_dep = b.dependency("handlebars", .{ .target = target, .optimize = optimize });
     const handlebars_mod = handlebars_dep.module("handlebars");
 
     // Protobuf wire format
-    const protobuf_dep = b.dependency("protobuf", .{});
+    const protobuf_dep = b.dependency("protobuf", .{ .target = target, .optimize = optimize });
     const protobuf_mod = protobuf_dep.module("protobuf");
+    const wasm_protobuf_mod = b.dependency("protobuf", .{ .target = wasm_target, .optimize = .ReleaseSafe }).module("protobuf");
+    const wasm_handlebars_mod = b.dependency("handlebars", .{ .target = wasm_target, .optimize = .ReleaseSafe }).module("handlebars");
     const platform_mod = platform_build.createModule(b, .{
         .root_source_file = b.path("lib/platform/src/root.zig"),
         .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
@@ -464,7 +435,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .target = wasm_target,
         .optimize = optimize,
     });
-    wasm_vector_mod.addImport("protobuf", protobuf_mod);
+    wasm_vector_mod.addImport("protobuf", wasm_protobuf_mod);
     const hash_mod = b.createModule(.{
         .root_source_file = b.path("lib/hash/src/mod.zig"),
         .target = target,
@@ -643,7 +614,6 @@ pub fn create(b: *std.Build) ?Artifacts {
     const openai_api_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "openai_api", antfly_generated_root ++ "/openai_api", httpx_mod);
 
     // --- Inference backend detection (must precede module creation) ---
-    const inference_ffmpeg_paths = if (link_libc) detectFfmpegPaths(b, target) else null;
     const image_mod = image_build.createModule(b, b.path("lib/image"), target, optimize, hash_mod);
     const pdf_standard_fonts_mod = b.createModule(.{
         .root_source_file = b.path("pdf_standard_fonts.zig"),
@@ -670,7 +640,10 @@ pub fn create(b: *std.Build) ?Artifacts {
     });
     const wasm_pdf_mod = pdf_build.createModule(b, b.path("lib/pdf"), wasm_target, optimize, wasm_image_mod, wasm_hash_mod, wasm_font_mod, wasm_pdf_standard_fonts_mod);
 
-    const sentencepiece_proto_mod = @import("lib/tokenizer/build_support.zig").addSentencePieceProtoModule(b, protobuf_dep, b.path("lib/tokenizer"));
+    const tokenizer_build = @import("lib/tokenizer/build_support.zig");
+    const sentencepiece_proto_source = tokenizer_build.generateSentencePieceProto(b, protobuf_dep.artifact("protoc-zig"), b.path("lib/tokenizer"));
+    const sentencepiece_proto_mod = tokenizer_build.createSentencePieceProtoModule(b, sentencepiece_proto_source, protobuf_mod);
+    const wasm_sentencepiece_proto_mod = tokenizer_build.createSentencePieceProtoModule(b, sentencepiece_proto_source, wasm_protobuf_mod);
     const inference_jinja_mod = b.createModule(.{
         .root_source_file = b.path("lib/jinja/src/jinja.zig"),
         .target = target,
@@ -717,6 +690,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .sentencepiece_proto = sentencepiece_proto_mod,
     });
 
+    const inference_api_source = inference_runtime_build.addInferenceApiOverride(b, openapi_build, b.path("../scripts"), openapi_codegen);
     const inference_config: inference_runtime_build.Config = .{
         .b = b,
         .target = target,
@@ -737,11 +711,6 @@ pub fn create(b: *std.Build) ?Artifacts {
             .enable_webgpu = b.option(bool, "webgpu", "Enable WebGPU for inference WASM") orelse false,
             .enable_system_blas = inference_enable_system_blas,
             .blas_root = inference_blas_root,
-            .enable_ffmpeg_audio = inference_ffmpeg_paths != null,
-            .ffmpeg_paths = if (inference_ffmpeg_paths) |paths| .{
-                .include_dir = paths.include_dir,
-                .lib_dir = paths.lib_dir,
-            } else null,
             .link_libc = link_libc,
             .skip_openapi = false,
         },
@@ -765,6 +734,7 @@ pub fn create(b: *std.Build) ?Artifacts {
             .prometheus = prometheus_mod,
             .structlog = structlog_mod,
             .jinja = inference_jinja_mod,
+            .inference_api_source = inference_api_source,
             .protobuf = protobuf_mod,
             .sentencepiece_proto = sentencepiece_proto_mod,
             .ml = inference_ml_mod,
@@ -955,7 +925,8 @@ pub fn create(b: *std.Build) ?Artifacts {
         .strip = strip,
         .wasm_target = wasm_target,
         .lmdb_engine_wasm_mod = lmdb_engine_wasm_mod,
-        .protobuf_mod = protobuf_mod,
+        .wasm_protobuf_mod = wasm_protobuf_mod,
+        .wasm_handlebars_mod = wasm_handlebars_mod,
         .wasm_platform_mod = wasm_platform_mod,
         .wasm_objectstore_mod = wasm_objectstore_mod,
         .wasm_vector_mod = wasm_vector_mod,
@@ -965,7 +936,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .wasm_image_mod = wasm_image_mod,
         .wasm_pdf_mod = wasm_pdf_mod,
         .wasm_font_mod = wasm_font_mod,
-        .sentencepiece_proto_mod = sentencepiece_proto_mod,
+        .wasm_sentencepiece_proto_mod = wasm_sentencepiece_proto_mod,
         .antfly_imports = antfly_imports,
         .antfly_mod = antfly_mod,
     });
