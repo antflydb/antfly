@@ -41,9 +41,20 @@ if [ -n "$published_integrity" ]; then
 fi
 
 npm publish "$tarball" --access public --provenance --tag "$dist_tag"
-published_tag="$(python3 scripts/release/registryctl.py npm-tag \
-  --package "$package_name" --tag "$dist_tag")"
-if [ "$published_tag" != "$version" ]; then
-  echo "npm publish completed but dist-tag ${dist_tag} does not point to v${version}" >&2
-  exit 1
-fi
+# A successful publish can precede the registry's read-side dist-tag update.
+# Retry only that observation; never republish or mutate a tag to repair it.
+attempt=1
+while [ "$attempt" -le 30 ]; do
+  published_tag="$(python3 scripts/release/registryctl.py npm-tag \
+    --package "$package_name" --tag "$dist_tag")"
+  if [ "$published_tag" = "$version" ]; then
+    exit 0
+  fi
+  if [ "$attempt" -lt 30 ]; then
+    echo "waiting for npm dist-tag ${dist_tag} to expose ${package_name}@${version} (attempt ${attempt}/30)" >&2
+    sleep 10
+  fi
+  attempt=$((attempt + 1))
+done
+echo "npm publish completed but dist-tag ${dist_tag} does not point to ${version} after 30 checks" >&2
+exit 1
