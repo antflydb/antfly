@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const platform_build = @import("build_support.zig");
+pub const addNativeProcessTest = platform_build.addNativeProcessTest;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -28,11 +29,13 @@ pub fn build(b: *std.Build) void {
         .link_libc = link_libc,
     });
 
-    _ = platform_build.addTests(b, .{
+    const tests = platform_build.addTests(b, .{
         .root = b.path("."),
-        .name = "test",
         .target = target,
         .optimize = optimize,
         .link_libc = link_libc,
     });
+    const test_step = b.step("test", "Run supervisor unit and process-lifecycle tests (Python 3 on POSIX)");
+    test_step.dependOn(&tests.unit.step);
+    if (tests.process) |process| test_step.dependOn(process);
 }

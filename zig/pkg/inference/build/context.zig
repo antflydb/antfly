@@ -25,6 +25,7 @@ pub const Context = struct {
     args: ?[]const []const u8,
     runtime_test_filter: bool = false,
     step_prefix: []const u8 = "",
+    add_native_process_test: *const fn (*std.Build, *std.Build.Step.Compile, std.Build.LazyPath) *std.Build.Step,
 
     pub fn step(ctx: Context, name: []const u8, description: []const u8) *std.Build.Step {
         return ctx.b.step(ctx.b.fmt("{s}{s}", .{ ctx.step_prefix, name }), description);
@@ -45,10 +46,5 @@ pub const Context = struct {
     }
     pub fn hasAccelerator(ctx: Context) bool {
         return ctx.backend.enable_metal or ctx.backend.enable_cuda or ctx.backend.enable_onnx or ctx.backend.enable_pjrt;
-    }
-
-    pub fn runsOnHost(ctx: Context) bool {
-        const host = ctx.b.graph.host.result;
-        return ctx.target.result.cpu.arch == host.cpu.arch and ctx.target.result.os.tag == host.os.tag and ctx.target.result.abi == host.abi;
     }
 };

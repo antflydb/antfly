@@ -129,7 +129,7 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     const run_bge_m3_e2e_bench_tests = checks.bge_benchmark;
     const test_step = ctx.step("test", "Run unit tests");
     const cancellation_e2e_step = ctx.step("test-cancellation-e2e", "Run HTTP inference cancellation and worker recovery E2E tests");
-    if (ctx.runsOnHost() and (ctx.target.result.os.tag == .linux or ctx.target.result.os.tag == .macos)) {
+    if (ctx.target.result.os.tag == .linux or ctx.target.result.os.tag == .macos) {
         const fixture = b.addExecutable(.{
             .name = "inference-cancellation-fixture",
             .max_rss = @as(usize, if (ctx.hasAccelerator()) 7 else 4) * 1024 * 1024 * 1024,
@@ -143,10 +143,8 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
         fixture.root_module.addImport("httpx", ctx.graph.httpx_mod);
         fixture.root_module.addImport("antfly_platform", ctx.graph.platform_mod);
         fixture.root_module.link_libc = true;
-        const integration = b.addSystemCommand(&.{"python3"});
-        integration.addFileArg(ctx.path("tests/test_cancellation_e2e.py"));
-        integration.addArtifactArg(fixture);
-        cancellation_e2e_step.dependOn(&integration.step);
+        const integration = ctx.add_native_process_test(b, fixture, ctx.path("tests/test_cancellation_e2e.py"));
+        cancellation_e2e_step.dependOn(integration);
         if (selected_test_filters.len == 0) test_step.dependOn(cancellation_e2e_step);
     }
     test_step.dependOn(&quant_kernel_codegen_test_check.step);

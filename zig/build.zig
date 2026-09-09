@@ -14,21 +14,21 @@
 
 const std = @import("std");
 const audio_build = @import("lib/audio/build_support.zig");
-const lib_audio_build_support = @import("lib/audio/build_support.zig");
-const FfmpegPaths = lib_audio_build_support.FfmpegPaths;
+const FfmpegPaths = inference_runtime_build.FfmpegPaths;
 
 const pdf_build = @import("lib/pdf/build_support.zig");
 const image_build = @import("lib/image/build_support.zig");
 
 const antfly_runtime_build = @import("pkg/antfly/build/runtime.zig");
 const lib_sql_build_support = @import("lib/sql/build_support.zig");
-const addYaccSteps = lib_sql_build_support.addYaccSteps;
+const yacc_build = @import("lib/yacc/build_support.zig");
+const tools_build = @import("tools/build_support.zig");
 
 const pkg_antfly_build_codegen = @import("pkg/antfly/build/codegen.zig");
 const addOpenApiRootCheckStep = pkg_antfly_build_codegen.addOpenApiRootCheckStep;
 const addCommittedOpenApiModule = pkg_antfly_build_codegen.addCommittedOpenApiModule;
 const addCommittedOpenApiModuleWithHttpx = pkg_antfly_build_codegen.addCommittedOpenApiModuleWithHttpx;
-const addOpenApiRegenStep = pkg_antfly_build_codegen.addOpenApiRegenStep;
+const addOpenApiSourceSteps = pkg_antfly_build_codegen.addOpenApiSourceSteps;
 
 const pkg_antfly_build_runtime = @import("pkg/antfly/build/runtime.zig");
 const RuntimeArtifactRole = pkg_antfly_build_runtime.RuntimeArtifactRole;
@@ -207,11 +207,14 @@ pub fn build(b: *std.Build) void {
     }
     const platform_tests = platform_build.addTests(b, .{
         .root = b.path("lib/platform"),
-        .name = "lib-platform-test",
         .target = target,
         .optimize = optimize,
         .link_libc = link_libc,
     });
+
+    const platform_test_step = b.step("lib-platform-test", "Run supervisor unit and process-lifecycle tests (Python 3 on POSIX)");
+    platform_test_step.dependOn(&platform_tests.unit.step);
+    if (platform_tests.process) |process| platform_test_step.dependOn(process);
 
     const lmdb_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, true, antfly_version);
@@ -238,10 +241,40 @@ pub fn build(b: *std.Build) void {
     addSnowballRegenStep(b);
     addSnowballCheckStep(b);
     const openapi_build = b.lazyImport(@This(), "openapi") orelse return;
-    const openapi_codegen = openapi_build.addCompiler(b, b.path("lib/openapi"), target, optimize, httpx_mod);
-    addOpenApiRegenStep(b, openapi_codegen);
-    const yacc_steps = addYaccSteps(b, target, optimize);
+    const openapi_codegen = openapi_build.addCompiler(b, b.path("lib/openapi"), b.graph.host, optimize, addLocalHttpxModule(b, b.graph.host, optimize));
+    const openapi_sources = addOpenApiSourceSteps(b, openapi_codegen);
+    const update_public_openapi = b.addUpdateSourceFiles();
+    update_public_openapi.addCopyFileToSource(openapi_sources.public_spec, "../openapi.yaml");
+    const openapi_regen_step = b.step("regen-openapi", "Regenerate checked-in OpenAPI sources");
+    openapi_regen_step.dependOn(&openapi_sources.regen.step);
+    openapi_regen_step.dependOn(&update_public_openapi.step);
+    const openapi_check_step = b.step("check-openapi", "Compare checked-in OpenAPI sources without modifying them");
+    openapi_check_step.dependOn(&openapi_sources.check.step);
+    const yacc_codegen = yacc_build.addCompiler(b, b.path("lib/yacc"), target, optimize);
+    b.step("yacc-zig", "Build and install the standalone Zig yacc generator").dependOn(&b.addInstallArtifact(yacc_codegen, .{}).step);
+    const yacc_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("lib/yacc/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_yacc_tests = b.addRunArtifact(yacc_tests);
+    b.step("lib-yacc-test", "Run standalone lib/yacc parser generator tests").dependOn(&run_yacc_tests.step);
+    const yacc_steps = lib_sql_build_support.addSteps(b, .{
+        .root = b.path("lib/sql"),
+        .target = target,
+        .optimize = optimize,
+        .codegen = yacc_build.addCompiler(b, b.path("lib/yacc"), b.graph.host, optimize),
+        .compare_tool = tools_build.addFileCompareTool(b, b.path("tools")),
+        .grammar_label = "lib/sql/grammar/antfly_sql.y",
+    });
+    b.step("regen-sql-grammar", "Regenerate checked-in Antfly SQL grammar metadata").dependOn(&yacc_steps.regen.step);
+    const sql_generated_check = b.step("sql-grammar-generated-check", "Check and compile the generated Antfly SQL grammar metadata");
+    sql_generated_check.dependOn(&yacc_steps.compare.step);
+    sql_generated_check.dependOn(&yacc_steps.run_generated.step);
+    b.step("lib-sql-parser-test", "Run the storage-independent SQL lexer and parser tests").dependOn(&yacc_steps.run_parser_tests.step);
+    b.step("lib-sql-parser-bench", "Build and install lib-sql-parser-bench").dependOn(&b.addInstallArtifact(yacc_steps.benchmark, .{}).step);
     const openapi_root_check = addOpenApiRootCheckStep(b);
+    openapi_check_step.dependOn(&openapi_root_check.step);
     const antfly_generated_root = "pkg/antfly/src/openapi/generated";
     const public_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_public_openapi", antfly_generated_root ++ "/antfly_public_openapi");
     const client_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_client_openapi", antfly_generated_root ++ "/antfly_client_openapi", httpx_mod);
@@ -582,7 +615,7 @@ pub fn build(b: *std.Build) void {
 
     // --- Inference backend detection (must precede module creation) ---
     const inference_ffmpeg_paths = if (link_libc) detectFfmpegPaths(b, target) else null;
-    const image_mod = image_build.createModule(b, target, optimize, hash_mod);
+    const image_mod = image_build.createModule(b, b.path("lib/image"), target, optimize, hash_mod);
     const pdf_standard_fonts_mod = b.createModule(.{
         .root_source_file = b.path("pdf_standard_fonts.zig"),
         .target = target,
@@ -593,9 +626,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const pdf_mod = pdf_build.createModule(b, target, optimize, image_mod, font_mod, pdf_standard_fonts_mod);
+    const pdf_mod = pdf_build.createModule(b, b.path("lib/pdf"), target, optimize, image_mod, font_mod, pdf_standard_fonts_mod);
 
-    const wasm_image_mod = image_build.createModule(b, wasm_target, optimize, wasm_hash_mod);
+    const wasm_image_mod = image_build.createModule(b, b.path("lib/image"), wasm_target, optimize, wasm_hash_mod);
     const wasm_pdf_standard_fonts_mod = b.createModule(.{
         .root_source_file = b.path("pdf_standard_fonts.zig"),
         .target = wasm_target,
@@ -606,7 +639,7 @@ pub fn build(b: *std.Build) void {
         .target = wasm_target,
         .optimize = optimize,
     });
-    const wasm_pdf_mod = pdf_build.createModule(b, wasm_target, optimize, wasm_image_mod, wasm_font_mod, wasm_pdf_standard_fonts_mod);
+    const wasm_pdf_mod = pdf_build.createModule(b, b.path("lib/pdf"), wasm_target, optimize, wasm_image_mod, wasm_font_mod, wasm_pdf_standard_fonts_mod);
 
     const sentencepiece_proto_mod = inference_runtime_build.addSentencePieceProtoModule(b, protobuf_dep, .{ .inference_root = "pkg/inference", .shared_lib_root = "" }, false);
     const inference_jinja_mod = b.createModule(.{
@@ -703,7 +736,6 @@ pub fn build(b: *std.Build) void {
         },
     };
     const inference_graph = inference_runtime_build.create(inference_config);
-    const inference_build_options_mod = inference_graph.build_options_mod;
     const inference_api_mod = inference_graph.inference_api_mod;
     inference_api_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     inference_api_mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
@@ -775,6 +807,7 @@ pub fn build(b: *std.Build) void {
         .graph = inference_graph,
         .args = b.args,
         .step_prefix = "inference-",
+        .add_native_process_test = platform_build.addNativeProcessTest,
         .runtime_test_filter = b.option(bool, "runtime-test-filter", "Build inference tests once and filter them at runtime") orelse false,
     };
     const inference_wasm_target = @import("pkg/inference/build/wasm.zig").resolveTarget(inference_workflow);
@@ -1120,6 +1153,7 @@ pub fn build(b: *std.Build) void {
     lib_extracting_test_step.dependOn(&run_lib_extracting_tests.step);
 
     const image_tests = image_build.addTests(b, .{
+        .root = b.path("lib/image"),
         .target = target,
         .optimize = optimize,
         .hash_mod = hash_mod,
@@ -1128,8 +1162,15 @@ pub fn build(b: *std.Build) void {
     const run_lib_image_tests = image_tests.run_lib_image_tests;
     const run_png_tests = image_tests.run_png_tests;
     const run_jpeg2000_decode_tests = image_tests.run_jpeg2000_decode_tests;
+    b.step("lib-image-png-test", "Run PNG codec and checksum compatibility tests").dependOn(&run_png_tests.step);
+    b.step("lib-image-jpeg2000-test", "Run direct JPEG 2000 decoder tests").dependOn(&run_jpeg2000_decode_tests.step);
+    const image_test_step = b.step("lib-image-test", "Run shared image tests");
+    image_test_step.dependOn(&run_lib_image_tests.step);
+    image_test_step.dependOn(&run_png_tests.step);
+    image_test_step.dependOn(&run_jpeg2000_decode_tests.step);
 
     const pdf_tests = pdf_build.addTests(b, .{
+        .root = b.path("lib/pdf"),
         .target = target,
         .optimize = optimize,
         .image_mod = image_mod,
@@ -1137,21 +1178,42 @@ pub fn build(b: *std.Build) void {
         .font_mod = font_mod,
     });
     const run_lib_pdf_tests = pdf_tests.run_lib_pdf_tests;
+    b.step("lib-pdf-test", "Run shared PDF tests").dependOn(&run_lib_pdf_tests.step);
 
+    const lib_image_spng_paths = image_build.detectSpngPaths(b, target);
     const image_benchmark = image_build.addBenchmark(b, .{
+        .root = b.path("lib/image"),
         .target = target,
         .hash_bench_mod = hash_bench_mod,
+        .spng_paths = lib_image_spng_paths,
     });
-    const lib_image_spng_paths = image_benchmark.lib_image_spng_paths;
-    const lib_image_enable_spng = image_benchmark.lib_image_enable_spng;
+    b.step("lib-image-bench", "Build and install lib-image-bench").dependOn(&b.addInstallArtifact(image_benchmark, .{}).step);
 
-    pdf_build.addBenchmark(b, .{
+    const pdf_bench_optimize = b.option(std.builtin.OptimizeMode, "pdf-optimize", "Optimization for the isolated PDF executable") orelse .ReleaseFast;
+    const pdf_bench_image = image_build.createModule(b, b.path("lib/image"), target, pdf_bench_optimize, hash_bench_mod);
+    const pdf_bench_font = b.createModule(.{
+        .root_source_file = b.path("lib/font/src/mod.zig"),
         .target = target,
-        .hash_bench_mod = hash_bench_mod,
-        .pdf_mod = pdf_mod,
+        .optimize = pdf_bench_optimize,
     });
+    const pdf_bench_fonts = b.createModule(.{
+        .root_source_file = b.path("pdf_standard_fonts.zig"),
+        .target = target,
+        .optimize = pdf_bench_optimize,
+    });
+    const pdf_bench_pdf = pdf_build.createModule(b, b.path("lib/pdf"), target, pdf_bench_optimize, pdf_bench_image, pdf_bench_font, pdf_bench_fonts);
+    const pdf_bench = pdf_build.addBenchmark(b, .{
+        .root = b.path("lib/pdf"),
+        .target = target,
+        .optimize = pdf_bench_optimize,
+        .pdf_mod = pdf_bench_pdf,
+    });
+    b.step("lib-pdf-bench", "Build and install lib-pdf-bench").dependOn(&b.addInstallArtifact(pdf_bench, .{}).step);
+    const pdf_safety = addFilteredTestRunArtifact(b, pdf_build.addSafetyTests(b, pdf_mod));
+    b.step("lib-pdf-safety-test", "Run focused PDF OCR rendering and parser safety tests").dependOn(&pdf_safety.step);
 
     const image_conformance = image_build.addConformance(b, .{
+        .root = b.path("lib/image"),
         .add_test_run = antfly_tests_build.addFilteredTestRunArtifact,
         .conformance_fetch = conformance_fetch,
         .conformance_fixtures = conformance_fixtures,
@@ -1159,10 +1221,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .hash_mod = hash_mod,
         .image_mod = image_mod,
-        .lib_image_spng_paths = lib_image_spng_paths,
-        .lib_image_enable_spng = lib_image_enable_spng,
+        .spng_paths = lib_image_spng_paths,
     });
-    const lib_image_conformance_run_step = image_conformance.lib_image_conformance_run_step;
+    const lib_image_conformance_run_step = b.step("lib-image-conformance", "Run lib/image conformance (fetch missing fixtures)");
+    for (image_conformance.runs) |run| lib_image_conformance_run_step.dependOn(&run.step);
+    b.step("image-jpeg-seed-corpora-e2e", "Build the lib/image upstream JPEG seed-corpora e2e runner").dependOn(&b.addInstallArtifact(image_conformance.jpeg_seed_corpora, .{}).step);
+    b.step("image-jpeg2000-fuzz", "Build the JPEG 2000 fuzz runner").dependOn(&b.addInstallArtifact(image_conformance.jpeg2000_fuzz, .{}).step);
 
     const lib_google_tests = b.addTest(.{ .root_module = google_mod });
     const run_lib_google_tests = addFilteredTestRunArtifact(b, lib_google_tests);
@@ -1226,7 +1290,7 @@ pub fn build(b: *std.Build) void {
     const soak_test_step = b.step("soak-test", "Run long-running soak test aggregates");
     const lib_test_step = b.step("lib-test", "Run default standalone library tests");
     dependOnAll(conformance_test_step, &.{ lib_toon_conformance_step, lib_image_conformance_run_step });
-    lib_test_step.dependOn(&yacc_steps.run_yacc_tests.step);
+    lib_test_step.dependOn(&run_yacc_tests.step);
     lib_test_step.dependOn(&yacc_steps.run_parser_tests.step);
     lib_test_step.dependOn(&run_lib_regex_tests.step);
     lib_test_step.dependOn(&run_raft_library_tests.step);
@@ -1250,7 +1314,7 @@ pub fn build(b: *std.Build) void {
     lib_test_step.dependOn(&run_lib_pdf_tests.step);
     lib_test_step.dependOn(&run_lib_scraping_tests.step);
     lib_test_step.dependOn(&run_hf_tokenizer_tests.step);
-    lib_test_step.dependOn(platform_tests);
+    lib_test_step.dependOn(platform_test_step);
     dependOnAll(lib_test_step, &.{
         &run_lib_json_tests.step,
         &run_lib_onnx_tests.step,
@@ -1266,14 +1330,15 @@ pub fn build(b: *std.Build) void {
     const lib_transcribing_test_step = b.step("lib-transcribing-test", "Run standalone lib/transcribing tests");
     lib_transcribing_test_step.dependOn(&run_lib_transcribing_tests.step);
 
-    audio_build.addConformance(b, .{
+    const audio_conformance = audio_build.addConformance(b, .{
+        .root = b.path("lib/audio"),
         .conformance_fetch = conformance_fetch,
         .conformance_fixtures = conformance_fixtures,
         .target = target,
-        .inference_ffmpeg_paths = inference_ffmpeg_paths,
-        .inference_build_options_mod = inference_build_options_mod,
-        .conformance_test_step = conformance_test_step,
     });
+    const audio_conformance_step = b.step("lib-audio-conformance", "Run lib/audio conformance (fetch missing fixtures)");
+    for (audio_conformance) |run| audio_conformance_step.dependOn(&run.step);
+    conformance_test_step.dependOn(audio_conformance_step);
 
     const regex_bench_mod = b.createModule(.{
         .root_source_file = b.path("lib/regex/bench/regex_bench.zig"),

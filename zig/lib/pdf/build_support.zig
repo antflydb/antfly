@@ -16,6 +16,7 @@ const std = @import("std");
 const addMacosSdkPaths = @import("../platform/build_support.zig").addMacosSdkPaths;
 
 pub const AddTestsOptions = struct {
+    root: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     image_mod: *std.Build.Module,
@@ -33,7 +34,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const pdf_standard_fonts_mod = options.pdf_standard_fonts_mod;
     const font_mod = options.font_mod;
     const pdf_test_mod = b.createModule(.{
-        .root_source_file = b.path("lib/pdf/pdf_test_root.zig"),
+        .root_source_file = options.root.path(b, "pdf_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -50,74 +51,28 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     lib_pdf_tests.root_module.link_libc = true;
     const run_lib_pdf_tests = b.addRunArtifact(lib_pdf_tests);
-    const lib_pdf_test_step = b.step("lib-pdf-test", "Run shared PDF tests");
-    lib_pdf_test_step.dependOn(&run_lib_pdf_tests.step);
 
     return .{
         .run_lib_pdf_tests = run_lib_pdf_tests,
     };
 }
-const addFilteredTestRunArtifact = @import("../../pkg/antfly/build/tests.zig").addFilteredTestRunArtifact;
-
-pub const AddBenchmarkOptions = struct {
+pub fn addBenchmark(b: *std.Build, options: struct {
+    root: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
-    hash_bench_mod: *std.Build.Module,
+    optimize: std.builtin.OptimizeMode,
     pdf_mod: *std.Build.Module,
-};
+}) *std.Build.Step.Compile {
+    const module = b.createModule(.{
+        .root_source_file = options.root.path(b, "src/pdf_bench.zig"),
+        .target = options.target,
+        .optimize = options.optimize,
+    });
+    module.addImport("antfly_pdf", options.pdf_mod);
+    return b.addExecutable(.{ .name = "lib-pdf-bench", .root_module = module });
+}
 
-pub fn addBenchmark(b: *std.Build, options: AddBenchmarkOptions) void {
-    const target = options.target;
-    const hash_bench_mod = options.hash_bench_mod;
-    const pdf_mod = options.pdf_mod;
-    const pdf_bench_optimize = b.option(
-        std.builtin.OptimizeMode,
-        "pdf-optimize",
-        "Optimization for the isolated PDF executable",
-    ) orelse .ReleaseFast;
-    const pdf_bench_image_mod = b.createModule(.{
-        .root_source_file = b.path("lib/image/src/mod.zig"),
-        .target = target,
-        .optimize = pdf_bench_optimize,
-    });
-    pdf_bench_image_mod.addImport("antfly_hash", hash_bench_mod);
-    const pdf_bench_font_mod = b.createModule(.{
-        .root_source_file = b.path("lib/font/src/mod.zig"),
-        .target = target,
-        .optimize = pdf_bench_optimize,
-    });
-    const pdf_bench_pdf_mod = b.createModule(.{
-        .root_source_file = b.path("lib/pdf/src/mod.zig"),
-        .target = target,
-        .optimize = pdf_bench_optimize,
-    });
-    const pdf_bench_standard_fonts_mod = b.createModule(.{
-        .root_source_file = b.path("pdf_standard_fonts.zig"),
-        .target = target,
-        .optimize = pdf_bench_optimize,
-    });
-    pdf_bench_pdf_mod.addImport("antfly_image", pdf_bench_image_mod);
-    pdf_bench_pdf_mod.addImport("antfly_font", pdf_bench_font_mod);
-    pdf_bench_pdf_mod.addImport("pdf_standard_fonts", pdf_bench_standard_fonts_mod);
-    if (target.result.os.tag == .macos) {
-        addMacosSdkPaths(b, pdf_bench_pdf_mod, target);
-        pdf_bench_pdf_mod.linkFramework("CoreFoundation", .{});
-        pdf_bench_pdf_mod.linkFramework("CoreGraphics", .{});
-    }
-    const pdf_bench_mod = b.createModule(.{
-        .root_source_file = b.path("lib/pdf/src/pdf_bench.zig"),
-        .target = target,
-        .optimize = pdf_bench_optimize,
-    });
-    pdf_bench_mod.addImport("antfly_pdf", pdf_bench_pdf_mod);
-    const lib_pdf_bench = b.addExecutable(.{
-        .name = "lib-pdf-bench",
-        .root_module = pdf_bench_mod,
-    });
-
-    const lib_pdf_bench_step = b.step("lib-pdf-bench", "Build and install lib-pdf-bench");
-    lib_pdf_bench_step.dependOn(&b.addInstallArtifact(lib_pdf_bench, .{}).step);
-
-    const lib_pdf_safety_tests = b.addTest(.{
+pub fn addSafetyTests(b: *std.Build, pdf_mod: *std.Build.Module) *std.Build.Step.Compile {
+    return b.addTest(.{
         .root_module = pdf_mod,
         .filters = &.{
             "native backend renders simple pdf first page png",
@@ -125,14 +80,11 @@ pub fn addBenchmark(b: *std.Build, options: AddBenchmarkOptions) void {
             "xref parser rejects a cyclic Prev chain",
         },
     });
-    const run_lib_pdf_safety_tests = addFilteredTestRunArtifact(b, lib_pdf_safety_tests);
-    const lib_pdf_safety_test_step = b.step("lib-pdf-safety-test", "Run focused PDF OCR rendering and parser safety tests");
-    lib_pdf_safety_test_step.dependOn(&run_lib_pdf_safety_tests.step);
 }
 
-pub fn createModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, image: *std.Build.Module, font: *std.Build.Module, standard_fonts: *std.Build.Module) *std.Build.Module {
+pub fn createModule(b: *std.Build, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, image: *std.Build.Module, font: *std.Build.Module, standard_fonts: *std.Build.Module) *std.Build.Module {
     const module = b.createModule(.{
-        .root_source_file = b.path("lib/pdf/src/mod.zig"),
+        .root_source_file = root.path(b, "src/mod.zig"),
         .target = target,
         .optimize = optimize,
     });

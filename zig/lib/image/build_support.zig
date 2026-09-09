@@ -54,6 +54,7 @@ fn pathExists(b: *std.Build, path: []const u8) bool {
 }
 
 pub const AddTestsOptions = struct {
+    root: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     hash_mod: *std.Build.Module,
@@ -71,7 +72,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const hash_mod = options.hash_mod;
     const image_mod = options.image_mod;
     const image_test_mod = b.createModule(.{
-        .root_source_file = b.path("lib/image/image_test_root.zig"),
+        .root_source_file = options.root.path(b, "image_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -83,17 +84,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // A named image dependency does not discover its internal PNG tests.
     // Compile PNG as a test root to verify its checksum/container integration.
     const png_test_mod = b.createModule(.{
-        .root_source_file = b.path("lib/image/src/png.zig"),
+        .root_source_file = options.root.path(b, "src/png.zig"),
         .target = target,
         .optimize = optimize,
     });
     png_test_mod.addImport("antfly_hash", hash_mod);
     const png_tests = b.addTest(.{ .root_module = png_test_mod });
     const run_png_tests = b.addRunArtifact(png_tests);
-    b.step("lib-image-png-test", "Run PNG codec and checksum compatibility tests").dependOn(&run_png_tests.step);
 
     const jpeg2000_decode_test_mod = b.createModule(.{
-        .root_source_file = b.path("lib/image/src/jpeg2000/decode.zig"),
+        .root_source_file = options.root.path(b, "src/jpeg2000/decode.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -101,16 +101,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = jpeg2000_decode_test_mod,
     });
     const run_jpeg2000_decode_tests = b.addRunArtifact(jpeg2000_decode_tests);
-    const jpeg2000_decode_test_step = b.step(
-        "lib-image-jpeg2000-test",
-        "Run direct JPEG 2000 decoder tests",
-    );
-    jpeg2000_decode_test_step.dependOn(&run_jpeg2000_decode_tests.step);
-    const lib_image_test_step = b.step("lib-image-test", "Run shared image tests");
-    lib_image_test_step.dependOn(&run_lib_image_tests.step);
-    lib_image_test_step.dependOn(&run_png_tests.step);
-    lib_image_test_step.dependOn(&run_jpeg2000_decode_tests.step);
-
     return .{
         .run_lib_image_tests = run_lib_image_tests,
         .run_png_tests = run_png_tests,
@@ -119,23 +109,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 }
 
 pub const AddBenchmarkOptions = struct {
+    root: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
     hash_bench_mod: *std.Build.Module,
+    spng_paths: ?SpngPaths,
 };
-pub const AddBenchmarkResult = struct {
-    lib_image_spng_paths: ?SpngPaths,
-    lib_image_enable_spng: bool,
-};
-
-pub fn addBenchmark(b: *std.Build, options: AddBenchmarkOptions) AddBenchmarkResult {
+pub fn addBenchmark(b: *std.Build, options: AddBenchmarkOptions) *std.Build.Step.Compile {
     const target = options.target;
     const hash_bench_mod = options.hash_bench_mod;
     const lib_image_bench_build_options = b.addOptions();
-    const lib_image_spng_paths = detectSpngPaths(b, target);
+    const lib_image_spng_paths = options.spng_paths;
     const lib_image_enable_spng = lib_image_spng_paths != null;
     lib_image_bench_build_options.addOption(bool, "enable_spng", lib_image_enable_spng);
     const lib_image_bench_mod = b.createModule(.{
-        .root_source_file = b.path("lib/image/src/image_bench.zig"),
+        .root_source_file = options.root.path(b, "src/image_bench.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
@@ -155,16 +142,11 @@ pub fn addBenchmark(b: *std.Build, options: AddBenchmarkOptions) AddBenchmarkRes
         lib_image_bench.root_module.link_libc = true;
     }
 
-    const lib_image_bench_step = b.step("lib-image-bench", "Build and install lib-image-bench");
-    lib_image_bench_step.dependOn(&b.addInstallArtifact(lib_image_bench, .{}).step);
-
-    return .{
-        .lib_image_spng_paths = lib_image_spng_paths,
-        .lib_image_enable_spng = lib_image_enable_spng,
-    };
+    return lib_image_bench;
 }
 
 pub const AddConformanceOptions = struct {
+    root: std.Build.LazyPath,
     add_test_run: *const fn (*std.Build, *std.Build.Step.Compile) *std.Build.Step.Run = std.Build.addRunArtifact,
     conformance_fetch: bool,
     conformance_fixtures: []const u8,
@@ -172,11 +154,12 @@ pub const AddConformanceOptions = struct {
     optimize: std.builtin.OptimizeMode,
     hash_mod: *std.Build.Module,
     image_mod: *std.Build.Module,
-    lib_image_spng_paths: ?SpngPaths,
-    lib_image_enable_spng: bool,
+    spng_paths: ?SpngPaths,
 };
 pub const AddConformanceResult = struct {
-    lib_image_conformance_run_step: *std.Build.Step,
+    runs: [8]*std.Build.Step.Run,
+    jpeg_seed_corpora: *std.Build.Step.Compile,
+    jpeg2000_fuzz: *std.Build.Step.Compile,
 };
 
 pub fn addConformance(b: *std.Build, options: AddConformanceOptions) AddConformanceResult {
@@ -186,10 +169,10 @@ pub fn addConformance(b: *std.Build, options: AddConformanceOptions) AddConforma
     const optimize = options.optimize;
     const hash_mod = options.hash_mod;
     const image_mod = options.image_mod;
-    const lib_image_spng_paths = options.lib_image_spng_paths;
-    const lib_image_enable_spng = options.lib_image_enable_spng;
+    const lib_image_spng_paths = options.spng_paths;
+    const lib_image_enable_spng = lib_image_spng_paths != null;
     const lib_image_conformance_test_mod = b.createModule(.{
-        .root_source_file = b.path("lib/image/src/mod.zig"),
+        .root_source_file = options.root.path(b, "src/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -199,13 +182,11 @@ pub fn addConformance(b: *std.Build, options: AddConformanceOptions) AddConforma
         .filters = &.{"conformance corpus"},
     });
     const run_lib_image_conformance_tests = options.add_test_run(b, lib_image_conformance_tests);
-    const lib_image_conformance_run_step = b.step("lib-image-conformance", "Run lib/image conformance (fetch missing fixtures)");
-    lib_image_conformance_run_step.dependOn(&run_lib_image_conformance_tests.step);
 
     const lib_image_corpus_build_options = b.addOptions();
     lib_image_corpus_build_options.addOption(bool, "enable_spng", lib_image_enable_spng);
     const lib_image_corpus_mod = b.createModule(.{
-        .root_source_file = b.path("lib/image/src/image_corpus.zig"),
+        .root_source_file = options.root.path(b, "src/image_corpus.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -226,64 +207,50 @@ pub fn addConformance(b: *std.Build, options: AddConformanceOptions) AddConforma
     }
     const run_lib_image_corpus_verify_jpeg = b.addRunArtifact(lib_image_corpus);
     run_lib_image_corpus_verify_jpeg.addArg("verify-jpeg");
-    lib_image_conformance_run_step.dependOn(&run_lib_image_corpus_verify_jpeg.step);
 
     const run_lib_image_corpus_verify_png = b.addRunArtifact(lib_image_corpus);
     run_lib_image_corpus_verify_png.addArg("verify-png");
-    lib_image_conformance_run_step.dependOn(&run_lib_image_corpus_verify_png.step);
 
     const run_lib_image_corpus_verify_png_spng = b.addRunArtifact(lib_image_corpus);
     run_lib_image_corpus_verify_png_spng.addArg("verify-png-spng");
-    lib_image_conformance_run_step.dependOn(&run_lib_image_corpus_verify_png_spng.step);
 
     const run_lib_image_corpus_verify_gif = b.addRunArtifact(lib_image_corpus);
     run_lib_image_corpus_verify_gif.addArg("verify-gif");
-    lib_image_conformance_run_step.dependOn(&run_lib_image_corpus_verify_gif.step);
 
     const run_lib_image_corpus_verify_bmp = b.addRunArtifact(lib_image_corpus);
     run_lib_image_corpus_verify_bmp.addArg("verify-bmp");
-    lib_image_conformance_run_step.dependOn(&run_lib_image_corpus_verify_bmp.step);
 
     const run_lib_image_corpus_verify_webp = b.addRunArtifact(lib_image_corpus);
     run_lib_image_corpus_verify_webp.addArg("verify-webp");
-    lib_image_conformance_run_step.dependOn(&run_lib_image_corpus_verify_webp.step);
 
     const image_jpeg_seed_corpora_e2e = b.addExecutable(.{
         .name = "image-jpeg-seed-corpora-e2e",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("lib/image/src/image_jpeg_seed_corpora_e2e.zig"),
+            .root_source_file = options.root.path(b, "src/image_jpeg_seed_corpora_e2e.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
-    const image_jpeg_seed_corpora_e2e_step = b.step("image-jpeg-seed-corpora-e2e", "Build the lib/image upstream JPEG seed-corpora e2e runner");
-    image_jpeg_seed_corpora_e2e_step.dependOn(&b.addInstallArtifact(image_jpeg_seed_corpora_e2e, .{}).step);
-
     const run_image_jpeg_seed_corpora_e2e = b.addRunArtifact(image_jpeg_seed_corpora_e2e);
     run_image_jpeg_seed_corpora_e2e.addArgs(&.{ "run", b.pathJoin(&.{ conformance_fixtures, "libjpeg-turbo-seed-corpora" }) });
     if (!conformance_fetch) run_image_jpeg_seed_corpora_e2e.addArg("--no-fetch");
-    lib_image_conformance_run_step.dependOn(&run_image_jpeg_seed_corpora_e2e.step);
 
     const jpeg2000_fuzz = b.addExecutable(.{
         .name = "jpeg2000-fuzz",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("lib/image/src/jpeg2000_fuzz.zig"),
+            .root_source_file = options.root.path(b, "src/jpeg2000_fuzz.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
     jpeg2000_fuzz.root_module.addImport("antfly_image", image_mod);
-    const install_jpeg2000_fuzz = b.addInstallArtifact(jpeg2000_fuzz, .{});
-    const jpeg2000_fuzz_step = b.step("image-jpeg2000-fuzz", "Build the JPEG 2000 fuzz runner");
-    jpeg2000_fuzz_step.dependOn(&install_jpeg2000_fuzz.step);
-
     // External lib/image conformance fixtures. The fetcher shallow-clones
     // openjpeg-data into /tmp; normal tests skip gracefully when the checkout
     // is missing.
     const lib_image_conformance_fetcher = b.addExecutable(.{
         .name = "lib-image-conformance-fetch",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("lib/image/src/jpeg2000_conformance_fixtures.zig"),
+            .root_source_file = options.root.path(b, "src/jpeg2000_conformance_fixtures.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -295,13 +262,15 @@ pub fn addConformance(b: *std.Build, options: AddConformanceOptions) AddConforma
     run_lib_image_conformance_tests.setEnvironmentVariable("OPENJPEG_DATA_DIR", b.pathJoin(&.{ conformance_fixtures, "openjpeg-data" }));
 
     return .{
-        .lib_image_conformance_run_step = lib_image_conformance_run_step,
+        .runs = .{ run_lib_image_conformance_tests, run_lib_image_corpus_verify_jpeg, run_lib_image_corpus_verify_png, run_lib_image_corpus_verify_png_spng, run_lib_image_corpus_verify_gif, run_lib_image_corpus_verify_bmp, run_lib_image_corpus_verify_webp, run_image_jpeg_seed_corpora_e2e },
+        .jpeg_seed_corpora = image_jpeg_seed_corpora_e2e,
+        .jpeg2000_fuzz = jpeg2000_fuzz,
     };
 }
 
-pub fn createModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, hash: *std.Build.Module) *std.Build.Module {
+pub fn createModule(b: *std.Build, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, hash: *std.Build.Module) *std.Build.Module {
     const module = b.createModule(.{
-        .root_source_file = b.path("lib/image/src/mod.zig"),
+        .root_source_file = root.path(b, "src/mod.zig"),
         .target = target,
         .optimize = optimize,
     });

@@ -11,9 +11,23 @@ embedded artifacts, benchmarks, generators, and test suites live in
 `pkg/antfly/build/`; inference constructors live in `pkg/inference/build/` and
 serve both package and root entrypoints. Small library definitions stay inline.
 
-Pass compatible module and generated-input handles into constructors. Native and
-WASM configurations remain separate. Runtime archive boundaries, link order, and
+Give library constructors an explicit owner path and compatible dependency modules.
+Constructors return artifacts and runs; entrypoints publish target names and connect
+aggregates. Native and WASM configurations remain separate. Runtime archive boundaries, link order, and
 test selections belong to their owners; moving a definition does not change them.
+
+Python process-lifecycle checks run only when Zig's executor resolver identifies a
+native target. Foreign Linux/macOS fixtures still compile, and the build summary
+reports those process checks as skipped. Ordinary Zig test executables keep Zig's
+normal foreign-execution and emulator handling. Run the process suites natively
+on Linux/macOS to qualify signal, process-group, and cancellation behavior.
+
+OpenAPI generators run on the host and write formatted Zig files into declared
+cache outputs. `make openapi-generate` (from `zig/`) synchronizes those outputs and
+the joined public schema into the checked-in trees, including removal of obsolete
+generated files. `make openapi-check` compares them without modifying source files.
+Both use the normal Zig cache; source files, generator options, Python dependency
+locks, and the schema tree supply the inputs. No Git-derived cache key is needed.
 
 ## Default Tests
 

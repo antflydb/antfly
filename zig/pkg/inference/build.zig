@@ -251,7 +251,9 @@ pub fn build(b: *std.Build) void {
         },
     };
     const runtime_graph = runtime_build.create(runtime_config);
+    const platform_build = b.lazyImport(@This(), "antfly_platform") orelse return;
     const workflow_ctx = @import("build/context.zig").Context{
+        .add_native_process_test = platform_build.addNativeProcessTest,
         .b = b,
         .target = target,
         .optimize = optimize,

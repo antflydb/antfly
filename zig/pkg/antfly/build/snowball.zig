@@ -161,7 +161,7 @@ pub fn addSnowballCheckStep(b: *std.Build) void {
         fmt.addFileArg(generated.stemmers[idx]);
     }
 
-    const compare_tool = addFileCompareTool(b);
+    const compare_tool = addFileCompareTool(b, b.path("tools"));
     const compare = b.addRunArtifact(compare_tool);
     compare.step.dependOn(&fmt.step);
     compare.addFileArg(generated.root);

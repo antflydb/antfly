@@ -14,12 +14,26 @@
 
 const std = @import("std");
 
-pub fn addFileCompareTool(b: *std.Build, root: std.Build.LazyPath) *std.Build.Step.Compile {
-    return b.addExecutable(.{
-        .name = "check-files-equal",
+pub fn addCompiler(
+    b: *std.Build,
+    root: std.Build.LazyPath,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Step.Compile {
+    const yacc_mod = b.createModule(.{
+        .root_source_file = root.path(b, "src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const exe = b.addExecutable(.{
+        .name = "yacc-zig",
         .root_module = b.createModule(.{
-            .root_source_file = root.path(b, "check_files_equal.zig"),
-            .target = b.graph.host,
+            .root_source_file = root.path(b, "src/main.zig"),
+            .target = target,
+            .optimize = optimize,
         }),
     });
+    exe.root_module.addImport("yacc", yacc_mod);
+    return exe;
 }

@@ -355,6 +355,14 @@ jobs:
           zig test lib/hash/src/mod.zig -O Debug -mcpu=baseline -fno-llvm
           zig build lib-hash-test -Dcpu=baseline -Doptimize=ReleaseSafe
 
+      - name: Test native static-musl process execution
+        working-directory: zig
+        run: |
+          set -euo pipefail
+          zig build lib-platform-test -Dtarget=x86_64-linux-musl --summary all 2>&1 | tee "$RUNNER_TEMP/platform-musl.log"
+          # A successful aggregate could hide a skipped process check.
+          grep -q 'run python3 success' "$RUNNER_TEMP/platform-musl.log"
+
       - name: Check generated sources
         run: make zig-generated-check
 
@@ -369,6 +377,7 @@ jobs:
           tools/test_run_test_partitions.py
           tools/test_run_recall_checks.py
           tools/test_test_runner.py
+          tools/test_sync_generated.py
 
       - name: Test benchmark orchestration and fixture setup
         run: |
@@ -667,6 +676,7 @@ jobs:
           tools/test_run_test_partitions.py
           tools/test_run_recall_checks.py
           tools/test_test_runner.py
+          tools/test_sync_generated.py
 
       - name: Test benchmark orchestration and fixture setup
         run: |
