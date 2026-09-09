@@ -27,12 +27,20 @@ class WorkloadErrorTests(unittest.TestCase):
     def test_startup_progress_is_not_a_workload_error(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "vdbbench-live.log").write_text('status {"error_count":0}\nSuccess to finish task\n')
-            (root / "antfly-initial.log").write_text("info: dense posting checkpoint published\n")
+            (root / "vdbbench-live.log").write_text(
+                'status {"error_count":0}\nSuccess to finish task\n'
+            )
+            (root / "antfly-initial.log").write_text(
+                "info: dense posting checkpoint published\n"
+            )
             self.assertTrue(inspect_workload_errors(root)["qualified"])
-            (root / "antfly-restart.log").write_text("error: query failed err=OutOfMemory\n")
+            (root / "antfly-restart.log").write_text(
+                "error: query failed err=OutOfMemory\n"
+            )
             self.assertFalse(inspect_workload_errors(root)["qualified"])
-            (root / "antfly-restart.log").write_text("warning: source collection cleanup deferred: OutOfMemory\n")
+            (root / "antfly-restart.log").write_text(
+                "warning: source collection cleanup deferred: OutOfMemory\n"
+            )
             self.assertFalse(inspect_workload_errors(root)["qualified"])
 
     def test_missing_workload_logs_fail_closed(self):
@@ -44,14 +52,28 @@ class WorkloadErrorTests(unittest.TestCase):
     def test_scale_gate_rechecks_old_successful_receipts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            arms = [{"case": "Performance1536D50K", "pair": pair, "mode": mode,
-                     "exit_code": 0, "binary_sha256": "pinned", "refinement": None}
-                    for pair, mode in [(1, "primary_lsm"), (1, "vector_store"),
-                                       (2, "vector_store"), (2, "primary_lsm")]]
+            arms = [
+                {
+                    "case": "Performance1536D50K",
+                    "pair": pair,
+                    "mode": mode,
+                    "exit_code": 0,
+                    "binary_sha256": "pinned",
+                    "refinement": None,
+                }
+                for pair, mode in [
+                    (1, "primary_lsm"),
+                    (1, "vector_store"),
+                    (2, "vector_store"),
+                    (2, "primary_lsm"),
+                ]
+            ]
             (root / "ab-runs.json").write_text(json.dumps(arms))
             arm = root / "Performance1536D50K-1-primary_lsm"
             arm.mkdir()
-            (arm / "vdbbench-live.log").write_text("Insert failed, try_idx=0\nSuccess to finish task\n")
+            (arm / "vdbbench-live.log").write_text(
+                "Insert failed, try_idx=0\nSuccess to finish task\n"
+            )
             (arm / "antfly-initial.log").write_text("info: ready\n")
             with self.assertRaisesRegex(ValueError, "logs contain errors/retries"):
                 verify_50k_gate(root, "pinned", None, 2, {}, {})

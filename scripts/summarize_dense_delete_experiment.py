@@ -58,8 +58,7 @@ def mixed_apply_work(lines, covered_sequence):
 def summarize(root):
     receipts = json.loads((root / "ab-runs.json").read_text())
     if not receipts or any(
-        row.get("exit_code") != 0 or row.get("invalid_reason")
-        for row in receipts
+        row.get("exit_code") != 0 or row.get("invalid_reason") for row in receipts
     ):
         raise ValueError("all recorded arms must pass qualification first")
     cases = {}
@@ -70,7 +69,8 @@ def summarize(root):
             raise ValueError("duplicate qualification arm")
         modes.add(row["mode"])
     if any(
-        len(pairs) < 2 or any(modes != {"control", "candidate"} for modes in pairs.values())
+        len(pairs) < 2
+        or any(modes != {"control", "candidate"} for modes in pairs.values())
         for pairs in cases.values()
     ):
         raise ValueError("expected complete reversed control/candidate pairs")
@@ -86,13 +86,15 @@ def summarize(root):
         if covered != int(status["catch_up_target_sequence"]):
             raise ValueError("mixed workload still has replay debt")
         lines = (arm / "antfly-initial.log").read_text().splitlines()
-        result.append({
-            "arm": arm.name,
-            "written_rows": profile["written_rows"],
-            "mixed_covered_sequence": covered,
-            **mixed_apply_work(lines, covered),
-            "checkpoint_handoffs": checkpoint_handoffs(lines),
-        })
+        result.append(
+            {
+                "arm": arm.name,
+                "written_rows": profile["written_rows"],
+                "mixed_covered_sequence": covered,
+                **mixed_apply_work(lines, covered),
+                "checkpoint_handoffs": checkpoint_handoffs(lines),
+            }
+        )
     return result
 
 

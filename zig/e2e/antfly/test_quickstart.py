@@ -283,10 +283,10 @@ def test_public_quickstart_default_field_searches_dynamic_strings(
     ]
 
 
-def test_public_quickstart_query_string_boolean_controls(backup_api):
+def test_public_quickstart_query_string_boolean_controls(stateful_api):
     table = f"quickstart_boolean_{time.time_ns()}"
-    backup_api.create_table(table, num_shards=1)
-    backup_api.batch_write(
+    stateful_api.create_table(table, num_shards=1)
+    stateful_api.batch_write(
         table,
         inserts={
             "both": {"body": "alpha beta"},
@@ -320,7 +320,7 @@ def test_public_quickstart_query_string_boolean_controls(backup_api):
 
     def assert_controls():
         for query, expected in cases:
-            result = backup_api.query_table(
+            result = stateful_api.query_table(
                 table, {"full_text_search": query, "limit": 10}
             )
             hits = result["responses"][0]["hits"]["hits"]
@@ -328,8 +328,8 @@ def test_public_quickstart_query_string_boolean_controls(backup_api):
             assert len(hits) == len(expected), query
 
     assert_controls()
-    if backup_api.supports_restart:
-        backup_api.restart_server()
+    if stateful_api.supports_restart:
+        stateful_api.restart_server()
         assert_controls()
 
 

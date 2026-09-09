@@ -332,7 +332,9 @@ def main():
                 if args.capture_stages:
                     arm_environment["ANTFLY_EXPERIMENT_CAPTURE_STAGES"] = "1"
                 if args.refinement in (
-                    "coalesced_deletes", "reused_delete_vectors", "dense_delete_plan",
+                    "coalesced_deletes",
+                    "reused_delete_vectors",
+                    "dense_delete_plan",
                     "stable_posting_origins",
                     "posting_row_deltas",
                 ):

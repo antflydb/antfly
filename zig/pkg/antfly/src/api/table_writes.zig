@@ -15193,9 +15193,11 @@ pub const ProvisionedTableWriteSource = struct {
             result.published += publication.published;
             result.busy = result.busy or publication.busy;
             result.deferred = result.deferred or publication.deferred;
-            if (publication.published != 0) if (lease.entry) |entry| self.invalidateReadCache(entry.table_name);
+            if (publication.published != 0) {
+                if (lease.entry) |entry| self.invalidateReadCache(entry.table_name);
+                self.refreshMaintenanceRuntimeStatusLeaseSnapshots(lease_alloc, &.{lease});
+            }
         }
-        if (result.published != 0) self.replaceRuntimeStatusLeaseSnapshotsFailClosed(lease_alloc, leases.items);
         return result;
     }
 
@@ -15261,14 +15263,12 @@ pub const ProvisionedTableWriteSource = struct {
                 try cache.appendMaintenanceLease(&leases, entry);
             }
         }
-        // Projection readiness is fail-closed. Invalidate before publishing
-        // from the same leased writers so a best-effort refresh that loses a
-        // writer/publication race cannot leave an older `ready` snapshot in
-        // authority while the base is absent. Do this both before the long
-        // build and after every exit: failure remains pending, while success
-        // publishes the installed generation.
-        self.replaceRuntimeStatusLeaseSnapshotsFailClosed(lease_alloc, leases.items);
-        defer self.replaceRuntimeStatusLeaseSnapshotsFailClosed(lease_alloc, leases.items);
+        // Acceleration maintenance withdraws convergence proof, not serving
+        // authority. A busy writer must not erase an accepted generation or
+        // its siblings. Refresh on every exit so failure remains pending and
+        // successful publication becomes visible.
+        self.refreshMaintenanceRuntimeStatusLeaseSnapshots(lease_alloc, leases.items);
+        defer self.refreshMaintenanceRuntimeStatusLeaseSnapshots(lease_alloc, leases.items);
         var total_steps: usize = 0;
         for (leases.items) |lease| {
             // "Best effort" means that this round may decline the cache lock
@@ -15560,17 +15560,22 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
-    fn replaceRuntimeStatusLeaseSnapshotsFailClosed(
+    fn refreshMaintenanceRuntimeStatusLeaseSnapshots(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         leases: []const ProvisionedTableWriteCache.CachedDb,
     ) void {
-        // Invalidate every affected table before attempting any replacement.
-        // If one writer is fenced or busy, the cache has no stale success to
-        // serve and the next observation must inspect current durable state.
+        // Maintenance does not replace the storage root or revoke a serving
+        // generation. Fence completion until the same resident owner samples
+        // current state, preserving immutable serving facts on WriterLocked.
+        // Root replacement and durable repair retain their separate, explicit
+        // authority invalidations. A retired maintenance lease cannot revoke
+        // a replacement root's observations.
         for (leases) |lease| {
             const entry = lease.entry orelse continue;
-            self.invalidateRuntimeStatusCache(entry.table_name);
+            if (entry.lsm_root_generation != self.visibleRootGeneration(entry.group_id)) continue;
+            if (self.runtime_status_cache) |cache|
+                cache.markGroupTargetObservationPending(entry.table_name, entry.group_id, null);
         }
         self.publishRuntimeStatusLeaseSnapshots(alloc, leases);
     }
@@ -49027,7 +49032,7 @@ test "runtime status publication rejects retired writer and authoritatively clea
     try std.testing.expect(!published.items[0].stats.repair_degraded);
 }
 
-test "fail closed runtime status replacement cannot retain stale ready snapshot" {
+test "maintenance runtime status preserves serving facts while fencing convergence" {
     const alloc = std.testing.allocator;
     const NoCatalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -49086,8 +49091,33 @@ test "fail closed runtime status replacement cannot retain stale ready snapshot"
         .schema_json = null,
     };
 
-    source.replaceRuntimeStatusLeaseSnapshotsFailClosed(alloc, (&[_]ProvisionedTableWriteCache.CachedDb{lease})[0..]);
-    try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
+    // The retired lease cannot erase a replacement root's accepted status.
+    source.refreshMaintenanceRuntimeStatusLeaseSnapshots(alloc, &.{lease});
+    {
+        var preserved = (try snapshot_cache.snapshot(alloc, "docs")).?;
+        defer preserved.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 41), preserved.items[0].stats.doc_count);
+        try std.testing.expect(preserved.items[0].metadata.target_observation_complete);
+    }
+    // On the current root, contention withdraws completion but leaves the
+    // immutable facts available. This is the recurring maintenance/E2E race.
+    visible_generation = 1;
+    db.core.lockApplyExclusive();
+    source.refreshMaintenanceRuntimeStatusLeaseSnapshots(alloc, &.{lease});
+    db.core.unlockApplyExclusive();
+    {
+        var preserved = (try snapshot_cache.snapshot(alloc, "docs")).?;
+        defer preserved.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 41), preserved.items[0].stats.doc_count);
+        try std.testing.expect(!preserved.items[0].metadata.target_observation_complete);
+        try std.testing.expect(runtime_status.statusHasRuntimeFacts(preserved.items[0]));
+    }
+    source.refreshMaintenanceRuntimeStatusLeaseSnapshots(alloc, &.{lease});
+    {
+        var refreshed = (try snapshot_cache.snapshot(alloc, "docs")).?;
+        defer refreshed.deinit(alloc);
+        try std.testing.expect(refreshed.items[0].metadata.target_observation_complete);
+    }
 }
 
 test "provisioned table write source publishes replay debt from owner db handle" {

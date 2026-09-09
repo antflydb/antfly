@@ -3307,7 +3307,7 @@ const ExperimentalPostingReadState = struct {
                                 index,
                                 base.bytes.len,
                                 std.mem.readInt(u32, patch_bytes[8..12], .big),
-                                std.hash.Crc32.hash(base.bytes),
+                                @import("antfly_hash").Crc32.hash(base.bytes),
                                 std.mem.readInt(u32, patch_bytes[24..28], .big),
                             });
                         }
@@ -3416,7 +3416,7 @@ const ExperimentalPostingReadState = struct {
                             record.source_sequence,
                             base.len,
                             std.mem.readInt(u32, record.payload[8..12], .big),
-                            std.hash.Crc32.hash(base),
+                            @import("antfly_hash").Crc32.hash(base),
                             std.mem.readInt(u32, record.payload[24..28], .big),
                         });
                     }

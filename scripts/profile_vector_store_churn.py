@@ -16,12 +16,19 @@ import pyarrow.parquet as pq
 
 
 def parse_batch_profiles(text, rows, batch):
-    profiles = [dict(re.findall(r"(\w+)=([^ ]+)", line.split("antfly_bench_batch ", 1)[1]))
-                for line in text.splitlines() if "antfly_bench_batch " in line]
-    if (len(profiles) != (rows + batch - 1) // batch
-            or sum(int(p["writes"]) + int(p["deletes"]) for p in profiles) != rows
-            or sum(p["sync"] == "full_index" for p in profiles) != 1):
-        raise RuntimeError("incomplete or unrelated batch profiles; sync timing cannot be attributed")
+    profiles = [
+        dict(re.findall(r"(\w+)=([^ ]+)", line.split("antfly_bench_batch ", 1)[1]))
+        for line in text.splitlines()
+        if "antfly_bench_batch " in line
+    ]
+    if (
+        len(profiles) != (rows + batch - 1) // batch
+        or sum(int(p["writes"]) + int(p["deletes"]) for p in profiles) != rows
+        or sum(p["sync"] == "full_index" for p in profiles) != 1
+    ):
+        raise RuntimeError(
+            "incomplete or unrelated batch profiles; sync timing cannot be attributed"
+        )
     return profiles
 
 
@@ -33,7 +40,11 @@ def main():
     parser.add_argument("--batch", type=int, default=100)
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--server-log", type=Path, help="ANTFLY_BENCH_METRICS log for separate sync wait accounting")
+    parser.add_argument(
+        "--server-log",
+        type=Path,
+        help="ANTFLY_BENCH_METRICS log for separate sync wait accounting",
+    )
     args = parser.parse_args()
     inputs = []
     parquet = pq.ParquetFile(args.dataset / "shuffle_train.parquet")
@@ -70,24 +81,32 @@ def main():
                             "_embeddings": {"vec": vector},
                         }
                     payload = {"inserts": inserts}
-                payload["sync_level"] = "full_index" if offset + args.batch >= len(rows) else "write"
+                payload["sync_level"] = (
+                    "full_index" if offset + args.batch >= len(rows) else "write"
+                )
                 response = client.post(base + "/batch", json=payload)
                 response.raise_for_status()
             mutations_finished = time.perf_counter()
             status = client.get(base)
             status.raise_for_status()
             status_finished = time.perf_counter()
-            timing = {"mutation_and_sync_s": mutations_finished - started,
-                      "status_read_s": status_finished - mutations_finished}
+            timing = {
+                "mutation_and_sync_s": mutations_finished - started,
+                "status_read_s": status_finished - mutations_finished,
+            }
             if args.server_log:
                 with args.server_log.open("rb") as log:
                     log.seek(log_offset)
-                    profiles = parse_batch_profiles(log.read().decode(errors="replace"), len(rows), args.batch)
+                    profiles = parse_batch_profiles(
+                        log.read().decode(errors="replace"), len(rows), args.batch
+                    )
                 sync_wait = sum(float(p["sync_wait_ms"]) for p in profiles) / 1000
-                timing.update(index_sync_s=sync_wait,
-                              mutation_s=max(0, mutations_finished - started - sync_wait),
-                              sync_timing_source="server sync_wait_ms; integer milliseconds per batch",
-                              batch_profiles=profiles)
+                timing.update(
+                    index_sync_s=sync_wait,
+                    mutation_s=max(0, mutations_finished - started - sync_wait),
+                    sync_timing_source="server sync_wait_ms; integer milliseconds per batch",
+                    batch_profiles=profiles,
+                )
             observations.append(
                 {
                     "phase": label,

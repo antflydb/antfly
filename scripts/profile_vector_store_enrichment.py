@@ -122,7 +122,9 @@ def main():
                     raise RuntimeError(f"index provisioning did not settle: {statuses}")
                 time.sleep(0.1)
             result["provision_s"] = time.perf_counter() - provision_started
-            result["provision_repair_issues"] = post("/repair/issues", {"target": "index"})
+            result["provision_repair_issues"] = post(
+                "/repair/issues", {"target": "index"}
+            )
             args.output.write_text(json.dumps(result, indent=2) + "\n")
             for version in range(2):
                 started = time.perf_counter()
@@ -183,7 +185,9 @@ def main():
                         "full_text_status": text_status,
                     }
                 )
-                result["phases"][-1]["repair_issues"] = post("/repair/issues", {"target": "index"})
+                result["phases"][-1]["repair_issues"] = post(
+                    "/repair/issues", {"target": "index"}
+                )
             for kind, query in [
                 (
                     "full_text",
@@ -215,18 +219,29 @@ def main():
                     except httpx.HTTPStatusError as error:
                         if error.response.status_code != 503:
                             raise
-                        failures.append({
-                            "status": 503,
-                            "elapsed_ms": (time.perf_counter() - started) * 1000,
-                            "body": error.response.text,
-                        })
+                        failures.append(
+                            {
+                                "status": 503,
+                                "elapsed_ms": (time.perf_counter() - started) * 1000,
+                                "body": error.response.text,
+                            }
+                        )
                         # Failed arms are already disqualified. Capture the
                         # admission state instead of retrying away the failure.
                         if len(failures) <= 3:
-                            for label, path in (("index", "/indexes/semantic"), ("table", "")):
+                            for label, path in (
+                                ("index", "/indexes/semantic"),
+                                ("table", ""),
+                            ):
                                 diagnostic = client.get(base + path)
-                                failures[-1][label] = diagnostic.json() if diagnostic.status_code == 200 else diagnostic.text
-                            failures[-1]["repair_issues"] = post("/repair/issues", {"target": "index"})
+                                failures[-1][label] = (
+                                    diagnostic.json()
+                                    if diagnostic.status_code == 200
+                                    else diagnostic.text
+                                )
+                            failures[-1]["repair_issues"] = post(
+                                "/repair/issues", {"target": "index"}
+                            )
                         args.output.write_text(json.dumps(result, indent=2) + "\n")
                         continue
                     latencies.append((time.perf_counter() - started) * 1000)
@@ -241,11 +256,19 @@ def main():
                     "failures": failures,
                     "elapsed_s": elapsed,
                     "qps": len(ordered) / elapsed,
-                    "p50_ms": ordered[max(0, int(len(ordered) * 0.50) - 1)] if ordered else None,
-                    "p95_ms": ordered[max(0, int(len(ordered) * 0.95) - 1)] if ordered else None,
-                    "p99_ms": ordered[max(0, int(len(ordered) * 0.99) - 1)] if ordered else None,
+                    "p50_ms": ordered[max(0, int(len(ordered) * 0.50) - 1)]
+                    if ordered
+                    else None,
+                    "p95_ms": ordered[max(0, int(len(ordered) * 0.95) - 1)]
+                    if ordered
+                    else None,
+                    "p99_ms": ordered[max(0, int(len(ordered) * 0.99) - 1)]
+                    if ordered
+                    else None,
                 }
-            result["qualified"] = not any(result[kind]["failed_queries"] for kind in ("full_text", "semantic"))
+            result["qualified"] = not any(
+                result[kind]["failed_queries"] for kind in ("full_text", "semantic")
+            )
             response = client.get(base)
             response.raise_for_status()
             result["table"] = response.json()

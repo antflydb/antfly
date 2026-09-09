@@ -46,9 +46,10 @@ def segments(root):
 
 
 def block_rows(path, expected_size):
-    with path.open("rb") as file, mmap.mmap(
-        file.fileno(), 0, access=mmap.ACCESS_READ
-    ) as data:
+    with (
+        path.open("rb") as file,
+        mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as data,
+    ):
         if (
             len(data) != expected_size
             or data[:8] != b"AFVBLK\0\0"
@@ -88,9 +89,13 @@ def block_rows(path, expected_size):
                 )
                 * scale
             )
-            yield data[key_offset : key_offset + key_len], integer(
-                data, pos + 32, 8
-            ), offset, checksum, vector
+            yield (
+                data[key_offset : key_offset + key_len],
+                integer(data, pos + 32, 8),
+                offset,
+                checksum,
+                vector,
+            )
 
 
 def parse_trace(text):

@@ -23360,7 +23360,7 @@ pub const IndexManager = struct {
                 .decoded_norm_lower_bound = value.decoded_norm_lower_bound orelse return error.Unsupported,
                 .checksum = switch (request.located) {
                     .block => |block| block.location.vector_checksum,
-                    .wal => std.hash.Crc32.hash(value.bytes),
+                    .wal => @import("antfly_hash").Crc32.hash(value.bytes),
                 },
                 .residual_location = switch (request.located) {
                     .block => |block| .{

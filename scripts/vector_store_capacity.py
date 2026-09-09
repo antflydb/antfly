@@ -29,9 +29,12 @@ def observe(path, case=None):
     total, available = stat.f_blocks * fragment, stat.f_bavail * fragment
     floor, growth = capacity_requirement(total, case)
     return {
-        "observed_at": time.time(), "path": str(Path(path).resolve()),
-        "capacity_bytes": total, "available_bytes": available,
-        "safety_floor_bytes": floor, "growth_allowance_bytes": growth,
+        "observed_at": time.time(),
+        "path": str(Path(path).resolve()),
+        "capacity_bytes": total,
+        "available_bytes": available,
+        "safety_floor_bytes": floor,
+        "growth_allowance_bytes": growth,
         "required_available_bytes": floor + growth,
         "sufficient": available >= floor + growth,
     }

@@ -418,7 +418,9 @@ class QualificationRunnerTest(unittest.TestCase):
                 )
                 self.assertEqual(receipt["refinement"], name)
                 if name in (
-                    "coalesced_deletes", "reused_delete_vectors", "dense_delete_plan"
+                    "coalesced_deletes",
+                    "reused_delete_vectors",
+                    "dense_delete_plan",
                 ):
                     self.assertEqual(env["ANTFLY_BENCH_BATCH_PROFILE"], "1")
                     self.assertEqual(env["ANTFLY_BENCH_HBC_WRITE_PROFILE"], "1")

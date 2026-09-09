@@ -1643,8 +1643,13 @@ def test_executable_embedding_artifact_producer_survives_restart(
     doc_key = "artifact-registry-doc"
     restarted_doc_key = "artifact-registry-doc-after-restart"
 
-    stateful_api.create_table(table_name, num_shards=1, storage={"dense_embeddings": dense_embeddings})
-    assert stateful_api.get_table(table_name)["storage"]["dense_embeddings"] == dense_embeddings
+    stateful_api.create_table(
+        table_name, num_shards=1, storage={"dense_embeddings": dense_embeddings}
+    )
+    assert (
+        stateful_api.get_table(table_name)["storage"]["dense_embeddings"]
+        == dense_embeddings
+    )
     stateful_api.put(
         f"{_table_artifact_path(table_name, chunk_name)}/enrichment",
         {

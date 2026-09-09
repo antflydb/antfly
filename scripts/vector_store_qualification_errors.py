@@ -28,12 +28,14 @@ def inspect_workload_errors(root: Path):
                 if kind is not None:
                     counts[kind] += 1
                     if counts[kind] <= 4:
-                        examples.append({
-                            "kind": kind,
-                            "log": path.name,
-                            "line": number,
-                            "message": line.strip()[:1000],
-                        })
+                        examples.append(
+                            {
+                                "kind": kind,
+                                "log": path.name,
+                                "line": number,
+                                "message": line.strip()[:1000],
+                            }
+                        )
     missing = [p.name for p in required if not p.is_file()]
     return {
         "qualified": not counts and not missing,

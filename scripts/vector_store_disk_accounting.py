@@ -38,7 +38,13 @@ def inventory(root: Path) -> dict:
             owner = "ann_and_other_indexes"
         else:
             owner = "primary_and_metadata"
-        kind = "directory" if path.name == "SOURCE_DIRECTORY" else "wal" if "wal" in path.name.lower() or path.suffix == ".afvw" else "persisted"
+        kind = (
+            "directory"
+            if path.name == "SOURCE_DIRECTORY"
+            else "wal"
+            if "wal" in path.name.lower() or path.suffix == ".afvw"
+            else "persisted"
+        )
         group = groups[f"{owner}.{kind}"]
         group["files"] += 1
         group["logical_bytes"] += stat.st_size

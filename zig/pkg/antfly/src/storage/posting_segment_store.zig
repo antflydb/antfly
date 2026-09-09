@@ -657,7 +657,7 @@ pub const Store = struct {
             // coverage on every checkpoint.
             // Zero means "not present" in older checkpoint formats. Preserve
             // an unambiguous fallback if the index CRC happens to be zero.
-            .checksum = if (admission_checksum == 0) std.hash.Crc32.hash(segment_bytes) else 0,
+            .checksum = if (admission_checksum == 0) @import("antfly_hash").Crc32.hash(segment_bytes) else 0,
             .admission_checksum = admission_checksum,
         };
         const segment_path = try self.segmentPathAlloc(segment_generation);
@@ -1135,7 +1135,7 @@ pub const Store = struct {
             // A zero admission CRC is valid but indistinguishable from the
             // legacy "field absent" encoding. Only that one-in-2^32 case pays
             // for the old full-file checksum.
-            break :blk std.hash.Crc32.hash(segment_bytes.?);
+            break :blk @import("antfly_hash").Crc32.hash(segment_bytes.?);
         };
         if (staged == null) {
             try generation_publication.replaceColdImmutable(self.alloc, self.storage, segment_path, segment_bytes.?);
@@ -1332,7 +1332,7 @@ pub const Store = struct {
             if ((posting_segment.admissionChecksum(bytes) catch 0) != descriptor.admission_checksum) {
                 return error.PostingSegmentChecksumMismatch;
             }
-        } else if (std.hash.Crc32.hash(bytes) != descriptor.checksum) {
+        } else if (@import("antfly_hash").Crc32.hash(bytes) != descriptor.checksum) {
             return error.PostingSegmentChecksumMismatch;
         }
         _ = try posting_segment.Reader.init(bytes);
@@ -1346,7 +1346,7 @@ pub const Store = struct {
             const published_checksum_matches = mapped.len <= max_segment_bytes and (if (descriptor.admission_checksum != 0)
                 (posting_segment.admissionChecksum(mapped) catch 0) == descriptor.admission_checksum
             else
-                std.hash.Crc32.hash(mapped) == descriptor.checksum);
+                @import("antfly_hash").Crc32.hash(mapped) == descriptor.checksum);
             if (published_checksum_matches) {
                 if (posting_segment.Reader.init(mapped)) |_| {
                     std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.RANDOM) catch {};

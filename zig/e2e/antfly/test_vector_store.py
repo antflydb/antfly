@@ -88,9 +88,9 @@ def test_vector_source_models_updates_deletes_and_restart(stateful_api, mode):
         # Accounting must survive startup writer retirement, before any query
         # or write happens to reacquire a live writer for this table.
         assert wait_until(
-            lambda: api.get_table(table)
-            .get("storage_status", {})
-            .get("source_vectors"),
+            lambda: (
+                api.get_table(table).get("storage_status", {}).get("source_vectors")
+            ),
             timeout_s=30,
             interval_s=0.5,
         )
@@ -105,9 +105,12 @@ def test_vector_source_models_updates_deletes_and_restart(stateful_api, mode):
 
         def reclaimed_source_stats():
             stats = source_stats()
-            if (stats and stats.get("retained_payloads") == 2
-                    and stats.get("retained_payload_bytes") == 20
-                    and stats.get("collection_pending_bytes") == 0):
+            if (
+                stats
+                and stats.get("retained_payloads") == 2
+                and stats.get("retained_payload_bytes") == 20
+                and stats.get("collection_pending_bytes") == 0
+            ):
                 return stats
             return None
 

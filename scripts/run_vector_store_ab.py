@@ -33,17 +33,30 @@ def verify_50k_gate(root, binary_hash, refinement, pairs, environment, settings)
     receipts = json.loads(receipt_path.read_text())
     arms = [r for r in receipts if r["case"] == "Performance1536D50K"]
     labels = ["control", "candidate"] if refinement else ["primary_lsm", "vector_store"]
-    expected_order = [(pair + 1, mode) for pair in range(pairs)
-                      for mode in (labels if pair % 2 == 0 else list(reversed(labels)))]
+    expected_order = [
+        (pair + 1, mode)
+        for pair in range(pairs)
+        for mode in (labels if pair % 2 == 0 else list(reversed(labels)))
+    ]
     if [(r["pair"], r["mode"]) for r in arms] != expected_order:
         raise ValueError("50K gate must contain complete alternating pairs")
     for arm in arms:
-        if (arm.get("exit_code") != 0 or arm.get("invalid_reason")
-                or arm.get("resource_sampler_exit_code", 0) != 0
-                or arm["binary_sha256"] != binary_hash or arm.get("refinement") != refinement):
+        if (
+            arm.get("exit_code") != 0
+            or arm.get("invalid_reason")
+            or arm.get("resource_sampler_exit_code", 0) != 0
+            or arm["binary_sha256"] != binary_hash
+            or arm.get("refinement") != refinement
+        ):
             raise ValueError("50K gate failed or used different binary/treatment")
-        expected_environment = configure(environment, refinement, arm["mode"] == "candidate") if refinement else environment
-        if refinement and arm["refinement_environment"] != {k: expected_environment.get(k) for k in ALL_FLAGS}:
+        expected_environment = (
+            configure(environment, refinement, arm["mode"] == "candidate")
+            if refinement
+            else environment
+        )
+        if refinement and arm["refinement_environment"] != {
+            k: expected_environment.get(k) for k in ALL_FLAGS
+        }:
             raise ValueError("50K experiment settings do not match")
         for flag, value in settings.items():
             command = arm["command"]
@@ -54,10 +67,17 @@ def verify_50k_gate(root, binary_hash, refinement, pairs, environment, settings)
             raise ValueError("50K workload logs contain errors/retries or are missing")
         if not (arm_root / "qualification-summary.json").is_file():
             raise ValueError("50K qualification summary is missing")
-        if not json.loads((arm_root / "source-enrichment.json").read_text()).get("qualified"):
+        if not json.loads((arm_root / "source-enrichment.json").read_text()).get(
+            "qualified"
+        ):
             raise ValueError("50K enrichment lifecycle gate failed")
-    return {"root": str(root.resolve()), "receipt_sha256": digest(receipt_path),
-            "binary_sha256": binary_hash, "refinement": refinement, "completed_arms": len(arms)}
+    return {
+        "root": str(root.resolve()),
+        "receipt_sha256": digest(receipt_path),
+        "binary_sha256": binary_hash,
+        "refinement": refinement,
+        "completed_arms": len(arms),
+    }
 
 
 def main() -> None:
@@ -68,21 +88,35 @@ def main() -> None:
     parser.add_argument("--health-port", type=int, default=18089)
     parser.add_argument("--pairs", type=int, default=2)
     parser.add_argument("--include-1m", action="store_true")
-    parser.add_argument("--only-1m", action="store_true", help="Reuse a matching completed 50K gate before running 1M pairs.")
+    parser.add_argument(
+        "--only-1m",
+        action="store_true",
+        help="Reuse a matching completed 50K gate before running 1M pairs.",
+    )
     parser.add_argument("--qualified-50k-root", type=Path)
-    parser.add_argument("--refinement", choices=list(TREATMENTS), help="Compare all source-store refinements against their controls on vector_store tables.")
+    parser.add_argument(
+        "--refinement",
+        choices=list(TREATMENTS),
+        help="Compare all source-store refinements against their controls on vector_store tables.",
+    )
     parser.add_argument("--query-seconds", type=int, default=30)
     parser.add_argument("--mixed-seconds", type=int, default=30)
     parser.add_argument("--profile-count", type=int, default=1000)
     parser.add_argument("--memory-budget-mb", type=int, default=4096)
     parser.add_argument("--vdbbench-root", type=Path)
     parser.add_argument("--vdbbench-python", type=Path)
-    parser.add_argument("--after-arm-hook", type=Path, help="Run a pinned Python lifecycle hook after each successful arm and before starting the next.")
+    parser.add_argument(
+        "--after-arm-hook",
+        type=Path,
+        help="Run a pinned Python lifecycle hook after each successful arm and before starting the next.",
+    )
     args = parser.parse_args()
     if args.pairs < 2:
         parser.error("at least two pairs are needed to alternate run order")
     if args.only_1m and (args.include_1m or not args.qualified_50k_root):
-        parser.error("--only-1m requires --qualified-50k-root and excludes --include-1m")
+        parser.error(
+            "--only-1m requires --qualified-50k-root and excludes --include-1m"
+        )
     if args.qualified_50k_root and not args.only_1m:
         parser.error("--qualified-50k-root requires --only-1m")
     binary = args.binary.resolve(strict=True)
@@ -91,16 +125,32 @@ def main() -> None:
     environment["ANTFLY_BIN"] = str(binary)
     environment["ANTFLY_VDBBENCH_SYNC_LEVEL"] = "write"
     environment["ANTFLY_BENCH_METRICS"] = "1"
-    gate = verify_50k_gate(args.qualified_50k_root, expected_hash, args.refinement,
-                          args.pairs, environment, {
-                              "--batch": 100, "--workers": 4, "--query-concurrency": "1,10,20,30",
-                              "--query-seconds": args.query_seconds, "--mixed-seconds": args.mixed_seconds,
-                              "--profile-count": args.profile_count, "--memory-budget-mb": args.memory_budget_mb,
-                              "--vector-block-encoding": "float32",
-                          }) if args.only_1m else None
+    gate = (
+        verify_50k_gate(
+            args.qualified_50k_root,
+            expected_hash,
+            args.refinement,
+            args.pairs,
+            environment,
+            {
+                "--batch": 100,
+                "--workers": 4,
+                "--query-concurrency": "1,10,20,30",
+                "--query-seconds": args.query_seconds,
+                "--mixed-seconds": args.mixed_seconds,
+                "--profile-count": args.profile_count,
+                "--memory-budget-mb": args.memory_budget_mb,
+                "--vector-block-encoding": "float32",
+            },
+        )
+        if args.only_1m
+        else None
+    )
     args.root.mkdir(parents=True, exist_ok=False)
     if gate is not None:
-        (args.root / "qualification-gate.json").write_text(json.dumps(gate, indent=2) + "\n")
+        (args.root / "qualification-gate.json").write_text(
+            json.dumps(gate, indent=2) + "\n"
+        )
     script = Path(__file__).resolve().with_name("run_vdbbench_qualification.sh")
     # Shared worktrees can change while a long qualification is running.
     # Treat changed measurement code or executable as an invalid arm.
@@ -130,14 +180,20 @@ def main() -> None:
         cases.append("Performance768D1M")
     for case in cases:
         for pair in range(args.pairs):
-            labels = ["control", "candidate"] if args.refinement else ["primary_lsm", "vector_store"]
+            labels = (
+                ["control", "candidate"]
+                if args.refinement
+                else ["primary_lsm", "vector_store"]
+            )
             order = labels if pair % 2 == 0 else list(reversed(labels))
             for mode in order:
                 verify_inputs()
                 arm_environment = environment.copy()
                 table_mode = "vector_store" if args.refinement else mode
                 if args.refinement:
-                    arm_environment = configure(environment, args.refinement, mode == "candidate")
+                    arm_environment = configure(
+                        environment, args.refinement, mode == "candidate"
+                    )
                 run = args.root.resolve() / f"{case}-{pair + 1}-{mode}"
                 command = [
                     str(script),
@@ -181,7 +237,9 @@ def main() -> None:
                     "mode": mode,
                     "table_mode": table_mode,
                     "refinement": args.refinement,
-                    "refinement_environment": {key: arm_environment.get(key) for key in ALL_FLAGS},
+                    "refinement_environment": {
+                        key: arm_environment.get(key) for key in ALL_FLAGS
+                    },
                     "command": command,
                     "binary_sha256": expected_hash,
                     "started_at": time.time(),
@@ -194,21 +252,37 @@ def main() -> None:
                 try:
                     require_capacity(receipt["capacity_preflight"])
                 except RuntimeError as exc:
-                    receipt.update(exit_code=1, invalid_reason=str(exc), finished_at=time.time())
+                    receipt.update(
+                        exit_code=1, invalid_reason=str(exc), finished_at=time.time()
+                    )
                     index.write_text(json.dumps(results, indent=2) + "\n")
                     raise
                 with (args.root / f"{run.name}.log").open("w") as log:
                     sampler = None
                     if sys.platform == "darwin":
-                        sampler = subprocess.Popen([
-                            sys.executable, "-B", str(script.with_name("sample_macos_process_memory.py")),
-                            "--pid-file", str(run / "antfly.pid"),
-                            "--output", str(args.root / f"{run.name}-resources.jsonl"),
-                            "--seconds", "86400", "--interval", "0.5",
-                        ], stdout=log, stderr=subprocess.STDOUT)
+                        sampler = subprocess.Popen(
+                            [
+                                sys.executable,
+                                "-B",
+                                str(script.with_name("sample_macos_process_memory.py")),
+                                "--pid-file",
+                                str(run / "antfly.pid"),
+                                "--output",
+                                str(args.root / f"{run.name}-resources.jsonl"),
+                                "--seconds",
+                                "86400",
+                                "--interval",
+                                "0.5",
+                            ],
+                            stdout=log,
+                            stderr=subprocess.STDOUT,
+                        )
                     try:
                         completed = subprocess.run(
-                            command, env=arm_environment, stdout=log, stderr=subprocess.STDOUT
+                            command,
+                            env=arm_environment,
+                            stdout=log,
+                            stderr=subprocess.STDOUT,
                         )
                     finally:
                         if sampler is not None:
@@ -240,24 +314,39 @@ def main() -> None:
                 )
                 receipt["workload_errors"] = workload_errors
                 if not workload_errors["qualified"]:
-                    receipt["invalid_reason"] = "workload errors/retries or missing logs"
+                    receipt["invalid_reason"] = (
+                        "workload errors/retries or missing logs"
+                    )
                 index.write_text(json.dumps(results, indent=2) + "\n")
                 if receipt.get("invalid_reason"):
                     raise RuntimeError(f"{run.name}: workload error gate failed")
                 if hook is not None:
                     if digest(hook) != hook_hash:
                         raise RuntimeError("lifecycle hook changed during experiment")
-                    hook_command = [sys.executable, "-B", str(hook), str(args.root.resolve()), run.name]
-                    receipt["after_arm_hook"] = {"command": hook_command, "sha256": hook_hash}
+                    hook_command = [
+                        sys.executable,
+                        "-B",
+                        str(hook),
+                        str(args.root.resolve()),
+                        run.name,
+                    ]
+                    receipt["after_arm_hook"] = {
+                        "command": hook_command,
+                        "sha256": hook_hash,
+                    }
                     index.write_text(json.dumps(results, indent=2) + "\n")
                     with (args.root / f"{run.name}-lifecycle.log").open("w") as log:
-                        followup = subprocess.run(hook_command, stdout=log, stderr=subprocess.STDOUT)
+                        followup = subprocess.run(
+                            hook_command, stdout=log, stderr=subprocess.STDOUT
+                        )
                     receipt["after_arm_hook"]["exit_code"] = followup.returncode
                     if followup.returncode or digest(hook) != hook_hash:
                         receipt["invalid_reason"] = "lifecycle hook failed or changed"
                     index.write_text(json.dumps(results, indent=2) + "\n")
                     if receipt.get("invalid_reason"):
-                        raise RuntimeError(f"{run.name}: lifecycle hook failed or changed; later arms are gated")
+                        raise RuntimeError(
+                            f"{run.name}: lifecycle hook failed or changed; later arms are gated"
+                        )
 
 
 if __name__ == "__main__":

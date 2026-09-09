@@ -209,7 +209,7 @@ pub fn validateProjectionPayload(values: []const f16, checksum: u32, verificatio
         2 => return error.QuantizedDirectoryChecksumMismatch,
         else => {},
     };
-    const valid = std.hash.Crc32.hash(std.mem.sliceAsBytes(values)) == checksum;
+    const valid = @import("antfly_hash").Crc32.hash(std.mem.sliceAsBytes(values)) == checksum;
     if (verification) |state| state.store(if (valid) 1 else 2, .release);
     if (!valid) return error.QuantizedDirectoryChecksumMismatch;
 }
