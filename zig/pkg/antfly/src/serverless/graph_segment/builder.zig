@@ -130,6 +130,8 @@ pub const Builder = struct {
         const record_count = std.math.add(usize, self.edges.items.len, local_edges) catch return error.GraphSegmentTooLarge;
         size = std.math.add(usize, size, std.math.mul(usize, record_count, wire.edge_len) catch return error.GraphSegmentTooLarge) catch return error.GraphSegmentTooLarge;
         size = std.math.add(usize, size, std.math.mul(usize, self.nodeCount(), 12) catch return error.GraphSegmentTooLarge) catch return error.GraphSegmentTooLarge;
+        const body_len = size;
+        size = std.math.add(usize, size, wire.topologyDirectorySize(self.kinds.values.keys(), self.nodes.values.count(), self.nodeCount(), self.tables.values.count()) + wire.topology_trailer_len) catch return error.GraphSegmentTooLarge;
         if (size > max_bytes) return error.GraphSegmentTooLarge;
         // Count and scatter directly into final adjacency storage. No mapped
         // forward/reverse Edge arrays coexist with the immutable wire payload.
@@ -175,7 +177,7 @@ pub const Builder = struct {
                 pos += @as(usize, counts[node][direction]) * wire.edge_len;
             }
         }
-        std.debug.assert(pos == bytes.len);
+        std.debug.assert(pos == body_len);
         for (self.edges.items, 0..) |edge, i| {
             if (i % 4096 == 0) try cancellation.check();
             const src = node_map[edge.source];
@@ -193,6 +195,7 @@ pub const Builder = struct {
                 std.mem.sort([wire.edge_len]u8, records, {}, wireEdgeLess);
             }
         }
+        try wire.finishEncoding(self.alloc, bytes, body_len, cancellation);
         return bytes;
     }
 };

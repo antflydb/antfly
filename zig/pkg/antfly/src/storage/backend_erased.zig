@@ -350,6 +350,7 @@ pub const WriteTxn = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    write_gate: ?*std.atomic.Mutex = null,
 
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
@@ -363,12 +364,15 @@ pub const WriteTxn = struct {
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn abort(self: *WriteTxn) void {
+        const gate = self.write_gate;
         self.vtable.abort(self.allocator, self.ptr);
+        if (gate) |mutex| mutex.unlock();
         self.* = undefined;
     }
 
     pub fn commit(self: *WriteTxn) !void {
         try BoundaryAbi.call("commit", self.boundary_dispatch, self.vtable.commit, .{ self.allocator, self.ptr });
+        if (self.write_gate) |mutex| mutex.unlock();
         self.* = undefined;
     }
 
@@ -468,6 +472,7 @@ pub const Batch = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    write_gate: ?*std.atomic.Mutex = null,
 
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
@@ -482,12 +487,15 @@ pub const Batch = struct {
     };
 
     pub fn abort(self: *Batch) void {
+        const gate = self.write_gate;
         self.vtable.abort(self.allocator, self.ptr);
+        if (gate) |mutex| mutex.unlock();
         self.* = undefined;
     }
 
     pub fn commit(self: *Batch) !void {
         try self.vtable.commit(self.allocator, self.ptr);
+        if (self.write_gate) |mutex| mutex.unlock();
         self.* = undefined;
     }
 
@@ -593,6 +601,10 @@ pub const Store = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    /// Opt-in transaction-wide serialization for read/modify/write users.
+    /// The backend owns this gate and must outlive all stores/transactions.
+    /// Reads and computation outside a write transaction remain concurrent.
+    write_gate: ?*std.atomic.Mutex = null,
 
     pub const ReplayCallback = *const fn (*anyopaque, u64, []const u8) anyerror!void;
 
@@ -668,16 +680,28 @@ pub const Store = struct {
     }
 
     pub fn beginWrite(self: *Store) !WriteTxn {
-        return try BoundaryAbi.call("begin_write", self.boundary_dispatch, self.vtable.begin_write, .{ self.allocator, self.ptr });
+        if (self.write_gate) |mutex| platform.sync.lockYielding(mutex);
+        errdefer if (self.write_gate) |mutex| mutex.unlock();
+        var txn = try BoundaryAbi.call("begin_write", self.boundary_dispatch, self.vtable.begin_write, .{ self.allocator, self.ptr });
+        txn.write_gate = self.write_gate;
+        return txn;
     }
 
     pub fn beginBatch(self: *Store) !Batch {
-        return try BoundaryAbi.call("begin_batch", self.boundary_dispatch, self.vtable.begin_batch, .{ self.allocator, self.ptr });
+        if (self.write_gate) |mutex| platform.sync.lockYielding(mutex);
+        errdefer if (self.write_gate) |mutex| mutex.unlock();
+        var batch = try BoundaryAbi.call("begin_batch", self.boundary_dispatch, self.vtable.begin_batch, .{ self.allocator, self.ptr });
+        batch.write_gate = self.write_gate;
+        return batch;
     }
 
     pub fn beginBatchWithOptions(self: *Store, options: backend_types.BatchOptions) !Batch {
         if (self.vtable.begin_batch_with_options) |begin_batch_with_options| {
-            return try BoundaryAbi.call("begin_batch_with_options", self.boundary_dispatch, begin_batch_with_options, .{ self.allocator, self.ptr, options });
+            if (self.write_gate) |mutex| platform.sync.lockYielding(mutex);
+            errdefer if (self.write_gate) |mutex| mutex.unlock();
+            var batch = try BoundaryAbi.call("begin_batch_with_options", self.boundary_dispatch, begin_batch_with_options, .{ self.allocator, self.ptr, options });
+            batch.write_gate = self.write_gate;
+            return batch;
         }
         return try self.beginBatch();
     }
@@ -1891,6 +1915,7 @@ test "runtime store erases concrete single-namespace store handles" {
     };
 
     const MockStore = struct {
+        fail_open: *bool,
         pub fn capabilities(_: *@This()) backend_types.Capabilities {
             return .{ .cursors = true };
         }
@@ -1899,18 +1924,23 @@ test "runtime store erases concrete single-namespace store handles" {
             return .{};
         }
 
-        pub fn beginWrite(_: *@This()) !MockWrite {
+        pub fn beginWrite(self: *@This()) !MockWrite {
+            if (self.fail_open.*) return error.OpenFailed;
             return .{};
         }
 
-        pub fn beginBatch(_: *@This()) !MockBatch {
+        pub fn beginBatch(self: *@This()) !MockBatch {
+            if (self.fail_open.*) return error.OpenFailed;
             return .{};
         }
     };
 
-    const mock = MockStore{};
+    var fail_open = false;
+    const mock = MockStore{ .fail_open = &fail_open };
     var store = try storeFrom(std.testing.allocator, mock);
     defer store.deinit();
+    var gate: std.atomic.Mutex = .unlocked;
+    store.write_gate = &gate;
     try std.testing.expect(store.capabilities().cursors);
 
     var read = try store.beginRead();
@@ -1931,14 +1961,35 @@ test "runtime store erases concrete single-namespace store handles" {
     try std.testing.expectEqualStrings("a", (try current_scan_cur.first()).?.key);
 
     var write = try store.beginWrite();
+    try std.testing.expect(!gate.tryLock());
     try write.put("k", "w");
     try std.testing.expectEqualStrings("w", try write.get("k"));
     try write.commit();
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
 
     var batch = try store.beginBatch();
+    try std.testing.expect(!gate.tryLock());
     try batch.put("k", "b");
     try std.testing.expectEqualStrings("b", try batch.get("k"));
     try batch.commit();
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+    batch = try store.beginBatchWithOptions(.{});
+    try std.testing.expect(!gate.tryLock());
+    batch.abort();
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+    fail_open = true;
+    try std.testing.expectError(error.OpenFailed, store.beginWrite());
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+    try std.testing.expectError(error.OpenFailed, store.beginBatch());
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+    try std.testing.expectError(error.OpenFailed, store.beginBatchWithOptions(.{}));
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
 }
 
 test "failed commit keeps erased write handle abortable" {
@@ -1991,9 +2042,25 @@ test "failed commit keeps erased write handle abortable" {
 
     var shared = Shared{};
     var txn = try writeTxnFrom(std.testing.allocator, MockWrite{ .shared = &shared });
+    var gate: std.atomic.Mutex = .unlocked;
+    try std.testing.expect(gate.tryLock());
+    txn.write_gate = &gate;
     try std.testing.expectError(error.CommitFailed, txn.commit());
+    try std.testing.expect(!gate.tryLock());
     txn.abort();
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
     try std.testing.expectEqual(@as(usize, 1), shared.commits);
+    try std.testing.expect(shared.aborted);
+    shared = .{};
+    var batch = try batchFrom(std.testing.allocator, MockWrite{ .shared = &shared });
+    try std.testing.expect(gate.tryLock());
+    batch.write_gate = &gate;
+    try std.testing.expectError(error.CommitFailed, batch.commit());
+    try std.testing.expect(!gate.tryLock());
+    batch.abort();
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
     try std.testing.expect(shared.aborted);
 }
 

@@ -8408,6 +8408,8 @@ pub fn build(b: *std.Build) void {
         "graph metric partition spans remain balanced at production cardinality",
         "graph metric partition census",
         "partition census owns bounded checkpoints",
+        "runtime store erases concrete single-namespace store handles",
+        "failed commit keeps erased write handle abortable",
         "graph metric floating page aggregates are deterministic across adoption order",
         "graph metric column snapshots preserve order across chunks and reject stale reads before scores",
         "graph metric physical score reads",

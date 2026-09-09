@@ -1,5 +1,75 @@
 # Graph metric execution and query benchmarks
 
+## Transactional indexing and directory-first reuse (2026-09-09)
+
+Run `zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --indexing-only`.
+Apple M4 Max / Zig 0.16.0, shared development host, six samples with the first
+discarded. These are phase measurements, not HTTP or cloud latency guarantees.
+
+| Phase | Reference | Current | Checked work / memory |
+| --- | ---: | ---: | --- |
+| Stateful membership maintenance, 65,536 edges / 16 types | 547.572 ms | 118.944 ms | 131,072 → 16,384 endpoint reads |
+| Weight-only PageRank republish, 65,536 edges | 4.071 ms | 0.035 ms | Exact scores and prior artifact ID; 2,755,143 → 1,270 tracked peak bytes |
+| JSON → graph artifact, 16-byte IDs | 27.550 ms | 16.489 ms | Exact current-wire SHA-256; 11,367,906 → 3,723,374 peak bytes |
+| JSON → graph artifact, 256-byte IDs | 71.197 ms | 30.294 ms | Exact current-wire SHA-256; 43,562,466 → 4,214,894 peak bytes |
+
+Membership maintenance uses the default durable LSM and aborts each all-edge
+removal to restore the identical fixture. Timing includes posting maintenance,
+but excludes fixture construction and WAL/commit. The reference is immediate
+per-edge incidence maintenance; the current path coalesces endpoint deltas,
+bulk-reads counts, caches encoded type prefixes, and uses already-known edge
+existence only when the covering index is ready in the same transaction.
+Scratch allocations fall 589,824 → 147,554; scratch peak rises 361 → 1,870,804
+bytes. Backend-owned allocations are not included in that scratch measurement.
+This is not an 8× reduction in WAL records: the LSM already coalesces repeated
+updates to the same mutable key before commit.
+
+Type postings and endpoint memberships are now demand-driven. Ordinary graphs
+and unfiltered metrics do not create them. The first filtered plan activates a
+bounded backfill; a durable activation marker keeps concurrent ingestion covered
+across pauses, filter removal and reopen. Existing partial indexes are detected
+before an inactive marker is written. A regression checks zero auxiliary posting
+and membership records before demand, then exact edge/node parity after activation,
+interleaved mutations and reopen. The timed membership fixture explicitly enables
+a filtered metric; these timings measure active-index maintenance.
+
+Private graph stores now serialize complete write transactions, including their
+initial reads, across foreground ingestion, backfill, leases and checkpoint CAS.
+Snapshots and numerical work remain outside that gate. Concurrent tests cover
+memory, in-memory LSM and durable LSM; native LMDB retains its native single
+writer. Commit failures retain the gate until abort, and failed opens release it.
+
+Census progress is a checksummed `GPC2` control record plus generation-bound,
+addressed boundary slots. A resume reads and writes no previous boundary bytes;
+only the new page's boundaries are persisted. Slots are reused after a generation
+restart and reclaimed on completion or filter removal. The long-key regression
+uses 256 boundaries of 128 KiB: control size falls from 33,686,596 to 131,140
+bytes, with zero saved-boundary reads/writes during an ordinary resume. Final
+plan assembly still materializes the bounded boundary set once, outside the
+write gate. Ordinary source/node scans also stop at their byte allowance.
+
+Graph wire v4 adds a bounded semantic type directory and an authenticated-range
+trailer. Both ingestion encoders produce identical bytes. Publication checks
+this directory before source-wide preparation; unchanged selected connectivity
+can reuse an authenticated metric even when weights, unrelated types, isolated
+documents or qualified endpoints change. Source cardinality limits, policy
+identity, cancellation and shared read/hash budgets still apply. Directory size
+is capped at 1 MiB and construction scratch at 64 MiB; an explicitly unavailable
+accelerator uses the same current wire, not a legacy decoder. Large dictionaries
+and incomplete local topology use the normal preparation path.
+
+The republish fixture uses a warm, content-verified local artifact store. Its
+timer includes range reads, identity selection, prior control authentication and
+publication; graph construction and score checking are outside it. Cold stores
+may need full-content authentication, charged to the shared reuse-read budget.
+Artifact-store-owned cache memory is outside the allocation tracker. First builds
+and changed selected topology still prepare the source graph; the 116× ratio is
+for this unchanged-connectivity republish, not all materializations. The ingestion
+rows include constructing the new directory, making its extra encoding cost
+visible rather than excluding it from the benchmark.
+
+## Earlier benchmark series
+
 Measured 2026-09-07 on Apple M4 Max, 36 GiB RAM, macOS 26.3.1,
 Zig 0.16.0, ReleaseFast, using the system SMP allocator. One warmup and five
 measured samples per case; tables report medians. This was a shared development

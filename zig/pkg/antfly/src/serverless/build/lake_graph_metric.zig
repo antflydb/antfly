@@ -902,7 +902,53 @@ const PriorInventory = struct {
         }
         return null;
     }
+
+    fn findSemantic(self: *PriorInventory, alloc: Allocator, artifacts: *artifact_store.ArtifactStore, previous: []const artifact_ref.ArtifactRef, request: PublicationRequest, digest: [32]u8, limits: Limits, cancellation: CancellationToken) !?artifact_ref.ArtifactRef {
+        for (previous) |prior| {
+            try cancellation.check();
+            if (prior.kind != .graph_metric_segment or prior.metadata_version != metric_segment.wire_version or
+                prior.graph_metric_materialization_state != .ready or
+                prior.graph_metric_config_fingerprint != configFingerprint(request.config) or
+                prior.materializer_fingerprint != materializerFingerprint(limits) or prior.byte_len == 0 or
+                prior.byte_len > limits.max_metric_payload_bytes or !std.mem.eql(u8, &prior.graph_metric_topology_checksum, &digest)) continue;
+            const decoded = (try self.header(alloc, artifacts, prior, request, cancellation)) orelse continue;
+            if (decoded.version != metric_segment.wire_version or decoded.kind != request.config.kind or
+                decoded.materialization_state != .ready or decoded.config_fingerprint != configFingerprint(request.config) or
+                decoded.materializer_fingerprint != materializerFingerprint(limits) or
+                !std.mem.eql(u8, &decoded.topology_checksum, &digest)) continue;
+            return prior;
+        }
+        return null;
+    }
 };
+
+const TopologyDirectory = struct { bytes: []u8, checksum: [32]u8 };
+
+/// Authenticate the small directory before source-wide preparation. The range
+/// store pins the exact SHA-256 object identity; cold full authentication is
+/// charged to the same reuse-read allowance as prior metric control reads.
+fn readTopologyDirectoryAlloc(alloc: Allocator, artifacts: *artifact_store.ArtifactStore, source: artifact_ref.ArtifactRef, budget: *graph_metric_policy.Budget, cancellation: CancellationToken) !?TopologyDirectory {
+    const wire = graph_segment.codec.compact;
+    if (source.byte_len < wire.topology_trailer_len or source.byte_len > budget.limits.max_graph_payload_bytes or
+        budget.limits.max_peak_memory_bytes < wire.topology_trailer_len or
+        budget.identity_work_bytes >= budget.limits.max_total_identity_work_bytes) return null;
+    var remaining = budget.limits.max_total_reuse_read_bytes -| budget.reuse_read_bytes;
+    const before = remaining;
+    defer budget.reuse_read_bytes += before - remaining;
+    const trailer_raw = artifacts.getVerifiedRangeAllocWithBudget(alloc, source.artifact_id, source.byte_len, source.checksum, source.byte_len - wire.topology_trailer_len, wire.topology_trailer_len, cancellation, &remaining) catch |err| switch (err) {
+        error.ArtifactReadBudgetExceeded, error.FileNotFound, error.InvalidArtifactId, error.InvalidRange, error.ArtifactIntegrityMismatch, error.ArtifactIdentityUnavailable => return null,
+        else => return err,
+    };
+    defer alloc.free(trailer_raw);
+    const trailer = wire.decodeTopologyTrailer(trailer_raw, source.byte_len) catch return null;
+    if (trailer.source_nodes > budget.limits.max_nodes or trailer.source_edges > budget.limits.max_edges) return null;
+    if (trailer.directory_len > budget.limits.max_peak_memory_bytes - wire.topology_trailer_len) return null;
+    const raw = artifacts.getVerifiedRangeAllocWithBudget(alloc, source.artifact_id, source.byte_len, source.checksum, trailer.body_len, trailer.directory_len, cancellation, &remaining) catch |err| switch (err) {
+        error.ArtifactReadBudgetExceeded, error.FileNotFound, error.InvalidArtifactId, error.InvalidRange, error.ArtifactIntegrityMismatch, error.ArtifactIdentityUnavailable => return null,
+        else => return err,
+    };
+    return .{ .bytes = raw, .checksum = trailer.checksum };
+}
 
 pub fn publishRequestsWithPriorAlloc(
     alloc: Allocator,
@@ -954,6 +1000,28 @@ pub fn publishRequestsWithPriorAlloc(
     for (requests, 0..) |first, first_index| {
         if (ready[first_index]) continue;
         try cancellation.check();
+        // A source is prepared only if at least one computation still needs
+        // it after exact-source and selected-topology reuse. Keep the directory
+        // request-local: no O(number of source artifacts) metadata cache.
+        if (previous.len > 0 or first.prior_artifact != null) {
+            if (try readTopologyDirectoryAlloc(alloc, artifacts, first.source_graph, budget, cancellation)) |directory| {
+                defer alloc.free(directory.bytes);
+                for (requests, refs, ready) |request, *ref, *initialized| {
+                    if (initialized.* or !sameSource(first.source_graph, request.source_graph)) continue;
+                    const comparisons: u64 = if (request.config.edge_filter.mode == .all) 1 else @as(u64, request.config.edge_filter.types.len) + 1;
+                    const identity_work = std.math.mul(u64, directory.bytes.len, comparisons) catch continue;
+                    if (identity_work > limits.max_total_identity_work_bytes -| budget.identity_work_bytes) continue;
+                    budget.identity_work_bytes += identity_work;
+                    const digest = (try graph_segment.codec.compact.selectedDirectoryChecksum(directory.bytes, directory.checksum, request.config.edge_filter)) orelse continue;
+                    const prior = (try inventory.findSemantic(alloc, artifacts, previous, request, digest, limits, cancellation)) orelse
+                        (if (request.prior_artifact) |candidate| try inventory.findSemantic(alloc, artifacts, &.{candidate}, request, digest, limits, cancellation) else null) orelse continue;
+                    ref.* = try aliasRefAlloc(alloc, prior, request.graph_index_name, request.config.name, request.provenance);
+                    initialized.* = true;
+                    ref.computed_at_ms = prior.computed_at_ms;
+                    ref.graph_metric_source_checksum = try artifact_store.sha256DigestFromChecksum(first.source_graph.checksum);
+                }
+            }
+        }
         configs.clearRetainingCapacity();
         priors.clearRetainingCapacity();
         mapping.clearRetainingCapacity();
@@ -975,6 +1043,7 @@ pub fn publishRequestsWithPriorAlloc(
             }
             try mapping.append(alloc, index);
         }
+        if (configs.items.len == 0) continue;
         const built = build: {
             var prepared = prepare: {
                 if (first.source_graph.byte_len > limits.max_graph_payload_bytes) break :prepare null;
@@ -2956,12 +3025,47 @@ test "serverless graph metric semantic reuse authenticates current provenance an
         if (round == 0) first_id = try alloc.dupe(u8, prior.?.artifact_id) else if (round == 1) {
             try std.testing.expectEqualStrings(first_id, prior.?.artifact_id);
             try std.testing.expectEqual(@as(u64, 0), budget.work_items);
+            try std.testing.expectEqual(@as(u64, 0), budget.graph_payload_bytes);
+            try std.testing.expect(budget.identity_work_bytes > 0 and budget.identity_work_bytes < payload.len);
             try std.testing.expectEqual(@as(u64, 10), prior.?.computed_at_ms);
             try std.testing.expectEqual(@as(u64, 2), prior.?.edge_generation);
         } else {
             try std.testing.expect(!std.mem.eql(u8, first_id, prior.?.artifact_id));
             try std.testing.expect(budget.work_items > 0);
         }
+    }
+}
+
+test "serverless graph metric directory reuse preserves source admission limits" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/directory-admission", .{tmp.sub_path});
+    defer alloc.free(root);
+    var fs = try fs_artifact_store.FsStore.init(alloc, root);
+    var artifacts = fs.artifactStore();
+    defer artifacts.deinit();
+    const config = graph_mod.GraphMetricConfig{ .name = "degree", .kind = .degree, .edge_filter = .{ .mode = .types, .types = &.{"cites"} } };
+    const limits = Limits{ .max_nodes = 2 };
+    var prior: ?artifact_ref.ArtifactRef = null;
+    defer if (prior) |ref| freeArtifactRef(alloc, ref);
+    for (0..2) |round| {
+        var builder = graph_segment.Builder{ .alloc = alloc };
+        defer builder.deinit();
+        try builder.addEdge("a", "b", "cites", 1, null);
+        if (round == 1) try builder.addEdge("c", "d", "unrelated", 1, null);
+        const payload = try builder.encodeAlloc(4096, .none);
+        defer alloc.free(payload);
+        var metadata = try artifacts.put(payload);
+        defer metadata.deinit(alloc);
+        const source = artifact_ref.ArtifactRef{ .kind = .graph_segment, .artifact_id = metadata.artifact_id, .checksum = metadata.checksum, .byte_len = metadata.byte_len };
+        const request = PublicationRequest{ .graph_index_name = "graph", .source_graph = source, .config = config, .prior_artifact = prior, .provenance = .{ .published_generation = round + 1, .edge_generation = round + 1, .computed_at_ms = round + 1 } };
+        var budget = graph_metric_policy.Budget{ .limits = limits };
+        const refs = try publishRequestsWithPriorAlloc(alloc, &artifacts, &.{request}, if (prior) |ref| &.{ref} else &.{}, .none, limits, &budget, .{});
+        defer alloc.free(refs);
+        if (prior) |ref| freeArtifactRef(alloc, ref);
+        prior = refs[0];
+        try std.testing.expectEqual(if (round == 0) artifact_ref.GraphMetricMaterializationState.ready else .rejected, prior.?.graph_metric_materialization_state);
     }
 }
 
@@ -3890,10 +3994,12 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
         alloc.free(retried);
     }
     try std.testing.expectEqual(artifact_ref.GraphMetricMaterializationState.ready, retried[0].graph_metric_materialization_state);
-    try std.testing.expectEqual(@as(usize, 1), counting.reads);
-    try std.testing.expectEqual(@as(usize, 1), counting.writes);
+    // The other source changed only weights: the directory now lets the
+    // previously ready sibling satisfy this retry without loading the graph.
+    try std.testing.expectEqual(@as(usize, 0), counting.reads);
+    try std.testing.expectEqual(@as(usize, 0), counting.writes);
     try std.testing.expectEqual(@as(u64, 5), retried[0].published_generation);
-    try std.testing.expectEqual(@as(u64, 5), retried[0].computed_at_ms);
+    try std.testing.expectEqual(stable[0].computed_at_ms, retried[0].computed_at_ms);
 
     const AllocationRunner = struct {
         fn run(failing: Allocator, store: *artifact_store.ArtifactStore, prior: []const artifact_ref.ArtifactRef, requests: []const PublicationRequest) !void {

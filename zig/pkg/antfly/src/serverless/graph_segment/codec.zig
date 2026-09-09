@@ -178,12 +178,18 @@ test "serverless graph segment codec rejects non-canonical edge ordering" {
         .edge_type = try alloc.dupe(u8, "cites"),
         .weight = 1,
     };
+    try std.testing.expectError(error.InvalidGraphSegment, encodeAlloc(alloc, segment));
+    std.mem.swap(graph_types.Edge, &segment.adjacencies[0].out_edges[0], &segment.adjacencies[0].out_edges[1]);
     const encoded = try encodeAlloc(alloc, segment);
     defer alloc.free(encoded);
+    var view = try compact.viewAlloc(alloc, encoded, .{}, .none);
+    defer view.deinit(alloc);
+    const records = std.mem.bytesAsSlice([compact.edge_len]u8, @constCast(view.adjacencies[0].out));
+    std.mem.swap([compact.edge_len]u8, &records[0], &records[1]);
     try std.testing.expectError(error.InvalidGraphSegment, decodeAlloc(alloc, encoded));
 }
 
-test "serverless graph segment codec encodes local artifacts as packed v3" {
+test "serverless graph segment codec encodes local artifacts as packed v4" {
     const alloc = std.testing.allocator;
     var segment = graph_types.Segment{
         .adjacencies = try alloc.alloc(graph_types.Adjacency, 1),

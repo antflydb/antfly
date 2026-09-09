@@ -21,10 +21,194 @@ const edge_type = @import("../../graph/edge_type.zig");
 const bounded = @import("../bounded_decode.zig");
 const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 pub const wire_magic = "AFSG";
-pub const wire_version: u16 = 3;
+pub const wire_version: u16 = 4;
 pub const header_len = 22;
 pub const edge_len = 16;
 pub const no_table = std.math.maxInt(u32);
+pub const topology_trailer_len = 64;
+pub const max_topology_directory_bytes = 1024 * 1024;
+const absent_directory = std.math.maxInt(u32);
+
+/// Fingerprints are an admitted accelerator, not another wire generation.
+/// Very large dictionaries omit it explicitly in the current wire rather than
+/// consuming unbounded ingestion scratch or bloating the source artifact.
+pub fn topologyDirectorySize(kinds: []const []const u8, nodes: usize, adjacencies: usize, tables: usize) usize {
+    var size: usize = 4;
+    for (kinds) |kind| size +|= 44 +| kind.len;
+    const scratch = (nodes *| (@sizeOf([]const u8) + 32 + @sizeOf(bool))) +|
+        (adjacencies *| @sizeOf(Adjacency)) +| (tables *| @sizeOf([]const u8)) +|
+        (kinds.len *| (@sizeOf(std.crypto.hash.sha2.Sha256) + 8 + @sizeOf([]const u8)));
+    return if (size <= max_topology_directory_bytes and scratch <= 64 * 1024 * 1024) size else 4;
+}
+
+pub const TopologyTrailer = struct {
+    body_len: u64,
+    directory_len: u32,
+    checksum: [32]u8,
+    source_nodes: u32,
+    source_edges: u64,
+};
+
+pub fn decodeTopologyTrailer(raw: []const u8, payload_len: u64) !TopologyTrailer {
+    if (raw.len != topology_trailer_len or !std.mem.eql(u8, raw[0..4], "GTD1")) return error.InvalidGraphSegment;
+    const dir_len = std.mem.readInt(u32, raw[4..8], .little);
+    const body_len = std.mem.readInt(u64, raw[8..16], .little);
+    if (dir_len < 4 or dir_len > max_topology_directory_bytes or body_len < header_len or
+        body_len > payload_len or payload_len - body_len != @as(u64, dir_len) + topology_trailer_len) return error.InvalidGraphSegment;
+    if (!std.mem.eql(u8, raw[60..64], &.{ 0, 0, 0, 0 })) return error.InvalidGraphSegment;
+    return .{ .body_len = body_len, .directory_len = dir_len, .checksum = raw[16..48].*, .source_nodes = std.mem.readInt(u32, raw[48..52], .little), .source_edges = std.mem.readInt(u64, raw[52..60], .little) };
+}
+
+test "serverless graph topology directory is bounded authenticated and distinguishes empty from unavailable" {
+    const alloc = std.testing.allocator;
+    const Filter = struct { mode: enum { all, types } = .all, types: []const []const u8 = &.{} };
+    const payload = try encodeAlloc(alloc, .{ .adjacencies = &.{} });
+    defer alloc.free(payload);
+    const trailer = try decodeTopologyTrailer(payload[payload.len - topology_trailer_len ..], payload.len);
+    const raw = payload[@intCast(trailer.body_len)..][0..trailer.directory_len];
+    const digest = (try selectedDirectoryChecksum(raw, trailer.checksum, Filter{})).?;
+    const empty = (try selectedDirectoryChecksum(raw, trailer.checksum, Filter{ .mode = .types, .types = &.{"absent"} })).?;
+    try std.testing.expectEqualSlices(u8, &digest, &empty);
+    raw[0] ^= 1;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, selectedDirectoryChecksum(raw, trailer.checksum, Filter{}));
+    std.mem.writeInt(u32, raw[0..4], absent_directory, .little);
+    var checksum: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(raw, &checksum, .{});
+    try std.testing.expect((try selectedDirectoryChecksum(raw, checksum, Filter{})) == null);
+    try std.testing.expectEqual(@as(usize, 4), topologyDirectorySize(&.{"link"}, 1024 * 1024, 1024 * 1024, 0));
+    try std.testing.expectEqual(@as(usize, 4), topologyDirectorySize(&.{"link"}, 1, 1, 8 * 1024 * 1024));
+    const long_kind = try alloc.alloc(u8, max_topology_directory_bytes);
+    defer alloc.free(long_kind);
+    try std.testing.expectEqual(@as(usize, 4), topologyDirectorySize(&.{long_kind}, 1, 1, 0));
+    // Forged sizes are rejected before any range allocation or request.
+    const footer = payload[payload.len - topology_trailer_len ..];
+    std.mem.writeInt(u32, footer[4..8], max_topology_directory_bytes + 1, .little);
+    try std.testing.expectError(error.InvalidGraphSegment, decodeTopologyTrailer(footer, payload.len));
+}
+
+/// Select a semantic identity using only the authenticated directory. Entries
+/// stay in canonical type order and empty/qualified-only types do not count.
+pub fn selectedDirectoryChecksum(raw: []const u8, expected: [32]u8, filter: anytype) !?[32]u8 {
+    if (raw.len < 4 or raw.len > max_topology_directory_bytes) return error.InvalidGraphSegment;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
+    if (!std.mem.eql(u8, &digest, &expected)) return error.ArtifactIntegrityMismatch;
+    const count = std.mem.readInt(u32, raw[0..4], .little);
+    if (count == absent_directory) {
+        for (raw[4..]) |byte| if (byte != 0) return error.InvalidGraphSegment;
+        return null;
+    }
+    if (count > (raw.len - 4) / 44) return error.InvalidGraphSegment;
+    var pos: usize = 4;
+    var previous: ?[]const u8 = null;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly:selected-unweighted-topology:v1");
+    for (0..count) |_| {
+        if (raw.len - pos < 44) return error.InvalidGraphSegment;
+        const len = std.mem.readInt(u32, raw[pos..][0..4], .little);
+        pos += 4;
+        if (len > raw.len - pos - 40) return error.InvalidGraphSegment;
+        const kind = raw[pos..][0..len];
+        pos += len;
+        if (!edge_type.isValid(kind)) return error.InvalidGraphSegment;
+        if (previous) |prior| if (std.mem.order(u8, prior, kind) != .lt) return error.InvalidGraphSegment;
+        previous = kind;
+        const edges = std.mem.readInt(u64, raw[pos..][0..8], .little);
+        pos += 8;
+        const selected = filter.mode == .all or for (filter.types) |name| {
+            if (std.mem.eql(u8, name, kind)) break true;
+        } else false;
+        if (edges > 0 and selected) hash.update(raw[pos..][0..32]);
+        pos += 32;
+    }
+    if (pos != raw.len) return error.InvalidGraphSegment;
+    hash.final(&digest);
+    return digest;
+}
+
+/// Both ingestion encoders finish the same byte-level wire. The two edge
+/// passes count and hash, without materializing another edge array.
+pub fn finishEncoding(alloc: Allocator, payload: []u8, body_len: usize, cancellation: CancellationToken) !void {
+    const directory = payload[body_len .. payload.len - topology_trailer_len];
+    const type_count = std.mem.readInt(u32, payload[14..18], .little);
+    var source_edges: u64 = 0;
+    if (directory.len == 4) {
+        std.mem.writeInt(u32, directory[0..4], if (type_count == 0) 0 else absent_directory, .little);
+    } else {
+        var graph = try readView(alloc, payload[0..body_len], std.math.maxInt(usize), cancellation);
+        defer graph.deinit(alloc);
+        const node_hashes = try alloc.alloc([32]u8, graph.nodes.len);
+        defer alloc.free(node_hashes);
+        for (graph.nodes, node_hashes, 0..) |node, *hash, i| {
+            if (i % 256 == 0) try cancellation.check();
+            std.crypto.hash.sha2.Sha256.hash(node, hash, .{});
+        }
+        const counts = try alloc.alloc(u64, graph.edge_types.len);
+        defer alloc.free(counts);
+        @memset(counts, 0);
+        const hashes = try alloc.alloc(std.crypto.hash.sha2.Sha256, counts.len);
+        defer alloc.free(hashes);
+        const local_nodes = try alloc.alloc(bool, graph.nodes.len);
+        defer alloc.free(local_nodes);
+        @memset(local_nodes, false);
+        var complete_local_topology = true;
+        for (graph.adjacencies) |adjacency| {
+            if (local_nodes[adjacency.node]) complete_local_topology = false;
+            local_nodes[adjacency.node] = true;
+        }
+        for (graph.adjacencies) |adjacency| for (0..adjacency.out.len / edge_len) |i| {
+            if (i % 4096 == 0) try cancellation.check();
+            const edge = readEdge(adjacency.out, i);
+            source_edges += 1;
+            if (edge.table == null) {
+                counts[edge.edge_type] += 1;
+                if (!local_nodes[edge.node]) complete_local_topology = false;
+            }
+        };
+        for (graph.edge_types, counts, hashes) |kind, count, *hash| {
+            hash.* = std.crypto.hash.sha2.Sha256.init(.{});
+            hash.update("antfly:unweighted-type:v1");
+            var value: [8]u8 = undefined;
+            std.mem.writeInt(u64, &value, kind.len, .little);
+            hash.update(&value);
+            hash.update(kind);
+            std.mem.writeInt(u64, &value, count, .little);
+            hash.update(&value);
+        }
+        for (graph.adjacencies) |adjacency| for (0..adjacency.out.len / edge_len) |i| {
+            if (i % 4096 == 0) try cancellation.check();
+            const edge = readEdge(adjacency.out, i);
+            if (edge.table != null) continue;
+            hashes[edge.edge_type].update(&node_hashes[adjacency.node]);
+            hashes[edge.edge_type].update(&node_hashes[edge.node]);
+        };
+        var pos: usize = 0;
+        put(directory, &pos, type_count);
+        for (graph.edge_types, counts, hashes) |kind, count, *hash| {
+            putString(directory, &pos, kind);
+            std.mem.writeInt(u64, directory[pos..][0..8], count, .little);
+            pos += 8;
+            hash.final(directory[pos..][0..32]);
+            pos += 32;
+        }
+        std.debug.assert(pos == directory.len);
+        // General graph artifacts can refer to local nodes without owning an
+        // adjacency row. Metrics reject those sources; never let reuse bypass
+        // that validation merely because endpoint strings still hash equally.
+        if (!complete_local_topology) {
+            @memset(directory, 0);
+            std.mem.writeInt(u32, directory[0..4], absent_directory, .little);
+        }
+    }
+    const trailer = payload[payload.len - topology_trailer_len ..];
+    @memcpy(trailer[0..4], "GTD1");
+    std.mem.writeInt(u32, trailer[4..8], @intCast(directory.len), .little);
+    std.mem.writeInt(u64, trailer[8..16], body_len, .little);
+    std.crypto.hash.sha2.Sha256.hash(directory, trailer[16..48], .{});
+    @memcpy(trailer[48..52], payload[18..22]);
+    std.mem.writeInt(u64, trailer[52..60], source_edges, .little);
+    @memset(trailer[60..64], 0);
+}
 
 pub fn viewRetainedBytes(data: []const u8) !usize {
     if (data.len < header_len or !std.mem.eql(u8, data[0..4], wire_magic)) return error.InvalidGraphSegment;
@@ -108,7 +292,7 @@ const Encoding = struct {
 pub fn encodedSize(alloc: Allocator, segment: types.Segment) !usize {
     var plan = try Encoding.init(alloc, segment, .none);
     defer plan.deinit(alloc);
-    return plan.size;
+    return std.math.add(usize, plan.size, topologyDirectorySize(plan.edge_types.values.items, plan.nodes.values.items.len, segment.adjacencies.len, segment.neighbor_tables.len) + topology_trailer_len) catch error.GraphSegmentTooLarge;
 }
 
 fn put(buf: []u8, pos: *usize, value: u32) void {
@@ -129,8 +313,9 @@ pub fn encodeAlloc(alloc: Allocator, segment: types.Segment) ![]u8 {
 pub fn encodeAllocWithLimit(alloc: Allocator, segment: types.Segment, max_bytes: usize, cancellation: CancellationToken) ![]u8 {
     var plan = try Encoding.init(alloc, segment, cancellation);
     defer plan.deinit(alloc);
-    if (plan.size > max_bytes) return error.GraphSegmentTooLarge;
-    const buf = try alloc.alloc(u8, plan.size);
+    const size = std.math.add(usize, plan.size, topologyDirectorySize(plan.edge_types.values.items, plan.nodes.values.items.len, segment.adjacencies.len, segment.neighbor_tables.len) + topology_trailer_len) catch return error.GraphSegmentTooLarge;
+    if (size > max_bytes) return error.GraphSegmentTooLarge;
+    const buf = try alloc.alloc(u8, size);
     errdefer alloc.free(buf);
     @memcpy(buf[0..4], wire_magic);
     std.mem.writeInt(u16, buf[4..6], wire_version, .little);
@@ -155,7 +340,8 @@ pub fn encodeAllocWithLimit(alloc: Allocator, segment: types.Segment, max_bytes:
             put(buf, &pos, edge.neighbor_table_id orelse no_table);
         };
     }
-    std.debug.assert(pos == buf.len);
+    std.debug.assert(pos == plan.size);
+    try finishEncoding(alloc, buf, plan.size, cancellation);
     return buf;
 }
 
@@ -232,7 +418,16 @@ pub fn viewAlloc(alloc: Allocator, data: []const u8, limits: bounded.Limits, can
     try cancellation.check();
     _ = try bounded.Budget.init(data.len, limits);
     var limiter = try bounded.AllocationLimiter.init(alloc, limits.max_allocation_bytes);
-    return readView(limiter.allocator(), data, limits.max_elements, cancellation) catch |err| {
+    // Check the version before inspecting the current-only extension layout.
+    if (data.len < 6) return error.InvalidGraphSegment;
+    if (std.mem.readInt(u16, data[4..6], .little) != wire_version) return error.UnsupportedGraphSegmentVersion;
+    if (data.len < topology_trailer_len) return error.InvalidGraphSegment;
+    const trailer = try decodeTopologyTrailer(data[data.len - topology_trailer_len ..], data.len);
+    const body_len: usize = @intCast(trailer.body_len);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data[body_len .. data.len - topology_trailer_len], &digest, .{});
+    if (!std.mem.eql(u8, &digest, &trailer.checksum)) return error.InvalidGraphSegment;
+    return readView(limiter.allocator(), data[0..body_len], limits.max_elements, cancellation) catch |err| {
         if (err == error.OutOfMemory and limiter.limit_exceeded) return error.DecodedArtifactTooLarge;
         return err;
     };

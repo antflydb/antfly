@@ -815,7 +815,7 @@ pub const GraphIndex = struct {
     // Census position is only a fairness hint. Deletion tombstones and removed
     // keys are the durable recovery state; idle scans must not write a WAL.
     topology_gc_cursor: ?topology_owner.Id = null,
-    filter_plan_gc_cursor: ?[64]u8 = null,
+    filter_plan_gc_cursor: ?struct { bytes: [68]u8, len: u8 } = null,
     topology_preparation_only: bool = false,
     topology_preparation_mutex: std.atomic.Mutex = .unlocked,
     topology_preparation_cursor: ?[64]u8 = null,
@@ -3121,13 +3121,14 @@ pub const GraphIndex = struct {
             if (prior.len > 2 and prior[0] == 0xff and prior[1] <= 2) {
                 if (try partition_census.State.decodeAlloc(self.alloc, prior[2..])) |value| {
                     var saved = value;
-                    if (saved.generation == epoch) {
+                    if (saved.generation == epoch and saved.phase == prior[1]) {
                         state = saved;
                         phase = prior[1];
                     } else saved.deinit(self.alloc);
                 }
             }
             complete = try self.advanceFilteredPartitionCensus(&txn, cfg, &state, &phase, max_records);
+            if (complete) try state.materializeBoundaries(self.alloc, &txn, key);
         }
         defer state.deinit(self.alloc);
         var batch = try self.beginWriteReverseBatch();
@@ -3153,7 +3154,10 @@ pub const GraphIndex = struct {
             defer plan.edge_page_units.deinit(self.alloc);
             for (0..plan.edge_page_count) |page| try plan.edge_page_units.append(self.alloc, graphMetricPartitionSpan(@intCast(state.edge_count), plan.edge_page_count, page).len);
             try self.putGraphMetricPartitionPlanAtKeyInBatch(&batch, key, plan);
+            try partition_census.State.deleteBoundaries(self.alloc, &batch, key);
         } else {
+            try state.persistBoundaries(self.alloc, &batch, key);
+            state.phase = phase;
             const raw = try state.encodeAlloc(self.alloc);
             defer self.alloc.free(raw);
             const encoded = try std.mem.concat(self.alloc, u8, &.{ &.{ 0xff, phase }, raw });
@@ -3184,7 +3188,7 @@ pub const GraphIndex = struct {
                     const count = std.math.cast(usize, if (nodes) state.node_count else state.edge_count) orelse return error.GraphMetricBuildBudgetExceeded;
                     const boundaries = if (nodes) &state.node_boundaries else &state.edge_boundaries;
                     const pages = if (nodes) self.graphMetricDegreeReducePageCount(count) else self.graphMetricDegreeScanPageCount(count);
-                    const page = boundaries.items.len;
+                    const page = state.boundaryCount(nodes);
                     if (page < pages and seen.* == graphMetricPartitionSpan(count, pages, page).start) {
                         try boundaries.ensureUnusedCapacity(self.alloc, 1);
                         boundaries.appendAssumeCapacity(try self.alloc.dupe(u8, key));
@@ -3227,7 +3231,6 @@ pub const GraphIndex = struct {
     /// coordinators compare the checkpoint before publishing their next step.
     pub fn prepareGraphMetricPartitionStep(self: *GraphIndex, max_records: usize) !bool {
         if (max_records == 0) return error.InvalidGraphMetricBuildOptions;
-        if (!try self.prepareTypedGraphEdgesStep(max_records)) return false;
         var state: partition_census.State = undefined;
         var old_raw: []u8 = &.{};
         defer self.alloc.free(old_raw);
@@ -3261,6 +3264,7 @@ pub const GraphIndex = struct {
                 else => return err,
             }
             complete = try self.advanceGraphMetricPartitionCensus(&txn, &state, max_records);
+            if (complete) try state.materializeBoundaries(self.alloc, &txn, graph_metric_partition_census_key);
         }
         defer state.deinit(self.alloc);
         var batch = try self.beginWriteReverseBatch();
@@ -3289,11 +3293,13 @@ pub const GraphIndex = struct {
             defer plan.edge_page_units.deinit(self.alloc);
             for (0..plan.edge_page_count) |page| try plan.edge_page_units.append(self.alloc, graphMetricPartitionSpan(@intCast(state.edge_count), plan.edge_page_count, page).len);
             try self.putGraphMetricPartitionPlanInBatch(&batch, plan);
+            try partition_census.State.deleteBoundaries(self.alloc, &batch, graph_metric_partition_census_key);
             batch.delete(graph_metric_partition_census_key) catch |err| switch (err) {
                 error.NotFound => {},
                 else => return err,
             };
         } else {
+            try state.persistBoundaries(self.alloc, &batch, graph_metric_partition_census_key);
             const encoded = try state.encodeAlloc(self.alloc);
             defer self.alloc.free(encoded);
             try batch.put(graph_metric_partition_census_key, encoded);
@@ -3357,13 +3363,17 @@ pub const GraphIndex = struct {
             batch.abort();
             return false;
         }
+        var typed_updates = typed_edges.Updates.init(self.alloc);
+        defer typed_updates.deinit();
         for (postings.items) |key| {
             var parsed = (try parseMetricReverseEdgeKeyView(temp, key, self.index_name)) orelse return error.InvalidGraphMetricBuildManifest;
             defer parsed.deinit(temp);
-            // Mutation scratch is released per edge; only the bounded raw-key
-            // page and decoded endpoints remain in the checkpoint arena.
-            try typed_edges.update(self.alloc, &batch, parsed.edge_type.bytes, key, parsed.source.bytes, parsed.target.bytes, true);
+            // Posting scratch is reused; endpoint deltas are coalesced across
+            // this byte-bounded page before touching durable counts.
+            try typed_updates.stage(&batch, parsed.edge_type.bytes, key, parsed.source.bytes, parsed.target.bytes, true);
         }
+        try typed_updates.flush(&batch);
+        try batch.put(typed_edges.active_key, "1");
         if (complete) {
             try batch.put(typed_edges.ready_key, "1");
             batch.delete(typed_edges.cursor_key) catch |err| if (err != error.NotFound) return err;
@@ -3376,6 +3386,7 @@ pub const GraphIndex = struct {
         const edge_count = std.math.cast(usize, state.edge_count) orelse return error.GraphMetricBuildBudgetExceeded;
         const node_count = std.math.cast(usize, state.node_count) orelse return error.GraphMetricBuildBudgetExceeded;
         var remaining = max_records;
+        var scanned_bytes: usize = 0;
         if (!state.edges_done) {
             var cur = try txn.openCursor();
             defer cur.close();
@@ -3391,7 +3402,7 @@ pub const GraphIndex = struct {
                     continue;
                 }
                 if (graphIndexEdgeKeyMatchesIndex(entry.key, self.index_name)) {
-                    const page = state.edge_boundaries.items.len;
+                    const page = state.boundaryCount(false);
                     const pages = self.graphMetricDegreeScanPageCount(edge_count);
                     if (page < pages and state.edges_seen == graphMetricPartitionSpan(edge_count, pages, page).start) {
                         try state.edge_boundaries.ensureUnusedCapacity(self.alloc, 1);
@@ -3401,7 +3412,8 @@ pub const GraphIndex = struct {
                     if (state.edges_seen > state.edge_count) return error.InvalidGraphMetricBuildManifest;
                 }
                 remaining -= 1;
-                if (remaining == 0) {
+                scanned_bytes +|= entry.key.len;
+                if (remaining == 0 or scanned_bytes >= 1024 * 1024) {
                     try self.replaceOwnedBytes(&state.edge_cursor, entry.key);
                     return false;
                 }
@@ -3419,7 +3431,7 @@ pub const GraphIndex = struct {
         };
         while (item) |entry| : (item = try cur.next()) {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
-            const page = state.node_boundaries.items.len;
+            const page = state.boundaryCount(true);
             const pages = self.graphMetricDegreeReducePageCount(node_count);
             if (page < pages and state.nodes_seen == graphMetricPartitionSpan(node_count, pages, page).start) {
                 try state.node_boundaries.ensureUnusedCapacity(self.alloc, 1);
@@ -3428,7 +3440,8 @@ pub const GraphIndex = struct {
             state.nodes_seen += 1;
             if (state.nodes_seen > state.node_count) return error.InvalidGraphMetricBuildManifest;
             remaining -= 1;
-            if (remaining == 0) {
+            scanned_bytes +|= entry.key.len;
+            if (remaining == 0 or scanned_bytes >= 1024 * 1024) {
                 try self.replaceOwnedBytes(&state.node_cursor, entry.key);
                 return false;
             }
@@ -6099,6 +6112,7 @@ pub const GraphIndex = struct {
                 errdefer backend.close();
 
                 var runtime = try backend.runtimeStore(alloc, .{});
+                runtime.write_gate = &backend.serialized_write_mutex;
                 errdefer runtime.deinit();
                 return .{
                     .store = runtime,
@@ -6110,6 +6124,7 @@ pub const GraphIndex = struct {
                 errdefer handle.close();
 
                 var runtime = try handle.backend.runtimeStore(alloc, .{});
+                runtime.write_gate = &handle.backend.serialized_write_mutex;
                 errdefer runtime.deinit();
                 return .{
                     .store = runtime,
@@ -6121,6 +6136,7 @@ pub const GraphIndex = struct {
                 errdefer handle.close();
 
                 var runtime = try handle.backend.runtimeStore(alloc, .{});
+                runtime.write_gate = &handle.backend.serialized_write_mutex;
                 errdefer runtime.deinit();
                 return .{
                     .store = runtime,
@@ -6472,6 +6488,10 @@ pub const GraphIndex = struct {
             while (keys.next()) |key| self.alloc.free(key.*);
             topology_changes.deinit(self.alloc);
         }
+        const typed_demand = for (self.metric_configs) |cfg| {
+            if (cfg.edge_filter.mode == .types) break true;
+        } else false;
+        const typed_state = try typed_edges.maintenanceState(&reverse_batch, typed_demand);
         // Compare original and final identity sets, not intermediate delete /
         // insert operations. Replacing attributes or replaying an identical
         // batch must not retire immutable topology or restart numerical jobs.
@@ -6529,13 +6549,17 @@ pub const GraphIndex = struct {
             try reverse_batch.put(rev_key, edge_val);
         }
 
+        var typed_updates = typed_edges.Updates.init(self.alloc);
+        defer typed_updates.deinit();
         changes = topology_changes.iterator();
         while (changes.next()) |entry| {
+            if (!typed_state.active) break;
             if (entry.value_ptr.before == entry.value_ptr.after) continue;
             const mutation = entry.value_ptr.*;
-            try typed_edges.update(self.alloc, &reverse_batch, mutation.kind, entry.key_ptr.*, mutation.source, mutation.target, mutation.after);
+            try typed_updates.stageKnown(&reverse_batch, mutation.kind, entry.key_ptr.*, mutation.source, mutation.target, mutation.after, if (typed_state.ready) mutation.before else null);
         }
-        if (prev_edge_count == 0) try reverse_batch.put(typed_edges.ready_key, "1");
+        try typed_updates.flush(&reverse_batch);
+        if (typed_state.active and prev_edge_count == 0) try reverse_batch.put(typed_edges.ready_key, "1");
         if (changed_types.count() > 0) {
             self.edge_generation = std.math.add(u64, self.edge_generation, 1) catch return error.InvalidGraphMetricBuildManifest;
             // A migration floor gives previously indexed types a conservative
@@ -6613,6 +6637,22 @@ pub const GraphIndex = struct {
     }
 
     pub const MetricEdgeScanBenchmark = struct { visited: usize = 0, matched: usize = 0, checksum: u64 = 0 };
+
+    /// Reference oracle for endpoint-maintenance cost. Abort leaves the same
+    /// durable fixture available to every sample; WAL/commit are not measured.
+    pub fn benchmarkTypedMembershipUpdates(self: *GraphIndex, alloc: Allocator, writes: []const BatchWrite, reference: bool) !usize {
+        var batch = try self.beginWriteReverseBatch();
+        defer batch.abort();
+        var updates = typed_edges.Updates.init(alloc);
+        defer updates.deinit();
+        for (writes) |write| {
+            const key = try reverseEdgeKeyAlloc(alloc, write.target, self.index_name, write.edge_type, write.source);
+            defer alloc.free(key);
+            if (reference) try typed_edges.update(alloc, &batch, write.edge_type, key, write.source, write.target, false) else try updates.stageKnown(&batch, write.edge_type, key, write.source, write.target, false, true);
+        }
+        if (!reference) try updates.flush(&batch);
+        return if (reference) writes.len * 2 else updates.deltas.count();
+    }
 
     pub fn benchmarkPartitionCensus(self: *GraphIndex, filter: GraphMetricEdgeFilter) !struct { steps: usize, edges: u64, nodes: u64 } {
         const cfg = GraphMetricConfig{ .name = "benchmark", .kind = .degree, .edge_filter = filter };
@@ -14512,13 +14552,13 @@ pub const GraphIndex = struct {
             try retained.put(temp, try temp.dupe(u8, key), {});
         }
         var obsolete = std.ArrayListUnmanaged([]const u8).empty;
-        var next_cursor: ?[64]u8 = null;
+        var next_cursor: @TypeOf(self.filter_plan_gc_cursor) = null;
         {
             var txn = try self.beginReadReverseTxn();
             defer txn.abort();
             var cur = try txn.openCursor();
             defer cur.close();
-            const start = if (self.filter_plan_gc_cursor) |suffix| try std.mem.concat(temp, u8, &.{ prefix, &suffix }) else prefix;
+            const start = if (self.filter_plan_gc_cursor) |suffix| try std.mem.concat(temp, u8, &.{ prefix, suffix.bytes[0..suffix.len] }) else prefix;
             var item = try cur.seekAtOrAfter(start);
             if (self.filter_plan_gc_cursor != null) if (item) |entry| if (std.mem.eql(u8, entry.key, start)) {
                 item = try cur.next();
@@ -14527,10 +14567,12 @@ pub const GraphIndex = struct {
             while (item) |entry| : (item = try cur.next()) {
                 if (!std.mem.startsWith(u8, entry.key, prefix)) break;
                 if (inspected == 64) break;
-                if (entry.key.len != prefix.len + 64) return error.InvalidGraphMetricBuildManifest;
-                next_cursor = entry.key[prefix.len..][0..64].*;
+                const suffix = entry.key[prefix.len..];
+                if (suffix.len != 64 and !(suffix.len == 68 and suffix[64] == '/')) return error.InvalidGraphMetricBuildManifest;
+                next_cursor = .{ .bytes = undefined, .len = @intCast(suffix.len) };
+                @memcpy(next_cursor.?.bytes[0..suffix.len], suffix);
                 inspected += 1;
-                if (!retained.contains(entry.key)) try obsolete.append(temp, try temp.dupe(u8, entry.key));
+                if (!retained.contains(entry.key[0 .. prefix.len + 64])) try obsolete.append(temp, try temp.dupe(u8, entry.key));
             }
             if (item == null or !std.mem.startsWith(u8, item.?.key, prefix)) next_cursor = null;
         }
@@ -19314,6 +19356,167 @@ test "graph metric ordinal topology checkpoints stop at byte admission for long 
     try std.testing.expectEqual(@as(usize, 1), topology.edges.len);
     try std.testing.expect(!topology.complete);
     try std.testing.expect(topology.cursor.len > kind.len * 2);
+}
+
+test "graph metric membership private store serializes read modify write across concurrent views" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-serialized-writes");
+    defer cleanupTmp(store_path);
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Worker = struct {
+        fn run(runtime: std.Io, view: backend_erased.Store, start: *std.Io.Event) !void {
+            var shared_view = view;
+            try start.wait(runtime);
+            for (0..32) |_| {
+                var batch = try shared_view.beginBatch();
+                errdefer batch.abort();
+                const current = try GraphIndex.readU64OrZero(&batch, "meta:test_serialized_counter");
+                try runtime.sleep(std.Io.Duration.fromNanoseconds(100_000), .awake);
+                try GraphIndex.putU64(&batch, "meta:test_serialized_counter", current + 1);
+                try batch.commit();
+                var txn = try shared_view.beginWrite();
+                errdefer txn.abort();
+                const value = try GraphIndex.readU64OrZero(&txn, "meta:test_serialized_counter");
+                try runtime.sleep(std.Io.Duration.fromNanoseconds(100_000), .awake);
+                try GraphIndex.putU64(&txn, "meta:test_serialized_counter", value + 1);
+                try txn.commit();
+            }
+        }
+    };
+    for ([_]ReverseBackend{ .mem, .lsm_memory, .lsm }) |kind| {
+        var rev_buf: [256]u8 = undefined;
+        const rev_path = tmpPath(&rev_buf, "rev-serialized-writes");
+        defer cleanupTmp(rev_path);
+        var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .reverse_backend = kind, .reverse_lsm_options = .{ .flush_threshold = 64 * 1024 } });
+        defer graph.close();
+        const gate = graph.reverseStore().write_gate orelse return error.TestExpectedWriteGate;
+        {
+            var batch = try graph.beginWriteReverseBatch();
+            defer batch.abort();
+            try std.testing.expect(!gate.tryLock());
+            // A write gate must not block snapshot reads.
+            var read = try graph.beginReadReverseTxn();
+            defer read.abort();
+            try std.testing.expectEqual(@as(u64, 0), try GraphIndex.readU64OrZero(&read, "meta:test_serialized_counter"));
+        }
+        var start: std.Io.Event = .unset;
+        var first = try io.concurrent(Worker.run, .{ io, graph.reverseStore().*, &start });
+        defer _ = first.cancel(io) catch {};
+        var second = try io.concurrent(Worker.run, .{ io, graph.reverseStore().*, &start });
+        defer _ = second.cancel(io) catch {};
+        start.set(io);
+        try first.await(io);
+        try second.await(io);
+        var read = try graph.beginReadReverseTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@as(u64, 128), try GraphIndex.readU64OrZero(&read, "meta:test_serialized_counter"));
+    }
+}
+
+test "graph metric membership deltas match immediate updates for duplicates self loops and reversals" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-membership-deltas");
+    defer cleanupTmp(store_path);
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-membership-deltas");
+    defer cleanupTmp(rev_path);
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{});
+    defer graph.close();
+    const Operation = struct { source: []const u8, target: []const u8, present: bool };
+    const operations = [_]Operation{
+        .{ .source = "a", .target = "a", .present = true },
+        .{ .source = "a", .target = "a", .present = true },
+        .{ .source = "a", .target = "b", .present = true },
+        .{ .source = "b", .target = "c", .present = true },
+        .{ .source = "b", .target = "c", .present = false },
+        .{ .source = "b", .target = "a", .present = true },
+    };
+    for ([_]bool{ true, false }) |reference| {
+        var batch = try graph.beginWriteReverseBatch();
+        defer batch.abort();
+        var updates = typed_edges.Updates.init(alloc);
+        defer updates.deinit();
+        for (operations) |op| {
+            const key = try reverseEdgeKeyAlloc(alloc, op.target, "links", "cites", op.source);
+            defer alloc.free(key);
+            if (reference) try typed_edges.update(alloc, &batch, "cites", key, op.source, op.target, op.present) else try updates.stage(&batch, "cites", key, op.source, op.target, op.present);
+        }
+        if (!reference) {
+            try updates.flush(&batch);
+            try updates.flush(&batch); // A second flush is a no-op.
+        }
+        for ([_][]const u8{ "a", "b", "c" }, [_]u64{ 4, 2, 0 }) |node, expected| {
+            const key = try std.mem.concat(alloc, u8, &.{ typed_edges.node_prefix, "cites\x00\x00", node });
+            defer alloc.free(key);
+            try std.testing.expectEqual(expected, try GraphIndex.readU64OrZero(&batch, key));
+        }
+    }
+}
+
+test "graph metric filtered postings activate lazily and retain mutation coverage across reopen" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-lazy-postings");
+    defer cleanupTmp(store_path);
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-lazy-postings");
+    defer cleanupTmp(rev_path);
+    const configs = [_]GraphMetricConfig{.{ .name = "all", .kind = .degree }};
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+    defer graph.close();
+    try graph.addEdge("a", "b", "cites", 1, 0, 0, "");
+    try graph.addEdge("b", "c", "cites", 1, 0, 0, "");
+    while (!try graph.prepareGraphMetricPartitionStep(1)) {}
+    {
+        var txn = try graph.beginReadReverseTxn();
+        defer txn.abort();
+        try std.testing.expectEqualStrings("0", try txn.get(typed_edges.active_key));
+        try std.testing.expectError(error.NotFound, txn.get(typed_edges.ready_key));
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        for ([_][]const u8{ typed_edges.prefix, typed_edges.node_prefix }) |prefix| {
+            if (try cursor.seekAtOrAfter(prefix)) |entry| try std.testing.expect(!std.mem.startsWith(u8, entry.key, prefix));
+        }
+    }
+    const filtered = GraphMetricConfig{ .name = "filtered", .kind = .degree, .edge_filter = .{ .mode = .types, .types = &.{"cites"} } };
+    try std.testing.expect(!try graph.prepareGraphMetricPartitionForConfigStep(filtered, 1));
+    // Only an unfiltered metric remains configured, but the started covering
+    // index must continue tracking writes behind its backfill cursor.
+    try graph.addEdge("z", "a", "cites", 1, 0, 0, "");
+    try graph.deleteEdge("a", "b", "cites");
+    graph.close();
+    graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+    while (!try graph.prepareGraphMetricPartitionForConfigStep(filtered, 1)) {}
+    const full = try graph.benchmarkMetricEdgeScan(filtered.edge_filter, true);
+    const selected = try graph.benchmarkMetricEdgeScan(filtered.edge_filter, false);
+    try std.testing.expectEqual(@as(usize, 2), selected.matched);
+    try std.testing.expectEqual(full.checksum, selected.checksum);
+    {
+        var batch = try graph.beginWriteReverseBatch();
+        errdefer batch.abort();
+        // Older partial indexes had neither an activation marker nor ready
+        // flag. Their persisted postings still require foreground maintenance.
+        try batch.delete(typed_edges.active_key);
+        try batch.delete(typed_edges.ready_key);
+        try batch.commit();
+    }
+    try graph.deleteEdge("b", "c", "cites");
+    while (!try graph.prepareGraphMetricPartitionForConfigStep(filtered, 1)) {}
+    const remaining = try graph.benchmarkMetricEdgeScan(filtered.edge_filter, false);
+    try std.testing.expectEqual(@as(usize, 1), remaining.matched);
+    var plan = try graph.cachedGraphMetricPartitionPlanForConfig(filtered);
+    defer plan.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), plan.node_count);
 }
 
 test "graph metric filtered census completes during unrelated churn and deduplicates shared endpoints" {

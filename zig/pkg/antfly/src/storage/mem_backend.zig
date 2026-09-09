@@ -93,6 +93,7 @@ fn releaseState(allocator: Allocator, rc: *RcState) void {
 }
 
 pub const Backend = struct {
+    serialized_write_mutex: std.atomic.Mutex = .unlocked,
     allocator: Allocator,
     open_options: backend_types.OpenOptions,
     state: ?*RcState = null,

@@ -1435,6 +1435,9 @@ pub const Backend = struct {
     };
 
     allocator: Allocator,
+    /// Opt-in gate shared by every graph-store view of this backend. Durable
+    /// roots already enforce a single open writer across processes/handles.
+    serialized_write_mutex: std.atomic.Mutex = .unlocked,
     mu: std.atomic.Mutex = .unlocked,
     // Cached score used by best-effort maintenance scheduling and metrics.
     // A value of 1 can still mean "known debt, exact score not refreshed yet".

@@ -380,7 +380,7 @@ pub fn main(init: std.process.Init) !void {
                 .allocated_bytes = last.total_alloc_bytes,
                 .peak_bytes = last.peak_bytes,
                 .samples = times.len,
-                .note = "same v3 input; excludes fetch, encoding and numeric kernel; one warmup",
+                .note = "same current-wire input; excludes fetch, encoding and numeric kernel; one warmup",
             }, .{});
             try output.interface.writeAll(json);
             try output.interface.writeByte('\n');
@@ -466,7 +466,7 @@ fn benchmarkTypedEdgeScans(io: std.Io, out: anytype) !void {
     const reverse_path = try std.fmt.allocPrint(fixture, "{s}/reverse\x00", .{root});
     var store = try antfly.docstore.DocStore.open(alloc, @ptrCast(store_path.ptr), .{});
     defer store.close();
-    var index = try antfly.graph.GraphIndex.open(alloc, &store, @ptrCast(reverse_path.ptr), "links", .{});
+    var index = try antfly.graph.GraphIndex.open(alloc, &store, @ptrCast(reverse_path.ptr), "links", .{ .metric_configs = &.{.{ .name = "selected", .kind = .degree, .edge_filter = .{ .mode = .types, .types = &.{"type-00"} } }} });
     defer index.close();
     const ids = try fixture.alloc([]const u8, 1024);
     for (ids, 0..) |*id, i| id.* = try std.fmt.allocPrint(fixture, "node-{d:0>8}", .{i});
@@ -475,6 +475,35 @@ fn benchmarkTypedEdgeScans(io: std.Io, out: anytype) !void {
     const writes = try fixture.alloc(antfly.graph.BatchWrite, ids.len * 64);
     for (writes, 0..) |*write, i| write.* = .{ .source = ids[i / 64], .target = ids[(i / 64 + i % 64 + 1) % ids.len], .edge_type = types[i % types.len] };
     try index.batchApply(writes, &.{});
+    for ([_]bool{ true, false }) |reference| {
+        var samples: [5]u64 = undefined;
+        var measured: PhaseAllocStats = undefined;
+        var endpoint_reads: usize = 0;
+        for (0..6) |sample| {
+            var stats = PhaseAllocStats{};
+            var tracking = PhaseTrackingAllocator{ .backing = alloc, .stats = &stats };
+            const started = antfly.platform_time.monotonicNs();
+            endpoint_reads = try index.benchmarkTypedMembershipUpdates(tracking.allocator(), writes, reference);
+            const elapsed = antfly.platform_time.monotonicNs() - started;
+            if (stats.current_bytes != 0) return error.InvalidBenchmarkResult;
+            if (sample != 0) samples[sample - 1] = elapsed;
+            measured = stats;
+        }
+        if (endpoint_reads != (if (reference) writes.len * 2 else ids.len * types.len)) return error.InvalidBenchmarkResult;
+        std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+        const json = try std.json.Stringify.valueAlloc(fixture, .{
+            .mode = if (reference) "stateful_membership_per_edge" else "stateful_membership_coalesced",
+            .edges = writes.len,
+            .endpoint_reads = endpoint_reads,
+            .median_ns = samples[2],
+            .scratch_peak_bytes = measured.peak_bytes,
+            .scratch_allocations = measured.alloc_count,
+            .note = "default durable LSM; identical all-edge removal followed by abort; six samples, first discarded; includes posting maintenance, excludes fixture and WAL commit; allocator measures update scratch only",
+        }, .{});
+        try out.interface.writeAll(json);
+        try out.interface.writeByte('\n');
+        try out.flush();
+    }
     const filter = antfly.graph.GraphMetricEdgeFilter{ .mode = .types, .types = types[0..1] };
     const expected = try index.benchmarkMetricEdgeScan(filter, true);
     for ([_]bool{ true, false }) |reference| {
