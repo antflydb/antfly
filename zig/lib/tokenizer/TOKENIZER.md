@@ -43,7 +43,7 @@ must be optimized along with the benchmark executable:
 
 ```sh
 cd zig
-zig build -Doptimize=ReleaseFast bench-tokenizer -- \
+zig build -Doptimize=ReleaseFast bench-tokenizer && ./zig-out/bin/tokenizer_benchmark \
   /path/to/tokenizer.json /path/to/corpus.txt \
   --warmup 2 --iterations 100 --threads 1
 ```

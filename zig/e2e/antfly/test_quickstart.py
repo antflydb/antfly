@@ -239,6 +239,160 @@ def test_text_quickstart_and_document_artifact(serverless_api):
     }
 
 
+@pytest.mark.parametrize(
+    "text_query",
+    [
+        {"query": "Korean"},
+        {"match": "Korean history major events"},
+        {"match": "Korean", "analyzer": "standard"},
+        {"term": "korean"},
+        {"prefix": "kore"},
+    ],
+    ids=["query-string", "match", "analyzed-match", "term", "prefix"],
+)
+def test_public_quickstart_default_field_searches_dynamic_strings(
+    backup_api, text_query
+):
+    # No explicit schema: both fields must participate in the default text index.
+    table = f"quickstart_default_field_{time.time_ns()}"
+    backup_api.create_table(table, num_shards=1)
+    batch = backup_api.batch_write(
+        table,
+        inserts={
+            "title-hit": {"title": "Korean history", "body": "dynasties"},
+            "body-hit": {"title": "Chronology", "body": "Korean history"},
+            "noise": {"title": "Gardening", "body": "flowers"},
+        },
+        sync_level="full_index",
+    )
+    assert batch["inserted"] == 3
+    result = backup_api.query_table(
+        table,
+        {"full_text_search": text_query, "fields": ["title"], "limit": 10},
+    )
+    hits = result["responses"][0]["hits"]["hits"]
+    assert {hit["_id"] for hit in hits} == {"title-hit", "body-hit"}
+    # Return projection does not supply or narrow the query's search field.
+    assert all(set(hit["_source"]) == {"title"} for hit in hits)
+    narrowed = backup_api.query_table(
+        table,
+        {"full_text_search": {"match": "Korean", "field": "title"}, "limit": 10},
+    )
+    assert [hit["_id"] for hit in narrowed["responses"][0]["hits"]["hits"]] == [
+        "title-hit"
+    ]
+
+
+@pytest.mark.fresh_antfly_process
+def test_public_quickstart_query_string_boolean_controls(stateful_api):
+    table = f"quickstart_boolean_{time.time_ns()}"
+    stateful_api.create_table(table, num_shards=1)
+    stateful_api.batch_write(
+        table,
+        inserts={
+            "both": {"body": "alpha beta"},
+            "alpha_only": {"body": "alpha gamma"},
+            "beta_only": {"body": "beta delta"},
+        },
+        sync_level="full_index",
+    )
+    cases = [
+        ({"query": "alpha"}, {"both", "alpha_only"}),
+        ({"match": "alpha beta"}, {"both", "alpha_only", "beta_only"}),
+        ({"query": "body:alpha"}, {"both", "alpha_only"}),
+        ({"query": "alpha beta"}, {"both"}),
+        ({"query": "body:alpha AND body:beta"}, {"both"}),
+        ({"query": "body:alpha AND body:alpha"}, {"both", "alpha_only"}),
+        (
+            {
+                "conjuncts": [
+                    {"match": "alpha", "field": "body"},
+                    {"match": "beta", "field": "body"},
+                ]
+            },
+            {"both"},
+        ),
+        ({"query": "body:alpha OR body:beta"}, {"both", "alpha_only", "beta_only"}),
+        ({"query": "body:alpha AND NOT body:beta"}, {"alpha_only"}),
+        ({"query": "NOT body:alpha"}, {"beta_only"}),
+        ({"query": "(body:alpha OR body:beta) AND body:gamma"}, {"alpha_only"}),
+        ({"query": "body:alpha AND body:missing"}, set()),
+    ]
+
+    def assert_controls():
+        for query, expected in cases:
+            result = stateful_api.query_table(
+                table, {"full_text_search": query, "limit": 10}
+            )
+            hits = result["responses"][0]["hits"]["hits"]
+            assert {hit["_id"] for hit in hits} == expected, query
+            assert len(hits) == len(expected), query
+
+    assert_controls()
+    if stateful_api.supports_restart:
+        stateful_api.restart_server()
+        assert_controls()
+
+
+def test_public_quickstart_rag_stream_requires_evidence(
+    backup_api, inference_generator
+):
+    from test_retrieval import _parse_sse_events
+
+    table = f"quickstart_rag_default_field_{time.time_ns()}"
+    backup_api.create_table(table, num_shards=1)
+    backup_api.batch_write(
+        table,
+        inserts={
+            "doc:a": {
+                "title": "Korean history",
+                "body": "The Joseon dynasty followed the Goryeo dynasty.",
+            },
+            "doc:b": {"title": "Gardening", "body": "flowers"},
+        },
+        sync_level="full_index",
+    )
+    response = backup_api._request(
+        "POST",
+        "/agents/retrieval",
+        {
+            "query": "What are the major events in Korean history?",
+            "stream": True,
+            "generator": {
+                "provider": "antfly",
+                "model": "local-generator",
+                "api_url": inference_generator,
+                "api_key": "test-key",
+            },
+            "steps": {"generation": {"enabled": True}},
+            "queries": [
+                {
+                    "table": table,
+                    # The exact legal query shape rejected during the real rerun.
+                    "full_text_search": {"match": "Korean history major events"},
+                    "fields": ["title", "body"],
+                    "limit": 5,
+                }
+            ],
+        },
+    )
+    response.raise_for_status()
+    assert response.headers["Content-Type"].startswith("text/event-stream")
+    events = _parse_sse_events(response.text)
+    assert not [data for event, data in events if event == "error"], response.text
+    done = [data for event, data in events if event == "done"]
+    assert len(done) == 1, response.text
+    assert events[-1][0] == "done", response.text
+    assert done[0]["status"] == "completed"
+    assert [hit["_id"] for hit in done[0]["hits"]] == ["doc:a"]
+    assert done[0]["generation"].strip()
+    assert any(event == "hit" and data["_id"] == "doc:a" for event, data in events)
+    assert any(
+        event == "generation" and isinstance(data, str) and data.strip()
+        for event, data in events
+    )
+
+
 def test_public_search_fields_projection(serverless_api):
     def projected_search() -> dict | None:
         try:

@@ -2883,7 +2883,7 @@ export interface components {
              * @description Stable machine-readable retry classification.
              * @enum {string}
              */
-            code: "doc_identity_unavailable" | "read_requires_primary" | "standby_read_unavailable" | "storage_read_temporarily_unavailable" | "index_rebuilding" | "query_embedding_temporarily_unavailable" | "reranker_temporarily_unavailable";
+            code: "doc_identity_unavailable" | "read_requires_primary" | "standby_read_unavailable" | "distributed_query_unavailable" | "storage_read_temporarily_unavailable" | "index_rebuilding" | "query_embedding_temporarily_unavailable" | "reranker_temporarily_unavailable";
             /** @description Human-readable error summary. */
             message: string;
             /**
@@ -6433,10 +6433,18 @@ export interface components {
             /** @description Number of tools available (present for native mode) */
             tools_count?: number;
         };
-        /** @description Emitted when an error occurs during retrieval */
+        /** @description Terminal retrieval failure. Capacity events carry the complete InferenceCapacityError envelope, including message, reason, retryable and retry_after_ms; generic failures may carry only error. */
         SSEError: {
-            /** @description Error message */
+            /** @description Error message or stable machine-readable code. */
             error: string;
+            /** @description Human-readable error description. */
+            message?: string;
+            /** @enum {string} */
+            reason?: "inference_capacity" | "inference_admission";
+            /** @description Whether the failure is temporary and the request may be retried. */
+            retryable?: boolean;
+            /** @description Minimum retry delay in milliseconds. */
+            retry_after_ms?: number;
         };
         /** @description Statistics from token-based document pruning */
         PruneStats: {
@@ -15334,6 +15342,17 @@ export interface components {
                 "application/json": components["schemas"]["QueryConflictError"];
             };
         };
+        /** @description Agent query dependencies or inference capacity are temporarily unavailable. */
+        AgentTemporarilyUnavailable: {
+            headers: {
+                /** @description Minimum retry delay in seconds. */
+                "Retry-After": number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["QueryTemporarilyUnavailableError"] | components["schemas"]["InferenceCapacityError"];
+            };
+        };
         /** @description A query dependency or read path is temporarily unavailable and the request is safe to retry */
         QueryTemporarilyUnavailable: {
             headers: {
@@ -16504,6 +16523,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            503: components["responses"]["AgentTemporarilyUnavailable"];
         };
     };
     retrievalAgent: {
@@ -16552,7 +16572,7 @@ export interface operations {
                 };
             };
             502: components["responses"]["QueryBadGateway"];
-            503: components["responses"]["QueryTemporarilyUnavailable"];
+            503: components["responses"]["AgentTemporarilyUnavailable"];
             504: components["responses"]["QueryGatewayTimeout"];
         };
     };

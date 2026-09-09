@@ -16,4 +16,4 @@ pub const split_bench_root = "pkg/antfly/src/split_bench_root.zig";
 pub const wal_bench_root = "pkg/antfly/src/wal_bench_root.zig";
 pub const derived_log_bench_root = "pkg/antfly/src/derived_log_bench_root.zig";
 pub const replay_bench_root = "pkg/antfly/src/replay_bench_root.zig";
-pub const algebraic_bench_root = "pkg/antfly/src/algebraic_bench_root.zig";
+pub const storage_bench_root = "pkg/antfly/src/storage_bench_root.zig";

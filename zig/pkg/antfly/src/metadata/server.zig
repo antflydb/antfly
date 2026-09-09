@@ -81,6 +81,7 @@ pub const MetadataServer = struct {
     owned_public_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null,
     owned_public_http_server: ?*public_api_kernel.ApiHttpServer = null,
     owned_admin_mux: ?*MetadataAdminMux = null,
+    http_observer_lease: ?@import("../storage/background_runtime.zig").BackendRuntime.WorkerLease = null,
     owned_http_runtime: ?*httpx.HttpRuntime = null,
     owned_admin_listener: ?*MetadataAdminHttpRuntime = null,
     restore_supervisor_owner_id: u64 = 0,
@@ -168,6 +169,8 @@ pub const MetadataServer = struct {
         };
         var owned_admin_mux: ?*MetadataAdminMux = null;
         errdefer if (owned_admin_mux) |mux| alloc.destroy(mux);
+        var http_observer_lease: ?@import("../storage/background_runtime.zig").BackendRuntime.WorkerLease = null;
+        errdefer if (http_observer_lease) |*lease| lease.release();
         var owned_http_runtime: ?*httpx.HttpRuntime = null;
         errdefer if (owned_http_runtime) |http_runtime| {
             http_runtime.deinit();
@@ -203,7 +206,7 @@ pub const MetadataServer = struct {
             public_read_source.* = api_table_reads.HostedProvisionedTableReadSource.init(
                 replica_root_dir,
                 catalog,
-                raft.read_gate.noopReadableLeaseRequester(),
+                raft.read_gate.alreadyReadSafeBarrier(),
                 data_router,
                 svc.raft.host.http_host.request_executor,
             );
@@ -277,8 +280,10 @@ pub const MetadataServer = struct {
             owned_admin_mux = mux;
 
             const listener_server_config = metadataAdminHttpxConfig(listener_cfg, null);
+            http_observer_lease = try (try svc.ensureBackendRuntime()).acquireWorkers(.{});
             const http_runtime = try alloc.create(httpx.HttpRuntime);
             http_runtime.* = httpx.HttpRuntime.init(alloc, .{
+                .observer_io = http_observer_lease.?.io(),
                 .max_active_h1_requests = listener_server_config.max_connections,
                 .max_active_connections = @as(usize, listener_server_config.max_connections) +| health_server.max_connections,
                 .max_active_requests = @as(usize, listener_server_config.max_request_tasks) +| health_server.max_connections,
@@ -308,6 +313,7 @@ pub const MetadataServer = struct {
             .owned_public_write_source = owned_public_write_source,
             .owned_public_http_server = owned_public_http_server,
             .owned_admin_mux = owned_admin_mux,
+            .http_observer_lease = http_observer_lease,
             .owned_http_runtime = owned_http_runtime,
             .owned_admin_listener = owned_admin_listener,
         };
@@ -336,6 +342,8 @@ pub const MetadataServer = struct {
             http_runtime.deinit();
             self.alloc.destroy(http_runtime);
         }
+        if (self.http_observer_lease) |*lease| lease.release();
+        self.http_observer_lease = null;
         if (self.owned_admin_mux) |mux| {
             self.alloc.destroy(mux);
         }

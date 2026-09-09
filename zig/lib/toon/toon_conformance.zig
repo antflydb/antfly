@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, subcommand, "fetch")) {
         const root_dir = args.next() orelse default_root_dir;
-        try ensureFixturesAvailable(alloc, root_dir, true);
+        try ensureFixturesAvailable(alloc, init.io, root_dir, true);
         std.debug.print("toon-format/spec fixtures ready at {s}\n", .{root_dir});
         return;
     }
@@ -76,7 +76,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        try ensureFixturesAvailable(alloc, config.root_dir, config.allow_fetch);
+        try ensureFixturesAvailable(alloc, init.io, config.root_dir, config.allow_fetch);
         const summary = try runFixtures(alloc, config);
         std.debug.print(
             "toon conformance: files={d} tests={d} passed={d} expected_errors={d} failed={d}\n",
@@ -99,10 +99,10 @@ fn printUsage(argv0: []const u8) void {
     , .{ argv0, argv0, argv0 });
 }
 
-fn ensureFixturesAvailable(alloc: Allocator, root_dir: []const u8, allow_fetch: bool) !void {
+fn ensureFixturesAvailable(alloc: Allocator, io: std.Io, root_dir: []const u8, allow_fetch: bool) !void {
     if (fixturesPresent(alloc, root_dir)) return;
     if (!allow_fetch) return error.ToonFixturesUnavailable;
-    try runChild(&.{ "git", "clone", "--depth=1", default_repo_url, root_dir });
+    try runChild(io, &.{ "git", "clone", "--depth=1", default_repo_url, root_dir });
     if (!fixturesPresent(alloc, root_dir)) return error.ToonFixturesUnavailable;
 }
 
@@ -277,17 +277,14 @@ fn jsonEqual(a: std.json.Value, b: std.json.Value) bool {
     };
 }
 
-fn runChild(argv: []const []const u8) !void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-
-    var child = try std.process.spawn(io_impl.io(), .{
+fn runChild(io: std.Io, argv: []const []const u8) !void {
+    var child = try std.process.spawn(io, .{
         .argv = argv,
         .stdin = .ignore,
         .stdout = .inherit,
         .stderr = .inherit,
     });
-    const term = try child.wait(io_impl.io());
+    const term = try child.wait(io);
     switch (term) {
         .exited => |code| if (code != 0) return error.ChildProcessFailed,
         else => return error.ChildProcessFailed,

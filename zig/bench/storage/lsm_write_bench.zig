@@ -879,16 +879,19 @@ const ReadWorker = struct {
 };
 
 fn benchHotOverwriteWithReaders(scenario: *Scenario, keys: []const []u8, value: []const u8) !void {
+    var worker_io = std.Io.Threaded.init(scenario.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(scenario.cfg.readers) });
+    defer worker_io.deinit();
+    const scheduling_io = worker_io.io();
     var stop = std.atomic.Value(bool).init(false);
     const workers = try scenario.allocator.alloc(ReadWorker, scenario.cfg.readers);
     defer scenario.allocator.free(workers);
-    var threads = try scenario.allocator.alloc(std.Thread, scenario.cfg.readers);
+    const threads = try scenario.allocator.alloc(std.Io.Future(void), scenario.cfg.readers);
     defer scenario.allocator.free(threads);
 
     var started: usize = 0;
     errdefer {
         stop.store(true, .release);
-        for (threads[0..started]) |thread| thread.join();
+        for (threads[0..started]) |*future| future.await(scheduling_io);
     }
 
     for (workers, 0..) |*worker, i| {
@@ -898,13 +901,13 @@ fn benchHotOverwriteWithReaders(scenario: *Scenario, keys: []const []u8, value: 
             .stop = &stop,
             .worker_index = i,
         };
-        threads[i] = try std.Thread.spawn(.{}, ReadWorker.run, .{worker});
+        threads[i] = try scheduling_io.concurrent(ReadWorker.run, .{worker});
         started += 1;
     }
 
     try benchHotOverwriteNoReaders(scenario, keys, value);
     stop.store(true, .release);
-    for (threads[0..started]) |thread| thread.join();
+    for (threads[0..started]) |*future| future.await(scheduling_io);
     started = 0;
 
     for (workers) |worker| scenario.read_stats.add(worker.stats);

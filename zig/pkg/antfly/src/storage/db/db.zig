@@ -58,6 +58,7 @@ const promotion_runtime_mod = @import("promotion_runtime.zig");
 const resolver_lib = @import("antfly_resolver");
 const backfill_state_mod = @import("backfill_state.zig");
 const range_state_mod = @import("range_state.zig");
+const merge_state_mod = @import("merge_state.zig");
 const types = @import("types.zig");
 const document_artifact_child_range = @import("document_artifact_child_range.zig");
 const aggregations_mod = @import("aggregations.zig");
@@ -76,6 +77,7 @@ test {
     _ = index_generation_manifest;
     _ = native_backup;
     _ = root_identity;
+    _ = merge_state_mod;
 }
 
 const change_journal_mod = @import("derived/change_journal.zig");
@@ -599,6 +601,11 @@ pub const OpenOptions = struct {
     /// pins inside the same atomic storage generation as their indexes.
     index_repair_checkpoint_storage: ?lsm_backend_mod.Storage = null,
     physical_root_mode: PhysicalRootMode = .filesystem_managed,
+    /// Durable identity supplied by an externally owned physical backend.
+    /// Filesystem-managed roots persist their own checkpoint; container
+    /// backends such as Lite must bind the DB to the container generation and
+    /// logical namespace that actually owns its bytes.
+    external_root_incarnation: u128 = 0,
     /// Optional enrichment providers. `DB.open` takes ownership of every
     /// non-null provider when called, including when the open subsequently
     /// fails. A successfully opened DB releases them from `close`.
@@ -2174,7 +2181,7 @@ const EnrichmentAppendContext = struct {
     ha_async_batch_mirror: ?HAAsyncBatchMirror = null,
     ha_async_metadata_mirror: ?HAAsyncMetadataMirror = null,
     ha_write_gate: ?HAWriteGate = null,
-    identity_visibility_owner_slot: ?*const std.atomic.Value(?*DB) = null,
+    identity_visibility: ?*db_core.IdentityVisibilityState = null,
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
     promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
 
@@ -2204,7 +2211,7 @@ const EnrichmentAppendContext = struct {
             .ha_async_batch_mirror = self.ha_async_batch_mirror,
             .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
             .ha_write_gate = self.ha_write_gate,
-            .identity_visibility_owner_slot = self.identity_visibility_owner_slot,
+            .identity_visibility = self.identity_visibility,
             .enrichment_runtime = null,
             .resolution_runtime = self.resolution_runtime,
             .promotion_runtime = self.promotion_runtime,
@@ -2252,7 +2259,7 @@ const BatchExecutionContext = struct {
     ha_async_batch_mirror: ?HAAsyncBatchMirror = null,
     ha_async_metadata_mirror: ?HAAsyncMetadataMirror = null,
     ha_write_gate: ?HAWriteGate = null,
-    identity_visibility_owner_slot: ?*const std.atomic.Value(?*DB) = null,
+    identity_visibility: ?*db_core.IdentityVisibilityState = null,
 };
 
 const ReplayApplyContext = struct {
@@ -2268,7 +2275,22 @@ const ReplayApplyContextBatch = struct {
 const TtlCleanupContext = struct {
     batch: BatchExecutionContext,
     grace_period_ns: u64,
-    identity_visibility_owner: std.atomic.Value(?*DB) = std.atomic.Value(?*DB).init(null),
+};
+
+/// Stable owner for transaction recovery callbacks. `DB.open` returns its
+/// public wrapper by value, so a background worker must never retain the
+/// address of that movable wrapper. The recovery-only snapshot is allocated
+/// after startup has initialized every shared subsystem and remains at a fixed
+/// address until the worker has joined during close.
+const TransactionRecoveryLocalContext = struct {
+    stable_owner: ?*DB = null,
+    /// A recovery call borrows replaceable providers for its entire mutation.
+    /// Reconfiguration takes this lock before retiring any provider runtime.
+    provider_mutex: Io.Mutex = .init,
+    /// Borrowed split state published under the core apply lock. The public DB
+    /// wrapper is movable, so its `shadow` field is not a stable source for the
+    /// recovery owner allocated during open.
+    split_shadow: ?*ShadowState = null,
 };
 
 const ManagedSyncTargets = struct {
@@ -4388,7 +4410,7 @@ fn spinOrYield() void {
     if (builtin.os.tag == .freestanding) {
         std.atomic.spinLoopHint();
     } else {
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
 }
 
@@ -4455,7 +4477,7 @@ fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
             continue;
         }
         if (attempts < 128) {
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
             continue;
         }
         const backoff_step = @min(attempts - 128, 5);
@@ -4475,7 +4497,7 @@ fn lockAtomicWithCancellation(mutex: *std.atomic.Mutex, cancellation: types.Canc
         if (builtin.os.tag == .freestanding or builtin.single_threaded or attempts < 64) {
             std.atomic.spinLoopHint();
         } else if (attempts < 128) {
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
         } else {
             const backoff_step = @min(attempts - 128, 5);
             sleepNs(@min(@as(u64, 50_000) << @intCast(backoff_step), @as(u64, 1_000_000)));
@@ -4535,7 +4557,7 @@ fn lockAtomicWithBackoffProfiled(mutex: *std.atomic.Mutex, stats: *MutexContenti
             continue;
         }
         if (attempts < 128) {
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
             yield_loops += 1;
             continue;
         }
@@ -4601,7 +4623,7 @@ fn lockApplyWithBackoffProfiled(rw_lock: *apply_rw_lock_mod.ApplyRwLock, stats: 
             continue;
         }
         if (attempts < 128) {
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
             yield_loops += 1;
             continue;
         }
@@ -4846,7 +4868,8 @@ fn makeLsmBackgroundExecutor(runtime: *background_runtime_mod.BackendRuntime, ow
 }
 
 fn installLsmReadRuntime(options: *lsm_backend_mod.Options, runtime: *background_runtime_mod.BackendRuntime) void {
-    if (options.native_storage_pool == null) options.native_storage_pool = runtime.nativeStoragePool();
+    if (options.storage == null) options.storage = runtime.storage();
+    if (options.storage == null and options.native_storage_pool == null) options.native_storage_pool = runtime.nativeStoragePool();
     if (options.read_runtime != null) return;
     if (runtime.io()) |io| options.read_runtime = lsm_backend_mod.storage_io.ReadRuntime.init(io);
 }
@@ -4976,7 +4999,7 @@ pub const DB = struct {
     primary_lsm_storage: ?lsm_backend_mod.Storage,
     physical_root_mode: OpenOptions.PhysicalRootMode,
     index_backends: db_config.IndexBackendOptions,
-    core: db_core.DBCore,
+    core: *db_core.DBCore,
     /// Parsed once per authoritative schema generation. The apply lock guards
     /// replacement and every write-side read; startup initializes it before
     /// workers are published.
@@ -5037,6 +5060,7 @@ pub const DB = struct {
     ttl_cleanup_context: ?*TtlCleanupContext,
     ttl_runtime: ?*ttl_runtime_mod.TtlRuntime,
     transaction_recovery_identity_context: ?*db_core.TransactionRecoveryIdentityContext,
+    transaction_recovery_local_context: ?*TransactionRecoveryLocalContext,
     transaction_runtime: ?*transaction_runtime_mod.Runtime,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime,
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime,
@@ -5056,7 +5080,8 @@ pub const DB = struct {
     // Background retry of quarantined index loads (see retryQuarantinedIndexLoads).
     // Started after the DB reaches its final address; exits once all
     // quarantined indexes recover or the DB closes.
-    quarantine_retry_thread: ?std.Thread = null,
+    quarantine_retry_future: ?std.Io.Future(void) = null,
+    quarantine_retry_stop_event: Io.Event = .unset,
     quarantine_retry_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     quarantine_retry_start_address_for_test: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     artifact_repair_metadata_future: ?Io.Future(void) = null,
@@ -5065,25 +5090,11 @@ pub const DB = struct {
     relational_columns_rebuild_requested: std.atomic.Value(bool) = .init(false),
     relational_column_maintenance: relational_columns.Maintenance = .{},
     artifact_metadata_retry_after_ns: u64 = 0,
-    shadow: ?ShadowState,
+    shadow: ?*ShadowState,
     bulk_ingest_coalescer: @This().BulkIngestCoalescer = .{},
     flushing_bulk_ingest_coalescer: bool = false,
     bulk_ingest_identity_all_new: bool = false,
     bulk_ingest_identity_state: doc_identity.AllNewTrustedState = .{},
-    identity_visibility_summary_cache: ?doc_identity.VisibilitySummary = null,
-    // Memoizes the resolved live-doc set for broad (.all) live filtering at a
-    // single identity read generation. Visibility at a fixed generation is
-    // stable, so the entry only turns over when queries arrive at a newer
-    // generation. Guarded by its own mutex because published-path queries do
-    // not hold the apply lock.
-    live_doc_set_cache_mutex: std.atomic.Mutex = .unlocked,
-    live_doc_set_cache_generation: ?u64 = null,
-    live_doc_set_cache_set: ?doc_set.ResolvedDocSet = null,
-    nonvisible_doc_set_cache_mutex: std.atomic.Mutex = .unlocked,
-    nonvisible_doc_set_cache_generation: ?u64 = null,
-    nonvisible_doc_set_cache_set: ?doc_set.ResolvedDocSet = null,
-    nonvisible_doc_set_cache_overflow: bool = false,
-    nonvisible_doc_set_cache_entries: AtomicU64 = AtomicU64.init(0),
     // Status snapshots are reconstructed from durable state on every poll, so
     // volatile worker observations need an independently owned cache. Keeping
     // it on the resident DB (rather than inside a returned DBStats value) lets
@@ -5182,6 +5193,7 @@ pub const DB = struct {
             .repair_replay_mutex = resources.repair_replay_mutex,
             .log_mutex = resources.log_mutex,
             .identity_namespace = resources.identity_namespace,
+            .identity_visibility = &self.core.identity_visibility,
             .artifact_cleanup_maybe = resources.artifact_cleanup_maybe,
             .executor = self.executor,
             .io = self.backend_runtime.io(),
@@ -5633,8 +5645,10 @@ pub const DB = struct {
                 if (owned_executor) |ptr| runtime_alloc.destroy(ptr);
                 if (owned_async_context) |ptr| runtime_alloc.destroy(ptr);
             }
+            if (opts.index_repair_checkpoint_storage == null)
+                opts.index_repair_checkpoint_storage = backend_runtime.storage();
             var effective_executor = opts.executor;
-            if (backend_runtime.io_impl == null and effective_executor.backend == .io_threaded) {
+            if ((backend_runtime.io() == null or backend_runtime.usesBorrowedIo()) and effective_executor.backend == .io_threaded) {
                 effective_executor.backend = .manual;
             }
             const backend_owner_id = try backend_runtime.allocOwnerId();
@@ -5698,6 +5712,13 @@ pub const DB = struct {
                 bind_cache_resource_manager,
                 effective_index_backends,
             );
+            const core_owner = try alloc.create(db_core.DBCore);
+            var core_owner_initialized = false;
+            var core_owner_transferred = false;
+            errdefer if (!core_owner_transferred) {
+                if (core_owner_initialized) core_owner.deinit();
+                alloc.destroy(core_owner);
+            };
             const open_primary_started_ns = monotonicTimeNs();
             var opened_primary = try openPrimaryStore(alloc, path, core_opts);
             var opened_primary_owned = true;
@@ -5755,12 +5776,13 @@ pub const DB = struct {
             const ha_standby_role = haWriteGateIsStandby(ha_write_gate);
             const start_index_workers = opts.open_mode.allowsIndexWorkers() and opts.start_index_workers and !ha_standby_role;
 
-            const initialized_core = try db_core.DBCore.fromOpened(
+            core_owner.* = try db_core.DBCore.fromOpened(
                 alloc,
                 backend_runtime.io() orelse backend_runtime.filesystemIo() orelse std.Options.debug_io,
                 core,
             );
             core_owned = false;
+            core_owner_initialized = true;
             var db = DB{
                 .alloc = alloc,
                 .runtime_alloc = runtime_alloc,
@@ -5770,7 +5792,7 @@ pub const DB = struct {
                 .primary_lsm_storage = resolved_config.primary_lsm_storage,
                 .physical_root_mode = opts.physical_root_mode,
                 .index_backends = resolved_config.index_backends,
-                .core = initialized_core,
+                .core = core_owner,
                 .async_context = async_context,
                 .backend_runtime = backend_runtime,
                 .backend_owner_id = backend_owner_id,
@@ -5799,11 +5821,13 @@ pub const DB = struct {
                 .ttl_cleanup_context = null,
                 .ttl_runtime = null,
                 .transaction_recovery_identity_context = null,
+                .transaction_recovery_local_context = null,
                 .transaction_runtime = null,
                 .text_merge_runtime = null,
                 .sparse_compaction_runtime = null,
                 .shadow = null,
             };
+            core_owner_transferred = true;
             backend_owner_transferred = true;
             repair_cleanup_owner_transferred = true;
             ha_recovery_owner_transferred = true;
@@ -5825,6 +5849,8 @@ pub const DB = struct {
             {
                 const identity = try loadOrCreateDurableRootIdentity(alloc, db.backend_runtime, path);
                 db.root_incarnation = identity.incarnation;
+            } else if (opts.physical_root_mode == .external_backend) {
+                db.root_incarnation = opts.external_root_incarnation;
             }
             if (opts.schema_before_index_load) |prepared_schema| {
                 // This option is used by the metadata-authoritative local
@@ -6164,7 +6190,6 @@ pub const DB = struct {
     }
 
     pub fn setQueryVisibilityHook(self: *DB, hook: ?QueryVisibilityHook) void {
-        if (hook != null) self.bindTtlIdentityVisibilityOwner();
         var pending_hook: ?QueryVisibilityHook = null;
         lockAtomic(&self.async_context.query_visibility_hook_mutex);
         self.async_context.query_visibility_hook = hook;
@@ -6247,21 +6272,24 @@ pub const DB = struct {
         }
     }
 
-    fn bindTtlIdentityVisibilityOwner(self: *DB) void {
-        const ttl_ctx = self.ttl_cleanup_context orelse return;
-        ttl_ctx.identity_visibility_owner.store(self, .release);
-
-        // DB.open returns the wrapper by value, so optional runtimes are
-        // initialized before a managed writer reaches its stable cache
-        // address. Refresh any TTL mutation that may have landed during that
-        // move window when the serving layer attaches its visibility hook.
-        lockApply(self);
-        defer self.core.unlockApply();
-        if (doc_identity.visibilitySummaryFromStore(self.core.store) catch null) |summary| {
-            self.identity_visibility_summary_cache = summary;
-            self.clearLiveDocSetCache();
-            self.clearNonVisibleDocSetCache();
-        }
+    fn prepareTransactionRecoveryOwner(self: *DB) !void {
+        const ctx = self.transaction_recovery_local_context orelse return;
+        if (ctx.stable_owner != null) return;
+        ctx.split_shadow = self.shadow;
+        const stable_owner = try self.runtime_alloc.create(DB);
+        stable_owner.* = self.*;
+        // The snapshot shares durable/core/runtime pointers, but it must not
+        // alias wrapper-owned caches, maps, or mutex state. Visibility is
+        // owned by the shared core. Replaceable enrichment state is borrowed
+        // from the shared async context only while provider_mutex is held.
+        stable_owner.bulk_ingest_coalescer = .{};
+        stable_owner.flushing_bulk_ingest_coalescer = false;
+        stable_owner.bulk_ingest_identity_all_new = false;
+        stable_owner.bulk_ingest_identity_state = .{};
+        stable_owner.bulk_ingest_seen_doc_keys = .{};
+        stable_owner.enrichment_runtime = null;
+        stable_owner.enrichment_append_context = null;
+        ctx.stable_owner = stable_owner;
     }
 
     fn notifyAsyncContextVisibilityHook(ptr: *anyopaque) void {
@@ -6583,6 +6611,11 @@ pub const DB = struct {
     ) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
 
+        const recovery = self.transaction_recovery_local_context;
+        const recovery_io = self.backend_runtime.io();
+        if (recovery) |ctx| ctx.provider_mutex.lockUncancelable(recovery_io.?);
+        defer if (recovery) |ctx| ctx.provider_mutex.unlock(recovery_io.?);
+
         var owned_cfg = cfg;
         var cfg_owned = true;
         errdefer if (cfg_owned) self.deinitEnrichmentConfig(&owned_cfg);
@@ -6776,7 +6809,7 @@ pub const DB = struct {
             },
             .grace_period_ns = cfg.grace_period_ns,
         };
-        ttl_ctx.batch.identity_visibility_owner_slot = &ttl_ctx.identity_visibility_owner;
+        ttl_ctx.batch.identity_visibility = &self.core.identity_visibility;
         const runtime = try self.runtime_alloc.create(ttl_runtime_mod.TtlRuntime);
         errdefer self.runtime_alloc.destroy(runtime);
         runtime.* = try ttl_runtime_mod.TtlRuntime.init(
@@ -6806,8 +6839,13 @@ pub const DB = struct {
         errdefer identity_ctx.deinit();
         identity_ctx.resource_manager = self.core.index_manager.resource_manager;
         identity_ctx.io = self.backend_runtime.io() orelse std.Options.debug_io;
+        const local_ctx = try self.runtime_alloc.create(TransactionRecoveryLocalContext);
+        errdefer self.runtime_alloc.destroy(local_ctx);
+        local_ctx.* = .{};
         var effective_cfg = cfg;
         effective_cfg.resolution_extra_hooks = db_core.transactionRecoveryIdentityHooks(identity_ctx);
+        effective_cfg.local_resolution_ctx = local_ctx;
+        effective_cfg.resolve_local_fn = resolveRecoveredLocalTransaction;
 
         const runtime = try self.runtime_alloc.create(transaction_runtime_mod.Runtime);
         errdefer self.runtime_alloc.destroy(runtime);
@@ -6819,6 +6857,7 @@ pub const DB = struct {
         );
         errdefer runtime.deinit();
         self.transaction_recovery_identity_context = identity_ctx;
+        self.transaction_recovery_local_context = local_ctx;
         self.transaction_runtime = runtime;
     }
 
@@ -6893,12 +6932,19 @@ pub const DB = struct {
         }
         if (self.ttl_runtime) |runtime| try runtime.start();
         if (self.transaction_runtime) |runtime| {
-            runtime.config.local_resolution_ctx = self;
-            runtime.config.resolve_local_fn = resolveRecoveredLocalTransaction;
+            try self.prepareTransactionRecoveryOwner();
             try runtime.start();
         }
         if (self.text_merge_runtime) |runtime| try runtime.start();
         if (self.sparse_compaction_runtime) |runtime| try runtime.start();
+    }
+
+    /// Publish non-joining shutdown to optional workers before a borrowed
+    /// deterministic scheduler drains them. Destruction still happens through
+    /// the ordinary close path after the drain completes.
+    pub fn beginTeardown(self: *DB) void {
+        if (self.enrichment_runtime) |runtime| runtime.beginTeardown();
+        if (self.transaction_runtime) |runtime| runtime.beginTeardown();
     }
 
     pub fn ensureTransactionRecoveryRuntime(self: *DB, cfg: transaction_runtime_mod.Config) !void {
@@ -6909,8 +6955,7 @@ pub const DB = struct {
         try self.initOptionalTransactionRuntime(cfg);
         if (self.optional_runtime_workers_enabled) {
             const runtime = self.transaction_runtime.?;
-            runtime.config.local_resolution_ctx = self;
-            runtime.config.resolve_local_fn = resolveRecoveredLocalTransaction;
+            try self.prepareTransactionRecoveryOwner();
             try runtime.start();
         }
     }
@@ -6973,21 +7018,11 @@ pub const DB = struct {
     }
 
     fn clearLiveDocSetCache(self: *DB) void {
-        lockAtomic(&self.live_doc_set_cache_mutex);
-        defer self.live_doc_set_cache_mutex.unlock();
-        if (self.live_doc_set_cache_set) |*cached| cached.deinit(self.alloc);
-        self.live_doc_set_cache_set = null;
-        self.live_doc_set_cache_generation = null;
+        self.core.identity_visibility.clearLive();
     }
 
     fn clearNonVisibleDocSetCache(self: *DB) void {
-        lockAtomic(&self.nonvisible_doc_set_cache_mutex);
-        defer self.nonvisible_doc_set_cache_mutex.unlock();
-        if (self.nonvisible_doc_set_cache_set) |*cached| cached.deinit(self.alloc);
-        self.nonvisible_doc_set_cache_set = null;
-        self.nonvisible_doc_set_cache_generation = null;
-        self.nonvisible_doc_set_cache_overflow = false;
-        self.nonvisible_doc_set_cache_entries.store(0, .monotonic);
+        self.core.identity_visibility.clearNonvisible();
     }
 
     fn clearEmbeddingActivityCache(self: *DB) void {
@@ -7005,6 +7040,21 @@ pub const DB = struct {
         self.stopArtifactRepairMetadataWorker();
         self.stopPortableActivationRetryWorker();
         self.stopQuarantineRetryWorker();
+        if (self.transaction_runtime) |runtime| {
+            runtime.deinit();
+            self.runtime_alloc.destroy(runtime);
+            self.transaction_runtime = null;
+        }
+        if (self.transaction_recovery_local_context) |ctx| {
+            if (ctx.stable_owner) |owner| self.runtime_alloc.destroy(owner);
+            self.runtime_alloc.destroy(ctx);
+            self.transaction_recovery_local_context = null;
+        }
+        if (self.transaction_recovery_identity_context) |ctx| {
+            ctx.deinit();
+            self.runtime_alloc.destroy(ctx);
+            self.transaction_recovery_identity_context = null;
+        }
         // Close may flush/coalesce derived watermarks while workers are
         // stopping. That must not call back into the write/status cache after
         // optional runtimes or index state have started tearing down.
@@ -7034,14 +7084,6 @@ pub const DB = struct {
         self.clearActiveIndexRepairsLocked();
         self.active_index_repairs.deinit(self.alloc);
         self.closeShadowIndexManagerLocked() catch {};
-        if (self.transaction_runtime) |runtime| {
-            runtime.deinit();
-            self.runtime_alloc.destroy(runtime);
-        }
-        if (self.transaction_recovery_identity_context) |ctx| {
-            ctx.deinit();
-            self.runtime_alloc.destroy(ctx);
-        }
         if (self.ttl_runtime) |runtime| {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
@@ -7086,7 +7128,9 @@ pub const DB = struct {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
         }
-        self.core.deinit();
+        const core = self.core;
+        core.deinit();
+        self.alloc.destroy(core);
         // Publication locks are opened and closed through the DB runtime's
         // `std.Io`. Release the read generation before destroying an owned
         // runtime, while still retaining the lease until all physical DB
@@ -7896,7 +7940,7 @@ pub const DB = struct {
             if (attempts >= 2000) {
                 return std.testing.expectEqual(expected, backend.snapshotMaintenanceStats().obsolete_paths_reclaimable);
             }
-            std.Thread.yield() catch {};
+            std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
     }
 
@@ -8042,6 +8086,11 @@ pub const DB = struct {
     fn projectedBatchLsmAdmissionBytes(req: types.BatchRequest) u64 {
         var payload_bytes: u64 = 0;
         var operations: u64 = 0;
+        for (req.merge_artifacts) |write| {
+            payload_bytes +|= @intCast(write.key.len);
+            payload_bytes +|= @intCast(write.value.len);
+            operations +|= 1;
+        }
         for (req.writes) |write| {
             payload_bytes +|= @intCast(write.key.len);
             payload_bytes +|= @intCast(write.value.len);
@@ -8262,7 +8311,12 @@ pub const DB = struct {
                     if (replication.sequence == 0) return error.InvalidBatchRequest;
                     const applied = try self.core.loadSplitDeltaFinalSeq(self.alloc);
                     if (replication.sequence <= applied) return false;
-                    if (replication.sequence != applied + 1) return error.SplitReplicationSequenceGap;
+                    if (replication.previous_sequence) |previous| {
+                        if (previous >= replication.sequence) return error.InvalidBatchRequest;
+                        if (previous != applied) return error.SplitReplicationSequenceGap;
+                    } else if (replication.sequence != applied + 1) {
+                        return error.SplitReplicationSequenceGap;
+                    }
                 },
                 .checkpoint => {
                     const checkpoint = req.split_checkpoint orelse return error.MissingSplitReplicationCheckpoint;
@@ -8584,6 +8638,7 @@ pub const DB = struct {
         opts: BatchExecutionOptions,
         allocator_guard: *PreparedRowAllocator,
     ) anyerror!void {
+        try types.validateMergeArtifacts(req);
         const max_prepared_generation_retries = 2;
         var retry_count: usize = 0;
         // Provider results are semantic request data, not schema/index-plan
@@ -8972,6 +9027,42 @@ pub const DB = struct {
                     unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
                     return;
                 },
+            }
+        }
+
+        // Checkpoints certify a copy; payloads must use a separately fenced
+        // command so a stale checkpoint cannot smuggle destructive mutations.
+        if (req.merge_checkpoint != null and (req.writes.len != 0 or req.deletes.len != 0 or
+            req.merge_artifacts.len != 0 or req.transforms.len != 0 or
+            req.graph_writes.len != 0 or req.graph_deletes.len != 0))
+            return error.InvalidBatchRequest;
+        if (req.merge_replication) |replication| if (req.merge_checkpoint == null) {
+            const raw = try merge_state_mod.loadRawAlloc(self.alloc, self.core.store);
+            defer if (raw) |value| self.alloc.free(value);
+            var state = if (raw) |value| try merge_state_mod.decodeAlloc(self.alloc, value) else null;
+            defer if (state) |*value| value.deinit(self.alloc);
+            if (!merge_state_mod.copyAllowed(state, replication)) {
+                if (!opts.bypass_ha_write_gate) return error.MergeCopyFenced;
+                // A delayed committed command must advance the receipt without
+                // touching documents, artifacts, indexes or visibility state.
+                if (opts.raft_applied_entry_marker) |identity| {
+                    var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
+                    try self.core.store.putBatch(&.{raftAppliedEntryWrite(identity, &marker_buf)}, &.{});
+                }
+                self.core.unlockApply();
+                apply_mutex_held = false;
+                return;
+            }
+        };
+
+        if (req.merge_artifacts.len > 0) {
+            if (!req.merge_replication.?.identity_namespace.eql(self.core.identity_namespace))
+                return error.DocIdentityNamespaceMismatch;
+            for (req.merge_artifacts) |row| {
+                const owner = (try internal_keys.decodeDocumentComponentAlloc(self.alloc, row.key)) orelse
+                    return error.InvalidBatchRequest;
+                defer self.alloc.free(owner);
+                if (!self.core.byteRange().contains(owner)) return error.KeyOutOfRange;
             }
         }
 
@@ -9490,6 +9581,10 @@ pub const DB = struct {
         }
 
         try store_writes.appendSlice(self.alloc, timestamp_writes.items);
+        for (req.merge_artifacts) |row| {
+            try store_writes.append(self.alloc, .{ .key = row.key, .value = row.value });
+            try appendUniqueOwnedKeyIndexed(self.alloc, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, row.key);
+        }
         for (explicit_embedding_artifact_writes.items) |write| {
             try store_writes.append(self.alloc, .{
                 .key = write.key,
@@ -9599,7 +9694,7 @@ pub const DB = struct {
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.precompute_generated_ns, precompute_generated_start_ns);
         }
-        if (explicit_embedding_artifact_writes.items.len > 0 or
+        if (req.merge_artifacts.len > 0 or explicit_embedding_artifact_writes.items.len > 0 or
             explicit_graph_artifact_writes.items.len > 0 or
             precomputed_generated.artifact_writes.len > 0)
         {
@@ -9878,6 +9973,10 @@ pub const DB = struct {
         }
         var split_range_value: ?[]u8 = null;
         defer if (split_range_value) |value| self.alloc.free(value);
+        var merge_range_value: ?[]u8 = null;
+        defer if (merge_range_value) |value| self.alloc.free(value);
+        var merge_state_value = std.ArrayListUnmanaged(u8).empty;
+        defer merge_state_value.deinit(self.alloc);
         var split_sequence_buf: [8]u8 = undefined;
         var split_marker_buf: [4 * @sizeOf(u64) + 1]u8 = undefined;
         var persisted_range: ?types.ByteRange = null;
@@ -9918,6 +10017,43 @@ pub const DB = struct {
                     .bootstrap_complete = checkpoint.kind == .destination_complete,
                 }, &split_marker_buf),
             });
+        }
+        if (req.merge_checkpoint) |checkpoint| {
+            if (checkpoint.receiver_identity_reassignment_namespace) |namespace| {
+                if (!checkpoint.allow_doc_identity_reassignment or
+                    !self.core.identity_namespace.eql(namespace))
+                    return error.DocIdentityNamespaceMismatch;
+            } else if (checkpoint.allow_doc_identity_reassignment) {
+                return error.InvalidBatchRequest;
+            }
+            const existing_raw = try merge_state_mod.loadRawAlloc(self.alloc, self.core.store);
+            defer if (existing_raw) |value| self.alloc.free(value);
+            var existing_state: ?merge_state_mod.State = if (existing_raw) |value|
+                try merge_state_mod.decodeAlloc(self.alloc, value)
+            else
+                null;
+            defer if (existing_state) |*state| state.deinit(self.alloc);
+            const plan = try merge_state_mod.planCheckpointApply(
+                self.alloc,
+                if (existing_state) |*state| state else null,
+                self.core.byteRange(),
+                checkpoint,
+            );
+            defer plan.deinit(self.alloc);
+            persisted_range = plan.range;
+            persisted_range_start_owned = try self.alloc.dupe(u8, plan.range.start);
+            persisted_range_end_owned = try self.alloc.dupe(u8, plan.range.end);
+            merge_range_value = try range_state_mod.encodeRangeAlloc(self.alloc, plan.range);
+            try store_writes.append(self.alloc, .{
+                .key = range_state_mod.range_key,
+                .value = merge_range_value.?,
+            });
+            try merge_state_mod.encode(&merge_state_value, self.alloc, plan.state);
+            try store_writes.append(self.alloc, .{
+                .key = merge_state_mod.key,
+                .value = merge_state_value.items,
+            });
+            try delete_keys.append(self.alloc, merge_state_mod.legacy_key);
         }
         try appendDenseArtifactCounterMutations(
             self.alloc,
@@ -10042,7 +10178,7 @@ pub const DB = struct {
             } else if (append_derived_replay) deferred_ha_gates.append(try appendHAReplayPayloadCommitLockedContext(&ha_ctx, replay_payload));
         }
         if (pending_identity_visibility_summary) |summary| {
-            self.identity_visibility_summary_cache = summary;
+            self.core.identity_visibility.summary = summary;
             self.clearLiveDocSetCache();
             self.clearNonVisibleDocSetCache();
         }
@@ -10266,7 +10402,7 @@ pub const DB = struct {
         if (!try self.primaryUserNamespaceIsEmptyLocked()) return;
         if (try doc_identity.loadAllNewTrustedStateForNamespace(self.core.store, self.core.identity_namespace)) |state| {
             self.bulk_ingest_identity_state = state;
-            self.identity_visibility_summary_cache = state.visibility_summary;
+            self.core.identity_visibility.summary = state.visibility_summary;
             self.clearLiveDocSetCache();
             self.clearNonVisibleDocSetCache();
             self.bulk_ingest_identity_all_new = true;
@@ -10996,7 +11132,7 @@ pub const DB = struct {
         if (builtin.is_test and test_block_generated_artifact_finalization.load(.acquire)) {
             test_generated_artifact_finalization_entered.store(true, .release);
             while (!test_release_generated_artifact_finalization.load(.acquire)) {
-                std.Thread.yield() catch {};
+                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
         }
         try finalizeRetiredIndexCleanupContext(ctx, index_name, cleanup_key);
@@ -19158,7 +19294,10 @@ pub const DB = struct {
 
         const shadow_index_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ shadow_indexes_path, cfg.name });
         defer alloc.free(shadow_index_path);
-        if (!resume_candidate and cfg.kind == .algebraic) try ensureDirPath(shadow_index_path);
+        // Generation manifests belong to the repair owner. Storage backends
+        // may keep index data in a separate namespace and need not create
+        // this filesystem directory as a side effect of opening an index.
+        try ensureDirPath(shadow_index_path);
         const shadow_checkpoint_path = try std.fmt.allocPrint(alloc, "{s}/applied-sequences", .{shadow_base});
         defer alloc.free(shadow_checkpoint_path);
         if (options.capacity_check) |check| try check.bindCandidateRoot(shadow_base);
@@ -19192,8 +19331,11 @@ pub const DB = struct {
             }
         }
 
+        // Detached index entries are adopted by the serving manager. Their
+        // mutexes, configs and runtime objects must share its allocator, even
+        // when this repair was requested through a short-lived HTTP arena.
         var shadow_manager = try index_manager_mod.IndexManager.initWithOptions(
-            alloc,
+            self.core.index_manager.alloc,
             shadow_base,
             self.index_backends,
         );
@@ -19686,7 +19828,7 @@ pub const DB = struct {
         if (durable_repair_id) |repair_id| try self.validateIndexRepairActivationState(alloc, repair_id, options.owner_epoch);
         try ensureRepairActivationDeadline(activation_deadline_ns);
         const previous_active_pointer = try self.core.index_manager.captureActiveIndexRootPointer(cfg.name);
-        defer if (previous_active_pointer) |value| alloc.free(value);
+        defer if (previous_active_pointer) |value| self.core.index_manager.alloc.free(value);
         try ensureRepairActivationDeadline(activation_deadline_ns);
         if (durable_repair_id) |repair_id| try self.updateIndexRepairIntent(alloc, repair_id, .{
             .phase = .activating,
@@ -20884,13 +21026,18 @@ pub const DB = struct {
 
         try self.core.registerShadowIndexes(self.alloc, shadow_manager);
 
-        self.shadow = .{
+        const shadow = try self.alloc.create(ShadowState);
+        shadow.* = .{
             .manager = shadow_manager,
             .base_path = base_path,
             .indexes_path = indexes_path,
             .range_start = shadow_start,
             .range_end = shadow_end,
         };
+        self.shadow = shadow;
+        if (self.transaction_recovery_local_context) |ctx| {
+            ctx.split_shadow = self.shadow;
+        }
     }
 
     pub fn closeShadowIndexManager(self: *DB) !void {
@@ -20905,12 +21052,16 @@ pub const DB = struct {
     fn closeShadowIndexManagerLocked(self: *DB) !void {
         try waitForSplitShadowDrainLocked(self, false);
         const shadow = self.shadow orelse return;
+        if (self.transaction_recovery_local_context) |ctx| {
+            ctx.split_shadow = null;
+        }
         shadow.manager.deinit();
         self.alloc.destroy(shadow.manager);
         self.alloc.free(shadow.base_path);
         self.alloc.free(shadow.indexes_path);
         self.alloc.free(shadow.range_start);
         self.alloc.free(shadow.range_end);
+        self.alloc.destroy(shadow);
         self.shadow = null;
     }
 
@@ -20998,9 +21149,11 @@ pub const DB = struct {
                 // reconciliation round trip, while waiting after the global
                 // barrier closes would deadlock its eventual publication.
                 error.EnrichmentRetryInProgress => {
-                    const now_ns = platform_time.monotonicNs();
+                    const wait_clock = self.backend_runtime.monotonicClock();
+                    const now_ns = wait_clock.nowRealtimeNs();
                     if (now_ns >= deadline_ns) return error.EnrichmentWaitTimeout;
-                    sleepNs(@min(25 * std.time.ns_per_ms, deadline_ns - now_ns));
+                    const sleep_ns = @min(25 * std.time.ns_per_ms, deadline_ns - now_ns);
+                    wait_clock.sleepMs(@max(1, @divTrunc(sleep_ns +| std.time.ns_per_ms - 1, std.time.ns_per_ms)));
                     continue;
                 },
                 else => return err,
@@ -21347,6 +21500,203 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
         try self.core.index_manager.syncAll(force);
+    }
+
+    /// Raw primary outcomes for a transition snapshot. Do not use public scan
+    /// projection here: it can hydrate derived fields into the returned JSON.
+    pub fn mergeDocumentsPage(self: *DB, alloc: Allocator, byte_range: types.ByteRange, after_key: ?[]const u8) ![]types.BatchWrite {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        const lower = if (after_key) |key| try internal_keys.documentKeyAlloc(alloc, key) else try documentRangeLowerAlloc(alloc, byte_range.start);
+        defer alloc.free(lower);
+        const upper = if (byte_range.end.len > 0) try documentRangeUpperAlloc(alloc, byte_range.end) else null;
+        defer if (upper) |key| alloc.free(key);
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        cursor.setUpperBound(upper);
+        var rows = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        errdefer {
+            for (rows.items) |row| {
+                alloc.free(row.key);
+                alloc.free(row.value);
+            }
+            rows.deinit(alloc);
+        }
+        var bytes: usize = 0;
+        var next = try cursor.seekAtOrAfter(lower);
+        while (next) |row| : (next = try cursor.next()) {
+            if (upper) |bound| if (std.mem.order(u8, row.key, bound) != .lt) break;
+            if (!internal_keys.isPrimaryDocumentKey(row.key)) continue;
+            const key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, row.key)).?;
+            errdefer alloc.free(key);
+            if (after_key) |after| if (std.mem.order(u8, key, after) != .gt) {
+                alloc.free(key);
+                continue;
+            };
+            const value = try alloc.dupe(u8, row.value);
+            errdefer alloc.free(value);
+            try rows.append(alloc, .{ .key = key, .value = value });
+            bytes +|= key.len +| value.len;
+            if (rows.items.len >= 128 or bytes >= 1024 * 1024) break;
+        }
+        return rows.toOwnedSlice(alloc);
+    }
+
+    /// Returns a bounded page of authoritative artifacts under a transition
+    /// lease. The continuation is an exclusive physical store key. One large
+    /// row may exceed the byte budget so pagination always makes progress.
+    pub fn mergeArtifactsPage(
+        self: *DB,
+        alloc: Allocator,
+        byte_range: types.ByteRange,
+        after_key: ?[]const u8,
+    ) ![]types.BatchWrite {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        const lower = try documentRangeLowerAlloc(alloc, byte_range.start);
+        defer alloc.free(lower);
+        const upper = if (byte_range.end.len > 0) try documentRangeUpperAlloc(alloc, byte_range.end) else null;
+        defer if (upper) |key| alloc.free(key);
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        cursor.setUpperBound(upper);
+        var rows = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        errdefer {
+            for (rows.items) |row| {
+                alloc.free(row.key);
+                alloc.free(row.value);
+            }
+            rows.deinit(alloc);
+        }
+        var bytes: usize = 0;
+        var next = try cursor.seekAtOrAfter(after_key orelse lower);
+        while (next) |row| : (next = try cursor.next()) {
+            if (upper) |bound| if (std.mem.order(u8, row.key, bound) != .lt) break;
+            if (after_key) |key| if (std.mem.order(u8, row.key, key) != .gt) continue;
+            if (!isMergeArtifactKey(row.key)) continue;
+            const value = if (internal_keys.isGraphEdgeArtifactKey(row.key)) graph: {
+                const edge = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(alloc, row.key)) orelse return error.InvalidBatchRequest;
+                defer {
+                    alloc.free(edge.doc_key);
+                    alloc.free(edge.index_name);
+                    alloc.free(edge.edge_type);
+                    alloc.free(edge.target_doc_key);
+                }
+                const index = self.core.index_manager.graphIndex(edge.index_name) orelse continue;
+                var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, row.value);
+                defer decoded.deinit(alloc);
+                if (enrichment_artifact_codec.isLegacyUnboundGraphEdge(row.value)) continue;
+                if (decoded.generation != index.config.coverage_generation and
+                    !enrichment_artifact_codec.isPortableUnboundGraphEdge(row.value)) continue;
+                // Authenticate against the donor generation, then mark the
+                // edge portable. Receiver replay binds its own generation;
+                // copying the donor generation would silently discard it.
+                break :graph try enrichment_artifact_codec.encodePortableUnboundGraphEdgeAlloc(
+                    alloc,
+                    decoded.weight,
+                    decoded.created_at,
+                    decoded.updated_at,
+                    decoded.metadata_json,
+                );
+            } else try alloc.dupe(u8, row.value);
+            errdefer alloc.free(value);
+            const key = try alloc.dupe(u8, row.key);
+            errdefer alloc.free(key);
+            try rows.append(alloc, .{ .key = key, .value = value });
+            bytes +|= key.len +| value.len;
+            if (rows.items.len >= 128 or bytes >= 1024 * 1024) break;
+        }
+        return rows.toOwnedSlice(alloc);
+    }
+
+    /// Imports donor-owned derived artifacts into a live merge receiver while
+    /// both DBs are protected by transition leases. Primary documents are
+    /// copied separately from the authoritative Raft apply projection.
+    ///
+    /// The Raft apply projection used by range coordination deliberately stores
+    /// only primary documents. It therefore cannot reconstruct stripped inputs
+    /// such as `_edges` or explicit embeddings by itself. Copy the authoritative
+    /// document-scoped store rows and live graph projection before cutover so a
+    /// successful merge cannot publish primary data with incomplete indexes.
+    pub fn importMergeRangeFromTransitionDonor(
+        self: *DB,
+        donor: *DB,
+        byte_range: types.ByteRange,
+    ) !void {
+        if (self == donor or std.mem.eql(u8, self.core.path, donor.core.path))
+            return error.InvalidArgument;
+
+        // Transition activity prevents new public writes. The DB apply locks
+        // additionally give this copy one coherent donor view and keep index
+        // mutation atomic with respect to receiver maintenance. Order by path
+        // so independently initiated transitions cannot invert these locks.
+        const donor_first = std.mem.order(u8, donor.core.path, self.core.path) == .lt;
+        if (donor_first) {
+            donor.core.lockApplyShared();
+            self.core.lockApply();
+        } else {
+            self.core.lockApply();
+            donor.core.lockApplyShared();
+        }
+        defer if (donor_first) {
+            self.core.unlockApply();
+            donor.core.unlockApplyShared();
+        } else {
+            donor.core.unlockApplyShared();
+            self.core.unlockApply();
+        };
+
+        const store_lower = try documentRangeLowerAlloc(self.alloc, byte_range.start);
+        defer self.alloc.free(store_lower);
+        const store_upper = if (byte_range.end.len > 0)
+            try documentRangeUpperAlloc(self.alloc, byte_range.end)
+        else
+            null;
+        defer if (store_upper) |key| self.alloc.free(key);
+        const donor_rows = try donor.core.scanStoreRange(
+            self.alloc,
+            store_lower,
+            if (store_upper) |key| key else "",
+        );
+        defer docstore_mod.DocStore.freeResults(self.alloc, donor_rows);
+
+        var derived_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer derived_writes.deinit(self.alloc);
+        for (donor_rows) |row| {
+            if (!internal_keys.isGraphEdgeArtifactKey(row.key) and
+                !internal_keys.isEmbeddingArtifactKey(row.key) and
+                !internal_keys.isDerivedEmbeddingArtifactKey(row.key)) continue;
+            try derived_writes.append(self.alloc, .{ .key = row.key, .value = row.value });
+        }
+        if (derived_writes.items.len > 0) {
+            const raw_writes: []const docstore_mod.KVPair = @ptrCast(derived_writes.items);
+            try self.core.store.putBatch(raw_writes, &.{});
+            try applySplitEmbeddingArtifactsFromBatch(
+                self.core.store,
+                self.core.index_manager,
+                derived_writes.items,
+                &.{},
+                &.{},
+            );
+        }
+        _ = try self.core.index_manager.copyGraphSplitDestinationFrom(
+            donor.core.index_manager,
+            byte_range.start,
+            byte_range.end,
+        );
+        try applySplitGraphArtifactsInRange(
+            self.alloc,
+            byte_range.start,
+            byte_range.end,
+            self.core.store,
+            self.core.index_manager,
+        );
+        try self.core.index_manager.syncAll(true);
+        try self.core.syncStore(true);
     }
 
     fn restoreSnapshotStoreTo(
@@ -24645,6 +24995,16 @@ pub const DB = struct {
         return try self.admitManagedIndex(cfg);
     }
 
+    /// VOPR-only preparation seam for a committed managed catalog admission
+    /// whose durable outbox has not yet been materialized. This exposes the
+    /// same crash boundary used by production recovery without pausing while
+    /// an apply or structural lock is held.
+    pub fn prepareManagedIndexAdmissionForVopr(self: *DB, cfg: types.IndexConfig) !void {
+        if (!builtin.is_test) return error.VoprTestSeamUnavailable;
+        const installed = try self.installIndexWhileEnrichmentQuiesced(cfg, .managed);
+        if (!installed.managed_admission_pending) return error.InvalidManagedIndexAdmission;
+    }
+
     pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var ha_mutation = self.acquireHAMutationShared();
@@ -26307,6 +26667,7 @@ pub const DB = struct {
         const wait = derived_executor_mod.VisibilityWait{
             .cancellation = cancellation,
             .deadline_ns = deadline_ns,
+            .clock = self.backend_runtime.monotonicClock(),
         };
         var stable_target = sequence;
         while (true) {
@@ -26614,9 +26975,9 @@ pub const DB = struct {
         if (!self.start_index_workers) return;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return;
         if (self.artifact_repair_metadata_future != null) return;
-        const io_impl = self.backend_runtime.io_impl orelse return;
+        const io = self.backend_runtime.io() orelse return;
         self.artifact_repair_metadata_stop.store(false, .release);
-        self.artifact_repair_metadata_future = io_impl.io().concurrent(artifactRepairMetadataWorkerMain, .{self}) catch |err| {
+        self.artifact_repair_metadata_future = io.concurrent(artifactRepairMetadataWorkerMain, .{self}) catch |err| {
             std.log.warn("artifact repair metadata worker spawn failed: {}", .{err});
             return;
         };
@@ -26625,8 +26986,8 @@ pub const DB = struct {
     fn stopArtifactRepairMetadataWorker(self: *DB) void {
         self.artifact_repair_metadata_stop.store(true, .release);
         if (self.artifact_repair_metadata_future) |*future| {
-            if (self.backend_runtime.io_impl) |io_impl| {
-                _ = future.await(io_impl.io());
+            if (self.backend_runtime.io()) |io| {
+                _ = future.await(io);
             }
             self.artifact_repair_metadata_future = null;
         }
@@ -26948,7 +27309,7 @@ pub const DB = struct {
     }
 
     /// Start only after the DB has reached its final address. The spawned
-    /// thread retains `self` after this call returns.
+    /// task retains `self` after this call returns.
     pub fn startQuarantineRetryWorkerIfNeeded(self: *DB) void {
         // Tests drive retries deterministically via retryQuarantinedIndexLoads;
         // a background worker racing them turns every quarantine-shaped test
@@ -26961,9 +27322,12 @@ pub const DB = struct {
         }
         if (comptime builtin.single_threaded or builtin.os.tag == .freestanding) return;
         if (!self.optional_runtime_workers_enabled or self.open_mode != .writer) return;
-        if (self.quarantine_retry_thread != null) return;
+        if (self.quarantine_retry_future != null) return;
         if (!self.core.index_manager.hasLoadFailures()) return;
-        self.quarantine_retry_thread = std.Thread.spawn(.{}, quarantineRetryWorkerMain, .{self}) catch |err| {
+        const io = self.backend_runtime.io() orelse return;
+        self.quarantine_retry_stop.store(false, .release);
+        self.quarantine_retry_stop_event.reset();
+        self.quarantine_retry_future = io.concurrent(quarantineRetryWorkerMain, .{self}) catch |err| {
             // Self-healing is best-effort: the quarantine still recovers on
             // the next open or via drop+recreate.
             std.log.warn("quarantine retry worker spawn failed: {}", .{err});
@@ -26981,18 +27345,28 @@ pub const DB = struct {
 
     fn stopQuarantineRetryWorker(self: *DB) void {
         self.quarantine_retry_stop.store(true, .release);
-        if (self.quarantine_retry_thread) |thread| {
-            thread.join();
-            self.quarantine_retry_thread = null;
+        if (self.quarantine_retry_future) |*future| {
+            const io = self.backend_runtime.io().?;
+            self.quarantine_retry_stop_event.set(io);
+            future.await(io);
+            self.quarantine_retry_future = null;
         }
     }
 
     fn quarantineRetryWorkerMain(self: *DB) void {
+        const io = self.backend_runtime.io().?;
         while (true) {
-            var slept: u64 = 0;
-            while (slept < quarantine_retry_poll_ns) : (slept += quarantine_retry_sleep_slice_ns) {
-                if (self.quarantine_retry_stop.load(.acquire)) return;
-                sleepNs(quarantine_retry_sleep_slice_ns);
+            const deadline_ns = std.Io.Clock.awake.now(io).toNanoseconds() +| quarantine_retry_poll_ns;
+            while (!self.quarantine_retry_stop.load(.acquire)) {
+                const now_ns = std.Io.Clock.awake.now(io).toNanoseconds();
+                if (now_ns >= deadline_ns) break;
+                self.quarantine_retry_stop_event.waitTimeout(io, .{ .duration = .{
+                    .raw = .fromNanoseconds(deadline_ns - now_ns),
+                    .clock = .awake,
+                } }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    error.Canceled => return,
+                };
             }
             if (self.quarantine_retry_stop.load(.acquire)) return;
             const result = self.retryQuarantinedIndexLoads(false) catch |err| {
@@ -29246,10 +29620,12 @@ pub const DB = struct {
         else
             default_visibility_wait_timeout_ms;
         const timeout_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
-        const deadline_ns = platform_time.monotonicNs() +| timeout_ns;
+        const visibility_clock = self.backend_runtime.monotonicClock();
+        const deadline_ns = visibility_clock.nowRealtimeNs() +| timeout_ns;
         const wait = derived_executor_mod.VisibilityWait{
             .cancellation = cancellation,
             .deadline_ns = deadline_ns,
+            .clock = visibility_clock,
         };
         switch (sync_level) {
             .propose, .write => try self.executor.failIfUnhealthy(),
@@ -30385,7 +30761,7 @@ pub const DB = struct {
         // being overlaid, so refresh the maintained O(1) identity summary at
         // the same apply-lock boundary before publishing live counters.
         var identity_stats = try doc_identity.fastStatsFromStore(self.core.store);
-        applyCachedIdentityVisibilitySummary(&identity_stats, self.identity_visibility_summary_cache);
+        applyCachedIdentityVisibilitySummary(&identity_stats, self.core.identity_visibility.summary);
         runtime_stats.source_doc_count = identity_stats.live_ordinals;
         runtime_stats.doc_identity = dbDocIdentityStats(identity_stats, self.core.identity_namespace);
         runtime_stats.columnar_maintenance = self.relational_column_maintenance.snapshot();
@@ -30780,7 +31156,7 @@ pub const DB = struct {
         std.debug.assert(prepared.alloc.ptr == self.alloc.ptr and prepared.alloc.vtable == self.alloc.vtable);
         std.debug.assert(prepared.runtime_alloc.ptr == self.runtime_alloc.ptr and prepared.runtime_alloc.vtable == self.runtime_alloc.vtable);
         self.clearBulkIngestIdentityAllNewLocked();
-        self.identity_visibility_summary_cache = prepared.identity_summary;
+        self.core.identity_visibility.summary = prepared.identity_summary;
         self.clearLiveDocSetCache();
         self.clearNonVisibleDocSetCache();
         self.core.replaceSchemaOwnedPrepared(prepared.schema, &prepared.schema_replacement);
@@ -31045,7 +31421,7 @@ pub const DB = struct {
 
     fn currentIdentityReadGeneration(self: *DB) !u64 {
         var current_generation = self.core.nextDerivedSequence();
-        if (self.identity_visibility_summary_cache) |summary| {
+        if (self.core.identity_visibility.summary) |summary| {
             return @max(current_generation, doc_identity.latestGenerationFromSummary(summary));
         }
         if (try doc_identity.latestGenerationFromSummaryFast(self.core.store)) |identity_generation| {
@@ -31062,7 +31438,7 @@ pub const DB = struct {
     }
 
     fn snapshotVisibilityStats(self: *DB) types.VisibilityStats {
-        return self.visibility_runtime_stats.snapshot(self.nonvisible_doc_set_cache_entries.load(.monotonic));
+        return self.visibility_runtime_stats.snapshot(self.core.identity_visibility.nonvisible_entries.load(.monotonic));
     }
 
     const DocIdentityCoverage = struct {
@@ -31110,7 +31486,7 @@ pub const DB = struct {
         // previous durable summary until the bulk window is published. Runtime
         // owners must publish the maintained live summary rather than making
         // status wait for a flush or fall back to a primary scan.
-        applyCachedIdentityVisibilitySummary(&raw_identity_stats, self.identity_visibility_summary_cache);
+        applyCachedIdentityVisibilitySummary(&raw_identity_stats, self.core.identity_visibility.summary);
         const identity_stats = dbDocIdentityStats(raw_identity_stats, self.core.identity_namespace);
         // Operational status is polled frequently. Identity metadata is the
         // normal O(1) source of the live document count; retain the legacy
@@ -33693,10 +34069,10 @@ pub const DB = struct {
         exec_ctx: types.ExecutionContext,
     ) !planning_stats_mod.PlanningStatsSummary {
         _ = exec_ctx;
-        try planning_bindings_mod.validateSearchRequestBindings(&self.core, self.alloc, req);
+        try planning_bindings_mod.validateSearchRequestBindings(self.core, self.alloc, req);
         return try planning_adapter_mod.collectSearchRequestStatsAlloc(
             alloc,
-            &self.core,
+            self.core,
             self,
             planningStatsSearchRequestCallback,
             req,
@@ -34066,10 +34442,10 @@ pub const DB = struct {
             return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, &all_set, generation);
         };
         {
-            lockAtomic(&self.live_doc_set_cache_mutex);
-            defer self.live_doc_set_cache_mutex.unlock();
-            if (self.live_doc_set_cache_generation == gen) {
-                if (self.live_doc_set_cache_set) |*cached| {
+            lockAtomic(&self.core.identity_visibility.live_mutex);
+            defer self.core.identity_visibility.live_mutex.unlock();
+            if (self.core.identity_visibility.live_generation == gen) {
+                if (self.core.identity_visibility.live_set) |*cached| {
                     return try doc_set.cloneAlloc(alloc, cached);
                 }
             }
@@ -34077,11 +34453,11 @@ pub const DB = struct {
         var computed = try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, &all_set, generation);
         errdefer computed.deinit(alloc);
         if (doc_set.cloneAlloc(self.alloc, &computed)) |cloned| {
-            lockAtomic(&self.live_doc_set_cache_mutex);
-            defer self.live_doc_set_cache_mutex.unlock();
-            if (self.live_doc_set_cache_set) |*old| old.deinit(self.alloc);
-            self.live_doc_set_cache_set = cloned;
-            self.live_doc_set_cache_generation = gen;
+            lockAtomic(&self.core.identity_visibility.live_mutex);
+            defer self.core.identity_visibility.live_mutex.unlock();
+            if (self.core.identity_visibility.live_set) |*old| old.deinit(self.alloc);
+            self.core.identity_visibility.live_set = cloned;
+            self.core.identity_visibility.live_generation = gen;
         } else |_| {
             // Caching is best-effort; the computed set is still returned.
         }
@@ -34113,14 +34489,14 @@ pub const DB = struct {
             );
         };
         {
-            lockAtomic(&self.nonvisible_doc_set_cache_mutex);
-            defer self.nonvisible_doc_set_cache_mutex.unlock();
-            if (self.nonvisible_doc_set_cache_generation == gen) {
-                if (self.nonvisible_doc_set_cache_overflow) {
+            lockAtomic(&self.core.identity_visibility.nonvisible_mutex);
+            defer self.core.identity_visibility.nonvisible_mutex.unlock();
+            if (self.core.identity_visibility.nonvisible_generation == gen) {
+                if (self.core.identity_visibility.nonvisible_overflow) {
                     self.visibility_runtime_stats.recordCacheHit();
                     return null;
                 }
-                if (self.nonvisible_doc_set_cache_set) |*cached| {
+                if (self.core.identity_visibility.nonvisible_set) |*cached| {
                     self.visibility_runtime_stats.recordCacheHit();
                     return try doc_set.cloneAlloc(alloc, cached);
                 }
@@ -34139,25 +34515,25 @@ pub const DB = struct {
             // Overflow (more non-visible docs than the budget) is also worth
             // remembering, so each query does not rescan before falling back
             // to the include-set path.
-            lockAtomic(&self.nonvisible_doc_set_cache_mutex);
-            defer self.nonvisible_doc_set_cache_mutex.unlock();
-            if (self.nonvisible_doc_set_cache_set) |*old| old.deinit(self.alloc);
-            self.nonvisible_doc_set_cache_set = null;
-            self.nonvisible_doc_set_cache_generation = gen;
-            self.nonvisible_doc_set_cache_overflow = true;
-            self.nonvisible_doc_set_cache_entries.store(0, .monotonic);
+            lockAtomic(&self.core.identity_visibility.nonvisible_mutex);
+            defer self.core.identity_visibility.nonvisible_mutex.unlock();
+            if (self.core.identity_visibility.nonvisible_set) |*old| old.deinit(self.alloc);
+            self.core.identity_visibility.nonvisible_set = null;
+            self.core.identity_visibility.nonvisible_generation = gen;
+            self.core.identity_visibility.nonvisible_overflow = true;
+            self.core.identity_visibility.nonvisible_entries.store(0, .monotonic);
             return null;
         };
         self.visibility_runtime_stats.recordBuild(platform_time.monotonicNs() -| build_start_ns);
         errdefer computed.deinit(alloc);
         if (doc_set.cloneAlloc(self.alloc, &computed)) |cloned| {
-            lockAtomic(&self.nonvisible_doc_set_cache_mutex);
-            defer self.nonvisible_doc_set_cache_mutex.unlock();
-            if (self.nonvisible_doc_set_cache_set) |*old| old.deinit(self.alloc);
-            self.nonvisible_doc_set_cache_set = cloned;
-            self.nonvisible_doc_set_cache_generation = gen;
-            self.nonvisible_doc_set_cache_overflow = false;
-            self.nonvisible_doc_set_cache_entries.store(1, .monotonic);
+            lockAtomic(&self.core.identity_visibility.nonvisible_mutex);
+            defer self.core.identity_visibility.nonvisible_mutex.unlock();
+            if (self.core.identity_visibility.nonvisible_set) |*old| old.deinit(self.alloc);
+            self.core.identity_visibility.nonvisible_set = cloned;
+            self.core.identity_visibility.nonvisible_generation = gen;
+            self.core.identity_visibility.nonvisible_overflow = false;
+            self.core.identity_visibility.nonvisible_entries.store(1, .monotonic);
         } else |_| {
             // Caching is best-effort; the computed set is still returned.
         }
@@ -34231,7 +34607,7 @@ pub const DB = struct {
     }
 
     fn allDocsVisibleSummaryFastMaybe(self: *DB, generation: ?u64) !?bool {
-        if (self.identity_visibility_summary_cache) |summary| {
+        if (self.core.identity_visibility.summary) |summary| {
             return doc_identity.allVisibleFromSummary(summary, generation);
         }
         return try doc_identity.allVisibleFromSummaryFast(self.core.store, generation);
@@ -35228,10 +35604,45 @@ pub const DB = struct {
             if (spins < 64) {
                 std.atomic.spinLoopHint();
             } else {
-                std.Thread.yield() catch {};
+                @import("antfly_platform").time.yieldNow();
             }
         }
         return true;
+    }
+
+    /// Nonblocking production-protocol microsteps used by VOPR. They expose
+    /// the lock-free reader/catalog-writer admission state machine without
+    /// copying the protocol into a test model or parking a deterministic
+    /// executor on native atomic waits.
+    pub fn beginPublishedDenseCaptureForVopr(self: *DB, index_name: []const u8) bool {
+        if (!builtin.is_test) return false;
+        if (!self.beginPublishedDenseSearch()) return false;
+        if (self.core.denseIndex(index_name) == null) {
+            self.endPublishedDenseSearch();
+            return false;
+        }
+        return true;
+    }
+
+    pub fn endPublishedDenseCaptureForVopr(self: *DB) void {
+        if (!builtin.is_test) return;
+        self.endPublishedDenseSearch();
+    }
+
+    pub fn beginIndexCatalogBarrierForVopr(self: *DB) bool {
+        if (!builtin.is_test) return false;
+        const previous = self.published_dense_admission.fetchOr(published_dense_catalog_closed, .acq_rel);
+        return previous & published_dense_catalog_closed == 0;
+    }
+
+    pub fn indexCatalogBarrierDrainedForVopr(self: *const DB) bool {
+        if (!builtin.is_test) return false;
+        return self.indexCatalogBarrierActive() and self.publishedDenseSearchCount() == 0;
+    }
+
+    pub fn endIndexCatalogBarrierForVopr(self: *DB) void {
+        if (!builtin.is_test) return;
+        self.endIndexCatalogBarrier();
     }
 
     fn endIndexCatalogBarrier(self: *DB) void {
@@ -35255,7 +35666,7 @@ pub const DB = struct {
             if (spins < 64) {
                 std.atomic.spinLoopHint();
             } else {
-                std.Thread.yield() catch {};
+                @import("antfly_platform").time.yieldNow();
             }
         }
         return true;
@@ -35408,7 +35819,7 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         if (builtin.is_test and test_block_match_all_ordinal_lookup.load(.acquire)) {
             test_match_all_ordinal_lookup_entered.store(true, .release);
-            while (!test_release_match_all_ordinal_lookup.load(.acquire)) std.Thread.yield() catch {};
+            while (!test_release_match_all_ordinal_lookup.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
         return try self.lookupLiveDocOrdinalNoLock(alloc, doc_id, generation);
     }
@@ -37522,6 +37933,12 @@ fn isMetadataKey(key: []const u8) bool {
         internal_keys.isTtlKey(key);
 }
 
+fn isMergeArtifactKey(key: []const u8) bool {
+    return internal_keys.isGraphEdgeArtifactKey(key) or
+        internal_keys.isEmbeddingArtifactKey(key) or
+        internal_keys.isDerivedEmbeddingArtifactKey(key);
+}
+
 fn isPrimaryDocumentStoreKey(key: []const u8) bool {
     return internal_keys.isStoredDocumentRowKey(key);
 }
@@ -37586,7 +38003,7 @@ fn shouldAppendSplitDeltaForContext(ctx: *const BatchExecutionContext) bool {
 }
 
 fn splitShadowRequiresMaterializedDerivedBatch(self: *DB) bool {
-    if (self.shadow == null) return false;
+    if (activeSplitShadow(self) == null) return false;
     const state = self.core.splitState() orelse return false;
     return state.phase == .splitting;
 }
@@ -37743,6 +38160,10 @@ fn encodeThinReplayRecordPayload(
 
     for (changed_artifact_keys) |key| {
         try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, key);
+        if (internal_keys.isEmbeddingArtifactKey(key) or internal_keys.isDerivedEmbeddingArtifactKey(key)) {
+            try appendUniqueReplayRecordHint(alloc, &target_hints, .dense_vector);
+            try appendUniqueReplayRecordHint(alloc, &target_hints, .sparse_vector);
+        }
         if (internal_keys.isChunkArtifactRecordKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .full_text);
         if (internal_keys.isGraphEdgeArtifactKey(key) or internal_keys.isAssetArtifactKey(key) or internal_keys.isChunkArtifactRecordKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
         if (internal_keys.isAssetArtifactKey(key)) {
@@ -38231,7 +38652,7 @@ fn remoteRenderConfig(
             config.remote_content = db.remote_content;
         }
         if (comptime @hasField(template_remote.RenderConfig, "io")) {
-            config.io = db.backend_runtime.inferenceIo();
+            config.io = db.backend_runtime.inferenceIo() orelse db.backend_runtime.io();
         }
     }
     if (comptime @hasField(template_remote.RenderConfig, "max_media_parts")) {
@@ -45722,7 +46143,7 @@ fn checkLookupOptionsActive(opts: types.LookupOptions) !void {
         if (cancellation.isCancelled()) return error.Cancelled;
     }
     if (opts.execution_deadline_ns) |deadline_ns| {
-        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        if (opts.executionNowNs() >= deadline_ns) return error.Timeout;
     }
 }
 
@@ -46690,13 +47111,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
         .payload = replay_payload,
     });
     if (pending_identity_visibility_summary) |summary| {
-        if (ctx.identity_visibility_owner_slot) |slot| {
-            if (slot.load(.acquire)) |owner| {
-                owner.identity_visibility_summary_cache = summary;
-                owner.clearLiveDocSetCache();
-                owner.clearNonVisibleDocSetCache();
-            }
-        }
+        if (ctx.identity_visibility) |visibility| visibility.publish(summary);
     }
     var deferred_ha_gates = HADeferredCommitGates.begin(ctx);
     defer deferred_ha_gates.releaseTransition();
@@ -48085,8 +48500,8 @@ test "external dense bulk waiter owns admission across catch-up handoff" {
         }
     };
     var waiter = Waiter{ .ctx = &ctx };
-    const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
-    defer waiter_thread.join();
+    var waiter_thread = try std.testing.io.concurrent(Waiter.run, .{&waiter});
+    defer waiter_thread.await(std.testing.io);
 
     const wait_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
     while (ctx.waiting_external_dense_bulk_sessions.load(.acquire) == 0) {
@@ -48566,11 +48981,11 @@ test "storage.ha resolution handoff fence rejects completion after durable HA re
         .resolution_key = resolution_key,
         .pause = &pause,
     };
-    const thread = try std.Thread.spawn(.{}, WriteProbe.run, .{&probe});
+    var thread = try std.testing.io.concurrent(WriteProbe.run, .{&probe});
     var thread_joined = false;
     errdefer {
         pause.release.set(pause.io);
-        if (!thread_joined) thread.join();
+        if (!thread_joined) thread.await(std.testing.io);
     }
 
     pause.reached.waitUncancelable(pause.io);
@@ -48591,7 +49006,7 @@ test "storage.ha resolution handoff fence rejects completion after durable HA re
     public_gate.publishPrimaryFence(true);
     pause.release.set(pause.io);
     transition_mutex.unlock();
-    thread.join();
+    thread.await(std.testing.io);
     thread_joined = true;
 
     try std.testing.expectEqual(@as(u8, 1), probe.result.load(.acquire));
@@ -56359,8 +56774,16 @@ fn startAsyncWorkers(self: *DB) !void {
     }
 }
 
+fn activeSplitShadow(self: *DB) ?*ShadowState {
+    // Recovery and the serving wrapper share the same ticket/mutex owner.
+    // The context is updated under the primary apply fence during split setup
+    // and teardown; a copied wrapper must not capture stale split ownership.
+    if (self.transaction_recovery_local_context) |ctx| return ctx.split_shadow;
+    return self.shadow;
+}
+
 fn reserveSplitShadowApplyTicket(self: *DB) ?u64 {
-    const shadow = if (self.shadow) |*active| active else return null;
+    const shadow = activeSplitShadow(self) orelse return null;
     const state = self.core.splitState() orelse return null;
     if (state.phase != .splitting) return null;
     const ticket = shadow.next_ticket;
@@ -56369,7 +56792,7 @@ fn reserveSplitShadowApplyTicket(self: *DB) ?u64 {
 }
 
 fn applyCommittedBatchToShadowOrdered(self: *DB, batch: derived_types.DerivedBatch, ticket: u64) void {
-    const shadow = if (self.shadow) |*active| active else return;
+    const shadow = activeSplitShadow(self) orelse return;
     const io = self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse std.Options.debug_io;
     shadow.apply_mutex.lockUncancelable(io);
     while (shadow.applied_ticket != ticket) {
@@ -56424,7 +56847,7 @@ fn applyCommittedBatchToShadow(self: *DB, shadow: *ShadowState, batch: derived_t
 /// a ticket, while already-committed owners need only the shadow-local mutex and
 /// can therefore drain without a lock cycle.
 fn waitForSplitShadowDrainLocked(self: *DB, require_clean: bool) !void {
-    const shadow = if (self.shadow) |*active| active else return;
+    const shadow = activeSplitShadow(self) orelse return;
     const io = self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse std.Options.debug_io;
     shadow.apply_mutex.lockUncancelable(io);
     while (shadow.applied_ticket != shadow.next_ticket) {
@@ -56706,7 +57129,7 @@ fn rebaseRangeCoverageMetadata(
     try store.putBatch(writes.items, &.{});
 }
 
-fn finalizePrimarySplitPreservingIdentity(
+fn finalizePrimarySplitPreservingMetadata(
     self: *DB,
     split_lower: []const u8,
     retained_range: types.ByteRange,
@@ -56715,6 +57138,7 @@ fn finalizePrimarySplitPreservingIdentity(
     const identity_rows = try self.core.store.scanRange(self.alloc, range.lower[0..], range.upper[0..]);
     defer docstore_mod.DocStore.freeResults(self.alloc, identity_rows);
 
+    try merge_state_mod.protectForSplit(self.alloc, self.core.store);
     _ = try tryFinalizePrimarySplitFast(self, split_lower);
     try putIdentityMetadataRows(self.alloc, self.core.store, identity_rows);
     try rebaseRangeCoverageMetadata(
@@ -56731,6 +57155,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
     const split_lower = try documentRangeLowerAlloc(self.alloc, byte_range.start);
     defer self.alloc.free(split_lower);
 
+    try merge_state_mod.protectForSplit(self.alloc, self.core.store);
     const page_split_built = try tryPreparePrimarySplitFast(self, split_lower, dest_dir);
 
     var opened_dest_store = try openSplitDestinationStore(self, dest_dir);
@@ -57577,7 +58002,7 @@ fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
     const split_lower = try documentRangeLowerAlloc(self.alloc, split_state.split_key);
     defer self.alloc.free(split_lower);
     try markSplitOffDocumentArtifactChildRangesLocked(self, split_state, split_lower);
-    try finalizePrimarySplitPreservingIdentity(self, split_lower, new_range);
+    try finalizePrimarySplitPreservingMetadata(self, split_lower, new_range);
     try ensureReplayFloor(self.core.store, replay_floor);
     try self.core.pruneSplitRangeFromPrimaryIndexes(split_state.split_key, split_state.original_range_end);
     try self.rebaseManagedIndexAppliedSequencesIfNeeded();
@@ -57746,7 +58171,12 @@ fn clearSystemMetadataFromSplitDestination(alloc: Allocator, dest_store: *docsto
     // The destination owns an independent Raft log. A physical page split can
     // copy the source's higher applied index; retaining it would suppress valid
     // low-index entries in the new group.
-    try dest_store.putBatch(&.{}, &.{internal_keys.raft_document_applied_entry_key[0..]});
+    // A destination prepared from an older layout must not inherit the
+    // parent's merge ownership or retired-transition fences either.
+    try dest_store.putBatch(&.{}, &.{
+        internal_keys.raft_document_applied_entry_key[0..],
+        merge_state_mod.legacy_key,
+    });
 }
 
 fn ensureReplayFloor(store: *docstore_mod.DocStore, next_sequence: u64) !void {
@@ -59463,7 +59893,13 @@ fn resolveRecoveredLocalTransaction(
     status: transactions_mod.TxnStatus,
     commit_version: u64,
 ) anyerror!void {
-    const db: *DB = @ptrCast(@alignCast(ctx));
+    const local_ctx: *TransactionRecoveryLocalContext = @ptrCast(@alignCast(ctx));
+    const db = local_ctx.stable_owner orelse return error.TransactionRecoveryOwnerUnbound;
+    const io = db.backend_runtime.io() orelse return error.MissingBackendRuntimeIo;
+    try local_ctx.provider_mutex.lock(io);
+    defer local_ctx.provider_mutex.unlock(io);
+    db.enrichment_runtime = db.async_context.enrichment_runtime;
+    defer db.enrichment_runtime = null;
     try db.resolveTransactionIntentsWithSyncLevel(txn_id, status, commit_version, .propose);
 }
 
@@ -60543,6 +60979,7 @@ const GateSparseEmbedder = struct {
 
 const DbSplitSimAction = db_split_sim_fixture.Action;
 const DbSplitSimDocSpec = db_split_sim_fixture.DocSpec;
+pub const VoprSplitAction = DbSplitSimAction;
 const db_split_sim_index_name = "ft_v1";
 const db_split_sim_split_key = "doc:m";
 
@@ -60552,7 +60989,7 @@ const DbSplitTerm = enum {
     gamma,
 };
 
-const DbSplitSimSummary = struct {
+pub const VoprSplitSummary = struct {
     source_doc_count: u32 = 0,
     dest_doc_count: u32 = 0,
     source_alpha_hits: u32 = 0,
@@ -60562,6 +60999,7 @@ const DbSplitSimSummary = struct {
     dest_beta_hits: u32 = 0,
     dest_gamma_hits: u32 = 0,
 };
+const DbSplitSimSummary = VoprSplitSummary;
 
 const DbSplitExpectedDoc = struct {
     side: enum { source, dest },
@@ -60673,7 +61111,7 @@ const DbSplitSimRuntime = struct {
         }
 
         if (!self.split_complete) {
-            try applyDbSplitWritesToDb(&self.source_db.?, writes);
+            try applyDbSplitWritesToDb(self.alloc, &self.source_db.?, writes);
             return;
         }
 
@@ -60705,6 +61143,89 @@ const DbSplitSimRuntime = struct {
     }
 };
 
+/// Live DB split seam for the common VOPR adapter. The harness owns the real
+/// DBs and their shared ModeledDevice; the adapter owns exploration policy.
+pub const VoprSplitHarness = struct {
+    alloc: Allocator,
+    source_directory: TestDirectory,
+    dest_directory: TestDirectory,
+    source_path: [*:0]const u8,
+    dest_path: [*:0]const u8,
+    modeled_device: storage_sim.ModeledDevice,
+    open_options: OpenOptions,
+    runtime: DbSplitSimRuntime,
+    runtime_open: bool,
+    actions: std.ArrayListUnmanaged(VoprSplitAction) = .empty,
+    recovered_summary: VoprSplitSummary = .{},
+    recovered: bool = false,
+
+    pub fn init(alloc: Allocator) !*VoprSplitHarness {
+        const self = try alloc.create(VoprSplitHarness);
+        errdefer alloc.destroy(self);
+        self.alloc = alloc;
+        self.source_directory = try TestDirectory.init("source");
+        errdefer self.source_directory.cleanup();
+        self.dest_directory = try TestDirectory.init("destination");
+        errdefer self.dest_directory.cleanup();
+        self.source_path = self.source_directory.path().ptr;
+        self.dest_path = self.dest_directory.path().ptr;
+        try ensureDirPath(std.mem.span(self.source_path));
+        try ensureDirPath(std.mem.span(self.dest_path));
+        self.modeled_device = storage_sim.ModeledDevice.init(alloc);
+        errdefer self.modeled_device.deinit();
+        try prepareModeledDbSplitRoot(&self.modeled_device, std.mem.span(self.source_path));
+        try prepareModeledDbSplitRoot(&self.modeled_device, std.mem.span(self.dest_path));
+        self.open_options = dbSplitModeledOpenOptions(&self.modeled_device);
+        self.runtime = try DbSplitSimRuntime.initWithOptions(alloc, self.source_path, self.dest_path, self.open_options);
+        self.runtime_open = true;
+        self.actions = .empty;
+        self.recovered_summary = .{};
+        self.recovered = false;
+        return self;
+    }
+
+    pub fn deinit(self: *VoprSplitHarness) void {
+        if (self.runtime_open) self.runtime.deinit();
+        self.actions.deinit(self.alloc);
+        self.modeled_device.deinit();
+        self.source_directory.cleanup();
+        self.dest_directory.cleanup();
+        const alloc = self.alloc;
+        self.* = undefined;
+        alloc.destroy(self);
+    }
+
+    pub fn apply(self: *VoprSplitHarness, action: VoprSplitAction) !void {
+        try self.runtime.applyAction(action, self.actions.items.len);
+        try self.actions.append(self.alloc, action);
+    }
+
+    pub fn crashAndRecover(self: *VoprSplitHarness) !void {
+        self.runtime.deinit();
+        self.runtime_open = false;
+        try self.modeled_device.device().crash();
+        self.recovered_summary = try summarizeDbSplitPathsWithOptions(
+            self.alloc,
+            self.source_path,
+            self.dest_path,
+            self.open_options,
+        );
+        self.recovered = true;
+    }
+
+    pub fn summary(self: *VoprSplitHarness) !VoprSplitSummary {
+        return if (self.recovered) self.recovered_summary else self.runtime.summary(self.alloc);
+    }
+
+    pub fn expected(self: *const VoprSplitHarness) !VoprSplitSummary {
+        return expectedDbSplitSummaryAlloc(self.alloc, self.actions.items);
+    }
+
+    pub fn splitComplete(self: *const VoprSplitHarness) bool {
+        return if (self.recovered) true else self.runtime.split_complete;
+    }
+};
+
 fn summarizeDbSplitDatabases(alloc: Allocator, source_db: *DB, dest_db: ?*DB) !DbSplitSimSummary {
     const source_text = source_db.core.textIndex(db_split_sim_index_name).?;
     const source_snapshot = source_text.snapshot();
@@ -60725,11 +61246,11 @@ fn summarizeDbSplitDatabases(alloc: Allocator, source_db: *DB, dest_db: ?*DB) !D
     };
 }
 
-fn applyDbSplitWritesToDb(db: *DB, writes: []const DbSplitOwnedWrite) !void {
+fn applyDbSplitWritesToDb(alloc: Allocator, db: *DB, writes: []const DbSplitOwnedWrite) !void {
     var batch_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
-    defer batch_writes.deinit(std.testing.allocator);
+    defer batch_writes.deinit(alloc);
     for (writes) |write| {
-        try batch_writes.append(std.testing.allocator, .{
+        try batch_writes.append(alloc, .{
             .key = write.key,
             .value = write.value,
         });
@@ -60769,8 +61290,12 @@ fn dbSplitWrite(alloc: Allocator, prefix: []const u8, step: usize, term: []const
 }
 
 fn expectedDbSplitSummary(actions: []const DbSplitSimAction) !DbSplitSimSummary {
+    return expectedDbSplitSummaryAlloc(std.testing.allocator, actions);
+}
+
+fn expectedDbSplitSummaryAlloc(alloc: Allocator, actions: []const DbSplitSimAction) !DbSplitSimSummary {
     var docs = std.StringHashMapUnmanaged(DbSplitExpectedDoc).empty;
-    defer docs.deinit(std.testing.allocator);
+    defer docs.deinit(alloc);
 
     var split_complete = false;
     for (actions, 0..) |action, step| {
@@ -60785,16 +61310,16 @@ fn expectedDbSplitSummary(actions: []const DbSplitSimAction) !DbSplitSimSummary 
                 }
             },
             .add_doc => |spec| {
-                const writes = try buildDbSplitWrites(std.testing.allocator, spec, step);
+                const writes = try buildDbSplitWrites(alloc, spec, step);
                 defer {
-                    for (writes) |*write| write.deinit(std.testing.allocator);
-                    std.testing.allocator.free(writes);
+                    for (writes) |*write| write.deinit(alloc);
+                    alloc.free(writes);
                 }
 
                 for (writes) |write| {
-                    const gop = try docs.getOrPut(std.testing.allocator, write.key);
+                    const gop = try docs.getOrPut(alloc, write.key);
                     if (!gop.found_existing) {
-                        gop.key_ptr.* = try std.testing.allocator.dupe(u8, write.key);
+                        gop.key_ptr.* = try alloc.dupe(u8, write.key);
                     }
                     gop.value_ptr.* = .{
                         .side = if (split_complete and std.mem.order(u8, write.key, db_split_sim_split_key) != .lt) .dest else .source,
@@ -60829,7 +61354,7 @@ fn expectedDbSplitSummary(actions: []const DbSplitSimAction) !DbSplitSimSummary 
     }
 
     var cleanup_it = docs.keyIterator();
-    while (cleanup_it.next()) |key| std.testing.allocator.free(key.*);
+    while (cleanup_it.next()) |key| alloc.free(key.*);
     return summary;
 }
 
@@ -61458,6 +61983,206 @@ test "db match_all consumes resolved ordinal filter" {
     try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
 }
 
+test "db native document filters preserve paged totals across representations" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+    try db.addIndex(.{ .name = "sp_v1", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\"}" });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha\",\"embedding\":[0,0],\"sparse\":{\"indices\":[1],\"values\":[5]}}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"alpha alpha\",\"embedding\":[1,0],\"sparse\":{\"indices\":[1],\"values\":[4]}}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"alpha alpha alpha\",\"embedding\":[2,0],\"sparse\":{\"indices\":[1],\"values\":[3]}}" },
+            .{ .key = "doc:d", .value = "{\"body\":\"alpha alpha alpha alpha\",\"embedding\":[3,0],\"sparse\":{\"indices\":[1],\"values\":[2]}}" },
+            .{ .key = "doc:e", .value = "{\"body\":\"alpha\",\"embedding\":[4,0],\"sparse\":{\"indices\":[1],\"values\":[1]}}" },
+        },
+        .sync_level = .full_index,
+    });
+    const ids: []const []const u8 = &.{ "doc:a", "doc:b", "doc:c", "doc:d" };
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try db.resolveDocSetForIdsAlloc(alloc, ids),
+        .exclude = .none,
+    };
+    defer filter.deinit(alloc);
+    filter.exclude = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:d"});
+
+    const Shape = enum { match_all, full_text, dense, sparse, primary_store };
+    for (std.enums.values(Shape)) |shape| {
+        if (shape == .primary_store) try std.testing.expect(try db.deleteIndex("ft_v1"));
+        for ([_]types.SearchRequest{
+            .{ .limit = 1 },
+            .{ .limit = 1, .offset = 1 },
+            .{ .limit = 10 },
+            .{ .limit = 1, .offset = 10 },
+            .{ .limit = 1, .count_only = true },
+        }) |page| {
+            // Count-only text collectors omit hit materialization. The primary
+            // store and vector paths leave count-only response shaping to the API.
+            if (page.count_only and shape != .match_all and shape != .full_text) continue;
+            errdefer std.debug.print("shape={s} limit={d} offset={d} count_only={}\n", .{ @tagName(shape), page.limit, page.offset, page.count_only });
+            var req = page;
+            req.include_stored = false;
+            req.query = .{ .match_all = {} };
+            switch (shape) {
+                .match_all, .primary_store => {},
+                .full_text => req.full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+                .dense => {
+                    req.index_name = "dv_v1";
+                    req.dense = .{ .vector = &.{ 0, 0 }, .k = 10 };
+                },
+                .sparse => {
+                    req.index_name = "sp_v1";
+                    req.query = .{ .sparse_knn = .{ .indices = &.{1}, .values = &.{1}, .k = 10 } };
+                },
+            }
+            req.filter_doc_ids = ids;
+            req.filter_doc_ids_positive = true;
+            req.exclude_doc_ids = &.{"doc:d"};
+            var public = try db.search(alloc, req);
+            defer public.deinit();
+            req.filter_doc_ids = &.{};
+            req.filter_doc_ids_positive = false;
+            req.exclude_doc_ids = &.{};
+            req.resolved_doc_filter = &filter;
+            var ordinal = try db.search(alloc, req);
+            defer ordinal.deinit();
+
+            // The native engine counted all three matches before paging. Neither
+            // their representation nor an empty result page changes that count.
+            try std.testing.expectEqual(@as(u32, 3), public.total_hits);
+            try std.testing.expectEqual(types.TotalHitsRelation.exact, public.total_hits_relation);
+            try std.testing.expectEqual(public.total_hits, ordinal.total_hits);
+            try std.testing.expectEqual(public.total_hits_relation, ordinal.total_hits_relation);
+            const expected_page_len: usize = if (page.count_only) 0 else @min(page.limit, 3 -| page.offset);
+            try std.testing.expectEqual(expected_page_len, public.hits.len);
+            try std.testing.expectEqual(public.hits.len, ordinal.hits.len);
+            for (public.hits, ordinal.hits) |expected, actual| {
+                try std.testing.expectEqualStrings(expected.id, actual.id);
+                try std.testing.expectEqual(expected.doc_ordinal, actual.doc_ordinal);
+                try std.testing.expect(!std.mem.eql(u8, actual.id, "doc:d"));
+                try std.testing.expect(!std.mem.eql(u8, actual.id, "doc:e"));
+            }
+        }
+    }
+}
+
+test "db dense filter hydration only looks up required hit ordinals" {
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        db: DB,
+        lookup_calls: usize = 0,
+        seen_generation: ?u64 = null,
+
+        fn lookup(ctx: ?*anyopaque, allocator: Allocator, index_name: []const u8, vector_ids: []const u64, generation: ?u64) anyerror![]?doc_set.DocOrdinal {
+            const db: *DB = @ptrCast(@alignCast(ctx.?));
+            const self: *@This() = @fieldParentPtr("db", db);
+            self.lookup_calls += 1;
+            self.seen_generation = generation;
+            return try DB.denseOrdinalsForVectorIdsCallback(ctx, allocator, index_name, vector_ids, generation);
+        }
+    };
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var harness = Harness{ .db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false }) };
+    defer harness.db.close();
+    const db = &harness.db;
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha\",\"category\":\"keep\",\"embedding\":[0,0]}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"beta\",\"category\":\"reject\",\"embedding\":[1,0]}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"alpha\",\"category\":\"keep\",\"embedding\":[2,0]}" },
+        },
+        .sync_level = .full_index,
+    });
+    var filter = doc_set.ResolvedDocFilter{ .include = try db.resolveDocSetForIdsAlloc(alloc, &.{ "doc:a", "doc:c" }) };
+    defer filter.deinit(alloc);
+    const generation = try db.currentIdentityReadGenerationForRequest(null);
+    // Exercise the real native collector and post-processor, counting the batch
+    // identity read separately from the identity work that admits candidates.
+    const executor = db_query_search.DenseSearchExecutor{
+        .ctx = db,
+        .text_index_entry = DB.textIndexEntryCallback,
+        .dense_index = DB.denseIndexCallback,
+        .lookup_doc_key = DB.denseDocKeyCallback,
+        .resolve_hit_key = DB.resolveDenseHitKeyCallback,
+        .lookup_vector_id = DB.denseVectorIdCallback,
+        .lookup_vector_ids_for_ordinals = DB.denseVectorIdsForOrdinalsCallback,
+        .all_docs_visible_fast = DB.allDocsVisibleFastCallback,
+        .lookup_doc_ordinal = DB.lookupLiveDocOrdinalNoLockCallback,
+        .lookup_doc_ordinals = DB.lookupLiveDocOrdinalsNoLockCallback,
+        .lookup_doc_ordinals_for_vector_ids = Harness.lookup,
+        .resolve_doc_set_doc_ids = DB.resolveDocSetDocIdsCallback,
+        .resolve_doc_ids_to_doc_set = DB.resolveDocIdsToDocSetCallback,
+        .live_filter_doc_set = DB.liveFilterDocSetCallback,
+        .nonvisible_doc_set = DB.nonVisibleDocSetCallback,
+        .load_projected_document = DB.loadRequiredProjectedSearchDocumentCallback,
+        .hbc_search = DB.hbcSearchCallback,
+        .hbc_search_profiled = DB.hbcSearchProfiledCallback,
+        .exact_dense_search = DB.exactDenseSearchCallback,
+        .postprocess = DB.postprocessVectorSearchResultCallback,
+    };
+    const Case = struct { req: types.SearchRequest, lookups: usize, without_text_index: bool = false };
+    var removed_text_index = false;
+    for ([_]Case{
+        .{ .req = .{ .filter_text = .{ .match = .{ .field = "body", .text = "alpha" } } }, .lookups = 0 },
+        .{ .req = .{ .exclusion_text = .{ .match = .{ .field = "body", .text = "beta" } } }, .lookups = 0 },
+        .{ .req = .{ .filter_query_json = "{\"doc_id\":[\"doc:a\",\"doc:c\"]}" }, .lookups = 0 },
+        .{ .req = .{ .exclusion_query_json = "{\"doc_id\":[\"doc:b\"]}" }, .lookups = 0 },
+        .{ .req = .{ .filter_doc_ids = &.{ "doc:a", "doc:c" }, .filter_doc_ids_positive = true }, .lookups = 1 },
+        .{ .req = .{ .exclude_doc_ids = &.{"doc:b"} }, .lookups = 1 },
+        .{ .req = .{ .resolved_doc_filter = &filter }, .lookups = 1 },
+        // Mix native ID constraints with residual stored predicates in both
+        // positions. Removing resolved predicates must preserve hydration when
+        // either remaining predicate still needs hit identity.
+        .{ .req = .{ .filter_query_json = "{\"term\":{\"category\":\"keep\"}}", .exclusion_query_json = "{\"doc_id\":[\"doc:b\"]}" }, .lookups = 1, .without_text_index = true },
+        .{ .req = .{ .filter_query_json = "{\"doc_id\":[\"doc:a\",\"doc:c\"]}", .exclusion_query_json = "{\"term\":{\"category\":\"reject\"}}" }, .lookups = 1, .without_text_index = true },
+    }, 0..) |case, i| {
+        errdefer std.debug.print("dense hydration case={d}\n", .{i});
+        if (case.without_text_index and !removed_text_index) {
+            try std.testing.expect(try db.deleteIndex("ft_v1"));
+            removed_text_index = true;
+        }
+        var req = case.req;
+        req.index_name = "dv_v1";
+        req.primary_text_index_name = if (removed_text_index) null else "ft_v1";
+        req.identity_read_generation = generation;
+        req.include_stored = false;
+        req.limit = 10;
+        harness.lookup_calls = 0;
+        harness.seen_generation = null;
+        var result = try db_query_search.searchDense(alloc, req, .{ .vector = &.{ 0, 0 }, .k = 10 }, executor);
+        defer result.deinit();
+        try std.testing.expectEqual(case.lookups, harness.lookup_calls);
+        try std.testing.expectEqual(@as(?u64, if (case.lookups == 0) null else generation), harness.seen_generation);
+        try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+        try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+        try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+        try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+        try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+        if (case.lookups > 0) {
+            for (result.hits) |hit| try std.testing.expect(hit.doc_ordinal != null);
+        }
+    }
+}
+
 test "db stats report engine-owned algebraic adaptive observation status" {
     const alloc = std.testing.allocator;
     const algebraic_ir = @import("algebraic/ir.zig");
@@ -61776,6 +62501,140 @@ test "db close retires runtime owners for memory primary backend" {
         .run = Fns.run,
         .deinit = Fns.deinit,
     }));
+}
+
+test "db implicit batch timestamps use the borrowed runtime clock" {
+    const alloc = std.testing.allocator;
+    var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{ .realtime_ns = 7 * std.time.ns_per_s });
+    defer vopr_io.deinit();
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = vopr_io.io() },
+    });
+    defer runtime.deinit();
+    var directory = try TestDirectory.init("batch-clock");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{
+        .backend_runtime = runtime.ptr(),
+        .executor = .{ .backend = .manual },
+        .primary_backend = .{ .mem = .{} },
+        .physical_root_mode = .external_backend,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{}" }}, .sync_level = .write });
+    try std.testing.expectEqual(@as(u64, 7 * std.time.ns_per_s), try db.getTimestamp(alloc, "doc:a"));
+    vopr_io.realtime_ns += 3 * std.time.ns_per_s;
+    try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{}" }}, .sync_level = .write });
+    try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_s), try db.getTimestamp(alloc, "doc:b"));
+    try db.batch(.{ .writes = &.{.{ .key = "doc:c", .value = "{}" }}, .timestamp_ns = 99, .sync_level = .write });
+    try std.testing.expectEqual(@as(u64, 99), try db.getTimestamp(alloc, "doc:c"));
+}
+
+test "background maintenance services lifecycle runs on borrowed VoprIo" {
+    const vopr = @import("vopr");
+    const alloc = std.testing.allocator;
+    var vopr_io = try vopr.vopr_io.VoprIo.init(.{
+        .required = .of(&.{ .clock_read, .task_scheduling, .synchronization, .sleep }),
+    });
+    defer vopr_io.deinit();
+    var backend_runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = vopr_io.io() },
+    });
+    defer backend_runtime.deinit();
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = backend_runtime.ptr(),
+        .executor = .{ .backend = .manual },
+        .primary_backend = .{ .mem = .{} },
+        .physical_root_mode = .external_backend,
+        .start_index_workers = false,
+        .start_optional_runtimes = true,
+        .start_optional_runtime_workers = false,
+        .enrichment = .{ .enable_without_producers = true },
+    });
+    defer db.close();
+
+    const resources = db.core.batchExecutionResources();
+    var text_merge = try text_merge_runtime_mod.TextMergeRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        backend_runtime.ptr(),
+        .{ .enabled = true, .idle_interval_ms = 1 },
+    );
+    defer text_merge.deinit();
+    var sparse_compaction = try sparse_compaction_runtime_mod.SparseCompactionRuntime.init(
+        alloc,
+        resources.index_manager,
+        resources.apply_mutex,
+        backend_runtime.ptr(),
+        .{ .enabled = true, .idle_interval_ms = 1 },
+    );
+    defer sparse_compaction.deinit();
+
+    var lifecycle_ok = false;
+    const Lifecycle = struct {
+        fn cycle(runtime: anytype) bool {
+            runtime.start() catch return false;
+            if (!runtime.isStarted()) return false;
+            if (!runtime.pause()) return false;
+            if (runtime.isStarted()) return false;
+            runtime.resumeAfterPause() catch return false;
+            if (!runtime.isStarted()) return false;
+            if (!runtime.stop()) return false;
+            return !runtime.isStarted();
+        }
+
+        fn run(
+            database: *DB,
+            text: *text_merge_runtime_mod.TextMergeRuntime,
+            sparse: *sparse_compaction_runtime_mod.SparseCompactionRuntime,
+            passed: *bool,
+        ) void {
+            const enrichment = database.enrichment_runtime orelse return;
+            enrichment.start() catch return;
+            if (!enrichment.isStarted()) return;
+            enrichment.stop();
+            if (enrichment.isStarted()) return;
+
+            const resolution = database.resolution_runtime orelse return;
+            resolution.start() catch return;
+            if (!resolution.worker_started.load(.acquire)) return;
+            resolution.stop();
+            if (resolution.worker_started.load(.acquire)) return;
+
+            const promotion = database.promotion_runtime orelse return;
+            promotion.start() catch return;
+            if (!promotion.worker_started.load(.acquire)) return;
+            promotion.stop();
+            if (promotion.worker_started.load(.acquire)) return;
+
+            if (!cycle(text)) return;
+            if (!cycle(sparse)) return;
+            passed.* = true;
+        }
+    };
+    _ = vopr_io.io().async(Lifecycle.run, .{ &db, &text_merge, &sparse_compaction, &lifecycle_ok });
+    const scheduler = vopr_io.scheduler();
+    var enabled: vopr.transition.List = .{};
+    defer enabled.deinit(alloc);
+    var events: vopr.event.Sink = .{};
+    defer events.deinit(alloc);
+    while (!scheduler.quiescent()) {
+        enabled.items.clearRetainingCapacity();
+        try scheduler.enumerateReady(&enabled, alloc);
+        try enabled.canonicalize();
+        try std.testing.expect(enabled.items.items.len != 0);
+        try scheduler.executeReady(enabled.items.items[0].id, &events, alloc);
+    }
+    try std.testing.expect(lifecycle_ok);
+    try vopr_io.ensureNoCapabilityViolation();
 }
 
 test "db inherits the resource manager capacity source" {
@@ -66027,27 +66886,27 @@ test "db portable relational restore refreshes open runtime before returning" {
 
     var target = try DB.open(alloc, std.mem.span(target_path), .{ .start_index_workers = false });
     defer target.close();
-    target.identity_visibility_summary_cache = .{
+    target.core.identity_visibility.summary = .{
         .live_ordinals = 99,
         .tombstone_ordinals = 7,
         .max_created_generation = 999,
     };
-    target.live_doc_set_cache_generation = 999;
-    target.nonvisible_doc_set_cache_generation = 999;
-    target.nonvisible_doc_set_cache_overflow = true;
-    target.nonvisible_doc_set_cache_entries.store(7, .monotonic);
+    target.core.identity_visibility.live_generation = 999;
+    target.core.identity_visibility.nonvisible_generation = 999;
+    target.core.identity_visibility.nonvisible_overflow = true;
+    target.core.identity_visibility.nonvisible_entries.store(7, .monotonic);
     try target.importPortableIntoEmpty(alloc, portable.items, doc_identity.default_namespace);
 
     const restored = (try target.get(alloc, "row:a")) orelse return error.TestExpectedEqual;
     defer alloc.free(restored);
     try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"active\"}", restored);
-    const restored_summary = target.identity_visibility_summary_cache orelse return error.TestExpectedEqual;
+    const restored_summary = target.core.identity_visibility.summary orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 1), restored_summary.live_ordinals);
     try std.testing.expectEqual(@as(u64, 0), restored_summary.tombstone_ordinals);
-    try std.testing.expectEqual(@as(?u64, null), target.live_doc_set_cache_generation);
-    try std.testing.expectEqual(@as(?u64, null), target.nonvisible_doc_set_cache_generation);
-    try std.testing.expect(!target.nonvisible_doc_set_cache_overflow);
-    try std.testing.expectEqual(@as(u64, 0), target.nonvisible_doc_set_cache_entries.load(.monotonic));
+    try std.testing.expectEqual(@as(?u64, null), target.core.identity_visibility.live_generation);
+    try std.testing.expectEqual(@as(?u64, null), target.core.identity_visibility.nonvisible_generation);
+    try std.testing.expect(!target.core.identity_visibility.nonvisible_overflow);
+    try std.testing.expectEqual(@as(u64, 0), target.core.identity_visibility.nonvisible_entries.load(.monotonic));
     try std.testing.expectError(error.InvalidBatchRequest, target.batch(.{ .writes = &.{.{
         .key = "row:invalid",
         .value = "{\"id\":\"invalid\",\"status\":\"inactive\"}",
@@ -67898,12 +68757,19 @@ test "db identity namespace reassignment refreshes transaction recovery hook con
     });
 
     const identity_ctx = db.transaction_recovery_identity_context orelse return error.TestExpectedEqual;
+    const local_ctx = db.transaction_recovery_local_context orelse return error.TestExpectedEqual;
     try std.testing.expect(identity_ctx.identity_namespace.eql(old_namespace));
     try std.testing.expect(db.transaction_runtime.?.config.resolution_extra_hooks.build != null);
     try std.testing.expectEqual(
         @intFromPtr(identity_ctx),
         @intFromPtr(db.transaction_runtime.?.config.resolution_extra_hooks.ctx.?),
     );
+    try std.testing.expectEqual(
+        @intFromPtr(local_ctx),
+        @intFromPtr(db.transaction_runtime.?.config.local_resolution_ctx.?),
+    );
+    try std.testing.expect(local_ctx.stable_owner != null);
+    try std.testing.expect(local_ctx.stable_owner.? != &db);
 
     try db.reassignIdentityNamespaceForInternalTransition(new_namespace);
     try std.testing.expect(db.core.identity_namespace.eql(new_namespace));
@@ -68070,7 +68936,7 @@ test "db operational stats prefer the maintained live identity summary" {
         .primary_backend = .{ .mem = .{} },
     });
     defer db.close();
-    db.identity_visibility_summary_cache = .{
+    db.core.identity_visibility.summary = .{
         .live_ordinals = 1,
         .max_created_generation = 3,
     };
@@ -68554,13 +69420,13 @@ test "db caches identity visibility summary after local writes" {
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
     });
-    try std.testing.expect(db.identity_visibility_summary_cache != null);
+    try std.testing.expect(db.core.identity_visibility.summary != null);
     try std.testing.expect(try db.allDocsVisibleAtGeneration(db.core.nextDerivedSequence()));
 
     try db.batch(.{
         .deletes = &.{"doc:a"},
     });
-    try std.testing.expect(db.identity_visibility_summary_cache != null);
+    try std.testing.expect(db.core.identity_visibility.summary != null);
     try std.testing.expect(!(try db.allDocsVisibleAtGeneration(db.core.nextDerivedSequence())));
 }
 
@@ -70089,7 +70955,7 @@ test "db non chunked search paths apply broad live doc filter" {
         try doc_identity.markDeletedTxn(alloc, &txn, 2, "doc:a");
         try txn.commit();
     }
-    db.identity_visibility_summary_cache = null;
+    db.core.identity_visibility.summary = null;
     db.clearLiveDocSetCache();
     db.clearNonVisibleDocSetCache();
 
@@ -79868,7 +80734,7 @@ test "index repair advance lease covers cancellation and deletion" {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqual(self.repair_id, observed_repair_id);
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
 
         fn run(self: *@This()) void {
@@ -79885,11 +80751,11 @@ test "index repair advance lease covers cancellation and deletion" {
     };
     defer DB.test_index_repair_advance_lease_hook = null;
 
-    var advance_thread = try std.Thread.spawn(.{}, Race.run, .{&race});
+    var advance_thread = try std.testing.io.concurrent(Race.run, .{&race});
     var joined = false;
     defer if (!joined) {
         race.release.store(true, .release);
-        advance_thread.join();
+        advance_thread.await(std.testing.io);
     };
     var entered = false;
     for (0..100_000) |_| {
@@ -79897,7 +80763,7 @@ test "index repair advance lease covers cancellation and deletion" {
             entered = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!entered) return error.TestTimeout;
 
@@ -79911,7 +80777,7 @@ test "index repair advance lease covers cancellation and deletion" {
     );
 
     race.release.store(true, .release);
-    advance_thread.join();
+    advance_thread.await(std.testing.io);
     joined = true;
     DB.test_index_repair_advance_lease_hook = null;
     try std.testing.expect(race.err == null);
@@ -83189,14 +84055,14 @@ test "db dense checkpoint persistence serializes with index apply" {
         }
     };
     var persist = Persist{ .db = &db };
-    const thread = try std.Thread.spawn(.{}, Persist.run, .{&persist});
+    var thread = try std.testing.io.concurrent(Persist.run, .{&persist});
     while (!persist.started.load(.acquire)) std.atomic.spinLoopHint();
     sleepNs(25 * std.time.ns_per_ms);
     const completed_while_apply_active = persist.done.load(.acquire);
 
     apply_guard.unlock();
     apply_locked = false;
-    thread.join();
+    thread.await(std.testing.io);
 
     try std.testing.expect(!completed_while_apply_active);
     if (persist.err) |err| return err;
@@ -83510,11 +84376,11 @@ test "db quarantined index self-heals via retryQuarantinedIndexLoads" {
     lockApplyShared(&db);
     var apply_shared_held = true;
     var retry_state = RetryState{ .db = &db };
-    var retry_thread = try std.Thread.spawn(.{}, RetryState.run, .{&retry_state});
+    var retry_thread = try std.testing.io.concurrent(RetryState.run, .{&retry_state});
     var retry_thread_joined = false;
     defer {
         if (apply_shared_held) db.core.unlockApplyShared();
-        if (!retry_thread_joined) retry_thread.join();
+        if (!retry_thread_joined) retry_thread.await(std.testing.io);
     }
 
     const publication_deadline = monotonicTimeNs() +| 30 * std.time.ns_per_s;
@@ -83525,7 +84391,7 @@ test "db quarantined index self-heals via retryQuarantinedIndexLoads" {
     const publication_waited_for_reader = publication_fence_entered and !retry_state.completed.load(.acquire);
     db.core.unlockApplyShared();
     apply_shared_held = false;
-    retry_thread.join();
+    retry_thread.await(std.testing.io);
     retry_thread_joined = true;
 
     try std.testing.expect(publication_fence_entered);
@@ -84346,7 +85212,7 @@ test "db chunked generated dense and sparse embeddings search as parent results"
         try doc_identity.markDeletedTxn(alloc, &txn, 2, "doc:a");
         try txn.commit();
     }
-    db.identity_visibility_summary_cache = null;
+    db.core.identity_visibility.summary = null;
     db.clearLiveDocSetCache();
     db.clearNonVisibleDocSetCache();
 
@@ -88950,7 +89816,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
         try doc_identity.markDeletedTxn(alloc, &txn, 2, "doc:a");
         try txn.commit();
     }
-    db.identity_visibility_summary_cache = null;
+    db.core.identity_visibility.summary = null;
     db.clearLiveDocSetCache();
     db.clearNonVisibleDocSetCache();
 
@@ -89983,17 +90849,17 @@ test "storage.ha seed capture barrier prevents local commit without matching wal
 
     var capture = barrier.acquireExclusive();
     var write_probe = ConcurrentWriteProbe{ .db = &db };
-    const write_thread = try std.Thread.spawn(.{}, ConcurrentWriteProbe.runBatch, .{&write_probe});
+    var write_thread = try std.testing.io.concurrent(ConcurrentWriteProbe.runBatch, .{&write_probe});
     errdefer {
         capture.release();
-        write_thread.join();
+        write_thread.await(std.testing.io);
     }
 
     try std.testing.expect(waitForAtomicFlag(&write_probe.started, 1, 10_000));
     var attempts: usize = 0;
     while (attempts < 10_000) : (attempts += 1) {
         if (barrier.pendingSharedAcquisitions() > 0) break;
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
 
     try std.testing.expect(barrier.pendingSharedAcquisitions() > 0);
@@ -90003,7 +90869,7 @@ test "storage.ha seed capture barrier prevents local commit without matching wal
     try std.testing.expect((try db.get(alloc, "doc:b")) == null);
 
     capture.release();
-    write_thread.join();
+    write_thread.await(std.testing.io);
     try std.testing.expectEqual(@as(u8, 0), write_probe.failed.load(.monotonic));
     try std.testing.expectEqual(@as(u8, 1), write_probe.done.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
@@ -90153,11 +91019,11 @@ test "storage.ha fence cannot strand a local commit beyond the HA tail" {
     lockAtomic(&transition_mutex);
     var transition_locked = true;
     var write_probe = ConcurrentWriteProbe{ .db = &db };
-    const write_thread = try std.Thread.spawn(.{}, ConcurrentWriteProbe.runBatch, .{&write_probe});
+    var write_thread = try std.testing.io.concurrent(ConcurrentWriteProbe.runBatch, .{&write_probe});
     var thread_joined = false;
     errdefer {
         if (transition_locked) transition_mutex.unlock();
-        if (!thread_joined) write_thread.join();
+        if (!thread_joined) write_thread.await(std.testing.io);
     }
     try std.testing.expect(waitForAtomicFlag(&write_probe.started, 1, 10_000));
     var local_commit_observed = false;
@@ -90167,7 +91033,7 @@ test "storage.ha fence cannot strand a local commit beyond the HA tail" {
             local_commit_observed = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     try std.testing.expect(local_commit_observed);
     try std.testing.expectEqual(@as(u64, 0), primary.lastLsn());
@@ -90175,7 +91041,7 @@ test "storage.ha fence cannot strand a local commit beyond the HA tail" {
     public_gate.publishPrimaryFence(true);
     transition_mutex.unlock();
     transition_locked = false;
-    write_thread.join();
+    write_thread.await(std.testing.io);
     thread_joined = true;
 
     try std.testing.expectEqual(@as(u8, 1), write_probe.failed.load(.monotonic));
@@ -90235,18 +91101,18 @@ test "storage.ha schema json mutation does not reacquire shared barrier behind q
             self.started.store(1, .release);
             var capture = self.barrier.acquireExclusive();
             self.acquired.store(1, .release);
-            while (self.release.load(.acquire) == 0) std.Thread.yield() catch {};
+            while (self.release.load(.acquire) == 0) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             capture.release();
         }
     };
 
     var outer = barrier.acquireShared();
     var probe = CaptureProbe{ .barrier = &barrier };
-    const capture_thread = try std.Thread.spawn(.{}, CaptureProbe.run, .{&probe});
+    var capture_thread = try std.testing.io.concurrent(CaptureProbe.run, .{&probe});
     errdefer {
         outer.release();
         probe.release.store(1, .release);
-        capture_thread.join();
+        capture_thread.await(std.testing.io);
     }
     try std.testing.expect(waitForAtomicFlag(&probe.started, 1, 10_000));
     var capture_queued = false;
@@ -90255,7 +91121,7 @@ test "storage.ha schema json mutation does not reacquire shared barrier behind q
             capture_queued = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     try std.testing.expect(capture_queued);
 
@@ -90266,7 +91132,7 @@ test "storage.ha schema json mutation does not reacquire shared barrier behind q
     outer.release();
     try std.testing.expect(waitForAtomicFlag(&probe.acquired, 1, 10_000));
     probe.release.store(1, .release);
-    capture_thread.join();
+    capture_thread.await(std.testing.io);
 
     const stored = (try db.getSchemaJson(alloc)) orelse return error.TestExpectedEqual;
     defer alloc.free(stored);
@@ -95026,7 +95892,7 @@ fn waitForAtomicFlag(flag: *const std.atomic.Value(u8), expected: u8, max_attemp
     var attempts: usize = 0;
     while (attempts < max_attempts) : (attempts += 1) {
         if (flag.load(.monotonic) == expected) return true;
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     return flag.load(.monotonic) == expected;
 }
@@ -95040,7 +95906,7 @@ const SharedReadLockHold = struct {
         self.db.core.lockApplyShared();
         self.acquired.store(1, .monotonic);
         while (self.release.load(.monotonic) == 0) {
-            std.Thread.yield() catch {};
+            std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
         self.db.core.unlockApplyShared();
     }
@@ -96006,6 +96872,99 @@ test "db document _edges reconcile graph state and preserve base document with d
 
     try std.testing.expectEqual(@as(u32, 1), after.total_hits);
     try std.testing.expectEqualStrings("doc:c", after.hits[0].id);
+}
+
+test "db replicated merge artifacts preserve graph dense sparse projections across replay and reopen" {
+    const alloc = std.testing.allocator;
+    var donor_path_tmp = try TestDirectory.init("db");
+    defer donor_path_tmp.cleanup();
+    const donor_path = donor_path_tmp.path().ptr;
+    var donor = try DB.open(alloc, std.mem.span(donor_path), .{});
+    defer donor.close();
+    const configs = [_]types.IndexConfig{
+        .{ .name = "dv_v1", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\"}" },
+        .{ .name = "sp_v1", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\"}" },
+        .{ .name = "gr_v1", .kind = .graph, .config_json = "{}" },
+    };
+    for (configs) |config| try donor.addIndex(config);
+    try donor.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[1,0,0],\"sparse\":{\"indices\":[7],\"values\":[1]},\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"doc:b\"}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .full_index,
+    });
+    const rows = try donor.mergeArtifactsPage(alloc, .{ .start = "", .end = "" }, null);
+    defer {
+        for (rows) |row| {
+            alloc.free(row.key);
+            alloc.free(row.value);
+        }
+        alloc.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, 3), rows.len);
+    const end_page = try donor.mergeArtifactsPage(alloc, .{ .start = "", .end = "" }, rows[rows.len - 1].key);
+    defer alloc.free(end_page);
+    try std.testing.expectEqual(@as(usize, 0), end_page.len);
+    const primary = (try donor.get(alloc, "doc:a")).?;
+    defer alloc.free(primary);
+    // Exercise both a live indexed receiver and a replica that restarts with
+    // artifact replay still pending.
+    for ([_]bool{ true, false }) |start_workers| {
+        var receiver_path_tmp = try TestDirectory.init("db");
+        defer receiver_path_tmp.cleanup();
+        const receiver_path = receiver_path_tmp.path().ptr;
+        {
+            var receiver = try DB.open(alloc, std.mem.span(receiver_path), .{ .start_index_workers = start_workers });
+            defer receiver.close();
+            for (configs) |config| try receiver.addIndex(config);
+            try receiver.updateRange(.{ .start = "doc:m", .end = "" });
+            try receiver.batch(.{ .merge_checkpoint = .{
+                .kind = .accept,
+                .transition_id = 1,
+                .donor_group_id = 2,
+                .receiver_group_id = 3,
+                .receiver_base_start = "doc:m",
+                .receiver_base_end = "",
+                .merged_start = "",
+                .merged_end = "",
+            } });
+            try receiver.batch(.{
+                .writes = &.{ .{ .key = "doc:a", .value = primary }, .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" } },
+                .sync_level = .full_index,
+            });
+            const req: types.BatchRequest = .{
+                .merge_replication = .{ .transition_id = 1, .donor_group_id = 2, .receiver_group_id = 3, .identity_namespace = receiver.core.identity_namespace },
+                .merge_artifacts = rows,
+            };
+            const identity: RaftAppliedEntryIdentity = .{ .term = 1, .index = 10 };
+            try receiver.batchRaftReplicatedApply(req, identity);
+            try receiver.batchRaftReplicatedApply(req, identity);
+            if (start_workers) {
+                try receiver.runUntilIdle();
+                try expectMergeArtifactSearches(alloc, &receiver);
+            }
+        }
+        var reopened = try DB.open(alloc, std.mem.span(receiver_path), .{});
+        defer reopened.close();
+        try reopened.runUntilIdle();
+        try expectMergeArtifactSearches(alloc, &reopened);
+    }
+}
+
+fn expectMergeArtifactSearches(alloc: Allocator, db: *DB) !void {
+    var dense = try db.search(alloc, .{ .index_name = "dv_v1", .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 1 } }, .limit = 1 });
+    defer dense.deinit();
+    try std.testing.expectEqual(@as(usize, 1), dense.hits.len);
+    try std.testing.expectEqualStrings("doc:a", dense.hits[0].id);
+    var sparse = try db.search(alloc, .{ .index_name = "sp_v1", .query = .{ .sparse_knn = .{ .indices = &.{7}, .values = &.{1}, .k = 1 } }, .limit = 1 });
+    defer sparse.deinit();
+    try std.testing.expectEqual(@as(usize, 1), sparse.hits.len);
+    try std.testing.expectEqualStrings("doc:a", sparse.hits[0].id);
+    var graph = try db.search(alloc, .{ .query = .{ .graph = .{ .query_type = .neighbors, .index_name = "gr_v1", .start_nodes = .{ .keys = &.{"doc:a"} }, .params = .{ .edge_types = &.{"links"} } } }, .limit = 10 });
+    defer graph.deinit();
+    try std.testing.expectEqual(@as(usize, 1), graph.hits.len);
+    try std.testing.expectEqualStrings("doc:b", graph.hits[0].id);
 }
 
 test "db document _embeddings update vector index and strip stored special fields" {
@@ -97424,7 +98383,7 @@ test "quarantine binding reconciliation serializes with terminal transition" {
         terminal_error: ?anyerror = null,
 
         fn terminal(ptr: *@This()) void {
-            while (!ptr.observed.load(.acquire)) std.Thread.yield() catch {};
+            while (!ptr.observed.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             ptr.terminal_attempted.store(true, .release);
             ptr.db.recordIndexRepairAttemptFailure(
                 ptr.db.alloc,
@@ -97440,18 +98399,18 @@ test "quarantine binding reconciliation serializes with terminal transition" {
             const ptr: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqual(ptr.repair_id, observed_repair_id);
             ptr.observed.store(true, .release);
-            while (!ptr.terminal_attempted.load(.acquire)) std.Thread.yield() catch {};
+            while (!ptr.terminal_attempted.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             // The terminal thread is now waiting on repair-control ownership.
             // Returning lets discovery finish its pending binding transaction;
             // terminalization must then release that exact binding.
         }
     };
     var context = Context{ .db = &reopened, .repair_id = repair_id };
-    var terminal_thread = try std.Thread.spawn(.{}, Context.terminal, .{&context});
+    var terminal_thread = try std.testing.io.concurrent(Context.terminal, .{&context});
     var terminal_thread_joined = false;
     defer if (!terminal_thread_joined) {
         context.observed.store(true, .release);
-        terminal_thread.join();
+        terminal_thread.await(std.testing.io);
     };
     DB.test_index_repair_discovery_observation_hook = .{
         .ptr = &context,
@@ -97459,7 +98418,7 @@ test "quarantine binding reconciliation serializes with terminal transition" {
     };
     defer DB.test_index_repair_discovery_observation_hook = null;
     const discovery = try reopened.discoverRecoverableStartupIndexFailures(alloc, 1);
-    terminal_thread.join();
+    terminal_thread.await(std.testing.io);
     terminal_thread_joined = true;
     try std.testing.expect(context.terminal_error == null);
     try std.testing.expectEqual(@as(usize, 1), discovery.already_pending);
@@ -97577,7 +98536,7 @@ test "db restart reconciles activated dense repair without rebuilding" {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqual(self.repair_id, observed_repair_id);
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
 
         fn reconcile(self: *@This()) void {
@@ -97601,11 +98560,11 @@ test "db restart reconciles activated dense repair without rebuilding" {
     };
     defer DB.test_index_repair_reconcile_fence_hook = null;
 
-    var reconcile_thread = try std.Thread.spawn(.{}, ReconcileRace.reconcile, .{&race});
+    var reconcile_thread = try std.testing.io.concurrent(ReconcileRace.reconcile, .{&race});
     var reconcile_joined = false;
     defer if (!reconcile_joined) {
         race.release.store(true, .release);
-        reconcile_thread.join();
+        reconcile_thread.await(std.testing.io);
     };
     var reconcile_entered = false;
     for (0..100_000) |_| {
@@ -97613,15 +98572,15 @@ test "db restart reconciles activated dense repair without rebuilding" {
             reconcile_entered = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!reconcile_entered) return error.TestTimeout;
 
-    var structural_thread = try std.Thread.spawn(.{}, ReconcileRace.structural, .{&race});
+    var structural_thread = try std.testing.io.concurrent(ReconcileRace.structural, .{&race});
     var structural_joined = false;
     defer if (!structural_joined) {
         race.release.store(true, .release);
-        structural_thread.join();
+        structural_thread.await(std.testing.io);
     };
     var structural_started = false;
     for (0..100_000) |_| {
@@ -97629,16 +98588,16 @@ test "db restart reconciles activated dense repair without rebuilding" {
             structural_started = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!structural_started) return error.TestTimeout;
-    for (0..256) |_| std.Thread.yield() catch {};
+    for (0..256) |_| std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(!race.structural_acquired.load(.acquire));
 
     race.release.store(true, .release);
-    reconcile_thread.join();
+    reconcile_thread.await(std.testing.io);
     reconcile_joined = true;
-    structural_thread.join();
+    structural_thread.await(std.testing.io);
     structural_joined = true;
     DB.test_index_repair_reconcile_fence_hook = null;
     try std.testing.expect(race.err == null);
@@ -98221,6 +99180,33 @@ test "db dense repair durably yields and resumes a reopenable building candidate
         try std.testing.expect(!std.mem.eql(u8, hit.id, "doc:d"));
     }
     try std.testing.expect(found_replayed_insert);
+}
+
+test "db modeled index repair adopts replacements with the serving allocator" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("repair-allocator");
+    defer directory.cleanup();
+    var device = storage_sim.ModeledDevice.init(alloc);
+    defer device.deinit();
+    try prepareModeledDbSplitRoot(&device, directory.path());
+    var options = dbSplitModeledOpenOptions(&device);
+    options.start_index_workers = false;
+    options.ttl_cleanup = .{ .enabled = false };
+    var db = try DB.open(std.heap.page_allocator, directory.path(), options);
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"hello allocator\"}" }}, .sync_level = .write });
+    _ = try db.admitManagedIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    // HTTP repair requests use an allocator independent of the cached DB.
+    // Rebuild twice to exercise both adoption and retirement of a shadow.
+    for (0..2) |_| {
+        var result = try db.repairArtifactIssuesWithRequest(alloc, .{ .target = .index, .index_name = "text", .force = true });
+        defer result.deinit(alloc);
+        try std.testing.expect(!result.debt_remaining);
+        try std.testing.expectEqual(@as(u64, 1), result.indexes_rebuilt);
+        var found = try db.search(alloc, .{ .index_name = "text", .query = .{ .match_all = {} } });
+        defer found.deinit();
+        try std.testing.expectEqual(@as(usize, 1), found.hits.len);
+    }
 }
 
 test "db managed vector admission captures writes while durable repair is pending" {
@@ -100667,7 +101653,7 @@ test "db managed admission ignores stale zero identity cache" {
 
     // Model a primary commit followed by an HA mirror failure before runtime
     // cache publication. Admission authority must remain the primary store.
-    db.identity_visibility_summary_cache = .{};
+    db.core.identity_visibility.summary = .{};
     try std.testing.expect((try db.admitManagedFullTextIndex(.{
         .name = "full_text_index_v1",
         .kind = .full_text,
@@ -100862,7 +101848,7 @@ test "db generated artifact finalization releases page arbitration and preserves
     var wait_attempts: usize = 0;
     while (!DB.test_generated_artifact_finalization_entered.load(.acquire)) : (wait_attempts += 1) {
         try std.testing.expect(wait_attempts < 100_000);
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
 
     try std.testing.expect(db.async_context.index_artifact_cleanup_mutex.tryLock());
@@ -100886,7 +101872,7 @@ test "db generated artifact finalization releases page arbitration and preserves
                 break;
             },
             .progressed => {},
-            .busy => std.Thread.yield() catch {},
+            .busy => std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {},
         }
     }
     try std.testing.expect(second_drained);
@@ -100968,7 +101954,7 @@ test "db managed admission materialization serializes with index deletion" {
         fn afterConfigLookup(ptr: *anyopaque, _: *DB, _: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
 
         fn materialize(self: *@This()) void {
@@ -100996,24 +101982,24 @@ test "db managed admission materialization serializes with index deletion" {
     };
     defer DB.test_managed_admission_materialization_hook = null;
 
-    var materialize_thread = try std.Thread.spawn(.{}, Race.materialize, .{&race});
+    var materialize_thread = try std.testing.io.concurrent(Race.materialize, .{&race});
     var entered = false;
     for (0..100_000) |_| {
         if (race.entered.load(.acquire)) {
             entered = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!entered) {
         race.release.store(true, .release);
-        materialize_thread.join();
+        materialize_thread.await(std.testing.io);
         return error.TestTimeout;
     }
 
-    var delete_thread = std.Thread.spawn(.{}, Race.delete, .{&race}) catch |err| {
+    var delete_thread = std.testing.io.concurrent(Race.delete, .{&race}) catch |err| {
         race.release.store(true, .release);
-        materialize_thread.join();
+        materialize_thread.await(std.testing.io);
         return err;
     };
     var delete_started = false;
@@ -101022,19 +102008,19 @@ test "db managed admission materialization serializes with index deletion" {
             delete_started = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!delete_started) {
         race.release.store(true, .release);
-        materialize_thread.join();
-        delete_thread.join();
+        materialize_thread.await(std.testing.io);
+        delete_thread.await(std.testing.io);
         return error.TestTimeout;
     }
-    for (0..256) |_| std.Thread.yield() catch {};
+    for (0..256) |_| std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     const deletion_crossed_materialization = race.delete_completed.load(.acquire);
     race.release.store(true, .release);
-    materialize_thread.join();
-    delete_thread.join();
+    materialize_thread.await(std.testing.io);
+    delete_thread.await(std.testing.io);
 
     try std.testing.expect(!deletion_crossed_materialization);
     try std.testing.expect(race.materialize_err == null);
@@ -107201,11 +108187,11 @@ test "db delete full text index drains active merge before closing generation" {
         }
     };
     var deletion = Delete{ .db = &db };
-    var delete_thread = try std.Thread.spawn(.{}, Delete.run, .{&deletion});
+    var delete_thread = try std.testing.io.concurrent(Delete.run, .{&deletion});
     var joined = false;
     defer if (!joined) {
         text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
-        delete_thread.join();
+        delete_thread.await(std.testing.io);
     };
 
     var stop_entered = false;
@@ -107224,7 +108210,7 @@ test "db delete full text index drains active merge before closing generation" {
     try std.testing.expect(!deletion.completed.load(.acquire));
 
     text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
-    delete_thread.join();
+    delete_thread.await(std.testing.io);
     joined = true;
     try std.testing.expect(deletion.err == null);
     try std.testing.expect(deletion.removed);
@@ -107350,11 +108336,11 @@ test "db post-delete filter reader does not deadlock behind queued cleanup write
         }
     };
     var reader = Reader{ .db = &db };
-    var reader_thread = try std.Thread.spawn(.{}, Reader.run, .{&reader});
+    var reader_thread = try std.testing.io.concurrent(Reader.run, .{&reader});
     var reader_joined = false;
     defer if (!reader_joined) {
         test_release_match_all_ordinal_lookup.store(true, .release);
-        reader_thread.join();
+        reader_thread.await(std.testing.io);
     };
     var lookup_entered = false;
     for (0..200_000) |_| {
@@ -107362,7 +108348,7 @@ test "db post-delete filter reader does not deadlock behind queued cleanup write
             lookup_entered = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!lookup_entered) return error.TestTimeout;
 
@@ -107377,11 +108363,11 @@ test "db post-delete filter reader does not deadlock behind queued cleanup write
         }
     };
     var writer = Writer{ .db = &db };
-    var writer_thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    var writer_thread = try std.testing.io.concurrent(Writer.run, .{&writer});
     var writer_joined = false;
     defer if (!writer_joined) {
         test_release_match_all_ordinal_lookup.store(true, .release);
-        writer_thread.join();
+        writer_thread.await(std.testing.io);
     };
 
     // Wait until a cleanup-style writer owns the reader gate and is blocked on
@@ -107395,16 +108381,16 @@ test "db post-delete filter reader does not deadlock behind queued cleanup write
             break;
         }
         db.core.unlockApplyShared();
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!writer_queued) return error.TestTimeout;
     try std.testing.expect(!reader.completed.load(.acquire));
     try std.testing.expect(!writer.completed.load(.acquire));
 
     test_release_match_all_ordinal_lookup.store(true, .release);
-    reader_thread.join();
+    reader_thread.await(std.testing.io);
     reader_joined = true;
-    writer_thread.join();
+    writer_thread.await(std.testing.io);
     writer_joined = true;
     if (reader.err) |err| return err;
     try std.testing.expectEqual(doc_count, reader.total_hits);
@@ -107928,14 +108914,14 @@ test "db text merge shutdown cancels a worker blocked on descriptor admission" {
         }
     };
     var stop = Stop{ .runtime = &runtime };
-    const stop_thread = try std.Thread.spawn(.{}, Stop.run, .{&stop});
+    var stop_thread = try std.testing.io.concurrent(Stop.run, .{&stop});
     var stop_joined = false;
     defer if (!stop_joined) {
         if (held_descriptors) {
             pool.releaseDescriptorsForTest(io, 2);
             held_descriptors = false;
         }
-        stop_thread.join();
+        stop_thread.await(std.testing.io);
     };
 
     for (0..1_000) |_| {
@@ -107943,7 +108929,7 @@ test "db text merge shutdown cancels a worker blocked on descriptor admission" {
         try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
     }
     if (!stop.completed.load(.acquire)) return error.TestTimeout;
-    stop_thread.join();
+    stop_thread.await(std.testing.io);
     stop_joined = true;
 
     try std.testing.expect(stop.stopped);
@@ -108189,19 +109175,19 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     };
     var waiter = Waiter{ .runtime = &admission_runtime };
     const events_before = admission_runtime.stats().backpressure_events;
-    var waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    var waiter_thread = try std.testing.io.concurrent(Waiter.run, .{&waiter});
     var waiter_joined = false;
     defer if (!waiter_joined) {
         held_permit.release();
-        waiter_thread.join();
+        waiter_thread.await(std.testing.io);
     };
     const waiter_deadline = monotonicTimeNs() +| std.time.ns_per_s;
     while (admission_runtime.stats().backpressure_events == events_before and monotonicTimeNs() < waiter_deadline) {
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     try std.testing.expect(admission_runtime.stats().backpressure_events > events_before);
     held_permit.release();
-    waiter_thread.join();
+    waiter_thread.await(std.testing.io);
     waiter_joined = true;
     try std.testing.expect(waiter.acquired.load(.acquire));
     try std.testing.expect(!waiter.failed.load(.acquire));
@@ -108240,20 +109226,20 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     };
     var cross_index_waiter = CrossIndexWaiter{ .runtime = &fair_runtime, .acquired = &cross_index_acquired };
     const cross_events_before = fair_runtime.stats().backpressure_events;
-    const cross_index_thread = try std.Thread.spawn(.{}, CrossIndexWaiter.run, .{&cross_index_waiter});
+    var cross_index_thread = try std.testing.io.concurrent(CrossIndexWaiter.run, .{&cross_index_waiter});
     var cross_index_joined = false;
     defer if (!cross_index_joined) {
         cross_index_blocker.release();
-        cross_index_thread.join();
+        cross_index_thread.await(std.testing.io);
     };
     const cross_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (fair_runtime.stats().backpressure_events == cross_events_before and monotonicTimeNs() < cross_wait_deadline) std.Thread.yield() catch {};
+    while (fair_runtime.stats().backpressure_events == cross_events_before and monotonicTimeNs() < cross_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(fair_runtime.stats().backpressure_events > cross_events_before);
     var independent_index_permit = try fair_runtime.acquireProducerPermit("admission-b", 100, 0);
     independent_index_permit.release();
     try std.testing.expect(!cross_index_acquired.load(.acquire));
     cross_index_blocker.release();
-    cross_index_thread.join();
+    cross_index_thread.await(std.testing.io);
     cross_index_joined = true;
     try std.testing.expect(cross_index_acquired.load(.acquire));
 
@@ -108299,7 +109285,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
                 return;
             };
             self.acquisition_order.store(self.acquisition_counter.fetchAdd(1, .acq_rel) + 1, .release);
-            while (!self.release_gate.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release_gate.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             permit.release();
         }
     };
@@ -108320,7 +109306,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         .failed = &mixed_older_failed,
     };
     const mixed_events_before = mixed_runtime.stats().backpressure_events;
-    const mixed_older_thread = try std.Thread.spawn(.{}, MixedWaiter.run, .{&mixed_older});
+    var mixed_older_thread = try std.testing.io.concurrent(MixedWaiter.run, .{&mixed_older});
     var mixed_older_joined = false;
     defer if (!mixed_older_joined) {
         if (mixed_segment_blocker_active) {
@@ -108332,10 +109318,10 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             mixed_byte_blocker_active = false;
         }
         mixed_release.store(true, .release);
-        mixed_older_thread.join();
+        mixed_older_thread.await(std.testing.io);
     };
     const mixed_older_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (mixed_runtime.stats().backpressure_events == mixed_events_before and monotonicTimeNs() < mixed_older_wait_deadline) std.Thread.yield() catch {};
+    while (mixed_runtime.stats().backpressure_events == mixed_events_before and monotonicTimeNs() < mixed_older_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(mixed_runtime.stats().backpressure_events > mixed_events_before);
 
     var mixed_younger = MixedWaiter{
@@ -108348,7 +109334,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         .release_gate = &mixed_release,
         .failed = &mixed_younger_failed,
     };
-    const mixed_younger_thread = try std.Thread.spawn(.{}, MixedWaiter.run, .{&mixed_younger});
+    var mixed_younger_thread = try std.testing.io.concurrent(MixedWaiter.run, .{&mixed_younger});
     var mixed_younger_joined = false;
     defer if (!mixed_younger_joined) {
         if (mixed_segment_blocker_active) {
@@ -108360,10 +109346,10 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             mixed_byte_blocker_active = false;
         }
         mixed_release.store(true, .release);
-        mixed_younger_thread.join();
+        mixed_younger_thread.await(std.testing.io);
     };
     const mixed_younger_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (mixed_runtime.stats().backpressure_events < mixed_events_before + 2 and monotonicTimeNs() < mixed_younger_wait_deadline) std.Thread.yield() catch {};
+    while (mixed_runtime.stats().backpressure_events < mixed_events_before + 2 and monotonicTimeNs() < mixed_younger_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(mixed_runtime.stats().backpressure_events >= mixed_events_before + 2);
     try std.testing.expectEqual(@as(u32, 0), mixed_older_order.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), mixed_younger_order.load(.acquire));
@@ -108373,18 +109359,18 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     mixed_byte_blocker.release();
     mixed_byte_blocker_active = false;
     const mixed_older_acquired_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (mixed_older_order.load(.acquire) == 0 and monotonicTimeNs() < mixed_older_acquired_deadline) std.Thread.yield() catch {};
+    while (mixed_older_order.load(.acquire) == 0 and monotonicTimeNs() < mixed_older_acquired_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expectEqual(@as(u32, 1), mixed_older_order.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), mixed_younger_order.load(.acquire));
     try std.testing.expect(!mixed_older_failed.load(.acquire));
     try std.testing.expect(!mixed_younger_failed.load(.acquire));
     mixed_release.store(true, .release);
-    mixed_older_thread.join();
+    mixed_older_thread.await(std.testing.io);
     mixed_older_joined = true;
     const mixed_younger_acquired_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (mixed_younger_order.load(.acquire) == 0 and monotonicTimeNs() < mixed_younger_acquired_deadline) std.Thread.yield() catch {};
+    while (mixed_younger_order.load(.acquire) == 0 and monotonicTimeNs() < mixed_younger_acquired_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expectEqual(@as(u32, 2), mixed_younger_order.load(.acquire));
-    mixed_younger_thread.join();
+    mixed_younger_thread.await(std.testing.io);
     mixed_younger_joined = true;
 
     var blocking_permit = try fair_runtime.acquireProducerPermit("admission-test", 80, 0);
@@ -108401,7 +109387,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             var permit = self.runtime.acquireProducerPermit("admission-test", self.segment_count, 0) catch return;
             self.acquired.store(true, .release);
             if (self.release_gate) |gate| {
-                while (!gate.load(.acquire)) std.Thread.yield() catch {};
+                while (!gate.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
             permit.release();
         }
@@ -108416,7 +109402,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         .acquired = &large_acquired,
         .release_gate = &release_large,
     };
-    const large_thread = try std.Thread.spawn(.{}, FairWaiter.run, .{&large_waiter});
+    var large_thread = try std.testing.io.concurrent(FairWaiter.run, .{&large_waiter});
     var large_joined = false;
     defer if (!large_joined) {
         if (blocking_active) {
@@ -108424,10 +109410,10 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             blocking_active = false;
         }
         release_large.store(true, .release);
-        large_thread.join();
+        large_thread.await(std.testing.io);
     };
     const large_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (fair_runtime.stats().backpressure_events < fair_events_before + 1 and monotonicTimeNs() < large_wait_deadline) std.Thread.yield() catch {};
+    while (fair_runtime.stats().backpressure_events < fair_events_before + 1 and monotonicTimeNs() < large_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(fair_runtime.stats().backpressure_events >= fair_events_before + 1);
 
     var small_waiter = FairWaiter{
@@ -108436,7 +109422,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         .acquired = &small_acquired,
         .release_gate = null,
     };
-    const small_thread = try std.Thread.spawn(.{}, FairWaiter.run, .{&small_waiter});
+    var small_thread = try std.testing.io.concurrent(FairWaiter.run, .{&small_waiter});
     var small_joined = false;
     defer if (!small_joined) {
         if (blocking_active) {
@@ -108444,23 +109430,23 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             blocking_active = false;
         }
         release_large.store(true, .release);
-        small_thread.join();
+        small_thread.await(std.testing.io);
     };
     const small_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (fair_runtime.stats().backpressure_events < fair_events_before + 2 and monotonicTimeNs() < small_wait_deadline) std.Thread.yield() catch {};
+    while (fair_runtime.stats().backpressure_events < fair_events_before + 2 and monotonicTimeNs() < small_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(fair_runtime.stats().backpressure_events >= fair_events_before + 2);
     try std.testing.expect(!small_acquired.load(.acquire));
 
     blocking_permit.release();
     blocking_active = false;
     const fair_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (!large_acquired.load(.acquire) and monotonicTimeNs() < fair_deadline) std.Thread.yield() catch {};
+    while (!large_acquired.load(.acquire) and monotonicTimeNs() < fair_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(large_acquired.load(.acquire));
     try std.testing.expect(!small_acquired.load(.acquire));
     release_large.store(true, .release);
-    large_thread.join();
+    large_thread.await(std.testing.io);
     large_joined = true;
-    small_thread.join();
+    small_thread.await(std.testing.io);
     small_joined = true;
     try std.testing.expect(small_acquired.load(.acquire));
 
@@ -108486,13 +109472,13 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     var cancel_waiter = CancelWaiter{ .runtime = &fair_runtime, .outcome = &cancel_outcome };
     const cancel_events_before = fair_runtime.stats().backpressure_events;
     const timeouts_before = fair_runtime.stats().backpressure_timeouts;
-    const fair_io = db.backend_runtime.io_impl.?.io();
+    const fair_io = db.backend_runtime.io().?;
     var cancel_group: std.Io.Group = .init;
     try cancel_group.concurrent(fair_io, CancelWaiter.run, .{&cancel_waiter});
     var cancel_group_active = true;
     defer if (cancel_group_active) cancel_group.cancel(fair_io);
     const cancel_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (fair_runtime.stats().backpressure_events == cancel_events_before and monotonicTimeNs() < cancel_wait_deadline) std.Thread.yield() catch {};
+    while (fair_runtime.stats().backpressure_events == cancel_events_before and monotonicTimeNs() < cancel_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(fair_runtime.stats().backpressure_events > cancel_events_before);
     cancel_group.cancel(fair_io);
     cancel_group_active = false;
@@ -112411,8 +113397,6 @@ test "db ttl delete callback atomically removes dense artifacts and updates repa
         .batch = db.batchContext(),
         .grace_period_ns = 0,
     };
-    ttl_ctx.identity_visibility_owner.store(&db, .release);
-    ttl_ctx.batch.identity_visibility_owner_slot = &ttl_ctx.identity_visibility_owner;
     const candidate_key = try alloc.dupe(u8, "doc:expired");
     defer alloc.free(candidate_key);
     const candidates = [_]ttl_runtime_mod.DeleteCandidate{.{
@@ -114898,10 +115882,28 @@ test "db transaction recovery runtime rebuilds all derived effects for committed
     });
     defer db.close();
 
-    var cleaned = false;
+    // Do not call a DB wrapper method while waiting. Recovery must be able to
+    // resolve the orphan from its stable heap owner without a caller first
+    // publishing the address of this by-value handle.
+    const recovered_store_key = try encodeStoreLookupKeyAlloc(&db, alloc, "doc:recovered_orphan");
+    defer alloc.free(recovered_store_key);
+    var recovered_without_api_call = false;
     var attempts: usize = 0;
     while (attempts < 500) : (attempts += 1) {
-        const status = db.getTransactionStatus(txn_id);
+        const raw = try db.core.getStoreValue(alloc, recovered_store_key);
+        if (raw) |value| {
+            alloc.free(value);
+            recovered_without_api_call = true;
+            break;
+        }
+        sleepPollInterval();
+    }
+    if (!recovered_without_api_call) return error.TransactionRecoveryLocalResolutionTimeout;
+
+    var cleaned = false;
+    attempts = 0;
+    while (attempts < 500) : (attempts += 1) {
+        const status = db.core.getTransactionStatus(txn_id);
         if (status) |_| {} else |err| {
             if (err == transactions_mod.TxnError.TxnNotFound) {
                 cleaned = true;
@@ -114934,6 +115936,201 @@ test "db transaction recovery runtime rebuilds all derived effects for committed
     defer result.deinit();
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("doc:recovered_orphan", result.hits[0].id);
+}
+
+test "db transaction recovery shares serving visibility and invalidates query caches" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    var recorder = TxnResolverRecorder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .transaction_recovery = .{
+            .enabled = true,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+    try db.prepareTransactionRecoveryOwner();
+    const recovery = db.transaction_recovery_local_context.?.stable_owner.?;
+    try std.testing.expect(&db.core.identity_visibility == &recovery.core.identity_visibility);
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }} });
+    try std.testing.expect(try db.allDocsVisibleSummaryFast(null));
+    const generation = try db.currentIdentityReadGeneration();
+    var live = try db.broadLiveDocSetCachedAlloc(alloc, generation);
+    defer live.deinit(alloc);
+    var hidden = (try db.nonVisibleDocSetCachedAlloc(alloc, generation)).?;
+    defer hidden.deinit(alloc);
+    try std.testing.expect(db.core.identity_visibility.live_generation != null);
+    try std.testing.expect(db.core.identity_visibility.nonvisible_generation != null);
+
+    const txn_id = try db.beginTransaction(1_000);
+    try db.writeTransaction(txn_id, .{ .deletes = &.{"doc:a"} });
+    const config = db.transaction_runtime.?.config;
+    try config.resolve_local_fn.?(config.local_resolution_ctx.?, txn_id, .committed, 2_000);
+    const stored = try db.get(alloc, "doc:a");
+    if (stored) |value| alloc.free(value);
+    try std.testing.expect(stored == null);
+    const durable = (try doc_identity.visibilitySummaryFromStore(db.core.store)).?;
+    try std.testing.expectEqual(@as(u64, 0), durable.live_ordinals);
+    try std.testing.expectEqualDeep(durable, db.core.identity_visibility.summary.?);
+    try std.testing.expect(!try db.allDocsVisibleSummaryFast(null));
+    try std.testing.expect(db.core.identity_visibility.live_generation == null);
+    try std.testing.expect(db.core.identity_visibility.nonvisible_generation == null);
+
+    // Serving writes also replace the recovery view, rather than leaving a
+    // second cached summary that can later mask the next recovered mutation.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }} });
+    try std.testing.expectEqual(@as(u64, 1), recovery.core.identity_visibility.summary.?.live_ordinals);
+}
+
+test "db transaction recovery borrows replacement enrichment only during resolution" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    var recorder = TxnResolverRecorder{};
+    var initial = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{ .dense_embedder = initial.interface() },
+        .transaction_recovery = .{
+            .enabled = true,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_recovery", .kind = .full_text, .config_json = "{}" });
+    try db.prepareTransactionRecoveryOwner();
+    const recovery = db.transaction_recovery_local_context.?.stable_owner.?;
+    try std.testing.expect(recovery.enrichment_runtime == null);
+    const original = db.enrichment_runtime.?;
+    var replacement = embedder_mod.DeterministicDenseEmbedder{};
+    try db.reconfigureEnrichmentRuntimePaused(.{ .dense_embedder = replacement.interface() });
+    try std.testing.expect(db.enrichment_runtime.? != original);
+    try std.testing.expect(recovery.enrichment_runtime == null);
+    const config = db.transaction_runtime.?.config;
+    const txn_id = try db.beginTransaction(1_000);
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"recovered\"}" }},
+    });
+    try config.resolve_local_fn.?(config.local_resolution_ctx.?, txn_id, .committed, 2_000);
+    try std.testing.expect(recovery.enrichment_runtime == null);
+    const sequence = db.core.nextDerivedSequence();
+    try std.testing.expect(sequence > 0);
+    try std.testing.expectEqual(sequence, db.enrichment_runtime.?.stats().target_sequence);
+    try db.waitForCurrentSyncLevel(.full_text);
+    var result = try db.search(alloc, .{
+        .index_name = "ft_recovery",
+        .query = .{ .match = .{ .field = "_all", .text = "recovered" } },
+        .limit = 10,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+
+    // Removing the producer must also leave no dangling pointer behind.
+    try db.reconfigureEnrichmentRuntimePaused(.{});
+    try std.testing.expect(db.enrichment_runtime == null);
+    const deleted = try db.beginTransaction(3_000);
+    try db.writeTransaction(deleted, .{ .deletes = &.{"doc:a"} });
+    try config.resolve_local_fn.?(config.local_resolution_ctx.?, deleted, .committed, 4_000);
+    try std.testing.expect(recovery.enrichment_runtime == null);
+}
+
+test "db transaction recovery provider guard survives failed enrichment replacement" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    var recorder = TxnResolverRecorder{};
+    var initial = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{ .dense_embedder = initial.interface() },
+        .transaction_recovery = .{
+            .enabled = true,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+    try db.prepareTransactionRecoveryOwner();
+    const original = db.enrichment_runtime.?;
+    const recovery = db.transaction_recovery_local_context.?;
+    const Fault = struct {
+        fn afterDetached(target: *DB) !void {
+            const context = target.transaction_recovery_local_context.?;
+            if (context.provider_mutex.tryLock()) {
+                context.provider_mutex.unlock(target.backend_runtime.io().?);
+                return error.TestMissingRecoveryProviderGuard;
+            }
+            return error.TestReplacementInterrupted;
+        }
+    };
+    DB.test_enrichment_reconfigure_after_detached_hook = Fault.afterDetached;
+    defer DB.test_enrichment_reconfigure_after_detached_hook = null;
+    var replacement = embedder_mod.DeterministicDenseEmbedder{};
+    try std.testing.expectError(error.TestReplacementInterrupted, db.reconfigureEnrichmentRuntimePaused(.{
+        .dense_embedder = replacement.interface(),
+    }));
+    try std.testing.expectEqual(original, db.enrichment_runtime.?);
+    try std.testing.expect(recovery.provider_mutex.tryLock());
+    recovery.provider_mutex.unlock(db.backend_runtime.io().?);
+    try std.testing.expect(recovery.stable_owner.?.enrichment_runtime == null);
+    const config = db.transaction_runtime.?.config;
+    const txn_id = try db.beginTransaction(1_000);
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"after failure\"}" }},
+    });
+    try config.resolve_local_fn.?(config.local_resolution_ctx.?, txn_id, .committed, 2_000);
+    try std.testing.expect(recovery.stable_owner.?.enrichment_runtime == null);
+    try std.testing.expect(recovery.provider_mutex.tryLock());
+    recovery.provider_mutex.unlock(db.backend_runtime.io().?);
+}
+
+test "db transaction recovery stable owner observes split shadow lifetime" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+
+    var recorder = TxnResolverRecorder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .transaction_recovery = .{
+            .enabled = true,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+    try db.prepareTransactionRecoveryOwner();
+    const recovery_ctx = db.transaction_recovery_local_context orelse
+        return error.TransactionRecoveryOwnerUnbound;
+    try std.testing.expect(recovery_ctx.stable_owner != null);
+    try std.testing.expect(recovery_ctx.stable_owner.?.shadow == null);
+
+    try db.addIndex(.{
+        .name = "ft_split_recovery",
+        .kind = .full_text,
+        .config_json = "{\"field\":\"title\"}",
+    });
+    try db.createShadowIndexManager("doc:m", "");
+    try std.testing.expect(recovery_ctx.split_shadow != null);
+    try std.testing.expect(recovery_ctx.split_shadow.?.manager == db.shadow.?.manager);
+    try std.testing.expect(activeSplitShadow(recovery_ctx.stable_owner.?) == db.shadow.?);
+    // Ticket counters and synchronization must have one address even though
+    // the recovery wrapper was captured before the split began.
+    try std.testing.expect(&activeSplitShadow(recovery_ctx.stable_owner.?).?.next_ticket == &db.shadow.?.next_ticket);
+
+    try db.closeShadowIndexManager();
+    try std.testing.expect(recovery_ctx.split_shadow == null);
+    try std.testing.expect(activeSplitShadow(recovery_ctx.stable_owner.?) == null);
 }
 
 test "db batch enforces optimistic version predicates" {
@@ -116139,6 +117336,565 @@ test "db replicated split bootstrap requires and preserves begin barrier" {
     try std.testing.expectEqualStrings("{\"v\":1}", found.json);
 }
 
+test "db merge receiver fences stale copies and retains retired transitions across reopen" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    const first: types.MergeReplicationCheckpoint = .{
+        .kind = .accept,
+        .transition_id = 100,
+        .donor_group_id = 101,
+        .receiver_group_id = 102,
+        .receiver_base_start = "m",
+        .receiver_base_end = "z",
+        .merged_start = "a",
+        .merged_end = "z",
+    };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+        try db.updateRange(.{ .start = "m", .end = "z" });
+        const copy: types.MergeReplicationContext = .{
+            .transition_id = 100,
+            .donor_group_id = 101,
+            .receiver_group_id = 102,
+            .identity_namespace = db.core.identity_namespace,
+        };
+        const payload: types.BatchRequest = .{ .merge_replication = copy, .writes = &.{.{ .key = "b", .value = "{}" }} };
+        try db.batchRaftReplicatedApply(payload, .{ .term = 1, .index = 1 });
+        try std.testing.expect((try db.get(alloc, "b")) == null);
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = first }, .{ .term = 1, .index = 2 });
+        try db.batchRaftReplicatedApply(payload, .{ .term = 1, .index = 3 });
+        var terminal = first;
+        terminal.kind = .bootstrap_complete;
+        terminal.bootstrap_applied_index = 3;
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = terminal }, .{ .term = 1, .index = 4 });
+        terminal.kind = .finalize;
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = terminal }, .{ .term = 1, .index = 5 });
+        try db.batch(.{ .writes = &.{.{ .key = "b", .value = "{\"public\":true}" }} });
+        const before = db.core.nextDerivedSequence();
+        try db.batchRaftReplicatedApply(payload, .{ .term = 2, .index = 6 });
+        try db.batchRaftReplicatedApply(.{ .merge_replication = copy, .deletes = &.{"b"} }, .{ .term = 2, .index = 7 });
+        // A stale artifact must be ignored before its payload is decoded.
+        const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "b", "graph", "links", "c");
+        defer alloc.free(artifact_key);
+        try db.batchRaftReplicatedApply(.{ .merge_replication = copy, .merge_artifacts = &.{.{ .key = artifact_key, .value = "invalid stale artifact" }} }, .{ .term = 2, .index = 8 });
+        try std.testing.expect((try db.core.getStoreValue(alloc, artifact_key)) == null);
+        try std.testing.expectEqual(before, db.core.nextDerivedSequence());
+        try std.testing.expectEqual(@as(u64, 8), (try db.raftAppliedEntry()).?.index);
+        const value = (try db.get(alloc, "b")).?;
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("{\"public\":true}", value);
+        var second = first;
+        second.transition_id = 200;
+        second.donor_group_id = 201;
+        second.receiver_base_start = "a";
+        second.merged_start = "";
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = second }, .{ .term = 2, .index = 9 });
+        try db.batchRaftReplicatedApply(payload, .{ .term = 2, .index = 10 });
+        second.kind = .bootstrap_complete;
+        second.bootstrap_applied_index = 10;
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = second }, .{ .term = 2, .index = 11 });
+        second.kind = .finalize;
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = second }, .{ .term = 2, .index = 12 });
+    }
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.batchRaftReplicatedApply(.{ .merge_checkpoint = first }, .{ .term = 3, .index = 13 });
+    const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)).?;
+    defer alloc.free(raw);
+    var state = try merge_state_mod.decodeAlloc(alloc, raw);
+    defer state.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 200), state.transition_id);
+    try std.testing.expectEqual(merge_state_mod.Phase.finalized, state.phase);
+    try std.testing.expectEqualSlices(u64, &.{100}, state.retired_transition_ids);
+    try std.testing.expectEqualStrings("", db.getRange().start);
+    const value = (try db.get(alloc, "b")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{\"public\":true}", value);
+}
+
+test "db merge copy attempts fence delayed leaders before finalize across reopen" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    var checkpoint: types.MergeReplicationCheckpoint = .{
+        .kind = .accept,
+        .transition_id = 100,
+        .donor_group_id = 101,
+        .receiver_group_id = 102,
+        .receiver_base_start = "m",
+        .receiver_base_end = "z",
+        .merged_start = "a",
+        .merged_end = "z",
+    };
+    const Apply = struct {
+        fn command(db: *DB, index: *u64, req: types.BatchRequest) !void {
+            index.* += 1;
+            try db.batchRaftReplicatedApply(req, .{ .term = 7, .index = index.* });
+        }
+    };
+    var index: u64 = 0;
+    var old_copy: types.MergeReplicationContext = undefined;
+    var old_begin = checkpoint;
+    old_begin.kind = .begin_copy;
+    old_begin.copy_attempt = .{ .donor_term = 1, .sequence = 100 };
+    var new_begin = old_begin;
+    // Term must dominate sequence, even if the successor just restarted.
+    new_begin.copy_attempt = .{ .donor_term = 2, .sequence = 1 };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+        try db.updateRange(.{ .start = "m", .end = "z" });
+        old_copy = .{
+            .transition_id = 100,
+            .donor_group_id = 101,
+            .receiver_group_id = 102,
+            .identity_namespace = db.core.identity_namespace,
+            .copy_attempt = old_begin.copy_attempt,
+        };
+        try Apply.command(&db, &index, .{ .merge_checkpoint = checkpoint });
+        try Apply.command(&db, &index, .{ .merge_checkpoint = old_begin });
+        try Apply.command(&db, &index, .{ .merge_replication = old_copy, .writes = &.{.{ .key = "b", .value = "{}" }} });
+        try Apply.command(&db, &index, .{ .merge_checkpoint = new_begin });
+        var new_copy = old_copy;
+        new_copy.copy_attempt = new_begin.copy_attempt;
+        try Apply.command(&db, &index, .{ .merge_replication = new_copy, .writes = &.{.{ .key = "b", .value = "{\"new\":true}" }} });
+        // A delayed begin cannot take ownership back. Nor can its completion
+        // or finalize certify B's still-incomplete copy.
+        try Apply.command(&db, &index, .{ .merge_checkpoint = old_begin });
+        var stale = old_begin;
+        stale.kind = .bootstrap_complete;
+        stale.bootstrap_applied_index = 900;
+        try Apply.command(&db, &index, .{ .merge_checkpoint = stale });
+        stale.kind = .finalize;
+        try Apply.command(&db, &index, .{ .merge_checkpoint = stale });
+        try Apply.command(&db, &index, .{ .merge_replication = old_copy, .deletes = &.{"b"} });
+        const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)).?;
+        defer alloc.free(raw);
+        var state = try merge_state_mod.decodeAlloc(alloc, raw);
+        defer state.deinit(alloc);
+        try std.testing.expectEqual(merge_state_mod.Phase.accepting, state.phase);
+        try std.testing.expect(!state.bootstrap_complete);
+        try std.testing.expectEqual(std.math.Order.eq, state.copy_attempt.order(new_begin.copy_attempt));
+    }
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    checkpoint = new_begin;
+    checkpoint.kind = .bootstrap_complete;
+    checkpoint.bootstrap_applied_index = 20;
+    try Apply.command(&db, &index, .{ .merge_checkpoint = checkpoint });
+    const before = db.core.nextDerivedSequence();
+    // This is the reported window: B completed bootstrap, but has not yet
+    // finalized, when A's delayed clear and artifact page are delivered.
+    try Apply.command(&db, &index, .{ .merge_replication = old_copy, .deletes = &.{"b"} });
+    const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "b", "graph", "links", "c");
+    defer alloc.free(artifact_key);
+    try Apply.command(&db, &index, .{ .merge_replication = old_copy, .merge_artifacts = &.{.{ .key = artifact_key, .value = "invalid stale artifact" }} });
+    // Completion also closes the winning attempt against duplicate packets.
+    var completed_copy = old_copy;
+    completed_copy.copy_attempt = checkpoint.copy_attempt;
+    try Apply.command(&db, &index, .{ .merge_replication = completed_copy, .deletes = &.{"b"} });
+    try std.testing.expectEqual(before, db.core.nextDerivedSequence());
+    try std.testing.expectEqual(index, (try db.raftAppliedEntry()).?.index);
+    try std.testing.expect((try db.core.getStoreValue(alloc, artifact_key)) == null);
+    checkpoint.kind = .finalize;
+    try Apply.command(&db, &index, .{ .merge_checkpoint = checkpoint });
+    const value = (try db.get(alloc, "b")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{\"new\":true}", value);
+    const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)).?;
+    defer alloc.free(raw);
+    var state = try merge_state_mod.decodeAlloc(alloc, raw);
+    defer state.deinit(alloc);
+    try std.testing.expectEqual(merge_state_mod.Phase.finalized, state.phase);
+    try std.testing.expectEqual(@as(u64, 20), state.bootstrap_applied_index);
+}
+
+test "db replicated merge checkpoints persist phase range and watermark across reopen" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+
+    const namespace: DocIdentityNamespace = .{ .table_id = 7, .shard_id = 42, .range_id = 420 };
+    const base_range: types.ByteRange = .{ .start = "doc:m", .end = "" };
+    const merged_range: types.ByteRange = .{ .start = "doc:a", .end = "" };
+    const checkpoint_base: types.MergeReplicationCheckpoint = .{
+        .kind = .accept,
+        .transition_id = 40,
+        .donor_group_id = 41,
+        .receiver_group_id = 42,
+        .receiver_base_start = base_range.start,
+        .receiver_base_end = base_range.end,
+        .merged_start = merged_range.start,
+        .merged_end = merged_range.end,
+        .allow_doc_identity_reassignment = true,
+        .receiver_identity_reassignment_namespace = namespace,
+    };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .identity_namespace = namespace,
+            .start_index_workers = false,
+        });
+        defer db.close();
+        try db.updateRange(base_range);
+        try db.batchReplicatedApply(.{ .merge_checkpoint = checkpoint_base });
+        try std.testing.expectEqualStrings("doc:a", db.getRange().start);
+
+        var premature_finalize = checkpoint_base;
+        premature_finalize.kind = .finalize;
+        premature_finalize.bootstrap_applied_index = 19;
+        try std.testing.expectError(
+            error.MergeTransitionNotReady,
+            db.batchReplicatedApply(.{ .merge_checkpoint = premature_finalize }),
+        );
+
+        var conflicting_range = checkpoint_base;
+        conflicting_range.kind = .bootstrap_complete;
+        conflicting_range.merged_start = "doc:b";
+        conflicting_range.bootstrap_applied_index = 19;
+        try std.testing.expectError(
+            error.ConflictingMergeTransition,
+            db.batchReplicatedApply(.{ .merge_checkpoint = conflicting_range }),
+        );
+
+        try db.batchReplicatedApply(.{
+            .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"from donor\"}" }},
+        });
+        var complete = checkpoint_base;
+        complete.kind = .bootstrap_complete;
+        complete.bootstrap_applied_index = 19;
+        try db.batchReplicatedApply(.{ .merge_checkpoint = complete });
+        try std.testing.expectEqualStrings("doc:a", db.getRange().start);
+        // A delayed accept is a no-op: it cannot regress either the expanded
+        // range or the durable bootstrap watermark.
+        try db.batchReplicatedApply(.{ .merge_checkpoint = checkpoint_base });
+        try std.testing.expectEqualStrings("doc:a", db.getRange().start);
+
+        const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)) orelse return error.TestExpectedEqual;
+        defer alloc.free(raw);
+        var state = try merge_state_mod.decodeAlloc(alloc, raw);
+        defer state.deinit(alloc);
+        try std.testing.expectEqual(merge_state_mod.Phase.accepting, state.phase);
+        try std.testing.expect(state.bootstrap_complete);
+        try std.testing.expectEqual(@as(u64, 19), state.bootstrap_applied_index);
+        try std.testing.expectEqual(@as(u64, 40), state.transition_id);
+        const corrupt = try alloc.dupe(u8, raw);
+        defer alloc.free(corrupt);
+        corrupt[0] = 0xff;
+        try std.testing.expectError(error.InvalidMergeState, merge_state_mod.decodeAlloc(alloc, corrupt));
+    }
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .identity_namespace = namespace,
+            .start_index_workers = false,
+        });
+        defer db.close();
+        try std.testing.expectEqualStrings("doc:a", db.getRange().start);
+        const donor = (try db.get(alloc, "doc:b")) orelse return error.TestExpectedEqual;
+        defer alloc.free(donor);
+        try std.testing.expectEqualStrings("{\"title\":\"from donor\"}", donor);
+
+        var finalized = checkpoint_base;
+        finalized.kind = .finalize;
+        finalized.bootstrap_applied_index = 19;
+        try db.batchReplicatedApply(.{ .merge_checkpoint = finalized });
+        try db.batchReplicatedApply(.{ .merge_checkpoint = checkpoint_base });
+        try std.testing.expectEqualStrings("doc:a", db.getRange().start);
+        var newer_after_finalize = finalized;
+        newer_after_finalize.bootstrap_applied_index = 20;
+        try db.batchReplicatedApply(.{ .merge_checkpoint = newer_after_finalize });
+        var different_transition = checkpoint_base;
+        different_transition.transition_id = 41;
+        try std.testing.expectError(
+            error.ConflictingMergeTransition,
+            db.batchReplicatedApply(.{ .merge_checkpoint = different_transition }),
+        );
+        var rollback = checkpoint_base;
+        rollback.kind = .rollback;
+        try db.batchReplicatedApply(.{ .merge_checkpoint = rollback });
+        const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)) orelse return error.TestExpectedEqual;
+        defer alloc.free(raw);
+        var state = try merge_state_mod.decodeAlloc(alloc, raw);
+        defer state.deinit(alloc);
+        try std.testing.expectEqual(merge_state_mod.Phase.finalized, state.phase);
+        try std.testing.expect(state.bootstrap_complete);
+        try std.testing.expectEqual(@as(u64, 19), state.bootstrap_applied_index);
+    }
+}
+
+test "db replicated merge checkpoints keep rolled back receivers live across delayed controls and reopen" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    var checkpoint: types.MergeReplicationCheckpoint = .{
+        .kind = .accept,
+        .transition_id = 50,
+        .donor_group_id = 51,
+        .receiver_group_id = 52,
+        .receiver_base_start = "m",
+        .receiver_base_end = "z",
+        .merged_start = "a",
+        .merged_end = "z",
+    };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+        try db.updateRange(.{ .start = "m", .end = "z" });
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 1 });
+        checkpoint.kind = .rollback;
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 2 });
+    }
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    for ([_]types.MergeReplicationCheckpoint.Kind{ .accept, .begin_copy, .bootstrap_complete, .finalize, .rollback }, 3..) |kind, index| {
+        checkpoint.kind = kind;
+        checkpoint.copy_attempt = .{ .donor_term = 2, .sequence = 1 };
+        checkpoint.bootstrap_applied_index = if (kind == .bootstrap_complete or kind == .finalize) 100 else 0;
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 2, .index = index });
+        try std.testing.expectEqualStrings("m", db.getRange().start);
+    }
+    try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "n", .value = "{\"live\":true}" }} }, .{ .term = 2, .index = 8 });
+    const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)).?;
+    defer alloc.free(raw);
+    var state = try merge_state_mod.decodeAlloc(alloc, raw);
+    defer state.deinit(alloc);
+    try std.testing.expectEqual(merge_state_mod.Phase.rolled_back, state.phase);
+    try std.testing.expect(!state.bootstrap_complete);
+    try std.testing.expectEqual(@as(u64, 0), state.bootstrap_applied_index);
+    try std.testing.expectEqual(@as(u64, 8), (try db.raftAppliedEntry()).?.index);
+    const value = (try db.get(alloc, "n")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{\"live\":true}", value);
+}
+
+test "db terminal merge controls preserve a subsequent split across reopen" {
+    const alloc = std.testing.allocator;
+    for ([_]types.MergeReplicationCheckpoint.Kind{ .finalize, .rollback }) |terminal| {
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
+        var checkpoint: types.MergeReplicationCheckpoint = .{
+            .kind = .accept,
+            .transition_id = 60,
+            .donor_group_id = 61,
+            .receiver_group_id = 62,
+            .receiver_base_start = "m",
+            .receiver_base_end = "z",
+            .merged_start = "a",
+            .merged_end = "z",
+        };
+        const expected_start = if (terminal == .finalize) "a" else "m";
+        {
+            var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+            defer db.close();
+            try db.updateRange(.{ .start = "m", .end = "z" });
+            try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 1 });
+            checkpoint.kind = .bootstrap_complete;
+            checkpoint.bootstrap_applied_index = 1;
+            try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 2 });
+            checkpoint.kind = terminal;
+            checkpoint.bootstrap_applied_index = if (terminal == .finalize) 1 else 0;
+            try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 3 });
+            // Exercise the production split-start mutation, including its
+            // persisted range, without replacing the terminal merge receipt.
+            try db.core.prepareSplit("t");
+            try db.core.completeSplitTransition(63, "t");
+            checkpoint.kind = .accept;
+            checkpoint.bootstrap_applied_index = 0;
+            try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 2, .index = 4 });
+            try std.testing.expectEqualStrings(expected_start, db.getRange().start);
+            try std.testing.expectEqualStrings("t", db.getRange().end);
+        }
+        {
+            var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+            defer db.close();
+            for ([_]types.MergeReplicationCheckpoint.Kind{ .accept, .begin_copy, .bootstrap_complete, .finalize, .rollback }, 5..) |kind, index| {
+                checkpoint.kind = kind;
+                checkpoint.copy_attempt = .{ .donor_term = 2, .sequence = 1 };
+                checkpoint.bootstrap_applied_index = if (kind == .bootstrap_complete or kind == .finalize) 100 else 0;
+                try db.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 2, .index = index });
+                try std.testing.expectEqualStrings(expected_start, db.getRange().start);
+                try std.testing.expectEqualStrings("t", db.getRange().end);
+            }
+            var conflicting = checkpoint;
+            conflicting.donor_group_id = 99;
+            try std.testing.expectError(error.ConflictingMergeTransition, db.batchRaftReplicatedApply(
+                .{ .merge_checkpoint = conflicting },
+                .{ .term = 2, .index = 10 },
+            ));
+            conflicting = checkpoint;
+            conflicting.merged_end = "zz";
+            try std.testing.expectError(error.ConflictingMergeTransition, db.batchRaftReplicatedApply(
+                .{ .merge_checkpoint = conflicting },
+                .{ .term = 2, .index = 10 },
+            ));
+            try db.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "n", .value = "{\"live\":true}" }} }, .{ .term = 2, .index = 10 });
+            const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)).?;
+            defer alloc.free(raw);
+            var state = try merge_state_mod.decodeAlloc(alloc, raw);
+            defer state.deinit(alloc);
+            try std.testing.expectEqual(if (terminal == .finalize) merge_state_mod.Phase.finalized else .rolled_back, state.phase);
+            try std.testing.expectEqual(terminal == .finalize, state.bootstrap_complete);
+            try std.testing.expectEqual(@as(u64, if (terminal == .finalize) 1 else 0), state.bootstrap_applied_index);
+            try std.testing.expectEqualStrings("z", state.receiver_base_range.end);
+            try std.testing.expectEqualStrings("z", state.merged_range.?.end);
+            try std.testing.expectEqual(@as(u64, 10), (try db.raftAppliedEntry()).?.index);
+            try std.testing.expectEqual(shard_mod.SplitPhase.splitting, db.core.splitState().?.phase);
+        }
+        var reopened = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer reopened.close();
+        try std.testing.expectEqualStrings(expected_start, reopened.getRange().start);
+        try std.testing.expectEqualStrings("t", reopened.getRange().end);
+        const value = (try reopened.get(alloc, "n")).?;
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("{\"live\":true}", value);
+        try std.testing.expectEqual(@as(u64, 10), (try reopened.raftAppliedEntry()).?.index);
+    }
+}
+
+test "db physical lsm split retains parent merge receipts and clears child receipts across reopen" {
+    const alloc = std.testing.allocator;
+    const options: OpenOptions = .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .start_index_workers = false,
+    };
+    for ([_]types.MergeReplicationCheckpoint.Kind{ .finalize, .rollback }) |terminal| {
+        for ([_]bool{ false, true }) |old_key_layout| {
+            var parent_path_tmp = try TestDirectory.init("db");
+            defer parent_path_tmp.cleanup();
+            const parent_path = parent_path_tmp.path().ptr;
+            var child_path_tmp = try TestDirectory.init("db");
+            defer child_path_tmp.cleanup();
+            const child_path = child_path_tmp.path().ptr;
+            var checkpoint: types.MergeReplicationCheckpoint = .{
+                .kind = .accept,
+                .transition_id = 70,
+                .donor_group_id = 71,
+                .receiver_group_id = 72,
+                .receiver_base_start = "a",
+                .receiver_base_end = "m",
+                .merged_start = "a",
+                .merged_end = "z",
+            };
+            const split_key = if (terminal == .finalize) "m" else "g";
+            const right_key = if (terminal == .finalize) "t" else "j";
+            {
+                var parent = try DB.open(alloc, std.mem.span(parent_path), options);
+                defer parent.close();
+                try parent.updateRange(.{ .start = "a", .end = "m" });
+                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 1 });
+                checkpoint.kind = .rollback;
+                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 2 });
+                checkpoint.kind = .accept;
+                checkpoint.transition_id = 80;
+                checkpoint.donor_group_id = 81;
+                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 3 });
+                checkpoint.kind = .begin_copy;
+                checkpoint.copy_attempt = .{ .donor_term = 1, .sequence = 1 };
+                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 4 });
+                checkpoint.kind = .bootstrap_complete;
+                checkpoint.bootstrap_applied_index = 4;
+                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 5 });
+                checkpoint.kind = terminal;
+                checkpoint.bootstrap_applied_index = if (terminal == .finalize) 4 else 0;
+                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 1, .index = 6 });
+                try parent.batchRaftReplicatedApply(.{ .writes = &.{
+                    .{ .key = "b", .value = "{\"side\":\"parent\"}" },
+                    .{ .key = right_key, .value = "{\"side\":\"child\"}" },
+                } }, .{ .term = 1, .index = 7 });
+                const before = (try parent.core.getStoreValue(alloc, merge_state_mod.key)).?;
+                defer alloc.free(before);
+                // Production records predating the protected metadata key
+                // must be promoted before a physical split can discard them.
+                if (old_key_layout and !std.mem.eql(u8, merge_state_mod.key, "raftmerge:state")) {
+                    try parent.core.store.putBatch(&.{.{ .key = "raftmerge:state", .value = before }}, &.{merge_state_mod.key});
+                }
+                try parent.split(parent.getRange(), split_key, "", std.mem.span(child_path), true);
+                const prepared_receipt = (try parent.core.getStoreValue(alloc, merge_state_mod.key)) orelse return error.MissingMergeReceiptAfterPrepare;
+                defer alloc.free(prepared_receipt);
+                try std.testing.expectEqualSlices(u8, before, prepared_receipt);
+                // Inspect the destructive rewrite boundary itself: receipt
+                // preservation must not rely on a later restoration write.
+                const split_lower = try documentRangeLowerAlloc(alloc, split_key);
+                defer alloc.free(split_lower);
+                _ = try tryFinalizePrimarySplitFast(&parent, split_lower);
+                const rewritten_receipt = (try parent.core.getStoreValue(alloc, merge_state_mod.key)) orelse return error.MissingMergeReceiptAfterPhysicalRewrite;
+                defer alloc.free(rewritten_receipt);
+                try std.testing.expectEqualSlices(u8, before, rewritten_receipt);
+                try parent.finalizeSplit(.{ .start = "a", .end = split_key });
+                const after = (try parent.core.getStoreValue(alloc, merge_state_mod.key)) orelse return error.MissingMergeReceiptAfterSplit;
+                defer alloc.free(after);
+                try std.testing.expectEqualSlices(u8, before, after);
+                try std.testing.expect((try parent.get(alloc, right_key)) == null);
+            }
+            {
+                var parent = try DB.open(alloc, std.mem.span(parent_path), options);
+                defer parent.close();
+                for ([_]types.MergeReplicationCheckpoint.Kind{ .accept, .begin_copy, .bootstrap_complete, .finalize, .rollback }, 8..) |kind, index| {
+                    checkpoint.kind = kind;
+                    checkpoint.copy_attempt = .{ .donor_term = 2, .sequence = 1 };
+                    checkpoint.bootstrap_applied_index = if (kind == .bootstrap_complete or kind == .finalize) 100 else 0;
+                    try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = checkpoint }, .{ .term = 2, .index = index });
+                    try std.testing.expectEqualStrings("a", parent.getRange().start);
+                    try std.testing.expectEqualStrings(split_key, parent.getRange().end);
+                }
+                var retired = checkpoint;
+                retired.kind = .accept;
+                retired.transition_id = 70;
+                retired.donor_group_id = 71;
+                retired.bootstrap_applied_index = 0;
+                try parent.batchRaftReplicatedApply(.{ .merge_checkpoint = retired }, .{ .term = 2, .index = 13 });
+                try parent.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "b", .value = "{\"live\":true}" }} }, .{ .term = 2, .index = 14 });
+                const raw = (try parent.core.getStoreValue(alloc, merge_state_mod.key)).?;
+                defer alloc.free(raw);
+                var receipt = try merge_state_mod.decodeAlloc(alloc, raw);
+                defer receipt.deinit(alloc);
+                try std.testing.expectEqual(if (terminal == .finalize) merge_state_mod.Phase.finalized else .rolled_back, receipt.phase);
+                try std.testing.expectEqual(@as(u64, 80), receipt.transition_id);
+                try std.testing.expectEqualSlices(u64, &.{70}, receipt.retired_transition_ids);
+                try std.testing.expectEqual(std.math.Order.eq, receipt.copy_attempt.order(.{ .donor_term = 1, .sequence = 1 }));
+                try std.testing.expectEqual(@as(u64, if (terminal == .finalize) 4 else 0), receipt.bootstrap_applied_index);
+                try std.testing.expectEqual(@as(u64, 14), (try parent.raftAppliedEntry()).?.index);
+            }
+            {
+                var child = try DB.open(alloc, std.mem.span(child_path), options);
+                defer child.close();
+                try std.testing.expect((try child.core.getStoreValue(alloc, merge_state_mod.key)) == null);
+                try std.testing.expect((try child.core.getStoreValue(alloc, "raftmerge:state")) == null);
+                const value = (try child.get(alloc, right_key)).?;
+                defer alloc.free(value);
+                try std.testing.expectEqualStrings("{\"side\":\"child\"}", value);
+                var fresh = checkpoint;
+                fresh.kind = .accept;
+                fresh.transition_id = 90;
+                fresh.donor_group_id = 91;
+                fresh.receiver_group_id = 92;
+                fresh.receiver_base_start = split_key;
+                fresh.receiver_base_end = if (terminal == .finalize) "z" else "m";
+                fresh.merged_start = "a";
+                fresh.merged_end = fresh.receiver_base_end;
+                fresh.bootstrap_applied_index = 0;
+                fresh.copy_attempt = .{};
+                try child.batchRaftReplicatedApply(.{ .merge_checkpoint = fresh }, .{ .term = 1, .index = 1 });
+                try std.testing.expectEqual(@as(u64, 1), (try child.raftAppliedEntry()).?.index);
+            }
+            var reopened = try DB.open(alloc, std.mem.span(parent_path), options);
+            defer reopened.close();
+            try std.testing.expectEqualStrings(split_key, reopened.getRange().end);
+            const value = (try reopened.get(alloc, "b")).?;
+            defer alloc.free(value);
+            try std.testing.expectEqualStrings("{\"live\":true}", value);
+        }
+    }
+}
+
 test "db split cutover fences enrichment to the owning range with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
@@ -116430,6 +118186,58 @@ test "db merge-style cutover fences enrichment to the merged receiver range with
     defer donor_result.deinit();
     for (donor_result.hits) |hit| {
         try std.testing.expect(!std.mem.eql(u8, hit.id, "doc:z"));
+    }
+}
+
+test "db merge artifact import holds both apply locks through copy failure" {
+    const Probe = struct {
+        donor: *apply_rw_lock_mod.ApplyRwLock,
+        receiver: *apply_rw_lock_mod.ApplyRwLock,
+        checked: bool = false,
+        both_held: bool = false,
+
+        fn allocate(ptr: *anyopaque, _: usize, _: std.mem.Alignment, _: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const donor_unlocked = self.donor.tryLockExclusive();
+            if (donor_unlocked) self.donor.unlockExclusive();
+            const receiver_unlocked = self.receiver.tryLockExclusive();
+            if (receiver_unlocked) self.receiver.unlockExclusive();
+            self.checked = true;
+            self.both_held = !donor_unlocked and !receiver_unlocked;
+            return null;
+        }
+    };
+    for ([_]bool{ true, false }) |donor_first| {
+        var donor_lock: apply_rw_lock_mod.ApplyRwLock = .{};
+        var receiver_lock: apply_rw_lock_mod.ApplyRwLock = .{};
+        var probe = Probe{ .donor = &donor_lock, .receiver = &receiver_lock };
+        // Allocation fails at the start of the actual copy; no store or index
+        // fields may be touched. Verify both lock orders and error unwinding.
+        var first_path = [_]u8{'a'};
+        var last_path = [_]u8{'z'};
+        var donor_core: db_core.DBCore = undefined;
+        donor_core.path = if (donor_first) &first_path else &last_path;
+        donor_core.apply_mutex = &donor_lock;
+        var receiver_core: db_core.DBCore = undefined;
+        receiver_core.path = if (donor_first) &last_path else &first_path;
+        receiver_core.apply_mutex = &receiver_lock;
+        var donor: DB = undefined;
+        donor.core = &donor_core;
+        var receiver: DB = undefined;
+        receiver.core = &receiver_core;
+        receiver.alloc = .{ .ptr = &probe, .vtable = &.{
+            .alloc = Probe.allocate,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = std.mem.Allocator.noFree,
+        } };
+        try std.testing.expectError(error.OutOfMemory, receiver.importMergeRangeFromTransitionDonor(&donor, .{ .start = "a", .end = "z" }));
+        try std.testing.expect(probe.checked);
+        try std.testing.expect(probe.both_held);
+        try std.testing.expect(donor_lock.tryLockExclusive());
+        donor_lock.unlockExclusive();
+        try std.testing.expect(receiver_lock.tryLockExclusive());
+        receiver_lock.unlockExclusive();
     }
 }
 
@@ -118202,7 +120010,13 @@ test "db native snapshot admission bounds capture under concurrent writes" {
     };
     defer DB.test_snapshot_fence_hook = null;
     var worker = SnapshotWorker{ .db = &db };
-    const snapshot_thread = try std.Thread.spawn(.{}, SnapshotWorker.run, .{&worker});
+    var snapshot_thread = try std.testing.io.concurrent(SnapshotWorker.run, .{&worker});
+    defer {
+        fence.release.store(true, .release);
+        fence.release_copy.store(true, .release);
+        fence.release_materialize.store(true, .release);
+        snapshot_thread.await(std.testing.io);
+    }
     while (!fence.entered.load(.acquire)) std.atomic.spinLoopHint();
 
     // Maintenance-owned replay production is not a client mutation and must
@@ -118215,9 +120029,15 @@ test "db native snapshot admission bounds capture under concurrent writes" {
     // selected revision. It resumes immediately after staging, before manifest
     // hashing and publication complete.
     var writer = Writer{ .db = &db };
-    const writer_thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    var writer_thread = try std.testing.io.concurrent(Writer.run, .{&writer});
+    defer {
+        fence.release.store(true, .release);
+        fence.release_copy.store(true, .release);
+        fence.release_materialize.store(true, .release);
+        writer_thread.await(std.testing.io);
+    }
     while (!writer.started.load(.acquire)) std.atomic.spinLoopHint();
-    for (0..1024) |_| std.Thread.yield() catch {};
+    for (0..1024) |_| std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(!writer.done.load(.acquire));
     fence.release.store(true, .release);
     while (!fence.copy_entered.load(.acquire)) std.atomic.spinLoopHint();
@@ -118225,9 +120045,15 @@ test "db native snapshot admission bounds capture under concurrent writes" {
     // Apply release alone is not the publication boundary: the short metadata
     // pin still excludes physical index maintenance.
     var maintenance = Maintenance{ .db = &db };
-    const maintenance_thread = try std.Thread.spawn(.{}, Maintenance.run, .{&maintenance});
+    var maintenance_thread = try std.testing.io.concurrent(Maintenance.run, .{&maintenance});
+    defer {
+        fence.release.store(true, .release);
+        fence.release_copy.store(true, .release);
+        fence.release_materialize.store(true, .release);
+        maintenance_thread.await(std.testing.io);
+    }
     while (!maintenance.started.load(.acquire)) std.atomic.spinLoopHint();
-    for (0..1024) |_| std.Thread.yield() catch {};
+    for (0..1024) |_| std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(!maintenance.done.load(.acquire));
     fence.release_copy.store(true, .release);
     while (!fence.materialize_entered.load(.acquire)) std.atomic.spinLoopHint();
@@ -118237,14 +120063,14 @@ test "db native snapshot admission bounds capture under concurrent writes" {
     const outside_fence_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
     while (monotonicTimeNs() < outside_fence_deadline) {
         if (writer.done.load(.acquire) and maintenance.done.load(.acquire)) break;
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     const writer_finished_outside_fence = writer.done.load(.acquire);
     const maintenance_finished_outside_fence = maintenance.done.load(.acquire);
     fence.release_materialize.store(true, .release);
-    snapshot_thread.join();
-    maintenance_thread.join();
-    writer_thread.join();
+    snapshot_thread.await(std.testing.io);
+    maintenance_thread.await(std.testing.io);
+    writer_thread.await(std.testing.io);
     if (worker.err) |err| return err;
     if (maintenance.err) |err| return err;
     if (writer.err) |err| return err;
@@ -120167,26 +121993,38 @@ test "db rw lock allows search and scan while shared read lock is held" {
     });
 
     var held = SharedReadLockHold{ .db = &db };
-    const held_thread = try std.Thread.spawn(.{}, SharedReadLockHold.run, .{&held});
+    var held_thread = try std.testing.io.concurrent(SharedReadLockHold.run, .{&held});
+    defer {
+        held.release.store(1, .release);
+        held_thread.await(std.testing.io);
+    }
     try std.testing.expect(waitForAtomicFlag(&held.acquired, 1, 10_000));
 
     var search_probe = ConcurrentReadProbe{ .db = &db };
-    const search_thread = try std.Thread.spawn(.{}, ConcurrentReadProbe.runSearch, .{&search_probe});
+    var search_thread = try std.testing.io.concurrent(ConcurrentReadProbe.runSearch, .{&search_probe});
+    defer {
+        held.release.store(1, .release);
+        search_thread.await(std.testing.io);
+    }
 
     try std.testing.expect(waitForAtomicFlag(&search_probe.started, 1, 10_000));
     try std.testing.expect(waitForAtomicFlag(&search_probe.done, 1, 10_000));
     try std.testing.expectEqual(@as(u8, 0), search_probe.failed.load(.monotonic));
-    search_thread.join();
+    search_thread.await(std.testing.io);
 
     var scan_probe = ConcurrentReadProbe{ .db = &db };
-    const scan_thread = try std.Thread.spawn(.{}, ConcurrentReadProbe.runScan, .{&scan_probe});
+    var scan_thread = try std.testing.io.concurrent(ConcurrentReadProbe.runScan, .{&scan_probe});
+    defer {
+        held.release.store(1, .release);
+        scan_thread.await(std.testing.io);
+    }
     try std.testing.expect(waitForAtomicFlag(&scan_probe.started, 1, 10_000));
     try std.testing.expect(waitForAtomicFlag(&scan_probe.done, 1, 10_000));
     try std.testing.expectEqual(@as(u8, 0), scan_probe.failed.load(.monotonic));
-    scan_thread.join();
+    scan_thread.await(std.testing.io);
 
     held.release.store(1, .monotonic);
-    held_thread.join();
+    held_thread.await(std.testing.io);
 }
 
 test "db rw lock keeps batch writes blocked behind shared read lock" {
@@ -120207,11 +122045,19 @@ test "db rw lock keeps batch writes blocked behind shared read lock" {
     });
 
     var held = SharedReadLockHold{ .db = &db };
-    const held_thread = try std.Thread.spawn(.{}, SharedReadLockHold.run, .{&held});
+    var held_thread = try std.testing.io.concurrent(SharedReadLockHold.run, .{&held});
+    defer {
+        held.release.store(1, .release);
+        held_thread.await(std.testing.io);
+    }
     try std.testing.expect(waitForAtomicFlag(&held.acquired, 1, 10_000));
 
     var write_probe = ConcurrentWriteProbe{ .db = &db };
-    const write_thread = try std.Thread.spawn(.{}, ConcurrentWriteProbe.runBatch, .{&write_probe});
+    var write_thread = try std.testing.io.concurrent(ConcurrentWriteProbe.runBatch, .{&write_probe});
+    defer {
+        held.release.store(1, .release);
+        write_thread.await(std.testing.io);
+    }
 
     try std.testing.expect(waitForAtomicFlag(&write_probe.started, 1, 10_000));
 
@@ -120222,13 +122068,13 @@ test "db rw lock keeps batch writes blocked behind shared read lock" {
             still_blocked = false;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     try std.testing.expect(still_blocked);
 
     held.release.store(1, .monotonic);
-    held_thread.join();
-    write_thread.join();
+    held_thread.await(std.testing.io);
+    write_thread.await(std.testing.io);
     try std.testing.expectEqual(@as(u8, 0), write_probe.failed.load(.monotonic));
     try std.testing.expectEqual(@as(u8, 1), write_probe.done.load(.monotonic));
 

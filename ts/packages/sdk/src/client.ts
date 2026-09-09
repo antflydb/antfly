@@ -7,6 +7,7 @@ import createClient, { type Client } from "openapi-fetch";
 import { validateGraphQueryIdentifiers } from "./graph-identifiers.js";
 import { validateGraphQueryResponses } from "./graph-results.js";
 import { validateCreateIndexRequestRelationships } from "./index-config.js";
+import { InferenceCapacityError, isTransientCapacityError } from "./inference-client.js";
 import type { paths } from "./public-api.js";
 import { parseSSEFrames } from "./sse.js";
 import type {
@@ -274,6 +275,9 @@ function errorMessage(error: unknown): string {
 }
 
 function queryError(prefix: string, error: unknown, response: Response | undefined): Error {
+  if (response?.status === 503 && isTransientCapacityError(error)) {
+    return new InferenceCapacityError(error);
+  }
   const stale = error && typeof error === "object" ? (error as Record<string, unknown>) : undefined;
   if (
     response?.status === 409 &&
@@ -721,7 +725,13 @@ export class AntflyClient {
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`Retrieval agent request failed: ${response.status} ${errorText}`);
+      let error: unknown = errorText;
+      try {
+        error = JSON.parse(errorText);
+      } catch {
+        // Older servers may return plain text.
+      }
+      throw queryError("Retrieval agent request failed", error, response);
     }
 
     if (!response.body) {
@@ -806,6 +816,7 @@ export class AntflyClient {
             }
             case "error": {
               const parsed = JSON.parse(frame.data);
+              if (isTransientCapacityError(parsed)) throw new InferenceCapacityError(parsed);
               const message =
                 parsed !== null && typeof parsed === "object" && parsed.error
                   ? String(parsed.error)
@@ -817,7 +828,9 @@ export class AntflyClient {
         throw new Error("Retrieval agent stream ended before done");
       } catch (error) {
         if (!abortController.signal.aborted) {
-          callbacks.onError?.(error instanceof Error ? error.message : String(error));
+          const detail = error instanceof Error ? error : new Error(String(error));
+          callbacks.onErrorDetail?.(detail);
+          callbacks.onError?.(detail.message);
         }
       }
     })();
@@ -874,7 +887,8 @@ export class AntflyClient {
    * @param config - Chat configuration (generator, table, indexes, etc.)
    * @param history - Previous conversation messages (pass result.messages from prior turns)
    * @param callbacks - Optional streaming callbacks including chat-specific events
-   * @returns For streaming: { abortController, messages } where messages is a Promise.
+   * @returns For streaming: { abortController, messages } where messages resolves on completion
+   *          and rejects on terminal stream errors, premature EOF, or abort.
    *          For non-streaming: { result, messages }
    */
   async chatAgent(
@@ -911,9 +925,22 @@ export class AntflyClient {
       // Streaming mode: accumulate answer and emit chat-specific callbacks
       let answerText = "";
       let resolveMessages: (msgs: ChatMessage[]) => void;
-      const messagesPromise = new Promise<ChatMessage[]>((resolve) => {
+      let rejectMessages: (error: Error) => void;
+      let settled = false;
+      let removeAbortListener = () => {};
+      const messagesPromise = new Promise<ChatMessage[]>((resolve, reject) => {
         resolveMessages = resolve;
+        rejectMessages = reject;
       });
+      // A terminal frame can arrive before the turn handle reaches the caller.
+      // Mark that early rejection handled while returning the original promise.
+      void messagesPromise.catch(() => {});
+      const failMessages = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        removeAbortListener();
+        rejectMessages(error);
+      };
 
       const wrappedCallbacks: RetrievalAgentStreamCallbacks = {
         ...callbacks,
@@ -922,20 +949,42 @@ export class AntflyClient {
           callbacks.onGeneration?.(chunk);
         },
         onDone: (data) => {
-          // Build updated messages with assistant response
-          const updatedMessages: ChatMessage[] = [
-            ...history,
-            { role: "user", content: userMessage },
-            { role: "assistant", content: answerText },
-          ];
+          // The terminal result also covers JSON fallback and streams without
+          // generation deltas. Prefer its complete answer and conversation.
+          answerText = data.generation ?? answerText;
+          const updatedMessages: ChatMessage[] = data.messages?.length
+            ? data.messages
+            : [
+                ...history,
+                { role: "user", content: userMessage },
+                { role: "assistant", content: answerText },
+              ];
+          settled = true;
+          removeAbortListener();
+          resolveMessages(updatedMessages);
           callbacks.onAssistantMessage?.(answerText);
           callbacks.onMessagesUpdated?.(updatedMessages);
           callbacks.onDone?.(data);
-          resolveMessages(updatedMessages);
+        },
+        onErrorDetail: (error) => {
+          failMessages(error);
+          callbacks.onErrorDetail?.(error);
         },
       };
 
       const abortController = await this.streamRetrievalAgent(request, wrappedCallbacks);
+      const { signal } = abortController;
+      const onAbort = () =>
+        failMessages(
+          signal.reason instanceof Error
+            ? signal.reason
+            : new DOMException("Chat turn aborted", "AbortError")
+        );
+      if (signal.aborted) onAbort();
+      else if (!settled) {
+        signal.addEventListener("abort", onAbort, { once: true });
+        removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+      }
 
       return { abortController, messages: messagesPromise };
     }
@@ -964,10 +1013,10 @@ export class AntflyClient {
    * @returns Promise with QueryBuilderResult containing the generated query, explanation, and confidence
    */
   async queryBuilderAgent(request: QueryBuilderRequest): Promise<QueryBuilderResult> {
-    const { data, error } = await this.client.POST("/db/v1/agents/query-builder", {
+    const { data, error, response } = await this.client.POST("/db/v1/agents/query-builder", {
       body: request,
     });
-    if (error) throw new Error(`Query builder agent failed: ${error.error}`);
+    if (error) throw queryError("Query builder agent failed", error, response);
     // biome-ignore lint/style/noNonNullAssertion: data is guaranteed defined after error check
     return data! as unknown as QueryBuilderResult;
   }

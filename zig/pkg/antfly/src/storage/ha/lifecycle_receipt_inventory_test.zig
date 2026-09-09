@@ -190,10 +190,11 @@ test "storage.ha lifecycle ledger serializes concurrent publication and rejects 
     defer ledger.close();
     var left = ConcurrentRecorder{ .ledger = &ledger, .receipt = receipt };
     var right = ConcurrentRecorder{ .ledger = &ledger, .receipt = receipt };
-    const left_thread = try std.Thread.spawn(.{}, ConcurrentRecorder.run, .{&left});
-    const right_thread = try std.Thread.spawn(.{}, ConcurrentRecorder.run, .{&right});
-    left_thread.join();
-    right_thread.join();
+    var left_thread = try std.testing.io.concurrent(ConcurrentRecorder.run, .{&left});
+    defer left_thread.await(std.testing.io);
+    var right_thread = try std.testing.io.concurrent(ConcurrentRecorder.run, .{&right});
+    left_thread.await(std.testing.io);
+    right_thread.await(std.testing.io);
     if (left.err) |err| return err;
     if (right.err) |err| return err;
     try std.testing.expectEqual(left.result.?.cursor, right.result.?.cursor);

@@ -334,8 +334,9 @@ journals during recovery, but cannot create a new release candidate.
 ## Release Lines
 
 `scripts/release/release-lines.json` is the default-branch controller's map
-from a tag's `X.Y` version line to its trusted source branch. It currently maps
-`0.2` to `main`; no maintenance-branch rollout is active yet. Release tags are
+from a tag's `X.Y` version line to its trusted source branch. It maps `0.2` to
+`v0.2.x` and `0.3` to `main`. The branches share the `v0.2.1` release commit,
+`e5261e9e2937d03943b518974bf8063351ad1449`. Release tags are
 still created and pushed manually. A non-nightly tag is accepted when its
 commit belongs to the selected branch when the controller validates it. This
 keeps a tag request replayable after the branch advances. The request cannot
@@ -348,16 +349,22 @@ branches. This allows an older release built from `main` to remain verifiable
 after ownership of that line moves to its maintenance branch, without allowing
 a new tag to select a historical branch.
 
-When `main` begins 0.3 development:
+For the active release lines:
 
-1. Ensure `v0.2.x` points at the intended final shared 0.2 commit.
-2. In a reviewed change on `main`, change the `0.2` `source_ref` to
-   `refs/heads/v0.2.x`, append that ref to `trusted_source_refs` without removing
-   `refs/heads/main`, and add an active `0.3` line sourced from
-   `refs/heads/main`.
-3. Backport later 0.2 fixes through PRs into `v0.2.x`, and create canonical
-   `v0.2.*` tags only from commits in that branch. Do not merge 0.3-era `main`
-   back into the maintenance branch.
+- Backport later 0.2 fixes through PRs into `v0.2.x`, and create canonical
+  `v0.2.*` tags only from commits in that branch. Do not merge 0.3-era `main`
+  back into the maintenance branch.
+- Develop 0.3 on `main` and create canonical `v0.3.*` tags from its commits.
+- Keep both `refs/heads/main` and `refs/heads/v0.2.x` in the 0.2 line's
+  `trusted_source_refs` so releases built before the handoff remain verifiable.
+
+When `main` begins a later minor line, first create that outgoing line's
+maintenance branch at its intended final shared commit. Then, in a reviewed
+change on `main`, move the outgoing line's `source_ref` to its maintenance
+branch, append that ref to `trusted_source_refs` without removing historical
+refs, and add the new active line sourced from `refs/heads/main`. Every minor
+line needs an explicit map entry; future lines do not inherit ownership
+automatically.
 
 Privileged build and promotion policy always remains on `main`; only versioned
 release source comes from the mapped maintenance branch. Repository branch/tag

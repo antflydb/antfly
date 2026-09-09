@@ -13,8 +13,10 @@ make zig-test
 
 `zig build test` depends on the default package aggregates:
 
+- `zig build lib-test`
 - `zig build antfly-test`
 - `zig build inference-test`
+- `zig build inference-finetune-test`
 
 The default aggregate is intended to be the normal local and CI confidence
 target. It does not fetch external corpora and does not run benchmark or soak
@@ -51,12 +53,12 @@ zig build antfly-test
 
 `antfly-test` includes:
 
-- `unit-test`
-- `sim-test`
-- `integration-test`
-- `recall-test`
+- `antfly-unit-test`
+- `vopr-test`
+- `antfly-integration-test`
+- `antfly-recall-test`
 - the default recall harness over `testdata/vectorsets`
-- `chaos-test`
+- `antfly-chaos-test`
 
 Run only the inference package tests:
 
@@ -75,10 +77,29 @@ Run the hermetic unit and focused integration bucket:
 make zig-unit-test
 ```
 
-`unit-test` is where default, no-fetch Antfly, storage, and shared-library unit
-coverage belongs. Focused aliases such as `lib-json-test`, `db-test`, and
-`wal-test` remain available for narrower iteration, but broad module suites are
-wired into `unit-test` once.
+`antfly-unit-test` owns Antfly unit and focused integration coverage. `lib-test`
+owns the existing default standalone library checks, including platform tests.
+The repository's `make zig-unit-test` gate runs `lib-test antfly-unit-test
+inference-test inference-finetune-test`, preserving its previous coverage.
+Use `zig build antfly-unit-test` for Antfly alone. All `zig build` commands here
+run from `zig/`; `lib-*` names refer to code in `zig/lib/`, and `antfly-*` names
+follow the subsystem path beneath `pkg/antfly/src/`.
+
+`antfly-storage-db-test` uses the focused DB root, whose inventory contains all
+former full-root DB and result-shape selections plus its own unique cases. It
+runs that union once. Focused subsystem suites remain available for iteration.
+
+Enable progress labels on the same run nodes with `-Dtest-progress=true`; this
+changes neither the selected tests nor scheduling. Regressions formerly exclusive
+to the progress shortcut now belong to the metadata and data-storage suites.
+
+The single `antfly-storage-db-enrichment-test` compiles the former selections once.
+Narrow its curated suite with runtime filters; unmatched selections fail:
+
+```sh
+zig build antfly-storage-db-enrichment-test -- --test-filter "split cutover"
+zig build antfly-storage-db-enrichment-test -- --list-tests
+```
 
 The aggregate Make targets reserve 20% memory headroom and use the patched Zig
 0.16 build runner so ready steps retain their declared RSS reservations. Set
@@ -86,61 +107,53 @@ The aggregate Make targets reserve 20% memory headroom and use the patched Zig
 From the `zig/` directory, the equivalent targets are `make test` and
 `make unit-test`.
 
-Run mocked-time and modeled simulation checks:
+Run fast deterministic VOPR checks, including production HTTP on `VoprIo`:
 
 ```sh
-zig build sim-test
+zig build vopr-test
 ```
 
 Run focused real HTTP and public API integration checks:
 
 ```sh
-zig build integration-test
+zig build antfly-integration-test
 ```
 
 Run bounded generated chaos campaigns:
 
 ```sh
-zig build chaos-test
+zig build antfly-chaos-test
 ```
 
 Run recall checks:
 
 ```sh
-zig build recall-test
-zig build recall-harness
+zig build antfly-storage-vectorindex-recall-test
+zig build recall-harness && ./zig-out/bin/recall_harness
 ```
 
 ## Conformance And Soak
 
-Fetch and run the conformance suites:
+Conformance targets fetch missing external fixtures, reuse cached corpora, and run
+the suite. Setup failures fail the target. These suites remain opt-in; ordinary
+library tests do not download external corpora.
 
 ```sh
 zig build conformance-test
-```
-
-`conformance-test` is intentionally outside `zig build test` and may download
-or refresh external corpora under local paths such as `/tmp`. It keeps
-successful corpus output quiet. Use the suite-specific run-only steps when you
-want verbose per-fixture output, or when you want to avoid fetches and use
-already present local corpora:
-
-```sh
-zig build lib-toon-conformance-run
-zig build lib-image-conformance-run
-zig build lib-audio-conformance-run
-zig build image-jpeg-seed-corpora-e2e-run
-```
-
-The suite-specific fetch and fetch-and-run steps remain available:
-
-```sh
-zig build lib-toon-conformance-fetch
 zig build lib-toon-conformance
-zig build lib-image-conformance-fetch
 zig build lib-image-conformance
-zig build lib-audio-conformance-fetch
 zig build lib-audio-conformance
+```
+
+Library suite names follow `lib-<library>-conformance`, alongside
+`lib-<library>-test` and `lib-<library>-bench`.
+
+Fixtures are cached under `/tmp` by default. Use
+`-Dconformance-fixtures=/absolute/path` to choose another cache directory.
+For offline runs, disable fixture fetching explicitly (missing fixtures fail):
+
+```sh
+zig build conformance-test -Dconformance-fetch=false -Dconformance-fixtures=/absolute/path
 ```
 
 Run long-running soak aggregates:
@@ -340,10 +353,10 @@ The build still exposes focused steps for narrow iteration. Examples:
 
 ```sh
 zig build lib-httpx-test
-zig build lib-metadata-test
+zig build antfly-metadata-test
 zig build lsm-backend-test
 zig build persistent-test
-zig build db-test
+zig build antfly-storage-db-test
 zig build sparse-test
 ```
 
@@ -352,3 +365,11 @@ List all available steps with:
 ```sh
 zig build --help
 ```
+
+## DB analytics and planner coverage
+
+Algebraic behavior uses the normal DB, API, metadata, and graph owner suites.
+`antfly-storage-db-test` includes the planner-ownership regression, and
+`antfly-unit-test` retains the dynamic-template/cardinality-cache selections.
+There are no separate algebraic test or guardrail targets. Benchmark sweeps use
+`scripts/run_db_query_matrix.py --suite analytics`; see [BENCHMARKS.md](BENCHMARKS.md#analytics-comparisons).

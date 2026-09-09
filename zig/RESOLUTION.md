@@ -532,7 +532,7 @@ Open/index/enrichment validation should reject:
          extraction artifact, pick the consuming resolver, build its engine via
          `Resolver.initFromParts`, and produce the resolution artifact bytes.
          `antfly_matcher`/`antfly_resolver` threaded into the antfly module graph
-         (build.zig). Verified by `db-test` + `root-test`.
+         (build.zig). Verified by `antfly-storage-db-test` + `root-test`.
    - [x] Per-key processing (`resolution_runtime.processChangedExtraction`):
          parse a changed asset key (`parseAssetArtifactKeyAlloc`), find the
          consuming resolver, and run the tested `ResolutionStage` over an
@@ -558,7 +558,7 @@ Open/index/enrichment validation should reject:
          started in `startOptionalRuntimes`, torn down in `deinitWrapperState`,
          and `notifySequence`d wherever enrichment is (incl. the enrichment
          derived-batch append where extraction artifacts land). Verified by
-         `db-test` + `root-test`.
+         `antfly-storage-db-test` + `root-test`.
    - [x] End-to-end integration test: doc write -> extraction asset artifact ->
          resolution worker -> resolution artifact, driven via `runUntilIdle`
          ("db resolves extracted entities into a resolution artifact
@@ -582,14 +582,14 @@ Open/index/enrichment validation should reject:
          `processChangedExtraction` -> `processRecordKeys` -> `catchUpWindow` ->
          `ResolutionRuntime`; `SourceCandidateProvider` dispatches exact_key /
          prefix / ann against it. Local-only (null) by default; unit-tested with
-         a fake source across all three modes (`db-test`).
+         a fake source across all three modes (`antfly-storage-db-test`).
    - [x] Cross-shard candidate adapter (`api/distributed_candidate_source.zig`):
          `DistributedCandidateSource` implements the seam over the routing-aware
          `TableReadSource` -- `get` via `lookup`, `scan_prefix` via a ranged
          `scan`, `ann` via a dense-vector `query` -- so blocking fans out to the
          entity shard and resolves local-or-remote, reusing existing group
          routing. Unit-tested with a fake `TableReadSource`
-         (`lib-resolution-source-test`).
+         (`antfly-api-resolution-source-test`).
    - [x] Serving-layer injection: `DataServer.initApiServer` wraps
          `read_source.source()` in a `DistributedCandidateSource` and hands it to
          the write source(s); the managed write cache applies it to every DB it
@@ -625,7 +625,7 @@ Open/index/enrichment validation should reject:
         non-owners wait without advancing their promotion checkpoint. Verified
         end-to-end on a live multi-Raft standalone by
         `e2e/antfly/test_resolution.py` (document -> extraction -> resolution ->
-        cross-shard entity upsert) plus db-test/lib-resolution-source-test.
+        cross-shard entity upsert) plus antfly-storage-db-test/lib-resolution-source-test.
    - [x] Resolvers declarable via table config: a `resolvers` section in the
          index config (top-level or nested in an index) is registered by the
          provisioner on both the reconcile and create-local paths.
@@ -641,7 +641,7 @@ Open/index/enrichment validation should reject:
          (entity not yet promoted, or a cross-table entity key) hydrates to
          nothing rather than being fabricated or erroring -- the storage path
          returns the node id with `stored_data = null`, the distributed hydrate
-         path skips the missing key. Verified by a db-test.
+         path skips the missing key. Verified by a antfly-storage-db-test.
    - [x] `DocRef` endpoints threaded through graph edge artifacts: mention edges
          record the resolved target table (`{"target_table":...}` in edge
          metadata). Graph traversal now surfaces that
@@ -650,7 +650,7 @@ Open/index/enrichment validation should reject:
          paths), and the distributed hydrate coordinator buckets result nodes by
          their effective table so a cross-table entity node hydrates from the
          entities table's shard group instead of failing closed against the
-         queried table. Verified by a db-test (the node carries `table =
+         queried table. Verified by a antfly-storage-db-test (the node carries `table =
          "entities"`) and the install build. The api routing runs only in the
          cross-range coordinator path; the live resolution e2e emits the
          `target_table`-tagged provenance edges. (Surfacing the hydrated document
@@ -662,7 +662,7 @@ Open/index/enrichment validation should reject:
          name embedding from its text via an injected `DenseEmbedder`
          (`OpenOptions.resolution_embedder`) when the extraction artifact carries
          none, so `ann`/`cosine` blocking has a query vector. Verified by
-         lib-resolver-test (the MentionEmbedder seam) and a db-test (full storage
+         lib-resolver-test (the MentionEmbedder seam) and a antfly-storage-db-test (full storage
          path: backfill -> cosine -> link). The entity side is config -- an
          embeddings enrichment on the entity table over `canonical_name`
          produces the `name_embedding` the dense index serves to
@@ -684,7 +684,7 @@ Open/index/enrichment validation should reject:
          `fusion_prior`, `fusion_prior_weight`) sets the provenance edge weight
          to the fused confidence of its extractor's `trust *` the mention's
          asserted `confidence` folded with the config-pinned prior, instead of a
-         fixed 1.0. Verified by a db-test (trust 0.9 x confidence 0.8 -> edge
+         fixed 1.0. Verified by a antfly-storage-db-test (trust 0.9 x confidence 0.8 -> edge
          weight 0.72). The prior is a fixed config-pinned snapshot value (never
          the live edges being written), which sidesteps the streaming
          self-reinforce caveat. Naive in that it fuses one source per resolver;
@@ -715,7 +715,7 @@ Open/index/enrichment validation should reject:
          multiple entity shards use 2PC, so a document never lands a partial
          set of its entities. Enabled in serving
          (`transactional = true`); verified live by e2e/test_resolution.py and a
-         db-test (atomic batch). NOTE: atomically coupling the entity upsert with
+         antfly-storage-db-test (atomic batch). NOTE: atomically coupling the entity upsert with
          the *graph-edge* artifact is still not possible -- `TableCommitRequest`
          carries document writes/transforms, not graph edges -- so the
          entity+edge coupling from option 1 needs that machinery extension; the
@@ -741,7 +741,7 @@ Open/index/enrichment validation should reject:
    - [x] Eager edge rewrite on merge: `DB.rewriteEntityEdges` repoints every
          inbound edge of the merged-away entity at the survivor (preserving type,
          weight, metadata), so already-materialized provenance mention edges come
-         into line with a merge. Verified by a db-test.
+         into line with a merge. Verified by a antfly-storage-db-test.
 
 ## Test Plan
 
@@ -775,25 +775,25 @@ Resolution stage (done, `lib/resolver`):
 Resolver / promoter integration:
 
 - [x] The `resolution`/`promotion` workers advance `applied_sequence` only after
-  the durable write; idempotent replay re-applies (db-test).
+  the durable write; idempotent replay re-applies (antfly-storage-db-test).
 - [x] Live candidate blocking links across shards (e2e `test_resolution.py`).
   Prefix blocking carries the resolver's `candidate_limit` through the
   `CandidateSource` seam so distributed scans are bounded before scoring.
 - [x] Promoter upsert is idempotent under replay; concurrent promotions union
-  aliases (db-test + `DistributedEntitySink` merge transform).
+  aliases (antfly-storage-db-test + `DistributedEntitySink` merge transform).
 - [x] Promoter and provenance materializer only consume canonical resolution
   decisions (`new`/`match`); review-band decisions remain pending review until
   curation re-resolves them (db-tests).
 - [x] Provenance mention edges appear with source documents and disappear on
-  source delete (db-test).
-- [x] Hydration of a not-yet-promoted entity fails closed (db-test).
+  source delete (antfly-storage-db-test).
+- [x] Hydration of a not-yet-promoted entity fails closed (antfly-storage-db-test).
 - [x] Resolution/promotion lag and blocked promotion are visible in DB status;
   these stages are intentionally separate from `full_index` because review-band
   resolution may require human input.
 - [x] Fusion combines per-source confidence into the edge weight from a pinned
   prior snapshot (phase 2): `fusedMentionWeight` sets the mention edge weight via
   `matcher.fuse(strategy, [{confidence, trust}], prior, prior_weight)` from the
-  resolver's fusion config (db-test). Multi-source combine across extractors over
+  resolver's fusion config (antfly-storage-db-test). Multi-source combine across extractors over
   one edge is the remaining naive->full step.
 
 ## Cross-shard candidate blocking
@@ -820,8 +820,8 @@ and both are now served by the same seam.
    `scan` over `[prefix, prefixUpperBound)`, `nearest` -> a dense-vector `query`.
    The read source already resolves each group to local or remote and fans out,
    so blocking reuses all existing topology/transport instead of re-deriving it.
-   Unit-tested with a fake `TableReadSource` (`lib-resolution-source-test`) and a
-   fake `CandidateSource` (`db-test`).
+   Unit-tested with a fake `TableReadSource` (`antfly-api-resolution-source-test`) and a
+   fake `CandidateSource` (`antfly-storage-db-test`).
 3. **Serving-layer injection.** `DataServer.initApiServer` wraps
    `read_source.source()` in a `DistributedCandidateSource` (a long-lived
    `DataServer` field) and hands its `CandidateSource` to the API and raft-apply

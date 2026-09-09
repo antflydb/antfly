@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import importlib.util
 import io
@@ -158,7 +157,7 @@ class ReleasePromotionTests(unittest.TestCase):
                 None,
             )
 
-            ledger["source_ref"] = "refs/heads/v0.2.x"
+            ledger["source_ref"] = "refs/heads/v0.3.x"
             ledger_path.write_text(json.dumps(ledger))
             with self.assertRaisesRegex(SystemExit, "release-line provenance"):
                 verifier.verify_payload(
@@ -175,10 +174,7 @@ class ReleasePromotionTests(unittest.TestCase):
             "verify_release_ledger_handoff_test", "verify_release_ledger.py"
         )
         release_lines = load_module("release_lines_handoff_test", "release_lines.py")
-        policy = copy.deepcopy(release_lines.load_policy())
-        policy["lines"]["0.2"]["source_ref"] = "refs/heads/v0.2.x"
-        policy["lines"]["0.2"]["trusted_source_refs"].append("refs/heads/v0.2.x")
-        release_lines.validate_policy(policy)
+        policy = release_lines.load_policy()
 
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)

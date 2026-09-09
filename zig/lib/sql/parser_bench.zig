@@ -123,7 +123,7 @@ const Summary = struct {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const config = parseArgs(allocator, init.minimal.args) catch |err| {
-        std.debug.print("sql-parser-bench: {s}\n\n{s}", .{ @errorName(err), usage });
+        std.debug.print("lib-sql-parser-bench: {s}\n\n{s}", .{ @errorName(err), usage });
         std.process.exit(2);
     };
 
@@ -294,7 +294,7 @@ fn parseArgs(allocator: std.mem.Allocator, args: std.process.Args) !Config {
 }
 
 const usage =
-    \\usage: zig build sql-parser-bench -- [iterations] [--mode parse|lex-parse|result|all]
+    \\usage: ./zig-out/bin/lib-sql-parser-bench [iterations] [--mode parse|lex-parse|result|all]
     \\
     \\  iterations must be between 1 and 100000 (default: 1000)
     \\  parse measures the pre-tokenized hot path; lex-parse includes tokenization

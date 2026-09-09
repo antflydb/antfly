@@ -962,6 +962,7 @@ pub const TableRuntimeSnapshotCache = struct {
     topology_revision: u64 = 1,
     next_invalidation_epoch: u64 = 1,
     next_observation_generation: u64 = 1,
+    stabilize_physical_duration_telemetry: bool = false,
     next_targeted_index_transition_revision: u64 = 1,
     target_observation_revision: u64 = 1,
     tables: std.StringHashMapUnmanaged(*TableState) = .empty,
@@ -1023,6 +1024,17 @@ pub const TableRuntimeSnapshotCache = struct {
         state.mutation_mutex.unlock(std.Options.debug_io);
         self.mutation_barrier.unlockShared(std.Options.debug_io);
         state.release(self.alloc);
+    }
+
+    /// Physical execution durations are useful in native production status,
+    /// but they are not logical state and cannot be replayed across fresh
+    /// worlds. A runtime with a modeled executor keeps semantic timestamps,
+    /// deadlines, counters, and readiness unchanged while stabilizing only
+    /// the diagnostic duration fields returned by snapshots.
+    pub fn setModeledRuntimeTelemetry(self: *@This(), enabled: bool) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        self.stabilize_physical_duration_telemetry = enabled;
     }
 
     pub fn deinit(self: *@This()) void {
@@ -2398,6 +2410,7 @@ pub const TableRuntimeSnapshotCache = struct {
     fn cloneStableTableStatuses(
         state: *const TableState,
         alloc: std.mem.Allocator,
+        stabilize_physical_duration_telemetry: bool,
     ) !?LocalTableRuntimeStatuses {
         if (state.groups.count() == 0) return null;
         const ordered = try alloc.alloc(*const LocalTableRuntimeStatus, state.groups.count());
@@ -2415,6 +2428,8 @@ pub const TableRuntimeSnapshotCache = struct {
         }
         for (ordered) |status| {
             items[initialized] = try status.clone(alloc);
+            if (stabilize_physical_duration_telemetry)
+                stabilizePhysicalDurationTelemetry(&items[initialized].stats);
             initialized += 1;
         }
         return .{ .items = items };
@@ -2452,7 +2467,11 @@ pub const TableRuntimeSnapshotCache = struct {
         }
         self.mutex.unlock();
 
-        var statuses = (cloneStableTableStatuses(initial_state, self.read_view_alloc) catch return) orelse return;
+        var statuses = (cloneStableTableStatuses(
+            initial_state,
+            self.read_view_alloc,
+            self.stabilize_physical_duration_telemetry,
+        ) catch return) orelse return;
         defer statuses.deinit(self.read_view_alloc);
         const prepared = ReadView.init(self.read_view_alloc, statuses) catch return;
         var prepared_owned = true;
@@ -3012,6 +3031,8 @@ pub const TableRuntimeSnapshotCache = struct {
             var cloned = try group.status.clone(alloc);
             errdefer cloned.deinit(alloc);
             try group.applyAuthority(alloc, &cloned);
+            if (self.stabilize_physical_duration_telemetry)
+                stabilizePhysicalDurationTelemetry(&cloned.stats);
             return cloned;
         }
         return null;
@@ -3726,6 +3747,70 @@ pub const TableRuntimeSnapshotCache = struct {
         }
     }
 };
+
+fn physicalDurationField(comptime name: []const u8) bool {
+    @setEvalBranchQuota(100_000);
+    const names = [_][]const u8{
+        "backpressure_ns",
+        "bulk_finish_current_window_ns",
+        "bulk_finish_max_window_ns",
+        "db_open_ns",
+        "finalize_ns",
+        "finish_ns",
+        "flush_ns",
+        "hold_ns",
+        "last_embed_batch_ns",
+        "last_merge_elapsed_ns",
+        "load_indexes_ns",
+        "lsm_open_ensuring_dirs_ns",
+        "lsm_open_initializing_storage_ns",
+        "lsm_open_manifest_ns",
+        "lsm_open_mounting_runs_ns",
+        "lsm_open_recovered_temp_cleanup_ns",
+        "lsm_open_total_ns",
+        "lsm_open_wal_replay_ns",
+        "maintenance_ns",
+        "manifest_ns",
+        "mask_build_ns",
+        "max_finalize_ns",
+        "max_finish_ns",
+        "max_flush_ns",
+        "max_hold_ns",
+        "max_maintenance_ns",
+        "max_wait_ns",
+        "merge_elapsed_ns",
+        "save_ns",
+        "sync_ns",
+        "total_embed_ns",
+        "wait_ns",
+        "wal_replay_ns",
+        "write_pressure_ns",
+    };
+    inline for (names) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
+    return false;
+}
+
+fn stabilizePhysicalDurationTelemetry(value: anytype) void {
+    const pointer = @typeInfo(@TypeOf(value)).pointer;
+    const T = pointer.child;
+    switch (@typeInfo(T)) {
+        .@"struct" => inline for (std.meta.fields(T)) |field| {
+            if (comptime physicalDurationField(field.name)) {
+                @field(value.*, field.name) = 0;
+            } else {
+                stabilizePhysicalDurationTelemetry(&@field(value.*, field.name));
+            }
+        },
+        .array => for (value) |*item| stabilizePhysicalDurationTelemetry(item),
+        .optional => if (value.*) |*item| stabilizePhysicalDurationTelemetry(item),
+        .pointer => |child_pointer| {
+            if (child_pointer.size == .slice and !child_pointer.is_const) {
+                for (value.*) |*item| stabilizePhysicalDurationTelemetry(item);
+            }
+        },
+        else => {},
+    }
+}
 
 fn lessThanGroupIdPtr(_: void, lhs: *const LocalTableRuntimeStatus, rhs: *const LocalTableRuntimeStatus) bool {
     return lhs.group_id < rhs.group_id;
@@ -4989,9 +5074,7 @@ fn findMatchingIndexStatus(
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) {
-        std.Thread.yield() catch {};
-    }
+    @import("antfly_platform").sync.lockYielding(mutex);
 }
 
 fn freeAlgebraicCandidateStatuses(alloc: std.mem.Allocator, candidates: []const db_mod.types.AlgebraicCandidateStatus) void {
@@ -5679,17 +5762,17 @@ test "runtime status snapshots never wait for mutable cache ownership" {
     };
     var snapshot = Snapshot{ .cache = &cache };
     lockAtomic(&cache.mutex);
-    const thread = try std.Thread.spawn(.{}, Snapshot.run, .{&snapshot});
+    var thread = try std.testing.io.concurrent(Snapshot.run, .{&snapshot});
     var completed_while_locked = false;
     for (0..10_000) |_| {
         if (snapshot.done.load(.acquire)) {
             completed_while_locked = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     cache.mutex.unlock();
-    thread.join();
+    thread.await(std.testing.io);
     try std.testing.expect(completed_while_locked);
     try std.testing.expect(!snapshot.failed.load(.acquire));
 }
@@ -5782,7 +5865,7 @@ test "blocked read payload preparation does not convoy an unrelated table" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.calls.fetchAdd(1, .acq_rel) != 0) return;
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
     };
     const Publish = struct {
@@ -5812,20 +5895,24 @@ test "blocked read payload preparation does not convoy an unrelated table" {
     defer test_read_group_preparation_hook = null;
     var publish_a = Publish{ .cache = &cache, .token = token_a, .table_name = "table-a", .group_id = 1 };
     var publish_b = Publish{ .cache = &cache, .token = token_b, .table_name = "table-b", .group_id = 2 };
-    const thread_a = try std.Thread.spawn(.{}, Publish.run, .{&publish_a});
-    while (!blocker.entered.load(.acquire)) std.Thread.yield() catch {};
-    const thread_b = try std.Thread.spawn(.{}, Publish.run, .{&publish_b});
+    var thread_a = try std.testing.io.concurrent(Publish.run, .{&publish_a});
+    defer {
+        blocker.release.store(true, .release);
+        thread_a.await(std.testing.io);
+    }
+    while (!blocker.entered.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    var thread_b = try std.testing.io.concurrent(Publish.run, .{&publish_b});
     var unrelated_completed = false;
     for (0..100_000) |_| {
         if (publish_b.done.load(.acquire)) {
             unrelated_completed = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     blocker.release.store(true, .release);
-    thread_a.join();
-    thread_b.join();
+    thread_a.await(std.testing.io);
+    thread_b.await(std.testing.io);
     try std.testing.expect(unrelated_completed);
     try std.testing.expect(!publish_a.failed.load(.acquire));
     try std.testing.expect(!publish_b.failed.load(.acquire));
@@ -5867,7 +5954,7 @@ test "blocked table refresh preparation does not convoy unrelated publication" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.calls.fetchAdd(1, .acq_rel) != 0) return;
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
     };
     const Refresh = struct {
@@ -5909,33 +5996,33 @@ test "blocked table refresh preparation does not convoy unrelated publication" {
     defer test_read_group_preparation_hook = null;
     var refresh = Refresh{ .cache = &cache, .token = &refresh_token, .snapshots = snapshots };
     var publish = Publish{ .cache = &cache, .token = token_b };
-    const refresh_thread = try std.Thread.spawn(.{}, Refresh.run, .{&refresh});
+    var refresh_thread = try std.testing.io.concurrent(Refresh.run, .{&refresh});
     var preparation_entered = false;
     for (0..100_000) |_| {
         if (blocker.entered.load(.acquire)) {
             preparation_entered = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!preparation_entered) {
         blocker.release.store(true, .release);
-        refresh_thread.join();
+        refresh_thread.await(std.testing.io);
         try std.testing.expect(preparation_entered);
         return;
     }
-    const publish_thread = try std.Thread.spawn(.{}, Publish.run, .{&publish});
+    var publish_thread = try std.testing.io.concurrent(Publish.run, .{&publish});
     var unrelated_completed = false;
     for (0..100_000) |_| {
         if (publish.done.load(.acquire)) {
             unrelated_completed = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     blocker.release.store(true, .release);
-    refresh_thread.join();
-    publish_thread.join();
+    refresh_thread.await(std.testing.io);
+    publish_thread.await(std.testing.io);
     try std.testing.expect(unrelated_completed);
     try std.testing.expect(!refresh.failed.load(.acquire));
     try std.testing.expect(!publish.failed.load(.acquire));
@@ -11200,4 +11287,53 @@ test "table runtime snapshot cache summarizes replay debt" {
     try std.testing.expectEqual(@as(usize, 2), summary.indexes_with_replay_debt);
     try std.testing.expectEqual(@as(u64, 6), summary.outstanding_replay_sequences);
     try std.testing.expectEqual(@as(u64, 3), summary.max_index_replay_backlog);
+}
+
+test "modeled runtime snapshots stabilize only physical duration telemetry" {
+    var cache = TableRuntimeSnapshotCache.init(std.testing.allocator);
+    defer cache.deinit();
+    cache.setModeledRuntimeTelemetry(true);
+
+    const token = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(token, "docs", .{
+            .group_id = 7,
+            .stats = .{
+                .doc_count = 3,
+                .enrichment = .{
+                    .next_retry_at_ms = 1234,
+                    .last_embed_batch_ns = 55,
+                    .total_embed_ns = 89,
+                },
+                .async_indexing = .{
+                    .startup = .{
+                        .configured_indexes = 2,
+                        .db_open_ns = 144,
+                        .load_indexes_ns = 233,
+                        .lsm_open_total_ns = 377,
+                    },
+                    .dense_catch_up = .{
+                        .current_sequence = 8,
+                        .finish_ns = 610,
+                        .max_finish_ns = 987,
+                    },
+                },
+            },
+        }),
+    );
+
+    var status = (try cache.snapshotGroupStatus(std.testing.allocator, "docs", 7)).?;
+    defer status.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 3), status.stats.doc_count);
+    try std.testing.expectEqual(@as(u64, 1234), status.stats.enrichment.next_retry_at_ms);
+    try std.testing.expectEqual(@as(u64, 0), status.stats.enrichment.last_embed_batch_ns);
+    try std.testing.expectEqual(@as(u64, 0), status.stats.enrichment.total_embed_ns);
+    try std.testing.expectEqual(@as(u32, 2), status.stats.async_indexing.startup.configured_indexes);
+    try std.testing.expectEqual(@as(u64, 0), status.stats.async_indexing.startup.db_open_ns);
+    try std.testing.expectEqual(@as(u64, 0), status.stats.async_indexing.startup.load_indexes_ns);
+    try std.testing.expectEqual(@as(u64, 0), status.stats.async_indexing.startup.lsm_open_total_ns);
+    try std.testing.expectEqual(@as(u64, 8), status.stats.async_indexing.dense_catch_up.current_sequence);
+    try std.testing.expectEqual(@as(u64, 0), status.stats.async_indexing.dense_catch_up.finish_ns);
+    try std.testing.expectEqual(@as(u64, 0), status.stats.async_indexing.dense_catch_up.max_finish_ns);
 }

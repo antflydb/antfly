@@ -107,11 +107,7 @@ run_case() {
   local docs="$3"
   local limit="$4"
   local cmd=(
-    zig build
-    --cache-dir "$ZIG_CACHE_DIR"
-    --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
-    public-query-guardrail
-    --
+    "$ROOT/zig/zig-out/bin/api_bench"
     --mode "$MODE"
     --query-shape "$query_shape"
     --docs "$docs"
@@ -139,8 +135,8 @@ run_case() {
 }
 
 if [[ "$WARM_BUILD" == "1" ]]; then
-  echo "warming public-query-guardrail"
-  zig build --cache-dir "$ZIG_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" public-query-guardrail-build
+  echo "warming antfly-api-bench"
+  zig build --cache-dir "$ZIG_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" antfly-api-bench
 fi
 
 run_case index_sort_first_page_small exact-sort-index-sort "$DOCS_SMALL" "$LIMIT_SMALL"

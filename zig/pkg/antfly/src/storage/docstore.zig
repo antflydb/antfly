@@ -50,10 +50,7 @@ fn backoffWriterLockRetry(io: ?std.Io) void {
         return;
     }
     if (comptime builtin.os.tag == .freestanding) return;
-    std.Thread.yield() catch {};
-    if (@hasDecl(std.Thread, "sleep")) {
-        std.Thread.sleep(writer_locked_retry_sleep_ns);
-    }
+    std.Io.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@intCast(writer_locked_retry_sleep_ns)), .awake) catch {};
 }
 
 const replay_hints = [_]change_journal_mod.TargetHint{

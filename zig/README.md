@@ -98,12 +98,12 @@ Focused targets are useful while iterating:
 
 ```sh
 make unit-test
-zig build lib-db-test
-zig build lib-storage-test
-zig build lib-metadata-test
+zig build antfly-storage-db-test
+zig build antfly-storage-test
+zig build antfly-metadata-test
 zig build lib-image-test
-zig build lib-audio-test
-zig build lib-raft-sim-test
+zig build antfly-audio-test
+zig build raft-vopr-test
 zig build inference-test
 ```
 
@@ -156,21 +156,18 @@ are not present.
 
 ## Benchmarks
 
-Benchmark sources are grouped by domain, while build step names stay stable:
+Artifact targets build and install into `zig-out/bin`. Run binaries directly,
+so a comparison can build once and execute several workloads:
 
 ```sh
-zig build search-bench-build
-zig build graph-pattern-bench-build
-zig build graph-pattern-bench -- --mode exact --fanout 10000 --target-degree 100000
-zig build graph-pattern-bench -- --mode generic --fanout 10000 --target-degree 100000
-zig build text-segment-write-bench
-zig build lsm-backend-bench
-zig build wal-bench
-zig build dense-stack-bench-build
-zig build hbc-read-bench
-zig build json-bench
-zig build regex-bench
+zig build graph-pattern-bench antfly-storage-bench
+./zig-out/bin/graph_pattern_query_bench --mode exact --fanout 10000 --target-degree 100000
+./zig-out/bin/graph_pattern_query_bench --mode generic --fanout 10000 --target-degree 100000
 ```
+
+[BENCHMARKS.md](BENCHMARKS.md) lists binaries, previous smoke/stress arguments,
+and the DB query matrix. Conformance fixture setup is documented in
+[TESTING.md](TESTING.md).
 
 Run each graph-pattern mode in a fresh process. The JSON output reports p50,
 p95, and p99 latency and query-allocation high-water marks. Process RSS is an
@@ -178,14 +175,14 @@ OS high-water mark; use `--warmup 0 --samples 1` for a cold-query RSS comparison
 
 The `search-benchmark-game/engines/antfly-zig` directory is an adapter for the
 external `search-benchmark-game` harness. It delegates to the root
-`search-bench-build` step.
+`search-bench` step.
 
 ### PDF-only iteration
 
 Build the native PDF machinery without the Antfly server or storage kernel:
 
 ```sh
-zig build lib-pdf-bench-install -Dpdf-optimize=Debug -j1
+zig build lib-pdf-bench -Dpdf-optimize=Debug -j1
 ./zig-out/bin/lib-pdf-bench dump-text input.pdf output.txt
 zig build lib-pdf-test -Doptimize=Debug -j1
 ```

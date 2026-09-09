@@ -570,9 +570,9 @@ fn lockFileExclusiveWithCancellation(
         if (attempts < 64) {
             std.atomic.spinLoopHint();
         } else if (attempts < 256) {
-            std.Thread.yield() catch {};
+            try io.sleep(.zero, .awake);
         } else {
-            platform_time.sleepNs(std.time.ns_per_ms);
+            try io.sleep(.fromMilliseconds(1), .awake);
         }
     }
     errdefer file.unlock(io);
@@ -1607,7 +1607,7 @@ fn lockAtomicWithCancellation(mutex: *std.atomic.Mutex, cancellation: Cancellati
         if (attempts < 64) {
             std.atomic.spinLoopHint();
         } else {
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
         }
     }
     errdefer mutex.unlock();

@@ -472,6 +472,9 @@ export interface RetrievalAgentStreamCallbacks {
   onStepProgress?: (data: Record<string, unknown>) => void;
   onStepCompleted?: (step: AgentStep) => void;
   onDone?: (data: RetrievalAgentResult) => void;
+  /** Receives typed failures, including InferenceCapacityError with retryAfterMs. */
+  onErrorDetail?: (error: Error) => void;
+  /** Legacy message callback; use onErrorDetail for structured retry handling. */
   onError?: (error: string) => void;
 }
 

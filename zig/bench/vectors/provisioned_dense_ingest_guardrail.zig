@@ -178,9 +178,9 @@ const Summary = struct {
     }
 };
 
-pub fn main(init: std.process.Init) !void {
+pub fn run(_: std.process.Init, args: *std.process.Args.Iterator) !void {
     const alloc = std.heap.c_allocator;
-    const cfg = try parseArgs(init.minimal.args);
+    const cfg = try parseArgs(args);
 
     var path_buf: [256]u8 = undefined;
     const replica_root = tempPath(&path_buf);
@@ -191,36 +191,34 @@ pub fn main(init: std.process.Init) !void {
     try enforceGuardrails(cfg, summary);
 }
 
-fn parseArgs(args_in: std.process.Args) !Config {
+fn parseArgs(args: *std.process.Args.Iterator) !Config {
     var cfg = Config{};
-    var args = std.process.Args.Iterator.init(args_in);
-    _ = args.skip();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--docs")) {
-            cfg.docs = try parseNextUsize(&args, "--docs");
+            cfg.docs = try parseNextUsize(args, "--docs");
         } else if (std.mem.eql(u8, arg, "--dims")) {
-            cfg.dims = try parseNextUsize(&args, "--dims");
+            cfg.dims = try parseNextUsize(args, "--dims");
         } else if (std.mem.eql(u8, arg, "--batch-size")) {
-            cfg.batch_size = try parseNextUsize(&args, "--batch-size");
+            cfg.batch_size = try parseNextUsize(args, "--batch-size");
         } else if (std.mem.eql(u8, arg, "--seed")) {
-            cfg.seed = try parseNextU64(&args, "--seed");
+            cfg.seed = try parseNextU64(args, "--seed");
         } else if (std.mem.eql(u8, arg, "--hold-before-final-drain-ms")) {
-            cfg.hold_before_final_drain_ms = try parseNextU64(&args, "--hold-before-final-drain-ms");
+            cfg.hold_before_final_drain_ms = try parseNextU64(args, "--hold-before-final-drain-ms");
         } else if (std.mem.eql(u8, arg, "--sync-level")) {
             const raw = args.next() orelse return error.InvalidArgument;
             cfg.sync_level = db_types.parsePublicSyncLevelText(raw) orelse return error.InvalidArgument;
         } else if (std.mem.eql(u8, arg, "--max-bulk-clone-calls")) {
-            cfg.max_bulk_clone_calls = try parseNextU64(&args, "--max-bulk-clone-calls");
+            cfg.max_bulk_clone_calls = try parseNextU64(args, "--max-bulk-clone-calls");
         } else if (std.mem.eql(u8, arg, "--max-bulk-clone-bytes")) {
-            cfg.max_bulk_clone_bytes = try parseNextU64(&args, "--max-bulk-clone-bytes");
+            cfg.max_bulk_clone_bytes = try parseNextU64(args, "--max-bulk-clone-bytes");
         } else if (std.mem.eql(u8, arg, "--max-bulk-clone-peak-bytes")) {
-            cfg.max_bulk_clone_peak_bytes = try parseNextU64(&args, "--max-bulk-clone-peak-bytes");
+            cfg.max_bulk_clone_peak_bytes = try parseNextU64(args, "--max-bulk-clone-peak-bytes");
         } else if (std.mem.eql(u8, arg, "--max-ingest-ms")) {
-            cfg.max_ingest_ms = try parseNextU64(&args, "--max-ingest-ms");
+            cfg.max_ingest_ms = try parseNextU64(args, "--max-ingest-ms");
         } else if (std.mem.eql(u8, arg, "--max-data-block-cache-bytes")) {
-            cfg.max_data_block_cache_bytes = try parseNextU64(&args, "--max-data-block-cache-bytes");
+            cfg.max_data_block_cache_bytes = try parseNextU64(args, "--max-data-block-cache-bytes");
         } else if (std.mem.eql(u8, arg, "--max-peak-footprint-bytes")) {
-            cfg.max_peak_footprint_bytes = try parseNextU64(&args, "--max-peak-footprint-bytes");
+            cfg.max_peak_footprint_bytes = try parseNextU64(args, "--max-peak-footprint-bytes");
         } else {
             return error.InvalidArgument;
         }
@@ -245,7 +243,7 @@ fn runProvisionedDenseIngest(
     var read_source = public_api.ProvisionedTableReadSource.init(
         replica_root_dir,
         catalog,
-        raft_mod.read_gate.noopReadableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     try storage.attachSources(&read_source, &write_source);
 
@@ -469,6 +467,9 @@ const BenchCatalog = struct {
             .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
+                .routing_snapshot = routingSnapshot,
+                .linearizable_routing_snapshot = routingSnapshot,
+                .free_routing_snapshot = freeRoutingSnapshot,
             },
         };
     }
@@ -486,6 +487,20 @@ const BenchCatalog = struct {
             .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
         };
     }
+
+    // This immutable benchmark catalog is authoritative for both eventual and
+    // linearizable reads. Its borrowed projection lives for the whole run.
+    fn routingSnapshot(ptr: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+        const state: *BenchCatalogState = @ptrCast(@alignCast(ptr));
+        return .{
+            .metadata_group_id = 1,
+            .change_token = .{ .metadata_group_id = 1 },
+            .tables = @as(*[1]metadata_table_manager.TableRecord, @ptrCast(&state.table))[0..],
+            .ranges = @as(*[1]metadata_table_manager.RangeRecord, @ptrCast(&state.range))[0..],
+        };
+    }
+
+    fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
 
     fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 };
@@ -664,10 +679,7 @@ fn normalizeInPlace(vec: []f32) void {
 
 fn sleepMs(duration_ms: u64) void {
     if (duration_ms == 0) return;
-    const deadline = nowNs() +| (duration_ms * std.time.ns_per_ms);
-    while (nowNs() < deadline) {
-        std.Thread.yield() catch {};
-    }
+    std.Io.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@as(i96, duration_ms) * std.time.ns_per_ms), .awake) catch {};
 }
 
 fn tempPath(buf: []u8) [*:0]const u8 {

@@ -2147,7 +2147,7 @@ Current status:
 - node/subtree split-range metadata is implemented in `hbc_adapter.zig`
 - `splitPlanningStats(...)`, `buildSplitReusePlan(...)`,
   `estimateSplitRebuildWork(...)`, and split-member collection are wired into
-  [pkg/antfly/src/bench/hbc_bench.zig](pkg/antfly/src/bench/hbc_bench.zig)
+  [bench/vectors/hbc_bench.zig](bench/vectors/hbc_bench.zig)
 - synthetic HBC workloads are a warning: `kmeans` produced almost entirely
   mixed subtrees, `hilbert` was only slightly better, and measured full-rebuild
   and mixed-rebuild costs were nearly identical because there were effectively

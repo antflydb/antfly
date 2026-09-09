@@ -819,7 +819,7 @@ Status as of 2026-05-19:
   boundary also rejects stale explicit generations before invoking readable
   lease hooks, keeping lease coordination behind the same fail-closed identity
   snapshot validation as storage search. The build now exposes a
-  dedicated `capi-test` step and includes it in `unit-test`, so these C API
+  dedicated `capi-test` step and includes it in `antfly-unit-test`, so these C API
   identity-generation boundaries are covered by direct C API tests rather than
   only by the shared-library compile. The C API gate names graph generation
   propagation, stale search and aggregation rejection, the packed-dense
@@ -1450,15 +1450,15 @@ Status as of 2026-05-19:
   ordinal-native. The focused DOCID gate now includes the ordinal-bitmap
   promotion regression, so the large-set representation and promotion counter
   remain covered alongside the query execution boundaries. `zig build
-  docid-doc-set-bench` now provides a repeatable ReleaseFast benchmark for raw
+  antfly-storage-bench` now provides a repeatable ReleaseFast benchmark for raw
   sorted `u32` ordinal arrays, direct roaring bitmaps, the current compact
   ordinal-list/bitmap document-set operators, sorted sparse `u64` IDs, and
   public DOCID-key baselines across small, medium, large, dense, and sparse
-  layouts. `zig build docid-write-bench` measures insert, update, and delete
+  layouts. `zig build antfly-storage-bench && ./zig-out/bin/storage_bench write --docs 512 --batch-size 128 --body-repeat 1` measures insert, update, and delete
   phases across write consistency levels and reports the isolated
   extraction, artifact-cleanup, identity-capacity, identity-metadata,
   derived-payload, and store-write timings from `BatchProfile` alongside
-  resulting identity-table stats. `zig build docid-query-bench` now benchmarks
+  resulting identity-table stats. `zig build antfly-storage-bench && ./zig-out/bin/storage_bench query --docs 4096 --queries 16 --repeats 8 --filter-size 256 --limit 32` now benchmarks
   direct DB query shapes that exercise the real filter bridges: match-all with a
   doc filter, full-text with a doc filter, and sparse-vector search with a doc
   filter. Each shape runs `public_ids` mode, where public document IDs are
@@ -1485,28 +1485,26 @@ Status as of 2026-05-19:
   `resolved_set_delta=0`, and ordinal/public ratios around 0.84-0.88 across the
   real DB shapes. These benchmarks are now the first pass/fail evidence hooks
   for validating whether the compact ordinal machinery is still earning its
-  complexity as sparse-ID alternatives evolve. `scripts/run_docid_query_matrix.sh`
-  wraps that benchmark into timestamped evidence runs under
-  `bench/results/docid-query-matrix/`, preserving `environment.txt`,
-  `commands.txt`, `status.tsv`, per-case stdout/stderr/JSONL, a combined
-  `docid-query-matrix-combined.jsonl`, and a summary-only
-  `docid-query-matrix-summary.jsonl`. Set `DOCID_QUERY_MATRIX_SMOKE=1` for a
-  fast local matrix; the default non-smoke matrix is a bounded developer
-  evidence run, and larger release-scale runs should override the
-  `DOCID_QUERY_MATRIX_*` case sizes and `DOCID_QUERY_MATRIX_MAX_ORDINAL_RATIO`.
+  complexity as sparse-ID alternatives evolve. The storage comparisons now run within
+  `python3 scripts/run_db_query_matrix.py --suite storage`. Use `--profile smoke`
+  for the original small cases; the bounded profile preserves all three original
+  workload sizes. The same matrix includes public query shapes (`--suite public`)
+  and collects environment, command, status, raw output, and JSONL evidence under
+  `bench/results/db-query-matrix/`. See [BENCHMARKS.md](BENCHMARKS.md).
   Lifecycle cutover, mixed-version, distributed snapshot, cache, compaction,
   and near-capacity boundary checks run in the owning suites:
-  `zig build integration-test lib-db-test raft-test`.
-  `scripts/run_docid_lifecycle_matrix.sh` wraps those suites,
-  focused DB/storage checks, and the DOCID query matrix into
-  timestamped evidence under `bench/results/docid-lifecycle-matrix/`; it
-  defaults to smoke-sized query evidence and can be expanded with
-  `DOCID_LIFECYCLE_MATRIX_SMOKE=0`.
+  `zig build antfly-integration-test antfly-storage-db-test antfly-raft-test`.
+  Additional focused coverage remains available through
+  `zig build antfly-storage-db-query-test` and
+  `zig build antfly-storage-test -- --test-filter "db lsm primary compaction preserves doc identity ordinals" --test-filter "db allocates final document ordinal with all index families present" --test-filter "db text compaction preserves ordinal filters across reopen" --test-filter "structured filter doc set cache separates shared namespace generation keys"`.
+  Run `python3 scripts/run_db_query_matrix.py --profile smoke` from the repository
+  root for storage and public-query smoke evidence. DOCID has no separate public
+  test target, benchmark target, or matrix script.
   Run the owning suites and optional chaos campaigns directly from `zig/`:
 
   ```sh
-  zig build integration-test lib-db-test raft-test \
-    lib-metadata-transition-chaos-test lib-metadata-public-chaos-test \
+  zig build antfly-integration-test antfly-storage-db-test antfly-raft-test \
+    lib-metadata-vopr-transition-chaos-test lib-metadata-vopr-public-chaos-test \
     lib-lsm-backend-chaos-test
   ```
 
@@ -1518,7 +1516,7 @@ Status as of 2026-05-19:
   repository root:
 
   ```sh
-  DOCID_PERF_MATRIX_DOCS=300000 scripts/run_docid_perf_matrix.sh
+  python3 scripts/run_db_query_matrix.py --suite public --public-docs 300000
   ANTFLY_BIN=/absolute/path/to/antfly \
     uv run --project zig/e2e/antfly pytest -q -x -s zig/e2e/antfly/test_auth.py \
     -k 'stateful_auth_enforces_table_permissions or stateful_auth_enforces_row_filters_on_lookup_and_scan'
@@ -1526,7 +1524,7 @@ Status as of 2026-05-19:
 
   For old/new binary auth smoke checks, repeat the auth command with each
   binary's absolute path. The performance matrix retains its own timestamped
-  evidence logs under `bench/results/docid-perf-matrix/`.
+  evidence logs under `bench/results/db-query-matrix/`.
   The query-matrix cases cover the existing medium baseline, a selective
   small-filter shape, and a broad large-filter shape so future evidence is not
   limited to one favorable filter size. A local smoke matrix passed all three
@@ -1757,7 +1755,7 @@ Status as of 2026-05-19:
   from the source range's identity domain before opening the destination DB.
   Fresh split handoff rows therefore preserve source-range ordinals instead of
   allocating a destination-range namespace or falling back to the default
-  compatibility namespace. The metadata simulation split runtime now mirrors
+  compatibility namespace. The metadata VOPR split runtime now mirrors
   that behavior by preserving source runtime identity telemetry for the
   destination DB, so transition simulation tests do not hide namespace bugs.
   Existing or restored stores keep their persisted namespace through
@@ -1790,7 +1788,7 @@ Status as of 2026-05-19:
   the merge coordinator for the opt-in transition action, and replays donor
   documents under that receiver namespace during catch-up. The focused DOCID
   gate now depends on the data-runtime split and merge fallback tests plus the
-  fast metadata simulation smoke tests for split namespace derivation and merge
+  fast metadata VOPR smoke tests for split namespace derivation and merge
   reassignment opt-in recording. It also runs the public metadata split/merge
   lifecycle simulations that exercise forwarded public transition requests,
   post-split multi-range read readiness, and post-merge routing over
@@ -1840,7 +1838,7 @@ Status as of 2026-05-19:
   phases does not erase the decision. Merge runtime status reports the persisted
   opt-in as an internal lifecycle fact, the transition-service queue path has
   focused coverage that cloned merge records dispatch the same callback,
-  metadata simulations now record the same transition-runtime callback, and
+  metadata VOPR tests now record the same transition-runtime callback, and
   raft HTTP-host merge simulations now model the callback before accept,
   catch-up, and finalize actions when a queued merge transition carries the
   reassignment opt-in. This keeps the service-lane simulation aligned with the
@@ -2097,11 +2095,11 @@ Status as of 2026-05-19:
   longer pre-materialize a broad all-live-doc vector-ID filter; visibility is
   left to normal result postprocessing unless the caller supplied a real
   document constraint.
-  In the 100k `public-query-guardrail --mode handler
+  In the 100k `antfly-api-bench --mode handler
   --query-shape hybrid-filter-exclude-project` profile, these changes moved the
   handler path from roughly 570ms before this pass to roughly 55ms while
   preserving the filled `k=20` correctness guardrail.
-  `scripts/run_docid_perf_matrix.sh` now captures a broader 100k public-query
+  `python3 scripts/run_db_query_matrix.py --suite public` now captures a broader 100k public-query
   evidence pass across full-text, dense-filter, sparse-filter, graph expansion,
   algebraic-filter, and hybrid-composed shapes. The default wrapper no longer
   requires symbolic dense profile rows because handler/local guardrail runs do
@@ -2146,7 +2144,7 @@ Status as of 2026-05-19:
   carries `doc_ordinal`, keeping the last postprocessing filter stage from
   reintroducing public-ID membership checks for ordinal-complete pages. This
   boundary is covered by the internal result-shaping tests included in
-  `lib-db-test` and `lib-db-query-test`. They import the DB result-shaping
+  `antfly-storage-db-test` and `antfly-storage-db-query-test`. They import the DB result-shaping
   module explicitly and verify that
   native public-ID constraints are resolved once, then applied against hit
   ordinals without stored-field loads. The owning DB suite also includes

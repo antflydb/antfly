@@ -23,6 +23,7 @@ pub const std_options: std.Options = .{
 var log_err_count: std.atomic.Value(usize) = .init(0);
 var expected_error_log_count: std.atomic.Value(usize) = .init(0);
 var test_filters: []const []const u8 = &.{};
+var suite_filters: []const []const u8 = &.{};
 var skip_test_filters: []const []const u8 = &.{};
 
 pub fn main(init: std.process.Init.Minimal) void {
@@ -35,6 +36,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         std.debug.panic("unable to parse command line args: {t}", .{err});
     };
     var include_filters: std.ArrayList([]const u8) = .empty;
+    var suite_include_filters: std.ArrayList([]const u8) = .empty;
     var exclude_filters: std.ArrayList([]const u8) = .empty;
     var allow_empty_test_filter = false;
     var list_tests = false;
@@ -45,6 +47,10 @@ pub fn main(init: std.process.Init.Minimal) void {
         if (std.mem.startsWith(u8, arg, "--seed=")) {
             testing.random_seed = std.fmt.parseUnsigned(u32, arg["--seed=".len..], 0) catch
                 @panic("unable to parse --seed command line argument");
+        } else if (std.mem.eql(u8, arg, "--suite-filter")) {
+            i += 1;
+            if (i >= args.len) @panic("missing value for --suite-filter");
+            appendFilter(arena, "--suite-filter", &suite_include_filters, args[i]);
         } else if (std.mem.startsWith(u8, arg, "--test-filter=")) {
             appendFilter(arena, "--test-filter", &include_filters, arg["--test-filter=".len..]);
         } else if (std.mem.eql(u8, arg, "--test-filter")) {
@@ -70,6 +76,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         }
     }
     test_filters = include_filters.items;
+    suite_filters = suite_include_filters.items;
     skip_test_filters = exclude_filters.items;
 
     const test_fns = builtin.test_functions;
@@ -216,7 +223,16 @@ pub export fn antfly_test_expect_error_logs(count: usize) callconv(.c) void {
     _ = expected_error_log_count.fetchAdd(count, .monotonic);
 }
 
+fn matchesSuite(name: []const u8) bool {
+    if (suite_filters.len == 0) return true;
+    for (suite_filters) |filter| {
+        if (matchesSingleFilter(name, filter)) return true;
+    }
+    return false;
+}
+
 fn matchesFilter(name: []const u8) bool {
+    if (!matchesSuite(name)) return false;
     if (test_filters.len != 0) {
         var included = false;
         for (test_filters) |filter| {
@@ -235,6 +251,7 @@ fn matchesFilter(name: []const u8) bool {
 }
 
 fn recordMatchingIncludeFilters(name: []const u8, matched_filter_counts: []usize) void {
+    if (!matchesSuite(name)) return;
     for (test_filters, 0..) |filter, filter_index| {
         if (matchesSingleFilter(name, filter)) matched_filter_counts[filter_index] += 1;
     }

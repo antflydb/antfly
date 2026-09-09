@@ -15,7 +15,7 @@
 //! Standalone fuzz target for `tabular_model.json` loading.
 //!
 //! Drives the IR loader against arbitrary input via the standard Zig
-//! `fuzz_test` machinery. Wired into the root build as `fuzz-tabular-loader`.
+//! `fuzz_test` machinery. Wired into the root build as `lib-ml-tabular-fuzz-test`.
 //!
 //! Run interactively:
 //!     zig test src/fuzz_loader.zig -fno-emit-bin --fuzz

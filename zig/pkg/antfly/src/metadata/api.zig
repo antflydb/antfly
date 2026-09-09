@@ -375,6 +375,7 @@ pub const CatalogRouteFence = struct {
     /// excluded from the wire representation: monotonic clocks and borrowed
     /// cancellation callbacks are process-local capabilities.
     admission_deadline_ns: ?u64 = null,
+    admission_deadline_io: ?@import("../runtime_io_abi.zig").Borrow = null,
     admission_cancellation: CancellationToken = .none,
 
     const Wire = struct {

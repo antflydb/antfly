@@ -67,7 +67,9 @@ export class InferenceCapacityError extends InferenceAPIError {
   }
 }
 
-function isTransientCapacityError(value: unknown): value is CompatibleTransientCapacityError {
+export function isTransientCapacityError(
+  value: unknown
+): value is CompatibleTransientCapacityError {
   if (typeof value !== "object" || value === null) return false;
   const candidate = value as Record<string, unknown>;
   return (
