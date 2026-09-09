@@ -291,6 +291,99 @@ fn resolveRunMaxConcurrentRequests(cli: ?u32, cfg: ?*const common_config.Config)
         common_config.default_inference_max_concurrent_requests);
 }
 
+// Standalone inference historically receives flat model settings from the
+// operator. Normalize those into the canonical inference object before using
+// the shared parser; explicit nested settings take precedence field by field.
+fn parseRunConfig(alloc: std.mem.Allocator, raw: []const u8) !common_config.Config {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var parsed = try std.json.parseFromSlice(std.json.Value, scratch, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidConfig;
+    var root = &parsed.value.object;
+    var model_config = if (root.get("inference")) |value| switch (value) {
+        .object => value.object,
+        else => return error.InvalidConfig,
+    } else std.json.ObjectMap{};
+    for ([_][]const u8{ "models_dir", "ml_dir", "max_loaded_models", "preload" }) |key| {
+        if (!model_config.contains(key)) {
+            if (root.get(key)) |value| try model_config.put(scratch, key, value);
+        }
+    }
+    // The shared schema requires a client API URL, which is not needed when
+    // starting this local server. Model artifact tags also have a wider CLI
+    // vocabulary than the shared schema enum (e.g. Q4_K_M). Reuse the raw
+    // preload parser so those tags retain their exact spelling.
+    const preload_value = model_config.fetchSwapRemove("preload");
+    if (root.contains("inference") or model_config.count() > 0 or preload_value != null) {
+        if (!model_config.contains("api_url")) try model_config.put(scratch, "api_url", .{ .string = "" });
+        try root.put(scratch, "inference", .{ .object = model_config });
+    }
+    const normalized = try std.json.Stringify.valueAlloc(scratch, parsed.value, .{});
+    var config = try common_config.Config.parseFromSlice(alloc, normalized);
+    errdefer config.deinit();
+    if (preload_value) |entry| {
+        var preload_object = std.json.ObjectMap{};
+        try preload_object.put(scratch, "preload", entry.value);
+        config.inference.preload = try common_config.parseInferencePreloadModels(alloc, .{ .object = preload_object });
+    }
+    return config;
+}
+
+const RunModelOverrides = struct {
+    models_dir: ?[]const u8 = null,
+    ml_dir: ?[]const u8 = null,
+    max_loaded_models: ?usize = null,
+    preload: []const inference.server.WarmModel = &.{},
+};
+
+const RunModelSettings = struct {
+    models_dir: ?[]const u8,
+    ml_dir: ?[]const u8,
+    max_loaded_models: usize,
+    // Owns the slice only; model strings borrow config/CLI storage.
+    preload: []inference.server.WarmModel,
+};
+
+fn resolveRunModelSettings(alloc: std.mem.Allocator, config: ?*const common_config.Config, cli: RunModelOverrides) !RunModelSettings {
+    const cfg: common_config.Config.InferenceConfig = if (config) |value| value.inference else .{};
+    const max_loaded_models = cli.max_loaded_models orelse if (cfg.max_loaded_models) |limit|
+        std.math.cast(usize, limit) orelse return error.InvalidInferenceModelCacheConfig
+    else
+        10;
+    const models_dir = cli.models_dir orelse cfg.models_dir;
+    const ml_dir = cli.ml_dir orelse cfg.ml_dir;
+    for ([_]?[]const u8{ models_dir, ml_dir }) |maybe_path| {
+        if (maybe_path) |path| {
+            if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidConfig;
+        }
+    }
+    const preload = try alloc.alloc(inference.server.WarmModel, if (cli.preload.len > 0) cli.preload.len else cfg.preload.len);
+    errdefer alloc.free(preload);
+    if (cli.preload.len > 0) {
+        @memcpy(preload, cli.preload);
+    } else {
+        for (cfg.preload, preload) |model, *warm| {
+            if (model.name.len == 0) return error.InvalidConfig;
+            warm.* = .{
+                .kind = parsePreloadModelKind(model.kind) orelse return error.InvalidArguments,
+                .name = model.name,
+                .backend = try parseOptionalBackendType(model.backend),
+                .format = model.format,
+                .quantization = model.quantization,
+                .residency_mode = if (model.residency_mode) |mode| switch (mode) {
+                    .auto => .auto,
+                    .resident => .resident,
+                    .streamed => .streamed,
+                } else null,
+                .memory_budget_mb = model.memory_budget_mb,
+            };
+        }
+    }
+    return .{ .models_dir = models_dir, .ml_dir = ml_dir, .max_loaded_models = max_loaded_models, .preload = preload };
+}
+
 fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     // Help is side-effect free and wins over every run option, even if it
     // follows an otherwise invalid value. Probe a copy so normal parsing can
@@ -309,9 +402,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
 
     var host: []const u8 = "127.0.0.1";
     var port: u16 = 8090;
-    var models_dir: []const u8 = defaultModelsDir(alloc);
-    var ml_dir: []const u8 = defaultMlDir(alloc);
-    var max_loaded_models: usize = 10;
+    var model_overrides = RunModelOverrides{};
     var config_path: ?[]const u8 = null;
     var max_concurrent_requests_override: ?u32 = null;
     var process_memory_budget_mb_override: ?usize = null;
@@ -334,11 +425,11 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         } else if (std.mem.eql(u8, arg, "--port")) {
             if (args.next()) |p| port = std.fmt.parseInt(u16, p, 10) catch 8090;
         } else if (std.mem.eql(u8, arg, "--models-dir")) {
-            models_dir = args.next() orelse models_dir;
+            model_overrides.models_dir = args.next() orelse return error.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--ml-dir")) {
-            ml_dir = args.next() orelse ml_dir;
+            model_overrides.ml_dir = args.next() orelse return error.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--max-loaded-models")) {
-            max_loaded_models = try std.fmt.parseInt(
+            model_overrides.max_loaded_models = try std.fmt.parseInt(
                 usize,
                 args.next() orelse return error.InvalidArguments,
                 10,
@@ -392,11 +483,17 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         }
     }
 
-    var loaded_config: ?common_config.Config = if (config_path) |path|
-        try common_config.loadFromPath(alloc, path)
-    else
-        null;
+    var loaded_config: ?common_config.Config = if (config_path) |path| blk: {
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16 * 1024 * 1024));
+        defer alloc.free(raw);
+        break :blk try parseRunConfig(alloc, raw);
+    } else null;
     defer if (loaded_config) |*config| config.deinit();
+    model_overrides.preload = preload_models.items;
+    const model_settings = try resolveRunModelSettings(alloc, if (loaded_config) |*config| config else null, model_overrides);
+    defer alloc.free(model_settings.preload);
+    const models_dir = model_settings.models_dir orelse defaultModelsDir(alloc);
+    const ml_dir = model_settings.ml_dir orelse defaultMlDir(alloc);
     const max_concurrent_requests = resolveRunMaxConcurrentRequests(
         max_concurrent_requests_override,
         if (loaded_config) |*config| config else null,
@@ -436,14 +533,14 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var node = try inference.server.Node.init(alloc, .{
         .models_dir = models_dir,
         .ml_dir = ml_dir,
-        .max_loaded_models = max_loaded_models,
+        .max_loaded_models = model_settings.max_loaded_models,
         .max_concurrent_requests = max_concurrent_requests,
         .generation_budget_overrides = budgetOverridesFromMb(budget_overrides_mb),
         .process_memory_limit_bytes = process_memory_resolution.limit_bytes,
         .process_memory_limit_provenance = inferenceProcessMemoryLimitProvenance(
             process_memory_resolution.effective_source,
         ),
-        .preload = preload_models.items,
+        .preload = model_settings.preload,
         .kernel_jit = kernel_jit,
         .allow_insecure_public_bind = allow_insecure_public_bind,
         .allow_unknown_models = allow_unknown_models,
@@ -863,7 +960,7 @@ fn printUsage() void {
         \\  --models-dir <dir> AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <dir>     Traditional ML directory (default: ~/.antfly/inference/ml)
         \\  --max-loaded-models <n> Maximum resident models; 0 disables the count limit (default: 10)
-        \\  --config <path>     Load admission settings from an Antfly config file
+        \\  --config <path>     Load admission and inference model settings (CLI flags override config)
         \\  --max-concurrent-requests <n> Override admission.inference.max_concurrent_requests; 0 disables it
         \\  --process-memory-budget-mb <n> Whole-process host-memory envelope; 0 selects cgroup/host detection
         \\  --inference-process-memory-budget-mb <n> Compatibility alias for --process-memory-budget-mb
@@ -897,6 +994,92 @@ test "inference runtime module compiles" {
     _ = run;
     _ = runFromIterator;
     _ = spawnServerProcess;
+}
+
+test "inference run config resolves flat operator and canonical model settings" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        \\{"models_dir":"/models","ml_dir":"/ml","max_loaded_models":0,"preload":[{"kind":"embedder","name":"owner/model:gguf:Q4_K","backend":"native","format":"gguf","quantization":"Q4_K"}]}
+        ,
+        \\{"inference":{"models_dir":"/models","ml_dir":"/ml","max_loaded_models":0,"preload":[{"kind":"embedder","name":"owner/model:gguf:Q4_K","backend":"native","format":"gguf","quantization":"Q4_K"}]}}
+        ,
+    }) |raw| {
+        var config = try parseRunConfig(alloc, raw);
+        defer config.deinit();
+        const settings = try resolveRunModelSettings(alloc, &config, .{});
+        defer alloc.free(settings.preload);
+        try std.testing.expectEqualStrings("/models", settings.models_dir.?);
+        try std.testing.expectEqualStrings("/ml", settings.ml_dir.?);
+        try std.testing.expectEqual(@as(usize, 0), settings.max_loaded_models);
+        try std.testing.expectEqual(@as(usize, 1), settings.preload.len);
+        try std.testing.expectEqual(.embedder, settings.preload[0].kind);
+        try std.testing.expectEqualStrings("owner/model:gguf:Q4_K", settings.preload[0].name);
+        try std.testing.expectEqual(.native, settings.preload[0].backend.?);
+        try std.testing.expectEqualStrings("gguf", settings.preload[0].format.?);
+        try std.testing.expectEqualStrings("Q4_K", settings.preload[0].quantization.?);
+    }
+}
+
+test "inference run config CLI overrides nested config which overrides flat fields" {
+    const alloc = std.testing.allocator;
+    var config = try parseRunConfig(alloc,
+        \\{"models_dir":"/flat","ml_dir":"/flat-ml","max_loaded_models":8,"preload":[{"kind":"embedder","name":"flat/model"}],"inference":{"models_dir":"/nested","max_loaded_models":3,"preload":[]},"admission":{"inference":{"max_concurrent_requests":7}}}
+    );
+    defer config.deinit();
+    const nested = try resolveRunModelSettings(alloc, &config, .{});
+    defer alloc.free(nested.preload);
+    try std.testing.expectEqualStrings("/nested", nested.models_dir.?);
+    try std.testing.expectEqualStrings("/flat-ml", nested.ml_dir.?);
+    try std.testing.expectEqual(@as(usize, 3), nested.max_loaded_models);
+    try std.testing.expectEqual(@as(usize, 0), nested.preload.len);
+    try std.testing.expectEqual(@as(u32, 7), resolveRunMaxConcurrentRequests(null, &config));
+    const cli = try resolveRunModelSettings(alloc, &config, .{
+        .models_dir = "/cli",
+        .ml_dir = "/cli-ml",
+        .max_loaded_models = 0,
+        .preload = &.{try parsePreloadModelFlag("embedder:native:cli/model:i8")},
+    });
+    defer alloc.free(cli.preload);
+    try std.testing.expectEqualStrings("/cli", cli.models_dir.?);
+    try std.testing.expectEqualStrings("/cli-ml", cli.ml_dir.?);
+    try std.testing.expectEqual(@as(usize, 0), cli.max_loaded_models);
+    try std.testing.expectEqual(@as(usize, 1), cli.preload.len);
+    try std.testing.expectEqualStrings("cli/model:i8", cli.preload[0].name);
+}
+
+test "inference run config defaults and invalid model policies" {
+    const alloc = std.testing.allocator;
+    const defaults = try resolveRunModelSettings(alloc, null, .{});
+    defer alloc.free(defaults.preload);
+    try std.testing.expectEqual(null, defaults.models_dir);
+    try std.testing.expectEqual(null, defaults.ml_dir);
+    try std.testing.expectEqual(@as(usize, 10), defaults.max_loaded_models);
+    try std.testing.expectEqual(@as(usize, 0), defaults.preload.len);
+    var empty_config = try parseRunConfig(alloc, "{\"inference\":{}}");
+    defer empty_config.deinit();
+    const empty_settings = try resolveRunModelSettings(alloc, &empty_config, .{});
+    defer alloc.free(empty_settings.preload);
+    try std.testing.expectEqual(@as(usize, 10), empty_settings.max_loaded_models);
+    try std.testing.expectError(error.InvalidConfig, parseRunConfig(alloc,
+        \\{"preload":[{"kind":"embedder"}]}
+    ));
+    for ([_][]const u8{
+        \\{"max_loaded_models":-1}
+        ,
+        \\{"models_dir":""}
+        ,
+        \\{"preload":[{"kind":"bogus","name":"owner/model"}]}
+        ,
+        \\{"preload":[{"kind":"embedder","name":"owner/model","backend":"bogus"}]}
+        ,
+    }) |raw| {
+        var config = parseRunConfig(alloc, raw) catch continue;
+        defer config.deinit();
+        if (resolveRunModelSettings(alloc, &config, .{})) |settings| {
+            alloc.free(settings.preload);
+            return error.ExpectedInvalidModelConfig;
+        } else |_| {}
+    }
 }
 
 test "inference runtime preload parser preserves registry variants and explicit backends" {

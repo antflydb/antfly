@@ -44,7 +44,8 @@ against the checksum-pinned Antfly v0.2.1 Linux GNU release, using the native CP
 backend and a small public BGE embedding model. It requires eager and lazy
 readiness plus a finite, nonzero 384-dimensional embedding, verifies eager
 warming before the first request, and checks that removing the model-directory
-flag reproduces an unready server. It needs neither Kubernetes nor GPUs.
+flag and config field reproduces an unready server. It needs neither Kubernetes
+nor GPUs.
 
 To run locally on Linux or macOS, supply an absolute path to a verified released
 or newly built Antfly binary:
@@ -63,6 +64,11 @@ update both the release version and SHA256 in `antfly-operator-go.yml` and run
 this same target against the candidate binary. This test does not exercise
 container packaging, real Kubernetes scheduling, or GPU execution; retain those
 rollout checks separately.
+
+Runtime PR CI also runs `zig/e2e/inference/test_run_config.py` against the newly
+built binary: config-only flat/nested startup, eager warming and embeddings,
+and CLI precedence in either argument order. This covers the config handoff
+independently of the operator's compatibility flags.
 
 ### Quick Development Cycle
 

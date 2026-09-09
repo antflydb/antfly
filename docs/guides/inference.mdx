@@ -36,6 +36,41 @@ The response is a 512-dimension vector in the OpenAI embeddings shape (`{"object
 
 In standalone mode the runtime is served on the API port under `/ai/v1`, beside `/db/v1`. Run as its own process with `antfly inference run`, it listens on `127.0.0.1:8090` by default, and a database points at it with the `inference.api_url` config key. External providers (Ollama, OpenAI, Bedrock) plug into the same embedder, reranker, and generator interfaces, so an index config names a provider and a model and never cares which process answers.
 
+## Configuring a Separate Inference Process
+
+`antfly inference run --config inference.json` reads admission settings and the
+model settings `models_dir`, `ml_dir`, `max_loaded_models`, and `preload`:
+
+```json
+{
+  "inference": {
+    "models_dir": "/models",
+    "ml_dir": "/ml",
+    "max_loaded_models": 3,
+    "preload": [
+      {"kind": "embedder", "name": "BAAI/bge-small-en-v1.5", "backend": "native"}
+    ]
+  }
+}
+```
+
+Pull the referenced models into that directory before starting the process.
+The operator's flat config spelling (those four fields at the top level) is
+also accepted. If both spellings exist, the nested `inference` value wins for
+each field, including an explicit empty `preload` list. No `api_url` is required
+to start the server; configure the listener with `--host` and `--port`.
+
+Explicit CLI options override config regardless of argument order. Supplying
+one or more `--preload-model` flags replaces the config preload list rather than
+appending to it. A model-count limit of zero disables that limit. When paths are
+absent from both CLI and config, the usual environment/home defaults apply.
+Preload entries retain their backend, artifact format/quantization, and optional
+residency/memory-budget choices.
+
+This config support is for the next runtime release; v0.2.1 requires explicit
+model CLI flags. The operator continues passing those flags so its fix can be
+released independently of the runtime update.
+
 ## Pulling Models
 
 Models come from HuggingFace by their full `owner/name` reference; a bare name without an owner is rejected. The `hf:` prefix is accepted.

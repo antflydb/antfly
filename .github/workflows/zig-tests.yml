@@ -937,6 +937,18 @@ jobs:
           ANTFLY_E2E_SUITE: ${{ matrix.suite }}
         run: taskset -c ${{ steps.e2e_cpus.outputs.list }} scripts/ci/zig-e2e-base-linux.sh
 
+      - name: Run inference config contract with a real CPU model
+        if: matrix.suite == 'inference'
+        working-directory: zig
+        env:
+          ANTFLY_BIN: ./zig-out/bin/antfly
+          ANTFLY_INFERENCE_MODELS_DIR: ${{ runner.temp }}/inference-config-models
+          ANTFLY_INFERENCE_DOWNLOAD: "1"
+          UV_PROJECT_ENVIRONMENT: /tmp/antfly-ci-venv/inference
+        run: >-
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference pytest -q
+          e2e/inference/test_run_config.py
+
       - name: Run low-FD HTTP worker ratchet regression
         if: matrix.suite == 'antfly'
         working-directory: zig

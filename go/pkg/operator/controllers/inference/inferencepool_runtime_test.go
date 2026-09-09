@@ -68,7 +68,18 @@ func TestInferenceRuntimeContract(t *testing.T) {
 			work := t.TempDir()
 			g.Expect(os.MkdirAll(modelDir, 0755)).To(Succeed())
 			configPath := filepath.Join(work, "config.json")
-			g.Expect(os.WriteFile(configPath, []byte(cm.Data["config.json"]), 0600)).To(Succeed())
+			var config map[string]any
+			g.Expect(json.Unmarshal([]byte(cm.Data["config.json"]), &config)).To(Succeed())
+			g.Expect(config["models_dir"]).To(Equal("/models"))
+			config["models_dir"] = modelDir
+			if scenario == "missing-directory-negative-control" {
+				// New runtimes also read this path from config. Remove both
+				// sources so the control remains valid across runtime releases.
+				delete(config, "models_dir")
+			}
+			configJSON, err := json.Marshal(config)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(os.WriteFile(configPath, configJSON, 0600)).To(Succeed())
 			env := []string{"PATH=" + os.Getenv("PATH"), "HOME=" + work, "TMPDIR=" + work, "XDG_CACHE_HOME=" + work}
 			for key, value := range cm.Data {
 				if key != "config.json" {
