@@ -15,7 +15,6 @@
 pub const split_bench_root = "pkg/antfly/src/split_bench_root.zig";
 pub const wal_bench_root = "pkg/antfly/src/wal_bench_root.zig";
 pub const derived_log_bench_root = "pkg/antfly/src/derived_log_bench_root.zig";
-pub const replay_bench_root = "pkg/antfly/src/replay_bench_root.zig";
 pub const storage_bench_root = "pkg/antfly/src/storage_bench_root.zig";
 const addFilteredTestRunArtifact = @import("tests.zig").addFilteredTestRunArtifact;
 const addSnowballModule = @import("snowball.zig").addSnowballModule;
@@ -673,44 +672,6 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const dense_stack_bench_step = b.step("dense-stack-bench", "Build and install dense_stack_bench");
     dense_stack_bench_step.dependOn(&b.addInstallArtifact(dense_stack_bench, .{}).step);
 
-    const replay_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/replay_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    const replay_bench_root_mod = b.createModule(.{
-        .root_source_file = b.path(storage_bench_root),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    // Use the same production storage graph as the combined benchmark. Explicit
-    // deterministic providers in the workloads remain local benchmark fixtures.
-    antfly_imports.configureRuntime(b, replay_bench_root_mod, false, true, false);
-    replay_bench_mod.addImport("antfly-zig", replay_bench_root_mod);
-
-    const replay_bench = b.addExecutable(.{
-        .name = "replay_bench",
-        .root_module = replay_bench_mod,
-    });
-
-    const replay_bench_step = b.step("replay-bench", "Build and install replay_bench");
-    replay_bench_step.dependOn(&b.addInstallArtifact(replay_bench, .{}).step);
-
-    const batch_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/batch_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    batch_bench_mod.addImport("antfly-zig", replay_bench_root_mod);
-
-    const batch_bench = b.addExecutable(.{
-        .name = "batch_bench",
-        .root_module = batch_bench_mod,
-    });
-
-    const batch_bench_step = b.step("batch-bench", "Build and install batch_bench");
-    batch_bench_step.dependOn(&b.addInstallArtifact(batch_bench, .{}).step);
-
     const storage_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage_bench.zig"),
         .target = target,
@@ -728,9 +689,38 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const storage_bench = b.addExecutable(.{
         .name = "storage_bench",
         .root_module = storage_bench_mod,
+        .max_rss = 14 * 1024 * 1024 * 1024,
     });
 
     storage_bench_step.dependOn(&b.addInstallArtifact(storage_bench, .{}).step);
+
+    // Keep focused DB workloads in separate compile artifacts under the same
+    // owner target. Combining them with the API/HBC driver made a batch-only
+    // edit rebuild the entire driver; see the build measurements in BENCHMARKS.md.
+    // Share the production module configuration, including generated inputs;
+    // the workloads explicitly supply their own deterministic providers.
+    const db_workloads = .{
+        .{ "batch_bench", "bench/storage/batch_bench.zig" },
+        .{ "replay_bench", "bench/storage/replay_bench.zig" },
+        .{ "open_bench", "bench/storage/open_bench.zig" },
+        .{ "artifact_rebuild_bench", "bench/storage/artifact_rebuild_bench.zig" },
+    };
+    inline for (db_workloads) |workload| {
+        const module = b.createModule(.{
+            .root_source_file = b.path(workload[1]),
+            .target = target,
+            .optimize = .ReleaseFast,
+        });
+        module.addImport("antfly-zig", storage_bench_root_mod);
+        const artifact = b.addExecutable(.{
+            .name = workload[0],
+            .root_module = module,
+            // Normalized standalone workloads measured up to 6 GiB; leave
+            // headroom for compiler/platform variation in the shared scheduler.
+            .max_rss = 8 * 1024 * 1024 * 1024,
+        });
+        storage_bench_step.dependOn(&b.addInstallArtifact(artifact, .{}).step);
+    }
 
     const rw_lock_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/rw_lock_bench.zig"),
@@ -746,36 +736,6 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
 
     const rw_lock_bench_step = b.step("rw-lock-bench", "Build and install rw_lock_bench");
     rw_lock_bench_step.dependOn(&b.addInstallArtifact(rw_lock_bench, .{}).step);
-
-    const open_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/open_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    open_bench_mod.addImport("antfly-zig", antfly_mod);
-
-    const open_bench = b.addExecutable(.{
-        .name = "open_bench",
-        .root_module = open_bench_mod,
-    });
-
-    const open_bench_step = b.step("open-bench", "Build and install open_bench");
-    open_bench_step.dependOn(&b.addInstallArtifact(open_bench, .{}).step);
-
-    const artifact_rebuild_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/artifact_rebuild_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    artifact_rebuild_bench_mod.addImport("antfly-zig", antfly_mod);
-
-    const artifact_rebuild_bench = b.addExecutable(.{
-        .name = "artifact_rebuild_bench",
-        .root_module = artifact_rebuild_bench_mod,
-    });
-
-    const artifact_rebuild_bench_step = b.step("artifact-rebuild-bench", "Build and install artifact_rebuild_bench");
-    artifact_rebuild_bench_step.dependOn(&b.addInstallArtifact(artifact_rebuild_bench, .{}).step);
 
     const provisioned_warmup_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/provisioned_warmup_bench.zig"),
