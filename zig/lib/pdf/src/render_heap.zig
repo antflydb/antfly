@@ -23,7 +23,7 @@ pub const Heap = struct {
     };
 
     pub fn allocator(self: *Heap) Allocator {
-        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = Allocator.noRemap, .free = free } };
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
 
     pub fn deinit(self: *Heap) void {
@@ -74,7 +74,7 @@ pub const Heap = struct {
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *Heap = @ptrCast(@alignCast(ctx));
         const class = sizeClass(len, alignment) orelse
-            return self.backingAlloc(roundedLarge(len) orelse return null, @enumFromInt(@max(@intFromEnum(alignment), @intFromEnum(std.mem.Alignment.fromByteUnits(std.heap.pageSize())))), ret_addr);
+            return self.backingAlloc(roundedLarge(len) orelse return null, largeAlignment(alignment), ret_addr);
         const slot_size = @as(usize, 8) << @intCast(class);
         const slab = self.available[class] orelse blk: {
             const memory = self.backingAlloc(slab_size, slab_alignment, ret_addr) orelse return null;
@@ -98,17 +98,21 @@ pub const Heap = struct {
         return ptr;
     }
 
-    fn resize(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, _: usize) bool {
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
         const old_class = sizeClass(memory.len, alignment);
         const new_class = sizeClass(new_len, alignment);
         if (old_class != null or new_class != null) return old_class == new_class;
-        return roundedLarge(memory.len) == roundedLarge(new_len);
+        const old_size = roundedLarge(memory.len) orelse return false;
+        const new_size = roundedLarge(new_len) orelse return false;
+        if (old_size == new_size) return true;
+        const self: *Heap = @ptrCast(@alignCast(ctx));
+        return self.backing_allocator.rawResize(memory.ptr[0..old_size], largeAlignment(alignment), new_size, ret_addr);
     }
 
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *Heap = @ptrCast(@alignCast(ctx));
         const class = sizeClass(memory.len, alignment) orelse {
-            self.backing_allocator.rawFree(memory.ptr[0..roundedLarge(memory.len).?], @enumFromInt(@max(@intFromEnum(alignment), @intFromEnum(std.mem.Alignment.fromByteUnits(std.heap.pageSize())))), ret_addr);
+            self.backing_allocator.rawFree(memory.ptr[0..roundedLarge(memory.len).?], largeAlignment(alignment), ret_addr);
             return;
         };
         const slab: *Slab = @ptrFromInt(@intFromPtr(memory.ptr) & ~(slab_size - 1));
@@ -122,7 +126,50 @@ pub const Heap = struct {
         node.* = .{ .next = slab.free };
         slab.free = node;
     }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        // ArrayList growth uses remap directly. Preserve the same in-place
+        // opportunities as resize instead of forcing a second allocation and
+        // charging its full size to the parser's cumulative work budget.
+        const old_class = sizeClass(memory.len, alignment);
+        const new_class = sizeClass(new_len, alignment);
+        const self: *Heap = @ptrCast(@alignCast(ctx));
+        if (old_class != null and old_class == new_class) return memory.ptr;
+        if (old_class == null and new_class == null) {
+            const old_size = roundedLarge(memory.len) orelse return null;
+            const new_size = roundedLarge(new_len) orelse return null;
+            if (old_size == new_size) return memory.ptr;
+            if (self.backing_allocator.rawRemap(memory.ptr[0..old_size], largeAlignment(alignment), new_size, ret_addr)) |ptr| return ptr;
+        }
+        // Match realloc's move semantics across size classes. Both allocations
+        // remain charged until the copy finishes; failure preserves the old
+        // allocation. Upper work ledgers then charge logical growth, just as
+        // they do for libc realloc, instead of an additional full allocation.
+        const ptr = alloc(ctx, new_len, alignment, ret_addr) orelse return null;
+        @memcpy(ptr[0..@min(memory.len, new_len)], memory[0..@min(memory.len, new_len)]);
+        free(ctx, memory, alignment, ret_addr);
+        return ptr;
+    }
+
+    fn largeAlignment(alignment: std.mem.Alignment) std.mem.Alignment {
+        return @enumFromInt(@max(@intFromEnum(alignment), @intFromEnum(std.mem.Alignment.fromByteUnits(std.heap.pageSize()))));
+    }
 };
+
+test "render heap remap grows within a size class without allocating or copying" {
+    var heap = Heap{ .backing_allocator = std.testing.allocator };
+    defer heap.deinit();
+    const alloc = heap.allocator();
+    var memory = try alloc.alignedAlloc(u8, .@"64", 17);
+    defer alloc.free(memory);
+    @memset(memory, 42);
+    const grown = alloc.remap(memory, 60) orelse return error.ExpectedInPlaceRemap;
+    try std.testing.expectEqual(memory.ptr, grown.ptr);
+    memory = grown;
+    for (grown[0..17]) |byte| try std.testing.expectEqual(@as(u8, 42), byte);
+    memory = alloc.remap(memory, 65) orelse return error.ExpectedMovingRemap;
+    for (memory[0..17]) |byte| try std.testing.expectEqual(@as(u8, 42), byte);
+}
 
 test "render heap reuses slots while other slots remain live" {
     var heap = Heap{ .backing_allocator = std.testing.allocator };
@@ -145,12 +192,14 @@ test "render heap handles alignment large allocations and allocation failures" {
             var heap = Heap{ .backing_allocator = backing };
             defer heap.deinit();
             const alloc = heap.allocator();
-            const small = try alloc.alignedAlloc(u8, .@"64", 17);
+            var small = try alloc.alignedAlloc(u8, .@"64", 17);
             defer alloc.free(small);
             @memset(small, 23);
-            const large = try alloc.alignedAlloc(u8, .fromByteUnits(65536), 70000);
+            var large = try alloc.alignedAlloc(u8, .fromByteUnits(65536), 70000);
             defer alloc.free(large);
             @memset(large, 42);
+            small = try alloc.realloc(small, 40000);
+            large = try alloc.realloc(large, 140000);
             try std.testing.expectEqual(@as(u8, 23), small[16]);
             try std.testing.expectEqual(@as(u8, 42), large[69999]);
         }

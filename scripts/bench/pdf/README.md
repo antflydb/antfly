@@ -49,6 +49,10 @@ omitted or zero uses the planner estimate.
 It reports geometry, scratch/output limits and render quality, and fails on a
 page error. Comparing an estimate with a configured ceiling helps diagnose
 content-dependent scratch growth; neither run measures end-to-end performance.
+Use `render-compare` with the same arguments to additionally compare exact pixels
+and render quality against the serial reference renderer. The reference run is
+not memory-admitted by the bounded window and is diagnostic only; a pixel or
+quality mismatch fails the command.
 
 ```sh
 /tmp/pdf-ab/venv/bin/python scripts/bench/pdf/benchmark.py run \
@@ -137,7 +141,8 @@ normal extraction and `--mode always` for forced rendering/OCR. The driver uses
 the existing harness with `--batch --verify-unit-text`. Retained unit text is
 hashed after the timed interval; volatile metadata is excluded from those hashes.
 Both subjects must have identical per-document page/chunk/OCR counts, total
-published vectors, retained-text hashes and page/DPI metadata. Corpus, model, table and server
+published vectors, retained-text hashes, page/DPI metadata and render-quality
+warnings. Corpus, model, table and server
 configuration must match, and runtime logs must confirm Metal for invoked models.
 Every requested pair must finish successfully; failed/unequal-output pairs are
 retained, not silently removed. No speedup is calculated for such an experiment.

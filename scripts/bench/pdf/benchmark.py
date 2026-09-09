@@ -151,6 +151,14 @@ def unit_text_hashes(manifests, fetch_unit, geometry=None):
                         "ocr_rendered_height",
                     )
                 }
+                warning = unit.get("extraction_warning") or provenance.get(
+                    "extraction_warning"
+                )
+                page["render_quality_warnings"] = [
+                    part
+                    for part in (warning or "").split(";")
+                    if part.startswith("pdf_render_quality:")
+                ]
                 # Main's image-only PDF extraction leaves rotation unknown;
                 # retain/compare that null, but do not invent a zero rotation.
                 required = ["page_number", "page_bbox"]
@@ -387,7 +395,7 @@ def run_created(args, out):
             if args.verify_unit_text:
                 retained_units = {}
 
-                def fetch_unit(key):
+                def fetch_unit(key, table_url=table_url, retained_units=retained_units):
                     unit = api.json_request(
                         "GET", table_url + "/documents/" + quote(key, safe="")
                     )

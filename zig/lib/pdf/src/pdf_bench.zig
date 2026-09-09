@@ -38,10 +38,10 @@ pub fn main(init: std.process.Init) !void {
         return BenchError.InvalidArguments;
     };
 
-    if (std.mem.eql(u8, subcommand, "render-window")) {
+    if (std.mem.eql(u8, subcommand, "render-window") or std.mem.eql(u8, subcommand, "render-compare")) {
         const path = args.next() orelse return BenchError.InvalidArguments;
         const dimension = try parseIterations(args.next(), 0);
-        try benchRenderWindow(alloc, path, dimension, try parseIterations(args.next(), 0));
+        try benchRenderWindow(alloc, path, dimension, try parseIterations(args.next(), 0), std.mem.eql(u8, subcommand, "render-compare"));
         return;
     }
 
@@ -116,7 +116,7 @@ fn printUsage(argv0: []const u8) void {
 
 /// Exercise one prepared, directly retained raster using the same estimated
 /// scratch admission and exact output allowance as the document planner.
-fn benchRenderWindow(alloc: std.mem.Allocator, path: []const u8, dimension: usize, scratch_override: usize) !void {
+fn benchRenderWindow(alloc: std.mem.Allocator, path: []const u8, dimension: usize, scratch_override: usize, compare: bool) !void {
     var threaded = std.Io.Threaded.init(alloc, .{});
     defer threaded.deinit();
     const bytes = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, alloc, .limited(max_pdf_input_bytes));
@@ -149,6 +149,14 @@ fn benchRenderWindow(alloc: std.mem.Allocator, path: []const u8, dimension: usiz
     defer batch.deinit(alloc);
     if (batch.results[0].failure) |err| return err;
     std.debug.print("render-window bytes={d} quality={s} elapsed_ms={d:.3} scratch_admitted={d} worker_scratch_peak={d}\n", .{ batch.results[0].rendered.?.bytes.len, @tagName(batch.results[0].rendered.?.quality), @as(f64, @floatFromInt(monotonicNowNs() - started)) / std.time.ns_per_ms, batch.peak_admitted_bytes, batch.peak_worker_scratch_bytes });
+    if (compare) {
+        const defaults = pdf.PageRenderRequest{ .page_number = 1 };
+        var reference = try pdf.renderParsedPageRasterAdaptiveWithProfileAlloc(alloc, &parsed, 1, plan.geometry().effective_dpi, defaults.max_pixels, defaults.max_dimension, .ocr);
+        defer reference.deinit(alloc);
+        const rendered = batch.results[0].rendered.?;
+        std.debug.print("render-compare reference_quality={s} pixels_equal={}\nreference_diagnostics={?}\nwindow_diagnostics={?}\n", .{ @tagName(reference.quality), std.mem.eql(u8, reference.bytes, rendered.bytes), reference.diagnostics, rendered.diagnostics });
+        if (reference.quality != rendered.quality or !std.mem.eql(u8, reference.bytes, rendered.bytes)) return error.RenderPixelMismatch;
+    }
 }
 
 fn parseIterations(maybe_value: ?[]const u8, default_value: usize) !usize {

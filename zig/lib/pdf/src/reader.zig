@@ -323,6 +323,25 @@ const DecodeBudgetAllocator = struct {
 };
 const max_trailing_pdf_bytes: usize = 4096;
 
+test "render heap moving remaps preserve logical materialization charges" {
+    var heap = @import("render_heap.zig").Heap{ .backing_allocator = std.testing.allocator };
+    defer heap.deinit();
+    var budget = DecodeBudgetAllocator.initWithCumulativeLimit(heap.allocator(), 0, 140000, 140000);
+    const alloc = budget.allocator();
+    var bytes = try alloc.alloc(u8, 17);
+    defer alloc.free(bytes);
+    @memset(bytes, 42);
+    for ([_]usize{ 31, 65, 1025, 32769, 80000, 140000 }) |size| {
+        bytes = try alloc.realloc(bytes, size);
+        for (bytes[0..17]) |byte| try std.testing.expectEqual(@as(u8, 42), byte);
+        try std.testing.expectEqual(size, budget.live_bytes);
+        try std.testing.expectEqual(size, budget.materializationCharge());
+    }
+    bytes = try alloc.realloc(bytes, 17);
+    try std.testing.expectEqual(@as(usize, 17), budget.live_bytes);
+    try std.testing.expectEqual(@as(usize, 140000), budget.materializationCharge());
+}
+
 pub const XrefEntry = struct {
     ptr: syntax.ObjRef,
     offset: usize,

@@ -37,6 +37,17 @@ class CompletionTests(unittest.TestCase):
         page = geometry["scan.pdf"]["page:000001"]
         self.assertEqual(page["page_number"], 1)
         self.assertEqual(page["ocr_effective_render_dpi"], 138)
+        self.assertEqual(page["render_quality_warnings"], [])
+        unit["extraction_warning"] = (
+            "pdf_render_quality:degraded:fallback_groups=1:reason=materialization_limit;ocr_numeric_table_hybrid"
+        )
+        unit_text_hashes(manifests, lambda _: unit, geometry)
+        self.assertEqual(
+            geometry["scan.pdf"]["page:000001"]["render_quality_warnings"],
+            [
+                "pdf_render_quality:degraded:fallback_groups=1:reason=materialization_limit"
+            ],
+        )
         del unit["ocr_effective_render_dpi"]
         with self.assertRaisesRegex(ValueError, "missing page geometry"):
             unit_text_hashes(manifests, lambda _: unit, {})

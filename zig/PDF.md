@@ -37,6 +37,11 @@ to the hard scratch grant. Idle slabs/pages are evicted before allocation
 failure; all lane memory is released after joined execution. Small scanner
 allocations therefore avoid repeated system mappings and allocator quarantine
 fragmentation without sharing mutable PDF readers across threads.
+The heap implements moving remaps as bounded allocate/copy/free when in-place
+growth is unavailable. Both old and replacement buffers stay accounted during
+the move. This preserves the serial renderer's realloc semantics and logical
+materialization charges; forcing replacement allocations through the caller
+would artificially exhaust the vector-text work budget and degrade valid pages.
 
 An underestimated window may request one non-blocking resource-manager grant
 up to its configured scratch ceiling while the page is still rendering. The
