@@ -22,7 +22,7 @@ wheels = [
 
 [[package]]
 name = "antfly-sdk"
-version = "0.0.2.dev2"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "attrs" },
