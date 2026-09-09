@@ -2274,7 +2274,7 @@ test "common config parses provider maps" {
         \\    "embedder": { "provider": "antfly" }
         \\  },
         \\  "rerankers": {
-        \\    "reranker": { "provider": "antfly", "field": "body" }
+        \\    "reranker": { "provider": "antfly", "model": "local-reranker", "field": "body" }
         \\  },
         \\  "chunkers": {
         \\    "fixed": { "provider": "antfly" }

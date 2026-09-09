@@ -1,6 +1,6 @@
 # Separate Vector Store: Intended Design
 
-Status: experimental implementation, repeated 50K/1M measurements completed, 2026-09-07. The table setting,
+Status: experimental implementation, repeated 50K/1M measurements completed, 2026-09-09. The table setting,
 reference-based source payload path, recovery/reader guards, and initial
 reclamation/accounting are implemented in this worktree. Recovery qualification
 passed; the 1M performance tradeoffs keep the settings opt-in.
@@ -68,8 +68,28 @@ churn source-counter intervals are incomplete, so no paired marking-time ratio
 is claimed at 1M. Candidate planning takes 2.1/6.5 seconds, including a 4.7-second
 restore planning interval that writes only 309,724 payload bytes. Metadata
 planning under the source lock remains a concrete profiling target; these
-counters do not prove the cause of the entire latency regression. The independent
-1M sparse-batching comparison is still in progress.
+counters do not prove the cause of the entire latency regression.
+
+Sparse batching also passed four separate 1M arms and both independent inventories.
+Median paired changes are -2.4% readiness time, +5.7% mixed writes, -14.0% p99,
++29.8% churn time, -18.2% sampled physical footprint, and +6.8% churn logical write
+I/O. Mixed writes change -13.9%/+25.3%, p99 +16.3%/-44.3%, and churn +75.7%/-16.1%
+between pairs, so the medians are not a consistent foreground win. In the first
+pair, batching copies 44.4 MB in six churn steps versus 6.25 MB in one control
+step, with 3.6 versus 0.38 seconds of planning. The second pair's full source
+counter intervals are unavailable. All four ordinary 1M idle drains settle in
+15–19 seconds; the sparse-layout outlier is specifically demonstrated by the
+matched 50K diagnostic.
+
+Keep both settings opt-in. The next policy to measure is sparse batching only
+when no denser reclaimable work is selected, with separate foreground and idle
+copy budgets. This would target the proven sparse-only cleanup case without
+opportunistically adding cold-segment copying to useful dense work. It is a
+follow-up hypothesis, not an implemented or qualified improvement. For the
+locator, prioritize bounded metadata planning and snapshot-safe segment liveness
+summaries before combining treatments. All twenty timed 50K/1M arms, twenty
+reclamation checks, ten independent inventories, and four matched-layout runs
+passed; the frozen runtime and harness identities remain pinned in the ledger.
 
 ## Cost-recovery experiments
 
@@ -134,11 +154,10 @@ unavailable. Compact marking needs faster location lookup before promotion.
 
 Keep all four settings opt-in. Do not combine the foreground-cost regressions
 or infer a new default from these comparisons against the previous candidate.
-The next focused experiments should apply queued WAL deltas at installation
-without eager foreground map updates, amortize a verified mark over bounded
-sparse-segment reclamation, and measure snapshot-safe location hints for bitmap
-marking. The cutoff needs a matched-dimension size sweep before selecting a
-crossover. These are follow-up hypotheses, not implemented or qualified wins.
+The locator and bounded sparse-reclamation follow-up is recorded above. Applying
+queued WAL deltas at installation without eager foreground map updates remains
+a separate hypothesis. The cutoff still needs a matched-dimension size sweep
+before selecting a crossover; neither is an implemented or qualified new win.
 Full per-arm results and limitations are in the
 [measurement report](../.benchmark-results/vector-store-cost-recovery/RESULTS.md).
 

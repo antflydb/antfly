@@ -33,6 +33,7 @@ const whisper_prompt = @import("whisper_prompt.zig");
 const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const TranscribeConfig = struct {
+    vocab_size: usize = 51865,
     max_length: usize = 448,
     language: ?[]const u8 = null,
     sample_rate: usize = 16000,
@@ -62,6 +63,7 @@ pub const TranscribeResult = struct {
 };
 
 pub const TranscriptionPipeline = struct {
+    batch_dispatch: ?@import("../server/tensor_microbatch.zig").Dispatch = null,
     allocator: std.mem.Allocator,
     encoder: backends.Session,
     decoder: backends.Session,
@@ -157,7 +159,10 @@ pub const TranscriptionPipeline = struct {
         var mel_tensor = try backends.Tensor.initFloat32(allocator, "input_features", &mel_shape, mel);
         defer mel_tensor.deinit();
 
-        const encoder_outputs = try encoder_permit.runWithControl(&.{mel_tensor}, allocator, self.execution_control);
+        const encoder_outputs = if (self.batch_dispatch) |dispatch|
+            try dispatch.run(allocator, self.encoder, &encoder_permit, null, &.{mel_tensor}, self.execution_control)
+        else
+            try encoder_permit.runWithControl(&.{mel_tensor}, allocator, self.execution_control);
         defer {
             for (encoder_outputs) |*t| {
                 var mt = t.*;
@@ -191,6 +196,8 @@ pub const TranscriptionPipeline = struct {
         const enc_mask = try allocator.alloc(i64, enc_seq_len);
         defer allocator.free(enc_mask);
         @memset(enc_mask, 1);
+        var incremental = @import("seq2seq_decode.zig").State.init(allocator, self.decoder, encoder_outputs[0], enc_mask, self.config.vocab_size);
+        defer if (incremental) |*state| state.deinit();
 
         while (dec_len < max_len) {
             if (forced_index < forced.len and forced[forced_index].position == dec_len) {
@@ -213,7 +220,7 @@ pub const TranscriptionPipeline = struct {
             const enc_hidden = encoder_outputs[0].borrowedView("encoder_hidden_states");
 
             if (self.execution_control) |control| try control.update(.executing, @intCast(generated_position), @intCast(self.config.max_length));
-            const dec_outputs = try self.decoder.runWithControl(
+            const dec_outputs = if (incremental) |*state| try state.stepOutputs(dec_ids[0..dec_len], self.batch_dispatch, self.execution_control) else if (self.batch_dispatch) |dispatch| try dispatch.run(allocator, self.decoder, null, null, &.{ dec_tensor, enc_hidden }, self.execution_control) else try self.decoder.runWithControl(
                 &.{ dec_tensor, enc_hidden },
                 allocator,
                 self.execution_control,
@@ -234,7 +241,8 @@ pub const TranscriptionPipeline = struct {
             else
                 return error.InvalidLogitsShape;
 
-            const last_logits = logits[(dec_len - 1) * vocab_size ..][0..vocab_size];
+            if (vocab_size == 0 or logits.len < vocab_size) return error.InvalidLogitsShape;
+            const last_logits = logits[logits.len - vocab_size ..];
 
             // Greedy argmax
             var best_id: usize = 0;

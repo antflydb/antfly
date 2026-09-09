@@ -1049,7 +1049,7 @@ pub const ResourceManager = struct {
     /// therefore publish their byte decreases through normal accounting APIs.
     pub fn reclaimForAllocation(self: *ResourceManager, requester: Slice, additional_bytes: u64) u64 {
         if (additional_bytes == 0) return 0;
-        const target_bytes = blk: {
+        const targets = blk: {
             lockAtomic(&self.mutex);
             defer self.mutex.unlock();
             const memory_hard = self.memory.budget.hard_limit_bytes;
@@ -1059,19 +1059,21 @@ pub const ResourceManager = struct {
                 (self.memory.used_bytes +| additional_bytes) -| memory_hard;
             const requester_state = &self.slices[sliceIndex(requester)];
             const slice_hard = requester_state.budget.hard_limit_bytes;
-            // Dense scratch and HBC metadata both have reclaimers in their own
-            // slices. Do not evict unrelated caches for a hard-limit violation
-            // they cannot resolve.
+            // These slices mix active allocations with reclaimable retained
+            // state. Satisfy their slice pressure before aggregate pressure:
+            // evicting an unrelated cache cannot raise this slice's ceiling.
             const requester_slice_reclaimable = requester == .dense_search_working_set or
-                requester == .hbc_node_metadata_cache;
+                requester == .hbc_node_metadata_cache or
+                requester == .document_extraction_working_set;
             const slice_target = if (!requester_slice_reclaimable or slice_hard == 0)
                 0
             else
                 (requester_state.used_bytes +| additional_bytes) -| slice_hard;
             const target = @max(memory_target, slice_target);
             if (target == 0) return 0;
-            break :blk target;
+            break :blk .{ .total = target, .slice = slice_target };
         };
+        const target_bytes = targets.total;
 
         _ = self.reclaim_requests.fetchAdd(1, .monotonic);
         var reclaimed: u64 = 0;
@@ -1092,10 +1094,21 @@ pub const ResourceManager = struct {
         // table content. Include the requester's own search slice so one index
         // can reuse capacity retained by another; callbacks use non-blocking
         // owner locks and therefore skip an in-flight scratch handle safely.
-        for ([_]Slice{ .dense_search_working_set, .hbc_node_metadata_cache, .lsm_block_table_cache }) |candidate_slice| {
+        const candidates = [_]Slice{ requester, .dense_search_working_set, .document_extraction_working_set, .hbc_node_metadata_cache, .lsm_block_table_cache };
+        for (candidates, 0..) |candidate_slice, candidate_index| {
+            if (candidate_index == 0) {
+                if (targets.slice == 0) continue;
+            } else if (targets.slice != 0) {
+                // The first pass is the only one that can resolve local
+                // pressure. Do not discard useful unrelated cache contents
+                // when live owners prevented that pass from making progress.
+                if (reclaimed < targets.slice) break;
+                if (candidate_slice == requester) continue;
+            }
             if (candidate_slice == requester and
                 candidate_slice != .dense_search_working_set and
-                candidate_slice != .hbc_node_metadata_cache) continue;
+                candidate_slice != .hbc_node_metadata_cache and
+                candidate_slice != .document_extraction_working_set) continue;
             var remaining_weight: u64 = 0;
             lockAtomic(&self.reclaimer_mutex);
             for (0..scan_len) |offset| {
@@ -2051,6 +2064,108 @@ pub const ResourceManager = struct {
         return try self.reserveOnce(slice, bytes);
     }
 
+    /// Attempt admission exactly once and never invoke a reclaimer callback.
+    /// Use this while holding a storage transaction or another subsystem lock
+    /// whose lock order cannot safely include arbitrary cache owners.
+    pub fn reserveWithoutReclaim(self: *ResourceManager, slice: Slice, bytes: u64) !Reservation {
+        return self.reserveOnce(slice, bytes);
+    }
+
+    /// Atomically owns a required secondary credit and as much of the requested
+    /// primary credit as currently fits. The full request gets the normal cache
+    /// reclamation opportunity before the partial fallback is considered.
+    ///
+    /// Unlike a "leave N bytes free" calculation, both returned credits belong
+    /// to this reservation until release, so concurrent work cannot consume the
+    /// secondary credit between admission and allocation.
+    pub fn reserveOwnedSplitAtMost(
+        self: *ResourceManager,
+        slice: Slice,
+        requested_primary_bytes: u64,
+        required_secondary_bytes: u64,
+    ) !OwnedSplitReservation {
+        return self.reserveOwnedSplitAtMostWithPolicy(slice, requested_primary_bytes, required_secondary_bytes, true);
+    }
+
+    /// Atomically grant available headroom up to the requested ceiling. Like
+    /// reserveWithoutReclaim, this never calls cache owners while the caller
+    /// holds another subsystem's resources. A nonzero request requires a
+    /// nonzero grant; partial grants remain ordinary owned reservations.
+    pub fn reserveAtMostWithoutReclaim(self: *ResourceManager, slice: Slice, requested_bytes: u64) !Reservation {
+        const split = try self.reserveOwnedSplitAtMostWithPolicy(slice, requested_bytes, 0, false);
+        return split.reservation;
+    }
+
+    fn reserveOwnedSplitAtMostWithPolicy(
+        self: *ResourceManager,
+        slice: Slice,
+        requested_primary_bytes: u64,
+        required_secondary_bytes: u64,
+        allow_reclaim: bool,
+    ) !OwnedSplitReservation {
+        const requested_total = std.math.add(u64, requested_primary_bytes, required_secondary_bytes) catch
+            return error.ResourceBudgetExceeded;
+        if (requested_total == 0) return .{
+            .reservation = .{ .manager = self, .identity = 0, .slice = slice, .bytes = 0 },
+            .primary_bytes = 0,
+            .secondary_bytes = 0,
+        };
+
+        if (if (allow_reclaim) self.reserve(slice, requested_total) else self.reserveWithoutReclaim(slice, requested_total)) |reservation| {
+            return .{
+                .reservation = reservation,
+                .primary_bytes = requested_primary_bytes,
+                .secondary_bytes = required_secondary_bytes,
+            };
+        } else |err| {
+            if (err != error.ResourceBudgetExceeded) return err;
+        }
+
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        const state = &self.slices[sliceIndex(slice)];
+        const slice_available = if (state.budget.hard_limit_bytes == 0)
+            requested_total
+        else
+            state.budget.hard_limit_bytes -| state.used_bytes;
+        const memory_available = if (self.memory.budget.hard_limit_bytes == 0)
+            requested_total
+        else
+            self.memory.budget.hard_limit_bytes -| self.memory.used_bytes;
+        const available = @min(slice_available, memory_available);
+        if (available < required_secondary_bytes) return error.ResourceBudgetExceeded;
+        const primary_bytes = @min(requested_primary_bytes, available - required_secondary_bytes);
+        if (requested_primary_bytes > 0 and primary_bytes == 0) return error.ResourceBudgetExceeded;
+        const granted = std.math.add(u64, primary_bytes, required_secondary_bytes) catch
+            return error.ResourceBudgetExceeded;
+
+        const next_slice = std.math.add(u64, state.used_bytes, granted) catch {
+            state.hard_limit_rejections +|= 1;
+            return error.ResourceBudgetExceeded;
+        };
+        const next_memory = std.math.add(u64, self.memory.used_bytes, granted) catch {
+            self.memory.hard_limit_rejections +|= 1;
+            return error.ResourceBudgetExceeded;
+        };
+
+        const identity = try self.registerReservationIdentityLocked(slice, granted);
+        state.used_bytes = next_slice;
+        state.peak_bytes = @max(state.peak_bytes, state.used_bytes);
+        if (state.budget.soft_limit_bytes > 0 and state.used_bytes > state.budget.soft_limit_bytes)
+            state.soft_limit_events +|= 1;
+        self.memory.used_bytes = next_memory;
+        self.memory.peak_bytes = @max(self.memory.peak_bytes, self.memory.used_bytes);
+        if (self.memory.budget.soft_limit_bytes > 0 and self.memory.used_bytes > self.memory.budget.soft_limit_bytes)
+            self.memory.soft_limit_events +|= 1;
+        self.pressure_change.advance();
+        return .{
+            .reservation = .{ .manager = self, .identity = identity, .slice = slice, .bytes = granted },
+            .primary_bytes = primary_bytes,
+            .secondary_bytes = required_secondary_bytes,
+        };
+    }
+
     fn reserveOnce(self: *ResourceManager, slice: Slice, bytes: u64) !Reservation {
         if (bytes == 0) return .{ .manager = self, .identity = 0, .slice = slice, .bytes = 0 };
 
@@ -2322,6 +2437,57 @@ pub const ResourceManager = struct {
         reservation.bytes -= released;
         self.pressure_change.advance();
         return true;
+    }
+
+    /// Move already-accounted credit between two live reservations without
+    /// changing slice or host usage. This is the ownership handoff used when
+    /// operation admission pre-reserves allocator headroom before the
+    /// destination BudgetedAllocator exists or begins allocating.
+    fn transferReservationCredit(
+        self: *ResourceManager,
+        source: *Reservation,
+        destination: *Reservation,
+        bytes: u64,
+    ) !void {
+        if (bytes == 0) return;
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        if (source.manager != self or destination.manager != self or
+            source.slice != destination.slice or source == destination or
+            (source.identity != 0 and source.identity == destination.identity) or
+            source.released or destination.released)
+        {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        }
+
+        // Register an empty destination first. The insertion may rehash the
+        // identity map, so acquire both entry pointers only afterwards.
+        _ = try self.reservationIdentityLocked(destination);
+        const source_owned = self.reservation_identities.getPtr(source.identity) orelse {
+            self.memory.accounting_errors +|= 1;
+            return error.ReservationReleased;
+        };
+        const destination_owned = self.reservation_identities.getPtr(destination.identity) orelse {
+            self.memory.accounting_errors +|= 1;
+            return error.ReservationReleased;
+        };
+        if (source_owned.slice != source.slice or source_owned.bytes != source.bytes or
+            destination_owned.slice != destination.slice or destination_owned.bytes != destination.bytes or
+            bytes > source.bytes)
+        {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        }
+        const next_destination = std.math.add(u64, destination.bytes, bytes) catch {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        };
+        source.bytes -= bytes;
+        source_owned.bytes = source.bytes;
+        destination.bytes = next_destination;
+        destination_owned.bytes = next_destination;
     }
 
     fn reconcileUsageLocked(
@@ -3018,6 +3184,10 @@ pub const Reservation = struct {
     bytes: u64,
     released: bool = false,
 
+    pub fn reservedBytes(self: *const Reservation) u64 {
+        return self.bytes;
+    }
+
     pub fn release(self: *Reservation) void {
         if (self.released) return;
         _ = self.manager.releaseReservation(self);
@@ -3041,6 +3211,41 @@ pub const Reservation = struct {
         if (self.released or bytes == 0) return;
         _ = self.manager.shrinkReservation(self, bytes);
     }
+
+    pub fn transferCreditTo(self: *Reservation, destination: *Reservation, bytes: u64) !void {
+        if (self.released or destination.released) return error.ReservationReleased;
+        try self.manager.transferReservationCredit(self, destination, bytes);
+    }
+};
+
+/// One ResourceManager reservation split into independently enforced owner
+/// credits. The manager accounts the sum; callers cap the native and allocator
+/// owners at `primary_bytes` and `secondary_bytes` respectively.
+pub const OwnedSplitReservation = struct {
+    reservation: Reservation,
+    primary_bytes: u64,
+    secondary_bytes: u64,
+
+    pub fn release(self: *OwnedSplitReservation) void {
+        self.reservation.release();
+    }
+
+    /// Hand secondary credit to an allocator using its normal idle-credit
+    /// reclamation policy. The ResourceManager total is unchanged; only
+    /// reservation ownership moves.
+    pub fn transferSecondaryTo(self: *OwnedSplitReservation, destination: *BudgetedAllocator) !void {
+        if (self.secondary_bytes == 0) return;
+        try destination.adoptReservationCredit(&self.reservation, self.secondary_bytes);
+        self.secondary_bytes = 0;
+    }
+
+    /// Transfer a credit that must remain available across several bounded
+    /// allocation windows. The destination releases it only at deinit.
+    pub fn transferSecondaryToPinned(self: *OwnedSplitReservation, destination: *BudgetedAllocator) !void {
+        if (self.secondary_bytes == 0) return;
+        try destination.adoptPinnedReservationCredit(&self.reservation, self.secondary_bytes);
+        self.secondary_bytes = 0;
+    }
 };
 
 /// Accounts allocator-backed working sets before each allocation reaches the
@@ -3063,8 +3268,11 @@ pub const BudgetedAllocator = struct {
     reservation: Reservation,
     max_hard_limit_multiple: u64,
     live_bytes: u64 = 0,
+    pinned_bytes: u64 = 0,
     credit_quantum: u64,
     budget_denied: bool = false,
+    denial_generation: u64 = 0,
+    reclaim_on_denial: bool = false,
     last_allocation_failure: ?AllocationFailure = null,
     reservation_floor: u64 = 0,
 
@@ -3151,6 +3359,20 @@ pub const BudgetedAllocator = struct {
         };
     }
 
+    /// Opt in only at allocation sites whose lock order permits invoking cache
+    /// owners. Ordinary init remains callback-free for storage transactions and
+    /// cache-internal allocators. Admission retries once, without raising limits.
+    pub fn initReclaiming(
+        manager: *ResourceManager,
+        slice: Slice,
+        backing: std.mem.Allocator,
+        max_hard_limit_multiple: u64,
+    ) BudgetedAllocator {
+        var self = init(manager, slice, backing, max_hard_limit_multiple);
+        self.reclaim_on_denial = true;
+        return self;
+    }
+
     pub fn deinit(self: *BudgetedAllocator) void {
         self.reservation.release();
         self.* = undefined;
@@ -3211,13 +3433,45 @@ pub const BudgetedAllocator = struct {
         return self.budget_denied;
     }
 
+    /// Distinguish a new admission failure from backing-allocator resize or
+    /// remap refusal without clearing the operation's sticky denied flag.
+    pub fn denialGeneration(self: *const BudgetedAllocator) u64 {
+        return self.denial_generation;
+    }
+
+    /// Pressure reclamation must return amortized spare credit as well as
+    /// freed buffers, without disturbing live bytes or an invocation's pin.
+    pub fn releaseUnusedCredit(self: *BudgetedAllocator) u64 {
+        const bytes = self.reservation.bytes -| @max(self.live_bytes, @max(self.pinned_bytes, self.reservation_floor));
+        self.reservation.shrink(bytes);
+        return bytes;
+    }
+
+    fn recordDenial(self: *BudgetedAllocator) void {
+        self.budget_denied = true;
+        self.denial_generation +%= 1;
+    }
+
+    pub fn adoptReservationCredit(self: *BudgetedAllocator, source: *Reservation, bytes: u64) !void {
+        try source.transferCreditTo(&self.reservation, bytes);
+    }
+
+    /// Adopt operation-lifetime credit. Ordinary frees may return any growth
+    /// above this floor, but cannot discard the next window's admission.
+    pub fn adoptPinnedReservationCredit(self: *BudgetedAllocator, source: *Reservation, bytes: u64) !void {
+        const pinned = std.math.add(u64, self.pinned_bytes, bytes) catch
+            return error.ResourceBudgetExceeded;
+        try source.transferCreditTo(&self.reservation, bytes);
+        self.pinned_bytes = pinned;
+    }
+
     fn reserveGrowth(self: *BudgetedAllocator, bytes: usize) bool {
         const amount = std.math.cast(u64, bytes) orelse {
-            self.budget_denied = true;
+            self.recordDenial();
             return false;
         };
         const next_live = std.math.add(u64, self.live_bytes, amount) catch {
-            self.budget_denied = true;
+            self.recordDenial();
             return false;
         };
         if (next_live > self.reservation.bytes) {
@@ -3227,23 +3481,22 @@ pub const BudgetedAllocator = struct {
                 minimum,
                 @max(minimum, self.credit_quantum),
                 self.max_hard_limit_multiple,
-            ) catch blk: {
-                // Incremental allocators must have the same cache-reclaim
-                // semantics as ResourceManager.reserve(). Without this retry,
-                // a bounded builder can repeatedly scan/spool its entire
-                // source and then fail even though reclaimable HBC/LSM cache
-                // bytes are the only thing occupying the aggregate envelope.
-                if (self.reservation.manager.reclaimForAllocation(self.reservation.slice, minimum) == 0) {
-                    self.budget_denied = true;
+            ) catch |err| {
+                // growReservationAmortized has released the accounting lock.
+                // Ask only for the actual deficit, not amortized spare credit.
+                if (!self.reclaim_on_denial or err != error.ResourceBudgetExceeded or
+                    self.reservation.manager.reclaimForAllocation(self.reservation.slice, minimum) == 0)
+                {
+                    self.recordDenial();
                     return false;
                 }
-                break :blk self.reservation.manager.growReservationAmortized(
+                _ = self.reservation.manager.growReservationAmortized(
                     &self.reservation,
                     minimum,
                     @max(minimum, self.credit_quantum),
                     self.max_hard_limit_multiple,
                 ) catch {
-                    self.budget_denied = true;
+                    self.recordDenial();
                     return false;
                 };
             };
@@ -3255,14 +3508,14 @@ pub const BudgetedAllocator = struct {
     fn releaseBytes(self: *BudgetedAllocator, bytes: usize) void {
         const amount = std.math.cast(u64, bytes) orelse std.math.maxInt(u64);
         self.live_bytes -|= amount;
-        if (self.live_bytes == 0 and self.reservation_floor == 0) {
-            self.reservation.shrink(self.reservation.bytes);
+        if (self.live_bytes == 0) {
+            self.reservation.shrink(self.reservation.bytes -| @max(self.pinned_bytes, self.reservation_floor));
             return;
         }
         const spare = self.reservation.bytes -| self.live_bytes;
         if (spare < self.credit_quantum *| 2) return;
         const retained_spare = @min(self.credit_quantum, self.reservation.bytes);
-        const target = @max(self.reservation_floor, self.live_bytes +| retained_spare);
+        const target = @max(@max(self.pinned_bytes, self.reservation_floor), self.live_bytes +| retained_spare);
         if (self.reservation.bytes > target)
             self.reservation.shrink(self.reservation.bytes - target);
     }
@@ -3993,6 +4246,209 @@ test "bounded observer growth grants aggregate slice and host capacity atomicall
     );
 }
 
+test "owned split reservations prevent concurrent headroom theft" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 100 };
+    var manager = ResourceManager.init(.{
+        .budgets = budgets,
+        .memory_budget = .{ .hard_limit_bytes = 90 },
+    });
+
+    var reservation = try manager.reserveOwnedSplitAtMost(.document_extraction_working_set, 100, 30);
+    defer reservation.release();
+    try std.testing.expectEqual(@as(u64, 60), reservation.primary_bytes);
+    try std.testing.expectEqual(@as(u64, 30), reservation.secondary_bytes);
+    try std.testing.expectEqual(@as(u64, 90), reservation.reservation.reservedBytes());
+    try std.testing.expectEqual(@as(u64, 90), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    try std.testing.expectEqual(@as(u64, 90), manager.snapshot().memory.used_bytes);
+    try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserve(.document_extraction_working_set, 1));
+    if (!builtin.single_threaded and builtin.os.tag != .freestanding) {
+        const Concurrent = struct {
+            manager: *ResourceManager,
+            acquired: std.atomic.Value(bool) = .init(false),
+
+            fn run(self: *@This()) void {
+                var competing = self.manager.reserve(.document_extraction_working_set, 1) catch return;
+                self.acquired.store(true, .release);
+                competing.release();
+            }
+        };
+        var concurrent = Concurrent{ .manager = &manager };
+        const thread = try std.Thread.spawn(.{}, Concurrent.run, .{&concurrent});
+        thread.join();
+        try std.testing.expect(!concurrent.acquired.load(.acquire));
+    }
+}
+
+test "nonreclaiming partial reservations atomically respect slice and host headroom" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn reclaim(raw: *anyopaque, _: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return 0;
+        }
+    };
+    for ([_]u64{ 90, 200 }) |host_limit| {
+        var budgets = Options.defaultBudgets();
+        budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 100 };
+        var manager = ResourceManager.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = host_limit } });
+        defer manager.deinit(std.testing.allocator);
+        var probe = Probe{};
+        const id = try manager.registerReclaimer(.document_extraction_working_set, &probe, Probe.reclaim);
+        defer manager.unregisterReclaimer(id);
+        var held = try manager.reserveWithoutReclaim(.document_extraction_working_set, 40);
+        defer held.release();
+        var other = try manager.reserveWithoutReclaim(.hbc_node_metadata_cache, 10);
+        defer other.release();
+        var growth = try manager.reserveAtMostWithoutReclaim(.document_extraction_working_set, 100);
+        try std.testing.expectEqual(@as(u64, if (host_limit == 90) 40 else 60), growth.bytes);
+        try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserveAtMostWithoutReclaim(.document_extraction_working_set, 1));
+        try std.testing.expectEqual(@as(usize, 0), probe.calls);
+        growth.release();
+        try std.testing.expectEqual(@as(u64, 40), manager.sliceStats(.document_extraction_working_set).used_bytes);
+        var zero = try manager.reserveAtMostWithoutReclaim(.document_extraction_working_set, 0);
+        zero.release();
+    }
+}
+
+test "owned split reservations reclaim before partial fallback for slice pressure" {
+    const Context = struct {
+        manager: *ResourceManager,
+        slice: Slice,
+        accounted: u64 = 0,
+        pinned: bool = false,
+        calls: usize = 0,
+
+        fn reclaim(raw: *anyopaque, target: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.pinned) return 0;
+            const released = @min(target, self.accounted);
+            self.manager.observeUsage(self.slice, &self.accounted, self.accounted - released);
+            return released;
+        }
+    };
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 100 };
+    var manager = ResourceManager.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = 200 } });
+    defer manager.deinit(std.testing.allocator);
+    var unrelated = Context{ .manager = &manager, .slice = .hbc_node_metadata_cache };
+    manager.observeUsage(unrelated.slice, &unrelated.accounted, 40);
+    const unrelated_id = try manager.registerReclaimer(unrelated.slice, &unrelated, Context.reclaim);
+    defer manager.unregisterReclaimer(unrelated_id);
+    var document = Context{ .manager = &manager, .slice = .document_extraction_working_set, .pinned = true };
+    manager.observeUsage(document.slice, &document.accounted, 60);
+    const document_id = try manager.registerReclaimer(document.slice, &document, Context.reclaim);
+    defer manager.unregisterReclaimer(document_id);
+
+    try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserveOwnedSplitAtMost(document.slice, 1, 70));
+    try std.testing.expectEqual(@as(usize, 0), unrelated.calls);
+    document.pinned = false;
+    var reservation = try manager.reserveOwnedSplitAtMost(document.slice, 1, 70);
+    defer reservation.release();
+    try std.testing.expectEqual(@as(u64, 29), document.accounted);
+    try std.testing.expectEqual(@as(u64, 40), unrelated.accounted);
+    try std.testing.expectEqual(@as(usize, 0), unrelated.calls);
+    try std.testing.expectEqual(@as(u64, 1), reservation.primary_bytes);
+    try std.testing.expectEqual(@as(u64, 70), reservation.secondary_bytes);
+}
+
+test "owned split reservations reclaim before partial fallback" {
+    const ReclaimContext = struct {
+        manager: *ResourceManager,
+        accounted: u64 = 0,
+
+        fn reclaim(raw: *anyopaque, target: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const released = @min(target, self.accounted);
+            self.manager.observeUsage(.hbc_node_metadata_cache, &self.accounted, self.accounted - released);
+            return released;
+        }
+    };
+
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 200 };
+    var manager = ResourceManager.init(.{
+        .budgets = budgets,
+        .memory_budget = .{ .hard_limit_bytes = 100 },
+    });
+    defer manager.deinit(std.testing.allocator);
+    var reclaimable = ReclaimContext{ .manager = &manager };
+    manager.observeUsage(.hbc_node_metadata_cache, &reclaimable.accounted, 40);
+    const reclaimer_id = try manager.registerReclaimer(.hbc_node_metadata_cache, &reclaimable, ReclaimContext.reclaim);
+    defer manager.unregisterReclaimer(reclaimer_id);
+
+    var reservation = try manager.reserveOwnedSplitAtMost(.document_extraction_working_set, 70, 30);
+    defer reservation.release();
+    try std.testing.expectEqual(@as(u64, 70), reservation.primary_bytes);
+    try std.testing.expectEqual(@as(u64, 30), reservation.secondary_bytes);
+    try std.testing.expectEqual(@as(u64, 0), reclaimable.accounted);
+    try std.testing.expectEqual(@as(u64, 100), manager.snapshot().memory.used_bytes);
+}
+
+test "owned split secondary credit transfers into a budgeted allocator" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 100 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(std.testing.allocator);
+
+    var split = try manager.reserveOwnedSplitAtMost(.document_extraction_working_set, 70, 30);
+    defer split.release();
+    var retained = BudgetedAllocator.init(
+        &manager,
+        .document_extraction_working_set,
+        std.testing.allocator,
+        1,
+    );
+    defer retained.deinit();
+
+    var aliased_source = split.reservation;
+    try std.testing.expectError(
+        error.ResourceAccountingMismatch,
+        split.reservation.transferCreditTo(&aliased_source, 1),
+    );
+    try split.transferSecondaryTo(&retained);
+    try std.testing.expectEqual(@as(u64, 0), split.secondary_bytes);
+    try std.testing.expectEqual(@as(u64, 70), split.reservation.bytes);
+    try std.testing.expectEqual(@as(u64, 30), retained.reservation.bytes);
+    try std.testing.expectEqual(@as(u64, 100), manager.sliceStats(.document_extraction_working_set).used_bytes);
+
+    const retained_alloc = retained.allocator();
+    const value = try retained_alloc.alloc(u8, 30);
+    split.release();
+    try std.testing.expectEqual(@as(u64, 30), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    retained_alloc.free(value);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.document_extraction_working_set).used_bytes);
+}
+
+test "pinned split credit survives idle allocation windows" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 100 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(std.testing.allocator);
+
+    var split = try manager.reserveOwnedSplitAtMost(.document_extraction_working_set, 70, 30);
+    defer split.release();
+    var invocation = BudgetedAllocator.init(
+        &manager,
+        .document_extraction_working_set,
+        std.testing.allocator,
+        1,
+    );
+    try split.transferSecondaryToPinned(&invocation);
+    const invocation_alloc = invocation.allocator();
+    const first_window = try invocation_alloc.alloc(u8, 30);
+    invocation_alloc.free(first_window);
+    try std.testing.expectEqual(@as(u64, 100), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    const second_window = try invocation_alloc.alloc(u8, 30);
+    invocation_alloc.free(second_window);
+    split.release();
+    try std.testing.expectEqual(@as(u64, 30), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    invocation.deinit();
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.document_extraction_working_set).used_bytes);
+}
+
 test "resource manager tracks inference prompt cache usage" {
     var manager = ResourceManager.init(.{});
     var current: u64 = 0;
@@ -4269,6 +4725,43 @@ test "foreground admission reclaims cache bytes and retries atomically" {
     try std.testing.expectEqual(@as(u64, 100), stats.memory.used_bytes);
     try std.testing.expectEqual(@as(u64, 1), stats.reclaim_requests);
     try std.testing.expectEqual(@as(u64, 10), stats.reclaimed_bytes);
+}
+
+test "non-reclaiming reservation never invokes callbacks" {
+    const ReclaimContext = struct {
+        invoked: bool = false,
+
+        fn reclaim(raw: *anyopaque, _: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.invoked = true;
+            return 0;
+        }
+    };
+
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.hbc_node_metadata_cache)] = .{ .hard_limit_bytes = 100 };
+    budgets[sliceIndex(.shard_transition_working_set)] = .{ .hard_limit_bytes = 100 };
+    var manager = ResourceManager.init(.{
+        .memory_budget = .{ .hard_limit_bytes = 100 },
+        .budgets = budgets,
+    });
+    defer manager.deinit(std.testing.allocator);
+
+    var context = ReclaimContext{};
+    var cache_bytes: u64 = 0;
+    manager.observeUsage(.hbc_node_metadata_cache, &cache_bytes, 80);
+    const identity = try manager.registerReclaimer(
+        .hbc_node_metadata_cache,
+        &context,
+        ReclaimContext.reclaim,
+    );
+    defer manager.unregisterReclaimer(identity);
+
+    try std.testing.expectError(
+        error.ResourceBudgetExceeded,
+        manager.reserveWithoutReclaim(.shard_transition_working_set, 30),
+    );
+    try std.testing.expect(!context.invoked);
 }
 
 test "dense search admission reclaims retained scratch from its own slice" {
@@ -4686,13 +5179,97 @@ test "budgeted allocator admits before allocation and releases exact live bytes"
     try std.testing.expectEqual(@as(u64, 12), manager.sliceStats(.shard_transition_working_set).used_bytes);
     const oversized = try alloc.alloc(u8, 12);
     try std.testing.expectEqual(@as(u64, 24), manager.sliceStats(.shard_transition_working_set).used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), budgeted.denialGeneration());
     try std.testing.expectError(error.OutOfMemory, alloc.alloc(u8, 9));
     try std.testing.expect(budgeted.denied());
+    try std.testing.expectEqual(@as(u64, 1), budgeted.denialGeneration());
+    try std.testing.expectError(error.OutOfMemory, alloc.alloc(u8, 9));
+    try std.testing.expectEqual(@as(u64, 2), budgeted.denialGeneration());
     try std.testing.expectEqual(@as(u64, 24), manager.sliceStats(.shard_transition_working_set).used_bytes);
 
     alloc.free(oversized);
     alloc.free(first);
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.shard_transition_working_set).used_bytes);
+    const recovered = try alloc.alloc(u8, 8);
+    defer alloc.free(recovered);
+    try std.testing.expect(budgeted.denied());
+    try std.testing.expectEqual(@as(u64, 2), budgeted.denialGeneration());
+}
+
+test "budgeted allocator reclamation is opt in and retries without raising limits" {
+    const Cache = struct {
+        retained: Reservation,
+        calls: usize = 0,
+
+        fn reclaim(raw: *anyopaque, target: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const bytes = @min(target, self.retained.bytes);
+            self.retained.shrink(bytes);
+            return bytes;
+        }
+    };
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 64 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(std.testing.allocator);
+    var cache = Cache{ .retained = try manager.reserve(.document_extraction_working_set, 48) };
+    defer cache.retained.release();
+    const identity = try manager.registerReclaimer(.document_extraction_working_set, &cache, Cache.reclaim);
+    defer manager.unregisterReclaimer(identity);
+
+    var ordinary = BudgetedAllocator.init(&manager, .document_extraction_working_set, std.testing.allocator, 1);
+    defer ordinary.deinit();
+    try std.testing.expectError(error.OutOfMemory, ordinary.allocator().alloc(u8, 32));
+    try std.testing.expectEqual(@as(usize, 0), cache.calls);
+    try std.testing.expectEqual(@as(u64, 48), cache.retained.bytes);
+
+    var required = BudgetedAllocator.initReclaiming(&manager, .document_extraction_working_set, std.testing.allocator, 1);
+    defer required.deinit();
+    const bytes = try required.allocator().alloc(u8, 32);
+    defer required.allocator().free(bytes);
+    try std.testing.expectEqual(@as(usize, 1), cache.calls);
+    try std.testing.expectEqual(@as(u64, 32), cache.retained.bytes);
+    try std.testing.expectEqual(@as(u64, 64), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), required.denialGeneration());
+
+    // Even evicting all remaining optional bytes cannot admit this request.
+    // The allocator retries once, retains its original live allocation, and
+    // never increases the configured hard limit or loops over reclaimers.
+    try std.testing.expectError(error.OutOfMemory, required.allocator().alloc(u8, 33));
+    try std.testing.expectEqual(@as(usize, 2), cache.calls);
+    try std.testing.expectEqual(@as(u64, 0), cache.retained.bytes);
+    try std.testing.expectEqual(@as(u64, 32), required.live_bytes);
+    try std.testing.expectEqual(@as(u64, 32), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    try std.testing.expectEqual(@as(u64, 1), required.denialGeneration());
+}
+
+test "budgeted allocator reclaim denial does not retry a busy cache" {
+    const Cache = struct {
+        calls: usize = 0,
+
+        fn reclaim(raw: *anyopaque, _: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return 0;
+        }
+    };
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 64 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(std.testing.allocator);
+    var retained = try manager.reserve(.document_extraction_working_set, 48);
+    defer retained.release();
+    var cache: Cache = .{};
+    const identity = try manager.registerReclaimer(.document_extraction_working_set, &cache, Cache.reclaim);
+    defer manager.unregisterReclaimer(identity);
+    var required = BudgetedAllocator.initReclaiming(&manager, .document_extraction_working_set, std.testing.allocator, 1);
+    defer required.deinit();
+    try std.testing.expectError(error.OutOfMemory, required.allocator().alloc(u8, 32));
+    try std.testing.expectEqual(@as(usize, 1), cache.calls);
+    try std.testing.expectEqual(@as(u64, 1), required.denialGeneration());
+    try std.testing.expectEqual(@as(u64, 0), required.live_bytes);
+    try std.testing.expectEqual(@as(u64, 48), retained.bytes);
 }
 
 test "budgeted allocator reclaims aggregate cache before denying growth" {
@@ -4722,7 +5299,7 @@ test "budgeted allocator reclaims aggregate cache before denying growth" {
     const identity = try manager.registerReclaimer(.hbc_node_metadata_cache, &context, ReclaimContext.reclaim);
     defer manager.unregisterReclaimer(identity);
 
-    var budgeted = BudgetedAllocator.init(
+    var budgeted = BudgetedAllocator.initReclaiming(
         &manager,
         .dense_vector_block_build_working_set,
         std.testing.allocator,
@@ -4738,6 +5315,25 @@ test "budgeted allocator reclaims aggregate cache before denying growth" {
     try std.testing.expectEqual(@as(u64, 100), stats.memory.used_bytes);
     try std.testing.expectEqual(@as(u64, 1), stats.reclaim_requests);
     try std.testing.expectEqual(@as(u64, 10), stats.reclaimed_bytes);
+}
+
+test "budgeted allocator retains both scratch and pinned credit floors" {
+    var manager = ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
+    var pinned = try manager.reserve(.dense_source_payload_state, 32);
+    defer pinned.release();
+    var budget = BudgetedAllocator.init(&manager, .dense_source_payload_state, std.testing.allocator, 1);
+    defer budget.deinit();
+    try budget.adoptPinnedReservationCredit(&pinned, 32);
+    const bytes = try budget.allocator().alloc(u8, 8);
+    const scratch = try budget.reserveScratch(64);
+    _ = budget.releaseUnusedCredit();
+    try std.testing.expectEqual(@as(u64, 72), budget.reservation.bytes);
+    budget.allocator().free(bytes);
+    try std.testing.expectEqual(@as(u64, 72), budget.reservation.bytes);
+    scratch.release();
+    try std.testing.expectEqual(@as(u64, 32), budget.reservation.bytes);
+    try std.testing.expectEqual(@as(u64, 0), budget.releaseUnusedCredit());
 }
 
 test "budgeted allocator allows concurrent operations within the shared hard limit" {
@@ -4784,6 +5380,9 @@ test "budgeted allocator amortizes manager reservations and releases idle credit
 
     alloc.free(first);
     try std.testing.expectEqual(reserved, manager.sliceStats(.shard_transition_working_set).used_bytes);
+    try std.testing.expectEqual(reserved - second.len, budgeted.releaseUnusedCredit());
+    try std.testing.expectEqual(@as(u64, second.len), manager.sliceStats(.shard_transition_working_set).used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), budgeted.releaseUnusedCredit());
     alloc.free(second);
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.shard_transition_working_set).used_bytes);
 }

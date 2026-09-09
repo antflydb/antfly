@@ -4872,7 +4872,7 @@ const ExperimentalPostingCheckpointBuild = struct {
             if (self.resource_manager) |manager| manager.dense_checkpoint_ready.notify();
         }
         var budget = if (self.resource_manager) |manager|
-            resource_manager_mod.BudgetedAllocator.init(manager, .lsm_compaction_work, allocator(), 1)
+            resource_manager_mod.BudgetedAllocator.initReclaiming(manager, .lsm_compaction_work, allocator(), 1)
         else
             null;
         defer if (budget) |*bounded| bounded.deinit();

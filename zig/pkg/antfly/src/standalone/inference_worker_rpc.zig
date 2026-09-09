@@ -40,11 +40,23 @@ const ResourceTask = struct { id: u64, len: usize, bytes: [max_resource_bytes]u8
 pub const Payload = struct {
     metadata: []const u8 = "",
     body: []const u8 = "",
+    /// Send-only scatter/gather body. The receiver still owns one admitted slab.
+    body_segments: ?[]const []const u8 = null,
+
+    fn bodySize(self: Payload) !usize {
+        var len = self.body.len;
+        if (self.body_segments) |segments| {
+            if (len != 0) return error.InvalidInput;
+            for (segments) |segment| len = std.math.add(usize, len, segment.len) catch return error.BodyTooLarge;
+        }
+        if (len > max_body_bytes) return error.BodyTooLarge;
+        return len;
+    }
 
     fn size(self: Payload) !usize {
-        if (self.metadata.len > max_metadata_bytes or self.body.len > max_body_bytes)
+        if (self.metadata.len > max_metadata_bytes)
             return error.BodyTooLarge;
-        return self.metadata.len + self.body.len;
+        return self.metadata.len + try self.bodySize();
     }
 };
 
@@ -198,9 +210,13 @@ pub const Endpoint = struct {
     pub fn copyPayload(self: *Endpoint, value: Payload) !OwnedPayload {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const owned = try self.allocateLocked(value.metadata.len, value.body.len);
+        const owned = try self.allocateLocked(value.metadata.len, try value.bodySize());
         @memcpy(owned.bytes[0..value.metadata.len], value.metadata);
-        @memcpy(owned.bytes[value.metadata.len..], value.body);
+        var offset = value.metadata.len;
+        for (value.body_segments orelse &.{value.body}) |segment| {
+            @memcpy(owned.bytes[offset..][0..segment.len], segment);
+            offset += segment.len;
+        }
         return owned;
     }
 
@@ -209,9 +225,13 @@ pub const Endpoint = struct {
         if (control.check) |check| try check(control.ptr);
         var pending = Pending{};
         self.mutex.lockUncancelable(self.io);
-        if (self.closed.load(.acquire) or self.pending.count() >= max_requests) {
+        if (self.closed.load(.acquire)) {
             self.mutex.unlock(self.io);
             return error.InferenceWorkerUnavailable;
+        }
+        if (self.pending.count() >= max_requests) {
+            self.mutex.unlock(self.io);
+            return error.QueueFull;
         }
         const id = self.next_id;
         self.next_id = std.math.add(u64, id, 2) catch {
@@ -318,9 +338,13 @@ pub const Endpoint = struct {
         _ = try payload.size();
         var offer = Offer{};
         self.mutex.lockUncancelable(self.io);
-        if (self.closed.load(.acquire) or self.offers.count() >= max_requests) {
+        if (self.closed.load(.acquire)) {
             self.mutex.unlock(self.io);
-            return error.ResourceTemporarilyUnavailable;
+            return error.InferenceWorkerUnavailable;
+        }
+        if (self.offers.count() >= max_requests) {
+            self.mutex.unlock(self.io);
+            return error.QueueFull;
         }
         const transfer = self.next_transfer;
         self.next_transfer = std.math.add(u64, transfer, 1) catch {
@@ -341,7 +365,7 @@ pub const Endpoint = struct {
         description[0] = @intFromEnum(kind);
         std.mem.writeInt(u64, description[1..9], request_id, .little);
         std.mem.writeInt(u32, description[9..13], @intCast(payload.metadata.len), .little);
-        std.mem.writeInt(u64, description[13..21], payload.body.len, .little);
+        std.mem.writeInt(u64, description[13..21], try payload.bodySize(), .little);
         errdefer self.sendFrame(.abort, transfer, "") catch {};
         try self.sendFrame(.offer, transfer, &description);
         while (!offer.ready.isSet()) {
@@ -349,8 +373,15 @@ pub const Endpoint = struct {
             if (self.closed.load(.acquire)) return error.InferenceWorkerUnavailable;
             try self.waitTick(&offer.ready);
         }
-        if (!offer.accepted) return error.ResourceTemporarilyUnavailable;
-        for ([_][]const u8{ payload.metadata, payload.body }) |part| {
+        // No payload or finish frame has crossed this boundary. A denied
+        // request has not executed and can be retried after sibling admission
+        // drains. Response denial is translated to terminal capacity below:
+        // the original request may already have executed successfully.
+        if (self.closed.load(.acquire)) return error.InferenceWorkerUnavailable;
+        if (!offer.accepted) return error.QueueFull;
+        const parts = payload.body_segments orelse &.{payload.body};
+        for (0..parts.len + 1) |index| {
+            const part = if (index == 0) payload.metadata else parts[index - 1];
             var offset: usize = 0;
             while (offset < part.len) {
                 if (control.check) |check| try check(control.ptr);
@@ -554,14 +585,14 @@ pub const Endpoint = struct {
         const response = self.handler(self.context, request) catch |err| {
             // Terminal failure never needs message credit or an offer slot.
             // Even a completely full recipient can finish this one request.
-            self.sendFrame(if (err == error.ResourceTemporarilyUnavailable) .capacity else .failure, request.id, "") catch {};
+            self.sendFrame(if (err == error.ResourceTemporarilyUnavailable or err == error.QueueFull) .capacity else .failure, request.id, "") catch {};
             return;
         };
         defer response.deinit();
         self.sendMessage(.response, request.id, response.view(), .{ .ptr = request, .check = Request.check }) catch |err| {
             // Terminal failure never needs message credit or an offer slot.
             // Even a completely full recipient can finish this one request.
-            self.sendFrame(if (err == error.ResourceTemporarilyUnavailable) .capacity else .failure, request.id, "") catch {};
+            self.sendFrame(if (err == error.ResourceTemporarilyUnavailable or err == error.QueueFull) .capacity else .failure, request.id, "") catch {};
         };
     }
 };
@@ -571,6 +602,7 @@ const TestPair = struct {
     child: Endpoint,
     files: [4]std.Io.File,
     cancelled: std.atomic.Value(bool) = .init(false),
+    handled: std.atomic.Value(usize) = .init(0),
     cancel_seen: std.Io.Event = .unset,
 
     fn init(self: *TestPair) !void {
@@ -612,6 +644,7 @@ const TestPair = struct {
     fn closed(_: *anyopaque) void {}
     fn handle(raw: *anyopaque, request: *Request) !OwnedPayload {
         const self: *TestPair = @ptrCast(@alignCast(raw));
+        _ = self.handled.fetchAdd(1, .monotonic);
         if (std.mem.eql(u8, request.payload.view().body, "nested"))
             return request.endpoint.call(.{ .body = "echo" }, .{});
         if (std.mem.eql(u8, request.payload.view().body, "cancel")) {
@@ -638,6 +671,26 @@ test "inference worker RPC permits nested bidirectional callbacks" {
     const result = try pair.parent.call(.{ .body = "nested" }, .{});
     defer result.deinit();
     try std.testing.expectEqualStrings("echo", result.view().body);
+}
+
+test "inference worker segmented media crosses the actual RPC boundary without sender copies" {
+    var pair: TestPair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    const envelope = @import("httpx").attachment_envelope;
+    var encoded = try envelope.encodeSegmentsAlloc(std.testing.allocator, "{\"image_count\":2}", &.{
+        .{ .mime_type = "image/png", .data = "\x89PNG\x00\xff" },
+        .{ .mime_type = "application/x-antfly-raster", .data = "\x00\xff\x00\x80" },
+    });
+    defer encoded.deinit();
+    const result = try pair.parent.call(.{ .metadata = "provider options", .body_segments = encoded.segments }, .{});
+    defer result.deinit();
+    var decoded = try envelope.parseAlloc(std.testing.allocator, result.view().body, .{});
+    defer decoded.deinit();
+    try std.testing.expectEqualStrings("provider options", result.view().metadata);
+    try std.testing.expectEqualStrings("{\"image_count\":2}", decoded.metadata);
+    try std.testing.expectEqualStrings("\x00\xff\x00\x80", decoded.attachments[1].data);
+    try std.testing.expectError(error.InvalidInput, pair.parent.call(.{ .body = "ambiguous", .body_segments = encoded.segments }, .{}));
 }
 
 test "inference worker RPC cancellation reaches the active child request" {
@@ -694,7 +747,8 @@ test "inference worker bulk capacity rejects one request and leaves nested resou
     const occupied = try pair.child.allocateLocked(0, body.len);
     pair.child.mutex.unlock(pair.child.io);
     defer occupied.deinit();
-    try std.testing.expectError(error.ResourceTemporarilyUnavailable, pair.parent.call(.{ .body = body }, .{}));
+    try std.testing.expectError(error.QueueFull, pair.parent.call(.{ .body = body }, .{}));
+    try std.testing.expectEqual(@as(usize, 0), pair.handled.load(.monotonic));
     const nested = try pair.parent.call(.{ .body = "nested" }, .{});
     defer nested.deinit();
     try std.testing.expectEqualStrings("echo", nested.view().body);

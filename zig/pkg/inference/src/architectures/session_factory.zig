@@ -6148,6 +6148,8 @@ const arch_vtable = Session.VTable{
     .runResidentWithControl = &archRunResidentWithControl,
     .inputInfo = &archInputInfo,
     .outputInfo = &archOutputInfo,
+    .independentBatchRows = &archIndependentBatchRows,
+    .runGeometry = &archRunGeometry,
     .backend = &archBackend,
     .close = &archClose,
 };
@@ -8054,6 +8056,106 @@ fn maybeApplyPooler(
     const activated_ct = try cb.tanh_act(pooled_ct);
     defer cb.free(activated_ct);
     return try cb.toFloat32(activated_ct, allocator);
+}
+
+fn archRunGeometry(ptr: *anyopaque, inputs: @import("../backends/session.zig").ShapeInputs, batch: usize) !?@import("../backends/session.zig").RunGeometry {
+    const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (inputs.len() == 0) return null;
+    const first = inputs.get(0);
+    if (first.shape.len < 2 or first.shape[1] <= 0) return null;
+    const input_seq: usize = @intCast(first.shape[1]);
+    var sequence = input_seq;
+    var output_seq = input_seq;
+    var workspace_bytes: usize = 0;
+    const width: usize = switch (self.arch_config) {
+        .bert => |cfg| blk: {
+            if (self.task == .classifier) output_seq = 1;
+            break :blk if (self.task == .classifier or self.task == .recognizer) cfg.num_labels else cfg.hidden_size;
+        },
+        .deberta => |cfg| blk: {
+            if (self.task == .classifier) output_seq = 1;
+            break :blk if (self.task == .classifier or self.task == .recognizer) cfg.num_labels else cfg.hidden_size;
+        },
+        .modern_bert => |cfg| cfg.hidden_size,
+        .nomic_bert => |cfg| cfg.hidden_size,
+        .t5 => |cfg| cfg.d_model,
+        .gpt => |cfg| blk: {
+            if (self.task == .classifier and (cfg.family == .qwen3 or cfg.family == .qwen3_vl)) {
+                output_seq = 1;
+                break :blk 1;
+            }
+            break :blk cfg.hidden_size;
+        },
+        .whisper => |cfg| blk: {
+            if (first.dtype == .f32 and std.mem.eql(u8, first.name, "input_features")) {
+                if (first.shape.len != 3 or first.shape[2] <= 0) return error.InvalidInputShape;
+                sequence = @intCast(first.shape[2]);
+                output_seq = (std.math.add(usize, sequence, 1) catch return error.ResourceLimitExceeded) / 2;
+                workspace_bytes = try whisperStageWorkspace(batch, output_seq, output_seq, cfg.d_model, cfg.encoder_attention_heads, cfg.encoder_ffn_dim);
+                break :blk cfg.d_model;
+            }
+            const hidden = inputs.named("encoder_hidden_states") orelse return error.InvalidInputShape;
+            if (hidden.shape.len != 3 or hidden.shape[1] <= 0) return error.InvalidInputShape;
+            sequence = @max(input_seq, @as(usize, @intCast(hidden.shape[1])));
+            workspace_bytes = try whisperStageWorkspace(batch, input_seq, sequence, cfg.d_model, cfg.decoder_attention_heads, cfg.decoder_ffn_dim);
+            break :blk cfg.vocab_size;
+        },
+        else => return null,
+    };
+    const elements = std.math.mul(usize, batch, std.math.mul(usize, output_seq, width) catch return error.ResourceLimitExceeded) catch return error.ResourceLimitExceeded;
+    const bytes = std.math.mul(usize, elements, @sizeOf(f32)) catch return error.ResourceLimitExceeded;
+    return .{ .sequence = sequence, .output_bytes = std.math.add(usize, bytes, 3 * @sizeOf(i64)) catch return error.ResourceLimitExceeded, .workspace_bytes = workspace_bytes };
+}
+
+fn whisperStageWorkspace(batch: usize, queries: usize, keys: usize, hidden: usize, heads: usize, ffn: usize) !usize {
+    // Attention score/probability storage, FFN intermediates, and K/V/frontend
+    // storage are sequential peaks, not one copy per transformer layer.
+    const mul = std.math.mul;
+    const add = std.math.add;
+    const scores = try mul(usize, try mul(usize, try mul(usize, queries, keys), heads), 3);
+    const activations = try mul(usize, queries, try add(usize, try mul(usize, hidden, 6), try mul(usize, ffn, 3)));
+    const context = try mul(usize, try mul(usize, keys, hidden), 6);
+    return mul(usize, try mul(usize, batch, @max(scores, @max(activations, context))), @sizeOf(f32)) catch error.ResourceLimitExceeded;
+}
+
+test "native stage geometry resolves Whisper encoder and decoder output residency" {
+    var arch: ArchSession = undefined;
+    arch.arch_config = .{ .whisper = .{} };
+    arch.task = .generic;
+    const input = Tensor{ .data = &.{}, .dtype = .f32, .shape = &.{ 1, 80, 3000 }, .name = "input_features", .allocator = std.testing.allocator, .owns_data = false, .owns_shape = false };
+    const encoder = (try archRunGeometry(&arch, .{ .tensors = &.{input} }, 8)).?;
+    try std.testing.expectEqual(@as(usize, 3000), encoder.sequence);
+    try std.testing.expectEqual(@as(usize, 8 * 1500 * 384 * 4 + 24), encoder.output_bytes);
+    var ids = input;
+    ids.dtype = .i64;
+    ids.shape = &.{ 1, 3 };
+    ids.name = "input_ids";
+    var hidden = input;
+    hidden.shape = &.{ 1, 1500, 384 };
+    hidden.name = "encoder_hidden_states";
+    const decoder = (try archRunGeometry(&arch, .{ .tensors = &.{ ids, hidden } }, 8)).?;
+    try std.testing.expectEqual(@as(usize, 1500), decoder.sequence);
+    try std.testing.expectEqual(@as(usize, 8 * 3 * 51865 * 4 + 24), decoder.output_bytes);
+}
+
+fn archIndependentBatchRows(ptr: *anyopaque, inputs: []const Tensor) bool {
+    const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    // Only stateless forward stages are qualified here. Native generation
+    // caches and resident multimodal stages use their own scheduler contracts.
+    return switch (self.arch_config) {
+        .bert, .deberta, .modern_bert, .nomic_bert => inputs.len >= 2 and
+            inputs[0].dtype == .i64 and inputs[0].shape.len == 2 and
+            inputs[1].dtype == .i64 and inputs[1].shape.len == 2,
+        .whisper => if (inputs.len == 1)
+            inputs[0].dtype == .f32 and inputs[0].shape.len == 3 and std.mem.eql(u8, inputs[0].name, "input_features")
+        else
+            inputs.len == 2 and inputs[0].dtype == .i64 and inputs[0].shape.len == 2 and
+                inputs[1].dtype == .f32 and inputs[1].shape.len == 3,
+        .t5 => inputs.len == 2 and inputs[0].dtype == .i64 and inputs[0].shape.len == 2 and
+            inputs[1].dtype == .i64 and inputs[1].shape.len == 2,
+        .gpt => self.task == .classifier and (self.arch_config.gpt.family == .qwen3 or self.arch_config.gpt.family == .qwen3_vl),
+        else => false,
+    };
 }
 
 fn archInputInfo(ptr: *anyopaque) []const TensorInfo {

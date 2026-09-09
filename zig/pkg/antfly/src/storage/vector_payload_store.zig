@@ -916,7 +916,7 @@ pub const Store = struct {
         const resource_manager = manager orelse return openWithEncoding(alloc, storage, root, read_only, preferredEncoding());
         const budget = try alloc.create(resources.BudgetedAllocator);
         errdefer alloc.destroy(budget);
-        budget.* = resources.BudgetedAllocator.init(resource_manager, .dense_source_payload_state, alloc, 1);
+        budget.* = resources.BudgetedAllocator.initReclaiming(resource_manager, .dense_source_payload_state, alloc, 1);
         errdefer budget.deinit();
         var store = try openWithEncoding(budget.threadSafeAllocator(), storage, root, read_only, preferredEncoding());
         errdefer store.deinit();
@@ -1222,7 +1222,7 @@ pub const Store = struct {
         // Decode independent artifact envelopes before entering source writer
         // exclusion. Each request has its own allocator reservation.
         var local_budget: ?resources.BudgetedAllocator = if (self.group_commit and self.preparation_manager != null)
-            resources.BudgetedAllocator.init(self.preparation_manager.?, .dense_source_payload_state, self.preparation_alloc, 1)
+            resources.BudgetedAllocator.initReclaiming(self.preparation_manager.?, .dense_source_payload_state, self.preparation_alloc, 1)
         else
             null;
         defer if (local_budget) |*budget| budget.deinit();
@@ -1356,7 +1356,7 @@ pub const Store = struct {
             // The result allocator may be a long-lived transaction arena;
             // transient lease metadata must be freed after this one read.
             var lease_budget: ?resources.BudgetedAllocator = if (self.preparation_manager) |manager|
-                resources.BudgetedAllocator.init(manager, .dense_source_payload_state, self.preparation_alloc, 1)
+                resources.BudgetedAllocator.initReclaiming(manager, .dense_source_payload_state, self.preparation_alloc, 1)
             else
                 null;
             defer if (lease_budget) |*budget| budget.deinit();
