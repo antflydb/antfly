@@ -26,9 +26,11 @@ const multistage_reader_mod = @import("multistage_reader.zig");
 const pix2struct_mod = @import("pix2struct.zig");
 const vision_reader_mod = @import("vision_reader.zig");
 const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
+const session_factory = @import("../architectures/session_factory.zig");
 const manifest_mod = @import("../models/manifest.zig");
 const reader_types = @import("types.zig");
 const metal_generated_quant_stats = @import("../metal_generated_quant_stats.zig");
+const antfly_image = @import("antfly_image");
 const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const Field = reader_types.Field;
@@ -36,6 +38,16 @@ pub const Region = reader_types.Region;
 pub const Result = reader_types.Result;
 pub const ReadOptions = reader_types.ReadOptions;
 pub const StructuredValue = reader_types.StructuredValue;
+pub const nativeFlorenceReadBatchSize = @import("../pipelines/reading.zig").nativeFlorenceReadBatchSize;
+
+pub const BatchExecutionMode = enum { native, serial, fallback };
+
+pub const BatchResult = struct {
+    results: []Result,
+    mode: BatchExecutionMode,
+    native_batches: usize = 0,
+    fallback_reason: ?[]const u8 = null,
+};
 
 const ParserKind = enum {
     default,
@@ -79,6 +91,26 @@ const VisionLoadedReader = struct {
         };
     }
 
+    /// Construct the Florence wrapper for an already generation-fenced native
+    /// model. The core loader validates that the borrowed session is Florence;
+    /// avoiding another path-based parser probe also prevents a concurrent
+    /// model publication from changing this wrapper's parser semantics.
+    pub fn loadFromBorrowedModel(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        model: *model_manager_mod.LoadedModel,
+    ) !VisionLoadedReader {
+        return .{
+            .allocator = allocator,
+            .parser_kind = .florence,
+            .core = try vision_reader_mod.LoadedVisionReader.loadFromBorrowedModel(
+                allocator,
+                model_path,
+                model,
+            ),
+        };
+    }
+
     pub fn deinit(self: *VisionLoadedReader) void {
         self.core.deinit();
     }
@@ -97,11 +129,38 @@ const VisionLoadedReader = struct {
     }
 
     pub fn readBatch(self: *VisionLoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
+        return (try self.readBatchReported(image_datas, options)).results;
+    }
+
+    pub fn readBatchReported(self: *VisionLoadedReader, image_datas: []const []const u8, options: ReadOptions) !BatchResult {
         try validateVisionReadOptions(self.parser_kind, options);
         const normalized_prompt = normalizePromptForFamily(self.parser_kind, options.prompt);
         var forwarded = options;
         forwarded.prompt = normalized_prompt;
-        const raw_results = try self.core.readRawBatch(image_datas, forwarded);
+        const raw_batch = try self.core.readRawBatchReported(image_datas, forwarded);
+        return self.parseRawBatch(raw_batch, normalized_prompt);
+    }
+
+    pub fn readBorrowedRasterBatchReported(
+        self: *VisionLoadedReader,
+        rasters: []const antfly_image.BorrowedRasterAttachment,
+        options: ReadOptions,
+    ) !BatchResult {
+        try validateVisionReadOptions(self.parser_kind, options);
+        if (self.parser_kind != .florence) return error.BorrowedRasterUnsupported;
+        const normalized_prompt = normalizePromptForFamily(self.parser_kind, options.prompt);
+        var forwarded = options;
+        forwarded.prompt = normalized_prompt;
+        const raw_batch = try self.core.readBorrowedRasterBatchReported(rasters, forwarded);
+        return self.parseRawBatch(raw_batch, normalized_prompt);
+    }
+
+    fn parseRawBatch(
+        self: *VisionLoadedReader,
+        raw_batch: @import("../pipelines/reading.zig").ReadBatchResult,
+        normalized_prompt: ?[]const u8,
+    ) !BatchResult {
+        const raw_results = raw_batch.results;
         defer {
             for (raw_results) |raw| {
                 var tmp = raw;
@@ -121,7 +180,27 @@ const VisionLoadedReader = struct {
             out[i] = try parseOutput(self.allocator, self.parser_kind, raw.text, normalized_prompt);
             filled += 1;
         }
-        return out;
+        return .{
+            .results = out,
+            .mode = switch (raw_batch.mode) {
+                .native => .native,
+                .serial => .serial,
+                .fallback => .fallback,
+            },
+            .native_batches = raw_batch.native_batches,
+            .fallback_reason = raw_batch.fallback_reason,
+        };
+    }
+
+    pub fn inputTokenCount(self: *VisionLoadedReader, options: ReadOptions) !usize {
+        try validateVisionReadOptions(self.parser_kind, options);
+        const normalized_prompt = normalizePromptForFamily(self.parser_kind, options.prompt);
+        return self.core.inputTokenCount(.{
+            .prompt = normalized_prompt,
+            .max_tokens = options.max_tokens,
+            .cache_dtype = options.cache_dtype,
+            .source_fingerprint = options.source_fingerprint,
+        });
     }
 };
 
@@ -175,6 +254,15 @@ const VlmLoadedReader = struct {
 
     pub fn readBatch(self: *VlmLoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
         return readBatchSerial(VlmLoadedReader, self, image_datas, options);
+    }
+
+    pub fn inputTokenCount(self: *VlmLoadedReader, options: ReadOptions) !usize {
+        const prompt = switch (self.parser_kind) {
+            .moondream => try moondream_mod.buildSingleImagePrompt(self.allocator, options.prompt),
+            else => return error.InvalidModelForReading,
+        };
+        defer self.allocator.free(prompt);
+        return self.pipeline.inputTokenCount(prompt);
     }
 };
 
@@ -251,6 +339,40 @@ const GenAiLoadedReader = struct {
     pub fn readBatch(self: *GenAiLoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
         return readBatchSerial(GenAiLoadedReader, self, image_datas, options);
     }
+
+    pub fn inputTokenCount(self: *GenAiLoadedReader, options: ReadOptions) !usize {
+        if (!build_options.enable_onnx) return error.OnnxNotEnabled;
+        const prompt = switch (self.parser_kind) {
+            .moondream => try moondream_mod.buildSingleImagePrompt(self.allocator, options.prompt),
+            else => return error.InvalidModelForReading,
+        };
+        defer self.allocator.free(prompt);
+        return ortgenai.inputTokenCount(self.allocator, &self.model, prompt);
+    }
+};
+
+/// Cheap immutable model-generation lease used while a request waits in the
+/// cross-request broker. The broker leader builds one reader wrapper for the
+/// executed batch; followers retain only this model-manager handle.
+pub const ExecutionFence = struct {
+    handle: model_manager_mod.ModelHandle,
+
+    pub fn deinit(self: *ExecutionFence) void {
+        self.handle.release();
+        self.* = undefined;
+    }
+
+    pub fn backend(self: *const ExecutionFence) backends.BackendType {
+        return self.handle.get().session.backend();
+    }
+
+    pub fn generationIdentity(self: *const ExecutionFence) usize {
+        return @intFromPtr(self.handle.get());
+    }
+
+    pub fn manifest(self: *const ExecutionFence) *const manifest_mod.ModelManifest {
+        return &self.handle.get().manifest;
+    }
 };
 
 pub const LoadedReader = union(enum) {
@@ -318,6 +440,44 @@ pub const LoadedReader = union(enum) {
         ) };
     }
 
+    /// Acquire the minimum lifetime fence needed for safe read microbatching.
+    /// Split-component and multistage readers do not yet expose one immutable
+    /// aggregate generation, so they bypass cross-request coalescing. The
+    /// loaded session is the authority here: repeating path-name and sidecar
+    /// probes on every request is both racy with publication and unnecessary.
+    pub fn acquireExecutionFence(
+        model_path: []const u8,
+        model_manager: *model_manager_mod.ModelManager,
+    ) !?ExecutionFence {
+        var handle = model_manager.acquireFromDir(model_path) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            // The direct typed loader remains responsible for reporting model
+            // layout and publication failures. Broker eligibility is optional.
+            else => return null,
+        };
+        errdefer handle.release();
+        if (session_factory.getFlorenceConfig(handle.get().session) == null) {
+            handle.release();
+            return null;
+        }
+        return .{ .handle = handle };
+    }
+
+    /// Build the single per-executed-batch wrapper while `fence` keeps its
+    /// exact model generation alive. The returned reader does not own the
+    /// fence and must be destroyed before it.
+    pub fn loadFromExecutionFence(
+        allocator: std.mem.Allocator,
+        fence: *const ExecutionFence,
+    ) !LoadedReader {
+        const model = fence.handle.get();
+        return .{ .vision = try VisionLoadedReader.loadFromBorrowedModel(
+            allocator,
+            model.model_dir,
+            model,
+        ) };
+    }
+
     pub fn deinit(self: *LoadedReader) void {
         switch (self.*) {
             .vision => |*reader| reader.deinit(),
@@ -348,16 +508,59 @@ pub const LoadedReader = union(enum) {
     }
 
     pub fn readBatch(self: *LoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
+        return (try self.readBatchReported(image_datas, options)).results;
+    }
+
+    pub fn readBatchReported(self: *LoadedReader, image_datas: []const []const u8, options: ReadOptions) !BatchResult {
         if (options.execution_control) |control| try control.check();
         try validateReadOptions(options);
         const allocator = self.resultAllocator();
-        const results = try switch (self.*) {
-            .vision => |*reader| reader.readBatch(image_datas, options),
-            .genai => |*reader| reader.readBatch(image_datas, options),
-            .vlm => |*reader| reader.readBatch(image_datas, options),
-            .multistage => |*reader| readBatchSerial(@TypeOf(reader.*), reader, image_datas, options),
+        const batch = try switch (self.*) {
+            .vision => |*reader| reader.readBatchReported(image_datas, options),
+            .genai => |*reader| BatchResult{ .results = try reader.readBatch(image_datas, options), .mode = .serial },
+            .vlm => |*reader| BatchResult{ .results = try reader.readBatch(image_datas, options), .mode = .serial },
+            .multistage => |*reader| BatchResult{ .results = try readBatchSerial(@TypeOf(reader.*), reader, image_datas, options), .mode = .serial },
         };
-        return finishReadBatch(allocator, results, options.execution_control);
+        errdefer {
+            for (batch.results) |*result| result.deinit();
+            allocator.free(batch.results);
+        }
+        for (batch.results) |*result| try sanitizeResultUtf8(result);
+        if (options.execution_control) |control| try control.check();
+        return batch;
+    }
+
+    pub fn readBorrowedRasterBatchReported(
+        self: *LoadedReader,
+        rasters: []const antfly_image.BorrowedRasterAttachment,
+        options: ReadOptions,
+    ) !BatchResult {
+        try validateReadOptions(options);
+        const allocator = self.resultAllocator();
+        const batch = try switch (self.*) {
+            .vision => |*reader| reader.readBorrowedRasterBatchReported(rasters, options),
+            .genai, .vlm, .multistage => return error.BorrowedRasterUnsupported,
+        };
+        errdefer {
+            for (batch.results) |*result| result.deinit();
+            allocator.free(batch.results);
+        }
+        if (batch.results.len != rasters.len) return error.InvalidReadResultCount;
+        for (batch.results) |*result| try sanitizeResultUtf8(result);
+        return batch;
+    }
+
+    /// Return the exact per-item textual input length produced by this loaded
+    /// reader. Multi-stage OCR has no text input; every generative reader uses
+    /// the same prompt builder and tokenizer as execution.
+    pub fn inputTokenCount(self: *LoadedReader, options: ReadOptions) !usize {
+        try validateReadOptions(options);
+        return switch (self.*) {
+            .vision => |*reader| reader.inputTokenCount(options),
+            .genai => |*reader| reader.inputTokenCount(options),
+            .vlm => |*reader| reader.inputTokenCount(options),
+            .multistage => 0,
+        };
     }
 
     fn resultAllocator(self: *LoadedReader) std.mem.Allocator {

@@ -1,0 +1,121 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+
+package proxy
+
+import (
+	"testing"
+
+	"go.uber.org/zap"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/tools/cache"
+)
+
+func TestRouteWatcherIgnoresInformerResyncUpdate(t *testing.T) {
+	t.Parallel()
+
+	routes := NewRouteManager()
+	routes.UpsertRoute(&Route{Namespace: "default", Name: "reader", Priority: 1})
+	generation := routes.Generation()
+	watcher := &RouteWatcher{routeManager: routes, logger: zap.NewNop()}
+	oldObject := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"namespace": "default", "name": "reader", "resourceVersion": "7"},
+	}}
+	newObject := oldObject.DeepCopy()
+
+	// A malformed spec makes this test prove the resync guard ran before route
+	// conversion; a normal informer resync must be a complete no-op.
+	watcher.onRouteUpdate(oldObject, newObject)
+	if got := routes.Generation(); got != generation {
+		t.Fatalf("generation = %d after informer resync, want %d", got, generation)
+	}
+}
+
+func TestRouteWatcherRejectsInvalidHeaderRegex(t *testing.T) {
+	t.Parallel()
+	watcher := &RouteWatcher{routeManager: NewRouteManager(), logger: zap.NewNop()}
+	object := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"namespace": "default", "name": "reader"},
+		"spec": map[string]any{
+			"match": map[string]any{
+				"headers": map[string]any{
+					"x-tenant": map[string]any{"regex": "["},
+				},
+			},
+		},
+	}}
+	if _, err := watcher.convertRoute(object); err == nil {
+		t.Fatal("invalid header regex was accepted")
+	}
+}
+
+func TestRouteWatcherPreservesExplicitRouteIdentity(t *testing.T) {
+	t.Parallel()
+	watcher := &RouteWatcher{routeManager: NewRouteManager(), logger: zap.NewNop()}
+	object := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"namespace": "tenant-a", "name": "reader"},
+		"spec":     map[string]any{},
+	}}
+	route, err := watcher.convertRoute(object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if route.Namespace != "tenant-a" || route.Name != "reader" {
+		t.Fatalf("route identity = %q/%q, want tenant-a/reader", route.Namespace, route.Name)
+	}
+}
+
+func TestRouteManagerKeepsSameNamedRoutesDisjointByNamespace(t *testing.T) {
+	t.Parallel()
+	routes := NewRouteManager()
+	for _, namespace := range []string{"tenant-a", "tenant-b"} {
+		changed, err := routes.UpsertRoute(&Route{
+			Namespace:    namespace,
+			Name:         "reader",
+			Destinations: []Destination{{Pool: "gpu", Weight: 100}},
+		})
+		if err != nil || !changed {
+			t.Fatalf("install %s/reader: changed=%v err=%v", namespace, changed, err)
+		}
+	}
+	if len(routes.routes) != 2 {
+		t.Fatalf("installed routes = %d, want 2", len(routes.routes))
+	}
+
+	routes.RemoveRoute("tenant-a", "reader")
+	if len(routes.routes) != 1 || routes.routes[0].Namespace != "tenant-b" || routes.routes[0].Name != "reader" {
+		t.Fatalf("routes after tenant-a delete = %#v", routes.routes)
+	}
+}
+
+func TestRouteWatcherDeletesFromInformerTombstone(t *testing.T) {
+	t.Parallel()
+
+	routes := NewRouteManager()
+	changed, err := routes.UpsertRoute(&Route{Namespace: "tenant-a", Name: "reader"})
+	if err != nil || !changed {
+		t.Fatalf("install tenant-a/reader: changed=%v err=%v", changed, err)
+	}
+	generation := routes.Generation()
+	watcher := &RouteWatcher{routeManager: routes, logger: zap.NewNop()}
+	deleted := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"namespace": "tenant-a", "name": "reader"},
+	}}
+
+	watcher.onRouteDelete(cache.DeletedFinalStateUnknown{
+		Key: "tenant-a/reader",
+		Obj: deleted,
+	})
+
+	if len(routes.routes) != 0 {
+		t.Fatalf("installed routes = %d after tombstone delete, want 0", len(routes.routes))
+	}
+	if got := routes.Generation(); got != generation+1 {
+		t.Fatalf("generation = %d after tombstone delete, want %d", got, generation+1)
+	}
+}

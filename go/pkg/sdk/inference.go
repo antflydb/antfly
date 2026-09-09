@@ -615,7 +615,7 @@ func (c *InferenceClient) RewriteText(ctx context.Context, model string, inputs 
 
 // Transcribe transcribes audio to text using a speech-to-text model.
 // The audio should be base64-encoded audio data (WAV, MP3, FLAC, etc.).
-// Model is optional - if empty, uses the default transcriber model.
+// Model must name the transcriber explicitly so local and distributed routing agree.
 // Language is optional - if empty, the model will auto-detect.
 func (c *InferenceClient) Transcribe(ctx context.Context, model string, audio []byte, language string) (*oapi.InferenceTranscribeResponse, error) {
 	req := oapi.InferenceTranscribeRequest{

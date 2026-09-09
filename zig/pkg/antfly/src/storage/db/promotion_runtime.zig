@@ -303,7 +303,10 @@ pub const PromotionRuntime = struct {
     worker_wake_generation: std.atomic.Value(u32) = .init(0),
     worker_mutex: Io.Mutex = .init,
     io: ?Io,
-    future: ?Io.Future(void),
+    future: ?background_runtime_mod.MaintenanceScheduler.Handle,
+    backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
+    scheduled_retry_generation: u64 = 0,
+    scheduled_retry_delay_ms: i64 = blocked_retry_min_interval_ms,
 
     pub fn init(
         alloc: Allocator,
@@ -333,6 +336,7 @@ pub const PromotionRuntime = struct {
             .worker_started = .init(false),
             .worker_wake_generation = .init(0),
             .io = backend_runtime.io(),
+            .backend_runtime = backend_runtime,
             .future = null,
         };
     }
@@ -403,7 +407,7 @@ pub const PromotionRuntime = struct {
         defer self.worker_mutex.unlock(io);
         if (self.worker_started.load(.acquire)) return;
         self.shutdown_flag.store(false, .release);
-        self.future = try io.concurrent(workerMain, .{self});
+        self.future = try (try self.backend_runtime.?.maintenanceScheduler()).registerClass(.propagation, self, workerStep);
         self.worker_started.store(true, .release);
         self.signalWorker(io);
     }
@@ -423,6 +427,7 @@ pub const PromotionRuntime = struct {
     }
 
     fn wakeWorker(self: *PromotionRuntime) void {
+        if (self.backend_runtime) |backend| backend.wakeMaintenance(self);
         if (!self.worker_started.load(.acquire)) return;
         const io = self.io orelse return;
         self.signalWorker(io);
@@ -468,6 +473,10 @@ pub const PromotionRuntime = struct {
     pub fn catchUp(self: *PromotionRuntime) !void {
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
+        return self.catchUpLocked(false);
+    }
+
+    fn catchUpLocked(self: *PromotionRuntime, single_window: bool) !void {
         errdefer _ = self.error_count.fetchAdd(1, .monotonic);
 
         while (true) {
@@ -530,59 +539,33 @@ pub const PromotionRuntime = struct {
             }
             try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, max_seen);
             self.applied_sequence.store(max_seen, .release);
+            if (single_window) return;
         }
     }
 
-    fn workerMain(self: *PromotionRuntime) void {
-        const io = self.io orelse return;
-        var retry_delay_ms = blocked_retry_min_interval_ms;
-        var retry_wake_generation = self.worker_wake_generation.load(.acquire);
-        while (!self.shutdown_flag.load(.acquire)) {
-            if (self.applied_sequence.load(.acquire) >= self.target_sequence.load(.acquire)) {
-                const idle_wake_generation = self.worker_wake_generation.load(.acquire);
-                if (!self.shutdown_flag.load(.acquire) and
-                    self.applied_sequence.load(.acquire) >= self.target_sequence.load(.acquire))
-                {
-                    _ = self.waitForWorkerSignal(io, idle_wake_generation, null);
-                }
-                continue;
-            }
-            if (self.shutdown_flag.load(.acquire)) break;
-
-            if (self.applied_sequence.load(.acquire) < self.target_sequence.load(.acquire)) {
-                const wake_generation = self.worker_wake_generation.load(.acquire);
-                if (wake_generation != retry_wake_generation) {
-                    retry_delay_ms = blocked_retry_min_interval_ms;
-                    retry_wake_generation = wake_generation;
-                }
-                self.catchUp() catch |err| {
-                    std.log.warn("promotion catch-up failed: {s}", .{@errorName(err)});
-                    // Persistent routing/capability failures must not turn a
-                    // durable retry queue into a log and CPU hot loop. The
-                    // bounded delay is interrupted immediately by a source,
-                    // ownership, or work-generation wake, preserving recovery
-                    // latency when the dependency becomes available.
-                    _ = self.waitForWorkerSignal(io, wake_generation, retry_delay_ms);
-                    retry_delay_ms = nextBlockedRetryIntervalMs(retry_delay_ms);
-                    continue;
-                };
-                if (self.applied_sequence.load(.acquire) < self.target_sequence.load(.acquire)) {
-                    // Sink/owner setters reset this backoff through the wake
-                    // generation, while ownership may also change behind the
-                    // dynamic predicate without calling either setter. A
-                    // finite delay is the correctness backstop for that case.
-                    // It runs only while work is pending and backs off so
-                    // long-lived follower shards do not create a hot loop.
-                    if (self.shouldDelayBlockedRetry(wake_generation)) {
-                        _ = self.waitForWorkerSignal(io, wake_generation, retry_delay_ms);
-                        retry_delay_ms = nextBlockedRetryIntervalMs(retry_delay_ms);
-                    }
-                } else {
-                    retry_delay_ms = blocked_retry_min_interval_ms;
-                }
-            }
+    fn workerStep(self: *PromotionRuntime) ?u64 {
+        if (self.shutdown_flag.load(.acquire)) return null;
+        if (self.applied_sequence.load(.acquire) >= self.target_sequence.load(.acquire)) return null;
+        if (!self.catch_up_mutex.tryLock()) return 25;
+        defer self.catch_up_mutex.unlock();
+        const generation = self.worker_wake_generation.load(.acquire);
+        if (generation != self.scheduled_retry_generation) {
+            self.scheduled_retry_generation = generation;
+            self.scheduled_retry_delay_ms = blocked_retry_min_interval_ms;
         }
-        self.catchUp() catch {};
+        self.catchUpLocked(true) catch |err| {
+            std.log.warn("promotion catch-up failed: {s}", .{@errorName(err)});
+            const delay = self.scheduled_retry_delay_ms;
+            self.scheduled_retry_delay_ms = nextBlockedRetryIntervalMs(delay);
+            return @intCast(delay);
+        };
+        if (self.applied_sequence.load(.acquire) < self.target_sequence.load(.acquire) and self.shouldDelayBlockedRetry(generation)) {
+            const delay = self.scheduled_retry_delay_ms;
+            self.scheduled_retry_delay_ms = nextBlockedRetryIntervalMs(delay);
+            return @intCast(delay);
+        }
+        self.scheduled_retry_delay_ms = blocked_retry_min_interval_ms;
+        return 0;
     }
 };
 

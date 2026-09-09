@@ -63,6 +63,7 @@ pub const SparseEmbeddingConfig = struct {
 };
 
 pub const SparseEmbeddingPipeline = struct {
+    batch_observation: ?*@import("batch_execution.zig").Observation = null,
     allocator: std.mem.Allocator,
     session: backends.Session,
     tok: Tokenizer,
@@ -209,7 +210,7 @@ pub const SparseEmbeddingPipeline = struct {
         const data = output.asFloat32();
 
         // Get [batch, vocab] scores via max-pool if 3D, or directly if 2D
-        return switch (output_shape.len) {
+        const vectors = switch (output_shape.len) {
             3 => blk: {
                 const layout = resolveSparse3DLayout(output_shape, data.len, batch, self.config.dynamic_3d_layout) orelse {
                     std.log.warn("sparse embedding unexpected 3D output shape={any} data_len={d} batch={d} configured_layout={any}", .{ output_shape, data.len, batch, self.config.dynamic_3d_layout });
@@ -224,8 +225,10 @@ pub const SparseEmbeddingPipeline = struct {
                 std.log.warn("sparse embedding unexpected 2D output shape={any} data_len={d} batch={d}", .{ output_shape, data.len, batch });
                 return error.UnexpectedOutputShape;
             }),
-            else => error.UnexpectedOutputShape,
+            else => return error.UnexpectedOutputShape,
         };
+        if (self.batch_observation) |observation| observation.record(texts.len);
+        return vectors;
     }
 
     fn embedWithBatchPlan(
@@ -772,11 +775,13 @@ test "sparse embedding batches dynamic native sessions and trims padded sequence
     const alloc = std.testing.allocator;
     var session_state = FakeDynamicBatchSparseSession{};
     var tokenizer_state = FakeSparseTokenizer{};
+    var observation = @import("batch_execution.zig").Observation{};
     var pipeline = SparseEmbeddingPipeline{
         .allocator = alloc,
         .session = session_state.session(),
         .tok = tokenizer_state.tokenizer(),
         .config = .{ .max_length = 8, .top_k = 4 },
+        .batch_observation = &observation,
     };
 
     const vectors = try pipeline.embed(&.{ "a", "bb", "ccc" });
@@ -787,6 +792,7 @@ test "sparse embedding batches dynamic native sessions and trims padded sequence
     try std.testing.expectEqual(@as(usize, 3), session_state.last_sequence);
     try std.testing.expectEqual(@as(usize, 3), tokenizer_state.encode_count);
     try std.testing.expectEqual(@as(usize, 3), vectors.len);
+    try std.testing.expectEqual(.native_batch, observation.execution(3));
 }
 
 test "sparse embedding preserves batch requests when full batch exceeds admission budget" {
@@ -808,11 +814,13 @@ test "sparse embedding preserves batch requests when full batch exceeds admissio
         .check_live_memory = false,
     };
     var tokenizer_state = FakeSparseTokenizer{};
+    var observation = @import("batch_execution.zig").Observation{};
     var pipeline = SparseEmbeddingPipeline{
         .allocator = alloc,
         .session = session,
         .tok = tokenizer_state.tokenizer(),
         .config = .{ .max_length = 8, .top_k = 4 },
+        .batch_observation = &observation,
     };
 
     const vectors = try pipeline.embed(&.{ "a", "bb", "ccc" });
@@ -822,6 +830,8 @@ test "sparse embedding preserves batch requests when full batch exceeds admissio
     try std.testing.expectEqual(@as(usize, 3), session_state.run_count);
     try std.testing.expectEqual(@as(usize, 1), session_state.max_batch_seen);
     try std.testing.expectEqual(@as(usize, 3), tokenizer_state.encode_count);
+    try std.testing.expectEqual(.fallback, observation.execution(3));
+    try std.testing.expectEqual(@as(usize, 0), observation.native_items);
 }
 
 test "sparse embedding admission denial happens before tokenization" {
