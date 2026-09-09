@@ -2686,6 +2686,10 @@ pub fn build(b: *std.Build) void {
         .max_rss = 2 * 1024 * 1024 * 1024,
     });
     libantfly.link_gc_sections = true;
+    // Homebrew rewrites the dylib ID to its absolute opt/lib path on install.
+    if (target.result.os.tag == .macos) {
+        libantfly.headerpad_max_install_names = true;
+    }
     const install_libantfly = b.addInstallArtifact(libantfly, .{});
     const install_capi_header = b.addInstallFileWithDir(
         b.path("pkg/antfly/include/antfly.h"),
