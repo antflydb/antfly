@@ -12,6 +12,34 @@ Existing planes remain readable without an eager rewrite. This does not change
 the table-level source-ownership setting or exact-score requirements. Frozen
 comparison catalogs and archive locations are in `benchmark-baselines/README.md`.
 
+## Sparse fallback and bounded planning follow-up
+
+Sparse batching now applies only when no denser reclaimable segment was selected.
+Empty segments do not suppress sparse progress; the existing copy-byte and row
+caps remain. This avoids adding cold-segment copying to useful dense collections.
+
+`ANTFLY_SOURCE_VECTOR_INCREMENTAL_PLANNING=1` computes segment liveness summaries
+on the pinned marking cut, using the existing scan row/time budget. With unlocked
+marking, the density scan runs outside the source mutex and before DB apply.
+Summaries cost 24 bytes per physical segment and are included in admission.
+Resurrected owners invalidate summaries after the scanner rejoins; no retirement
+can use stale classifications. All-live verification skips density work unless a
+post-cut preparation prevents the fast path. Final copy planning uses direct
+reader indices, but copy-set construction and sorting still run under the lock.
+
+The [new qualification ledger](../.benchmark-results/vector-store-planning-targets-v2/README.md)
+records separate planner and sparse-policy comparisons. Qualification is in
+progress; neither setting is promoted. Density visits contribute to marking
+counters in the treatment, so compare marking plus planning rather than treating
+a lower planning counter alone as less work. The preceding results below apply
+to the earlier, more eager sparse policy and remain preserved.
+
+The first current-integration control exposed a separate cold-restart cost in
+ANN metadata admission. CLOCK removal already swap-compacts its slots, but
+insertion still scanned the full array for holes. That obsolete scan is removed
+in the common control/candidate baseline. The sampled control and its cold
+restart result remain diagnostic evidence, excluded from the fresh comparison.
+
 ## Bitmap locator and sparse reclamation follow-up
 
 Two focused opt-in changes now target the preceding experiments' costs.
@@ -81,13 +109,12 @@ counter intervals are unavailable. All four ordinary 1M idle drains settle in
 15–19 seconds; the sparse-layout outlier is specifically demonstrated by the
 matched 50K diagnostic.
 
-Keep both settings opt-in. The next policy to measure is sparse batching only
+Keep both settings opt-in. These results motivated sparse batching only
 when no denser reclaimable work is selected, with separate foreground and idle
 copy budgets. This would target the proven sparse-only cleanup case without
-opportunistically adding cold-segment copying to useful dense work. It is a
-follow-up hypothesis, not an implemented or qualified improvement. For the
-locator, prioritize bounded metadata planning and snapshot-safe segment liveness
-summaries before combining treatments. All twenty timed 50K/1M arms, twenty
+opportunistically adding cold-segment copying to useful dense work. The follow-up implementation and its separate qualification are recorded above.
+For the locator, bounded metadata planning and snapshot-safe segment liveness
+summaries are evaluated before combining treatments. All twenty timed 50K/1M arms, twenty
 reclamation checks, ten independent inventories, and four matched-layout runs
 passed; the frozen runtime and harness identities remain pinned in the ledger.
 

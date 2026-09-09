@@ -2006,13 +2006,9 @@ pub const Cache = struct {
         slots: *std.AutoHashMapUnmanaged(HbcSharedCacheKey, usize),
         key: HbcSharedCacheKey,
     ) !void {
-        for (clock.items, 0..) |entry, i| {
-            if (entry.key.namespace == 0) {
-                try slots.put(self.alloc, key, i);
-                clock.items[i] = .{ .key = key, .referenced = .init(true) };
-                return;
-            }
-        }
+        // removeSlot swap-deletes and repairs the moved key's slot. There
+        // are no holes to search; every admission can append directly.
+        std.debug.assert(slots.count() == clock.items.len);
         const slot = clock.items.len;
         try slots.put(self.alloc, key, slot);
         errdefer _ = slots.remove(key);
@@ -20788,6 +20784,15 @@ test "hbc shared cache keeps CLOCK slots compact across churn" {
     const namespace = hbcCacheNamespace("/tmp/hbc-clock-churn");
 
     for (1..1000) |id| {
+        // Exercise metadata replacement as well as vector eviction: both
+        // use the same compact slot array under the shared-cache mutex.
+        _ = try cache.cacheMetadata(namespace, id % 7, "current-metadata");
+        try std.testing.expectEqual(cache.metadata_cache.count(), cache.metadata_clock.items.len);
+        try std.testing.expectEqual(cache.metadata_cache.count(), cache.metadata_slots.count());
+        for (cache.metadata_clock.items, 0..) |entry, slot| {
+            try std.testing.expect(entry.key.namespace != 0);
+            try std.testing.expectEqual(slot, cache.metadata_slots.get(entry.key).?);
+        }
         const value: f32 = @floatFromInt(id);
         _ = try cache.cacheVector(namespace, id, &.{ value, value + 1, value + 2, value + 3 });
         try std.testing.expectEqual(cache.vector_cache.count(), cache.vector_clock.items.len);

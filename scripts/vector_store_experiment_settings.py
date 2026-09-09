@@ -162,6 +162,17 @@ CONTROLS["mark_sparse_batch"] = {
 TREATMENTS["mark_sparse_batch"] = {
     "ANTFLY_SOURCE_VECTOR_SPARSE_GC_COPY_BYTES": "67108864"
 }
+# Density planning is measured alone before combining it with sparse fallback.
+CONTROLS["mark_planning"] = {
+    **_COST_BASE,
+    **TREATMENTS["mark_locator_shape"],
+}
+TREATMENTS["mark_planning"] = {"ANTFLY_SOURCE_VECTOR_INCREMENTAL_PLANNING": "1"}
+CONTROLS["mark_planning_sparse"] = dict(CONTROLS["mark_planning"])
+TREATMENTS["mark_planning_sparse"] = {
+    **TREATMENTS["mark_planning"],
+    **TREATMENTS["mark_sparse_batch"],
+}
 ALL_FLAGS = sorted(
     {key for flags in [*TREATMENTS.values(), *CONTROLS.values()] for key in flags}
 )

@@ -100,6 +100,7 @@ pub const Store = struct {
     debt_scheduling: bool = false,
     bitmap_marking: bool = false,
     bitmap_locator: bool = false,
+    incremental_planning: bool = false,
     sparse_gc_copy_bytes: u64 = 0,
     inventory_min_payloads: u64 = 0,
     inventory_requested: bool = false,
@@ -510,6 +511,12 @@ pub const Store = struct {
         cancel_requested: bool = false,
         scan_done: bool = false,
         verification_done: bool = false,
+        // Scanner-owned density summaries over the pinned physical cut. The
+        // checkpoint path cannot replace segments while this mark is active.
+        segment_stats: ?[]SegmentStats = null,
+        planning_reader: usize = 0,
+        planning_row: usize = 0,
+        planning_required: bool = false,
         // Scanner-owned live map; only these bounded discoveries cross back
         // into the writer-owned tail map at the end of a scan turn.
         discovered: std.ArrayListUnmanaged(payload.Digest) = .empty,
@@ -531,6 +538,7 @@ pub const Store = struct {
 
         fn deinit(self: *@This(), alloc: Allocator) void {
             std.debug.assert(!self.running);
+            if (self.segment_stats) |stats| alloc.free(stats);
             self.source.deinit();
             if (self.scopes) |scopes| alloc.free(scopes);
             self.discovered.deinit(alloc);
@@ -640,6 +648,18 @@ pub const Store = struct {
             }
             marking.verification_done = true;
         }
+        if (marking.segment_stats) |stats| {
+            if (!marking.verification_done or marking.planning_required) while (marking.planning_reader < marking.source.readers.len) {
+                const reader = marking.source.readers[marking.planning_reader];
+                while (marking.planning_row < reader.count) : (marking.planning_row += 1) {
+                    if (markBudgetExpired(started, budget_ns, limit, progress)) return;
+                    progress.rows += 1;
+                    try stats[marking.planning_reader].add(reader, marking.planning_row, &marking.live);
+                }
+                marking.planning_row = 0;
+                marking.planning_reader += 1;
+            };
+        }
         marking.scan_done = true;
     }
 
@@ -724,6 +744,12 @@ pub const Store = struct {
                 marking.verified_bytes = 0;
                 marking.verification_done = false;
                 marking.scan_done = false;
+                // A retry can resurrect a row already classified as garbage.
+                // Recompute summaries before selecting any retirement; the
+                // writer queue never mutates scanner-owned state in flight.
+                if (marking.segment_stats) |stats| @memset(stats, .{});
+                marking.planning_reader = 0;
+                marking.planning_row = 0;
                 try marking.live.put(item.key_ptr.*, item.value_ptr.*);
                 marking.rescued_any = true;
             }
@@ -855,6 +881,7 @@ pub const Store = struct {
         self.inventory.delta = self.delta_inventory;
         self.bitmap_marking = experimentEnabled("ANTFLY_SOURCE_VECTOR_BITMAP_MARKING");
         self.bitmap_locator = experimentEnabled("ANTFLY_SOURCE_VECTOR_BITMAP_LOCATOR");
+        self.incremental_planning = experimentEnabled("ANTFLY_SOURCE_VECTOR_INCREMENTAL_PLANNING");
         if (@import("builtin").link_libc) {
             if (std.c.getenv("ANTFLY_SOURCE_VECTOR_SPARSE_GC_COPY_BYTES")) |raw|
                 self.sparse_gc_copy_bytes = try std.fmt.parseInt(u64, std.mem.span(raw), 10);
@@ -1617,18 +1644,22 @@ pub const Store = struct {
     }
 
     fn markWorkspaceBytes(self: *const Store) !usize {
+        const planning_bytes = if (self.incremental_planning and self.selective_gc)
+            try std.math.mul(usize, self.opened.readers.len, @sizeOf(SegmentStats))
+        else
+            0;
         // AutoHashMap's 80% load factor rounds to a power-of-two capacity.
         // Forty bytes per bucket covers a digest, dimension and metadata;
         // fixed slack covers the header/alignment and the Marking itself.
         // Reserve also for the source lease (and full-GC sealing successor).
         if (self.bitmap_marking) {
             const locator_workspace = if (self.bitmap_locator) try LiveSet.locatorWorkspaceBytes(&self.opened) else 0;
-            return std.math.add(usize, locator_workspace, try std.math.add(usize, try LiveSet.workspaceBytes(&self.opened), try std.math.add(usize, @sizeOf(Marking) + 4096, try std.math.mul(usize, @intCast(self.opened.catalogMetadataBytes()), 3))));
+            return std.math.add(usize, locator_workspace, try std.math.add(usize, try LiveSet.workspaceBytes(&self.opened), try std.math.add(usize, @sizeOf(Marking) + 4096 + planning_bytes, try std.math.mul(usize, @intCast(self.opened.catalogMetadataBytes()), 3))));
         }
         const count = std.math.cast(u32, self.stats.retained_payloads) orelse return error.VectorPayloadCountOverflow;
         const load_capacity = (try std.math.mul(usize, count, 5)) / 4;
         const slots = try std.math.ceilPowerOfTwo(usize, @max(8, try std.math.add(usize, load_capacity, 1)));
-        return std.math.add(usize, try std.math.add(usize, try std.math.mul(usize, slots, 40), @sizeOf(Marking) + 4096), try std.math.mul(usize, @intCast(self.opened.catalogMetadataBytes()), 2));
+        return std.math.add(usize, try std.math.add(usize, try std.math.mul(usize, slots, 40), @sizeOf(Marking) + 4096 + planning_bytes), try std.math.mul(usize, @intCast(self.opened.catalogMetadataBytes()), 2));
     }
 
     fn startMarkingLocked(self: *Store, primary: *erased.Store) !bool {
@@ -1720,9 +1751,16 @@ pub const Store = struct {
         if (self.bitmap_marking) {
             try live.enableBitmapsDeferred(&source_snapshot, self.bitmap_locator);
         } else try live.ensureTotalCapacity(std.math.cast(u32, self.stats.retained_payloads) orelse return error.ResourceBudgetExceeded);
+        const segment_stats = if (self.incremental_planning and self.selective_gc and !source_snapshot.store.manifest.?.hasPhysicalBase())
+            try self.alloc.alloc(SegmentStats, source_snapshot.readers.len)
+        else
+            null;
+        errdefer if (segment_stats) |stats| self.alloc.free(stats);
+        if (segment_stats) |stats| @memset(stats, .{});
         const marking = try self.alloc.create(Marking);
         marking.* = .{
             .source = source_snapshot,
+            .segment_stats = segment_stats,
             .retained_at_cut = self.stats.retained_payloads,
             .debt_at_cut = self.obsolete_debt,
             .scopes = scopes,
@@ -1752,6 +1790,20 @@ pub const Store = struct {
         total.* += elapsed;
         maximum.* = @max(maximum.*, elapsed);
     }
+
+    const SegmentStats = struct {
+        total: u64 = 0,
+        dead: u64 = 0,
+        live_rows: u64 = 0,
+
+        fn add(self: *@This(), reader: anytype, index: usize, live: *const LiveSet) !void {
+            const row = try reader.entryAt(index);
+            if (row.value != .vector or row.key.len != 32) return;
+            const bytes = @as(u64, row.value.vector.dims) * 4;
+            self.total += bytes;
+            if (!live.contains(row.key[0..32].*)) self.dead += bytes else self.live_rows += 1;
+        }
+    };
 
     const SparseSegment = struct {
         index: usize,
@@ -1801,6 +1853,16 @@ pub const Store = struct {
             self.marking = null;
             return true;
         }
+        if (marking.segment_stats != null and marking.planning_reader != marking.source.readers.len) {
+            // Verification skipped density work for an all-live cut, but a
+            // post-cut preparation may now prevent that fast path. Resume the
+            // bounded scan instead of doing a surprise corpus scan locked.
+            marking.live = live;
+            live = .init(self.alloc);
+            marking.planning_required = true;
+            marking.scan_done = false;
+            return false;
+        }
         const manifest = self.opened.store.manifest orelse return error.MissingVectorBlockManifest;
         var live_bytes: u64 = 0;
         var dimensions = live.valueIterator();
@@ -1823,6 +1885,8 @@ pub const Store = struct {
         else
             null else null;
         defer if (selection_scratch) |reservation| reservation.release();
+        var selected_indices = std.ArrayListUnmanaged(usize).empty;
+        defer selected_indices.deinit(self.alloc);
         var selected_rows: u64 = 0;
         if (partial) {
             // Retain cold segments byte-for-byte. Updated versions arrive in
@@ -1836,16 +1900,15 @@ pub const Store = struct {
             var sparse = std.ArrayListUnmanaged(SparseSegment).empty;
             defer sparse.deinit(self.alloc);
             for (self.opened.readers, 0..) |reader, index| {
-                var total: u64 = 0;
-                var dead: u64 = 0;
-                var live_rows: u64 = 0;
-                for (0..reader.count) |i| {
-                    const row = try reader.entryAt(i);
-                    if (row.value != .vector or row.key.len != 32) continue;
-                    const bytes = @as(u64, row.value.vector.dims) * 4;
-                    total += bytes;
-                    if (!live.contains(row.key[0..32].*)) dead += bytes else live_rows += 1;
-                }
+                var counts: SegmentStats = .{};
+                if (marking.segment_stats) |stats| {
+                    std.debug.assert(marking.planning_reader == self.opened.readers.len);
+                    std.debug.assert(reader.generation == marking.source.readers[index].generation and reader.shard_id == marking.source.readers[index].shard_id);
+                    counts = stats[index];
+                } else for (0..reader.count) |i| try counts.add(reader, i, &live);
+                const total = counts.total;
+                const dead = counts.dead;
+                const live_rows = counts.live_rows;
                 const ratio = @as(f64, @floatFromInt(dead)) / @as(f64, @floatFromInt(@max(1, total)));
                 if (ratio > best_ratio) {
                     best_ratio = ratio;
@@ -1854,6 +1917,7 @@ pub const Store = struct {
                 }
                 if (ratio >= 0.25 or reader.count == 0) {
                     try selected.append(self.alloc, manifest.segments[index]);
+                    try selected_indices.append(self.alloc, index);
                     selected_reclaimable = selected_reclaimable or dead != 0;
                     selected_copy_bytes +|= total - dead;
                     selected_rows +|= live_rows;
@@ -1863,7 +1927,10 @@ pub const Store = struct {
             }
             // Empty output segments are cheap to retire, but selecting one
             // must not starve real garbage below the density threshold.
-            if (self.sparse_gc_copy_bytes != 0) {
+            // Sparse batching is a fallback, not extra cold work appended to
+            // an already useful dense collection. Empty segments do not count
+            // as reclaimable work and must not suppress sparse progress.
+            if (self.sparse_gc_copy_bytes != 0 and !selected_reclaimable) {
                 std.mem.sort(SparseSegment, sparse.items, {}, SparseSegment.less);
                 for (sparse.items) |candidate| {
                     // Always admit the best nonempty candidate to make progress
@@ -1871,6 +1938,7 @@ pub const Store = struct {
                     // yields at the existing per-step byte budget.
                     if (selected_reclaimable and (candidate.live_bytes > self.sparse_gc_copy_bytes -| selected_copy_bytes or candidate.live_rows > 65536 -| selected_sparse_rows)) continue;
                     try selected.append(self.alloc, manifest.segments[candidate.index]);
+                    try selected_indices.append(self.alloc, candidate.index);
                     selected_copy_bytes +|= candidate.live_bytes;
                     selected_sparse_rows +|= candidate.live_rows;
                     selected_rows +|= candidate.live_rows;
@@ -1879,6 +1947,7 @@ pub const Store = struct {
             } else if (!selected_reclaimable) {
                 if (best) |index| {
                     try selected.append(self.alloc, manifest.segments[index]);
+                    try selected_indices.append(self.alloc, index);
                     selected_rows +|= best_live_rows;
                 }
             }
@@ -1904,14 +1973,12 @@ pub const Store = struct {
             if (self.bitmap_marking) {
                 if (self.bitmap_locator) try copy_live.enableSubset(&live) else try copy_live.enableBitmaps(&self.opened);
             } else if (bounded_plan) try copy_live.ensureTotalCapacity(plan_count);
-            for (selected.items) |segment| {
-                for (self.opened.readers) |reader| {
-                    if (reader.generation != segment.generation or reader.shard_id != segment.shard_id) continue;
-                    for (0..reader.count) |i| {
-                        const row = try reader.entryAt(i);
-                        if (row.key.len != 32) continue;
-                        if (live.get(row.key[0..32].*)) |dims| try copy_live.put(row.key[0..32].*, dims);
-                    }
+            for (selected_indices.items) |index| {
+                const reader = self.opened.readers[index];
+                for (0..reader.count) |i| {
+                    const row = try reader.entryAt(i);
+                    if (row.key.len != 32) continue;
+                    if (live.get(row.key[0..32].*)) |dims| try copy_live.put(row.key[0..32].*, dims);
                 }
             }
         }
@@ -3272,130 +3339,141 @@ test "source vector payloads selective collection cannot starve sparse garbage b
 }
 
 test "source vector payloads unlocked marking admits writers fences cancellation and reconciles retries" {
-    for ([_]bool{ false, true }) |rescue| {
-        for ([_]enum { finish, cancel, ambiguous, poisoned }{ .finish, .cancel, .ambiguous, .poisoned }) |outcome| {
-            const alloc = std.testing.allocator;
-            const docs = @import("docstore.zig");
-            const backend_mod = @import("lsm_backend.zig");
-            const keys = @import("internal_keys.zig");
-            var memory = lsm.MemoryStorage.init(alloc);
-            defer memory.deinit();
-            var backend = try backend_mod.Backend.open(alloc, "/unlocked-primary", .{ .storage = memory.storage() });
-            defer backend.close();
-            var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
-            defer raw.deinit();
-            var source = try Store.open(alloc, memory.storage(), "/unlocked-source", false);
-            defer source.deinit();
-            source.mark_outside_lock = true;
-            source.rescue_reappends = rescue;
-            source.mark_step_rows = 1;
-            source.append_only = true;
-            source.selective_gc = true;
-            var store = try docs.DocStore.openRuntime(alloc, &raw);
-            defer store.close();
-            store.payload_store = source.interface();
-            const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "a", "model-a");
-            defer alloc.free(key);
-            const other = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "z", "model-b");
-            defer alloc.free(other);
-            const old_value = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
-            defer alloc.free(old_value);
-            const current = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &.{ 4, 5, 6, 7 });
-            defer alloc.free(current);
-            try store.put(key, old_value);
-            try store.put(key, current);
-            try store.put(other, current);
-            const known = try payload.Reference.forArtifact(key, current);
-            try std.testing.expect(!try source.collectStepDeferredMark(&raw, 1));
-            while (!source.marking.?.live.contains(known.digest)) try source.advanceMarkingSnapshot();
-            try std.testing.expect(!source.marking.?.scan_done);
-            var old_reader = try store.beginReadTxn();
-            var reader_active = true;
-            defer if (reader_active) old_reader.abort();
-            MarkInterleaving.entered.store(false, .release);
-            MarkInterleaving.resume_scan.store(false, .release);
-            MarkInterleaving.cancel_entered.store(false, .release);
-            MarkInterleaving.cancel_done.store(false, .release);
-            MarkInterleaving.scan_error = null;
-            source.mark_test_hook = MarkInterleaving.pause;
-            const thread = try std.Thread.spawn(.{}, MarkInterleaving.scan, .{&source});
-            var joined = false;
-            defer if (!joined) {
+    for ([_]bool{ false, true }) |planning_phase| {
+        for ([_]bool{ false, true }) |rescue| {
+            for ([_]enum { finish, cancel, ambiguous, poisoned }{ .finish, .cancel, .ambiguous, .poisoned }) |outcome| {
+                const alloc = std.testing.allocator;
+                const docs = @import("docstore.zig");
+                const backend_mod = @import("lsm_backend.zig");
+                const keys = @import("internal_keys.zig");
+                var memory = lsm.MemoryStorage.init(alloc);
+                defer memory.deinit();
+                var backend = try backend_mod.Backend.open(alloc, "/unlocked-primary", .{ .storage = memory.storage() });
+                defer backend.close();
+                var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+                defer raw.deinit();
+                var source = try Store.open(alloc, memory.storage(), "/unlocked-source", false);
+                defer source.deinit();
+                source.mark_outside_lock = true;
+                source.incremental_planning = planning_phase;
+                source.rescue_reappends = rescue;
+                source.mark_step_rows = 1;
+                source.append_only = true;
+                source.selective_gc = true;
+                var store = try docs.DocStore.openRuntime(alloc, &raw);
+                defer store.close();
+                store.payload_store = source.interface();
+                const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "a", "model-a");
+                defer alloc.free(key);
+                const other = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "z", "model-b");
+                defer alloc.free(other);
+                const old_value = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+                defer alloc.free(old_value);
+                const current = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &.{ 4, 5, 6, 7 });
+                defer alloc.free(current);
+                try store.put(key, old_value);
+                try store.put(key, current);
+                try store.put(other, current);
+                const known = try payload.Reference.forArtifact(key, current);
+                try std.testing.expect(!try source.collectStepDeferredMark(&raw, 1));
+                while (!source.marking.?.live.contains(known.digest)) try source.advanceMarkingSnapshot();
+                if (planning_phase) {
+                    while (true) {
+                        var classified: u64 = 0;
+                        for (source.marking.?.segment_stats.?) |stats| classified += stats.total;
+                        if (classified != 0) break;
+                        try source.advanceMarkingSnapshot();
+                    }
+                }
+                try std.testing.expect(!source.marking.?.scan_done);
+                var old_reader = try store.beginReadTxn();
+                var reader_active = true;
+                defer if (reader_active) old_reader.abort();
+                MarkInterleaving.entered.store(false, .release);
+                MarkInterleaving.resume_scan.store(false, .release);
+                MarkInterleaving.cancel_entered.store(false, .release);
+                MarkInterleaving.cancel_done.store(false, .release);
+                MarkInterleaving.scan_error = null;
+                source.mark_test_hook = MarkInterleaving.pause;
+                const thread = try std.Thread.spawn(.{}, MarkInterleaving.scan, .{&source});
+                var joined = false;
+                defer if (!joined) {
+                    MarkInterleaving.resume_scan.store(true, .release);
+                    thread.join();
+                };
+                try MarkInterleaving.awaitFlag(&MarkInterleaving.entered);
+                // Fail promptly if a regression keeps the foreground lock held.
+                const admitted = source.mutex.tryLock();
+                if (admitted) source.mutex.unlock();
+                try std.testing.expect(admitted);
+                const generation = source.currentGeneration();
+                try source.advanceMarkingSnapshot(); // no parallel access to cursor/live
+                try std.testing.expect(source.statsSnapshot().collection_mark_busy_deferrals > 0);
+                const wal_before_retry = source.statsSnapshot().wal_bytes_written;
+                try store.put(key, current); // already scanned: reconcile pending tail
+                try store.put(key, old_value); // resurrect an orphan after the cut
+                if (rescue) {
+                    try std.testing.expectEqual(wal_before_retry, source.statsSnapshot().wal_bytes_written);
+                    try std.testing.expectEqual(@as(u64, 2), source.statsSnapshot().deduplicated_reappend_payloads);
+                } else try std.testing.expect(source.statsSnapshot().wal_bytes_written > wal_before_retry);
+                try store.delete(other);
+                try source.checkpoint(); // cannot retire the scanner's source cut
+                try std.testing.expectEqual(generation, source.currentGeneration());
+                try source.setAnnScopes(&.{123}); // scanner owns the old scope snapshot
+                var cancellation: ?std.Thread = null;
+                defer if (cancellation) |cancel_thread| {
+                    MarkInterleaving.resume_scan.store(true, .release);
+                    cancel_thread.join();
+                };
+                if (outcome == .cancel) {
+                    cancellation = try std.Thread.spawn(.{}, MarkInterleaving.cancel, .{&source});
+                    try MarkInterleaving.awaitFlag(&MarkInterleaving.cancel_entered);
+                    try std.testing.expect(!MarkInterleaving.cancel_done.load(.acquire));
+                } else if (outcome == .ambiguous) {
+                    Store.unresolvedCommit(&source);
+                } else if (outcome == .poisoned) {
+                    source.lock();
+                    source.poisoned = true;
+                    source.mutex.unlock();
+                }
                 MarkInterleaving.resume_scan.store(true, .release);
                 thread.join();
-            };
-            try MarkInterleaving.awaitFlag(&MarkInterleaving.entered);
-            // Fail promptly if a regression keeps the foreground lock held.
-            const admitted = source.mutex.tryLock();
-            if (admitted) source.mutex.unlock();
-            try std.testing.expect(admitted);
-            const generation = source.currentGeneration();
-            try source.advanceMarkingSnapshot(); // no parallel access to cursor/live
-            try std.testing.expect(source.statsSnapshot().collection_mark_busy_deferrals > 0);
-            const wal_before_retry = source.statsSnapshot().wal_bytes_written;
-            try store.put(key, current); // already scanned: reconcile pending tail
-            try store.put(key, old_value); // resurrect an orphan after the cut
-            if (rescue) {
-                try std.testing.expectEqual(wal_before_retry, source.statsSnapshot().wal_bytes_written);
-                try std.testing.expectEqual(@as(u64, 2), source.statsSnapshot().deduplicated_reappend_payloads);
-            } else try std.testing.expect(source.statsSnapshot().wal_bytes_written > wal_before_retry);
-            try store.delete(other);
-            try source.checkpoint(); // cannot retire the scanner's source cut
-            try std.testing.expectEqual(generation, source.currentGeneration());
-            try source.setAnnScopes(&.{123}); // scanner owns the old scope snapshot
-            var cancellation: ?std.Thread = null;
-            defer if (cancellation) |cancel_thread| {
-                MarkInterleaving.resume_scan.store(true, .release);
-                cancel_thread.join();
-            };
-            if (outcome == .cancel) {
-                cancellation = try std.Thread.spawn(.{}, MarkInterleaving.cancel, .{&source});
-                try MarkInterleaving.awaitFlag(&MarkInterleaving.cancel_entered);
-                try std.testing.expect(!MarkInterleaving.cancel_done.load(.acquire));
-            } else if (outcome == .ambiguous) {
-                Store.unresolvedCommit(&source);
-            } else if (outcome == .poisoned) {
-                source.lock();
-                source.poisoned = true;
-                source.mutex.unlock();
+                joined = true;
+                source.mark_test_hook = null;
+                if (cancellation) |cancel_thread| {
+                    cancel_thread.join();
+                    cancellation = null;
+                    try std.testing.expect(source.marking == null);
+                }
+                if (outcome == .poisoned) {
+                    try std.testing.expectEqual(error.VectorPayloadStorePoisoned, MarkInterleaving.scan_error.?);
+                    try std.testing.expect(source.marking == null);
+                } else {
+                    try std.testing.expect(MarkInterleaving.scan_error == null);
+                    if (source.marking) |marking| try std.testing.expect(!marking.tail.contains(known.digest));
+                }
+                if (outcome == .finish) {
+                    while (!try source.collectStep(&raw, 1)) {}
+                    try std.testing.expectEqual(@as(u64, 3), source.statsSnapshot().retained_payloads);
+                } else if (outcome == .ambiguous) {
+                    try std.testing.expect(!try source.collectStep(&raw, std.math.maxInt(u64)));
+                    try std.testing.expectEqual(generation, source.currentGeneration());
+                }
+                if (outcome == .poisoned) {
+                    try std.testing.expectError(error.VectorPayloadStorePoisoned, old_reader.get(other));
+                } else try std.testing.expectEqualSlices(u8, current, try old_reader.get(other));
+                old_reader.abort();
+                reader_active = false;
+                source.cancelMarking();
+                var reopened = try Store.open(alloc, memory.storage(), "/unlocked-source", false);
+                defer reopened.deinit();
+                while (!try reopened.collectStep(&raw, std.math.maxInt(u64))) {}
+                try std.testing.expectEqual(@as(u64, 1), reopened.statsSnapshot().retained_payloads);
+                const ref = try payload.Reference.forArtifact(key, old_value);
+                const value = try Store.resolve(&reopened, alloc, key, ref);
+                defer alloc.free(value);
+                try std.testing.expectEqualSlices(u8, old_value, value);
             }
-            MarkInterleaving.resume_scan.store(true, .release);
-            thread.join();
-            joined = true;
-            source.mark_test_hook = null;
-            if (cancellation) |cancel_thread| {
-                cancel_thread.join();
-                cancellation = null;
-                try std.testing.expect(source.marking == null);
-            }
-            if (outcome == .poisoned) {
-                try std.testing.expectEqual(error.VectorPayloadStorePoisoned, MarkInterleaving.scan_error.?);
-                try std.testing.expect(source.marking == null);
-            } else {
-                try std.testing.expect(MarkInterleaving.scan_error == null);
-                if (source.marking) |marking| try std.testing.expect(!marking.tail.contains(known.digest));
-            }
-            if (outcome == .finish) {
-                while (!try source.collectStep(&raw, 1)) {}
-                try std.testing.expectEqual(@as(u64, 3), source.statsSnapshot().retained_payloads);
-            } else if (outcome == .ambiguous) {
-                try std.testing.expect(!try source.collectStep(&raw, std.math.maxInt(u64)));
-                try std.testing.expectEqual(generation, source.currentGeneration());
-            }
-            if (outcome == .poisoned) {
-                try std.testing.expectError(error.VectorPayloadStorePoisoned, old_reader.get(other));
-            } else try std.testing.expectEqualSlices(u8, current, try old_reader.get(other));
-            old_reader.abort();
-            reader_active = false;
-            source.cancelMarking();
-            var reopened = try Store.open(alloc, memory.storage(), "/unlocked-source", false);
-            defer reopened.deinit();
-            while (!try reopened.collectStep(&raw, std.math.maxInt(u64))) {}
-            try std.testing.expectEqual(@as(u64, 1), reopened.statsSnapshot().retained_payloads);
-            const ref = try payload.Reference.forArtifact(key, old_value);
-            const value = try Store.resolve(&reopened, alloc, key, ref);
-            defer alloc.free(value);
-            try std.testing.expectEqualSlices(u8, old_value, value);
         }
     }
 }
@@ -4528,7 +4606,14 @@ test "source vector payloads sparse batches amortize one mark with bounded selec
     const mem = @import("mem_backend.zig");
     const docs = @import("docstore.zig");
     const keys = @import("internal_keys.zig");
-    for ([_]u64{ 0, 84, 64 * 1024 * 1024 }) |target| {
+    for ([_]struct { target: u64, dense: bool, planning: bool }{
+        .{ .target = 0, .dense = false, .planning = false },
+        .{ .target = 84, .dense = false, .planning = true },
+        .{ .target = 64 * 1024 * 1024, .dense = false, .planning = true },
+        .{ .target = 64 * 1024 * 1024, .dense = true, .planning = false },
+        .{ .target = 64 * 1024 * 1024, .dense = true, .planning = true },
+    }) |case| {
+        const target = case.target;
         var memory = lsm.MemoryStorage.init(alloc);
         defer memory.deinit();
         var source = try Store.open(alloc, memory.storage(), "/sparse-batches", false);
@@ -4536,6 +4621,7 @@ test "source vector payloads sparse batches amortize one mark with bounded selec
         source.append_only = true;
         source.selective_gc = true;
         source.sparse_gc_copy_bytes = target;
+        source.incremental_planning = case.planning;
         source.mark_outside_lock = true;
         source.mark_step_rows = 1;
         var backend = mem.Backend.init(alloc, .{});
@@ -4568,23 +4654,25 @@ test "source vector payloads sparse batches amortize one mark with bounded selec
         var old = try source.snapshot(alloc);
         defer old.deinit();
         for (0..3) |shard| try store.delete(names[shard][0]);
+        if (case.dense) try store.delete(names[0][1]);
         const collections = source.stats.collections;
         while (!try source.collectStep(&raw, 12)) {}
         try std.testing.expectEqual(collections + 1, source.stats.collections);
         // Each segment has seven live 12-byte vectors and one dead vector.
-        try std.testing.expectEqual(@as(u64, if (target > 84) 21 else 23), source.stats.retained_payloads);
+        try std.testing.expectEqual(@as(u64, if (case.dense) 22 else if (target > 84) 21 else 23), source.stats.retained_payloads);
         for (0..3) |shard| {
             const old_reference = try payload.Reference.forArtifact(names[shard][0], artifact);
             try std.testing.expect((try old.get(&old_reference.digest, std.math.maxInt(u64), 1)) == .vector);
-            for (names[shard][1..]) |key| {
+            for (names[shard][if (case.dense and shard == 0) 2 else 1..]) |key| {
                 const actual = try store.get(alloc, key);
                 defer alloc.free(actual);
                 try std.testing.expectEqualSlices(u8, artifact, actual);
             }
         }
-        while (source.stats.retained_payloads != 21) _ = try source.collectStep(&raw, 12);
+        const expected: u64 = if (case.dense) 20 else 21;
+        while (source.stats.retained_payloads != expected) _ = try source.collectStep(&raw, 12);
         try source.inventoryRetainedPayloads();
-        try std.testing.expectEqual(@as(u64, 21), source.stats.retained_payloads);
-        try std.testing.expectEqual(@as(u64, 21 * 12), source.stats.retained_payload_bytes);
+        try std.testing.expectEqual(expected, source.stats.retained_payloads);
+        try std.testing.expectEqual(expected * 12, source.stats.retained_payload_bytes);
     }
 }
