@@ -177,6 +177,15 @@ pub fn inferenceAdmissionFailure() InferenceAdmissionFailure {
     return .{};
 }
 
+/// The same public retry envelope for model execution admission failures.
+pub fn generationCapacityFailure() InferenceAdmissionFailure {
+    return .{
+        .@"error" = "GenerationCapacityUnavailable",
+        .message = "inference capacity temporarily unavailable",
+        .reason = "inference_capacity",
+    };
+}
+
 pub const InferenceAdmissionOwner = enum {
     caller,
     target,

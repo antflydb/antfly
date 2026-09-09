@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const connections_api = @import("connections.zig");
 const agent_tools = @import("agent_tools.zig");
 const ant_json = @import("antfly-json");
 const generating_api_openapi = @import("antfly_generating_api_openapi");
@@ -589,7 +590,7 @@ fn failAgentResult(
 ) !EncodedResponse {
     if (format == .json) return err;
     if (err == error.GenerationCapacityUnavailable) {
-        const payload = .{ .@"error" = "GenerationCapacityUnavailable", .retryable = true, .reason = "inference_capacity" };
+        const payload = connections_api.generationCapacityFailure();
         try live.emitValue("error", payload);
         return .{
             .content_type = "text/event-stream",
@@ -9826,7 +9827,7 @@ test "retrieval agent sse preserves retryable inference capacity" {
     try std.testing.expectEqualStrings("text/event-stream", encoded.content_type);
     try std.testing.expectEqual(@as(usize, 0), countSseEvents(events, "done"));
     try std.testing.expectEqualStrings(
-        "{\"error\":\"GenerationCapacityUnavailable\",\"retryable\":true,\"reason\":\"inference_capacity\"}",
+        "{\"error\":\"GenerationCapacityUnavailable\",\"message\":\"inference capacity temporarily unavailable\",\"reason\":\"inference_capacity\",\"retryable\":true,\"retry_after_ms\":1000}",
         firstSseEventData(events, "error").?,
     );
 

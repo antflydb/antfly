@@ -872,6 +872,7 @@ from .sort_profile import SortProfile
 from .sort_profile_candidate_source import SortProfileCandidateSource
 from .sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
 from .sse_error import SSEError
+from .sse_error_reason import SSEErrorReason
 from .sse_event import SSEEvent
 from .sse_step_completed import SSEStepCompleted
 from .sse_step_completed_details import SSEStepCompletedDetails
@@ -1875,6 +1876,7 @@ __all__ = (
     "SortProfileCandidateSource",
     "SortProfileSortLifecycleState",
     "SSEError",
+    "SSEErrorReason",
     "SSEEvent",
     "SSEStepCompleted",
     "SSEStepCompletedDetails",
