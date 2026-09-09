@@ -140,6 +140,8 @@ var _ = Describe("InferencePool Controller", func() {
 				"--port", "8080",
 				"--config", "/config/config.json",
 				"--allow-insecure-public-bind",
+				"--models-dir", "/models",
+				"--preload-model", "embedder:BAAI/bge-small-en-v1.5:i8",
 			}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers).To(HaveLen(2))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Name).To(Equal("pjrt-plugin"))

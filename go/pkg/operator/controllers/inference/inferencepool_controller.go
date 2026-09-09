@@ -23,6 +23,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"maps"
+	"path"
 	"reflect"
 	"slices"
 	"strconv"
@@ -388,6 +389,80 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 	return string(configJSON), nil
 }
 
+// inferenceModelArgs translates the merged model settings to the released CLI
+// contract. Keep --config for admission settings; it does not configure models.
+func inferenceModelArgs(configJSON string) (string, []string, error) {
+	var config struct {
+		ModelsDir       string `json:"models_dir"`
+		MaxLoadedModels *int   `json:"max_loaded_models"`
+		Preload         []struct {
+			Kind         string `json:"kind"`
+			Name         string `json:"name"`
+			Backend      string `json:"backend"`
+			Format       string `json:"format"`
+			Quantization string `json:"quantization"`
+		} `json:"preload"`
+	}
+	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
+		return "", nil, fmt.Errorf("invalid inference model config: %w", err)
+	}
+	if !path.IsAbs(config.ModelsDir) || path.Clean(config.ModelsDir) != config.ModelsDir ||
+		config.ModelsDir == "/" || config.ModelsDir == "/config" || strings.HasPrefix(config.ModelsDir, "/config/") {
+		return "", nil, fmt.Errorf("models_dir must be a clean absolute path outside /config")
+	}
+	args := []string{"--models-dir", config.ModelsDir}
+	if config.MaxLoadedModels != nil {
+		if *config.MaxLoadedModels < 0 {
+			return "", nil, fmt.Errorf("max_loaded_models must not be negative")
+		}
+		args = append(args, "--max-loaded-models", strconv.Itoa(*config.MaxLoadedModels))
+	}
+	for i, model := range config.Preload {
+		if model.Kind == "" {
+			model.Kind = "generator"
+		}
+		switch model.Kind {
+		case "embedder", "extractor", "reranker", "classifier", "generator", "reader", "transcriber", "rewriter", "chunker":
+		default:
+			return "", nil, fmt.Errorf("preload[%d]: unsupported kind %q", i, model.Kind)
+		}
+		switch model.Backend {
+		case "", "native", "onnx", "metal", "cuda", "xla", "pjrt", "wasm", "webgpu":
+		default:
+			return "", nil, fmt.Errorf("preload[%d]: unsupported backend %q", i, model.Backend)
+		}
+		name := inferenceWarmModelName(model.Name)
+		if name == "" {
+			return "", nil, fmt.Errorf("preload[%d]: name is required", i)
+		}
+		// Artifact selections are encoded in the CLI model reference, not in
+		// separate flags. Generated entries already include these suffixes.
+		if model.Format != "" || model.Quantization != "" {
+			format, quantization, selected := inferenceArtifactSelection(name)
+			if selected {
+				if (model.Format != "" && model.Format != format) ||
+					(model.Quantization != "" && model.Quantization != quantization) {
+					return "", nil, fmt.Errorf("preload[%d]: artifact selection conflicts with name", i)
+				}
+			} else {
+				if strings.Contains(name, ":") || model.Format == "" {
+					return "", nil, fmt.Errorf("preload[%d]: artifact selection requires an unqualified name and format", i)
+				}
+				name += ":" + model.Format
+				if model.Quantization != "" {
+					name += ":" + model.Quantization
+				}
+			}
+		}
+		value := model.Kind + ":"
+		if model.Backend != "" {
+			value += model.Backend + ":"
+		}
+		args = append(args, "--preload-model", value+name)
+	}
+	return config.ModelsDir, args, nil
+}
+
 func inferenceKeepAliveMillis(pool *antflyaiv1alpha1.InferencePool) (uint64, error) {
 	if pool.Spec.Models.KeepAlive == nil {
 		return defaultInferenceKeepAliveMillis, nil
@@ -474,6 +549,18 @@ func inferenceArtifactSelection(modelRef string) (format, quantization string, o
 }
 
 func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool *antflyaiv1alpha1.InferencePool) error {
+	// The standalone inference CLI reads admission settings from --config, but
+	// model discovery and warming are CLI-only in v0.2.1. Use the same merged
+	// configuration for the pullers, volume mounts, and server arguments.
+	configJSON, err := r.generateCompleteConfig(pool)
+	if err != nil {
+		return err
+	}
+	modelsDir, modelArgs, err := inferenceModelArgs(configJSON)
+	if err != nil {
+		return err
+	}
+
 	var activationLease *coordinationv1.Lease
 	if pool.Spec.ScaleToZero != nil && pool.Spec.ScaleToZero.Enabled {
 		activationLease = &coordinationv1.Lease{}
@@ -513,7 +600,7 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 		})
 	}
 	for i, model := range preloadModels {
-		args := []string{"inference", "pull", model.Name, "--models-dir", "/models"}
+		args := []string{"inference", "pull", model.Name, "--models-dir", modelsDir}
 		if len(model.Tasks) > 0 {
 			args = append(args, "--tasks", strings.Join(model.Tasks, ","))
 		}
@@ -526,7 +613,7 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 			Command: []string{"/antfly"},
 			Args:    args,
 			VolumeMounts: []corev1.VolumeMount{
-				{Name: "models", MountPath: "/models"},
+				{Name: "models", MountPath: modelsDir},
 			},
 			EnvFrom: []corev1.EnvFromSource{
 				{ConfigMapRef: &corev1.ConfigMapEnvSource{
@@ -543,9 +630,10 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 		"--config", "/config/config.json",
 		"--allow-insecure-public-bind",
 	}
+	inferenceArgs = append(inferenceArgs, modelArgs...)
 
 	inferenceVolumeMounts := []corev1.VolumeMount{
-		{Name: "models", MountPath: "/models"},
+		{Name: "models", MountPath: modelsDir},
 		{Name: "config", MountPath: "/config", ReadOnly: true},
 	}
 	volumes := []corev1.Volume{
