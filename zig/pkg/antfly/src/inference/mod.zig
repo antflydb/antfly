@@ -39,6 +39,7 @@ pub const SparseEmbedResult = types.SparseEmbedResult;
 pub const GenerateResult = types.GenerateResult;
 pub const RerankResult = types.RerankResult;
 pub const ChatMessage = types.ChatMessage;
+pub const GenerationOptions = types.GenerationOptions;
 pub const Role = types.Role;
 pub const ContentPart = types.ContentPart;
 pub const RequestContext = request_context.RequestContext;
@@ -56,6 +57,7 @@ test "inference module compiles" {
 }
 
 test "bedrock provider request helpers" {
+    try managed_embedder.testBedrockCredentialTrafficBypassesModelQuota();
     try bedrock.testBedrockSigningClockUsesUnixWallTime();
     try bedrock.testBedrockSigningDatesUseCalendarMonthNumbers();
     try bedrock.testTitanMultimodalBodyOmitsEmptyInputText();
@@ -79,8 +81,11 @@ test "bedrock provider request helpers" {
 }
 
 test "embedding provider request helpers" {
+    try @import("../common/provider_limits.zig").testProviderQuotas();
     try vertex.testEmbeddingStatusMapping();
     try vertex.testGeminiEmbeddingBatchesOneInputPerRequest();
+    try managed_embedder.testLocalForegroundEmbeddingAdmissionCapabilities();
+    try managed_embedder.testManagedEmbeddingRequestContextProgress();
     try google_auth.testCredentialSourceCacheKeys();
     try credential_source_identity.testCredentialSourceIdentities();
     try managed_embedder.testManagedEmbeddingCredentialSourceIdentities();

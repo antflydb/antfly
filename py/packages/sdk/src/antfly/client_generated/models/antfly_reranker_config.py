@@ -21,6 +21,8 @@ class AntflyRerankerConfig:
 
     Attributes:
         provider (AntflyRerankerConfigProvider):
+        api_key (str | Unset): Optional bearer API key for remote Antfly inference. Supports secret references and
+            defaults to ANTFLY_INFERENCE_API_KEY. Embedded inference does not resolve or use outbound credentials.
         model (str | Unset): Optional reranking model name. When omitted, Antfly inference selects a model from its
             reranker model directory. Set this explicitly when more than one local reranker is installed.
         url (str | Unset): The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment
@@ -28,12 +30,15 @@ class AntflyRerankerConfig:
     """
 
     provider: AntflyRerankerConfigProvider
+    api_key: str | Unset = UNSET
     model: str | Unset = UNSET
     url: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         provider = self.provider.value
+
+        api_key = self.api_key
 
         model = self.model
 
@@ -46,6 +51,8 @@ class AntflyRerankerConfig:
                 "provider": provider,
             }
         )
+        if api_key is not UNSET:
+            field_dict["api_key"] = api_key
         if model is not UNSET:
             field_dict["model"] = model
         if url is not UNSET:
@@ -58,12 +65,15 @@ class AntflyRerankerConfig:
         d = dict(src_dict)
         provider = AntflyRerankerConfigProvider(d.pop("provider"))
 
+        api_key = d.pop("api_key", UNSET)
+
         model = d.pop("model", UNSET)
 
         url = d.pop("url", UNSET)
 
         antfly_reranker_config = cls(
             provider=provider,
+            api_key=api_key,
             model=model,
             url=url,
         )

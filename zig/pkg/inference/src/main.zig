@@ -267,6 +267,9 @@ fn preloadModelsFromConfig(allocator: std.mem.Allocator, values: []const RunConf
 }
 
 pub fn main(init: std.process.Init) !void {
+    var worker_lifetime = platform.inference_process_supervisor.WorkerLifetime{};
+    defer worker_lifetime.deinit(init.io);
+    if (try platform.inference_process_supervisor.runIfNeeded(init, 1, &worker_lifetime)) return;
     const allocator = platform.allocator.processAllocator(std.heap.smp_allocator);
 
     var args_iter = std.process.Args.Iterator.init(init.minimal.args);
@@ -385,7 +388,7 @@ const run_usage_options =
     \\  --kernel-jit-mode <mode>             off, shadow, on, or required
     \\  --preload-model <spec>               Warm a model at startup; repeatable
     \\  --allow-insecure-public-bind         Permit a non-loopback listener without built-in auth/TLS
-    \\  --allow-unknown-models               Allow models absent from the registry
+    \\  --allow-unknown-models               Accepted for compatibility; unknown architectures are attempted by default
     \\  -h, --help                           Show this help and exit
     \\
 ;
@@ -463,7 +466,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var budget_overrides_mib = inference.runtime.tier.memory.BudgetOverridesMib{};
     var kernel_jit_mode_override: ?inference.graph.kernel_jit.Mode = null;
     var allow_insecure_public_bind = false;
-    var allow_unknown_models = false;
+    var allow_unknown_models = true;
     var models_overridden = false;
     var ml_overridden = false;
     var preload_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
@@ -591,6 +594,11 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
             .automatic,
         .allow_insecure_public_bind = allow_insecure_public_bind,
         .allow_unknown_models = allow_unknown_models,
+        // Only the replaceable worker advertises process termination. The
+        // stable parent owns restart after a hard cancellation boundary fires.
+        .process_termination_available = platform.env.getenvBool(
+            platform.inference_process_supervisor.worker_env,
+        ),
     };
     if (loaded_cfg) |parsed| {
         const cfg = parsed.value;
@@ -631,7 +639,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
 
     var node = try inference.server.Node.init(allocator, node_cfg);
     defer node.deinit();
-    node.attachIo(io);
+    try node.attachIo(io);
 
     try node.warmConfiguredModelsBeforeServing(allocator);
     node.configureForcedRunAdmissionDenialsFromEnvironmentForTesting();
@@ -816,7 +824,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  --scratch-budget-mb <n> Process-wide inference scratch-memory admission override (MiB)
         \\  --kernel-jit-mode <off|shadow|on|required> JIT startup-preloaded Metal/CUDA models
         \\  --preload-model <kind:name|kind:backend:name> Preload and warm a configured model before serving
-        \\  --allow-unknown-models Permit artifacts whose compatibility cannot be proven; known incompatible models remain blocked
+        \\  --allow-unknown-models Accepted for compatibility; unknown architectures are attempted by default
         \\
         \\Pull options:
         \\  --token <token>   HuggingFace API token (or set HF_TOKEN env var)

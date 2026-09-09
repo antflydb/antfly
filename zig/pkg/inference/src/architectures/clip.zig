@@ -537,6 +537,7 @@ test "native clip vision patch weight direct path matches explicit 2d reshape" {
         weight_store.lazy_weights.deinit(allocator);
     }
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
 
     const batch = 2;

@@ -13,7 +13,8 @@
 // limitations under the License.
 
 const std = @import("std");
-const builtin = @import("builtin");
+const Crc32 = @import("antfly_hash").Crc32;
+const Adler32 = @import("antfly_hash").Adler32;
 const test_support = @import("test_support.zig");
 
 const Allocator = std.mem.Allocator;
@@ -60,27 +61,35 @@ pub fn encodeRgbaWithCancellation(alloc: Allocator, width: u32, height: u32, rgb
     var compressed = try std.Io.Writer.Allocating.initCapacity(alloc, 16 * 1024);
     defer compressed.deinit();
     {
+        try compressed.writer.writeAll(std.compress.flate.Container.zlib.header());
+        var adler = Adler32.init();
         var history: [std.compress.flate.max_window_len]u8 = undefined;
         var compressor = try std.compress.flate.Compress.init(
             &compressed.writer,
             history[0..],
-            .zlib,
+            .raw,
             .default,
         );
         for (0..height) |row| {
             try compressor.writer.writeByte(0);
+            adler.update(&.{0});
             const offset = row * row_bytes;
             const row_data = rgba[offset..][0..row_bytes];
             var chunk_offset: usize = 0;
             while (chunk_offset < row_data.len) {
                 try cancellation.check();
                 const chunk_end = chunk_offset + @min(row_data.len - chunk_offset, cancellation_work_bytes);
-                try compressor.writer.writeAll(row_data[chunk_offset..chunk_end]);
+                const chunk = row_data[chunk_offset..chunk_end];
+                try compressor.writer.writeAll(chunk);
+                adler.update(chunk);
                 chunk_offset = chunk_end;
             }
         }
         try cancellation.check();
         try compressor.finish();
+        var trailer: [4]u8 = undefined;
+        std.mem.writeInt(u32, &trailer, adler.final(), .big);
+        try compressed.writer.writeAll(&trailer);
     }
     try cancellation.check();
     const zlib = compressed.writer.buffered();
@@ -110,18 +119,19 @@ pub fn encodeRgbaWithCancellation(alloc: Allocator, width: u32, height: u32, rgb
     const idat_type_start = cursor;
     @memcpy(out[cursor .. cursor + 4], "IDAT");
     cursor += 4;
-    var idat_crc = crc32FastUpdate(crc32FastInit(), out[idat_type_start..cursor]);
+    var idat_crc = Crc32.init();
+    idat_crc.update(out[idat_type_start..cursor]);
     var zlib_offset: usize = 0;
     while (zlib_offset < zlib.len) {
         try cancellation.check();
         const chunk_end = zlib_offset + @min(zlib.len - zlib_offset, cancellation_work_bytes);
         const chunk = zlib[zlib_offset..chunk_end];
         @memcpy(out[cursor .. cursor + chunk.len], chunk);
-        idat_crc = crc32FastUpdate(idat_crc, chunk);
+        idat_crc.update(chunk);
         cursor += chunk.len;
         zlib_offset = chunk_end;
     }
-    writeU32be(out[cursor .. cursor + 4], crc32FastFinal(idat_crc));
+    writeU32be(out[cursor .. cursor + 4], idat_crc.final());
     cursor += 4;
 
     try cancellation.check();
@@ -153,180 +163,10 @@ fn writeU32be(dest: []u8, value: u32) void {
 }
 
 fn chunkCrc(name: []const u8, data: []const u8) u32 {
-    var crc = crc32FastInit();
-    crc = crc32FastUpdate(crc, name);
-    crc = crc32FastUpdate(crc, data);
-    return crc32FastFinal(crc);
-}
-
-fn crc32Fast(bytes: []const u8) u32 {
-    return crc32FastFinal(crc32FastUpdate(crc32FastInit(), bytes));
-}
-
-fn crc32FastInit() u32 {
-    return 0xffffffff;
-}
-
-fn crc32FastFinal(crc: u32) u32 {
-    return crc ^ 0xffffffff;
-}
-
-fn crc32FastUpdate(initial_crc: u32, bytes: []const u8) u32 {
-    if (comptime builtin.cpu.arch == .aarch64 and std.Target.aarch64.featureSetHas(builtin.cpu.features, .crc)) {
-        return crc32Arm64Update(initial_crc, bytes);
-    }
-
-    const tables = comptime crc32SlicingTables();
-    var crc = initial_crc;
-    var index: usize = 0;
-
-    while (index + 8 <= bytes.len) : (index += 8) {
-        crc ^= readU32le(bytes[index .. index + 4]);
-        const next = readU32le(bytes[index + 4 .. index + 8]);
-        crc =
-            tables[7][@as(u8, @truncate(crc))] ^
-            tables[6][@as(u8, @truncate(crc >> 8))] ^
-            tables[5][@as(u8, @truncate(crc >> 16))] ^
-            tables[4][@as(u8, @truncate(crc >> 24))] ^
-            tables[3][@as(u8, @truncate(next))] ^
-            tables[2][@as(u8, @truncate(next >> 8))] ^
-            tables[1][@as(u8, @truncate(next >> 16))] ^
-            tables[0][@as(u8, @truncate(next >> 24))];
-    }
-
-    while (index < bytes.len) : (index += 1) {
-        crc = tables[0][@as(u8, @truncate(crc ^ bytes[index]))] ^ (crc >> 8);
-    }
-    return crc;
-}
-
-fn crc32SlicingTables() [8][256]u32 {
-    @setEvalBranchQuota(30000);
-    const polynomial: u32 = 0xedb88320;
-    var tables: [8][256]u32 = undefined;
-    for (0..256) |i| {
-        var crc: u32 = @intCast(i);
-        for (0..8) |_| {
-            crc = if ((crc & 1) != 0) (crc >> 1) ^ polynomial else crc >> 1;
-        }
-        tables[0][i] = crc;
-    }
-    for (1..8) |table_index| {
-        for (0..256) |i| {
-            const previous = tables[table_index - 1][i];
-            tables[table_index][i] = (previous >> 8) ^ tables[0][@as(u8, @truncate(previous))];
-        }
-    }
-    return tables;
-}
-
-fn readU32le(bytes: []const u8) u32 {
-    return @as(u32, bytes[0]) |
-        (@as(u32, bytes[1]) << 8) |
-        (@as(u32, bytes[2]) << 16) |
-        (@as(u32, bytes[3]) << 24);
-}
-
-fn readU16le(bytes: []const u8) u16 {
-    return @as(u16, bytes[0]) |
-        (@as(u16, bytes[1]) << 8);
-}
-
-fn readU64le(bytes: []const u8) u64 {
-    return @as(u64, bytes[0]) |
-        (@as(u64, bytes[1]) << 8) |
-        (@as(u64, bytes[2]) << 16) |
-        (@as(u64, bytes[3]) << 24) |
-        (@as(u64, bytes[4]) << 32) |
-        (@as(u64, bytes[5]) << 40) |
-        (@as(u64, bytes[6]) << 48) |
-        (@as(u64, bytes[7]) << 56);
-}
-
-fn crc32Arm64Update(initial_crc: u32, bytes: []const u8) u32 {
-    var crc = initial_crc;
-    var index: usize = 0;
-    while (index + 8 <= bytes.len) : (index += 8) {
-        crc = crc32Arm64U64(crc, readU64le(bytes[index .. index + 8]));
-    }
-    if (index + 4 <= bytes.len) {
-        crc = crc32Arm64U32(crc, readU32le(bytes[index .. index + 4]));
-        index += 4;
-    }
-    if (index + 2 <= bytes.len) {
-        crc = crc32Arm64U16(crc, readU16le(bytes[index .. index + 2]));
-        index += 2;
-    }
-    if (index < bytes.len) {
-        crc = crc32Arm64U8(crc, bytes[index]);
-    }
-    return crc;
-}
-
-fn crc32Arm64U64(crc: u32, value: u64) u32 {
-    return asm ("crc32x %[out:w], %[crc:w], %[value]"
-        : [out] "=r" (-> u32),
-        : [crc] "r" (crc),
-          [value] "r" (value),
-    );
-}
-
-fn crc32Arm64U32(crc: u32, value: u32) u32 {
-    return asm ("crc32w %[out:w], %[crc:w], %[value:w]"
-        : [out] "=r" (-> u32),
-        : [crc] "r" (crc),
-          [value] "r" (value),
-    );
-}
-
-fn crc32Arm64U16(crc: u32, value: u16) u32 {
-    return asm ("crc32h %[out:w], %[crc:w], %[value:w]"
-        : [out] "=r" (-> u32),
-        : [crc] "r" (crc),
-          [value] "r" (value),
-    );
-}
-
-fn crc32Arm64U8(crc: u32, value: u8) u32 {
-    return asm ("crc32b %[out:w], %[crc:w], %[value:w]"
-        : [out] "=r" (-> u32),
-        : [crc] "r" (crc),
-          [value] "r" (value),
-    );
-}
-
-fn adler32FastInit() u32 {
-    return 1;
-}
-
-fn adler32FastUpdate(state: u32, bytes: []const u8) u32 {
-    const base = 65521;
-    const nmax = 5552;
-    const weights: @Vector(16, u32) = .{ 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1 };
-
-    var s1 = state & 0xffff;
-    var s2 = state >> 16;
-    var index: usize = 0;
-
-    while (index < bytes.len) {
-        const end = @min(index + nmax, bytes.len);
-        while (index + 16 <= end) : (index += 16) {
-            const byte_vec: @Vector(16, u8) = bytes[index..][0..16].*;
-            const lanes: @Vector(16, u32) = @intCast(byte_vec);
-            const sum = @reduce(.Add, lanes);
-            const weighted_sum = @reduce(.Add, lanes * weights);
-            s2 += 16 * s1 + weighted_sum;
-            s1 += sum;
-        }
-        while (index < end) : (index += 1) {
-            s1 += bytes[index];
-            s2 += s1;
-        }
-        s1 %= base;
-        s2 %= base;
-    }
-
-    return s1 | (s2 << 16);
+    var crc = Crc32.init();
+    crc.update(name);
+    crc.update(data);
+    return crc.final();
 }
 
 pub fn decodeRgba(alloc: Allocator, png_bytes: []const u8) !DecodedImage {
@@ -901,27 +741,59 @@ test "encode rgba compresses repetitive pages" {
     try std.testing.expectEqualSlices(u8, rgba, decoded.rgba);
 }
 
+test "PNG shared Adler32 preserves the standard zlib container bytes" {
+    const alloc = std.testing.allocator;
+    const width = 16385; // Each row crosses the cancellation/chunk boundary.
+    const height = 2;
+    const rgba = try alloc.alloc(u8, width * height * 4);
+    defer alloc.free(rgba);
+    var random = std.Random.DefaultPrng.init(0xad1e32);
+    random.random().bytes(rgba);
+    const encoded = try encodeRgba(alloc, width, height, rgba);
+    defer alloc.free(encoded);
+
+    var reference = try std.Io.Writer.Allocating.initCapacity(alloc, 16 * 1024);
+    defer reference.deinit();
+    var history: [std.compress.flate.max_window_len]u8 = undefined;
+    var compressor = try std.compress.flate.Compress.init(&reference.writer, &history, .zlib, .default);
+    for (0..height) |row| {
+        try compressor.writer.writeByte(0);
+        const pixels = rgba[row * width * 4 ..][0 .. width * 4];
+        var offset: usize = 0;
+        while (offset < pixels.len) {
+            const end = offset + @min(pixels.len - offset, cancellation_work_bytes);
+            try compressor.writer.writeAll(pixels[offset..end]);
+            offset = end;
+        }
+    }
+    try compressor.finish();
+    const idat_offset = 8 + chunkTotalLen(13);
+    const idat_len = std.mem.readInt(u32, encoded[idat_offset..][0..4], .big);
+    try std.testing.expectEqualStrings("IDAT", encoded[idat_offset + 4 ..][0..4]);
+    try std.testing.expectEqualSlices(u8, reference.writer.buffered(), encoded[idat_offset + 8 ..][0..idat_len]);
+}
+
 test "png crc32 fast path matches std crc32" {
     const bytes = "IHDRabcdefghijklmnopqrstuvwxyz0123456789";
-    try std.testing.expectEqual(std.hash.Crc32.hash(bytes), crc32Fast(bytes));
-    var crc = crc32FastInit();
-    crc = crc32FastUpdate(crc, bytes[0..4]);
-    crc = crc32FastUpdate(crc, bytes[4..]);
-    try std.testing.expectEqual(std.hash.Crc32.hash(bytes), crc32FastFinal(crc));
+    try std.testing.expectEqual(std.hash.Crc32.hash(bytes), Crc32.hash(bytes));
+    var crc = Crc32.init();
+    crc.update(bytes[0..4]);
+    crc.update(bytes[4..]);
+    try std.testing.expectEqual(std.hash.Crc32.hash(bytes), crc.final());
 }
 
 test "png adler32 fast path matches std adler32" {
     const bytes = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789";
-    try std.testing.expectEqual(std.hash.Adler32.hash(bytes), adler32FastUpdate(adler32FastInit(), bytes));
+    try std.testing.expectEqual(std.hash.Adler32.hash(bytes), Adler32.hash(bytes));
 
-    var chunked = adler32FastInit();
-    chunked = adler32FastUpdate(chunked, bytes[0..7]);
-    chunked = adler32FastUpdate(chunked, bytes[7..31]);
-    chunked = adler32FastUpdate(chunked, bytes[31..]);
-    try std.testing.expectEqual(std.hash.Adler32.hash(bytes), chunked);
+    var chunked = Adler32.init();
+    chunked.update(bytes[0..7]);
+    chunked.update(bytes[7..31]);
+    chunked.update(bytes[31..]);
+    try std.testing.expectEqual(std.hash.Adler32.hash(bytes), chunked.final());
 
     const long = [_]u8{0xf3} ** 7000;
-    try std.testing.expectEqual(std.hash.Adler32.hash(&long), adler32FastUpdate(adler32FastInit(), &long));
+    try std.testing.expectEqual(std.hash.Adler32.hash(&long), Adler32.hash(&long));
 }
 
 test "decode rgba matches manifest-backed red fixture" {

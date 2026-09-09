@@ -13,6 +13,9 @@ Matryoshka truncation to 32-1024 dims).
   (including the single tokenizer-appended trailing EOS `151643`), applied
   instruction per case, and embeddings at dims 1024/256/32 (reduced dims are
   truncate-then-renormalize of the 1024 vector).
+- `qualify_qwen3_embedding_common.py` — implements the backend-neutral request
+  and numerical gates used by the thin Metal and CUDA qualification entry
+  points.
 - `qualify_qwen3_embedding_metal.py` — replays the oracle cases against a
   running Antfly server's `/ai/v1/embeddings` endpoint and gates cosine
   parity per precision tier, batch-vs-single equivalence, `dimensions`
@@ -62,10 +65,11 @@ antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:f16-bundle-v1   # GGUF F
 antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B:bf16-safetensors-bundle-v1  # safetensors
 ```
 
-The Q8_0 bundle is qualified on Metal, CUDA, and native CPU. The F16 GGUF is
-admitted on Metal, while the BF16 safetensors bundle is admitted on Metal and
-CUDA; each variant still requires its exact managed receipt and live artifact
-hashes.
+These pinned references reproduce the qualification fixtures. Normal pulls can
+use `Qwen/Qwen3-Embedding-0.6B-GGUF` or
+`Qwen/Qwen3-Embedding-0.6B:safetensors`. Serving validates the artifact and
+backend contract, without requiring a catalog identity or qualification receipt.
+See [model compatibility](../../MODEL_COMPATIBILITY.md).
 
 Then run the gate against the running server:
 
@@ -98,10 +102,13 @@ After the server reports `selected backend cuda` and `listening`, run:
 ```bash
 python3 qualify_qwen3_embedding_cuda.py \
   --oracle /tmp/qwen3_embedding_oracle.json \
-  --model MODEL_ID \
-  --tier q8_0
-# Use --tier bf16 for the safetensors bundle.
+  --base-url http://127.0.0.1:8080 \
+  --model MODEL_ID
 ```
+
+`MODEL_ID` must be a promoted Q8_0 or BF16 CUDA reference (or its friendly
+alias). The qualifier derives the numerical tier from that reference instead
+of accepting a separately supplied label.
 
 For CUDA throughput measurements, run the pretokenized E2E benchmark (model
 loading and tokenization remain outside the timed region):

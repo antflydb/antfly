@@ -5,6 +5,9 @@ from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 
+from ..models.enrichment_runtime_status_active_phase import EnrichmentRuntimeStatusActivePhase
+from ..models.enrichment_runtime_status_stall_reason import EnrichmentRuntimeStatusStallReason
+
 T = TypeVar("T", bound="EnrichmentRuntimeStatus")
 
 
@@ -34,8 +37,17 @@ class EnrichmentRuntimeStatus:
         retrying (bool):
         worker_failed (bool):
         worker_started (bool): Whether the background enrichment worker is currently running.
-        stalled (bool): Whether work is pending with no running worker, retry, or terminal failure explaining the
-            backlog.
+        stalled (bool): Whether pending work has no worker or has exceeded its execution/progress deadline.
+        stall_reason (EnrichmentRuntimeStatusStallReason):
+        active_phase (EnrichmentRuntimeStatusActivePhase):
+        active_model (str):
+        active_backend (str):
+        active_deadline_ms (int): Display-only Unix deadline in milliseconds; timeout decisions use a monotonic clock.
+        last_progress_ms (int):
+        active_progress_completed (int):
+        active_progress_total (int):
+        inference_timeout_count (int):
+        inference_cancel_count (int):
         skip_by_hash_count (int):
         skipped_source_count (int):
         codec_decode_failures (int):
@@ -76,6 +88,16 @@ class EnrichmentRuntimeStatus:
     worker_failed: bool
     worker_started: bool
     stalled: bool
+    stall_reason: EnrichmentRuntimeStatusStallReason
+    active_phase: EnrichmentRuntimeStatusActivePhase
+    active_model: str
+    active_backend: str
+    active_deadline_ms: int
+    last_progress_ms: int
+    active_progress_completed: int
+    active_progress_total: int
+    inference_timeout_count: int
+    inference_cancel_count: int
     skip_by_hash_count: int
     skipped_source_count: int
     codec_decode_failures: int
@@ -135,6 +157,26 @@ class EnrichmentRuntimeStatus:
 
         stalled = self.stalled
 
+        stall_reason = self.stall_reason.value
+
+        active_phase = self.active_phase.value
+
+        active_model = self.active_model
+
+        active_backend = self.active_backend
+
+        active_deadline_ms = self.active_deadline_ms
+
+        last_progress_ms = self.last_progress_ms
+
+        active_progress_completed = self.active_progress_completed
+
+        active_progress_total = self.active_progress_total
+
+        inference_timeout_count = self.inference_timeout_count
+
+        inference_cancel_count = self.inference_cancel_count
+
         skip_by_hash_count = self.skip_by_hash_count
 
         skipped_source_count = self.skipped_source_count
@@ -193,6 +235,16 @@ class EnrichmentRuntimeStatus:
                 "worker_failed": worker_failed,
                 "worker_started": worker_started,
                 "stalled": stalled,
+                "stall_reason": stall_reason,
+                "active_phase": active_phase,
+                "active_model": active_model,
+                "active_backend": active_backend,
+                "active_deadline_ms": active_deadline_ms,
+                "last_progress_ms": last_progress_ms,
+                "active_progress_completed": active_progress_completed,
+                "active_progress_total": active_progress_total,
+                "inference_timeout_count": inference_timeout_count,
+                "inference_cancel_count": inference_cancel_count,
                 "skip_by_hash_count": skip_by_hash_count,
                 "skipped_source_count": skipped_source_count,
                 "codec_decode_failures": codec_decode_failures,
@@ -258,6 +310,26 @@ class EnrichmentRuntimeStatus:
 
         stalled = d.pop("stalled")
 
+        stall_reason = EnrichmentRuntimeStatusStallReason(d.pop("stall_reason"))
+
+        active_phase = EnrichmentRuntimeStatusActivePhase(d.pop("active_phase"))
+
+        active_model = d.pop("active_model")
+
+        active_backend = d.pop("active_backend")
+
+        active_deadline_ms = d.pop("active_deadline_ms")
+
+        last_progress_ms = d.pop("last_progress_ms")
+
+        active_progress_completed = d.pop("active_progress_completed")
+
+        active_progress_total = d.pop("active_progress_total")
+
+        inference_timeout_count = d.pop("inference_timeout_count")
+
+        inference_cancel_count = d.pop("inference_cancel_count")
+
         skip_by_hash_count = d.pop("skip_by_hash_count")
 
         skipped_source_count = d.pop("skipped_source_count")
@@ -313,6 +385,16 @@ class EnrichmentRuntimeStatus:
             worker_failed=worker_failed,
             worker_started=worker_started,
             stalled=stalled,
+            stall_reason=stall_reason,
+            active_phase=active_phase,
+            active_model=active_model,
+            active_backend=active_backend,
+            active_deadline_ms=active_deadline_ms,
+            last_progress_ms=last_progress_ms,
+            active_progress_completed=active_progress_completed,
+            active_progress_total=active_progress_total,
+            inference_timeout_count=inference_timeout_count,
+            inference_cancel_count=inference_cancel_count,
             skip_by_hash_count=skip_by_hash_count,
             skipped_source_count=skipped_source_count,
             codec_decode_failures=codec_decode_failures,

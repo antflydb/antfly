@@ -693,6 +693,7 @@ pub const NativeEvalSession = struct {
             self.allocator.destroy(graph);
         }
         self.full_task_graphs.deinit(self.allocator);
+        self.native_backend.deinit();
         self.adapter_reader.deinit();
         self.tokenizer.deinit(self.allocator);
         deinitNativeWeightStore(self.allocator, &self.weight_store, &self.owned_weight_names);
@@ -1661,6 +1662,7 @@ fn evalSavedAdapter(allocator: std.mem.Allocator, owned_opts: OwnedOptions) !Eva
         .auto => {},
     };
     defer switch (selected_backend) {
+        .native => native_backend.deinit(),
         .metal => if (comptime build_options.enable_metal) metal_backend.deinit(),
         else => {},
     };

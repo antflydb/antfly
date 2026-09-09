@@ -387,7 +387,7 @@ JPEG 2000 production-blocker status, April 2026:
   built from a normal encoded codestream by moving packet-header bytes out of
   SOD and updating `Psot`.
 - The external `openjpeg-data` ISO corpus is populated at
-  `/tmp/openjpeg-data` via `zig build lib-image-conformance-fetch` and is part
+  `/tmp/openjpeg-data` via `zig build lib-image-conformance` and is part
   of this investigation.
 - The ISO harness now compares high-bit-depth fixtures through
   `decodeU16Bytes`, so 12-bit samples are checked against the PGX references at

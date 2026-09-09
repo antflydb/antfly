@@ -422,8 +422,32 @@ admits the map and source leases against the resident ANN snapshot before map
 allocation. Rejected setup releases its temporary snapshots and retries later;
 backing allocation and I/O failures still propagate. Its regression verifies
 repeated deferral without retained memory, reclamation after pressure clears,
-old readers and repeated reopen. Fresh qualification of this follow-up is
-pending. Earlier failed arms remain excluded and no defaults are promoted.
+old readers and repeated reopen. Validation passes 42 source checks in each
+configuration, 33 native checks, 256 publication allocation-failure positions,
+and both five-case public API suites, with no test leaks. Fresh sequential 50K
+and 1M ABBA passes all eight workloads and reclamation checks and all four
+independent candidate inventories. No OOM/poison/retry error invalidates an arm.
+The memory limits are unchanged; earlier failed arms and diagnostic timings
+remain excluded.
+
+The optional catalog/eager-inventory/unlocked-scan combination remains a
+performance tradeoff against the fixed locked baseline. At 1M, median paired
+mixed queries improve 9.5%, writes 7.4%, p99 14.5%, and C1 queries 7.8%; those
+directions repeat in both pairs. Readiness is slower in both pairs (+9.8% paired median).
+Mixed RSS falls 3.4%, while physical footprint varies by pair (+1.5% median).
+At 50K, mixed writes fall 11.2% and p99 rises 13.2%, so no defaults are promoted.
+Candidate maximum sampled source heap still reaches 372–374 MiB of the 384 MiB
+slice; the fix provides admission and progress, not elimination of resident
+memory demand. Maximum sampled source WAL is 48.05 MiB in all four 1M arms.
+These periodic samples are not exact peaks. The second 1M control lacks a
+complete churn-stage source-counter interval; its lock/inventory breakdown is
+unavailable, not zero. See the
+[qualified results](../.benchmark-results/vector-source-memory-admission/RESULTS.md).
+Both arms contain the fixes: this is not a pre-fix/post-fix timing comparison,
+a comparison against `primary_lsm`, or qualification of other deployment modes.
+The frozen source/harness/binary hashes verify. Qualification excludes unrelated
+concurrent changes in the live worktree; the final repository-wide and task-file
+diff checks pass.
 
 The completed isolated deferred-inventory 50K ABBA passes all four timed and
 reclamation arms and both independent full inventories, but it is not selected:

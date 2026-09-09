@@ -6,7 +6,7 @@
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 
-//! Strict Qwen3-VL GGUF vision tower and DeepStack projector.
+//! Strict Qwen3-VL vision tower and DeepStack projector.
 //!
 //! The official projector is not a CLIP pooling head: it contains a temporal
 //! split Conv3D patch embed, learned-position interpolation, two-axis vision
@@ -28,7 +28,6 @@ const projector_common = @import("gemma4_projector.zig");
 const qwen3vl_plan = @import("qwen3vl_plan.zig");
 const gpt_arch = @import("gpt.zig");
 const gpt_config = @import("../models/gpt.zig");
-const cuda_compute_mod = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
 
 const ComputeBackend = ops.ComputeBackend;
 const CT = ops.CT;
@@ -351,6 +350,7 @@ const WeightCache = struct {
     }
 
     fn weight(self: *WeightCache, name: []const u8) !CT {
+        try self.cb.checkExecutionControl();
         const key = try std.fmt.allocPrint(self.allocator, "weight:{s}", .{name});
         defer self.allocator.free(key);
         if (self.tensors.get(key)) |tensor| return tensor;
@@ -367,6 +367,7 @@ const WeightCache = struct {
     }
 
     fn linear(self: *WeightCache, name: []const u8, in_dim: usize, out_dim: usize) !CT {
+        try self.cb.checkExecutionControl();
         const key = try std.fmt.allocPrint(self.allocator, "linear:{d}:{d}:{s}", .{ in_dim, out_dim, name });
         defer self.allocator.free(key);
         if (self.tensors.get(key)) |tensor| return tensor;
@@ -408,34 +409,6 @@ const WeightCache = struct {
                         }
                     }
                     if (!shape_matches) storage.deinit();
-                }
-            }
-        }
-        if (comptime build_options.enable_cuda) {
-            if (self.cb.kind() == .cuda) {
-                var tensor_ref = try store.tensorStore().describeTensor(self.allocator, name);
-                defer tensor_ref.deinit(self.allocator);
-                if (tensor_ref.quantized) {
-                    if (try store.tensorStore().loadQuantizedStorageRef(&tensor_ref)) |storage_value| {
-                        var storage = storage_value;
-                        if (storage.shape.len == 2 and
-                            storage.shape[0] == @as(i64, @intCast(out_dim)) and
-                            storage.shape[1] == @as(i64, @intCast(in_dim)))
-                        {
-                            const cache_key = try std.fmt.allocPrint(self.allocator, "qwen3vl.projector:{s}", .{key});
-                            defer self.allocator.free(cache_key);
-                            const shape = [_]i64{ @intCast(out_dim), @intCast(in_dim) };
-                            const tensor = try cuda_compute_mod.CudaCompute.cacheExternalQuantizedStorage(
-                                self.cb,
-                                cache_key,
-                                storage,
-                                &shape,
-                            );
-                            errdefer self.cb.free(tensor);
-                            return self.insert(key, tensor);
-                        }
-                        storage.deinit();
-                    }
                 }
             }
         }
@@ -493,39 +466,6 @@ const WeightCache = struct {
             .gguf => |value| value,
             .resident => unreachable,
         };
-        if (comptime build_options.enable_cuda) {
-            if (self.cb.kind() == .cuda) {
-                var tensor_ref = try store.tensorStore().describeTensor(self.allocator, name);
-                defer tensor_ref.deinit(self.allocator);
-                if (tensor_ref.quantized) {
-                    if (try store.tensorStore().loadQuantizedStorageRef(&tensor_ref)) |storage_value| {
-                        var storage = storage_value;
-                        if (storage.shape.len == 4 and
-                            storage.shape[0] == @as(i64, @intCast(cfg.vision_hidden)) and
-                            storage.shape[1] == 3 and
-                            storage.shape[2] == @as(i64, @intCast(cfg.patch_size)) and
-                            storage.shape[3] == @as(i64, @intCast(cfg.patch_size)))
-                        {
-                            const cache_key = try std.fmt.allocPrint(self.allocator, "qwen3vl.projector:{s}", .{key});
-                            defer self.allocator.free(cache_key);
-                            const shape = [_]i64{
-                                @intCast(cfg.vision_hidden),
-                                @intCast(cfg.patch_size * cfg.patch_size * 3),
-                            };
-                            const tensor = try cuda_compute_mod.CudaCompute.cacheExternalQuantizedStorage(
-                                self.cb,
-                                cache_key,
-                                storage,
-                                &shape,
-                            );
-                            errdefer self.cb.free(tensor);
-                            return self.insert(key, tensor);
-                        }
-                        storage.deinit();
-                    }
-                }
-            }
-        }
         const tensor = try loadPatchWeight(self.cb, store, name, cfg);
         errdefer self.cb.free(tensor);
         return self.insert(key, tensor);
@@ -689,6 +629,7 @@ fn encodeProjectedImagesQualified(
     limits: Limits,
     collect_preprocess_evidence: bool,
 ) !ProjectedImages {
+    try cb.checkExecutionControl();
     var store = try tensor_store_mod.GgufStore.initAbsolute(allocator, projector_path);
     defer store.tensorStore().deinit();
     return encodeProjectedImagesFromStoreQualified(cb, allocator, store, images, limits, collect_preprocess_evidence);
@@ -784,8 +725,10 @@ fn encodeProjectedImagesFromWeightsQualified(
     errdefer preprocess_spatial_patches.deinit(allocator);
 
     for (images) |bytes| {
+        try cb.checkExecutionControl();
         var encoded = try encodeSingleImage(cb, allocator, weights, cfg, bytes, limits, collect_preprocess_evidence);
         defer encoded.deinit(allocator);
+        try cb.checkExecutionControl();
         try embeddings.appendSlice(allocator, encoded.embeddings);
         // Reserve the list slot before duplicating the feature payload so a
         // failed list growth cannot orphan a large per-image allocation.
@@ -973,6 +916,7 @@ fn encodeSingleImage(
     failed_stage = "decode";
     const decoded = try image.decode(allocator, bytes);
     defer decoded.deinit(allocator);
+    try cb.checkExecutionControl();
     const decode_ns = profileLap(profile, &stage_started_at);
     const decoded_pixels = std.math.mul(usize, decoded.width, decoded.height) catch return error.VisionAdmissionExceeded;
     if (decoded_pixels == 0 or decoded_pixels > limits.max_decoded_pixels) return error.VisionAdmissionExceeded;
@@ -1095,6 +1039,9 @@ fn encodeSingleImage(
     var blocks_ns: u64 = 0;
     var deepstack_ns: u64 = 0;
     for (0..cfg.block_count) |layer| {
+        // GGUF-backed projector weights bypass ComputeBackend.getWeight, so
+        // retain explicit bounded checkpoints even when those weights cache.
+        try cb.checkExecutionControl();
         failed_stage = "vision_block";
         failed_layer = layer;
         const block_started_at = if (profile) monotonicNowNs() else 0;
@@ -1127,6 +1074,7 @@ fn encodeSingleImage(
     }
 
     failed_stage = "post_norm";
+    try cb.checkExecutionControl();
     const post_norm = try layerNormNamed(cb, allocator, weights, hidden, "v.post_ln", cfg.vision_hidden, cfg.layer_norm_eps);
     cb.free(hidden);
     hidden = post_norm;
@@ -1933,6 +1881,48 @@ test "Qwen3-VL still-image temporal patch expansion matches Conv3D CTHW order" {
     try std.testing.expectEqualSlices(f32, &.{ 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6 }, actual);
 }
 
+test "Qwen3-VL projector cancellation unwinds live vision intermediates with cached weights" {
+    const native_compute = @import("../ops/native_compute.zig");
+    const allocator = std.testing.allocator;
+    var store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    defer native_compute.deinitPrefetchQueue(&store);
+    var compute = native_compute.NativeCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute.vtable_impl };
+    // The first layer norm really executes. Cancellation at its following
+    // projection must release that intermediate even when weights are cached.
+    var weights = WeightCache.initGguf(allocator, &cb, undefined);
+    defer weights.deinit();
+    _ = try weights.insert("weight:v.blk.0.ln1.weight", try cb.fromFloat32(&.{ 1, 1, 1, 1 }));
+    _ = try weights.insert("weight:v.blk.0.ln1.bias", try cb.fromFloat32(&.{ 0, 0, 0, 0 }));
+    const input = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 1, 4 });
+    defer cb.free(input);
+    const Probe = struct {
+        checks: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.checks >= 3) return error.Cancelled;
+        }
+    };
+    var probe = Probe{};
+    cb.execution_control = .{ .ptr = &probe, .check_fn = Probe.check };
+    try std.testing.expectError(error.Cancelled, encoderBlock(&cb, allocator, &weights, .{
+        .text_hidden = 4,
+        .vision_hidden = 4,
+        .intermediate = 8,
+        .block_count = 1,
+        .head_count = 1,
+        .image_size = 2,
+        .patch_size = 1,
+        .spatial_merge = 2,
+        .layer_norm_eps = 1e-5,
+        .image_mean = .{ 0, 0, 0 },
+        .image_std = .{ 1, 1, 1 },
+    }, input, &.{ 0, 0 }, 1, 0));
+    try std.testing.expectEqual(@as(usize, 3), probe.checks);
+}
+
 test "Qwen3-VL prompt preparation keeps M-RoPE mask and DeepStack aligned" {
     const native_compute = @import("../ops/native_compute.zig");
     const tensor_mod = @import("../backends/tensor.zig");
@@ -1956,7 +1946,7 @@ test "Qwen3-VL prompt preparation keeps M-RoPE mask and DeepStack aligned" {
     errdefer tensor.deinit();
     try store.resident_weights.put(allocator, name, weight_source.LoadedWeight{ .tensor = tensor });
     var compute = native_compute.NativeCompute.init(allocator, &store, null);
-    defer compute.weight_reservations.deinit(allocator);
+    defer compute.deinit();
     var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute.vtable_impl };
     var projected = ProjectedImages{
         .allocator = allocator,

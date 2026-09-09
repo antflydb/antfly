@@ -11,6 +11,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.embedding_retrieval_config import EmbeddingRetrievalConfig
+    from ..models.rate_limit_config import RateLimitConfig
 
 
 T = TypeVar("T", bound="EmbedderConfig")
@@ -197,6 +198,10 @@ class EmbedderConfig:
 
         Attributes:
             provider (EmbedderProvider): The embedding provider to use.
+            rate_limit (RateLimitConfig | Unset): Outbound provider limits shared within one Antfly process by effective
+                endpoint, operation, model, credential source, project and region/location.
+                Conflicting policies for an active scope are rejected. These limits do
+                not coordinate across replicas or infer the provider's account quota.
             multimodal (bool | Unset): Declare that this model supports non-text content (images, audio, video, PDFs),
                 even if the model isn't in Antfly's built-in model registry yet.
 
@@ -232,6 +237,7 @@ class EmbedderConfig:
     """
 
     provider: EmbedderProvider
+    rate_limit: RateLimitConfig | Unset = UNSET
     multimodal: bool | Unset = UNSET
     query_input_type: str | Unset = UNSET
     document_input_type: str | Unset = UNSET
@@ -241,6 +247,10 @@ class EmbedderConfig:
 
     def to_dict(self) -> dict[str, Any]:
         provider = self.provider.value
+
+        rate_limit: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.rate_limit, Unset):
+            rate_limit = self.rate_limit.to_dict()
 
         multimodal = self.multimodal
 
@@ -261,6 +271,8 @@ class EmbedderConfig:
                 "provider": provider,
             }
         )
+        if rate_limit is not UNSET:
+            field_dict["rate_limit"] = rate_limit
         if multimodal is not UNSET:
             field_dict["multimodal"] = multimodal
         if query_input_type is not UNSET:
@@ -277,9 +289,17 @@ class EmbedderConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.embedding_retrieval_config import EmbeddingRetrievalConfig
+        from ..models.rate_limit_config import RateLimitConfig
 
         d = dict(src_dict)
         provider = EmbedderProvider(d.pop("provider"))
+
+        _rate_limit = d.pop("rate_limit", UNSET)
+        rate_limit: RateLimitConfig | Unset
+        if isinstance(_rate_limit, Unset):
+            rate_limit = UNSET
+        else:
+            rate_limit = RateLimitConfig.from_dict(_rate_limit)
 
         multimodal = d.pop("multimodal", UNSET)
 
@@ -298,6 +318,7 @@ class EmbedderConfig:
 
         embedder_config = cls(
             provider=provider,
+            rate_limit=rate_limit,
             multimodal=multimodal,
             query_input_type=query_input_type,
             document_input_type=document_input_type,

@@ -20,7 +20,7 @@ const error_abi = @import("../runtime_error_abi.zig");
 const http_abi = @import("../runtime_http_abi.zig");
 const native_abi = @import("../runtime_native_abi.zig");
 
-pub const abi_version: u32 = 18;
+pub const abi_version: u32 = 20;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -159,6 +159,16 @@ pub const ProviderOperation = enum(c_int) {
     list_models_json = 12,
 };
 
+pub const ProgressView = extern struct {
+    context: ?*anyopaque = null,
+    update_progress: ?*const fn (?*anyopaque, phase: u8, completed: u64, total: u64, model: String, backend: String) callconv(.c) void = null,
+
+    pub fn update(self: ProgressView, phase: u8, completed: u64, total: u64, model: []const u8, backend: []const u8) void {
+        const callback = self.update_progress orelse return;
+        callback(self.context, phase, completed, total, String.init(model), String.init(backend));
+    }
+};
+
 pub const ProviderInvokeContext = extern struct {
     abi_version: u32,
     struct_size: u32 = @sizeOf(@This()),
@@ -172,6 +182,8 @@ pub const ProviderInvokeContext = extern struct {
     /// Appended in ABI v18 so older layouts fail the strict size/version gate
     /// rather than silently losing cooperative cancellation.
     cancellation: http_abi.CancellationView = .{},
+    /// Appended in ABI v19 and extended in v20 with model/backend detail.
+    progress: ProgressView = .{},
 };
 
 pub const RouteManifestEntry = extern struct {

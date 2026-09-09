@@ -526,7 +526,9 @@ fn executeModelForwardViaDefinition(
             else => return err,
         },
         .prefill => |prefill_request| blk: {
+            try prefill_request.check();
             try runtime.reset();
+            try prefill_request.check();
             break :blk runtime.prefill(allocator, prefill_request) catch |err| switch (err) {
                 error.ArtifactShapeMismatch,
                 error.UnsupportedArtifactInputs,

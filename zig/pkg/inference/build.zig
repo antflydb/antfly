@@ -1460,6 +1460,39 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    const bge_m3_runtime_mod = b.createModule(.{
+        .root_source_file = b.path("src/bge_m3_runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    runtime_build.addInferenceRootImports(bge_m3_runtime_mod, .{
+        .build_options_mod = build_options_mod,
+        .json_mod = runtime_graph.json_mod,
+        .httpx_mod = httpx_mod,
+        .inference_api_mod = inference_api_mod,
+        .inference_audio_mod = inference_audio_mod,
+        .inference_chunker_mod = inference_chunker_mod,
+        .jinja_mod = jinja_mod,
+        .inference_tokenizer_mod = inference_tokenizer_mod,
+        .inference_hf_tokenizer_mod = inference_hf_tokenizer_mod,
+        .inference_linalg_mod = inference_linalg_mod,
+        .inference_fixed_tokenizer_data_mod = inference_fixed_tokenizer_data_mod,
+        .jsonschema_mod = antfly_jsonschema_mod,
+        .scraping_mod = antfly_scraping_mod,
+        .image_mod = antfly_image_mod,
+        .ml_mod = ml_mod,
+        .ml_tabular_mod = runtime_graph.ml_tabular_mod,
+        .prometheus_mod = prometheus_mod,
+        .structlog_mod = structlog_mod,
+        .onnx_graph_mod = onnx_graph_mod,
+        .pjrt_mod = pjrt_mod,
+        .platform_mod = platform_mod,
+        .protobuf_mod = protobuf_mod,
+        .inference_client_mod = client_mod,
+    });
+    bge_m3_runtime_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    bge_m3_runtime_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
+    bge_m3_runtime_mod.addImport("antfly_extracting", extracting_mod);
     bge_m3_e2e_bench_exe.root_module.addImport("build_options", build_options_mod);
     bge_m3_e2e_bench_exe.root_module.addImport("ml", ml_mod);
     bge_m3_e2e_bench_exe.root_module.addImport("pjrt", pjrt_mod);
@@ -1469,15 +1502,14 @@ pub fn build(b: *std.Build) void {
     bge_m3_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
     bge_m3_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     bge_m3_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
-    bge_m3_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    // inference_internal already owns the Metal source and frameworks.
-    configureNativeTool(b, bge_m3_e2e_bench_exe, target, enable_system_blas, blas_root, false);
+    bge_m3_e2e_bench_exe.root_module.addImport("bge_m3_runtime", bge_m3_runtime_mod);
+    configureNativeTool(b, bge_m3_e2e_bench_exe, target, enable_system_blas, blas_root, enable_metal);
     configureOnnxRuntime(b, bge_m3_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_bge_m3_e2e_bench = b.addRunArtifact(bge_m3_e2e_bench_exe);
     if (b.args) |args| {
         run_bge_m3_e2e_bench.addArgs(args);
     }
-    const bge_m3_e2e_bench_step = b.step("bench-bge-m3-e2e", "Run pretokenized BGE-M3 encoder E2E benchmarks");
+    const bge_m3_e2e_bench_step = b.step("bench-bge-m3-e2e", "Run node-request and pretokenized BGE-M3 encoder benchmarks");
     bge_m3_e2e_bench_step.dependOn(&run_bge_m3_e2e_bench.step);
 
     const qwen3_embedding_e2e_bench_exe = b.addExecutable(.{
@@ -1651,6 +1683,16 @@ pub fn build(b: *std.Build) void {
     cli_tests.root_module.addImport("antfly_platform", platform_mod);
     cli_tests.root_module.link_libc = link_libc;
 
+    const bge_m3_e2e_bench_tests = b.addTest(.{
+        .root_module = bge_m3_e2e_bench_exe.root_module,
+    });
+    const run_bge_m3_e2e_bench_tests = b.addRunArtifact(bge_m3_e2e_bench_tests);
+    const bge_m3_e2e_bench_test_step = b.step(
+        "test-bge-m3-e2e-benchmark",
+        "Run BGE-M3 benchmark contract tests",
+    );
+    bge_m3_e2e_bench_test_step.dependOn(&run_bge_m3_e2e_bench_tests.step);
+
     const run_cli_tests = b.addRunArtifact(cli_tests);
     for (selected_test_filters) |filter| {
         run_cli_tests.addArgs(&.{ "--test-filter", filter });
@@ -1709,14 +1751,35 @@ pub fn build(b: *std.Build) void {
         quant_kernel_local_check_step.dependOn(&run_quant_kernel_cuda_microbench_tests.step);
     }
     const test_step = b.step("test", "Run unit tests");
+    const cancellation_e2e_step = b.step("test-cancellation-e2e", "Run HTTP inference cancellation and worker recovery E2E tests");
+    if (targetRunsOnBuildHost(b, target) and (target.result.os.tag == .linux or target.result.os.tag == .macos)) {
+        const fixture = b.addExecutable(.{
+            .name = "inference-cancellation-fixture",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("tests/cancellation_fixture.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        fixture.root_module.addImport("inference", runtime_graph.inference_mod);
+        fixture.root_module.addImport("httpx", httpx_mod);
+        fixture.root_module.addImport("antfly_platform", platform_mod);
+        fixture.root_module.link_libc = true;
+        const integration = b.addSystemCommand(&.{"python3"});
+        integration.addFileArg(b.path("tests/test_cancellation_e2e.py"));
+        integration.addArtifactArg(fixture);
+        cancellation_e2e_step.dependOn(&integration.step);
+        if (selected_test_filters.len == 0) test_step.dependOn(cancellation_e2e_step);
+    }
     test_step.dependOn(&quant_kernel_codegen_test_check.step);
     test_step.dependOn(&cuda_artifact_source_policy_check.step);
     test_step.dependOn(&run_quant_kernel_metal_runtime_check_tests.step);
     test_step.dependOn(&run_tests.step);
     // A focused server/library filter need not match an executable-root test.
-    // The default aggregate still owns the complete CLI suite.
+    // The default aggregate still owns the complete executable-root suites.
     if (selected_test_filters.len == 0) {
         test_step.dependOn(&run_cli_tests.step);
+        test_step.dependOn(&run_bge_m3_e2e_bench_tests.step);
     }
     const install_tests = b.addInstallArtifact(tests, .{
         .dest_sub_path = "antfly-inference-tests",
@@ -2253,6 +2316,7 @@ pub fn build(b: *std.Build) void {
     chunker_tests.root_module.addImport("inference_audio", inference_audio_mod);
     chunker_tests.root_module.addImport("inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod);
     chunker_tests.root_module.addImport("antfly_image", antfly_image_mod);
+    chunker_tests.root_module.addImport("antfly_hash", inference_chunker_mod.import_table.get("antfly_hash").?);
     chunker_tests.root_module.link_libc = true;
     const run_chunker_tests = b.addRunArtifact(chunker_tests);
     const chunker_test_step = b.step("test-chunker", "Run chunker tests");
@@ -2330,6 +2394,12 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseSafe,
             .single_threaded = true,
         });
+        const wasm_hash_mod = b.createModule(.{
+            .root_source_file = b.path(b.fmt("{s}/lib/hash/src/mod.zig", .{shared_lib_root})),
+            .target = wasm_target,
+            .optimize = .ReleaseSafe,
+        });
+        wasm_image_mod.addImport("antfly_hash", wasm_hash_mod);
         const wasm_platform_mod = b.dependency("antfly_platform", .{
             .target = wasm_target,
             .optimize = .ReleaseSafe,

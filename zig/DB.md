@@ -1075,8 +1075,10 @@ infer completeness from physical cardinality.
 `antfly index wait --until complete` waits for complete readiness. `antfly
 index wait --until searchable-artifacts=N` waits for at least N published,
 query-admitted result-bearing units for the same incarnation. Embeddings also
-support `--until source-covered=N` or `N%`; percentages count covered sources,
-not skipped outcomes. When a dense publication target is available, that
+support `--until source-covered=N` or `N%`; percentages use
+`covered / (source_total - skipped)`. Pending and failed sources remain in the
+denominator; an all-skipped index does not satisfy a positive coverage target.
+When a dense publication target is available, that
 threshold does not succeed until the matching physical publication is visible.
 
 Ordinary initial materialization is durable build work, not repair debt. It is
@@ -2145,7 +2147,7 @@ Current status:
 - node/subtree split-range metadata is implemented in `hbc_adapter.zig`
 - `splitPlanningStats(...)`, `buildSplitReusePlan(...)`,
   `estimateSplitRebuildWork(...)`, and split-member collection are wired into
-  [pkg/antfly/src/bench/hbc_bench.zig](pkg/antfly/src/bench/hbc_bench.zig)
+  [bench/vectors/hbc_bench.zig](bench/vectors/hbc_bench.zig)
 - synthetic HBC workloads are a warning: `kmeans` produced almost entirely
   mixed subtrees, `hilbert` was only slightly better, and measured full-rebuild
   and mixed-rebuild costs were nearly identical because there were effectively

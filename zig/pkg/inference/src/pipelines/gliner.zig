@@ -90,6 +90,7 @@ pub const GlinerPipeline = struct {
     /// from the same loaded model. Preparation and decoding stay parallel;
     /// only stateful session execution is serialized.
     execution_lock: ?*std.atomic.Mutex = null,
+    execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
 
     fn lockedSessionRun(
         self: *GlinerPipeline,
@@ -97,9 +98,15 @@ pub const GlinerPipeline = struct {
         inputs: []const Tensor,
         alloc: std.mem.Allocator,
     ) ![]Tensor {
-        if (self.execution_lock) |mutex| platform.sync.lockYielding(mutex);
+        if (self.execution_control) |control| try control.update(.executing, 0, 1);
+        if (self.execution_lock) |mutex| {
+            if (self.execution_control) |control|
+                try control.lock(mutex)
+            else
+                platform.sync.lockYielding(mutex);
+        }
         defer if (self.execution_lock) |mutex| mutex.unlock();
-        return permit.run(inputs, alloc);
+        return permit.runWithControl(inputs, alloc, self.execution_control);
     }
 
     pub fn usesDistributedGpuHosted(self: *const GlinerPipeline) bool {

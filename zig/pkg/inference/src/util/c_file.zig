@@ -551,6 +551,28 @@ pub fn prefetchFile(
 }
 
 /// Check if a file exists at the given path.
+/// Fallible counterpart for admission/discovery. Only absence means false.
+pub fn fileExistsChecked(allocator: std.mem.Allocator, path: []const u8) !bool {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    return fileExistsZChecked(path_z);
+}
+
+pub fn fileExistsZChecked(path_z: [:0]const u8) !bool {
+    const fd = openReadOnlyZ(path_z) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return err,
+    };
+    defer closeFd(fd);
+    return true;
+}
+
+pub fn fileExistsInDirChecked(allocator: std.mem.Allocator, dir: []const u8, name: []const u8) !bool {
+    const path = try std.fs.path.join(allocator, &.{ dir, name });
+    defer allocator.free(path);
+    return fileExistsChecked(allocator, path);
+}
+
 pub fn fileExists(allocator: std.mem.Allocator, path: []const u8) bool {
     const path_z = allocator.dupeZ(u8, path) catch return false;
     defer allocator.free(path_z);

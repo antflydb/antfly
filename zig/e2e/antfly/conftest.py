@@ -40,6 +40,7 @@ import hmac
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -72,6 +73,8 @@ CLIPCLAP_GGUF_FILES = (
     "termite_variants.json",
 )
 ALLOW_REAL_MODEL_DOWNLOAD_ENV = "ANTFLY_E2E_ALLOW_REAL_MODEL_DOWNLOAD"
+FAILURE_LOG_TAIL_LIMIT = 20_000
+SERVER_LOG_DIAGNOSTIC_MARKER = "\nserver logs:\n"
 
 # Distributed binaries fail fast without an isolated internal RPC identity.
 # Every subprocess launched by this pytest tree inherits this test-only key;
@@ -137,11 +140,50 @@ def maybe_preserve_tempdir(
     return True
 
 
+_DEFERRED_MODULE_TEMPDIRS = pytest.StashKey[list[tempfile.TemporaryDirectory[str]]]()
+
+
+def defer_module_tempdir_cleanup(
+    module: pytest.Module, tempdir: tempfile.TemporaryDirectory[str]
+) -> None:
+    # Keep ownership until the report for the module's last teardown is ready.
+    module.stash.setdefault(_DEFERRED_MODULE_TEMPDIRS, []).append(tempdir)
+
+
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[object]):
     outcome = yield
     report = outcome.get_result()
     setattr(item, f"rep_{report.when}", report)
+    module = item.getparent(pytest.Module)
+    if report.when != "teardown" or module is None:
+        return
+    pending = module.stash.get(_DEFERRED_MODULE_TEMPDIRS, [])
+    if not pending:
+        return
+    del module.stash[_DEFERRED_MODULE_TEMPDIRS]
+    failed = any(
+        phase_report is not None and phase_report.failed
+        for module_item in item.session.items
+        if module_item.getparent(pytest.Module) is module
+        for phase in ("setup", "call", "teardown")
+        for phase_report in (getattr(module_item, f"rep_{phase}", None),)
+    )
+    for tempdir in pending:
+        if not maybe_preserve_tempdir(tempdir, failed=failed):
+            try:
+                tempdir.cleanup()
+            except OSError as err:
+                # Cleanup now runs after fixture teardown; attach errors to its
+                # report rather than turning them into a pytest internal error.
+                diagnostic = f"E2E directory cleanup failed for {tempdir.name}: {err}"
+                report.longrepr = (
+                    f"{report.longrepr}\n{diagnostic}"
+                    if report.longrepr is not None
+                    else diagnostic
+                )
+                report.outcome = "failed"
+                failed = True
 
 
 def default_antfly_api_root(binary: str) -> str:
@@ -292,16 +334,65 @@ def _cleanup_created_tables(api: Any, table_names: set[str]) -> list[str]:
     cleanup_errors: list[str] = []
     for table_name in reversed(sorted(table_names)):
         try:
-            response = api.s.delete(
-                f"{api.url}/tables/{quote(table_name, safe='')}", timeout=30
-            )
-            if response.status_code not in (200, 202, 204, 404):
-                cleanup_errors.append(
-                    f"{table_name}: HTTP {response.status_code} {response.text[:500]}"
-                )
-        except requests.RequestException as err:
+            _delete_created_table(api, table_name)
+        except (requests.RequestException, RuntimeError) as err:
             cleanup_errors.append(f"{table_name}: {err}")
     return cleanup_errors
+
+
+def _delete_created_table(api: Any, table_name: str) -> None:
+    # DELETE is idempotent: a lost response may mean the table is already gone.
+    # Retry transport failures within one cleanup deadline, but never hide an
+    # exited server or a real HTTP error behind a later successful request.
+    deadline = time.monotonic() + 30
+    for attempt in range(3):
+        raise_if_server_process_exited(api._server)
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise requests.Timeout(
+                    "table cleanup deadline expired before request lock"
+                )
+            if not api._request_lock.acquire(timeout=remaining):
+                raise requests.Timeout(
+                    "table cleanup timed out waiting for request lock"
+                )
+            try:
+                # Lock acquisition may consume the deadline, including when
+                # the waiter is descheduled just as the lock becomes available.
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise requests.Timeout(
+                        "table cleanup deadline expired before DELETE"
+                    )
+                response = api.s.delete(
+                    f"{api.url}/tables/{quote(table_name, safe='')}",
+                    timeout=remaining,
+                )
+            finally:
+                api._request_lock.release()
+        except (requests.ConnectionError, requests.Timeout) as err:
+            raise_if_server_process_exited(api._server)
+            remaining = deadline - time.monotonic()
+            if attempt == 2 or remaining <= 0.1:
+                raise_request_error_with_logs(err, api._server)
+            print(
+                f"retrying table cleanup for {table_name}: {type(err).__name__}: {err}"
+            )
+            time.sleep(0.1)
+            continue
+        except requests.RequestException as err:
+            raise_request_error_with_logs(err, api._server)
+        raise_if_server_process_exited(api._server)
+        if response.status_code not in (200, 202, 204, 404):
+            raise_request_error_with_logs(
+                requests.HTTPError(
+                    f"HTTP {response.status_code} {response.text[:500]}",
+                    response=response,
+                ),
+                api._server,
+            )
+        return
 
 
 def _created_table_from_path(path: str) -> str | None:
@@ -560,26 +651,41 @@ def raise_request_error_with_logs(
     logs = ""
     proc_statuses: list[str] = []
     if server_ref is not None:
-        logs = server_ref.debug_logs().strip()
+        logs = _bounded_failure_log_tail(server_ref.debug_logs().strip())
         for name, proc in _server_processes(server_ref):
             proc_statuses.append(f"{name}: {proc.poll()}")
     if not logs and not proc_statuses:
-        raise err
-    message = f"{err}\nserver logs:\n{logs}"
+        raise err from None
+
+    # Some response decoders historically attached the complete server log
+    # before their request wrapper reached this shared diagnostic boundary.
+    # Normalize such errors so a failure contains one bounded log tail rather
+    # than two full copies rendered again through exception chaining.
+    message = str(err).split(SERVER_LOG_DIAGNOSTIC_MARKER, 1)[0].rstrip()
+    if logs:
+        message += f"{SERVER_LOG_DIAGNOSTIC_MARKER}{logs}"
     if proc_statuses:
         message += "\nserver exit status:\n" + "\n".join(proc_statuses)
-    raise err.__class__(
-        message,
-        request=getattr(err, "request", None),
-        response=getattr(err, "response", None),
-    ) from err
+    err.args = (message, *err.args[1:])
+    raise err from None
+
+
+def _bounded_failure_log_tail(logs: str, *, limit: int = FAILURE_LOG_TAIL_LIMIT) -> str:
+    if len(logs) <= limit:
+        return logs
+    omitted = len(logs) - limit
+    return f"... omitted {omitted} earlier server-log characters ...\n{logs[-limit:]}"
 
 
 def raise_if_server_process_exited(server_ref: Any) -> None:
     statuses = _dead_process_statuses(_server_processes(server_ref))
     if not statuses:
         return
-    logs = server_ref.debug_logs().strip() if server_ref is not None else ""
+    logs = (
+        _bounded_failure_log_tail(server_ref.debug_logs().strip())
+        if server_ref is not None
+        else ""
+    )
     message = "server process exited during request retry"
     if logs:
         message += f"\nserver logs:\n{logs}"
@@ -1124,6 +1230,27 @@ class StatefulAntflyServer:
             self.tempdir.cleanup()
 
 
+def require_standalone_storage_headroom(root: Path) -> None:
+    """Fail before launch when production disk admission cannot run fixtures.
+
+    Match storage/resource_manager.zig's default max(1 GiB, capacity/20)
+    safety floor, plus 256 MiB for the small local fixtures. This is a test
+    environment requirement, not an override of the server's disk guard.
+    """
+    usage = shutil.disk_usage(root)
+    safety_floor = max(1024**3, usage.total // 20)
+    required = safety_floor + 256 * 1024**2
+    if usage.free < required:
+        raise RuntimeError(
+            "Insufficient E2E storage headroom: "
+            f"path={root} available_bytes={usage.free} "
+            f"safety_floor_bytes={safety_floor} required_bytes={required}. "
+            "Repairs, schema rebuilds, and native backups would wait for disk "
+            "admission. Free space or set TMPDIR to a volume with sufficient "
+            "headroom; production disk safeguards have not been disabled."
+        )
+
+
 class StandaloneAntflyServer:
     def __init__(self, binary: str, host: str, port: int):
         self.binary = binary
@@ -1140,6 +1267,7 @@ class StandaloneAntflyServer:
             )
             setup.callback(self.tempdir.cleanup)
             self.root = Path(self.tempdir.name)
+            require_standalone_storage_headroom(self.root)
             self.replica_root = self.root / "replicas"
             self.log_path = self.root / "server.log"
             self.log_file = setup.enter_context(self.log_path.open("w"))
@@ -1217,11 +1345,13 @@ class StandaloneAntflyServer:
     def resume(self) -> None:
         self._start_process(truncate_logs=False)
 
-    def stop(self, *, test_failed: bool = False) -> None:
+    def stop(self, *, test_failed: bool = False, cleanup_root: bool = True) -> None:
         self._stop_process()
         self.port_reservations.close()
         self.log_file.close()
-        if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
+        if cleanup_root and not maybe_preserve_tempdir(
+            self.tempdir, failed=test_failed
+        ):
             self.tempdir.cleanup()
 
 
@@ -2609,22 +2739,9 @@ def stateful_api(request: pytest.FixtureRequest):
         def _check(self, response: requests.Response) -> Any:
             if response.status_code >= 400:
                 body = response.text.strip()
-                logs = ""
-                if self._server is not None:
-                    logs = self._server.debug_logs().strip()
                 if body:
-                    if logs:
-                        raise requests.HTTPError(
-                            f"{response.status_code} {response.reason} for url: {response.url} body={body}\nserver logs:\n{logs}",
-                            response=response,
-                        )
                     raise requests.HTTPError(
                         f"{response.status_code} {response.reason} for url: {response.url} body={body}",
-                        response=response,
-                    )
-                if logs:
-                    raise requests.HTTPError(
-                        f"{response.status_code} {response.reason} for url: {response.url}\nserver logs:\n{logs}",
                         response=response,
                     )
                 response.raise_for_status()
@@ -3271,22 +3388,9 @@ def backup_api(request: pytest.FixtureRequest):
         def _check(self, response: requests.Response) -> Any:
             if response.status_code >= 400:
                 body = response.text.strip()
-                logs = ""
-                if self._server is not None:
-                    logs = self._server.debug_logs().strip()
                 if body:
-                    if logs:
-                        raise requests.HTTPError(
-                            f"{response.status_code} {response.reason} for url: {response.url} body={body}\nserver logs:\n{logs}",
-                            response=response,
-                        )
                     raise requests.HTTPError(
                         f"{response.status_code} {response.reason} for url: {response.url} body={body}",
-                        response=response,
-                    )
-                if logs:
-                    raise requests.HTTPError(
-                        f"{response.status_code} {response.reason} for url: {response.url}\nserver logs:\n{logs}",
                         response=response,
                     )
                 response.raise_for_status()

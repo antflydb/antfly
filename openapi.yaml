@@ -3451,6 +3451,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/AgentTemporarilyUnavailable'
         '500':
           description: Internal server error (e.g., LLM call failed)
           content:
@@ -3562,7 +3564,7 @@ paths:
         '502':
           $ref: '#/components/responses/QueryBadGateway'
         '503':
-          $ref: '#/components/responses/QueryTemporarilyUnavailable'
+          $ref: '#/components/responses/AgentTemporarilyUnavailable'
         '504':
           $ref: '#/components/responses/QueryGatewayTimeout'
         '500':
@@ -5397,7 +5399,7 @@ paths:
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
         '409':
-          $ref: '#/components/responses/Conflict'
+          $ref: '#/components/responses/IndexMutationConflict'
         '422':
           description: Graph resolver destinations cannot be bound to this credential type
           content:
@@ -5424,6 +5426,12 @@ paths:
           description: Index dropped successfully
         '400':
           $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '409':
+          $ref: '#/components/responses/IndexMutationConflict'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -9201,6 +9209,9 @@ components:
             - $ref: '#/components/schemas/CohereEmbedderConfig'
             - $ref: '#/components/schemas/AntflyEmbedderConfig'
         - properties:
+            rate_limit:
+              x-go-type-skip-optional-pointer: false
+              $ref: '#/components/schemas/RateLimitConfig'
             provider:
               $ref: '#/components/schemas/EmbedderProvider'
             multimodal:
@@ -12112,23 +12123,28 @@ components:
         collection_apply_visits_avoided:
           type: integer
           format: int64
-          description: Incomplete scan turns advanced without entering DB apply; metadata maintenance retains its own cadence.
+          description: Incomplete scan turns advanced without entering DB apply; metadata maintenance
+            retains its own cadence.
         inventory_rows_scanned:
           type: integer
           format: int64
-          description: Segment entries visited during full physical inventory scans or incremental updates; excludes WAL entries.
+          description: Segment entries visited during full physical inventory scans or incremental updates;
+            excludes WAL entries.
         catalog_metadata_bytes_shared:
           type: integer
           format: int64
-          description: Logical immutable catalog bytes shared instead of copied by successful source snapshot and WAL-successor allocations; not resident bytes.
+          description: Logical immutable catalog bytes shared instead of copied by successful source snapshot
+            and WAL-successor allocations; not resident bytes.
         catalog_metadata_bytes_copied:
           type: integer
           format: int64
-          description: Immutable catalog array bytes copied by successful source snapshot and WAL-successor allocations; excludes object and root-path allocations.
+          description: Immutable catalog array bytes copied by successful source snapshot and WAL-successor
+            allocations; excludes object and root-path allocations.
         inventory_updates:
           type: integer
           format: int64
-          description: Full physical inventory scans and incremental occurrence-cache updates; this cache is not ownership authority.
+          description: Full physical inventory scans and incremental occurrence-cache updates; this cache
+            is not ownership authority.
         inventory_update_ns:
           type: integer
           format: int64
@@ -12136,7 +12152,8 @@ components:
         collection_locked_ns:
           type: integer
           format: int64
-          description: Total time inside the source writer lock for collection entry points; includes nested stages.
+          description: Total time inside the source writer lock for collection entry points; includes
+            nested stages.
         collection_max_locked_ns:
           type: integer
           format: int64
@@ -13820,8 +13837,10 @@ components:
           type: integer
           minimum: 0
           maximum: 20
-          description: Additive bounded-agent field for the query builder. Phase 1 remains a single-pass
-            generation flow, but this field is echoed in result accounting.
+          description: Maximum planning tool calls (0-20). Zero uses the compatibility planner. A positive
+            value enables model-directed table inspection and complete QueryRequest submission using the
+            canonical DSL parser and runtime preflight, with validation feedback for repair. It requires
+            an Antfly or OpenAI tool-capable generator and never executes database searches.
         max_user_clarifications:
           type: integer
           minimum: 0
@@ -14263,13 +14282,30 @@ components:
           description: Number of tools available (present for native mode)
     SSEError:
       type: object
-      description: Emitted when an error occurs during retrieval
+      description: Terminal retrieval failure. Capacity events carry the complete InferenceCapacityError
+        envelope, including message, reason, retryable and retry_after_ms; generic failures may carry
+        only error.
       required:
         - error
       properties:
         error:
           type: string
-          description: Error message
+          description: Error message or stable machine-readable code.
+        message:
+          type: string
+          description: Human-readable error description.
+        reason:
+          type: string
+          enum:
+            - inference_capacity
+            - inference_admission
+        retryable:
+          type: boolean
+          description: Whether the failure is temporary and the request may be retried.
+        retry_after_ms:
+          type: integer
+          minimum: 1
+          description: Minimum retry delay in milliseconds.
     PruneStats:
       type: object
       description: Statistics from token-based document pruning
@@ -14388,7 +14424,13 @@ components:
 
         **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
 
-        call, using the queries to determine available tables and indexes.
+        call, using the queries to determine available tables and indexes. A query
+
+        may contain only a table scope and caller constraints: build_query delegates
+
+        to the query-builder agent, then search executes its validated QueryRequest.
+
+        Refinements use the same canonical full-DSL validator, not keyword substitution.
 
 
         Authenticated row filters are enforced on every initial and generated
@@ -14480,7 +14522,11 @@ components:
           maximum: 20
           default: 0
           description: >
-            Maximum number of internal tool-calling rounds.
+            Maximum number of model-generation rounds across retrieval and any
+
+            delegated query-builder calls. All calls share the request deadline
+
+            and cancellation. Tool calls are additionally capped at 20 overall.
 
 
             - 0: Pipeline mode — execute provided queries directly, no LLM loop
@@ -18619,6 +18665,73 @@ components:
         provider: antfly
         model: bge-base-en-v1.5
         api_url: http://localhost:8082
+    RequestPacing:
+      type: string
+      enum:
+        - token_bucket
+        - completion
+      description: >
+        token_bucket limits admission rate while allowing overlapping attempts.
+
+        completion serializes attempts and waits one RPM interval after each
+
+        attempt finishes, including streamed writes and transport failures.
+
+        This prevents delayed connection setup from compressing successful
+
+        request spacing, at the cost of response latency plus one interval per
+
+        request. Requires requests_per_minute and burst=1. Neither mode can
+
+        guarantee zero upstream 429s or coordinate other processes.
+    RateLimitConfig:
+      type: object
+      x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+      description: >
+        Outbound provider limits shared within one Antfly process by effective
+
+        endpoint, operation, model, credential source, project and region/location.
+
+        Conflicting policies for an active scope are rejected. These limits do
+
+        not coordinate across replicas or infer the provider's account quota.
+      properties:
+        pacing:
+          $ref: '#/components/schemas/RequestPacing'
+          description: Request pacing mode. Defaults to token_bucket. Legacy flat embedder RPM with burst=1
+            uses completion pacing.
+        requests_per_minute:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 4294967295
+        burst:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 4294967295
+          default: 1
+        tokens_per_minute:
+          type: integer
+          format: int64
+          minimum: 1
+          description: >
+            Conservative text budget: each HTTP attempt reserves its serialized
+
+            UTF-8 body byte count plus the configured generation output cap.
+
+            Reservations are not refunded. A request larger than this budget
+
+            is rejected. This is not provider billing token accounting; media
+
+            requests are not supported with this limit.
+        max_concurrency:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 4294967295
+          description: Maximum in-flight HTTP attempts, held through response completion.
     EnrichmentKind:
       type: string
       enum:
@@ -19442,6 +19555,9 @@ components:
             - $ref: '#/components/schemas/AntflyGeneratorConfig'
             - $ref: '#/components/schemas/OpenAIGeneratorConfig'
         - properties:
+            rate_limit:
+              x-go-type-skip-optional-pointer: false
+              $ref: '#/components/schemas/RateLimitConfig'
             provider:
               $ref: '#/components/schemas/GeneratorProvider'
           required:
@@ -21165,6 +21281,16 @@ components:
         - worker_failed
         - worker_started
         - stalled
+        - stall_reason
+        - active_phase
+        - active_model
+        - active_backend
+        - active_deadline_ms
+        - last_progress_ms
+        - active_progress_completed
+        - active_progress_total
+        - inference_timeout_count
+        - inference_cancel_count
         - skip_by_hash_count
         - skipped_source_count
         - codec_decode_failures
@@ -21242,8 +21368,47 @@ components:
           description: Whether the background enrichment worker is currently running.
         stalled:
           type: boolean
-          description: Whether work is pending with no running worker, retry, or terminal failure explaining
-            the backlog.
+          description: Whether pending work has no worker or has exceeded its execution/progress deadline.
+        stall_reason:
+          type: string
+          enum:
+            - ''
+            - worker_missing
+            - model_loading
+            - embedding_overdue
+            - publishing_overdue
+        active_phase:
+          type: string
+          enum:
+            - idle
+            - loading_model
+            - tokenizing
+            - executing
+            - serializing
+            - publishing
+        active_model:
+          type: string
+        active_backend:
+          type: string
+        active_deadline_ms:
+          type: integer
+          format: uint64
+          description: Display-only Unix deadline in milliseconds; timeout decisions use a monotonic clock.
+        last_progress_ms:
+          type: integer
+          format: uint64
+        active_progress_completed:
+          type: integer
+          format: uint64
+        active_progress_total:
+          type: integer
+          format: uint64
+        inference_timeout_count:
+          type: integer
+          format: uint64
+        inference_cancel_count:
+          type: integer
+          format: uint64
         skip_by_hash_count:
           type: integer
           format: uint64
@@ -23915,6 +24080,11 @@ components:
           type: string
           enum:
             - antfly
+        api_key:
+          type: string
+          description: Optional bearer API key for remote Antfly inference. Supports secret references
+            and defaults to ANTFLY_INFERENCE_API_KEY. Embedded inference does not resolve or use outbound
+            credentials.
         model:
           type: string
           description: Optional reranking model name. When omitted, Antfly inference selects a model from
@@ -24022,6 +24192,9 @@ components:
       allOf:
         - type: object
           properties:
+            rate_limit:
+              x-go-type-skip-optional-pointer: false
+              $ref: '#/components/schemas/RateLimitConfig'
             provider:
               $ref: '#/components/schemas/RerankerProvider'
             field:
@@ -25883,6 +26056,27 @@ components:
         $ref: '#/components/schemas/StatefulGraphResult'
       description: Stateful graph results keyed by operation name. Legacy values are possible only when
         the corresponding request used graph_searches.
+    IndexMutationConflictError:
+      type: object
+      additionalProperties: false
+      description: An index mutation conflict. When `error` is `metadata_mutation_outcome_unknown`, the
+        mutation may already have committed and callers must observe index state before deciding whether
+        to issue another mutation.
+      required:
+        - error
+        - message
+        - retryable
+      properties:
+        error:
+          type: string
+          enum:
+            - table_mutation_conflict
+            - artifact_dependency_conflict
+            - metadata_mutation_outcome_unknown
+        message:
+          type: string
+        retryable:
+          type: boolean
     EvalRequest:
       type: object
       x-go-type-skip-optional-pointer: true
@@ -28996,6 +29190,22 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    IndexMutationConflict:
+      description: The index mutation conflicts with current state, or its commit outcome could not be
+        proven.
+      headers:
+        X-Antfly-Raft-Mutation-Outcome:
+          required: false
+          description: Present with value `unknown-v1` only when the mutation may already have committed
+            and must not be blindly retried.
+          schema:
+            type: string
+            enum:
+              - unknown-v1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/IndexMutationConflictError'
     MethodNotAllowed:
       description: Method not allowed for this resource
       content:
@@ -29130,6 +29340,21 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/QueryConflictError'
+    AgentTemporarilyUnavailable:
+      description: Agent query dependencies or inference capacity are temporarily unavailable.
+      headers:
+        Retry-After:
+          required: true
+          description: Minimum retry delay in seconds.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: '#/components/schemas/QueryTemporarilyUnavailableError'
+              - $ref: '#/components/schemas/InferenceCapacityError'
     QueryTemporarilyUnavailable:
       description: A query dependency or read path is temporarily unavailable and the request is safe
         to retry

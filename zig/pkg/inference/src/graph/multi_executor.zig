@@ -196,6 +196,7 @@ pub fn executeMultiDevice(
     mesh: *const DeviceMesh,
     options: ExecuteOptions,
 ) !MultiExecutionResult {
+    if (options.execution_control) |control| try control.check();
     const count = graph.nodeCount();
     if (count == 0 or plan.base.partitions.len == 0) {
         return .{
@@ -231,6 +232,16 @@ pub fn executeMultiDevice(
             }
             values[@intCast(ri.node_id)] = ri.value;
             value_device[@intCast(ri.node_id)] = 0;
+        }
+    }
+    errdefer {
+        cleanup: for (values, 0..) |maybe_value, index| {
+            const value = maybe_value orelse continue;
+            if (interpreter.isBorrowedRuntimeValue(options, value)) continue;
+            for (values[0..index]) |prior| {
+                if (prior == value) continue :cleanup;
+            }
+            if (mesh.device(value_device[index])) |entry| entry.backend.free(value);
         }
     }
 
@@ -271,6 +282,7 @@ pub fn executeMultiDevice(
 
     // Execute each partition in order.
     for (plan.base.partitions, 0..) |part, part_idx| {
+        if (options.execution_control) |control| try control.check();
         if (collect_stats) exec_stats.partitions_executed += 1;
         const dev_id = plan.device_assignment[part_idx];
         const dev_entry = mesh.device(dev_id) orelse return error.DeviceNotFound;
@@ -376,6 +388,7 @@ pub fn executeMultiDevice(
 
             // Execute each node in this partition.
             for (part.node_ids) |node_id| {
+                if (options.execution_control) |control| try control.check();
                 const i: usize = @intCast(node_id);
                 if (!reachable[i]) continue;
 
@@ -400,6 +413,8 @@ pub fn executeMultiDevice(
                 if (graph.node(node_id).op == .fused_from_float32) continue;
 
                 values[i] = try executeNode(graph, cb, values, node_id, &exec_state);
+                value_device[i] = dev_id;
+                if (options.execution_control) |control| try control.check();
                 if (collect_stats) {
                     if (part.backend == .cuda) {
                         exec_stats.planned_operator_dispatches += 1;
@@ -407,7 +422,6 @@ pub fn executeMultiDevice(
                         exec_stats.interpreter_fallbacks += 1;
                     }
                 }
-                value_device[i] = dev_id;
                 try runtime_shape_tracker.record(cb, node_id, values[i].?);
                 try interpreter.cloneOutputIfAliasedInputWouldBeFreed(
                     allocator,
@@ -754,6 +768,7 @@ test "graph backend partition executes through native partition executor path" {
     var weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&weight_store, allocator);
     var compute = native_compute.NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
     var cb = compute.computeBackend();
     var mesh = try DeviceMesh.init(allocator, &.{.{ .id = 0, .backend = &cb, .kind = .native }});
     defer mesh.deinit();
@@ -800,11 +815,13 @@ test "native partition executor transfers borrowed runtime input across devices"
     var weight_store_a = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&weight_store_a, allocator);
     var compute_a = native_compute.NativeCompute.init(allocator, &weight_store_a, null);
+    defer compute_a.deinit();
     var cb_a = compute_a.computeBackend();
 
     var weight_store_b = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&weight_store_b, allocator);
     var compute_b = native_compute.NativeCompute.init(allocator, &weight_store_b, null);
+    defer compute_b.deinit();
     var cb_b = compute_b.computeBackend();
 
     var mesh = try DeviceMesh.init(allocator, &.{
@@ -864,6 +881,7 @@ test "multi-executor keeps metal partition outputs resident until final readback
     var native_weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&native_weight_store, allocator);
     var native_compute_impl = native_compute.NativeCompute.init(allocator, &native_weight_store, null);
+    defer native_compute_impl.deinit();
     var native_cb = native_compute_impl.computeBackend();
 
     var metal_weight_store = initEmptyMetalWeightStore(allocator);
@@ -932,6 +950,7 @@ test "multi-executor metal graph outputs survive plan-slot reuse across executio
     var native_weight_store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitEmptyNativeWeightStore(&native_weight_store, allocator);
     var native_compute_impl = native_compute.NativeCompute.init(allocator, &native_weight_store, null);
+    defer native_compute_impl.deinit();
     var native_cb = native_compute_impl.computeBackend();
 
     var metal_weight_store = initEmptyMetalWeightStore(allocator);

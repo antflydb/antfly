@@ -3232,7 +3232,7 @@ fn qwen3VlTextMropePositions(
     return positions;
 }
 
-/// Exact Qwen3-VL-Reranker head: select the final active hidden row and keep
+/// Qwen3 and Qwen3-VL reranker head: select the final active hidden row and keep
 /// only `(W_yes - W_no)` on the backend. This avoids materializing the full
 /// vocabulary logits and preserves the official pointwise scoring contract.
 pub fn qwen3VlRerankerLogits(
@@ -3244,7 +3244,7 @@ pub fn qwen3VlRerankerLogits(
     batch: usize,
     seq_len: usize,
 ) ![]f32 {
-    if (config.family != .qwen3_vl or
+    if ((config.family != .qwen3_vl and config.family != .qwen3) or
         qwen3vl_reranker.yes_token_id >= config.vocab_size or
         qwen3vl_reranker.no_token_id >= config.vocab_size)
     {
@@ -3256,13 +3256,13 @@ pub fn qwen3VlRerankerLogits(
 
     const active_rows = try activeFinalRowIndices(allocator, attention_mask, batch, seq_len);
     defer allocator.free(active_rows);
-    const mrope_positions = try qwen3VlTextMropePositions(
+    const mrope_positions = if (config.family == .qwen3_vl) try qwen3VlTextMropePositions(
         allocator,
         attention_mask,
         batch,
         seq_len,
-    );
-    defer allocator.free(mrope_positions);
+    ) else null;
+    defer if (mrope_positions) |positions| allocator.free(positions);
 
     const decode_context = DecodeContext{
         .attention_mode = .full_recompute,
@@ -5043,7 +5043,7 @@ test "deepseek v4 compressed attention dispatches resident backend request and f
     var store = native_compute_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitDeepSeekV4TestWeightStore(allocator, &store);
     var compute = native_compute_mod.NativeCompute.init(allocator, &store, null);
-    defer compute.weight_reservations.deinit(allocator);
+    defer compute.deinit();
     var cb = ComputeBackend{ .ptr = &compute, .vtable = &DeepSeekV4DeviceFastPathTestBackend.vtable };
 
     try putDeepSeekV4TestWeight(allocator, &store, "model.layers.0.self_attn.compressor.kv_proj.weight", &.{ 2, 2 }, &.{
@@ -11561,7 +11561,7 @@ test "uniform batched RoPE restarts positions for each item" {
     var store = native_compute_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitDeepSeekV4TestWeightStore(allocator, &store);
     var compute = native_compute_mod.NativeCompute.init(allocator, &store, null);
-    defer compute.weight_reservations.deinit(allocator);
+    defer compute.deinit();
     var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute_mod.vtable_impl };
 
     const first_values = [_]f32{ 1.0, 0.0, 0.0, 1.0 };
@@ -11597,7 +11597,7 @@ test "Gemma 4 router independently RMS-normalizes and hidden-scales its source" 
     var store = native_compute_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitDeepSeekV4TestWeightStore(allocator, &store);
     var compute = native_compute_mod.NativeCompute.init(allocator, &store, null);
-    defer compute.weight_reservations.deinit(allocator);
+    defer compute.deinit();
     var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute_mod.vtable_impl };
 
     try putDeepSeekV4TestWeight(
@@ -11636,7 +11636,7 @@ test "Qwen3-VL attention requires and consumes explicit M-RoPE positions" {
     var store = native_compute_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitDeepSeekV4TestWeightStore(allocator, &store);
     var compute = native_compute_mod.NativeCompute.init(allocator, &store, null);
-    defer compute.weight_reservations.deinit(allocator);
+    defer compute.deinit();
     var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute_mod.vtable_impl };
 
     const q = try cb.fromFloat32Shape(&.{ 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0 }, &.{ 2, 6 });
@@ -11699,7 +11699,7 @@ test "Qwen3-VL DeepStack adds features only to visual rows" {
     var store = native_compute_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitDeepSeekV4TestWeightStore(allocator, &store);
     var compute = native_compute_mod.NativeCompute.init(allocator, &store, null);
-    defer compute.weight_reservations.deinit(allocator);
+    defer compute.deinit();
     var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute_mod.vtable_impl };
     const hidden = try cb.fromFloat32Shape(&.{ 1, 2, 10, 20, 100, 200 }, &.{ 3, 2 });
     defer cb.free(hidden);
@@ -11814,7 +11814,7 @@ test "Qwen3-VL reranker prefers converted two-row classifier head" {
     var store = native_compute_mod.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
     defer deinitDeepSeekV4TestWeightStore(allocator, &store);
     var compute = native_compute_mod.NativeCompute.init(allocator, &store, null);
-    defer compute.weight_reservations.deinit(allocator);
+    defer compute.deinit();
     var cb = ComputeBackend{ .ptr = &compute, .vtable = &native_compute_mod.vtable_impl };
 
     try putDeepSeekV4TestWeight(

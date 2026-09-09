@@ -97,6 +97,7 @@ pub const ReadingPipeline = struct {
     tokenizer: tokenizer_mod.Tokenizer,
     config: ReadConfig,
     florence_final_logits_bias_zero_cache: ?*?bool = null,
+    execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -118,6 +119,14 @@ pub const ReadingPipeline = struct {
 
     /// Read text from an image. image_data is raw JPEG/PNG bytes.
     pub fn read(self: *ReadingPipeline, image_data: []const u8) !ReadResult {
+        var result = try self.readImageImpl(image_data);
+        errdefer result.deinit();
+        if (self.execution_control) |control| try control.check();
+        return result;
+    }
+
+    fn readImageImpl(self: *ReadingPipeline, image_data: []const u8) !ReadResult {
+        if (self.execution_control) |control| try control.update(.tokenizing, 0, 1);
         const previous_source_fingerprint = active_read_profile_source_fingerprint;
         active_read_profile_source_fingerprint = self.config.source_fingerprint;
         defer active_read_profile_source_fingerprint = previous_source_fingerprint;
@@ -157,6 +166,17 @@ pub const ReadingPipeline = struct {
     /// back to the existing serial path; native Florence uses a batched encoder
     /// and KV-decoder path where the selected backend supports it.
     pub fn readBatch(self: *ReadingPipeline, image_datas: []const []const u8) ![]ReadResult {
+        const results = try self.readBatchImpl(image_datas);
+        errdefer {
+            for (results) |*result| result.deinit();
+            self.allocator.free(results);
+        }
+        if (self.execution_control) |control| try control.check();
+        return results;
+    }
+
+    fn readBatchImpl(self: *ReadingPipeline, image_datas: []const []const u8) ![]ReadResult {
+        if (self.execution_control) |control| try control.check();
         const previous_source_fingerprint = active_read_profile_source_fingerprint;
         active_read_profile_source_fingerprint = self.config.source_fingerprint;
         defer active_read_profile_source_fingerprint = previous_source_fingerprint;
@@ -225,6 +245,7 @@ pub const ReadingPipeline = struct {
 
         var offset: usize = 0;
         while (offset < image_datas.len) {
+            if (self.execution_control) |control| try control.update(.executing, offset, image_datas.len);
             const chunk_len = @min(max_batch, image_datas.len - offset);
             const chunk = image_datas[offset .. offset + chunk_len];
             const chunk_results = try self.readBatchNativeFlorence(chunk);
@@ -264,6 +285,7 @@ pub const ReadingPipeline = struct {
 
         for (image_datas, 0..) |image_data, i| {
             {
+                if (self.execution_control) |control| try control.update(.tokenizing, i, image_datas.len);
                 const decoded = try image.decode(allocator, image_data);
                 defer decoded.deinit(allocator);
                 const single = try image.preprocessDecodedWithResample(
@@ -296,13 +318,14 @@ pub const ReadingPipeline = struct {
             for (prompt_i32, 0..) |id, i| prompt_i64[b * prompt_len + i] = id;
         }
 
-        var cb = try session_factory.getComputeBackend(self.vision_encoder, allocator);
-        defer cb.deinit();
+        var managed = try session_factory.getComputeBackendWithControl(self.vision_encoder, allocator, self.execution_control);
+        defer managed.deinit();
+        const cb = &managed.backend;
 
         if (debug_cuda_session) std.log.info("reading: native florence batch encoder start batch={d}", .{batch});
         const encoder_start = nowNs();
         const encoder = try florence_arch.encoderForwardTensor(
-            &cb,
+            cb,
             allocator,
             florence_cfg,
             pixel_values,
@@ -320,7 +343,7 @@ pub const ReadingPipeline = struct {
             last_read_telemetry.kv_cache = true;
             last_read_telemetry.cuda_graph_replay = false;
             last_read_telemetry.cuda_graph_fallback_reason = "batched_florence_kv_decode";
-            const kv_result = self.decodeNativeFlorenceBatchIncrementalFromEncoder(&cb, florence_cfg, encoder.hidden, batch, encoder.seq_len) catch |err| fallback: {
+            const kv_result = self.decodeNativeFlorenceBatchIncrementalFromEncoder(cb, florence_cfg, encoder.hidden, batch, encoder.seq_len) catch |err| fallback: {
                 if (!shouldFallbackFlorenceIncremental(err)) return err;
                 markFlorenceIncrementalFallback();
                 break :fallback null;
@@ -330,7 +353,7 @@ pub const ReadingPipeline = struct {
                 return result;
             }
         }
-        const result = try self.decodeNativeFlorenceBatchFromEncoder(&cb, florence_cfg, encoder.hidden, batch, encoder.seq_len);
+        const result = try self.decodeNativeFlorenceBatchFromEncoder(cb, florence_cfg, encoder.hidden, batch, encoder.seq_len);
         logReadProfile("batch_decode_from_encoder", decode_start);
         return result;
     }
@@ -395,6 +418,7 @@ pub const ReadingPipeline = struct {
         const step_tokens = try allocator.alloc(i64, batch);
         defer allocator.free(step_tokens);
         for (0..dec_len) |idx| {
+            if (self.execution_control) |control| try control.update(.executing, idx, max_len);
             for (0..batch) |b| step_tokens[b] = dec_ids[b * max_len + idx];
             const prefix_step_start = nowNs();
             const hidden = try florence_arch.decoderForwardIncrementalBatchStepFinalHiddenTensor(
@@ -416,6 +440,7 @@ pub const ReadingPipeline = struct {
         var decoder_run_total_ns: u64 = 0;
         var decoder_steps: usize = 0;
         while (dec_len < max_len and finished_count < batch) {
+            if (self.execution_control) |control| try control.update(.executing, dec_len, max_len);
             {
                 const hidden = hidden_opt orelse return error.InvalidInputShape;
                 hidden_opt = null;
@@ -543,6 +568,7 @@ pub const ReadingPipeline = struct {
         var decoder_steps: usize = 0;
         var finished_count: usize = 0;
         while (dec_len < max_len and finished_count < batch) {
+            if (self.execution_control) |control| try control.update(.executing, dec_len, max_len);
             {
                 const decoder_input_ids = try compactDecoderInputIds(allocator, dec_ids, batch, max_len, dec_len);
                 defer allocator.free(decoder_input_ids);
@@ -603,6 +629,14 @@ pub const ReadingPipeline = struct {
 
     /// Read text from an already-decoded image crop.
     pub fn readDecoded(self: *ReadingPipeline, img: image.Image) !ReadResult {
+        if (self.execution_control) |control| try control.update(.tokenizing, 0, 1);
+        var result = try self.readDecodedImpl(img);
+        errdefer result.deinit();
+        if (self.execution_control) |control| try control.check();
+        return result;
+    }
+
+    fn readDecodedImpl(self: *ReadingPipeline, img: image.Image) !ReadResult {
         resetLastReadTelemetry();
         if (expectsFlattenedPatches(self.vision_encoder)) {
             return self.readPix2StructDecoded(img);
@@ -654,8 +688,13 @@ pub const ReadingPipeline = struct {
                 allocator,
                 pv_tensor,
                 prompt_i32,
+                self.execution_control,
             );
-        } else try self.vision_encoder.run(&.{pv_tensor}, allocator);
+        } else blk: {
+            if (self.execution_control) |control| try control.update(.executing, 0, 1);
+            const outputs = try self.vision_encoder.runWithControl(&.{pv_tensor}, allocator, self.execution_control);
+            break :blk outputs;
+        };
         if (debug_cuda_session) std.log.info("reading: vision encoder run done outputs={d}", .{encoder_outputs.len});
         defer {
             for (encoder_outputs) |*t| {
@@ -679,6 +718,7 @@ pub const ReadingPipeline = struct {
         allocator: std.mem.Allocator,
         pixel_tensor: backends.Tensor,
         prompt_ids: []const i32,
+        execution_control: ?@import("../execution_control.zig").InferenceExecutionControl,
     ) ![]backends.Tensor {
         const prompt_i64 = try allocator.alloc(i64, prompt_ids.len);
         defer allocator.free(prompt_i64);
@@ -693,7 +733,7 @@ pub const ReadingPipeline = struct {
         );
         defer prompt_tensor.deinit();
 
-        return vision_encoder.run(&.{ pixel_tensor, prompt_tensor }, allocator);
+        return vision_encoder.runWithControl(&.{ pixel_tensor, prompt_tensor }, allocator, execution_control);
     }
 
     fn readNativeFlorencePixelValues(self: *ReadingPipeline, pixel_values: []const f32, florence_cfg: florence_arch.Config) !ReadResult {
@@ -714,13 +754,14 @@ pub const ReadingPipeline = struct {
         defer allocator.free(prompt_i64);
         for (prompt_i32, 0..) |id, i| prompt_i64[i] = id;
 
-        var cb = try session_factory.getComputeBackend(self.vision_encoder, allocator);
-        defer cb.deinit();
+        var managed = try session_factory.getComputeBackendWithControl(self.vision_encoder, allocator, self.execution_control);
+        defer managed.deinit();
+        const cb = &managed.backend;
 
         if (debug_cuda_session) std.log.info("reading: native florence encoder tensor run start", .{});
         const encoder_start = nowNs();
         const encoder = try florence_arch.encoderForwardTensor(
-            &cb,
+            cb,
             allocator,
             florence_cfg,
             pixel_values,
@@ -733,7 +774,7 @@ pub const ReadingPipeline = struct {
         defer cb.free(encoder.hidden);
 
         const decode_start = nowNs();
-        const result = try self.decodeNativeFlorenceFromEncoder(&cb, florence_cfg, encoder.hidden, encoder.seq_len);
+        const result = try self.decodeNativeFlorenceFromEncoder(cb, florence_cfg, encoder.hidden, encoder.seq_len);
         logReadProfile("decode_from_encoder", decode_start);
         return result;
     }
@@ -777,6 +818,7 @@ pub const ReadingPipeline = struct {
         var decoder_run_total_ns: u64 = 0;
         var decoder_steps: usize = 0;
         while (dec_len < max_len) {
+            if (self.execution_control) |control| try control.update(.executing, dec_len, max_len);
             const decoder_run_start = nowNs();
             const logits = if (cross_cache) |*cache|
                 try florence_arch.decoderForwardCached(
@@ -839,8 +881,9 @@ pub const ReadingPipeline = struct {
         const florence_cfg = session_factory.getFlorenceConfig(self.vision_encoder) orelse return null;
         last_read_telemetry.resident_decoder = true;
         const allocator = self.allocator;
-        var cb = try session_factory.getComputeBackend(self.vision_encoder, allocator);
-        defer cb.deinit();
+        var managed = try session_factory.getComputeBackendWithControl(self.vision_encoder, allocator, self.execution_control);
+        defer managed.deinit();
+        const cb = &managed.backend;
 
         const prompt_text = self.config.prompt orelse "<OCR>";
         const prompt_i32 = try buildFlorencePromptIds(
@@ -857,7 +900,7 @@ pub const ReadingPipeline = struct {
 
         const encoder = (try session_factory.runFlorenceEncoderResident(
             self.vision_encoder,
-            &cb,
+            cb,
             allocator,
             pixel_values,
             1,
@@ -898,7 +941,7 @@ pub const ReadingPipeline = struct {
             last_read_telemetry.cuda_graph_fallback_reason = if (florenceCudaGraphEnabled()) null else "florence_graph_disabled";
             const decode_start = nowNs();
             const result = self.decodeFlorenceResidentIncremental(
-                &cb,
+                cb,
                 florence_cfg,
                 encoder.hidden,
                 encoder.seq_len,
@@ -910,16 +953,17 @@ pub const ReadingPipeline = struct {
                 break :fallback null;
             };
             if (result) |decoded| {
-                logMetalStageTimingProfile(&cb);
+                logMetalStageTimingProfile(cb);
                 logReadProfile("florence_resident_kv_decode", decode_start);
                 return decoded;
             }
         }
 
         while (dec_len < max_len) {
+            if (self.execution_control) |control| try control.update(.executing, dec_len, max_len);
             const logits = (try session_factory.runFlorenceDecoderResident(
                 self.decoder,
-                &cb,
+                cb,
                 allocator,
                 dec_ids[0..dec_len],
                 encoder.hidden,
@@ -1013,6 +1057,7 @@ pub const ReadingPipeline = struct {
 
         var dec_len = initial_len;
         for (0..dec_len) |idx| {
+            if (self.execution_control) |control| try control.update(.executing, idx, max_len);
             const prefix_step_start = nowNs();
             const hidden = try florence_arch.decoderForwardIncrementalStepFinalHiddenTensor(
                 cb,
@@ -1032,6 +1077,7 @@ pub const ReadingPipeline = struct {
         var decoder_run_total_ns: u64 = 0;
         var decoder_steps: usize = 0;
         while (dec_len < max_len) {
+            if (self.execution_control) |control| try control.update(.executing, dec_len, max_len);
             var hidden = hidden_opt orelse return error.InvalidInputShape;
             hidden_opt = null;
             var hidden_live = true;
@@ -1207,7 +1253,7 @@ pub const ReadingPipeline = struct {
         else
             &[_]backends.Tensor{patch_tensor};
 
-        const encoder_outputs = try self.vision_encoder.run(inputs, allocator);
+        const encoder_outputs = try self.vision_encoder.runWithControl(inputs, allocator, self.execution_control);
         defer {
             for (encoder_outputs) |*t| {
                 var mt = t.*;
@@ -1292,7 +1338,12 @@ pub const ReadingPipeline = struct {
             try decoder_inputs.append(allocator, enc_hidden);
 
             const decoder_run_start = nowNs();
-            const dec_outputs = try self.decoder.run(decoder_inputs.items, allocator);
+            if (self.execution_control) |control| try control.update(.executing, @intCast(dec_len), @intCast(max_len));
+            const dec_outputs = try self.decoder.runWithControl(
+                decoder_inputs.items,
+                allocator,
+                self.execution_control,
+            );
             const decoder_run_ns = nowNs() - decoder_run_start;
             decoder_run_total_ns += decoder_run_ns;
             decoder_steps += 1;
@@ -1740,6 +1791,29 @@ const AdmissionDenyingFlorenceSession = struct {
     fn close(_: *anyopaque) void {}
 };
 
+test "reading entry points and batch publication honor execution control" {
+    var pipeline: ReadingPipeline = undefined;
+    pipeline.allocator = std.testing.allocator;
+    pipeline.execution_control = .{ .deadline_ns = 0 };
+    try std.testing.expectError(error.Timeout, pipeline.read("unused"));
+    try std.testing.expectError(error.Timeout, pipeline.readBatch(&.{"unused"}));
+    try std.testing.expectError(error.Timeout, pipeline.readDecoded(undefined));
+
+    const CancelAtPublication = struct {
+        checks: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.checks == 2) return error.Cancelled;
+        }
+    };
+    var cancellation = CancelAtPublication{};
+    pipeline.config = .{};
+    pipeline.execution_control = .{ .ptr = &cancellation, .check_fn = CancelAtPublication.check };
+    try std.testing.expectError(error.Cancelled, pipeline.readBatch(&.{}));
+    try std.testing.expectEqual(@as(usize, 2), cancellation.checks);
+}
+
 test "Florence prompt tensor cleanup survives encoder admission denial" {
     const allocator = std.testing.allocator;
     var fake = AdmissionDenyingFlorenceSession{};
@@ -1758,6 +1832,7 @@ test "Florence prompt tensor cleanup survives encoder admission denial" {
             allocator,
             pixel_tensor,
             &.{ 11, 22, 33 },
+            null,
         ),
     );
     try std.testing.expect(fake.run_called);

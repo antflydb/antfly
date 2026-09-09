@@ -177,7 +177,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (!saw_path) {
-        try out.writeAll("usage: zig build dense-profile-summary -- <profile.jsonl> [more.jsonl...]\n");
+        try out.writeAll("usage: ./zig-out/bin/dense_profile_summary <profile.jsonl> [more.jsonl...]\n");
         try stdout_writer.flush();
         return error.InvalidArgument;
     }

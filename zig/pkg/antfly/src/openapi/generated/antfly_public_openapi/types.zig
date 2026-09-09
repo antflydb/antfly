@@ -6774,7 +6774,7 @@ pub const QueryBuilderRequest = struct {
     decisions: ?[]const AgentDecision = null,
     /// If true, the agent may return clarification questions when needed.
     interactive: ?bool = null,
-    /// Additive bounded-agent field for the query builder. Phase 1 remains a single-pass generation flow, but this field is echoed in result accounting.
+    /// Maximum planning tool calls (0-20). Zero uses the compatibility planner. A positive value enables model-directed table inspection and complete QueryRequest submission using the canonical DSL parser and runtime preflight, with validation feedback for repair. It requires an Antfly or OpenAI tool-capable generator and never executes database searches.
     max_internal_iterations: ?i64 = null,
     /// Maximum number of clarification turns the agent may request from the user.
     max_user_clarifications: ?i64 = null,
@@ -8951,7 +8951,7 @@ pub const RestoreRequest = struct {
     connection: []const u8,
 };
 
-/// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes. Authenticated row filters are enforced on every initial and generated operation in both modes, including scans, aggregates, and graph/tree traversal. They cannot be replaced or weakened by model tool arguments.
+/// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes. A query may contain only a table scope and caller constraints: build_query delegates to the query-builder agent, then search executes its validated QueryRequest. Refinements use the same canonical full-DSL validator, not keyword substitution. Authenticated row filters are enforced on every initial and generated operation in both modes, including scans, aggregates, and graph/tree traversal. They cannot be replaced or weakened by model tool arguments.
 pub const RetrievalAgentRequest = struct {
     /// User's natural language query
     query: []const u8,
@@ -8969,7 +8969,7 @@ pub const RetrievalAgentRequest = struct {
     decisions: ?[]const AgentDecision = null,
     /// If true, the agent may return clarification questions when needed.
     interactive: ?bool = null,
-    /// Maximum number of internal tool-calling rounds. - 0: Pipeline mode — execute provided queries directly, no LLM loop - 1+: Agentic mode — LLM decides which tools to call
+    /// Maximum number of model-generation rounds across retrieval and any delegated query-builder calls. All calls share the request deadline and cancellation. Tool calls are additionally capped at 20 overall. - 0: Pipeline mode — execute provided queries directly, no LLM loop - 1+: Agentic mode — LLM decides which tools to call
     max_internal_iterations: ?i64 = null,
     /// Maximum number of clarification turns the agent may request from the user.
     max_user_clarifications: ?i64 = null,
@@ -9833,10 +9833,57 @@ pub const RuntimeConfigStatus = struct {
     }
 };
 
-/// Emitted when an error occurs during retrieval
+/// Terminal retrieval failure. Capacity events carry the complete InferenceCapacityError envelope, including message, reason, retryable and retry_after_ms; generic failures may carry only error.
 pub const SSEError = struct {
-    /// Error message
+    /// Error message or stable machine-readable code.
     @"error": []const u8,
+    /// Human-readable error description.
+    message: ?[]const u8 = null,
+    reason: ?[]const u8 = null,
+    /// Whether the failure is temporary and the request may be retried.
+    retryable: ?bool = null,
+    /// Minimum retry delay in milliseconds.
+    retry_after_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "error", "error", false },
+        .{ "message", "message", true },
+        .{ "reason", "reason", true },
+        .{ "retryable", "retryable", true },
+        .{ "retry_after_ms", "retry_after_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("error");
+        try jw.write(self.@"error");
+        if (self.message) |value| {
+            try jw.objectField("message");
+            try jw.write(value);
+        }
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
+        if (self.retryable) |value| {
+            try jw.objectField("retryable");
+            try jw.write(value);
+        }
+        if (self.retry_after_ms) |value| {
+            try jw.objectField("retry_after_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// SSE event types emitted by the retrieval agent streaming endpoint

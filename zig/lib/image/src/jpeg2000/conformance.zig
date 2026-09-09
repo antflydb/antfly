@@ -5137,12 +5137,9 @@ test "external jpeg2000 iso conformance corpus decodes within baseline" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Root directory is the default cache; override by dropping a symlink
-    // at `/tmp/openjpeg-data` if you have the checkout elsewhere. Keeping
-    // this hardcoded avoids depending on env-var helpers whose surface
-    // moves between Zig 0.16 nightlies.
-    const root_dir = try allocator.dupe(u8, iso_fixtures_root_default);
-    defer allocator.free(root_dir);
+    var environ = try std.testing.environ.createMap(allocator);
+    defer environ.deinit();
+    const root_dir = environ.get("OPENJPEG_DATA_DIR") orelse iso_fixtures_root_default;
 
     const conformance_dir = try isoConformanceDirAbsolute(allocator, root_dir);
     defer allocator.free(conformance_dir);
@@ -5153,7 +5150,7 @@ test "external jpeg2000 iso conformance corpus decodes within baseline" {
     if (!isoConformanceDirPresent(conformance_dir)) {
         std.debug.print(
             "iso conformance: fixtures not present at {s} — skipping. " ++
-                "Populate via `zig build lib-image-conformance-fetch` " ++
+                "Populate via `zig build lib-image-conformance` " ++
                 "or `git clone --depth=1 https://github.com/uclouvain/openjpeg-data {s}`.\n",
             .{ conformance_dir, root_dir },
         );

@@ -503,6 +503,34 @@ pub const AntflyClient = struct {
         };
     }
 
+    /// Execute a retrieval-agent request while forwarding response bytes as
+    /// they arrive. The returned response owns only its status metadata; the
+    /// body has already been written to `writer`.
+    pub fn retrievalAgentToWriter(
+        self: *AntflyClient,
+        body: openapi.types.RetrievalAgentRequest,
+        writer: anytype,
+    ) !openapi.client.RawResponse {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/agents/retrieval", .{self.inner.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var auth_headers: ?[1][2][]const u8 = null;
+        if (self.inner.auth_header) |h| auth_headers = .{h};
+
+        var resp = try self.inner.http.requestToWriter(.POST, url, .{
+            .json = json_body,
+            .headers = if (auth_headers) |*h| h[0..] else null,
+            .timeout_ms = retrieval_agent_timeout_ms,
+        }, writer, null, null);
+        defer resp.deinit();
+        return .{
+            .status_code = resp.status.code,
+            .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null,
+            .allocator = self.allocator,
+        };
+    }
+
     pub fn queryBuilder(self: *AntflyClient, body: openapi.types.QueryBuilderRequest) !openapi.ApiResponse(openapi.types.QueryBuilderResult) {
         var resp = try self.inner.queryBuilderAgent(body);
         if (resp.status_code >= 300) {

@@ -23,7 +23,9 @@ import time
 from helpers import wait_until
 
 
-SCHEMA_MIGRATION_REBUILD_TIMEOUT_S = 240.0
+SCHEMA_MIGRATION_REBUILD_TIMEOUT_S = float(
+    os.getenv("ANTFLY_E2E_SCHEMA_MIGRATION_TIMEOUT_S", "240")
+)
 
 
 def _index_stats(index_status: dict) -> dict:

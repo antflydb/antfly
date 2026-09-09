@@ -80,6 +80,8 @@ const StandaloneWikiConfig = struct {
     sync_level: PublicSyncLevel = .write,
     dims: usize = 512,
     model: []const u8 = "antflydb/clipclap",
+    backend: []const u8 = "auto",
+    chunk_tokens: usize = 0,
     models_dir: []const u8 = "/Users/ajroetker/.termite/models",
     standalone_binary: []const u8 = "./zig-out/bin/antfly",
     bind_host: []const u8 = "127.0.0.1",
@@ -737,7 +739,7 @@ pub fn main(init: std.process.Init) !void {
     const alloc = std.heap.c_allocator;
     const cfg = try parseQuickstartBenchArgs(init.minimal.args);
     if (cfg.mode == .standalone_wiki) {
-        try runStandaloneWikiBench(alloc, init.io, cfg);
+        try runStandaloneWikiBench(alloc, init.io, cfg, init.environ_map);
         return;
     }
 
@@ -855,6 +857,13 @@ fn parseQuickstartBenchArgs(args_in: std.process.Args) !StandaloneWikiConfig {
             cfg.dims = try parseBenchNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--model")) {
             cfg.model = args.next() orelse return error.InvalidArgument;
+        } else if (std.mem.eql(u8, arg, "--backend")) {
+            cfg.backend = args.next() orelse return error.InvalidArgument;
+            if (!std.mem.eql(u8, cfg.backend, "auto") and
+                !std.mem.eql(u8, cfg.backend, "native") and
+                !std.mem.eql(u8, cfg.backend, "metal")) return error.InvalidArgument;
+        } else if (std.mem.eql(u8, arg, "--chunk-tokens")) {
+            cfg.chunk_tokens = try parseBenchNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--models-dir")) {
             cfg.models_dir = args.next() orelse return error.InvalidArgument;
         } else if (std.mem.eql(u8, arg, "--standalone-binary")) {
@@ -882,7 +891,12 @@ fn parseQuickstartBenchArgs(args_in: std.process.Args) !StandaloneWikiConfig {
     return cfg;
 }
 
-fn runStandaloneWikiBench(alloc: std.mem.Allocator, io: std.Io, input_cfg: StandaloneWikiConfig) !void {
+fn runStandaloneWikiBench(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    input_cfg: StandaloneWikiConfig,
+    parent_environ: *const std.process.Environ.Map,
+) !void {
     var cfg = input_cfg;
     if (cfg.docs == 0 or cfg.batch_size == 0 or cfg.dims == 0) return error.InvalidArgument;
 
@@ -897,7 +911,8 @@ fn runStandaloneWikiBench(alloc: std.mem.Allocator, io: std.Io, input_cfg: Stand
     const cwd = try std.process.currentPathAlloc(io, alloc);
     defer alloc.free(cwd);
 
-    var child = try spawnWikiStandalone(alloc, io, cwd, cfg, root_path[0..root_path.len]);
+    const startup_started = nanotime();
+    var child = try spawnWikiStandalone(alloc, io, cwd, cfg, root_path[0..root_path.len], parent_environ);
     const child_pid = child.id orelse return error.UnexpectedProcessExit;
     var child_live = true;
     defer if (child_live) {
@@ -914,6 +929,7 @@ fn runStandaloneWikiBench(alloc: std.mem.Allocator, io: std.Io, input_cfg: Stand
     defer alloc.free(status_uri);
 
     try waitForHttpOk(alloc, health_uri, cfg.startup_timeout_ms);
+    const startup_ns = nanotime() - startup_started;
 
     var client = WikiHttpClient.init(alloc);
     defer client.deinit();
@@ -921,35 +937,45 @@ fn runStandaloneWikiBench(alloc: std.mem.Allocator, io: std.Io, input_cfg: Stand
     try createWikiTableAndIndex(alloc, &client, base_uri, cfg);
 
     const load_started = nanotime();
-    const loaded = try loadWikiDataset(alloc, io, &client, base_uri, cfg, child_pid, health_uri, metrics_uri, status_uri);
+    const load = try loadWikiDataset(alloc, io, &client, base_uri, cfg, child_pid, health_uri, metrics_uri, status_uri);
     const load_ns = nanotime() - load_started;
     print(
-        "quickstart_wiki_standalone load complete dataset={s} docs={d} batch_size={d} sync_level={s} load_s={d:.2}\n",
+        "quickstart_wiki_standalone load complete dataset={s} docs={d} batch_size={d} sync_level={s} startup_s={d:.2} cold_first_batch_publish_s={d:.2} warm_batches={d} warm_avg_publish_ms={d:.2} warm_max_publish_ms={d:.2} load_s={d:.2}\n",
         .{
             cfg.dataset_path,
-            loaded,
+            load.loaded,
             cfg.batch_size,
             cfg.sync_level.text(),
+            nsToSeconds(startup_ns),
+            nsToSeconds(load.cold_first_batch_publish_ns),
+            load.warm_batch_count,
+            nsToMs(load.warmAvgPostNs()),
+            nsToMs(load.warm_max_post_ns),
             nsToSeconds(load_ns),
         },
     );
 
     const wait_started = nanotime();
-    const visibility = try waitForWikiIndexReady(alloc, &client, base_uri, loaded, cfg.index_ready_timeout_ms);
+    const visibility = try waitForWikiIndexReady(alloc, &client, base_uri, load.loaded, cfg.index_ready_timeout_ms);
     const wait_ns = nanotime() - wait_started;
 
     const query_stats = try runWikiQueries(alloc, &client, base_uri, cfg);
     const rss = sampleRssBytes(alloc, io, child_pid) catch 0;
 
     print(
-        "quickstart_wiki_standalone dataset={s} docs={d} batch_size={d} sync_level={s} dims={d} model={s} load_s={d:.2} index_wait_s={d:.2} query_count={d} avg_query_ms={d:.2} max_query_ms={d:.2} rss_mb={d:.2} visible={d} total_indexed={d} enrichment={d}/{d} replay={d}/{d} runtime_fresh={any}\n",
+        "quickstart_wiki_standalone dataset={s} docs={d} batch_size={d} sync_level={s} dims={d} model={s} backend={s} chunk_tokens={d} startup_s={d:.2} cold_first_batch_publish_s={d:.2} warm_avg_publish_ms={d:.2} load_s={d:.2} final_index_wait_s={d:.2} query_count={d} avg_query_ms={d:.2} max_query_ms={d:.2} rss_mb={d:.2} visible={d} total_indexed={d} enrichment={d}/{d} replay={d}/{d} runtime_fresh={any}\n",
         .{
             cfg.dataset_path,
-            loaded,
+            load.loaded,
             cfg.batch_size,
             cfg.sync_level.text(),
             cfg.dims,
             cfg.model,
+            cfg.backend,
+            cfg.chunk_tokens,
+            nsToSeconds(startup_ns),
+            nsToSeconds(load.cold_first_batch_publish_ns),
+            nsToMs(load.warmAvgPostNs()),
             nsToSeconds(load_ns),
             nsToSeconds(wait_ns),
             query_stats.count,
@@ -982,6 +1008,7 @@ fn spawnWikiStandalone(
     cwd: []const u8,
     cfg: StandaloneWikiConfig,
     root_path: []const u8,
+    parent_environ: *const std.process.Environ.Map,
 ) !std.process.Child {
     const bind_port_arg = try std.fmt.allocPrint(alloc, "{d}", .{cfg.bind_port});
     defer alloc.free(bind_port_arg);
@@ -993,6 +1020,11 @@ fn spawnWikiStandalone(
     defer alloc.free(replica_catalog);
     const snapshot_root = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{root_path});
     defer alloc.free(snapshot_root);
+
+    var child_environ = try parent_environ.clone(alloc);
+    defer child_environ.deinit();
+    if (!std.mem.eql(u8, cfg.backend, "auto"))
+        try child_environ.put("ANTFLY_INFERENCE_REQUIRED_BACKEND", cfg.backend);
 
     return try std.process.spawn(io, .{
         .argv = &.{
@@ -1016,6 +1048,7 @@ fn spawnWikiStandalone(
             snapshot_root,
         },
         .cwd = .{ .path = cwd },
+        .environ_map = &child_environ,
         .stdin = .ignore,
         .stdout = .inherit,
         .stderr = .inherit,
@@ -1042,13 +1075,33 @@ fn createWikiTableAndIndex(
     try index_body.print(alloc, "{d}", .{cfg.dims});
     try index_body.appendSlice(alloc, ",\"embedder\":{\"provider\":\"antfly\",\"model\":");
     try appendJsonString(alloc, &index_body, cfg.model);
-    try index_body.appendSlice(alloc, "}}");
+    try index_body.append(alloc, '}');
+    if (cfg.chunk_tokens > 0) {
+        try index_body.appendSlice(alloc, ",\"chunker\":{\"provider\":\"antfly\",\"model\":");
+        try appendJsonString(alloc, &index_body, cfg.model);
+        try index_body.appendSlice(alloc, ",\"store_chunks\":false,\"text\":{\"target_tokens\":");
+        try index_body.print(alloc, "{d}", .{cfg.chunk_tokens});
+        try index_body.appendSlice(alloc, ",\"overlap_tokens\":0}}}");
+    }
+    try index_body.append(alloc, '}');
 
     const index_path = try std.fmt.allocPrint(alloc, "/tables/{s}/indexes/{s}", .{ table_name, semantic_index_name });
     defer alloc.free(index_path);
     const index_resp = try postJsonExpect(alloc, client, base_uri, index_path, index_body.items, &.{ 200, 201 });
     defer alloc.free(index_resp);
 }
+
+const WikiLoadStats = struct {
+    loaded: usize = 0,
+    cold_first_batch_publish_ns: u64 = 0,
+    warm_batch_count: usize = 0,
+    warm_total_post_ns: u64 = 0,
+    warm_max_post_ns: u64 = 0,
+
+    fn warmAvgPostNs(self: WikiLoadStats) u64 {
+        return if (self.warm_batch_count == 0) 0 else self.warm_total_post_ns / self.warm_batch_count;
+    }
+};
 
 fn loadWikiDataset(
     alloc: std.mem.Allocator,
@@ -1060,7 +1113,7 @@ fn loadWikiDataset(
     health_uri: []const u8,
     metrics_uri: []const u8,
     status_uri: []const u8,
-) !usize {
+) !WikiLoadStats {
     var file = try std.Io.Dir.openFileAbsolute(io, cfg.dataset_path, .{});
     defer file.close(io);
 
@@ -1073,37 +1126,47 @@ fn loadWikiDataset(
     const batch_path = try std.fmt.allocPrint(alloc, "/tables/{s}/batch", .{table_name});
     defer alloc.free(batch_path);
 
-    var loaded: usize = 0;
+    var stats = WikiLoadStats{};
     var batch_count: usize = 0;
     try startWikiBatch(alloc, &batch, cfg.sync_level);
-    while (loaded < cfg.docs) {
+    while (stats.loaded < cfg.docs) {
         const raw = (try reader.interface.takeDelimiter('\n')) orelse break;
         const line = std.mem.trim(u8, raw, " \t\r\n");
         if (line.len == 0) continue;
 
         var parsed = std.json.parseFromSlice(WikiArticle, alloc, line, .{ .ignore_unknown_fields = true }) catch |err| {
-            print("quickstart_wiki_standalone skipping malformed line={d} err={s}\n", .{ loaded + 1, @errorName(err) });
+            print("quickstart_wiki_standalone skipping malformed line={d} err={s}\n", .{ stats.loaded + 1, @errorName(err) });
             continue;
         };
         defer parsed.deinit();
 
         if (batch_count != 0) try batch.append(alloc, ',');
-        try appendWikiInsert(alloc, &batch, loaded, parsed.value);
+        try appendWikiInsert(alloc, &batch, stats.loaded, parsed.value);
         batch_count += 1;
-        loaded += 1;
+        stats.loaded += 1;
 
         if (batch_count >= cfg.batch_size) {
+            const batch_started = nanotime();
             try finishAndPostWikiBatch(alloc, client, base_uri, batch_path, &batch);
+            _ = try waitForWikiIndexReady(alloc, client, base_uri, stats.loaded, cfg.index_ready_timeout_ms);
+            if (stats.cold_first_batch_publish_ns == 0) {
+                stats.cold_first_batch_publish_ns = nanotime() - batch_started;
+            } else {
+                const elapsed = nanotime() - batch_started;
+                stats.warm_batch_count += 1;
+                stats.warm_total_post_ns += elapsed;
+                stats.warm_max_post_ns = @max(stats.warm_max_post_ns, elapsed);
+            }
             batch_count = 0;
             try startWikiBatch(alloc, &batch, cfg.sync_level);
         }
-        if (cfg.load_progress_interval > 0 and loaded % cfg.load_progress_interval == 0) {
+        if (cfg.load_progress_interval > 0 and stats.loaded % cfg.load_progress_interval == 0) {
             const rss = sampleRssBytes(alloc, io, pid) catch 0;
             const visibility = fetchWikiVisibility(alloc, base_uri) catch WikiVisibility{};
             print(
                 "quickstart_wiki_standalone load progress docs={d}/{d} rss_mb={d:.2} visible={d} indexed={d} enrichment={d}/{d} replay={d}/{d}\n",
                 .{
-                    loaded,
+                    stats.loaded,
                     cfg.docs,
                     bytesToMiB(rss),
                     visibility.visibleDocs(),
@@ -1119,8 +1182,20 @@ fn loadWikiDataset(
             _ = httpGetStatus(alloc, status_uri) catch {};
         }
     }
-    if (batch_count > 0) try finishAndPostWikiBatch(alloc, client, base_uri, batch_path, &batch);
-    return loaded;
+    if (batch_count > 0) {
+        const batch_started = nanotime();
+        try finishAndPostWikiBatch(alloc, client, base_uri, batch_path, &batch);
+        _ = try waitForWikiIndexReady(alloc, client, base_uri, stats.loaded, cfg.index_ready_timeout_ms);
+        if (stats.cold_first_batch_publish_ns == 0) {
+            stats.cold_first_batch_publish_ns = nanotime() - batch_started;
+        } else {
+            const elapsed = nanotime() - batch_started;
+            stats.warm_batch_count += 1;
+            stats.warm_total_post_ns += elapsed;
+            stats.warm_max_post_ns = @max(stats.warm_max_post_ns, elapsed);
+        }
+    }
+    return stats;
 }
 
 fn startWikiBatch(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), sync_level: PublicSyncLevel) !void {

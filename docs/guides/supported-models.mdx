@@ -53,13 +53,13 @@ is strict and never silently falls back.
 | Higher-quality embedding | `BAAI/bge-large-en-v1.5` | `BAAI/bge-base-en-v1.5`, `mixedbread-ai/mxbai-embed-large-v1` |
 | Multilingual dense embedding | `BAAI/bge-m3` | Qualified dense checkpoint; see below |
 | Sparse embedding | `sparse-encoder-testing/splade-bert-tiny-nq-onnx` | — |
-| Reranking | `mixedbread-ai/mxbai-rerank-base-v1` | `cross-encoder/ms-marco-MiniLM-L6-v2` |
+| Text reranking | `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0` | `mixedbread-ai/mxbai-rerank-base-v1`, `cross-encoder/ms-marco-MiniLM-L6-v2` |
 | Multimodal (text + image + audio) | `antflydb/clipclap` | — |
 | Chunking | `fixed_bert` (built in) | `mirth/chonky_mmbert_small_multilingual_1` |
 | Entity, relation & structured extraction | `antflydb/gliner2-base-v1` | — |
 | Document reading / OCR | `antflydb/Florence-2-base` | — |
 | Transcription | `openai/whisper-tiny` | — |
-| Local generation | `ggml-org/gemma-4-E4B-it-GGUF` | Gemma 3, Llama 3.x, Qwen3 dense GGUFs |
+| Local multimodal generation | `ggml-org/gemma-4-E4B-it-GGUF` | Gemma 3, Llama 3.x, Qwen3 dense GGUFs |
 
 Pull models by their full `owner/name` reference:
 
@@ -68,9 +68,19 @@ antfly inference pull hf:BAAI/bge-small-en-v1.5 --tasks embed
 antfly inference pull hf:nomic-ai/nomic-embed-text-v1.5 --tasks embed
 antfly inference pull hf:BAAI/bge-m3 --tasks embed
 antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1
+antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank
 antfly inference pull hf:antflydb/clipclap:gguf:Q4_K --tasks embed
-antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF --tasks generate
+antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 --tasks generate --projector auto
 ```
+
+Gemma 4's automatically selected unified projector enables text, image, and audio
+generation inputs. Pass `--projector none` when only text generation is needed.
+
+The Qwen3 0.6B text reranker is publicly downloadable as a single GGUF. It uses
+the checkpoint's fixed text prompt, final active token, and yes/no score head.
+This is separate from the Qwen3-VL 2B multimodal reranker, whose Metal serving
+route requires its exact qualified managed bundle; community VL GGUFs cannot
+be substituted for that bundle solely because they share a model name or quant.
 
 Antfly treats retrieval roles as model input semantics, not model-name aliases.
 Semantic searches automatically use `RETRIEVAL_QUERY`; index and artifact writes
@@ -138,7 +148,7 @@ contracts and are not exposed by the dense embeddings endpoint.
 | Family | Verified with |
 |---|---|
 | Gemma 3 | `unsloth/gemma-3-4b-it-GGUF` |
-| Gemma 4 | `ggml-org/gemma-4-E4B-it-GGUF`; exact 26B-A4B Q4_0 on Metal and CUDA SM89 |
+| Gemma 4 | Dense `ggml-org/gemma-4-E4B-it-GGUF` Q4_0; exact 26B-A4B Q4_0 on Metal and CUDA SM89 |
 | Llama 3.x | `unsloth/Llama-3.2-1B-Instruct-GGUF` |
 | Qwen3 (dense) | `unsloth/Qwen3-1.7B-GGUF` |
 
@@ -231,12 +241,14 @@ report `"chat_template": false` in `/ai/v1/models`.
 cleanly through `antfly inference generate`, but can fail to stop through
 `/ai/v1/chat/completions`. Prefer `gemma-3-4b` or larger for chat.
 
-**Gemma 4 artifacts and quants differ.** The recommended
-`ggml-org/gemma-4-E4B-it-GGUF` Q4_K_M artifact runs on native and Metal. Google QAT Q4_0
-and tested third-party Q4_1/Q4_K_M variants also produce a clean final channel after the
+**Gemma 4 artifacts and quants differ.** The current
+`ggml-org/gemma-4-E4B-it-GGUF` repository publishes BF16, Q4_0, and Q8_0 decoder weights;
+it does not publish Q4_K_M. Pull the exact Q4_0 variant shown above. Its automatically
+selected Q8 projector supports both image and audio inputs. Google QAT Q4_0 and
+tested third-party Q4_1/Q4_K_M variants also produce a clean final channel after the
 GGUF-over-sidecar structural fix. A tested `UD-Q4_K_XL` contains `IQ4_XS`; Metal rejects
 that quant before generation and automatic selection falls back to native. Keep one quant
-per directory and prefer the recommended artifact.
+per directory rather than mixing artifacts from different variants.
 
 **Mixed-variant model directories.** Pulling a second variant into a directory that already
 holds another leaves both in place, and different parts of a model can then resolve to

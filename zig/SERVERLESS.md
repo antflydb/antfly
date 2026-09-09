@@ -685,15 +685,15 @@ Current binary/image split:
 Build graph steps:
 
 - `zig build antfly`
-- `zig build serverless-test`
+- `zig build antfly-serverless-test`
 
 GitHub Actions:
 
 - `.github/workflows/zig-tests.yml`
-  - PR / push coverage for `serverless-test`
+  - PR / push coverage for `antfly-serverless-test`
   - smoke checks for `antfly --help` and the nested
     `antfly serverless <role> --help` commands
-  - nightly scheduled `zig build test` + `zig build serverless-test`
+  - nightly scheduled `zig build test` + `zig build antfly-serverless-test`
 - `.github/workflows/container-smoke.yml`
   - PR / push smoke build for `Dockerfile.serverless`
   - builds `install`

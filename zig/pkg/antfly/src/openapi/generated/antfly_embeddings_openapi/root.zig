@@ -14,4 +14,5 @@ pub const IndexEmbedderConfig = types.IndexEmbedderConfig;
 pub const OllamaEmbedderConfig = types.OllamaEmbedderConfig;
 pub const OpenAIEmbedderConfig = types.OpenAIEmbedderConfig;
 pub const OpenRouterEmbedderConfig = types.OpenRouterEmbedderConfig;
+pub const RateLimitConfig = types.RateLimitConfig;
 pub const VertexEmbedderConfig = types.VertexEmbedderConfig;

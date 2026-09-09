@@ -22,6 +22,8 @@
 // and loops until EOS or max_tokens. Matches Go inference's TextGenerationPipeline.
 
 const std = @import("std");
+const Gemma4Projection = @import("gemma4_channels.zig").Projection;
+const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const ortgenai = if (build_options.enable_onnx) @import("../backends/ortgenai.zig") else struct {};
@@ -85,6 +87,7 @@ fn supportsSpeculativeTargetVerification(
 pub var gemma4_mtp_debug_override: bool = false;
 
 pub const Message = struct {
+    pub const ToolCall = jinja.ChatToolCall;
     pub const ContentPart = union(enum) {
         text: []const u8,
         image: usize,
@@ -93,6 +96,9 @@ pub const Message = struct {
 
     role: []const u8,
     content: []const u8,
+    content_is_null: bool = false,
+    tool_calls: ?[]const ToolCall = null,
+    tool_call_id: ?[]const u8 = null,
     /// Raw image bytes for multimodal messages (decoded from data URIs).
     /// Null or empty for text-only messages.
     image_bytes: ?[]const []const u8 = null,
@@ -102,6 +108,18 @@ pub const Message = struct {
     /// Optional structured content parts preserving text/image ordering.
     /// Image/audio parts store the index into `image_bytes`/`audio_bytes`.
     content_parts: ?[]const ContentPart = null,
+
+    pub fn textBytes(self: Message) usize {
+        var bytes = self.content.len;
+        if (self.tool_call_id) |id| bytes +|= id.len;
+        if (self.tool_calls) |calls| for (calls) |call| {
+            bytes +|= call.id.len;
+            bytes +|= call.type.len;
+            bytes +|= call.name.len;
+            bytes +|= call.arguments.len;
+        };
+        return bytes;
+    }
 
     pub fn hasImages(self: Message) bool {
         if (self.image_bytes) |imgs| return imgs.len > 0;
@@ -376,8 +394,7 @@ pub fn metalSplitSwaRingRequestEligible(
     if (comptime !build_options.enable_metal) return false;
     return model_config.supportsSplitSwaGlobalKvRing() and
         !gemma4_runtime.wholeFramePrefillExplicitlyDisabled() and
-        !generation_config.prompt_cache_enabled and
-        generation_config.cache_compaction_ratio == null and
+        metalRingDecodeRequestEligible(generation_config) and
         !kvSlidingTrimForced() and
         backends.metal_kv_storage.MetalKvStorage.splitSwaKvRingEnabled();
 }
@@ -504,6 +521,9 @@ pub const ChatTemplate = struct {
                 .role = m.role,
                 .content = m.content,
                 .parts = parts,
+                .content_is_null = m.content_is_null,
+                .tool_calls = m.tool_calls,
+                .tool_call_id = m.tool_call_id,
             };
         }
 
@@ -723,6 +743,7 @@ fn emitCompletedProjectionDelta(
 
 const StreamingTextState = struct {
     emitted_text: []u8,
+    canonical: ?Gemma4Projection = null,
     /// Set from the model contract, independently of tokenizer resolution.
     /// A channel-aware model must never fall back to decoding its raw generated
     /// tokens merely because one of the protocol tokens is missing or malformed.
@@ -747,6 +768,18 @@ const StreamingTextState = struct {
 const gemma4_thought_channel_prompt_suffix = "<|channel>thought\n<channel|>";
 const gemma4_final_channel_prompt_suffix = "<|channel>final\n<channel|>";
 
+/// Canonical Gemma 4 has ordinary public answer text and an optional thought
+/// block. Older caller-supplied final-channel prompts retain their legacy
+/// fail-closed projection; only recognized canonical continuations opt in.
+fn canonicalGemma4Prompt(prompt: []const u8) ?bool {
+    const trimmed = std.mem.trimEnd(u8, prompt, &std.ascii.whitespace);
+    if (std.mem.endsWith(u8, trimmed, "<|channel>thought")) return true;
+    if (std.mem.endsWith(u8, trimmed, "<|turn>model") or
+        std.mem.endsWith(u8, trimmed, gemma4_thought_channel_prompt_suffix) or
+        std.mem.endsWith(u8, trimmed, "<tool_response|>")) return false;
+    return null;
+}
+
 fn promptOpensGemma4FinalChannel(prompt: []const u8) bool {
     return std.mem.endsWith(
         u8,
@@ -759,37 +792,22 @@ fn configPromptOpensGemma4FinalChannel(config: gpt_mod.Config, prompt: []const u
     return config.usesGemma4Channels() and promptOpensGemma4FinalChannel(prompt);
 }
 
-/// Grammar-constrained generation must start in a public channel because the
-/// grammar applies to the first generated token. Leaving the normal private
-/// `thought` channel open would make the grammar reject the final-channel
-/// transition and the fail-closed response projection would correctly withhold
-/// the entire result.
+/// Grammar constraints apply from the first generated token. Close any thought
+/// block in the prompt so its protocol delimiters do not enter the grammar.
 fn openGemma4FinalChannelForGrammar(
     allocator: std.mem.Allocator,
     prompt: []const u8,
 ) ![]u8 {
     const trimmed = std.mem.trimEnd(u8, prompt, &std.ascii.whitespace);
-    const trailing = prompt[trimmed.len..];
+    if (canonicalGemma4Prompt(prompt)) |private| {
+        if (std.mem.endsWith(u8, trimmed, gemma4_thought_channel_prompt_suffix)) return allocator.dupe(u8, prompt);
+        // Close an empty thought block before the grammar's first public token.
+        return std.mem.concat(allocator, u8, &.{ prompt, if (private) "<channel|>" else "<|channel>thought\n<channel|>" });
+    }
     if (std.mem.endsWith(u8, trimmed, gemma4_final_channel_prompt_suffix)) {
         return allocator.dupe(u8, prompt);
     }
-    if (!std.mem.endsWith(u8, trimmed, gemma4_thought_channel_prompt_suffix)) {
-        return error.GrammarRequiresGemma4ChannelPrompt;
-    }
-
-    const prefix_len = trimmed.len - gemma4_thought_channel_prompt_suffix.len;
-    const result = try allocator.alloc(
-        u8,
-        prefix_len + gemma4_final_channel_prompt_suffix.len + trailing.len,
-    );
-    errdefer allocator.free(result);
-    @memcpy(result[0..prefix_len], trimmed[0..prefix_len]);
-    @memcpy(
-        result[prefix_len .. prefix_len + gemma4_final_channel_prompt_suffix.len],
-        gemma4_final_channel_prompt_suffix,
-    );
-    @memcpy(result[result.len - trailing.len ..], trailing);
-    return result;
+    return error.GrammarRequiresGemma4ChannelPrompt;
 }
 
 fn finalChannelContentStart(token_ids: []const i64, marker_id: ?i32) ?usize {
@@ -1076,7 +1094,10 @@ fn emitDecodedDeltaForTokenizer(
     on_token_ctx: *anyopaque,
 ) !bool {
     var projected_ids = generated_token_ids;
-    if (state.final_channel_required) {
+    if (state.canonical) |*projection| {
+        projection.update(generated_token_ids);
+        projected_ids = projection.publicTokens(generated_token_ids);
+    } else if (state.final_channel_required) {
         if (state.final_channel_end_token_id == null) return true;
         const turn_end = state.turn_end_token_id orelse return true;
         const channel_start_token = state.channel_start_token_id orelse return true;
@@ -1932,6 +1953,16 @@ fn getenvBool(comptime name: [*:0]const u8) bool {
 
 fn isPureGreedyConfig(config: GenerationConfig) bool {
     return config.temperature <= 0 and !hasSamplingPenalties(config);
+}
+
+fn metalRingDecodeRequestEligible(config: GenerationConfig) bool {
+    // Sampled/grammar decode may materialize KV through the logits path,
+    // even when prefill used a whole-model frame. Ring storage cannot
+    // satisfy that contract after eviction. Select full-history storage
+    // before prefill; never switch layouts or disable the read guard midway.
+    // Both admission and execution use this policy to reserve the same layout.
+    return isPureGreedyConfig(config) and config.grammar == null and
+        !config.prompt_cache_enabled and config.cache_compaction_ratio == null;
 }
 
 fn requiresCudaDecodeGraphBeforeEagerFallback(
@@ -3035,10 +3066,12 @@ pub const GenerationPipeline = struct {
     model: if (build_options.enable_onnx) *ortgenai.GenAiModel else void,
     chat_template: ?*const ChatTemplate = null,
     prompt_override: ?[]const u8 = null,
+    execution_control: ?InferenceExecutionControl = null,
 
     pub fn generate(self: *GenerationPipeline, messages: []const Message, config: GenerationConfig) !GenerationResult {
         if (!build_options.enable_onnx) return error.OnnxNotEnabled;
         if (config.ignore_eos) return error.IgnoreEosUnsupportedByOrtGenAi;
+        if (self.execution_control) |control| try control.update(.tokenizing, 0, 1);
 
         // Format messages into a prompt
         const prompt = if (self.prompt_override) |override|
@@ -3048,6 +3081,7 @@ pub const GenerationPipeline = struct {
         else
             try formatMessages(self.allocator, messages);
         defer self.allocator.free(prompt);
+        if (self.execution_control) |control| try control.update(.executing, 0, @intCast(@max(config.max_tokens, 1)));
 
         const gen_opts = ortgenai.GenerateOptions{
             .max_tokens = config.max_tokens,
@@ -3067,7 +3101,16 @@ pub const GenerationPipeline = struct {
                 }
             }
 
-            const result = try ortgenai.generateWithImages(self.allocator, self.model, prompt, all_images.items, gen_opts);
+            var result = try ortgenai.generateWithImages(
+                self.allocator,
+                self.model,
+                prompt,
+                all_images.items,
+                gen_opts,
+                self.execution_control,
+            );
+            errdefer result.deinit();
+            if (self.execution_control) |control| try control.check();
             return .{
                 .text = result.text,
                 .token_ids = null,
@@ -3078,7 +3121,9 @@ pub const GenerationPipeline = struct {
             };
         }
 
-        const result = try ortgenai.generate(self.allocator, self.model, prompt, gen_opts);
+        var result = try ortgenai.generate(self.allocator, self.model, prompt, gen_opts, self.execution_control);
+        errdefer result.deinit();
+        if (self.execution_control) |control| try control.check();
         return .{
             .text = result.text,
             .token_ids = null,
@@ -3101,6 +3146,7 @@ pub const GenerationPipeline = struct {
     ) !GenerationResult {
         if (!build_options.enable_onnx) return error.OnnxNotEnabled;
         if (config.ignore_eos) return error.IgnoreEosUnsupportedByOrtGenAi;
+        if (self.execution_control) |control| try control.check();
 
         // Multimodal streaming not supported yet — fall back
         if (messagesHaveImages(messages)) {
@@ -3124,7 +3170,32 @@ pub const GenerationPipeline = struct {
             .top_k = config.top_k,
         };
 
-        const result = try ortgenai.generateStreaming(self.allocator, self.model, prompt, gen_opts, on_token_ctx, on_token);
+        const ForwardingCallback = struct {
+            downstream_ctx: *anyopaque,
+            downstream: TokenCallback,
+
+            fn call(raw: *anyopaque, text: []const u8) bool {
+                const callback: *@This() = @ptrCast(@alignCast(raw));
+                return callback.downstream(callback.downstream_ctx, text);
+            }
+        };
+        var callback = ForwardingCallback{
+            .downstream_ctx = on_token_ctx,
+            .downstream = on_token,
+        };
+        var result = try ortgenai.generateStreaming(
+            self.allocator,
+            self.model,
+            prompt,
+            gen_opts,
+            @ptrCast(&callback),
+            ForwardingCallback.call,
+            self.execution_control,
+        );
+        errdefer result.deinit();
+        if (self.execution_control) |control| control.check() catch |err| {
+            return err;
+        };
         return .{
             .text = result.text,
             .token_ids = null,
@@ -3297,6 +3368,7 @@ pub const NativeGenerationPipeline = struct {
     /// intentionally withholding private reasoning text.
     continue_ctx: ?*anyopaque = null,
     continue_fn: ?*const fn (ctx: *anyopaque) bool = null,
+    execution_control: ?InferenceExecutionControl = null,
     /// Local diagnostics may request the complete generated sequence. Serving
     /// callers must keep the default so private Gemma4 channel tokens stay hidden.
     return_raw_token_ids: bool = false,
@@ -3342,6 +3414,13 @@ pub const NativeGenerationPipeline = struct {
 
     const prefetch_drain_budget_per_step: usize = 4;
     const default_mtp_zero_match_fallback_rounds: usize = 16;
+
+    fn lockExecution(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex) !void {
+        if (self.execution_control) |control|
+            try control.lock(mutex)
+        else
+            platform.sync.lockYielding(mutex);
+    }
 
     fn shouldStopOnEos(self: *const NativeGenerationPipeline, config: GenerationConfig, token: usize) bool {
         return !config.ignore_eos and self.gpt_config.isEosToken(token);
@@ -3426,6 +3505,7 @@ pub const NativeGenerationPipeline = struct {
         on_token_fn: ?TokenCallback,
         on_token_ctx: ?*anyopaque,
     ) !GenerationResult {
+        if (self.execution_control) |control| try control.update(.tokenizing, 0, 1);
         const allocator = self.allocator;
         const started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         const grammar_opens_public_final_channel =
@@ -3467,6 +3547,7 @@ pub const NativeGenerationPipeline = struct {
         }
         const prompt_opens_public_final_channel =
             configPromptOpensGemma4FinalChannel(self.gpt_config, prompt);
+        const canonical_prompt = if (self.gpt_config.usesGemma4Channels()) canonicalGemma4Prompt(prompt) else null;
         const formatted_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
 
         const has_images = messagesHaveImages(messages);
@@ -3579,6 +3660,7 @@ pub const NativeGenerationPipeline = struct {
             encoded_ids = owned_encoded.?.ids;
             encoded_attention_mask = owned_encoded.?.attention_mask;
         }
+        if (self.execution_control) |control| try control.update(.tokenizing, 1, 1);
         const encoded_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
 
         var actual_prompt_tokens: usize = 0;
@@ -4092,8 +4174,20 @@ pub const NativeGenerationPipeline = struct {
         else
             null;
         defer if (owned_final_channel_header) |ids| allocator.free(ids);
+        const owned_thought_header = if (canonical_prompt != null and channel_start != null and final_channel_end != null and turn_end != null)
+            try self.tokenizer.encode(allocator, "<|channel>thought\n")
+        else
+            null;
+        defer if (owned_thought_header) |ids| allocator.free(ids);
         var streaming_text = StreamingTextState{
             .emitted_text = if (stream_enabled) try allocator.dupe(u8, "") else &.{},
+            .canonical = if (owned_thought_header) |header|
+                if (header.len > 1 and header[0] == channel_start.?)
+                    Gemma4Projection.init(canonical_prompt.?, channel_start.?, final_channel_end.?, turn_end.?, header)
+                else
+                    null
+            else
+                null,
             .final_channel_required = final_channel_required,
             .final_channel_preopened = prompt_opens_public_final_channel,
             .final_channel_end_token_id = final_channel_end,
@@ -4176,7 +4270,7 @@ pub const NativeGenerationPipeline = struct {
                     prefill_greedy_token = null;
                     var continued_decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
                     const kv_mutation_mutex = batchKvMutationMutex(self.execution_lock, decode_state.kv_lock);
-                    if (kv_mutation_mutex) |mutex| platform.sync.lockYielding(mutex);
+                    if (kv_mutation_mutex) |mutex| try self.lockExecution(mutex);
                     defer if (kv_mutation_mutex) |mutex| mutex.unlock();
                     _ = try continued_decode_runtime.appendGeneratedToken();
                 }
@@ -4432,6 +4526,7 @@ pub const NativeGenerationPipeline = struct {
                     0;
                 var mtp_acceptance_gate_checked = false;
                 while (tokens_generated < max_tokens) {
+                    if (self.execution_control) |control| try control.update(.executing, @intCast(tokens_generated), @intCast(max_tokens));
                     const remaining = max_tokens - tokens_generated;
                     const step_k = if (use_gemma4_mtp)
                         mtp_adaptive_k.nextK(remaining)
@@ -4736,7 +4831,9 @@ pub const NativeGenerationPipeline = struct {
         const gen_start = prompt_token_count;
         const final_channel_end_token_id = streaming_text.final_channel_end_token_id;
         const turn_end_token_id = streaming_text.turn_end_token_id;
-        const projected_gen_token_ids = finalResponseTokenSlice(
+        const raw_gen_token_ids = token_ids[gen_start..seq_len];
+        if (streaming_text.canonical) |*projection| projection.update(raw_gen_token_ids);
+        const projected_gen_token_ids = if (streaming_text.canonical) |projection| projection.publicTokens(raw_gen_token_ids) else finalResponseTokenSlice(
             token_ids[gen_start..seq_len],
             streaming_text.final_channel_required,
             streaming_text.final_channel_preopened,
@@ -4745,8 +4842,7 @@ pub const NativeGenerationPipeline = struct {
             streaming_text.channel_start_token_id,
             turn_end_token_id,
         );
-        const raw_gen_token_ids = token_ids[gen_start..seq_len];
-        const reasoning_gen_token_ids = reasoningResponseTokenSlice(
+        const reasoning_gen_token_ids = if (streaming_text.canonical) |projection| projection.thoughtTokens(raw_gen_token_ids) else reasoningResponseTokenSlice(
             raw_gen_token_ids,
             streaming_text.final_channel_required,
             streaming_text.final_channel_preopened,
@@ -5324,8 +5420,7 @@ pub const NativeGenerationPipeline = struct {
                 @max(current_chunk_size, max_speculative_rows),
                 self.cb.kind() == .metal and
                     prefilled_tokens == 0 and
-                    !config.prompt_cache_enabled and
-                    config.cache_compaction_ratio == null,
+                    metalRingDecodeRequestEligible(config),
             );
             var processed: usize = 0;
             var plan_chunk_index: usize = 0;
@@ -5402,9 +5497,7 @@ pub const NativeGenerationPipeline = struct {
                     use_metal_prefill_greedy_token,
                     self.execution_lock,
                 );
-                if (direct_execution_mutex) |mutex| {
-                    platform.sync.lockYielding(mutex);
-                }
+                if (direct_execution_mutex) |mutex| try self.lockExecution(mutex);
                 defer if (direct_execution_mutex) |mutex| mutex.unlock();
                 try decode_runtime.appendPrefillChunk(chunk.len);
                 const decode_context = decode_runtime.makeDecodeContext(total_chunk_end, chunk.len);
@@ -5655,7 +5748,7 @@ pub const NativeGenerationPipeline = struct {
         // Match text prefill/decode lock order: scheduler turn, then model.
         // Both stay held until the backend forward and result copy complete.
         const direct_execution_mutex = directPrefillExecutionMutex(true, false, false, self.execution_lock);
-        if (direct_execution_mutex) |mutex| platform.sync.lockYielding(mutex);
+        if (direct_execution_mutex) |mutex| try self.lockExecution(mutex);
         defer if (direct_execution_mutex) |mutex| mutex.unlock();
         const ple_token_ids = prepared.ple_token_ids orelse prepared.token_ids;
         const ple_vectors = try gpt_arch.computePleVectors(&self.cb, self.allocator, self.gpt_config, ple_token_ids, input_embeddings, seq_len);
@@ -6002,6 +6095,7 @@ pub const NativeGenerationPipeline = struct {
         }
 
         while (tokens_generated < max_tokens) {
+            if (self.execution_control) |control| try control.update(.executing, @intCast(tokens_generated), @intCast(max_tokens));
             var used_decode_microbatch = false;
             var direct_decode_turn_acquired = false;
             defer if (direct_decode_turn_acquired) {
@@ -6066,9 +6160,7 @@ pub const NativeGenerationPipeline = struct {
                                 }
                             }
                         }
-                        if (self.execution_lock) |mutex| {
-                            platform.sync.lockYielding(mutex);
-                        }
+                        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
                         defer if (self.execution_lock) |mutex| mutex.unlock();
                         break :direct_token_blk try self.forwardGreedyDeviceDecodeToken(
                             token_ids,
@@ -6196,7 +6288,7 @@ pub const NativeGenerationPipeline = struct {
             tokens_generated += 1;
             {
                 const kv_mutation_mutex = batchKvMutationMutex(self.execution_lock, decode_state.kv_lock);
-                if (kv_mutation_mutex) |mutex| platform.sync.lockYielding(mutex);
+                if (kv_mutation_mutex) |mutex| try self.lockExecution(mutex);
                 defer if (kv_mutation_mutex) |mutex| mutex.unlock();
                 _ = try decode_runtime.appendGeneratedToken();
             }
@@ -6296,6 +6388,7 @@ pub const NativeGenerationPipeline = struct {
             _ = decoder_gated_runtime.decoderRuntimePipelinedControl(&self.cb, .await_only) catch {};
         }
         while (tokens_generated.* < max_tokens) {
+            if (self.execution_control) |control| try control.update(.executing, @intCast(tokens_generated.*), @intCast(max_tokens));
             const remaining = max_tokens - tokens_generated.*;
             var next_token: i64 = -1;
             var speculative_appended = false;
@@ -6418,6 +6511,7 @@ pub const NativeGenerationPipeline = struct {
         );
 
         while (tokens_generated < max_tokens) {
+            if (self.execution_control) |control| try control.update(.executing, @intCast(tokens_generated), @intCast(max_tokens));
             if (candidate_token_tensor == null) {
                 if (tokens_generated == 0) {
                     if (prefill_greedy_token.*) |token| {
@@ -6989,9 +7083,7 @@ pub const NativeGenerationPipeline = struct {
     }
 
     fn makeDeviceTokenTensor(self: *NativeGenerationPipeline, token_id: usize) !?ops.CT {
-        if (self.execution_lock) |mutex| {
-            platform.sync.lockYielding(mutex);
-        }
+        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
         defer if (self.execution_lock) |mutex| mutex.unlock();
         const data = [_]i32{@intCast(token_id)};
         const shape = [_]i32{1};
@@ -11188,14 +11280,12 @@ test "encodePromptForGeneration does not duplicate literal bos prefix" {
     );
 }
 
-test "grammar prompt opens Gemma4 public final channel" {
+test "grammar prompt opens Gemma4 public answer after an empty thought block" {
     const allocator = std.testing.allocator;
     const thought_prompt =
         "<bos><|turn>user\nReturn JSON<turn|>\n<|turn>model\n" ++
         gemma4_thought_channel_prompt_suffix ++ "\n";
-    const expected =
-        "<bos><|turn>user\nReturn JSON<turn|>\n<|turn>model\n" ++
-        gemma4_final_channel_prompt_suffix ++ "\n";
+    const expected = thought_prompt;
     const opened = try openGemma4FinalChannelForGrammar(allocator, thought_prompt);
     defer allocator.free(opened);
     try std.testing.expectEqualStrings(expected, opened);
@@ -11204,10 +11294,36 @@ test "grammar prompt opens Gemma4 public final channel" {
     defer allocator.free(already_open);
     try std.testing.expectEqualStrings(expected, already_open);
 
+    const bare_prompt = "<bos><|turn>user\nReturn JSON<turn|>\n<|turn>model\n";
+    const bare_opened = try openGemma4FinalChannelForGrammar(allocator, bare_prompt);
+    defer allocator.free(bare_opened);
+    try std.testing.expectEqualStrings(bare_prompt ++ gemma4_thought_channel_prompt_suffix, bare_opened);
+    const private_opened = try openGemma4FinalChannelForGrammar(allocator, bare_prompt ++ "<|channel>thought\n");
+    defer allocator.free(private_opened);
+    try std.testing.expectEqualStrings(bare_opened, private_opened);
+
     try std.testing.expectError(
         error.GrammarRequiresGemma4ChannelPrompt,
         openGemma4FinalChannelForGrammar(allocator, "<bos>raw prompt"),
     );
+}
+
+test "chat template preserves tool history and structured arguments" {
+    const alloc = std.testing.allocator;
+    var template = try ChatTemplate.init(alloc, "{% for m in messages %}{% if m.tool_calls %}{% if m.content is none %}null:{% endif %}{% for c in m.tool_calls %}{{ c.id }}:{{ c.type }}:{{ c.function.name }}:{{ c.function.arguments.query }}:{{ c.function.arguments.limit }}:{{ c.function.arguments.filters.tags[0] }}{% endfor %}{% elif m.role == 'tool' %}|{{ m.tool_call_id }}:{{ m.content }}{% endif %}{% endfor %}", "", "", "", "");
+    defer template.deinit();
+    const messages = [_]Message{
+        .{ .role = "assistant", .content = "", .content_is_null = true, .tool_calls = &.{.{
+            .id = "call_1",
+            .name = "search",
+            .arguments = "{\"query\":\"anatomy\",\"limit\":3,\"filters\":{\"tags\":[\"science\"]}}",
+        }} },
+        .{ .role = "tool", .content = "AZURE-731", .tool_call_id = "call_1" },
+    };
+    const prompt = try template.apply(alloc, &messages, true);
+    defer alloc.free(prompt);
+    try std.testing.expectEqualStrings("null:call_1:function:search:anatomy:3:science|call_1:AZURE-731", prompt);
+    try std.testing.expectError(error.ToolHistoryRequiresChatTemplate, formatMessages(alloc, &messages));
 }
 
 test "chat template enable_thinking false opens an explicit final channel" {
@@ -13359,6 +13475,22 @@ test "whole-model prefill stays bounded and speculative width is validated" {
     try validateSpeculativeK(false, runtime.tier.memory.generation_max_speculative_k + 1);
 }
 
+test "Metal ring admission excludes decode paths that require materialized KV" {
+    try std.testing.expect(metalRingDecodeRequestEligible(.{ .temperature = 0 }));
+    const model_config = gpt_mod.Config{ .family = .gemma, .num_hidden_layers = 6, .position_encoding = .rope, .sliding_window = 512, .sliding_window_pattern = 6, .ple_hidden_size = 256 };
+    for ([_]GenerationConfig{
+        .{ .temperature = 0.7 },
+        .{ .temperature = 0, .grammar = "json" },
+        .{ .temperature = 0, .frequency_penalty = 0.1 },
+        .{ .temperature = 0, .repetition_penalty = 1.1 },
+        .{ .temperature = 0, .prompt_cache_enabled = true },
+        .{ .temperature = 0, .cache_compaction_ratio = 0.5 },
+    }) |config| {
+        try std.testing.expect(!metalRingDecodeRequestEligible(config));
+        try std.testing.expectEqual(.full_history, generationKvCapacityPolicyForRoute(.metal_whole_model, model_config, config, .f16));
+    }
+}
+
 test "generation KV capacity policy is route and device-format aware" {
     const config = gpt_mod.Config{
         .family = .gemma,
@@ -14701,6 +14833,10 @@ pub fn formatMessages(allocator: std.mem.Allocator, messages: []const Message) !
     defer buf.deinit(allocator);
 
     for (messages) |msg| {
+        // Tool syntax is model-specific. Never silently erase call history
+        // when the model has no usable chat template.
+        if (msg.tool_calls != null or msg.tool_call_id != null or std.mem.eql(u8, msg.role, "tool"))
+            return error.ToolHistoryRequiresChatTemplate;
         if (std.mem.eql(u8, msg.role, "system")) {
             try buf.appendSlice(allocator, "System: ");
         } else if (std.mem.eql(u8, msg.role, "user")) {

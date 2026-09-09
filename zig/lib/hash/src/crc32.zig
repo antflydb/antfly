@@ -1,205 +1,177 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-//! IEEE CRC32 with exactly the std.hash.Crc32 wire semantics. The accelerated
-//! path is selected only when the compilation target guarantees ARM CRC;
-//! portable slicing-by-eight handles every other target, including x86 (whose
-//! SSE4.2 CRC instruction uses a different polynomial). Neither path allocates.
-//! The algorithm originated in lib/image's PNG encoder. Keep this module
-//! dependency-free so storage formats and other libraries can share it.
+//! IEEE CRC32 and CRC32C with std-compatible streaming and wire semantics.
+//! Compilation-target guarantees bypass discovery. Baseline builds discover
+//! optional instructions once, and unsupported platforms remain portable.
 const std = @import("std");
 const builtin = @import("builtin");
+const cpu = @import("cpu.zig");
+const portable = @import("portable_crc.zig");
+const arm = @import("arm_crc.zig");
+const x86_ieee = @import("x86_crc32.zig");
+const x86_castagnoli = @import("x86_crc32c.zig");
 
-pub const Crc32 = struct {
-    crc: u32 = 0xffffffff,
+// Zig 0.16's non-LLVM x86 backend cannot encode either PCLMULQDQ or
+// CRC32 r64,r64. Keep those kernels out of semantic analysis in Debug builds
+// using that backend; LLVM release builds retain hardware acceleration.
+const asm_kernels_supported = builtin.zig_backend != .stage2_c and builtin.zig_backend != .stage2_x86_64;
 
-    pub fn init() Crc32 {
-        return .{};
-    }
+pub const Crc32 = Crc(false);
+pub const Crc32c = Crc(true);
+pub const Implementation = enum { slicing_by_eight, arm_crc, x86_pclmul, x86_crc };
 
-    pub fn update(self: *Crc32, bytes: []const u8) void {
-        if (comptime builtin.cpu.arch == .aarch64 and std.Target.aarch64.featureSetHas(builtin.cpu.features, .crc)) {
-            self.crc = crc32Arm64Update(self.crc, bytes);
-        } else {
-            self.crc = portableUpdate(self.crc, bytes);
+fn Crc(comptime castagnoli: bool) type {
+    return struct {
+        const Self = @This();
+        const polynomial: u32 = if (castagnoli) 0x82f63b78 else 0xedb88320;
+        crc: u32 = 0xffffffff,
+
+        pub fn init() Self {
+            return .{};
         }
-    }
 
-    pub fn final(self: Crc32) u32 {
-        return self.crc ^ 0xffffffff;
-    }
-
-    pub fn hash(bytes: []const u8) u32 {
-        var crc = init();
-        crc.update(bytes);
-        return crc.final();
-    }
-};
-
-fn portableUpdate(initial_crc: u32, bytes: []const u8) u32 {
-    const tables = comptime crc32SlicingTables();
-    var crc = initial_crc;
-    var index: usize = 0;
-
-    while (index + 8 <= bytes.len) : (index += 8) {
-        crc ^= readU32le(bytes[index .. index + 4]);
-        const next = readU32le(bytes[index + 4 .. index + 8]);
-        crc =
-            tables[7][@as(u8, @truncate(crc))] ^
-            tables[6][@as(u8, @truncate(crc >> 8))] ^
-            tables[5][@as(u8, @truncate(crc >> 16))] ^
-            tables[4][@as(u8, @truncate(crc >> 24))] ^
-            tables[3][@as(u8, @truncate(next))] ^
-            tables[2][@as(u8, @truncate(next >> 8))] ^
-            tables[1][@as(u8, @truncate(next >> 16))] ^
-            tables[0][@as(u8, @truncate(next >> 24))];
-    }
-
-    while (index < bytes.len) : (index += 1) {
-        crc = tables[0][@as(u8, @truncate(crc ^ bytes[index]))] ^ (crc >> 8);
-    }
-    return crc;
-}
-
-fn crc32SlicingTables() [8][256]u32 {
-    @setEvalBranchQuota(30000);
-    const polynomial: u32 = 0xedb88320;
-    var tables: [8][256]u32 = undefined;
-    for (0..256) |i| {
-        var crc: u32 = @intCast(i);
-        for (0..8) |_| {
-            crc = if ((crc & 1) != 0) (crc >> 1) ^ polynomial else crc >> 1;
+        /// Available bulk kernel. Short IEEE buffers use the portable path
+        /// even when PCLMUL is available, avoiding folding setup overhead.
+        pub fn implementation() Implementation {
+            const baseline = comptime select(cpu.guaranteed());
+            if (comptime baseline != .slicing_by_eight) return baseline;
+            return select(cpu.features());
         }
-        tables[0][i] = crc;
-    }
-    for (1..8) |table_index| {
-        for (0..256) |i| {
-            const previous = tables[table_index - 1][i];
-            tables[table_index][i] = (previous >> 8) ^ tables[0][@as(u8, @truncate(previous))];
+
+        fn select(features: cpu.Features) Implementation {
+            if (comptime !asm_kernels_supported) return .slicing_by_eight;
+            return switch (builtin.cpu.arch) {
+                .aarch64 => if (features.arm_crc) .arm_crc else .slicing_by_eight,
+                .x86_64 => if (castagnoli)
+                    (if (features.x86_crc) .x86_crc else .slicing_by_eight)
+                else
+                    (if (features.pclmul) .x86_pclmul else .slicing_by_eight),
+                else => .slicing_by_eight,
+            };
         }
-    }
-    return tables;
+
+        pub fn update(self: *Self, bytes: []const u8) void {
+            if (bytes.len == 0) return;
+            if (@inComptime()) {
+                self.updatePortable(bytes);
+                return;
+            }
+            if (comptime asm_kernels_supported) {
+                if (comptime builtin.cpu.arch == .aarch64) {
+                    if (implementation() == .arm_crc) {
+                        self.crc = arm.update(castagnoli, self.crc, bytes);
+                        return;
+                    }
+                } else if (comptime builtin.cpu.arch == .x86_64) {
+                    if (comptime castagnoli) {
+                        if (implementation() == .x86_crc) {
+                            self.crc = x86_castagnoli.update(self.crc, bytes);
+                            return;
+                        }
+                    } else if (bytes.len >= 64 and implementation() == .x86_pclmul) {
+                        const folded_len = bytes.len & ~@as(usize, 15);
+                        self.crc = x86_ieee.update(self.crc, bytes[0..folded_len]);
+                        self.updatePortable(bytes[folded_len..]);
+                        return;
+                    }
+                }
+            }
+            self.updatePortable(bytes);
+        }
+
+        fn updatePortable(self: *Self, bytes: []const u8) void {
+            self.crc = portable.update(u32, polynomial, self.crc, bytes);
+        }
+
+        pub fn final(self: Self) u32 {
+            return self.crc ^ 0xffffffff;
+        }
+
+        pub fn hash(bytes: []const u8) u32 {
+            var crc = init();
+            crc.update(bytes);
+            return crc.final();
+        }
+    };
 }
 
-fn readU32le(bytes: []const u8) u32 {
-    return @as(u32, bytes[0]) |
-        (@as(u32, bytes[1]) << 8) |
-        (@as(u32, bytes[2]) << 16) |
-        (@as(u32, bytes[3]) << 24);
+test "CRC32 and CRC32C preserve known vectors and comptime hashing" {
+    try std.testing.expectEqual(@as(u32, 0xcbf43926), Crc32.hash("123456789"));
+    try std.testing.expectEqual(@as(u32, 0xe3069283), Crc32c.hash("123456789"));
+    try std.testing.expectEqual(@as(u32, 0xcbf43926), comptime Crc32.hash("123456789"));
+    try std.testing.expectEqual(@as(u32, 0xe3069283), comptime Crc32c.hash("123456789"));
+    try std.testing.expectEqual(@as(u32, 0), Crc32.hash(""));
+    try std.testing.expectEqual(@as(u32, 0), Crc32c.hash(""));
+    // SSE4.2 alone must never select IEEE acceleration.
+    try std.testing.expectEqual(Implementation.slicing_by_eight, Crc32.select(.{ .x86_crc = true }));
+    try std.testing.expectEqual(Implementation.slicing_by_eight, Crc32.select(.{}));
+    try std.testing.expectEqual(Implementation.slicing_by_eight, Crc32c.select(.{}));
 }
 
-fn readU16le(bytes: []const u8) u16 {
-    return @as(u16, bytes[0]) |
-        (@as(u16, bytes[1]) << 8);
+test "CRC dispatch selects the available bulk kernels" {
+    const available = cpu.features();
+    try std.testing.expectEqual(Crc32.select(available), Crc32.implementation());
+    try std.testing.expectEqual(Crc32c.select(available), Crc32c.implementation());
+    std.debug.print("CRC dispatch target={s} crc32={s} crc32c={s}\n", .{
+        builtin.cpu.model.name, @tagName(Crc32.implementation()), @tagName(Crc32c.implementation()),
+    });
 }
 
-fn readU64le(bytes: []const u8) u64 {
-    return @as(u64, bytes[0]) |
-        (@as(u64, bytes[1]) << 8) |
-        (@as(u64, bytes[2]) << 16) |
-        (@as(u64, bytes[3]) << 24) |
-        (@as(u64, bytes[4]) << 32) |
-        (@as(u64, bytes[5]) << 40) |
-        (@as(u64, bytes[6]) << 48) |
-        (@as(u64, bytes[7]) << 56);
-}
-
-fn crc32Arm64Update(initial_crc: u32, bytes: []const u8) u32 {
-    var crc = initial_crc;
-    var index: usize = 0;
-    while (index + 8 <= bytes.len) : (index += 8) {
-        crc = crc32Arm64U64(crc, readU64le(bytes[index .. index + 8]));
-    }
-    if (index + 4 <= bytes.len) {
-        crc = crc32Arm64U32(crc, readU32le(bytes[index .. index + 4]));
-        index += 4;
-    }
-    if (index + 2 <= bytes.len) {
-        crc = crc32Arm64U16(crc, readU16le(bytes[index .. index + 2]));
-        index += 2;
-    }
-    if (index < bytes.len) {
-        crc = crc32Arm64U8(crc, bytes[index]);
-    }
-    return crc;
-}
-
-fn crc32Arm64U64(crc: u32, value: u64) u32 {
-    return asm ("crc32x %[out:w], %[crc:w], %[value]"
-        : [out] "=r" (-> u32),
-        : [crc] "r" (crc),
-          [value] "r" (value),
-    );
-}
-
-fn crc32Arm64U32(crc: u32, value: u32) u32 {
-    return asm ("crc32w %[out:w], %[crc:w], %[value:w]"
-        : [out] "=r" (-> u32),
-        : [crc] "r" (crc),
-          [value] "r" (value),
-    );
-}
-
-fn crc32Arm64U16(crc: u32, value: u16) u32 {
-    return asm ("crc32h %[out:w], %[crc:w], %[value:w]"
-        : [out] "=r" (-> u32),
-        : [crc] "r" (crc),
-          [value] "r" (value),
-    );
-}
-
-fn crc32Arm64U8(crc: u32, value: u8) u32 {
-    return asm ("crc32b %[out:w], %[crc:w], %[value:w]"
-        : [out] "=r" (-> u32),
-        : [crc] "r" (crc),
-          [value] "r" (value),
-    );
-}
-
-test "native CRC32 agrees with standard across alignment tails and incremental updates" {
-    var bytes: [4097]u8 = undefined;
+test "CRC32 kernels agree across unaligned buffers tails and incremental updates" {
+    var bytes: [65536 + 32]u8 = undefined;
     var random = std.Random.DefaultPrng.init(0x593c32);
     random.random().bytes(&bytes);
-    try std.testing.expectEqual(@as(u32, 0xcbf43926), Crc32.hash("123456789"));
-    for (0..8) |offset| {
-        for (0..257) |len| {
-            const data = bytes[offset..][0..len];
-            const expected = std.hash.Crc32.hash(data);
-            try std.testing.expectEqual(expected, Crc32.hash(data));
-            try std.testing.expectEqual(expected, portableUpdate(0xffffffff, data) ^ 0xffffffff);
-            var crc = Crc32.init();
-            crc.update(data[0 .. len / 3]);
-            crc.update(&.{});
-            crc.update(data[len / 3 .. len / 2]);
-            crc.update(data[len / 2 ..]);
-            try std.testing.expectEqual(expected, crc.final());
+    inline for (.{ false, true }) |castagnoli| {
+        const Impl = Crc(castagnoli);
+        const Oracle = if (castagnoli) std.hash.crc.Crc32Iscsi else std.hash.Crc32;
+        for (0..32) |offset| {
+            for (0..513) |len| try check(Impl, Oracle, bytes[offset..][0..len]);
+            for ([_]usize{ 1023, 1024, 1031, 4095, 4096, 16383, 16384, 65535, 65536 }) |len| {
+                try check(Impl, Oracle, bytes[offset..][0..len]);
+            }
+        }
+        for (0..256) |split| {
+            const data = bytes[1..1028];
+            var crc = Impl.init();
+            crc.update(data[0..split]);
+            crc.update(data[split..]);
+            try std.testing.expectEqual(Oracle.hash(data), crc.final());
         }
     }
-    try std.testing.expectEqual(std.hash.Crc32.hash(&bytes), Crc32.hash(&bytes));
-    var portable = portableUpdate(0xffffffff, bytes[0..1999]);
-    portable = portableUpdate(portable, bytes[1999..]);
-    try std.testing.expectEqual(std.hash.Crc32.hash(&bytes), portable ^ 0xffffffff);
 }
 
-test "native CRC32 throughput microbenchmark" {
-    if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
-    const alloc = std.testing.allocator;
-    const bytes = try alloc.alloc(u8, 1024 * 1024);
-    defer alloc.free(bytes);
-    var random = std.Random.DefaultPrng.init(0x593);
-    random.random().bytes(bytes);
-    for (0..3) |round| {
-        inline for (.{ std.hash.Crc32, Crc32 }) |Impl| {
-            var sum: u32 = 0;
-            const started = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
-            for (0..64) |iteration| {
-                bytes[0] = @truncate(iteration + round);
-                sum +%= Impl.hash(bytes);
-            }
-            const elapsed = std.Io.Clock.awake.now(std.testing.io).nanoseconds - started;
-            std.debug.print("crc32 implementation={s} bytes={} elapsed_ns={} checksum={}\n", .{
-                @typeName(Impl), bytes.len * 64, elapsed, sum,
-            });
-        }
-    }
+fn check(comptime Impl: type, comptime Oracle: type, data: []const u8) !void {
+    const expected = Oracle.hash(data);
+    try std.testing.expectEqual(expected, Impl.hash(data));
+    var fast = Impl.init();
+    var slow = Impl.init();
+    const split = data.len / 3;
+    fast.update(data[0..split]);
+    fast.update(&.{});
+    fast.update(data[split..]);
+    slow.updatePortable(data[0..split]);
+    slow.updatePortable(&.{});
+    slow.updatePortable(data[split..]);
+    try std.testing.expectEqual(expected, fast.final());
+    try std.testing.expectEqual(expected, slow.final());
+    // final is non-mutating and both states remain usable after it.
+    fast.update("suffix");
+    slow.updatePortable("suffix");
+    var oracle = Oracle.init();
+    oracle.update(data);
+    oracle.update("suffix");
+    try std.testing.expectEqual(oracle.final(), fast.final());
+    try std.testing.expectEqual(oracle.final(), slow.final());
 }

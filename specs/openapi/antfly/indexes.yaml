@@ -329,6 +329,19 @@ components:
           embeddings: "#/components/schemas/CreateEmbeddingsIndexRequest"
           graph: "#/components/schemas/CreateGraphIndexRequest"
           algebraic: "#/components/schemas/CreateAlgebraicIndexRequest"
+    IndexMutationConflictError:
+      type: object
+      additionalProperties: false
+      description: An index mutation conflict. When `error` is `metadata_mutation_outcome_unknown`, the mutation may already have committed and callers must observe index state before deciding whether to issue another mutation.
+      required: [error, message, retryable]
+      properties:
+        error:
+          type: string
+          enum: [table_mutation_conflict, artifact_dependency_conflict, metadata_mutation_outcome_unknown]
+        message:
+          type: string
+        retryable:
+          type: boolean
     CreatedIndexCommon:
       type: object
       description: "Fields returned for every newly created index. Provider credentials are write-only and are never returned."
@@ -1434,6 +1447,16 @@ components:
         - worker_failed
         - worker_started
         - stalled
+        - stall_reason
+        - active_phase
+        - active_model
+        - active_backend
+        - active_deadline_ms
+        - last_progress_ms
+        - active_progress_completed
+        - active_progress_total
+        - inference_timeout_count
+        - inference_cancel_count
         - skip_by_hash_count
         - skipped_source_count
         - codec_decode_failures
@@ -1509,7 +1532,36 @@ components:
           description: "Whether the background enrichment worker is currently running."
         stalled:
           type: boolean
-          description: "Whether work is pending with no running worker, retry, or terminal failure explaining the backlog."
+          description: "Whether pending work has no worker or has exceeded its execution/progress deadline."
+        stall_reason:
+          type: string
+          enum: ["", worker_missing, model_loading, embedding_overdue, publishing_overdue]
+        active_phase:
+          type: string
+          enum: [idle, loading_model, tokenizing, executing, serializing, publishing]
+        active_model:
+          type: string
+        active_backend:
+          type: string
+        active_deadline_ms:
+          type: integer
+          format: uint64
+          description: "Display-only Unix deadline in milliseconds; timeout decisions use a monotonic clock."
+        last_progress_ms:
+          type: integer
+          format: uint64
+        active_progress_completed:
+          type: integer
+          format: uint64
+        active_progress_total:
+          type: integer
+          format: uint64
+        inference_timeout_count:
+          type: integer
+          format: uint64
+        inference_cancel_count:
+          type: integer
+          format: uint64
         skip_by_hash_count:
           type: integer
           format: uint64

@@ -1823,6 +1823,8 @@ pub const AntflyGeneratorConfig = struct {
 /// Configuration for the Antfly inference reranking provider.
 pub const AntflyRerankerConfig = struct {
     provider: []const u8,
+    /// Optional bearer API key for remote Antfly inference. Supports secret references and defaults to ANTFLY_INFERENCE_API_KEY. Embedded inference does not resolve or use outbound credentials.
+    api_key: ?[]const u8 = null,
     /// Optional reranking model name. When omitted, Antfly inference selects a model from its reranker model directory. Set this explicitly when more than one local reranker is installed.
     model: ?[]const u8 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
@@ -1831,6 +1833,7 @@ pub const AntflyRerankerConfig = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", false },
+        .{ "api_key", "api_key", true },
         .{ "model", "model", true },
         .{ "url", "url", true },
     };
@@ -1847,6 +1850,10 @@ pub const AntflyRerankerConfig = struct {
         try jw.beginObject();
         try jw.objectField("provider");
         try jw.write(self.provider);
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
         if (self.model) |value| {
             try jw.objectField("model");
             try jw.write(value);
@@ -8459,6 +8466,7 @@ pub const EmbedderConfig = struct {
     batch_size: ?i64 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
+    rate_limit: ?RateLimitConfig = null,
     /// Declare that this model supports non-text content (images, audio, video, PDFs), even if the model isn't in Antfly's built-in model registry yet. When `true`, Antfly treats the model as multimodal and sends binary content (images, audio, etc.) through an embedding adapter that supports content parts. Antfly currently provides that contract for local Antfly inference and Bedrock; text-only provider adapters reject media rather than silently discarding it. Not needed for models already in the local registry (e.g., `clip-*`, `clipclap`). **Example:** ```json { "provider": "antfly", "model": "some-future-multimodal-model", "multimodal": true } ```
     multimodal: ?bool = null,
     /// Deprecated compatibility form of `retrieval.query_input_type`. New configurations should use the nested `retrieval` object.
@@ -8487,6 +8495,7 @@ pub const EmbedderConfig = struct {
         .{ "strip_new_lines", "strip_new_lines", true },
         .{ "batch_size", "batch_size", true },
         .{ "api_url", "api_url", true },
+        .{ "rate_limit", "rate_limit", true },
         .{ "multimodal", "multimodal", true },
         .{ "query_input_type", "query_input_type", true },
         .{ "document_input_type", "document_input_type", true },
@@ -8569,6 +8578,10 @@ pub const EmbedderConfig = struct {
         }
         if (self.api_url) |value| {
             try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        if (self.rate_limit) |value| {
+            try jw.objectField("rate_limit");
             try jw.write(value);
         }
         if (self.multimodal) |value| {
@@ -9655,8 +9668,19 @@ pub const EnrichmentRuntimeStatus = struct {
     worker_failed: bool,
     /// Whether the background enrichment worker is currently running.
     worker_started: bool,
-    /// Whether work is pending with no running worker, retry, or terminal failure explaining the backlog.
+    /// Whether pending work has no worker or has exceeded its execution/progress deadline.
     stalled: bool,
+    stall_reason: []const u8,
+    active_phase: []const u8,
+    active_model: []const u8,
+    active_backend: []const u8,
+    /// Display-only Unix deadline in milliseconds; timeout decisions use a monotonic clock.
+    active_deadline_ms: i64,
+    last_progress_ms: i64,
+    active_progress_completed: i64,
+    active_progress_total: i64,
+    inference_timeout_count: i64,
+    inference_cancel_count: i64,
     skip_by_hash_count: i64,
     skipped_source_count: i64,
     codec_decode_failures: i64,
@@ -12456,6 +12480,7 @@ pub const GeneratorConfig = struct {
     frequency_penalty: ?f32 = null,
     /// Penalty for token presence (-2.0 to 2.0).
     presence_penalty: ?f32 = null,
+    rate_limit: ?RateLimitConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -12474,6 +12499,7 @@ pub const GeneratorConfig = struct {
         .{ "api_url", "api_url", true },
         .{ "frequency_penalty", "frequency_penalty", true },
         .{ "presence_penalty", "presence_penalty", true },
+        .{ "rate_limit", "rate_limit", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -12544,6 +12570,10 @@ pub const GeneratorConfig = struct {
         }
         if (self.presence_penalty) |value| {
             try jw.objectField("presence_penalty");
+            try jw.write(value);
+        }
+        if (self.rate_limit) |value| {
+            try jw.objectField("rate_limit");
             try jw.write(value);
         }
         try jw.endObject();
@@ -17191,6 +17221,13 @@ pub const IndexMilestoneStatus = struct {
 pub const IndexMilestones = struct {
     queryable: IndexMilestoneStatus,
     complete: IndexMilestoneStatus,
+};
+
+/// An index mutation conflict. When `error` is `metadata_mutation_outcome_unknown`, the mutation may already have committed and callers must observe index state before deciding whether to issue another mutation.
+pub const IndexMutationConflictError = struct {
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
 };
 
 /// A retryable index mutation failure, including a distributed artifact-source protocol fence or a temporarily unavailable model probe.
@@ -24696,7 +24733,7 @@ pub const QueryBuilderRequest = struct {
     decisions: ?[]const AgentDecision = null,
     /// If true, the agent may return clarification questions when needed.
     interactive: ?bool = null,
-    /// Additive bounded-agent field for the query builder. Phase 1 remains a single-pass generation flow, but this field is echoed in result accounting.
+    /// Maximum planning tool calls (0-20). Zero uses the compatibility planner. A positive value enables model-directed table inspection and complete QueryRequest submission using the canonical DSL parser and runtime preflight, with validation feedback for repair. It requires an Antfly or OpenAI tool-capable generator and never executes database searches.
     max_internal_iterations: ?i64 = null,
     /// Maximum number of clarification turns the agent may request from the user.
     max_user_clarifications: ?i64 = null,
@@ -26113,6 +26150,60 @@ pub const QueryUnprocessableError = union(enum) {
     }
 };
 
+/// Outbound provider limits shared within one Antfly process by effective endpoint, operation, model, credential source, project and region/location. Conflicting policies for an active scope are rejected. These limits do not coordinate across replicas or infer the provider's account quota.
+pub const RateLimitConfig = struct {
+    /// Request pacing mode. Defaults to token_bucket. Legacy flat embedder RPM with burst=1 uses completion pacing.
+    pacing: ?RequestPacing = null,
+    requests_per_minute: ?i64 = null,
+    burst: ?i64 = null,
+    /// Conservative text budget: each HTTP attempt reserves its serialized UTF-8 body byte count plus the configured generation output cap. Reservations are not refunded. A request larger than this budget is rejected. This is not provider billing token accounting; media requests are not supported with this limit.
+    tokens_per_minute: ?i64 = null,
+    /// Maximum in-flight HTTP attempts, held through response completion.
+    max_concurrency: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "pacing", "pacing", true },
+        .{ "requests_per_minute", "requests_per_minute", true },
+        .{ "burst", "burst", true },
+        .{ "tokens_per_minute", "tokens_per_minute", true },
+        .{ "max_concurrency", "max_concurrency", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.pacing) |value| {
+            try jw.objectField("pacing");
+            try jw.write(value);
+        }
+        if (self.requests_per_minute) |value| {
+            try jw.objectField("requests_per_minute");
+            try jw.write(value);
+        }
+        if (self.burst) |value| {
+            try jw.objectField("burst");
+            try jw.write(value);
+        }
+        if (self.tokens_per_minute) |value| {
+            try jw.objectField("tokens_per_minute");
+            try jw.write(value);
+        }
+        if (self.max_concurrency) |value| {
+            try jw.objectField("max_concurrency");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// An Antfly query expression retained as syntactically validated JSON and compiled by the query engine.
 pub const RawQuery = @import("antfly-json").RawValue;
 
@@ -26687,6 +26778,32 @@ pub const ReplicationTransformOp = struct {
     }
 };
 
+/// token_bucket limits admission rate while allowing overlapping attempts. completion serializes attempts and waits one RPM interval after each attempt finishes, including streamed writes and transport failures. This prevents delayed connection setup from compressing successful request spacing, at the cost of response latency plus one interval per request. Requires requests_per_minute and burst=1. Neither mode can guarantee zero upstream 429s or coordinate other processes.
+pub const RequestPacing = enum {
+    token_bucket,
+    completion,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .token_bucket => "token_bucket",
+            .completion => "completion",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "token_bucket", .token_bucket },
+            .{ "completion", .completion },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RerankerCandidateLimitExceededError = struct {
     status: i32,
     @"error": []const u8,
@@ -26700,6 +26817,7 @@ pub const RerankerCandidateLimitExceededError = struct {
 
 /// A unified configuration for a reranking provider.
 pub const RerankerConfig = struct {
+    rate_limit: ?RateLimitConfig = null,
     provider: RerankerProvider,
     /// Field name to extract from documents for reranking.
     field: ?[]const u8 = null,
@@ -26711,10 +26829,10 @@ pub const RerankerConfig = struct {
     candidate_count: ?i64 = null,
     /// Deprecated compatibility override for QueryRequest.limit. When present, this is the final page size after reranking and offset is applied after scoring. Prefer QueryRequest.limit. Cannot exceed candidate_count when both are present or the selected provider's candidate ceiling; Vertex currently accepts at most 200.
     top_n: ?i64 = null,
+    /// Optional bearer API key for remote Antfly inference. Supports secret references and defaults to ANTFLY_INFERENCE_API_KEY. Embedded inference does not resolve or use outbound credentials.
+    api_key: ?[]const u8 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     url: ?[]const u8 = null,
-    /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
-    api_key: ?[]const u8 = null,
     /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
     project_id: ?[]const u8 = null,
     /// Path to an ADC credential JSON file (service-account, authorized-user, or external-account). Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to the default ADC chain.
@@ -26722,14 +26840,15 @@ pub const RerankerConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "rate_limit", "rate_limit", true },
         .{ "provider", "provider", true },
         .{ "field", "field", true },
         .{ "template", "template", true },
         .{ "model", "model", true },
         .{ "candidate_count", "candidate_count", true },
         .{ "top_n", "top_n", true },
-        .{ "url", "url", true },
         .{ "api_key", "api_key", true },
+        .{ "url", "url", true },
         .{ "project_id", "project_id", true },
         .{ "credentials_path", "credentials_path", true },
     };
@@ -26744,6 +26863,10 @@ pub const RerankerConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.rate_limit) |value| {
+            try jw.objectField("rate_limit");
+            try jw.write(value);
+        }
         try jw.objectField("provider");
         try jw.write(self.provider);
         if (self.field) |value| {
@@ -26766,12 +26889,12 @@ pub const RerankerConfig = struct {
             try jw.objectField("top_n");
             try jw.write(value);
         }
-        if (self.url) |value| {
-            try jw.objectField("url");
-            try jw.write(value);
-        }
         if (self.api_key) |value| {
             try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.url) |value| {
+            try jw.objectField("url");
             try jw.write(value);
         }
         if (self.project_id) |value| {
@@ -27035,7 +27158,7 @@ pub const RestoreRequest = struct {
     connection: []const u8,
 };
 
-/// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes. Authenticated row filters are enforced on every initial and generated operation in both modes, including scans, aggregates, and graph/tree traversal. They cannot be replaced or weakened by model tool arguments.
+/// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes. A query may contain only a table scope and caller constraints: build_query delegates to the query-builder agent, then search executes its validated QueryRequest. Refinements use the same canonical full-DSL validator, not keyword substitution. Authenticated row filters are enforced on every initial and generated operation in both modes, including scans, aggregates, and graph/tree traversal. They cannot be replaced or weakened by model tool arguments.
 pub const RetrievalAgentRequest = struct {
     /// User's natural language query
     query: []const u8,
@@ -27053,7 +27176,7 @@ pub const RetrievalAgentRequest = struct {
     decisions: ?[]const AgentDecision = null,
     /// If true, the agent may return clarification questions when needed.
     interactive: ?bool = null,
-    /// Maximum number of internal tool-calling rounds. - 0: Pipeline mode — execute provided queries directly, no LLM loop - 1+: Agentic mode — LLM decides which tools to call
+    /// Maximum number of model-generation rounds across retrieval and any delegated query-builder calls. All calls share the request deadline and cancellation. Tool calls are additionally capped at 20 overall. - 0: Pipeline mode — execute provided queries directly, no LLM loop - 1+: Agentic mode — LLM decides which tools to call
     max_internal_iterations: ?i64 = null,
     /// Maximum number of clarification turns the agent may request from the user.
     max_user_clarifications: ?i64 = null,
@@ -28017,10 +28140,57 @@ pub const RuntimeDecl = struct {
     }
 };
 
-/// Emitted when an error occurs during retrieval
+/// Terminal retrieval failure. Capacity events carry the complete InferenceCapacityError envelope, including message, reason, retryable and retry_after_ms; generic failures may carry only error.
 pub const SSEError = struct {
-    /// Error message
+    /// Error message or stable machine-readable code.
     @"error": []const u8,
+    /// Human-readable error description.
+    message: ?[]const u8 = null,
+    reason: ?[]const u8 = null,
+    /// Whether the failure is temporary and the request may be retried.
+    retryable: ?bool = null,
+    /// Minimum retry delay in milliseconds.
+    retry_after_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "error", "error", false },
+        .{ "message", "message", true },
+        .{ "reason", "reason", true },
+        .{ "retryable", "retryable", true },
+        .{ "retry_after_ms", "retry_after_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("error");
+        try jw.write(self.@"error");
+        if (self.message) |value| {
+            try jw.objectField("message");
+            try jw.write(value);
+        }
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
+        if (self.retryable) |value| {
+            try jw.objectField("retryable");
+            try jw.write(value);
+        }
+        if (self.retry_after_ms) |value| {
+            try jw.objectField("retry_after_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// SSE event types emitted by the retrieval agent streaming endpoint

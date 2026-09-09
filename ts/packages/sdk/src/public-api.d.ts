@@ -3464,6 +3464,7 @@ export interface components {
          *     }
          */
         EmbedderConfig: (components["schemas"]["GoogleEmbedderConfig"] | components["schemas"]["VertexEmbedderConfig"] | components["schemas"]["OllamaEmbedderConfig"] | components["schemas"]["OpenAIEmbedderConfig"] | components["schemas"]["OpenRouterEmbedderConfig"] | components["schemas"]["BedrockEmbedderConfig"] | components["schemas"]["CohereEmbedderConfig"] | components["schemas"]["AntflyEmbedderConfig"]) & {
+            rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["EmbedderProvider"];
             /**
              * @description Declare that this model supports non-text content (images, audio, video, PDFs),
@@ -6112,7 +6113,7 @@ export interface components {
              * @default true
              */
             interactive?: boolean;
-            /** @description Additive bounded-agent field for the query builder. Phase 1 remains a single-pass generation flow, but this field is echoed in result accounting. */
+            /** @description Maximum planning tool calls (0-20). Zero uses the compatibility planner. A positive value enables model-directed table inspection and complete QueryRequest submission using the canonical DSL parser and runtime preflight, with validation feedback for repair. It requires an Antfly or OpenAI tool-capable generator and never executes database searches. */
             max_internal_iterations?: number;
             /** @description Maximum number of clarification turns the agent may request from the user. */
             max_user_clarifications?: number;
@@ -6422,10 +6423,18 @@ export interface components {
             /** @description Number of tools available (present for native mode) */
             tools_count?: number;
         };
-        /** @description Emitted when an error occurs during retrieval */
+        /** @description Terminal retrieval failure. Capacity events carry the complete InferenceCapacityError envelope, including message, reason, retryable and retry_after_ms; generic failures may carry only error. */
         SSEError: {
-            /** @description Error message */
+            /** @description Error message or stable machine-readable code. */
             error: string;
+            /** @description Human-readable error description. */
+            message?: string;
+            /** @enum {string} */
+            reason?: "inference_capacity" | "inference_admission";
+            /** @description Whether the failure is temporary and the request may be retried. */
+            retryable?: boolean;
+            /** @description Minimum retry delay in milliseconds. */
+            retry_after_ms?: number;
         };
         /** @description Statistics from token-based document pruning */
         PruneStats: {
@@ -6513,7 +6522,10 @@ export interface components {
          *     directly without an LLM tool-calling loop.
          *
          *     **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
-         *     call, using the queries to determine available tables and indexes.
+         *     call, using the queries to determine available tables and indexes. A query
+         *     may contain only a table scope and caller constraints: build_query delegates
+         *     to the query-builder agent, then search executes its validated QueryRequest.
+         *     Refinements use the same canonical full-DSL validator, not keyword substitution.
          *
          *     Authenticated row filters are enforced on every initial and generated
          *     operation in both modes, including scans, aggregates, and graph/tree
@@ -6575,7 +6587,9 @@ export interface components {
              */
             interactive?: boolean;
             /**
-             * @description Maximum number of internal tool-calling rounds.
+             * @description Maximum number of model-generation rounds across retrieval and any
+             *     delegated query-builder calls. All calls share the request deadline
+             *     and cancellation. Tool calls are additionally capped at 20 overall.
              *
              *     - 0: Pipeline mode — execute provided queries directly, no LLM loop
              *     - 1+: Agentic mode — LLM decides which tools to call
@@ -9240,6 +9254,48 @@ export interface components {
             retrieval?: components["schemas"]["EmbeddingRetrievalConfig"];
         };
         /**
+         * @description token_bucket limits admission rate while allowing overlapping attempts.
+         *     completion serializes attempts and waits one RPM interval after each
+         *     attempt finishes, including streamed writes and transport failures.
+         *     This prevents delayed connection setup from compressing successful
+         *     request spacing, at the cost of response latency plus one interval per
+         *     request. Requires requests_per_minute and burst=1. Neither mode can
+         *     guarantee zero upstream 429s or coordinate other processes.
+         * @enum {string}
+         */
+        RequestPacing: "token_bucket" | "completion";
+        /**
+         * @description Outbound provider limits shared within one Antfly process by effective
+         *     endpoint, operation, model, credential source, project and region/location.
+         *     Conflicting policies for an active scope are rejected. These limits do
+         *     not coordinate across replicas or infer the provider's account quota.
+         */
+        RateLimitConfig: {
+            /** @description Request pacing mode. Defaults to token_bucket. Legacy flat embedder RPM with burst=1 uses completion pacing. */
+            pacing?: components["schemas"]["RequestPacing"];
+            /** Format: int64 */
+            requests_per_minute?: number;
+            /**
+             * Format: int64
+             * @default 1
+             */
+            burst?: number;
+            /**
+             * Format: int64
+             * @description Conservative text budget: each HTTP attempt reserves its serialized
+             *     UTF-8 body byte count plus the configured generation output cap.
+             *     Reservations are not refunded. A request larger than this budget
+             *     is rejected. This is not provider billing token accounting; media
+             *     requests are not supported with this limit.
+             */
+            tokens_per_minute?: number;
+            /**
+             * Format: int64
+             * @description Maximum in-flight HTTP attempts, held through response completion.
+             */
+            max_concurrency?: number;
+        };
+        /**
          * @description Managed generated artifact kind.
          * @enum {string}
          */
@@ -9738,6 +9794,7 @@ export interface components {
          *     }
          */
         GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"]) & {
+            rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["GeneratorProvider"];
         };
         /** @description Configuration for a specific edge type */
@@ -10759,8 +10816,29 @@ export interface components {
             worker_failed: boolean;
             /** @description Whether the background enrichment worker is currently running. */
             worker_started: boolean;
-            /** @description Whether work is pending with no running worker, retry, or terminal failure explaining the backlog. */
+            /** @description Whether pending work has no worker or has exceeded its execution/progress deadline. */
             stalled: boolean;
+            /** @enum {string} */
+            stall_reason: "" | "worker_missing" | "model_loading" | "embedding_overdue" | "publishing_overdue";
+            /** @enum {string} */
+            active_phase: "idle" | "loading_model" | "tokenizing" | "executing" | "serializing" | "publishing";
+            active_model: string;
+            active_backend: string;
+            /**
+             * Format: uint64
+             * @description Display-only Unix deadline in milliseconds; timeout decisions use a monotonic clock.
+             */
+            active_deadline_ms: number;
+            /** Format: uint64 */
+            last_progress_ms: number;
+            /** Format: uint64 */
+            active_progress_completed: number;
+            /** Format: uint64 */
+            active_progress_total: number;
+            /** Format: uint64 */
+            inference_timeout_count: number;
+            /** Format: uint64 */
+            inference_cancel_count: number;
             /** Format: uint64 */
             skip_by_hash_count: number;
             /** Format: uint64 */
@@ -12409,6 +12487,8 @@ export interface components {
         AntflyRerankerConfig: {
             /** @enum {string} */
             provider: "antfly";
+            /** @description Optional bearer API key for remote Antfly inference. Supports secret references and defaults to ANTFLY_INFERENCE_API_KEY. Embedded inference does not resolve or use outbound credentials. */
+            api_key?: string;
             /** @description Optional reranking model name. When omitted, Antfly inference selects a model from its reranker model directory. Set this explicitly when more than one local reranker is installed. */
             model?: string;
             /**
@@ -12485,6 +12565,7 @@ export interface components {
          *     }
          */
         RerankerConfig: {
+            rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["RerankerProvider"];
             /** @description Field name to extract from documents for reranking. */
             field?: string;
@@ -13246,6 +13327,13 @@ export interface components {
         /** @description Stateful graph results keyed by operation name. Legacy values are possible only when the corresponding request used graph_searches. */
         StatefulGraphQueryResults: {
             [key: string]: components["schemas"]["StatefulGraphResult"];
+        };
+        /** @description An index mutation conflict. When `error` is `metadata_mutation_outcome_unknown`, the mutation may already have committed and callers must observe index state before deciding whether to issue another mutation. */
+        IndexMutationConflictError: {
+            /** @enum {string} */
+            error: "table_mutation_conflict" | "artifact_dependency_conflict" | "metadata_mutation_outcome_unknown";
+            message: string;
+            retryable: boolean;
         };
         /**
          * @description Standalone evaluation request for POST /eval endpoint.
@@ -15098,6 +15186,17 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description The index mutation conflicts with current state, or its commit outcome could not be proven. */
+        IndexMutationConflict: {
+            headers: {
+                /** @description Present with value `unknown-v1` only when the mutation may already have committed and must not be blindly retried. */
+                "X-Antfly-Raft-Mutation-Outcome"?: "unknown-v1";
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["IndexMutationConflictError"];
+            };
+        };
         /** @description Method not allowed for this resource */
         MethodNotAllowed: {
             headers: {
@@ -15230,6 +15329,17 @@ export interface components {
             };
             content: {
                 "application/json": components["schemas"]["QueryConflictError"];
+            };
+        };
+        /** @description Agent query dependencies or inference capacity are temporarily unavailable. */
+        AgentTemporarilyUnavailable: {
+            headers: {
+                /** @description Minimum retry delay in seconds. */
+                "Retry-After": number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["QueryTemporarilyUnavailableError"] | components["schemas"]["InferenceCapacityError"];
             };
         };
         /** @description A query dependency or read path is temporarily unavailable and the request is safe to retry */
@@ -16402,6 +16512,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            503: components["responses"]["AgentTemporarilyUnavailable"];
         };
     };
     retrievalAgent: {
@@ -16450,7 +16561,7 @@ export interface operations {
                 };
             };
             502: components["responses"]["QueryBadGateway"];
-            503: components["responses"]["QueryTemporarilyUnavailable"];
+            503: components["responses"]["AgentTemporarilyUnavailable"];
             504: components["responses"]["QueryGatewayTimeout"];
         };
     };
@@ -17659,7 +17770,7 @@ export interface operations {
             400: components["responses"]["IndexMutationBadRequest"];
             404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
-            409: components["responses"]["Conflict"];
+            409: components["responses"]["IndexMutationConflict"];
             /** @description Graph resolver destinations cannot be bound to this credential type */
             422: {
                 headers: {
@@ -17696,6 +17807,9 @@ export interface operations {
                 content?: never;
             };
             400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["IndexMutationConflict"];
             500: components["responses"]["InternalServerError"];
         };
     };

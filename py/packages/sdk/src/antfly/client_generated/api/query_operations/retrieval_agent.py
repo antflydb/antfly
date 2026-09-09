@@ -13,6 +13,7 @@ from ...models.graph_match_operation_limit_exceeded_error import GraphMatchOpera
 from ...models.graph_path_weight_domain_error import GraphPathWeightDomainError
 from ...models.graph_query_unsupported_error import GraphQueryUnsupportedError
 from ...models.graph_work_budget_exceeded_error import GraphWorkBudgetExceededError
+from ...models.inference_capacity_error import InferenceCapacityError
 from ...models.query_candidate_budget_exceeded_error import QueryCandidateBudgetExceededError
 from ...models.query_dependency_error import QueryDependencyError
 from ...models.query_filter_error import QueryFilterError
@@ -60,8 +61,9 @@ def _parse_response(
     | RerankerCandidateLimitExceededError
     | UnsupportedHierarchyGroupingError
     | UnsupportedQueryError
-    | QueryDependencyError
+    | InferenceCapacityError
     | QueryTemporarilyUnavailableError
+    | QueryDependencyError
     | str
     | None
 ):
@@ -231,7 +233,23 @@ def _parse_response(
         return response_502
 
     if response.status_code == 503:
-        response_503 = QueryTemporarilyUnavailableError.from_dict(response.json())
+
+        def _parse_response_503(data: object) -> InferenceCapacityError | QueryTemporarilyUnavailableError:
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                response_503_type_0 = QueryTemporarilyUnavailableError.from_dict(data)
+
+                return response_503_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            if not isinstance(data, dict):
+                raise TypeError()
+            response_503_type_1 = InferenceCapacityError.from_dict(data)
+
+            return response_503_type_1
+
+        response_503 = _parse_response_503(response.json())
 
         return response_503
 
@@ -263,8 +281,9 @@ def _build_response(
     | RerankerCandidateLimitExceededError
     | UnsupportedHierarchyGroupingError
     | UnsupportedQueryError
-    | QueryDependencyError
+    | InferenceCapacityError
     | QueryTemporarilyUnavailableError
+    | QueryDependencyError
     | str
 ]:
     return Response(
@@ -294,8 +313,9 @@ def sync_detailed(
     | RerankerCandidateLimitExceededError
     | UnsupportedHierarchyGroupingError
     | UnsupportedQueryError
-    | QueryDependencyError
+    | InferenceCapacityError
     | QueryTemporarilyUnavailableError
+    | QueryDependencyError
     | str
 ]:
     """Retrieval Agent - Agentic document retrieval with tool calling
@@ -341,7 +361,10 @@ def sync_detailed(
             directly without an LLM tool-calling loop.
 
             **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
-            call, using the queries to determine available tables and indexes.
+            call, using the queries to determine available tables and indexes. A query
+            may contain only a table scope and caller constraints: build_query delegates
+            to the query-builder agent, then search executes its validated QueryRequest.
+            Refinements use the same canonical full-DSL validator, not keyword substitution.
 
             Authenticated row filters are enforced on every initial and generated
             operation in both modes, including scans, aggregates, and graph/tree
@@ -352,7 +375,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | RerankerCandidateLimitExceededError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | QueryDependencyError | QueryTemporarilyUnavailableError | str]
+        Response[Error | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | RerankerCandidateLimitExceededError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | InferenceCapacityError | QueryTemporarilyUnavailableError | QueryDependencyError | str]
     """
 
     kwargs = _get_kwargs(
@@ -385,8 +408,9 @@ def sync(
     | RerankerCandidateLimitExceededError
     | UnsupportedHierarchyGroupingError
     | UnsupportedQueryError
-    | QueryDependencyError
+    | InferenceCapacityError
     | QueryTemporarilyUnavailableError
+    | QueryDependencyError
     | str
     | None
 ):
@@ -433,7 +457,10 @@ def sync(
             directly without an LLM tool-calling loop.
 
             **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
-            call, using the queries to determine available tables and indexes.
+            call, using the queries to determine available tables and indexes. A query
+            may contain only a table scope and caller constraints: build_query delegates
+            to the query-builder agent, then search executes its validated QueryRequest.
+            Refinements use the same canonical full-DSL validator, not keyword substitution.
 
             Authenticated row filters are enforced on every initial and generated
             operation in both modes, including scans, aggregates, and graph/tree
@@ -444,7 +471,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | RerankerCandidateLimitExceededError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | QueryDependencyError | QueryTemporarilyUnavailableError | str
+        Error | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | RerankerCandidateLimitExceededError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | InferenceCapacityError | QueryTemporarilyUnavailableError | QueryDependencyError | str
     """
 
     return sync_detailed(
@@ -472,8 +499,9 @@ async def asyncio_detailed(
     | RerankerCandidateLimitExceededError
     | UnsupportedHierarchyGroupingError
     | UnsupportedQueryError
-    | QueryDependencyError
+    | InferenceCapacityError
     | QueryTemporarilyUnavailableError
+    | QueryDependencyError
     | str
 ]:
     """Retrieval Agent - Agentic document retrieval with tool calling
@@ -519,7 +547,10 @@ async def asyncio_detailed(
             directly without an LLM tool-calling loop.
 
             **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
-            call, using the queries to determine available tables and indexes.
+            call, using the queries to determine available tables and indexes. A query
+            may contain only a table scope and caller constraints: build_query delegates
+            to the query-builder agent, then search executes its validated QueryRequest.
+            Refinements use the same canonical full-DSL validator, not keyword substitution.
 
             Authenticated row filters are enforced on every initial and generated
             operation in both modes, including scans, aggregates, and graph/tree
@@ -530,7 +561,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | RerankerCandidateLimitExceededError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | QueryDependencyError | QueryTemporarilyUnavailableError | str]
+        Response[Error | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | RerankerCandidateLimitExceededError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | InferenceCapacityError | QueryTemporarilyUnavailableError | QueryDependencyError | str]
     """
 
     kwargs = _get_kwargs(
@@ -561,8 +592,9 @@ async def asyncio(
     | RerankerCandidateLimitExceededError
     | UnsupportedHierarchyGroupingError
     | UnsupportedQueryError
-    | QueryDependencyError
+    | InferenceCapacityError
     | QueryTemporarilyUnavailableError
+    | QueryDependencyError
     | str
     | None
 ):
@@ -609,7 +641,10 @@ async def asyncio(
             directly without an LLM tool-calling loop.
 
             **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to
-            call, using the queries to determine available tables and indexes.
+            call, using the queries to determine available tables and indexes. A query
+            may contain only a table scope and caller constraints: build_query delegates
+            to the query-builder agent, then search executes its validated QueryRequest.
+            Refinements use the same canonical full-DSL validator, not keyword substitution.
 
             Authenticated row filters are enforced on every initial and generated
             operation in both modes, including scans, aggregates, and graph/tree
@@ -620,7 +655,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | RerankerCandidateLimitExceededError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | QueryDependencyError | QueryTemporarilyUnavailableError | str
+        Error | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | QueryDependencyError | QueryFilterError | RerankerCandidateLimitExceededError | UnsupportedHierarchyGroupingError | UnsupportedQueryError | InferenceCapacityError | QueryTemporarilyUnavailableError | QueryDependencyError | str
     """
 
     return (

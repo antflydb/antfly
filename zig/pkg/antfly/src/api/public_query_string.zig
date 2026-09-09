@@ -122,13 +122,18 @@ pub fn filterToStatefulTextQueryAlloc(
             .inclusive_max = range.inclusive_max,
             .boost = root_boost * range.boost,
         } },
-        .bool_filter => |bool_filter| .{ .bool_query = .{
-            .must = try filterSliceToStatefulTextQueryAlloc(alloc, bool_filter.must, 1.0),
-            .should = try filterSliceToStatefulTextQueryAlloc(alloc, bool_filter.should, 1.0),
-            .must_not = try filterSliceToStatefulTextQueryAlloc(alloc, bool_filter.must_not, 1.0),
-            .min_should = bool_filter.min_should_match,
-            .boost = root_boost * bool_filter.boost,
-        } },
+        .bool_filter => |bool_filter| .{
+            .bool_query = .{
+                .must = try filterSliceToStatefulTextQueryAlloc(alloc, bool_filter.must, 1.0),
+                .should = try filterSliceToStatefulTextQueryAlloc(alloc, bool_filter.should, 1.0),
+                .must_not = try filterSliceToStatefulTextQueryAlloc(alloc, bool_filter.must_not, 1.0),
+                // BoolFilter ignores its default minimum when there are no should
+                // clauses. Preserve that meaning: the scored query treats a positive
+                // minimum over an empty should list as an impossible condition.
+                .min_should = if (bool_filter.should.len == 0) 0 else bool_filter.min_should_match,
+                .boost = root_boost * bool_filter.boost,
+            },
+        },
         else => error.UnsupportedQueryRequest,
     };
 }

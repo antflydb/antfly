@@ -101,6 +101,8 @@ pub const TableManager = table_manager.TableManager;
 pub const TableProvisionSummary = table_provisioner.ProvisionSummary;
 pub const ReconcileReplicaRootOptions = table_provisioner.ReconcileReplicaRootOptions;
 pub const ShardDbAdapter = shard_db_adapter.ShardDbAdapter;
+pub const IndexActivationTarget = shard_db_adapter.IndexActivationTarget;
+pub const IndexActivationProgress = shard_db_adapter.IndexActivationProgress;
 pub const FallbackLocalShardDbAdapter = shard_db_adapter.FallbackLocalShardDbAdapter;
 pub const groupDbPathFromReplicaRoot = table_provisioner.groupDbPathFromReplicaRoot;
 pub const reconcileReplicaRootTables = table_provisioner.reconcileReplicaRoot;
@@ -137,6 +139,7 @@ pub const TransitionStepResult = transition_driver.StepResult;
 pub const TransitionDriver = transition_driver.TransitionDriver;
 
 test "metadata module compiles" {
+    _ = runtime_status_protocol;
     _ = storage;
     _ = runtime;
     _ = api;

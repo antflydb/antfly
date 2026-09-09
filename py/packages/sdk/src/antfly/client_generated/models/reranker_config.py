@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.reranker_provider import RerankerProvider
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.rate_limit_config import RateLimitConfig
+
 
 T = TypeVar("T", bound="RerankerConfig")
 
@@ -21,6 +25,10 @@ class RerankerConfig:
 
     Attributes:
         provider (RerankerProvider): The reranking provider to use.
+        rate_limit (RateLimitConfig | Unset): Outbound provider limits shared within one Antfly process by effective
+            endpoint, operation, model, credential source, project and region/location.
+            Conflicting policies for an active scope are rejected. These limits do
+            not coordinate across replicas or infer the provider's account quota.
         field (str | Unset): Field name to extract from documents for reranking.
         template (str | Unset): Handlebars template to render document text for reranking.
         model (str | Unset): Optional provider model name. When omitted, the selected provider's documented default is
@@ -40,6 +48,7 @@ class RerankerConfig:
     """
 
     provider: RerankerProvider
+    rate_limit: RateLimitConfig | Unset = UNSET
     field: str | Unset = UNSET
     template: str | Unset = UNSET
     model: str | Unset = UNSET
@@ -49,6 +58,10 @@ class RerankerConfig:
 
     def to_dict(self) -> dict[str, Any]:
         provider = self.provider.value
+
+        rate_limit: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.rate_limit, Unset):
+            rate_limit = self.rate_limit.to_dict()
 
         field = self.field
 
@@ -67,6 +80,8 @@ class RerankerConfig:
                 "provider": provider,
             }
         )
+        if rate_limit is not UNSET:
+            field_dict["rate_limit"] = rate_limit
         if field is not UNSET:
             field_dict["field"] = field
         if template is not UNSET:
@@ -82,8 +97,17 @@ class RerankerConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.rate_limit_config import RateLimitConfig
+
         d = dict(src_dict)
         provider = RerankerProvider(d.pop("provider"))
+
+        _rate_limit = d.pop("rate_limit", UNSET)
+        rate_limit: RateLimitConfig | Unset
+        if isinstance(_rate_limit, Unset):
+            rate_limit = UNSET
+        else:
+            rate_limit = RateLimitConfig.from_dict(_rate_limit)
 
         field = d.pop("field", UNSET)
 
@@ -97,6 +121,7 @@ class RerankerConfig:
 
         reranker_config = cls(
             provider=provider,
+            rate_limit=rate_limit,
             field=field,
             template=template,
             model=model,

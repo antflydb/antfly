@@ -2340,34 +2340,38 @@ test "applyStoredSearchPatternFilters batch-loads only missing stored docs" {
 test "applyStoredSearchPatternFilters reports lower-bound total for filtered page window" {
     const alloc = std.testing.allocator;
 
-    var hits = try alloc.alloc(types.SearchHit, 2);
-    hits[0] = .{
-        .id = try alloc.dupe(u8, "doc:a"),
-        .stored_data = try alloc.dupe(u8, "{\"title\":\"alpha\"}"),
-    };
-    hits[1] = .{
-        .id = try alloc.dupe(u8, "doc:b"),
-        .stored_data = try alloc.dupe(u8, "{\"title\":\"beta\"}"),
-    };
+    // An unresolved predicate cannot certify unseen matches, even when the
+    // whole materialized page passes. Its total must remain a lower bound.
+    for ([_][]const u8{ "{\"title\":\"alpha\"}", "{\"title\":\"beta\"}" }, 1..) |first_document, kept| {
+        var hits = try alloc.alloc(types.SearchHit, 2);
+        hits[0] = .{
+            .id = try alloc.dupe(u8, "doc:a"),
+            .stored_data = try alloc.dupe(u8, first_document),
+        };
+        hits[1] = .{
+            .id = try alloc.dupe(u8, "doc:b"),
+            .stored_data = try alloc.dupe(u8, "{\"title\":\"beta\"}"),
+        };
 
-    var loader = TestStoredLoader{};
-    var result = try applyStoredSearchPatternFilters(alloc, .{
-        .filter_query_json = "{\"term\":{\"title\":\"beta\"}}",
-    }, .{
-        .alloc = alloc,
-        .hits = hits,
-        .total_hits = 10,
-        .total_hits_relation = .exact,
-    }, .{
-        .ctx = &loader,
-        .load_stored = TestStoredLoader.loadStored,
-        .load_many_stored = TestStoredLoader.loadManyStored,
-    });
-    defer result.deinit();
+        var loader = TestStoredLoader{};
+        var result = try applyStoredSearchPatternFilters(alloc, .{
+            .filter_query_json = "{\"term\":{\"title\":\"beta\"}}",
+        }, .{
+            .alloc = alloc,
+            .hits = hits,
+            .total_hits = 10,
+            .total_hits_relation = .exact,
+        }, .{
+            .ctx = &loader,
+            .load_stored = TestStoredLoader.loadStored,
+            .load_many_stored = TestStoredLoader.loadManyStored,
+        });
+        defer result.deinit();
 
-    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
-    try std.testing.expectEqual(types.TotalHitsRelation.gte, result.total_hits_relation);
-    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+        try std.testing.expectEqual(@as(u32, @intCast(kept)), result.total_hits);
+        try std.testing.expectEqual(types.TotalHitsRelation.gte, result.total_hits_relation);
+        try std.testing.expectEqualStrings("doc:b", result.hits[kept - 1].id);
+    }
 }
 
 const TestPostprocessor = struct {

@@ -32,6 +32,7 @@ comptime {
     _ = @import("db/algebraic/law.zig");
     _ = @import("db/algebraic/lexical.zig");
     _ = @import("db/algebraic/mod.zig");
+    _ = @import("db/algebraic/ownership_test.zig");
     _ = @import("db/algebraic/path.zig");
     _ = @import("db/algebraic/pathfact.zig");
     _ = @import("db/algebraic/planner.zig");
@@ -96,6 +97,7 @@ comptime {
     _ = @import("db/ownership.zig");
     _ = @import("db/planning_stats.zig");
     _ = @import("db/promotion_runtime.zig");
+    _ = @import("db/publication.zig");
     _ = @import("db/query/graph_exec.zig");
     _ = @import("db/query/projection.zig");
     _ = @import("db/query/result_shape.zig");

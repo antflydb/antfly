@@ -2,6 +2,7 @@
 // Package: antfly_embeddings_openapi
 
 const std = @import("std");
+const antfly_provider_openapi = @import("antfly_provider_openapi");
 
 /// Configuration for the Antfly inference embedding provider. Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models. It provides embedding generation with multi-tier caching (memory + persistent). **Features:** - Local ONNX-based embedding generation - L1 memory cache with configurable TTL - L2 persistent Pebble database cache - Singleflight deduplication for concurrent identical requests **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims) Models are loaded from the `models/embedders/{name}/` directory.
 pub const AntflyEmbedderConfig = struct {
@@ -229,6 +230,7 @@ pub const EmbedderConfig = struct {
     batch_size: ?i64 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
+    rate_limit: ?antfly_provider_openapi.RateLimitConfig = null,
     /// Declare that this model supports non-text content (images, audio, video, PDFs), even if the model isn't in Antfly's built-in model registry yet. When `true`, Antfly treats the model as multimodal and sends binary content (images, audio, etc.) through an embedding adapter that supports content parts. Antfly currently provides that contract for local Antfly inference and Bedrock; text-only provider adapters reject media rather than silently discarding it. Not needed for models already in the local registry (e.g., `clip-*`, `clipclap`). **Example:** ```json { "provider": "antfly", "model": "some-future-multimodal-model", "multimodal": true } ```
     multimodal: ?bool = null,
     /// Deprecated compatibility form of `retrieval.query_input_type`. New configurations should use the nested `retrieval` object.
@@ -257,6 +259,7 @@ pub const EmbedderConfig = struct {
         .{ "strip_new_lines", "strip_new_lines", true },
         .{ "batch_size", "batch_size", true },
         .{ "api_url", "api_url", true },
+        .{ "rate_limit", "rate_limit", false },
         .{ "multimodal", "multimodal", true },
         .{ "query_input_type", "query_input_type", true },
         .{ "document_input_type", "document_input_type", true },
@@ -340,6 +343,13 @@ pub const EmbedderConfig = struct {
         if (self.api_url) |value| {
             try jw.objectField("api_url");
             try jw.write(value);
+        }
+        if (self.rate_limit) |value| {
+            try jw.objectField("rate_limit");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("rate_limit");
+            try jw.write(@as(?u8, null));
         }
         if (self.multimodal) |value| {
             try jw.objectField("multimodal");
@@ -752,6 +762,8 @@ pub const OpenRouterEmbedderConfig = struct {
         try jw.endObject();
     }
 };
+
+pub const RateLimitConfig = antfly_provider_openapi.RateLimitConfig;
 
 /// Configuration for Google Cloud Vertex AI embedding models (enterprise-grade). Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`. **Example Model:** gemini-embedding-001 (default, 3072 dims) Antfly's Vertex embedder currently supports text inputs. Binary media is rejected instead of being flattened or silently discarded. **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
 pub const VertexEmbedderConfig = struct {

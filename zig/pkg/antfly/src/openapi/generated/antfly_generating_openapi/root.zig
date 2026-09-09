@@ -22,6 +22,7 @@ pub const MediaContentPart = types.MediaContentPart;
 pub const OllamaGeneratorConfig = types.OllamaGeneratorConfig;
 pub const OpenAIGeneratorConfig = types.OpenAIGeneratorConfig;
 pub const OpenRouterGeneratorConfig = types.OpenRouterGeneratorConfig;
+pub const RateLimitConfig = types.RateLimitConfig;
 pub const RetryConfig = types.RetryConfig;
 pub const TextContentPart = types.TextContentPart;
 pub const ToolCall = types.ToolCall;

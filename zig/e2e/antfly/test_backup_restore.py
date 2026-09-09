@@ -285,6 +285,102 @@ def _check_response(response: requests.Response) -> dict:
     return payload
 
 
+def _create_cluster_table_when_admitted(
+    cluster,
+    session: requests.Session,
+    table_name: str,
+    definition: dict,
+    *,
+    timeout_s=30.0,
+) -> dict:
+    # Leader observations do not reserve mutation authority. Replay only an
+    # explicit pre-admission rejection; an unknown outcome may have committed.
+    deadline = time.monotonic() + timeout_s
+    attempts = 0
+    last_response: requests.Response | None = None
+    try:
+        while True:
+            cluster.assert_processes_alive()
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, "table create admission deadline exceeded"
+            attempts += 1
+            last_response = session.post(
+                f"{cluster.data_api_urls[0]}/tables/{table_name}",
+                json=definition,
+                timeout=remaining,
+            )
+            cluster.assert_processes_alive()
+            retryable = False
+            if (
+                last_response.status_code == 503
+                and last_response.headers.get(
+                    "X-Antfly-Metadata-Mutation-Not-Admitted", ""
+                ).lower()
+                == "true"
+                and last_response.headers.get("X-Antfly-Raft-Mutation-Outcome")
+                in (None, "not-proposed-v1")
+            ):
+                try:
+                    payload = last_response.json()
+                except ValueError:
+                    payload = None
+                retryable = (
+                    isinstance(payload, dict)
+                    and payload.get("code") == "metadata_leader_unavailable"
+                    and payload.get("retryable") is True
+                )
+            if not retryable:
+                result = _check_response(last_response)
+                if attempts > 1:
+                    print(f"backup table create admitted after {attempts} attempts")
+                return result
+            # This response advertises Retry-After: 1. Keep backoff and every
+            # subsequent request within the original create request budget.
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+    except (AssertionError, requests.RequestException) as exc:
+        raise AssertionError(
+            f"backup table create failed after {attempts} attempts: {exc}; "
+            f"last_status={last_response.status_code if last_response is not None else None}; "
+            f"last_headers={dict(last_response.headers) if last_response is not None else None}; "
+            f"last_response={last_response.text if last_response is not None else None}\n"
+            f"{cluster.debug_logs()}"
+        ) from exc
+
+
+def _seed_cluster_docs_when_writable(
+    cluster, session: requests.Session, table_name: str, docs: dict, *, timeout_s=30.0
+) -> dict:
+    # Replication status is an observation, not a lease on the data leader or
+    # its routing catalog. Seed through the write API's admission contract.
+    # Only this explicit pre-commit response permits a fresh batch attempt;
+    # transport failures and ambiguous/post-commit outcomes must remain errors.
+    deadline = time.monotonic() + timeout_s
+    last_response: requests.Response | None = None
+
+    def attempt() -> dict | None:
+        nonlocal last_response
+        cluster.assert_processes_alive()
+        last_response = session.post(
+            f"{cluster.data_api_urls[0]}/tables/{table_name}/batch",
+            json={"inserts": docs, "sync_level": "write"},
+            timeout=max(0.001, deadline - time.monotonic()),
+        )
+        if (
+            last_response.status_code == 503
+            and last_response.text.strip() == "write unavailable"
+        ):
+            return None
+        return _check_response(last_response)
+
+    batch = wait_until(attempt, timeout_s=timeout_s, interval_s=0.1)
+    assert batch is not None, (
+        f"table {table_name} did not become writable; "
+        f"last_response={last_response.text if last_response is not None else None}\n"
+        f"{cluster.debug_logs()}"
+    )
+    return batch
+
+
 def _is_metadata_not_leader_response(response: requests.Response) -> bool:
     return response.headers.get("X-Antfly-Metadata-Not-Leader", "").lower() == "true"
 
@@ -1398,12 +1494,11 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
     session.headers["Connection"] = "close"
 
     data_api_url = cluster.data_api_urls[0]
-    _check_response(
-        session.post(
-            f"{data_api_url}/tables/{table_name}",
-            json={"num_shards": 3, "description": "3x3 backup and restore docs"},
-            timeout=30,
-        )
+    _create_cluster_table_when_admitted(
+        cluster,
+        session,
+        table_name,
+        {"num_shards": 3, "description": "3x3 backup and restore docs"},
     )
 
     assert wait_until(
@@ -1426,13 +1521,7 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
             "content": "high range backup and restore coverage",
         },
     }
-    batch = _check_response(
-        session.post(
-            f"{data_api_url}/tables/{table_name}/batch",
-            json={"inserts": source_docs, "sync_level": "write"},
-            timeout=30,
-        )
-    )
+    batch = _seed_cluster_docs_when_writable(cluster, session, table_name, source_docs)
     assert batch["inserted"] == len(source_docs)
     assert wait_until(
         lambda: (

@@ -5,16 +5,16 @@ The storage sim stack now has a shared workflow across LMDB, WAL, persistent sto
 - randomized schedules in the storage-layer tests
 - reducer/minimizer support for failing schedules
 - checked-in replay fixtures under `pkg/antfly/src/storage/*_sim_fixtures/`
-- generic fixture promotion through `zig build storage-fixture-promote`
+- generic fixture promotion through `zig build storage-fixture-promote && ./zig-out/bin/storage_fixture_promote`
 
 ## Targets
 
 LMDB:
 
 - default wrapper matrix on the Zig backend:
-  `zig build storage-lmdb-test`
+  `zig build antfly-storage-lmdb-test`
 - wrapper matrix on the C oracle backend:
-  `zig build storage-lmdb-test -Dlmdb_backend=c`
+  `zig build antfly-storage-lmdb-test -Dlmdb_backend=c`
 - replay-only fixture target:
   `zig build lmdb-replay-fixtures`
 
@@ -59,7 +59,7 @@ Index manager:
 DB split orchestration:
 
 - focused randomized workload target:
-  `zig build db-split-sim-test`
+  `zig build antfly-storage-db-split-sim-test`
 - replay-only fixture target:
   `zig build db-split-replay-fixtures`
 
@@ -89,48 +89,48 @@ Typical artifact prefixes:
 Promote one into the checked-in corpus with:
 
 ```sh
-zig build storage-fixture-promote -- /tmp/antfly-...fixture
+zig build storage-fixture-promote && ./zig-out/bin/storage_fixture_promote /tmp/antfly-...fixture
 ```
 
 If you want to override the destination stem:
 
 ```sh
-zig build storage-fixture-promote -- /tmp/antfly-...fixture custom-name
+zig build storage-fixture-promote && ./zig-out/bin/storage_fixture_promote /tmp/antfly-...fixture custom-name
 ```
 
 If the destination already exists and you want to replace it:
 
 ```sh
-zig build storage-fixture-promote -- /tmp/antfly-...fixture --force
+zig build storage-fixture-promote && ./zig-out/bin/storage_fixture_promote /tmp/antfly-...fixture --force
 ```
 
 If you want the newest reduced artifact from `/tmp` without looking up the path:
 
 ```sh
-zig build storage-fixture-promote -- --latest
+zig build storage-fixture-promote && ./zig-out/bin/storage_fixture_promote --latest
 ```
 
 Persistent example:
 
 ```sh
-zig build storage-fixture-promote -- /tmp/antfly-persistent-replay-...fixture
+zig build storage-fixture-promote && ./zig-out/bin/storage_fixture_promote /tmp/antfly-persistent-replay-...fixture
 ```
 
 Index manager example:
 
 ```sh
-zig build storage-fixture-promote -- /tmp/antfly-index-manager-replay-...fixture
+zig build storage-fixture-promote && ./zig-out/bin/storage_fixture_promote /tmp/antfly-index-manager-replay-...fixture
 ```
 
 DB split example:
 
 ```sh
-zig build storage-fixture-promote -- /tmp/antfly-db-split-replay-...fixture
+zig build storage-fixture-promote && ./zig-out/bin/storage_fixture_promote /tmp/antfly-db-split-replay-...fixture
 ```
 
 Compatibility alias:
 
-- `zig build lmdb-fixture-promote -- ...` still works for LMDB fixtures
+- `zig build storage-fixture-promote && ./zig-out/bin/storage_fixture_promote ...` still works for LMDB fixtures
 
 ## Fixture Layout
 

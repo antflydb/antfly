@@ -25,8 +25,8 @@ lexical diagnostics are allocation-free.
 Useful commands:
 
 ```sh
-zig build sql-parser-test
-zig build sql-parser-bench -- --mode all
+zig build lib-sql-parser-test
+zig build lib-sql-parser-bench && ./zig-out/bin/lib-sql-parser-bench --mode all
 zig build regen-sql-grammar
 zig build sql-grammar-generated-check
 ```

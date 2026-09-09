@@ -40,6 +40,16 @@ pub const SingleTextEncoding = enum {
     generation,
 };
 
+pub const GenerativePrompt = enum { qwen3_vl, qwen3_text };
+
+// Qwen3's text reranker closes an empty thinking block before the yes/no
+// decision. Qwen3-VL uses a different assistant suffix; sharing its prompt
+// would silently change the text checkpoint's scoring semantics.
+const qwen3_text_prefix = "<|im_start|>system\n" ++ qwen3vl_reranker.system_prompt ++
+    "<|im_end|>\n<|im_start|>user\n";
+const qwen3_text_suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+const qwen3_text_instruction = "Given a web search query, retrieve relevant passages that answer the query";
+
 pub const RerankingConfig = struct {
     max_length: usize = 512,
     batch_size: usize = 32,
@@ -47,6 +57,7 @@ pub const RerankingConfig = struct {
     single_text_encoding: SingleTextEncoding = .encoder,
     add_bos_token: bool = false,
     generative_instruction: []const u8 = qwen3vl_reranker.default_instruction,
+    generative_prompt: GenerativePrompt = .qwen3_vl,
     max_prompt_bytes: usize = qwen3vl_reranker.default_max_prompt_bytes,
     /// Dynamic text encoders should execute only through the longest active
     /// pair in the batch rather than paying for max_length padding.
@@ -98,16 +109,8 @@ pub const GenerativeQualificationTrace = struct {
     }
 };
 
-/// Optional request-lifetime hook installed by servers. The pipeline checks it
-/// at bounded batch boundaries without depending on an HTTP or API context.
-pub const ExecutionControl = struct {
-    ptr: ?*anyopaque,
-    check_fn: *const fn (?*anyopaque) anyerror!void,
-
-    pub fn check(self: ExecutionControl) !void {
-        return self.check_fn(self.ptr);
-    }
-};
+/// Compatibility alias while callers migrate to the package-wide contract.
+pub const ExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 pub const RerankingPipeline = struct {
     allocator: std.mem.Allocator,
@@ -166,6 +169,9 @@ pub const RerankingPipeline = struct {
         document: []const u8,
     ) ![]i32 {
         const alloc = self.allocator;
+        if (self.config.generative_prompt == .qwen3_text) {
+            return self.encodeQwen3TextPair(query, document);
+        }
         const prompt = try qwen3vl_reranker.renderTextPromptAlloc(
             alloc,
             self.config.generative_instruction,
@@ -203,6 +209,42 @@ pub const RerankingPipeline = struct {
         errdefer alloc.free(result);
         for (bounded, result) |id, *out| out.* = @intCast(id);
         if (self.generative_qualification_trace) |trace| {
+            try trace.appendPair(prompt, result);
+        }
+        return result;
+    }
+
+    fn encodeQwen3TextPair(self: *RerankingPipeline, query: []const u8, document: []const u8) ![]i32 {
+        const alloc = self.allocator;
+        const instruction = if (std.mem.eql(u8, self.config.generative_instruction, qwen3vl_reranker.default_instruction) or
+            self.config.generative_instruction.len == 0)
+            qwen3_text_instruction
+        else
+            self.config.generative_instruction;
+        var prompt_bytes = std.math.add(usize, query.len, document.len) catch return error.RerankerPromptTooLarge;
+        prompt_bytes = std.math.add(usize, prompt_bytes, instruction.len) catch return error.RerankerPromptTooLarge;
+        prompt_bytes = std.math.add(usize, prompt_bytes, qwen3_text_prefix.len + qwen3_text_suffix.len +
+            "<Instruct>: \n<Query>: \n<Document>: ".len) catch return error.RerankerPromptTooLarge;
+        if (prompt_bytes > self.config.max_prompt_bytes) return error.RerankerPromptTooLarge;
+        const body = try std.fmt.allocPrint(alloc, "<Instruct>: {s}\n<Query>: {s}\n<Document>: {s}", .{ instruction, query, document });
+        defer alloc.free(body);
+        // Tokenize each section independently, as in Qwen's reference scorer,
+        // and reserve the entire fixed prefix and suffix before truncating.
+        const prefix_ids = try self.tok.encode(alloc, qwen3_text_prefix);
+        defer alloc.free(prefix_ids);
+        const body_ids = try self.tok.encode(alloc, body);
+        defer alloc.free(body_ids);
+        const suffix_ids = try self.tok.encode(alloc, qwen3_text_suffix);
+        defer alloc.free(suffix_ids);
+        const result = try joinQwen3TextTokens(alloc, prefix_ids, body_ids, suffix_ids, self.config.max_length);
+        errdefer alloc.free(result);
+        const vocab_size = self.tok.vocabSize();
+        for (result) |id| {
+            if (id < 0 or @as(usize, @intCast(id)) >= vocab_size) return error.InvalidRerankerTokenId;
+        }
+        if (self.generative_qualification_trace) |trace| {
+            const prompt = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ qwen3_text_prefix, body, qwen3_text_suffix });
+            defer alloc.free(prompt);
             try trace.appendPair(prompt, result);
         }
         return result;
@@ -632,9 +674,14 @@ pub const RerankingPipeline = struct {
         inputs: []const Tensor,
         allocator: std.mem.Allocator,
     ) ![]Tensor {
-        if (self.execution_lock) |mutex| platform.sync.lockYielding(mutex);
+        if (self.execution_lock) |mutex| {
+            if (self.execution_control) |control|
+                try control.lock(mutex)
+            else
+                platform.sync.lockYielding(mutex);
+        }
         defer if (self.execution_lock) |mutex| mutex.unlock();
-        return permit.run(inputs, allocator);
+        return permit.runWithControl(inputs, allocator, self.execution_control);
     }
 
     fn admitTextRun(
@@ -642,9 +689,10 @@ pub const RerankingPipeline = struct {
         batch: usize,
         sequence: usize,
     ) !session_mod.RunPermit {
+        try self.checkExecution();
         const tokens = std.math.mul(usize, batch, sequence) catch
             return error.ResourceLimitExceeded;
-        return self.session.admit(.{
+        var permit = try self.session.admit(.{
             .batch = batch,
             .sequence = sequence,
             .input_bytes = std.math.mul(usize, tokens, 24) catch
@@ -652,6 +700,9 @@ pub const RerankingPipeline = struct {
             .host_preprocess_bytes = std.math.mul(usize, tokens, 32) catch
                 return error.ResourceLimitExceeded,
         });
+        errdefer permit.deinit();
+        try self.checkExecution();
+        return permit;
     }
 
     fn encodeSingleText(self: *RerankingPipeline, text: []const u8) !@import("inference_tokenizer").EncodeResult {
@@ -679,6 +730,32 @@ pub const RerankingPipeline = struct {
         }
     }
 };
+
+fn joinQwen3TextTokens(
+    allocator: std.mem.Allocator,
+    prefix: []const i32,
+    body: []const i32,
+    suffix: []const i32,
+    max_length: usize,
+) ![]i32 {
+    const reserved = std.math.add(usize, prefix.len, suffix.len) catch return error.InvalidRerankerConfiguration;
+    if (prefix.len == 0 or suffix.len == 0 or reserved >= max_length) return error.InvalidRerankerConfiguration;
+    const body_len = @min(body.len, max_length - reserved);
+    const result = try allocator.alloc(i32, reserved + body_len);
+    @memcpy(result[0..prefix.len], prefix);
+    @memcpy(result[prefix.len..][0..body_len], body[0..body_len]);
+    @memcpy(result[prefix.len + body_len ..], suffix);
+    return result;
+}
+
+test "Qwen3 text reranking truncates the body without losing its fixed scoring suffix" {
+    const allocator = std.testing.allocator;
+    const ids = try joinQwen3TextTokens(allocator, &.{ 1, 2 }, &.{ 3, 4, 5, 6 }, &.{ 7, 8, 9 }, 7);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i32, &.{ 1, 2, 3, 4, 7, 8, 9 }, ids);
+    try std.testing.expectError(error.InvalidRerankerConfiguration, joinQwen3TextTokens(allocator, &.{ 1, 2 }, &.{3}, &.{ 7, 8, 9 }, 5));
+    try std.testing.expect(std.mem.endsWith(u8, qwen3_text_suffix, "<think>\n\n</think>\n\n"));
+}
 
 fn activeTokenLength(mask: []const i32) usize {
     var last_active: usize = 0;
@@ -749,19 +826,18 @@ test "cross encoder bounds working memory with configured batches" {
 
 test "cross encoder observes cancellation between bounded batches" {
     const Control = struct {
-        checks: std.atomic.Value(usize) = .init(0),
+        runs: *std.atomic.Value(usize),
 
         fn check(raw: ?*anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
-            const count = self.checks.fetchAdd(1, .acq_rel) + 1;
-            if (count >= 3) return error.Cancelled;
+            if (self.runs.load(.acquire) != 0) return error.Cancelled;
         }
     };
 
     const allocator = std.testing.allocator;
     var tokenizer_state = FakeRerankingTokenizer{};
     var session_state = FakeRerankingSession{ .fixed_sequence = false };
-    var control = Control{};
+    var control = Control{ .runs = &session_state.run_count };
     var pipeline = RerankingPipeline.init(
         allocator,
         session_state.session(),
@@ -897,6 +973,7 @@ const FakeRerankingSession = struct {
             .ptr = self,
             .vtable = &.{
                 .run = run,
+                .runWithControl = runWithControl,
                 .inputInfo = inputInfo,
                 .outputInfo = outputInfo,
                 .backend = backend,
@@ -918,6 +995,22 @@ const FakeRerankingSession = struct {
         const out = try allocator.alloc(Tensor, 1);
         out[0] = try Tensor.initFloat32(allocator, "logits", &.{ @intCast(batch), 1 }, logits);
         return out;
+    }
+
+    fn runWithControl(
+        ptr: *anyopaque,
+        inputs: []const Tensor,
+        allocator: std.mem.Allocator,
+        control: ExecutionControl,
+    ) anyerror![]Tensor {
+        try control.check();
+        const outputs = try run(ptr, inputs, allocator);
+        errdefer {
+            for (outputs) |*output| output.deinit();
+            allocator.free(outputs);
+        }
+        try control.check();
+        return outputs;
     }
 
     fn inputInfo(ptr: *anyopaque) []const backends.TensorInfo {

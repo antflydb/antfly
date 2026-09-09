@@ -59,6 +59,7 @@ pub const SharedModules = struct {
     regex: ?*std.Build.Module = null,
     jsonschema: ?*std.Build.Module = null,
     image: ?*std.Build.Module = null,
+    hash: ?*std.Build.Module = null,
     prometheus: ?*std.Build.Module = null,
     structlog: ?*std.Build.Module = null,
     jinja: ?*std.Build.Module = null,
@@ -174,7 +175,9 @@ pub fn create(config: Config) Graph {
         mod.addImport("antfly_regex", regex_mod);
         break :blk mod;
     };
+    const hash_mod = shared.hash orelse createSharedModule(config, "lib/hash/src/mod.zig");
     const image_mod = shared.image orelse createSharedModule(config, "lib/image/src/mod.zig");
+    if (shared.image == null) image_mod.addImport("antfly_hash", hash_mod);
     const prometheus_mod = shared.prometheus orelse createOptionalSharedModule(config, "lib/prometheus/src/root.zig", "src/compat/prometheus.zig");
     const structlog_mod = shared.structlog orelse createOptionalSharedModule(config, "lib/structlog/src/root.zig", "src/compat/structlog.zig");
     const jinja_mod = shared.jinja orelse b.dependency("jinja", .{
@@ -212,6 +215,11 @@ pub fn create(config: Config) Graph {
         .optimize = optimize,
     });
     var shared_with_generating = shared;
+    if (shared.generating_openapi == null) generating_openapi_mod.addImport("antfly_provider_openapi", b.createModule(.{
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_provider_openapi/root.zig")),
+        .target = target,
+        .optimize = optimize,
+    }));
     shared_with_generating.generating_openapi = generating_openapi_mod;
     const chunking_api_openapi_mod = shared.chunking_api_openapi orelse addChunkingApiOpenApiModule(b, target, optimize, paths, generating_openapi_mod);
     shared_with_generating.chunking_api_openapi = chunking_api_openapi_mod;
@@ -281,6 +289,7 @@ pub fn create(config: Config) Graph {
     inference_chunker_mod.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     inference_chunker_mod.addImport("inference_fixed_tokenizer_data", inference_fixed_tokenizer_data_mod);
     inference_chunker_mod.addImport("antfly_image", image_mod);
+    inference_chunker_mod.addImport("antfly_hash", hash_mod);
 
     const inference_mod = b.createModule(.{
         .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/inference.zig")),
@@ -583,6 +592,11 @@ fn addInferenceApiModule(
         .target = target,
         .optimize = optimize,
     });
+    if (shared.generating_openapi == null) generating_openapi_mod.addImport("antfly_provider_openapi", b.createModule(.{
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_provider_openapi/root.zig")),
+        .target = target,
+        .optimize = optimize,
+    }));
     const chunking_api_openapi_mod = shared.chunking_api_openapi orelse addChunkingApiOpenApiModule(b, target, optimize, paths, generating_openapi_mod);
 
     if (skip_openapi) {

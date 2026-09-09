@@ -22,6 +22,8 @@ extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_
 extern fn unsetenv(name: [*:0]const u8) c_int;
 
 pub const backends = @import("backends/backends.zig");
+pub const execution_control = @import("execution_control.zig");
+pub const InferenceExecutionControl = execution_control.InferenceExecutionControl;
 pub const sentencepiece = @import("inference_tokenizer").sentencepiece;
 pub const hf_tokenizer = @import("inference_hf_tokenizer");
 pub const tokenizer = @import("inference_tokenizer");
@@ -97,6 +99,7 @@ pub const native_compute = struct {
 
 test {
     _ = backends;
+    _ = execution_control;
     _ = sentencepiece;
     _ = hf_tokenizer;
     _ = tokenizer;
@@ -104,11 +107,13 @@ test {
     _ = chunker;
     _ = pipelines;
     _ = @import("pipelines/gliner.zig");
+    _ = @import("pipelines/gemma4_channels.zig");
     _ = extractors;
     _ = server;
     _ = cache;
     _ = singleflight;
     _ = registry;
+    _ = tabular;
     _ = models;
     _ = gguf;
     _ = runtime;
@@ -127,6 +132,8 @@ test {
     _ = architectures.qwen3vl_reranker;
     _ = @import("architectures/gpt.zig");
     _ = @import("architectures/gemma4_runtime.zig");
+    _ = @import("architectures/gemma4_projector.zig");
+    _ = @import("embedding_trace.zig");
     _ = @import("server/model_manager.zig");
     _ = finetune;
     _ = finetune_cli;

@@ -52,27 +52,29 @@ Current harness:
 Suggested usage:
 
 ```sh
-zig build lib-audio-conformance-fetch
-zig build lib-audio-conformance-run
 zig build lib-audio-conformance
 ```
+
+The target fetches missing corpora and reuses cached fixtures. Add
+`-Dconformance-fetch=false` for an offline run, or
+`-Dconformance-fixtures=/absolute/path` to change the cache directory.
 
 Quick local status:
 
 ```sh
-zig run lib/audio/audio_xiph_corpora_e2e.zig -- status /tmp/termite-audio-xiph-corpora
+zig run lib/audio/audio_xiph_corpora_e2e.zig -- status /tmp/audio-xiph-corpora
 ```
 
-Fetch once explicitly if needed:
+Optional explicit cache preparation:
 
 ```sh
-zig run lib/audio/audio_xiph_corpora_e2e.zig -- fetch /tmp/termite-audio-xiph-corpora
+zig run lib/audio/audio_xiph_corpora_e2e.zig -- fetch /tmp/audio-xiph-corpora
 ```
 
 Run the broad sweep:
 
 ```sh
-zig run lib/audio/audio_xiph_corpora_e2e.zig -- run /tmp/termite-audio-xiph-corpora
+zig run lib/audio/audio_xiph_corpora_e2e.zig -- run /tmp/audio-xiph-corpora
 ```
 
 Current clean summary:
@@ -85,5 +87,5 @@ Misc MP3/AAC/MP4: success=12 expected_unsupported=0 unsupported=0 decode_failed=
 Single-file probe:
 
 ```sh
-zig run lib/audio/audio_xiph_corpora_e2e.zig -- probe-one /tmp/termite-audio-xiph-corpora vorbis/test/whatever.ogg
+zig run lib/audio/audio_xiph_corpora_e2e.zig -- probe-one /tmp/audio-xiph-corpora vorbis/test/whatever.ogg
 ```

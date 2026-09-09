@@ -13,6 +13,7 @@
 //! never observe one without the other.
 
 const std = @import("std");
+const Crc32 = @import("antfly_hash").Crc32;
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../../common/fs_paths.zig");
 const platform_sync = @import("antfly_platform").sync;
@@ -837,7 +838,7 @@ fn encode(alloc: Allocator, state: *const State) ![]u8 {
             try appendInt(alloc, &out, u64, pin.retain_after_sequence);
         }
     }
-    try appendInt(alloc, &out, u32, std.hash.Crc32.hash(out.items));
+    try appendInt(alloc, &out, u32, Crc32.hash(out.items));
     if (out.items.len > max_file_bytes) return error.IndexRepairStateTooLarge;
     return try out.toOwnedSlice(alloc);
 }
@@ -846,7 +847,7 @@ fn decode(alloc: Allocator, raw: []const u8) !State {
     if (raw.len < magic.len + 4 + 4 or !std.mem.eql(u8, raw[0..magic.len], magic)) return error.InvalidIndexRepairState;
     const payload_end = raw.len - 4;
     const expected_crc = std.mem.readInt(u32, raw[payload_end..][0..4], .little);
-    if (std.hash.Crc32.hash(raw[0..payload_end]) != expected_crc) return error.InvalidIndexRepairState;
+    if (Crc32.hash(raw[0..payload_end]) != expected_crc) return error.InvalidIndexRepairState;
     var pos: usize = magic.len;
     const decoded_format_version = try readInt(raw[0..payload_end], &pos, u32);
     if (decoded_format_version < 1 or decoded_format_version > format_version) return error.InvalidIndexRepairState;

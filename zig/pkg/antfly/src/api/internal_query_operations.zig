@@ -38,6 +38,8 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 
 pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
     return switch (err) {
+        error.ProviderTokenBudgetExceeded => error.QueryEmbeddingInputTooLarge,
+        error.ProviderQuotaRegistryFull => error.QueryEmbeddingOverloaded,
         error.QueryEmbeddingInputTooLarge,
         error.QueryEmbeddingOverloaded,
         error.EmbedRateLimited,

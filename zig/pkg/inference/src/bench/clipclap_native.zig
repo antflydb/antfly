@@ -1030,6 +1030,7 @@ fn runConcreteScenario(
             switch (cfg.backend) {
                 .native => {
                     var compute = if (cfg.io) |io| NativeCompute.initWithIo(allocator, &weight_store, null, io) else NativeCompute.init(allocator, &weight_store, null);
+                    defer compute.deinit();
                     const cb = compute.computeBackend();
                     const result = try benchClipText(allocator, &cb, clip_cfg, inputs, cfg, variant);
                     if (cfg.format == .text) printQuantCacheStats(&weight_store);
@@ -1052,6 +1053,7 @@ fn runConcreteScenario(
             switch (cfg.backend) {
                 .native => {
                     var compute = if (cfg.io) |io| NativeCompute.initWithIo(allocator, &weight_store, null, io) else NativeCompute.init(allocator, &weight_store, null);
+                    defer compute.deinit();
                     const cb = compute.computeBackend();
                     const result = try benchClipVision(allocator, &cb, clip_cfg, pixels, cfg, variant);
                     if (cfg.format == .text) printQuantCacheStats(&weight_store);
@@ -1078,6 +1080,7 @@ fn runConcreteScenario(
             switch (cfg.backend) {
                 .native => {
                     var compute = if (cfg.io) |io| NativeCompute.initWithIo(allocator, &weight_store, null, io) else NativeCompute.init(allocator, &weight_store, null);
+                    defer compute.deinit();
                     const cb = compute.computeBackend();
                     const result = try benchClapText(allocator, &cb, clap_cfg, inputs, cfg, variant);
                     if (cfg.format == .text) printQuantCacheStats(&weight_store);
@@ -1106,6 +1109,7 @@ fn runConcreteScenario(
             switch (cfg.backend) {
                 .native => {
                     var compute = if (cfg.io) |io| NativeCompute.initWithIo(allocator, &weight_store, null, io) else NativeCompute.init(allocator, &weight_store, null);
+                    defer compute.deinit();
                     const cb = compute.computeBackend();
                     const result = try benchClapAudio(allocator, &cb, clap_audio_cfg, audio_features, is_longer, cfg, variant);
                     if (cfg.format == .text) printQuantCacheStats(&weight_store);

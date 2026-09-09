@@ -32,6 +32,16 @@ def load_module(name: str, path: Path):
     return module
 
 
+def workflow_job(document: str, name: str) -> str:
+    document = document[document.index("\njobs:\n") + 1 :]
+    marker = f"  {name}:\n"
+    start = document.index(marker)
+    remainder = document[start + len(marker) :]
+    next_job = re.search(r"(?m)^  [a-z][a-z0-9-]*:\n", remainder)
+    end = start + len(marker) + (next_job.start() if next_job else len(remainder))
+    return document[start:end]
+
+
 package_cli_release = load_module(
     "package_cli_release_for_cabi_test",
     PACKAGING_DIR / "package_cli_release.py",
@@ -95,6 +105,22 @@ class CompletionPackagingTests(unittest.TestCase):
 
 
 class CAbiPackagingTests(unittest.TestCase):
+    def test_homebrew_job_provisions_packaging_toolchains(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github" / "workflows" / "antfly-release.yml"
+        ).read_text()
+        job = workflow_job(workflow, "prepare-zig-homebrew")
+        bootstrap = job.split("      - name: Render formula", 1)[0]
+        self.assertIn("uses: actions/setup-python@", bootstrap)
+        self.assertIn("steps.toolchain.outputs.python_build", bootstrap)
+        self.assertIn("uses: cachix/install-nix-action@", bootstrap)
+        self.assertIn("steps.toolchain.outputs.zig_nixpkgs_revision", bootstrap)
+        self.assertIn("steps.toolchain.outputs.zig_nix_attribute", bootstrap)
+        self.assertIn("steps.toolchain.outputs.zig_version", bootstrap)
+        self.assertIn('nix-build \'<nixpkgs>\' -A "$ZIG_NIX_ATTRIBUTE"', bootstrap)
+        self.assertIn('echo "$zig_path/bin" >> "$GITHUB_PATH"', bootstrap)
+        self.assertIn("grep -q 'dynamically linked'", bootstrap)
+
     def test_linux_abi_release_contract_stays_consistent(self) -> None:
         installer = (REPO_ROOT / "scripts" / "install.sh").read_text()
         minimum_match = re.search(
@@ -120,6 +146,9 @@ class CAbiPackagingTests(unittest.TestCase):
         ).read_text()
         release_workflow = (
             REPO_ROOT / ".github" / "workflows" / "antfly-release.yml"
+        ).read_text()
+        github_cli_action = (
+            REPO_ROOT / ".github" / "actions" / "setup-github-cli" / "action.yml"
         ).read_text()
         container_workflow = (
             REPO_ROOT / ".github" / "workflows" / "antfly-container.yml"
@@ -255,6 +284,30 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertEqual(release_workflow.count("environment: release-promotion"), 1)
         self.assertIn("github_environment.py check", release_workflow)
         self.assertIn("--environment release-promotion", release_workflow)
+        self.assertEqual(
+            release_workflow.count("uses: ./.github/actions/setup-github-cli"), 3
+        )
+        self.assertEqual(
+            release_gc_workflow.count("uses: ./.github/actions/setup-github-cli"),
+            2,
+        )
+        for job_name in (
+            "prepare-release-promotion",
+            "preflight-release-channel",
+            "publish-github-release",
+        ):
+            self.assertIn(
+                "uses: ./.github/actions/setup-github-cli",
+                workflow_job(release_workflow, job_name),
+            )
+        for job_name in ("plan", "apply"):
+            self.assertIn(
+                "uses: ./.github/actions/setup-github-cli",
+                workflow_job(release_gc_workflow, job_name),
+            )
+        self.assertIn("GH_CLI_VERSION: 2.100.0", github_cli_action)
+        self.assertIn("sha256sum --check --status", github_cli_action)
+        self.assertIn('case "$RUNNER_ARCH" in', github_cli_action)
         self.assertIn("--content-addressed-prefix", release_workflow)
         self.assertEqual(release_workflow.count("--exact-prefix"), 2)
         self.assertIn("--signer-workflow", release_workflow)

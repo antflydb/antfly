@@ -113,9 +113,14 @@ jobs:
             ':(glob)zig/**' \
             ':(exclude,glob)zig/pkg/antfly/antfarm/**' \
             ':(glob)scripts/ci/zig-*.sh' \
+            scripts/ci/check_zig_checksum_usage.py \
+            scripts/ci/test_check_zig_checksum_usage.py \
             scripts/ci/toolchain-policy.json \
             .github/actions/load-toolchain-policy/action.yml \
             scripts/test-backup-s3-integration.sh \
+            scripts/run_db_query_matrix.py \
+            scripts/test_run_db_query_matrix.py \
+            scripts/test_conformance_fixtures.py \
             Makefile \
             .github/workflows/zig-tests.yml \
             .github/workflows/antfly-container.yml
@@ -255,7 +260,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y ca-certificates curl xz-utils
+          sudo apt-get install -y ca-certificates curl xz-utils python3 make
           curl -fsSL \
             "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz" \
             -o "$RUNNER_TEMP/zig.tar.xz"
@@ -278,6 +283,14 @@ jobs:
           zig test -O ReleaseFast zig/pkg/antfly/src/encoding/streamvbyte.zig
           zig test zig/pkg/antfly/src/encoding/chunked_coder.zig
           zig test -O ReleaseFast zig/pkg/antfly/src/encoding/chunked_coder.zig
+
+      - name: Check shared checksum usage
+        run: make zig-checksums-check
+
+      - name: Test baseline ARM64 checksum runtime dispatch
+        run: |
+          zig test zig/lib/hash/src/mod.zig -O ReleaseSafe -mcpu=baseline
+          zig test zig/lib/hash/src/mod.zig -O ReleaseSafe -mcpu=baseline -lc
 
   zig-base-tests:
     name: zig-base / x86_64
@@ -323,6 +336,15 @@ jobs:
       - name: Verify Zig version
         run: zig version
 
+      - name: Check shared checksum usage
+        run: make zig-checksums-check
+
+      - name: Test baseline checksum runtime dispatch
+        working-directory: zig
+        run: |
+          zig test lib/hash/src/mod.zig -O Debug -mcpu=baseline -fno-llvm
+          zig build lib-hash-test -Dcpu=baseline -Doptimize=ReleaseSafe
+
       - name: Check generated sources
         run: make zig-generated-check
 
@@ -341,6 +363,12 @@ jobs:
           tools/test_audit_storage_test_shards.py
           tools/test_run_test_partitions.py
           tools/test_run_recall_checks.py
+          tools/test_test_runner.py
+
+      - name: Test benchmark orchestration and fixture setup
+        run: |
+          python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
+          python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
 
       - name: Check inference kernel generator
         working-directory: zig/pkg/inference
@@ -630,6 +658,12 @@ jobs:
           tools/test_audit_storage_test_shards.py
           tools/test_run_test_partitions.py
           tools/test_run_recall_checks.py
+          tools/test_test_runner.py
+
+      - name: Test benchmark orchestration and fixture setup
+        run: |
+          python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
+          python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
 
       # Keep normal build-step parallelism while bounding aggregate compiler
       # memory to the pod's cgroup budget.
@@ -647,7 +681,7 @@ jobs:
             "$patched_runner"
           echo "build_runner=$patched_runner" >> "$GITHUB_OUTPUT"
 
-      - name: Run full Zig unit tests
+      - name: Run library, Antfly, and inference unit tests
         run: |
           set +e
           taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test ZIG_BUILD_FLAGS="--build-runner ${{ steps.cpus.outputs.build_runner }} --maxrss ${{ steps.cpus.outputs.max_rss }}"
@@ -670,7 +704,7 @@ jobs:
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
           release-scale-test
-          recall-harness-build
+          recall-harness
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
@@ -691,7 +725,7 @@ jobs:
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
-          sim-test
+          antfly-sim-test
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
@@ -700,7 +734,7 @@ jobs:
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
-          integration-test
+          antfly-integration-test
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
@@ -709,7 +743,7 @@ jobs:
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
-          recall-ci-test
+          antfly-recall-test
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
@@ -718,7 +752,7 @@ jobs:
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 tools/run_bounded_zig_build.py --zig zig -- build
-          chaos-test
+          antfly-chaos-test
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
@@ -1164,7 +1198,6 @@ jobs:
         working-directory: zig
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
-          ANTFLY_LSM_OPEN_DEBUG: "1"
         run: |
           chmod +x ./zig-out/bin/antfly
           taskset -c ${{ steps.e2e_cpus.outputs.list }} ../scripts/ci/zig-antfly-e2e-pytest.sh e2e/antfly

@@ -153,7 +153,7 @@ pub fn main(init: std.process.Init) !void {
                 return error.InvalidArguments;
             }
         }
-        try ensureSourcesAvailable(alloc, root_dir, refresh, true);
+        try ensureSourcesAvailable(alloc, init.io, root_dir, refresh, true);
         std.debug.print("audio misc corpora ready: {s}\n", .{root_dir});
         return;
     }
@@ -183,7 +183,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        try ensureSourcesAvailable(alloc, config.root_dir, config.refresh, config.allow_fetch);
+        try ensureSourcesAvailable(alloc, init.io, config.root_dir, config.refresh, config.allow_fetch);
         const summary = try runSweep(alloc, config);
         printSummary(summary);
         return;
@@ -794,11 +794,11 @@ fn minimp3ExpectedCase(relative_path: []const u8) ?Minimp3VectorCase {
     return null;
 }
 
-fn ensureSourcesAvailable(alloc: Allocator, root_dir: []const u8, refresh: bool, allow_fetch: bool) !void {
+fn ensureSourcesAvailable(alloc: Allocator, io: std.Io, root_dir: []const u8, refresh: bool, allow_fetch: bool) !void {
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
-    try runChild(&.{ "mkdir", "-p", root_dir });
+    try runChild(io, &.{ "mkdir", "-p", root_dir });
 
     for (sources) |source| {
         const source_dir = try std.fs.path.join(alloc, &.{ root_dir, source.local_dir });
@@ -812,12 +812,12 @@ fn ensureSourcesAvailable(alloc: Allocator, root_dir: []const u8, refresh: bool,
             dir.close(io_impl.io());
         }
 
-        try runChild(&.{ "mkdir", "-p", source_dir });
+        try runChild(io, &.{ "mkdir", "-p", source_dir });
         for (source.file_names) |file_name| {
             const local_path = try std.fs.path.join(alloc, &.{ source_dir, file_name });
             defer alloc.free(local_path);
             if (std.fs.path.dirname(local_path)) |parent_dir| {
-                try runChild(&.{ "mkdir", "-p", parent_dir });
+                try runChild(io, &.{ "mkdir", "-p", parent_dir });
             }
 
             const file_exists = blk: {
@@ -825,11 +825,14 @@ fn ensureSourcesAvailable(alloc: Allocator, root_dir: []const u8, refresh: bool,
                 break :blk true;
             };
             if (file_exists and !refresh) continue;
-            if (!allow_fetch) continue;
+            if (!allow_fetch) {
+                std.debug.print("missing upstream corpus file: {s}\n", .{local_path});
+                return error.ExternalAudioCorpusUnavailable;
+            }
 
             const remote_url = try std.mem.concat(alloc, u8, &.{ source.archive_url, file_name });
             defer alloc.free(remote_url);
-            try runChild(&.{ "curl", "-L", "-o", local_path, remote_url });
+            try runChild(io, &.{ "curl", "--fail", "--remove-on-error", "-L", "-o", local_path, remote_url });
         }
     }
 }
@@ -870,17 +873,14 @@ fn printStatus(alloc: Allocator, root_dir: []const u8) !void {
     }
 }
 
-fn runChild(argv: []const []const u8) !void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-
-    var child = try std.process.spawn(io_impl.io(), .{
+fn runChild(io: std.Io, argv: []const []const u8) !void {
+    var child = try std.process.spawn(io, .{
         .argv = argv,
         .stdin = .ignore,
         .stdout = .inherit,
         .stderr = .inherit,
     });
-    const term = try child.wait(io_impl.io());
+    const term = try child.wait(io);
     switch (term) {
         .exited => |code| if (code != 0) return error.ChildProcessFailed,
         else => return error.ChildProcessFailed,

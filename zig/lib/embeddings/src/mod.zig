@@ -44,6 +44,7 @@ fn retrievalCapabilities(provider: Provider, model: []const u8, request_format: 
 }
 
 pub const Config = struct {
+    rate_limit: ?openapi.RateLimitConfig = null,
     provider: Provider,
     model: []const u8 = "",
     request_format: []const u8 = "",
@@ -66,6 +67,7 @@ pub const Config = struct {
 
     pub fn clone(self: Config, alloc: Allocator) !Config {
         return .{
+            .rate_limit = self.rate_limit,
             .provider = self.provider,
             .model = if (self.model.len > 0) try alloc.dupe(u8, self.model) else "",
             .request_format = if (self.request_format.len > 0) try alloc.dupe(u8, self.request_format) else "",
@@ -177,6 +179,7 @@ pub fn configFromOpenApi(alloc: Allocator, generated: openapi.EmbedderConfig) !C
         generated.query_instruction,
     );
     var cfg = Config{
+        .rate_limit = generated.rate_limit,
         .provider = std.meta.stringToEnum(Provider, provider_name) orelse return error.InvalidEmbedderConfig,
         .model = if (generated.model) |model| try alloc.dupe(u8, model) else "",
         .request_format = if (generated.request_format) |request_format| try alloc.dupe(u8, request_format) else "",
@@ -218,6 +221,7 @@ pub fn configFromOpenApi(alloc: Allocator, generated: openapi.EmbedderConfig) !C
 
 pub fn openApiFromConfig(cfg: Config) openapi.EmbedderConfig {
     return .{
+        .rate_limit = cfg.rate_limit,
         .provider = @tagName(cfg.provider),
         .model = if (cfg.model.len > 0) cfg.model else null,
         .request_format = if (cfg.request_format.len > 0) cfg.request_format else null,
@@ -389,4 +393,21 @@ test "embedder config validates model for remote providers" {
         error.InvalidEmbedderConfig,
         parseConfigFromSlice(alloc, "{\"provider\":\"openai\"}"),
     );
+}
+
+test "embeddings config preserves shared rate limits through cloning and JSON" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseConfigFromSlice(alloc, "{\"provider\":\"antfly\",\"model\":\"test\",\"rate_limit\":{\"requests_per_minute\":120,\"burst\":2,\"tokens_per_minute\":1000,\"max_concurrency\":4}}");
+    defer cfg.deinit(alloc);
+    cfg.rate_limit.?.pacing = .completion;
+    cfg.rate_limit.?.burst = 1;
+    var cloned = try cfg.clone(alloc);
+    defer cloned.deinit(alloc);
+    const encoded = try stringifyAlloc(alloc, cloned);
+    defer alloc.free(encoded);
+    var reparsed = try parseConfigFromSlice(alloc, encoded);
+    defer reparsed.deinit(alloc);
+    try std.testing.expectEqualDeep(cfg.rate_limit, reparsed.rate_limit);
+    try std.testing.expectEqual(.completion, reparsed.rate_limit.?.pacing.?);
+    try std.testing.expectEqual(@as(?i64, 4), reparsed.rate_limit.?.max_concurrency);
 }
