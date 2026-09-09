@@ -91,6 +91,7 @@ pub const AddRuntimeOptions = struct {
 pub const AddRuntimeResult = struct {
     antfly_main_tests: *std.Build.Step.Compile,
     antfly_main: *std.Build.Step.Compile,
+    run_linked_inference_abi_integration: *std.Build.Step.Run,
     runtime_library_artifacts: [std.meta.fields(RuntimeLibraryUnit).len]?*std.Build.Step.Compile,
 };
 
@@ -255,6 +256,27 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         }
     }
 
+    // Exercise the real production archive boundary for encoded-image reads.
+    // The probe resolves only the exported C function table, so it cannot
+    // accidentally pass by importing inference_host.zig into the test root.
+    const linked_inference_abi_integration_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/inference_abi_integration.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    // This executable loads the production archive, including version consumers.
+    production_antfly_imports.build_info.link(linked_inference_abi_integration_mod);
+    linked_inference_abi_integration_mod.link_libc = link_libc;
+    addMacosSdkPaths(b, linked_inference_abi_integration_mod, target);
+    const linked_inference_abi_integration = b.addExecutable(.{
+        .name = "linked-inference-abi-integration",
+        .root_module = linked_inference_abi_integration_mod,
+    });
+    linked_inference_abi_integration.root_module.linkLibrary(
+        runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?,
+    );
+    const run_linked_inference_abi_integration = b.addRunArtifact(linked_inference_abi_integration);
+
     for (runtime_library_link_order) |unit| {
         antfly_main.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(unit)].?);
     }
@@ -318,6 +340,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     return .{
         .antfly_main_tests = antfly_main_tests,
         .antfly_main = antfly_main,
+        .run_linked_inference_abi_integration = run_linked_inference_abi_integration,
         .runtime_library_artifacts = runtime_library_artifacts,
     };
 }

@@ -19,7 +19,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -131,31 +130,56 @@ func (w *RouteWatcher) onRouteAdd(obj any) {
 		return
 	}
 
-	w.routeManager.AddRoute(route)
-	w.logger.Info("added route", zap.String("name", route.Name), zap.Int32("priority", route.Priority))
+	changed, err := w.routeManager.UpsertRoute(route)
+	if err != nil {
+		w.logger.Error("failed to install InferenceProxy", zap.Error(err))
+		return
+	}
+	if !changed {
+		w.logger.Debug("route policy already installed", zap.String("namespace", route.Namespace), zap.String("name", route.Name))
+		return
+	}
+	w.logger.Info("added route", zap.String("namespace", route.Namespace), zap.String("name", route.Name), zap.Int32("priority", route.Priority))
 }
 
 func (w *RouteWatcher) onRouteUpdate(oldObj, newObj any) {
+	oldRoute, oldOK := oldObj.(*unstructured.Unstructured)
+	newRoute, newOK := newObj.(*unstructured.Unstructured)
+	// Shared informer resyncs deliberately deliver synthetic Update events with
+	// the same resource version. They are cache maintenance, not policy changes,
+	// and must not invalidate capability leases.
+	if oldOK && newOK && oldRoute.GetResourceVersion() != "" && oldRoute.GetResourceVersion() == newRoute.GetResourceVersion() {
+		return
+	}
 	route, err := w.convertRoute(newObj)
 	if err != nil {
 		w.logger.Error("failed to convert InferenceProxy", zap.Error(err))
 		return
 	}
 
-	w.routeManager.AddRoute(route) // AddRoute handles updates by name
-	w.logger.Info("updated route", zap.String("name", route.Name), zap.Int32("priority", route.Priority))
+	changed, err := w.routeManager.UpsertRoute(route)
+	if err != nil {
+		w.logger.Error("failed to update InferenceProxy", zap.Error(err))
+		return
+	}
+	if !changed { // UpsertRoute handles updates by complete route identity.
+		w.logger.Debug("route update did not change policy", zap.String("namespace", route.Namespace), zap.String("name", route.Name))
+		return
+	}
+	w.logger.Info("updated route", zap.String("namespace", route.Namespace), zap.String("name", route.Name), zap.Int32("priority", route.Priority))
 }
 
 func (w *RouteWatcher) onRouteDelete(obj any) {
-	u, ok := obj.(*unstructured.Unstructured)
+	u, ok := unstructuredFromDelete(obj)
 	if !ok {
-		w.logger.Error("failed to cast object to Unstructured")
+		w.logger.Error("failed to recover deleted InferenceProxy identity")
 		return
 	}
 
-	name := u.GetNamespace() + "/" + u.GetName()
-	w.routeManager.RemoveRoute(name)
-	w.logger.Info("removed route", zap.String("name", name))
+	namespace := u.GetNamespace()
+	name := u.GetName()
+	w.routeManager.RemoveRoute(namespace, name)
+	w.logger.Info("removed route", zap.String("namespace", namespace), zap.String("name", name))
 }
 
 // convertRoute converts an unstructured InferenceProxy to the proxy's Route type
@@ -171,16 +195,17 @@ func (w *RouteWatcher) convertRoute(obj any) (*Route, error) {
 		return nil, fmt.Errorf("spec not found")
 	}
 
-	// Build the route name with namespace for uniqueness
+	// Preserve namespace and name as separate identity fields. Namespace is also
+	// the routing scope for every pool referenced by this policy.
 	namespace := u.GetNamespace()
 	name := u.GetName()
-	fullName := namespace + "/" + name
 
 	route := &Route{
-		Name:                fullName,
+		Namespace:           namespace,
+		Name:                name,
 		Priority:            getInt32(spec, "priority", 100),
 		Operations:          make(map[OperationType]bool),
-		ModelPatterns:       make([]*regexp.Regexp, 0),
+		ModelPatterns:       make([]*RegexPattern, 0),
 		HeaderMatchers:      make(map[string]*StringMatcher),
 		SourceTables:        make(map[string]bool),
 		SourceOrganizations: make(map[string]bool),
@@ -206,8 +231,7 @@ func (w *RouteWatcher) convertRoute(obj any) (*Route, error) {
 				if modelStr, ok := model.(string); ok {
 					pattern, err := CompileModelPattern(modelStr)
 					if err != nil {
-						w.logger.Warn("failed to compile model pattern", zap.String("pattern", modelStr), zap.Error(err))
-						continue
+						return nil, fmt.Errorf("compile model pattern %q: %w", modelStr, err)
 					}
 					route.ModelPatterns = append(route.ModelPatterns, pattern)
 				}
@@ -226,9 +250,11 @@ func (w *RouteWatcher) convertRoute(obj any) (*Route, error) {
 						matcher.Prefix = prefix
 					}
 					if regexStr, ok := matchMap["regex"].(string); ok {
-						if regex, err := regexp.Compile(regexStr); err == nil {
-							matcher.Regex = regex
+						regex, err := CompileRegexPattern(regexStr, RegexLeftmostFirst)
+						if err != nil {
+							return nil, fmt.Errorf("compile header pattern %q for %q: %w", regexStr, headerName, err)
 						}
+						matcher.Regex = regex
 					}
 					route.HeaderMatchers[headerName] = matcher
 				}

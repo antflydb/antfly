@@ -655,7 +655,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .target = target,
         .optimize = optimize,
     });
-    const pdf_mod = pdf_build.createModule(b, b.path("lib/pdf"), target, optimize, image_mod, font_mod, pdf_standard_fonts_mod);
+    const pdf_mod = pdf_build.createModule(b, b.path("lib/pdf"), target, optimize, image_mod, hash_mod, font_mod, pdf_standard_fonts_mod);
 
     const wasm_image_mod = image_build.createModule(b, b.path("lib/image"), wasm_target, optimize, wasm_hash_mod);
     const wasm_pdf_standard_fonts_mod = b.createModule(.{
@@ -668,7 +668,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .target = wasm_target,
         .optimize = optimize,
     });
-    const wasm_pdf_mod = pdf_build.createModule(b, b.path("lib/pdf"), wasm_target, optimize, wasm_image_mod, wasm_font_mod, wasm_pdf_standard_fonts_mod);
+    const wasm_pdf_mod = pdf_build.createModule(b, b.path("lib/pdf"), wasm_target, optimize, wasm_image_mod, wasm_hash_mod, wasm_font_mod, wasm_pdf_standard_fonts_mod);
 
     const sentencepiece_proto_mod = @import("lib/tokenizer/build_support.zig").addSentencePieceProtoModule(b, protobuf_dep, b.path("lib/tokenizer"));
     const inference_jinja_mod = b.createModule(.{
@@ -771,6 +771,8 @@ pub fn create(b: *std.Build) ?Artifacts {
             .ml_tabular = ml_tabular_mod,
             .onnx_graph = inference_onnx_graph_mod,
             .pjrt = inference_pjrt_mod,
+            .audio_openapi = audio_openapi_mod,
+            .s3_openapi = s3_openapi_mod,
             .generating_openapi = generating_openapi_mod,
             .extraction_openapi = extraction_openapi_mod,
             .extracting = extracting_mod,
@@ -804,21 +806,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     );
     hf_tokenizer_test_step.dependOn(&run_hf_tokenizer_tests.step);
 
-    const transcribing_mod = b.createModule(.{
-        .root_source_file = b.path("lib/transcribing/src/mod.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    transcribing_mod.addImport("antfly_audio_openapi", audio_openapi_mod);
-    transcribing_mod.addImport("httpx", httpx_mod);
-    transcribing_mod.addImport("inference_api", inference_api_mod);
-    transcribing_mod.addImport("antfly_scraping", scraping_mod);
-    transcribing_mod.addImport("antfly_google", google_mod);
-    const reader_config_mod = b.createModule(.{
-        .root_source_file = b.path("lib/readers/src/config.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const transcribing_mod = inference_graph.transcribing_mod;
+    const reader_config_mod = inference_graph.reader_config_mod;
     const readers_mod = b.createModule(.{
         .root_source_file = b.path("lib/readers/src/mod.zig"),
         .target = target,
@@ -828,8 +817,10 @@ pub fn create(b: *std.Build) ?Artifacts {
     readers_mod.addImport("inference_api", inference_api_mod);
     readers_mod.addImport("antfly_google", google_mod);
     readers_mod.addImport("antfly_reader_config", reader_config_mod);
+    readers_mod.addImport("antfly_scraping", scraping_mod);
+    readers_mod.addImport("antfly_image", image_mod);
     inference_server_mod.addImport("antfly_readers", readers_mod);
-    inference_server_mod.addImport("antfly_transcribing", transcribing_mod);
+    inference_server_mod.addImport("antfly_reader_config", reader_config_mod);
     inference_server_mod.addImport("antfly_extracting", extracting_mod);
     const synthesizing_mod = b.createModule(.{
         .root_source_file = b.path("lib/synthesizing/src/mod.zig"),
@@ -1235,11 +1226,22 @@ pub fn create(b: *std.Build) ?Artifacts {
         .target = target,
         .optimize = optimize,
         .image_mod = image_mod,
+        .hash_mod = hash_mod,
         .pdf_standard_fonts_mod = pdf_standard_fonts_mod,
         .font_mod = font_mod,
     });
     const run_lib_pdf_tests = pdf_tests.run_lib_pdf_tests;
-    b.step("lib-pdf-test", "Run shared PDF tests").dependOn(&run_lib_pdf_tests.step);
+    const pdf_integration = antfly_tests_build.createPdfIntegration(b, .{
+        .root = b.path("pkg/antfly"),
+        .fixture = b.path("lib/pdf/integration_fixture.zig"),
+        .imports = production_antfly_imports,
+        .optimize = optimize,
+    });
+    const pdf_test_step = b.step("lib-pdf-test", "Run shared PDF tests");
+    pdf_test_step.dependOn(&run_lib_pdf_tests.step);
+    pdf_test_step.dependOn(&pdf_integration.run.step);
+    b.step("pdf-ocr-integration-test", "Run native PDF rendering and encoded reader batching through the OCR coordinator").dependOn(&pdf_integration.run.step);
+    b.step("pdf-model-qualification-test", "Run opt-in real Florence/Gemma4/ClipClap PDF qualification against ANTFLY_PDF_QUALIFICATION_URL").dependOn(&pdf_integration.qualification.step);
 
     const lib_image_spng_paths = image_build.detectSpngPaths(b, target);
     const image_benchmark = image_build.addBenchmark(b, .{
@@ -1262,7 +1264,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .target = target,
         .optimize = pdf_bench_optimize,
     });
-    const pdf_bench_pdf = pdf_build.createModule(b, b.path("lib/pdf"), target, pdf_bench_optimize, pdf_bench_image, pdf_bench_font, pdf_bench_fonts);
+    const pdf_bench_pdf = pdf_build.createModule(b, b.path("lib/pdf"), target, pdf_bench_optimize, pdf_bench_image, hash_bench_mod, pdf_bench_font, pdf_bench_fonts);
     const pdf_bench = pdf_build.addBenchmark(b, .{
         .root = b.path("lib/pdf"),
         .target = target,
@@ -1345,6 +1347,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_lib_ha_compat_tests = owner_tests.run_lib_ha_compat_tests;
     const antfly_test_step = owner_tests.antfly_test_step;
     const unit_test_step = owner_tests.unit_test_step;
+    unit_test_step.dependOn(&pdf_integration.run.step);
     unit_test_step.dependOn(&run_httpx_client_lifecycle_tests.step);
     const vopr_test_step = owner_tests.vopr_test_step;
     const integration_test_step = owner_tests.integration_test_step;
@@ -1488,6 +1491,8 @@ pub fn create(b: *std.Build) ?Artifacts {
         .capi_mod = capi_mod,
         .libantfly_link_mod = libantfly_link_mod,
     });
+    b.step("linked-inference-abi-integration-test", "Run the production-linked inference function-table and binary-payload ABI probe").dependOn(&runtime.run_linked_inference_abi_integration.step);
+    owner_tests.standalone_runtime_test_step.dependOn(&runtime.run_linked_inference_abi_integration.step);
     const antfly_main = runtime.antfly_main;
     const runtime_library_artifacts = runtime.runtime_library_artifacts;
 

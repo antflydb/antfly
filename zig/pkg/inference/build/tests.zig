@@ -52,6 +52,7 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("antfly_generating_openapi", ctx.graph.generating_openapi_mod);
     tests.root_module.addImport("antfly_extraction_openapi", ctx.graph.extraction_openapi_mod);
     tests.root_module.addImport("antfly_extracting", ctx.graph.extracting_mod);
+    tests.root_module.addImport("antfly_transcribing", ctx.graph.transcribing_mod);
     tests.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
     tests.root_module.addImport("inference_chunker", ctx.graph.inference_chunker_mod);
     tests.root_module.addImport("jinja", ctx.graph.jinja_mod);
@@ -69,6 +70,7 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("prometheus", ctx.graph.prometheus_mod);
     tests.root_module.addImport("structlog", ctx.graph.structlog_mod);
     tests.root_module.addImport("antfly_platform", ctx.graph.platform_mod);
+    tests.root_module.addImport("antfly_reader_config", ctx.graph.reader_config_mod);
     tests.root_module.addImport("inference_internal", tests.root_module);
     if (ctx.graph.inference_client_mod) |mod| {
         tests.root_module.addImport("inference_client", mod);

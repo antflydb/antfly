@@ -181,6 +181,7 @@ pub fn createBge(ctx: Context) CreateBgeResult {
         .pjrt_mod = ctx.graph.pjrt_mod,
         .platform_mod = ctx.graph.platform_mod,
         .protobuf_mod = ctx.graph.protobuf_mod,
+        .reader_config_mod = ctx.graph.reader_config_mod,
         .inference_client_mod = ctx.graph.inference_client_mod,
     });
     bge_m3_runtime_mod.addImport("antfly_generating_openapi", ctx.graph.generating_openapi_mod);

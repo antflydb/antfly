@@ -20,6 +20,7 @@ pub const AddTestsOptions = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     image_mod: *std.Build.Module,
+    hash_mod: *std.Build.Module,
     pdf_standard_fonts_mod: *std.Build.Module,
     font_mod: *std.Build.Module,
 };
@@ -39,6 +40,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     });
     pdf_test_mod.addImport("antfly_image", image_mod);
+    pdf_test_mod.addImport("antfly_hash", options.hash_mod);
     pdf_test_mod.addImport("antfly_font", font_mod);
     pdf_test_mod.addImport("pdf_standard_fonts", pdf_standard_fonts_mod);
     if (target.result.os.tag == .macos) {
@@ -82,13 +84,14 @@ pub fn addSafetyTests(b: *std.Build, pdf_mod: *std.Build.Module) *std.Build.Step
     });
 }
 
-pub fn createModule(b: *std.Build, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, image: *std.Build.Module, font: *std.Build.Module, standard_fonts: *std.Build.Module) *std.Build.Module {
+pub fn createModule(b: *std.Build, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, image: *std.Build.Module, hash: *std.Build.Module, font: *std.Build.Module, standard_fonts: *std.Build.Module) *std.Build.Module {
     const module = b.createModule(.{
         .root_source_file = root.path(b, "src/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
     module.addImport("antfly_image", image);
+    module.addImport("antfly_hash", hash);
     module.addImport("antfly_font", font);
     module.addImport("pdf_standard_fonts", standard_fonts);
     if (target.result.os.tag == .macos) {

@@ -197,6 +197,7 @@ pub const AntflyRootImports = struct {
             "reranking",          "chunking",        "json",                     "handlebars",
             "openai_api",         "indexes_openapi", "embeddings_openapi",       "embeddings",
             "inference_chunker",  "vector",          "structlog",                "hash",
+            "image",
         }) |field| self.addImport(mod, field);
         mod.link_libc = link_libc;
     }

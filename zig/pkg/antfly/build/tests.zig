@@ -76,6 +76,7 @@ pub const AddTestsResult = struct {
     run_lib_ha_compat_tests: *std.Build.Step.Run,
     antfly_test_step: *std.Build.Step,
     unit_test_step: *std.Build.Step,
+    standalone_runtime_test_step: *std.Build.Step,
     vopr_test_step: *std.Build.Step,
     integration_test_step: *std.Build.Step,
     chaos_test_step: *std.Build.Step,
@@ -436,7 +437,33 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lib_generating_runtime_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "generating backend", "local generation budgets", "local generation bridge", "asset producer runtime", "provider quotas", "vertex provider" },
+        .filters = &.{
+            "generating backend",
+            "local generation budgets",
+            "local generation bridge",
+            "generating backend factory executes fallback chain across providers",
+            "asset producer runtime",
+            "asset producer raw raster selection requires local physical capability and borrows pixels",
+            "asset producer destroys returned values",
+            "asset producer media invocation memory fails closed",
+            "asset producer enforces media allocator and result contracts",
+            "asset producer enforces invocation contracts",
+            "asset producer bounds invocation contract resolution",
+            "encoded reader chunks obey model item and byte limits",
+            "media part item embedding",
+            "managed embedder",
+            "inference capabilities",
+            "attachment transport",
+            "remote generator batch streams attachments",
+            "batch capabilities",
+            "work identity and execution reports",
+            "bounded invocation allocator",
+            "remote Antfly",
+            "antfly chunk request frames borrowed binary input",
+            "capability lease HTTP fields own storage",
+            "provider quotas",
+            "vertex provider",
+        },
     });
     const run_lib_generating_runtime_tests = addFilteredTestRunArtifact(b, lib_generating_runtime_tests);
     const lib_generating_runtime_test_step = b.step("antfly-generating-test", "Run generating backend adapter tests");
@@ -444,7 +471,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lib_managed_embedder_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{"managed embedder"},
+        .filters = &.{ "managed embedder", "antfly numeric", "antfly provider preserves explicit distributed admission denial", "legacy numeric" },
     });
     const run_lib_managed_embedder_tests = addFilteredTestRunArtifact(b, lib_managed_embedder_tests);
     const lib_managed_embedder_test_step = b.step("antfly-inference-managed-embedder-test", "Run managed embedder contract and provider tests");
@@ -765,7 +792,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "query embedding cache owns results and coalesces misses",
         "query embedding cache keys isolate security domains",
         "managed embedder deadlines bound provider pacing and transport",
+        "remote capability invalidation fences active discovery",
         "managed embedder dimension probe validation modes",
+        "managed embedding request overlays borrow capability cache synchronization",
         "managed embedder rejects malformed provider vectors",
         "managed embedder rejects unsupported execution namespaces",
         "managed embedder separates index and artifact lookup namespaces",
@@ -778,6 +807,27 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "catalog ownership rejects duplicate executable owners and endpoint mismatches",
         "metadata http client preserves artifact dependency conflicts",
         "managed embedder preserves coverage policy in storage config",
+        "managed embedder admission follows the selected attachment transport",
+        "managed embedder metadata",
+        "managed embedder partitions and validates inline image data URIs",
+        "attachment transport separates wire and peak resident representations",
+        "bounded invocation allocator",
+        "inline data URI parser validates canonical metadata",
+        "antfly embed parts uses the framed attachment transport",
+        "antfly embed parts request sizing is exact for escaped strings",
+        "antfly dense JSON response cleanup is allocation-failure safe",
+        "remote generator batch streams attachments into one exact JSON body",
+        "capability lease HTTP fields own storage",
+        "asset producer runtime rejects empty borrowed media",
+        "asset producer runtime derives coherent logical and wire result ceilings",
+        "asset producer runtime applies result ceilings to non-model producers",
+        "remote chunk runtime services do not require a local callback provider",
+        "asset producer media invocation memory fails closed",
+        "asset producer enforces media allocator and result contracts",
+        "asset producer enforces invocation contracts",
+        "asset producer bounds invocation contract resolution",
+        "media part item embedding",
+        "PDF render budget reserves the complete invocation peak",
         "semantic query planning reuses equivalent embeddings",
         "batch parser preserves oversized value errors",
         "batch parser accepts raw payload value under public request cap",
@@ -2041,6 +2091,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "classified batch reservation distinguishes size from contention",
         "aggregate host memory admission is atomic across slices",
         "bounded observer growth grants aggregate slice and host capacity atomically",
+        "owned split reservations prevent concurrent headroom theft",
+        "owned split reservations reclaim before partial fallback",
+        "owned split secondary credit transfers into a budgeted allocator",
+        "pinned split credit survives idle allocation windows",
         "logical inference slices can charge only physical host memory",
         "batch release accounting errors fail closed",
         "single release and observer mismatch cannot debit unrelated memory",
@@ -2105,6 +2159,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "capacity reservation revalidation fails closed when available space falls",
         "resource manager background deferral follows slice policy",
         "budgeted allocator admits before allocation and releases exact live bytes",
+        "budgeted allocator reclamation is opt in and retries without raising limits",
+        "budgeted allocator reclaim denial does not retry a busy cache",
         "budgeted allocator allows concurrent operations within the shared hard limit",
         "budgeted allocator amortizes manager reservations and releases idle credit",
     };
@@ -2227,7 +2283,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "index status aggregation preserves actionable repair diagnostics for the requested incarnation",
             "actionable repair remains visible while retained generation stays queryable",
             "serviceable full text replacement remains queryable while rebuilding",
-            "serviceable repair cannot mask sibling shard serving failures",
+            "serviceable repair preserves sibling shard dense catch-up fallback",
+            "serviceable repair cannot mask sibling shard load failure",
+            "index encoders preserve sibling replay debt during serviceable repair",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3357,6 +3415,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{
             "VOPR durable job",
             "backend runtime durable owner lifecycle",
+            "backend runtime borrows backend-agnostic std.Io lanes",
             "ttl runtime executes production pass on borrowed VoprIo",
             "transaction recovery executes production pass on borrowed VoprIo",
             "background maintenance services lifecycle runs on borrowed VoprIo",
@@ -3580,9 +3639,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone runtime local generator accepts media url data uris",
             "local generate message conversion preserves tool history and admission",
             "inference worker",
+            "provider failure logging",
+            "provider owner logs private cause",
             "standalone runtime local dense embed preserves borrowed binary media",
+            "standalone numeric result ABI",
+            "standalone raster embedding control",
+            "standalone encoded reader ABI round trips borrowed payloads",
+            "standalone raster reader ABI preserves borrowed strided pages and identity",
+            "encoded reader ABI enforces resolved model capabilities",
             "standalone runtime local generator preflights mixed resident media exactly",
             "standalone runtime local generator refuses decode allocation beyond preflight",
+            "linked generator validates concrete MIME and decoded pixels",
             "standalone inference middleware reuses public API authentication",
             "standalone CORS middleware",
             "standalone runtime local replica reconcile permit blocks only active startup catch-up",
@@ -3656,6 +3723,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
+        // This root intentionally links the complete standalone runtime and
+        // embedded inference ABI. macOS codegen peaked near 7.6 GiB in Debug
+        // and 9.93 GB in ReleaseFast; reserve headroom for safe parallel builds.
+        // This is a compile-memory scheduling claim, not a service limit.
+        // Linux retains the measured aggregate default.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 11 else 7) * 1024 * 1024 * 1024,
     });
     const lib_standalone_runtime_test_step = b.step("antfly-standalone-runtime-test", "Run focused standalone runtime tests");
     const run_lib_standalone_runtime_tests = addFilteredTestRunArtifact(b, lib_standalone_runtime_tests);
@@ -3989,6 +4062,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     index_manager_test_mod.addImport("antfly_resolver", resolver_mod);
     index_manager_test_mod.addImport("antfly_chunking", chunking_mod);
     index_manager_test_mod.addImport("antfly-json", json_mod);
+    index_manager_test_mod.addImport("antfly_scraping", scraping_mod);
+    index_manager_test_mod.addImport("antfly_image", image_mod);
     index_manager_test_mod.addImport("antfly_regex", regex_mod);
     index_manager_test_mod.addImport("antfly_reader_config", reader_config_mod);
     index_manager_test_mod.addImport("structlog", structlog_mod);
@@ -4301,6 +4376,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const sparse_test_mod = makeLmdbModule(b, "pkg/antfly/src/sparse_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     sparse_test_mod.addImport("bloom", bloom_mod);
+    // Sparse lifecycle tests reach BackendRuntime through shared storage code;
+    // its lazy PDF lane is part of that module graph even when the test itself
+    // does not render a document.
+    sparse_test_mod.addImport("antfly_pdf", pdf_mod);
     const sparse_unit_tests = b.addTest(.{
         .root_module = sparse_test_mod,
     });
@@ -4983,9 +5062,37 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_lib_ha_compat_tests = run_lib_ha_compat_tests,
         .antfly_test_step = antfly_test_step,
         .unit_test_step = unit_test_step,
+        .standalone_runtime_test_step = lib_standalone_runtime_test_step,
         .vopr_test_step = vopr_test_step,
         .integration_test_step = integration_test_step,
         .chaos_test_step = chaos_test_step,
         .compiled_recall_tests = compiled_recall_tests,
     };
+}
+
+/// Exercise native PDF decoding without pulling its implementation into every
+/// unit-test root. The entrypoint owns the public targets and aggregates.
+pub fn createPdfIntegration(b: *std.Build, options: struct {
+    root: std.Build.LazyPath,
+    fixture: std.Build.LazyPath,
+    imports: AntflyRootImports,
+    optimize: std.builtin.OptimizeMode,
+}) struct { run: *std.Build.Step.Run, qualification: *std.Build.Step.Run } {
+    const target = options.imports.platform_target;
+    const module = b.createModule(.{
+        .root_source_file = options.root.path(b, "src/pdf_ocr_integration.zig"),
+        .target = target,
+        .optimize = options.optimize,
+    });
+    module.addImport("pdf_integration_fixture", b.createModule(.{
+        .root_source_file = options.fixture,
+        .target = target,
+        .optimize = options.optimize,
+    }));
+    options.imports.configure(b, module, false, options.imports.platform_link_libc);
+    const executable = b.addExecutable(.{ .name = "pdf-ocr-integration", .root_module = module });
+    const run = b.addRunArtifact(executable);
+    const qualification = b.addRunArtifact(executable);
+    qualification.addArg("--qualify-real");
+    return .{ .run = run, .qualification = qualification };
 }
