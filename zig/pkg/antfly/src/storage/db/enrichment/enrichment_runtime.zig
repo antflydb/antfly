@@ -11905,6 +11905,34 @@ pub fn runNativePdfOcrCoordinatorIntegration(
 
     try verifySharedPdfWindowConsumers(alloc, batch, window_lease, &coordinator.session);
 
+    // A conservative estimate can exceed the remaining owned grant. Preserve
+    // one page's geometry and let the bounded renderer attempt that grant.
+    {
+        const plan = try coordinator.session.preparePageRenderPlan(.{ .page_number = 1, .requested_dpi = 150 });
+        const plans: []const document_extraction_mod.PreparedPdfPageRenderPlan = &.{plan};
+        const requested = try planPdfRenderWave(&coordinator.session, plans, 1, available_bytes);
+        const output_bytes = try pdfRgbaBytesForPixels(plan.geometry().pixels) + 4096;
+        var budgets = resource_manager_mod.Options.defaultBudgets();
+        budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = requested.scratch_bytes - 1 + output_bytes };
+        var limited_resources = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+        defer limited_resources.deinit(alloc);
+        const partial_lease = try PdfWindowCompositeLease.create(alloc, alloc, &limited_resources, requested.scratch_bytes, output_bytes, 1);
+        defer partial_lease.destroy();
+        try std.testing.expectEqual(requested.scratch_bytes - 1, partial_lease.scratchBytesPerWindow());
+        const admitted = try planPdfRenderWave(&coordinator.session, plans, requested.workers, partial_lease.scratchBytesPerWindow());
+        var rendered = try coordinator.session.renderPreparedPagesRasterBatchAlloc(partial_lease.allocator(), plans, .{
+            .max_parallel_pages = admitted.workers,
+            .max_inflight_bytes = admitted.scratch_bytes,
+            .max_retained_raster_bytes = output_bytes,
+        });
+        defer rendered.deinit(partial_lease.allocator());
+        partial_lease.finishRendering();
+        const page = rendered.results[0].rendered orelse return error.PartialGrantRenderFailed;
+        try std.testing.expectEqual(@as(u16, 150), page.effective_dpi);
+        try std.testing.expectEqual(plan.geometry().width, page.width);
+        try std.testing.expectEqual(plan.geometry().height, page.height);
+    }
+
     const media = [_][1]asset_producer_mod.EncodedMedia{
         .{.{ .bytes = batch.results[0].rendered.?.png, .mime_type = "image/png" }},
         .{.{ .bytes = batch.results[1].rendered.?.png, .mime_type = "image/png" }},
@@ -13988,6 +14016,39 @@ test "shared PDF window invocation peaks follow allocation lifetimes" {
     try std.testing.expectError(error.InferenceInvocationMemoryUnavailable, peak.include(different));
 }
 
+const PdfRenderWaveBudget = struct { workers: usize, scratch_bytes: usize };
+
+/// Estimates choose concurrency, not whether a serial render is allowed to
+/// try an owned grant. The page allocator enforces the actual memory ceiling.
+/// Use this both before reservation and after a partial resource-manager grant.
+fn planPdfRenderWave(session: anytype, plans: anytype, maximum_workers: usize, granted_bytes: usize) !PdfRenderWaveBudget {
+    if (plans.len == 0 or maximum_workers == 0 or granted_bytes == 0)
+        return error.DocumentExtractionWorkingSetTooLarge;
+    var workers = @min(plans.len, maximum_workers);
+    while (true) : (workers -= 1) {
+        const estimate = try session.estimatePreparedWaveScratchBytes(plans, workers, document_extraction_mod.default_pdf_render_bytes_per_pixel_reserve);
+        if (workers == 1 or estimate <= granted_bytes)
+            return .{ .workers = workers, .scratch_bytes = @min(estimate, granted_bytes) };
+    }
+}
+
+test "PDF render wave accepts partial serial grants without changing page plans" {
+    const Estimator = struct {
+        fn estimatePreparedWaveScratchBytes(_: @This(), plans: []const usize, workers: usize, _: usize) !usize {
+            try std.testing.expectEqualSlices(usize, &.{ 150, 150, 150 }, plans);
+            return workers * 100;
+        }
+    };
+    const plans: []const usize = &.{ 150, 150, 150 };
+    const parallel = try planPdfRenderWave(Estimator{}, plans, 3, 250);
+    try std.testing.expectEqual(@as(usize, 2), parallel.workers);
+    try std.testing.expectEqual(@as(usize, 200), parallel.scratch_bytes);
+    const partial = try planPdfRenderWave(Estimator{}, plans, parallel.workers, 75);
+    try std.testing.expectEqual(@as(usize, 1), partial.workers);
+    try std.testing.expectEqual(@as(usize, 75), partial.scratch_bytes);
+    try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, planPdfRenderWave(Estimator{}, plans, 3, 0));
+}
+
 fn renderRuntimePdfWindow(
     runtime: *EnrichmentRuntime,
     alloc: Allocator,
@@ -14006,6 +14067,10 @@ fn renderRuntimePdfWindow(
     use_borrowed_rasters: bool,
     cancellation: document_extraction_mod.PdfCancellationProbe,
 ) !RuntimePdfRenderWindow {
+    var admission_phase: []const u8 = "prepare";
+    errdefer if (runtimeReadProfileEnabled()) {
+        std.log.info("read-profile phase=pdf_window_admission source_fingerprint={s} failed_stage={s} scratch_ceiling={d}", .{ source_fingerprint, admission_phase, max_inflight_bytes });
+    };
     var invocation_cancellation: AssetInvocationCancellation = undefined;
     const invocation_producer = scopedAssetProducer(runtime, producer, &invocation_cancellation);
     const max_pages = @max(@as(usize, 1), @min(batch_policy.collectionItems(), generated_ocr_absolute_batch_max_items));
@@ -14107,6 +14172,7 @@ fn renderRuntimePdfWindow(
                 .media = if (use_borrowed_rasters) &.{} else prototype_media[i .. i + 1],
             };
         }
+        admission_phase = "invocation";
         const full_invocation_memory = try pdfRenderWindowInvocationMemory(
             invocation_producer,
             alloc,
@@ -14162,29 +14228,13 @@ fn renderRuntimePdfWindow(
                     candidate_count,
                     retained_raw_bytes,
                 );
-            var candidate_parallel_pages = @min(
-                config.pdf_render_max_parallel_pages,
-                candidate_count,
-            );
-            var required_scratch_bytes: usize = 0;
-            while (candidate_parallel_pages > 0) : (candidate_parallel_pages -= 1) {
-                required_scratch_bytes = try session.estimatePreparedWaveScratchBytes(
-                    prepared_plans[0..candidate_count],
-                    candidate_parallel_pages,
-                    document_extraction_mod.default_pdf_render_bytes_per_pixel_reserve,
-                );
-                if (candidate_parallel_pages == 1) required_scratch_bytes = @min(required_scratch_bytes, max_inflight_bytes);
-                if (required_scratch_bytes <= max_inflight_bytes) break;
-            }
-            if (candidate_parallel_pages == 0) {
-                if (candidate_count > 1) continue;
-                return error.DocumentExtractionWorkingSetTooLarge;
-            }
+            const requested_wave = try planPdfRenderWave(session, prepared_plans[0..candidate_count], config.pdf_render_max_parallel_pages, max_inflight_bytes);
+            admission_phase = "reservation";
             const lease = PdfWindowCompositeLease.create(
                 alloc,
                 alloc,
                 runtime.config.resource_manager orelse runtime.index_manager.resource_manager,
-                required_scratch_bytes,
+                requested_wave.scratch_bytes,
                 required_output_bytes,
                 1,
             ) catch |err| {
@@ -14194,21 +14244,9 @@ fn renderRuntimePdfWindow(
             };
             var lease_owned = true;
             defer if (lease_owned) lease.destroy();
-            while (candidate_parallel_pages > 0 and
-                lease.scratchBytesPerWindow() < required_scratch_bytes)
-            {
-                candidate_parallel_pages -= 1;
-                if (candidate_parallel_pages > 0)
-                    required_scratch_bytes = try session.estimatePreparedWaveScratchBytes(
-                        prepared_plans[0..candidate_count],
-                        candidate_parallel_pages,
-                        document_extraction_mod.default_pdf_render_bytes_per_pixel_reserve,
-                    );
-            }
-            if (candidate_parallel_pages == 0) {
-                if (candidate_count > 1) continue;
-                return error.DocumentExtractionWorkingSetTooLarge;
-            }
+            const admitted_wave = try planPdfRenderWave(session, prepared_plans[0..candidate_count], requested_wave.workers, lease.scratchBytesPerWindow());
+            if (runtimeReadProfileEnabled()) std.log.info("read-profile phase=pdf_window_grant source_fingerprint={s} pages={d} requested_workers={d} admitted_workers={d} requested_scratch={d} granted_scratch={d} output_bytes={d}", .{ source_fingerprint, candidate_count, requested_wave.workers, admitted_wave.workers, requested_wave.scratch_bytes, lease.scratchBytesPerWindow(), lease.outputBytesPerWindow() });
+            admission_phase = "output_budget";
             const candidate_budget = (if (use_borrowed_rasters)
                 splitOwnedPdfRasterInvocationMemoryBudget(
                     lease.scratchBytesPerWindow(),
@@ -14231,7 +14269,7 @@ fn renderRuntimePdfWindow(
             if (pdfOutputAllowancesFit(candidate_budget.retained_bytes, singleton_allowances[0..candidate_count])) {
                 requests.items.len = candidate_count;
                 unit_indices.items.len = candidate_count;
-                render_parallel_pages = candidate_parallel_pages;
+                render_parallel_pages = admitted_wave.workers;
                 if (!use_borrowed_rasters) {
                     for (requests.items, singleton_allowances[0..candidate_count], 0..) |*request, allowance, i| {
                         request.max_output_bytes = @min(request.max_output_bytes.?, allowance);
@@ -14256,6 +14294,7 @@ fn renderRuntimePdfWindow(
         .external = cancellation,
     };
     const lease = window_lease orelse return error.DocumentExtractionWorkingSetTooLarge;
+    admission_phase = "render";
     var batch = try renderAdmittedPdfWindowBatchAlloc(runtime, session, lease, prepared_plans[0..requests.items.len], .{
         .max_batch_pages = max_pages,
         .max_parallel_pages = parallel_pages,
@@ -20592,29 +20631,12 @@ const PdfEmbeddingWindowPreparer = struct {
                     candidate_count,
                     retained_raw_bytes,
                 );
-            var candidate_parallel_pages = @min(
-                self.render_config.pdf_render_max_parallel_pages,
-                candidate_count,
-            );
-            var required_scratch_bytes: usize = 0;
-            while (candidate_parallel_pages > 0) : (candidate_parallel_pages -= 1) {
-                required_scratch_bytes = try self.coordinator.session.estimatePreparedWaveScratchBytes(
-                    prepared_plans[0..candidate_count],
-                    candidate_parallel_pages,
-                    document_extraction_mod.default_pdf_render_bytes_per_pixel_reserve,
-                );
-                if (candidate_parallel_pages == 1) required_scratch_bytes = @min(required_scratch_bytes, available_bytes);
-                if (required_scratch_bytes <= available_bytes) break;
-            }
-            if (candidate_parallel_pages == 0) {
-                if (candidate_count > 1) continue;
-                return error.DocumentExtractionWorkingSetTooLarge;
-            }
+            const requested_wave = try planPdfRenderWave(&self.coordinator.session, prepared_plans[0..candidate_count], self.render_config.pdf_render_max_parallel_pages, available_bytes);
             const lease = PdfWindowCompositeLease.create(
                 concurrent_alloc,
                 concurrent_alloc,
                 self.resource_manager,
-                required_scratch_bytes,
+                requested_wave.scratch_bytes,
                 required_output_bytes,
                 1,
             ) catch |err| {
@@ -20624,21 +20646,7 @@ const PdfEmbeddingWindowPreparer = struct {
             };
             var lease_owned = true;
             defer if (lease_owned) lease.destroy();
-            while (candidate_parallel_pages > 0 and
-                lease.scratchBytesPerWindow() < required_scratch_bytes)
-            {
-                candidate_parallel_pages -= 1;
-                if (candidate_parallel_pages > 0)
-                    required_scratch_bytes = try self.coordinator.session.estimatePreparedWaveScratchBytes(
-                        prepared_plans[0..candidate_count],
-                        candidate_parallel_pages,
-                        document_extraction_mod.default_pdf_render_bytes_per_pixel_reserve,
-                    );
-            }
-            if (candidate_parallel_pages == 0) {
-                if (candidate_count > 1) continue;
-                return error.DocumentExtractionWorkingSetTooLarge;
-            }
+            const admitted_wave = try planPdfRenderWave(&self.coordinator.session, prepared_plans[0..candidate_count], requested_wave.workers, lease.scratchBytesPerWindow());
             const candidate_budget = (if (self.use_borrowed_rasters)
                 splitOwnedPdfRasterInvocationMemoryBudget(
                     lease.scratchBytesPerWindow(),
@@ -20661,7 +20669,7 @@ const PdfEmbeddingWindowPreparer = struct {
             if (retained_raw_bytes <= candidate_budget.retained_bytes) {
                 count = candidate_count;
                 memory_budget = candidate_budget;
-                render_parallel_pages = candidate_parallel_pages;
+                render_parallel_pages = admitted_wave.workers;
                 window_lease = lease;
                 lease_owned = false;
                 break;

@@ -38,12 +38,14 @@ can override the default `WORK_DIR/models`.
 To isolate renderer admission without model loading, run from `zig/`:
 
 ```sh
-zig build lib-pdf-bench -Doptimize=ReleaseFast -- render-window /path/to/input.pdf 768
-zig build lib-pdf-bench -Doptimize=ReleaseFast -- render-window /path/to/input.pdf 768 268435456
+zig build lib-pdf-bench -Doptimize=ReleaseFast -- render-window /path/to/input.pdf
+zig build lib-pdf-bench -Doptimize=ReleaseFast -- render-window /path/to/input.pdf 0 268435456
 ```
 
-This renders the first page with an exact retained-RGBA allowance. The optional
-final argument supplies scratch bytes; omitted or zero uses the planner estimate.
+This renders the first page with an exact retained-RGBA allowance. The first
+optional argument selects model-input dimensions (for example, `768`); omitted
+or zero preserves requested DPI. The final argument supplies scratch bytes;
+omitted or zero uses the planner estimate.
 It reports geometry, scratch/output limits and render quality, and fails on a
 page error. Comparing an estimate with a configured ceiling helps diagnose
 content-dependent scratch growth; neither run measures end-to-end performance.

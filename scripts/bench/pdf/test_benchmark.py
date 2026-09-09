@@ -11,6 +11,41 @@ from benchmark import artifact_errors, coverage_ready, unit_text_hashes
 
 
 class CompletionTests(unittest.TestCase):
+    def test_geometry_reads_provenance_and_rejects_missing_render_metadata(self):
+        manifests = {
+            "scan.pdf": {
+                "unit_count": 1,
+                "state_json": json.dumps({"unit_keys": ["key"]}),
+            }
+        }
+        unit = {
+            "unit_id": "page:000001",
+            "text": "A short note",
+            "ocr_attempted": True,
+            "ocr_render_dpi": 150,
+            "ocr_effective_render_dpi": 138,
+            "ocr_rendered_width": 4094,
+            "ocr_rendered_height": 2750,
+            "provenance": {
+                "page_number": 1,
+                "page_bbox": [0, 0, 2136, 1435],
+                "page_rotation": 0,
+            },
+        }
+        geometry = {}
+        unit_text_hashes(manifests, lambda _: unit, geometry)
+        page = geometry["scan.pdf"]["page:000001"]
+        self.assertEqual(page["page_number"], 1)
+        self.assertEqual(page["ocr_effective_render_dpi"], 138)
+        del unit["ocr_effective_render_dpi"]
+        with self.assertRaisesRegex(ValueError, "missing page geometry"):
+            unit_text_hashes(manifests, lambda _: unit, {})
+        unit["ocr_attempted"] = False
+        unit_text_hashes(manifests, lambda _: unit, {})
+        del unit["provenance"]["page_number"]
+        with self.assertRaisesRegex(ValueError, "missing page geometry"):
+            unit_text_hashes(manifests, lambda _: unit, {})
+
     def test_unit_hashes_compare_text_not_volatile_metadata(self):
         manifest = {
             "scan.pdf": {

@@ -25,6 +25,11 @@ concurrency. Neither changes the prepared page geometry. Insufficient
 single-page admission is an explicit failure. Under `requested_dpi`, encoded
 output limits cannot trigger repeated render/downscale attempts. Spatial caps
 and provider input limits remain explicit constraints on admissible geometry.
+The same wave planner runs before reservation and after a partial owned grant.
+An estimate larger than the grant reduces concurrency to one; it does not
+reject that page without attempting the hard-bounded renderer. Scratch and
+retained outputs share the extraction slice, so this distinction matters even
+when the page fits the configured per-window scratch ceiling.
 
 Render lanes use private freeing size-class slabs with immediate slot reuse,
 not a debug allocator. Backing pages, including cached empty pages, are charged

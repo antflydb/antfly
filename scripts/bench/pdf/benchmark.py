@@ -138,16 +138,37 @@ def unit_text_hashes(manifests, fetch_unit, geometry=None):
                 raise ValueError(f"{source}: invalid unit text or identity")
             units[identity] = hashlib.sha256(text.encode("utf-8")).hexdigest()
             if geometry is not None:
-                geometry[source][identity] = {
-                    field: unit.get(field)
+                provenance = unit.get("provenance") or {}
+                page = {
+                    field: unit.get(field, provenance.get(field))
                     for field in (
                         "page_number",
                         "page_bbox",
                         "page_rotation",
                         "ocr_render_dpi",
                         "ocr_effective_render_dpi",
+                        "ocr_rendered_width",
+                        "ocr_rendered_height",
                     )
                 }
+                # Main's image-only PDF extraction leaves rotation unknown;
+                # retain/compare that null, but do not invent a zero rotation.
+                required = ["page_number", "page_bbox"]
+                if unit.get("ocr_attempted", provenance.get("ocr_attempted")):
+                    required.extend(
+                        [
+                            "ocr_render_dpi",
+                            "ocr_effective_render_dpi",
+                            "ocr_rendered_width",
+                            "ocr_rendered_height",
+                        ]
+                    )
+                geometry[source][identity] = page
+                missing = [field for field in required if page[field] is None]
+                if missing:
+                    raise ValueError(
+                        f"{source}/{identity}: missing page geometry: {missing}"
+                    )
         hashes[source] = units
     return hashes
 
@@ -364,16 +385,25 @@ def run_created(args, out):
             text_hashes = None
             render_geometry = {} if args.verify_unit_text else None
             if args.verify_unit_text:
+                retained_units = {}
+
+                def fetch_unit(key):
+                    unit = api.json_request(
+                        "GET", table_url + "/documents/" + quote(key, safe="")
+                    )
+                    retained_units[key] = unit
+                    return unit
+
                 try:
                     text_hashes = unit_text_hashes(
                         finished["manifests"],
-                        lambda key, table_url=table_url: api.json_request(
-                            "GET", table_url + "/documents/" + quote(key, safe="")
-                        ),
+                        fetch_unit,
                         render_geometry,
                     )
                 except (KeyError, TypeError, ValueError, OSError, RuntimeError) as exc:
                     errors.append(f"Unit text verification failed: {exc}")
+                finally:
+                    save(out / f"retained-units-{trial}.json", retained_units)
             if args.mode == "always" and any(
                 finished["manifests"][r["path"]].get("ocr_attempted_count")
                 != r["pages"]
