@@ -288,7 +288,7 @@ The relevant paths are:
   - ordinary API uploads do not automatically start explicit table bulk windows
 - `pkg/antfly/src/storage/db/derived/catch_up_policy.zig`
   - dense replay coalescing, session reuse, and window limits
-- `pkg/antfly/src/storage/db/derived/async_runtime.zig`
+- `pkg/antfly/src/storage/db/derived/runtime_types.zig`
   - opens and closes per-index catch-up state
 - `pkg/antfly/src/storage/db/db.zig`
   - `beginDerivedCatchUpSessionAsync`

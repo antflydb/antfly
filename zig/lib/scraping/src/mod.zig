@@ -1893,18 +1893,20 @@ const TestHttpResponseServer = struct {
         };
         defer stream.close(self.io);
 
-        var write_buffer: [1024]u8 = undefined;
-        var writer = stream.writer(self.io, &write_buffer);
-        // Consume the GET request before closing the connection. Closing with
-        // unread request bytes can reset TCP and truncate the response at the
-        // client, making the decoding and size-limit checks scheduling-dependent.
+        // Drain the GET headers before closing the connection; unread request
+        // bytes can otherwise turn this response into a TCP reset.
         var read_buffer: [4096]u8 = undefined;
         var reader = stream.reader(self.io, &read_buffer);
-        var http = std.http.Server.init(&reader.interface, &writer.interface);
-        _ = http.receiveHead() catch |err| {
-            self.failure = err;
-            return;
-        };
+        while (true) {
+            const line = reader.interface.takeDelimiterInclusive('\n') catch |err| {
+                self.failure = err;
+                return;
+            };
+            if (std.mem.eql(u8, line, "\r\n")) break;
+        }
+
+        var write_buffer: [1024]u8 = undefined;
+        var writer = stream.writer(self.io, &write_buffer);
         writer.interface.writeAll(
             "HTTP/1.1 200 OK\r\n" ++
                 "Content-Type: text/plain; charset=utf-8\r\n" ++
@@ -1954,10 +1956,9 @@ fn downloadTestHttpResponseAlloc(
         .body = body,
         .content_encoding = content_encoding,
     };
-    const thread = try std.Thread.spawn(.{}, TestHttpResponseServer.serve, .{&fixture});
-
     const uri = try std.fmt.allocPrint(alloc, "http://{f}/blob", .{server.socket.address});
     defer alloc.free(uri);
+    var thread = try std.testing.io.concurrent(TestHttpResponseServer.serve, .{&fixture});
     var security = ContentSecurityConfig{
         .block_private_ips = false,
         .max_download_size_bytes = max_download_size_bytes,
@@ -1965,10 +1966,10 @@ fn downloadTestHttpResponseAlloc(
     var downloaded = downloadContentAlloc(alloc, uri, &security, null) catch |err| {
         server.deinit(io);
         server_open = false;
-        thread.join();
+        thread.await(std.testing.io);
         return err;
     };
-    thread.join();
+    thread.await(std.testing.io);
     if (fixture.failure) |server_err| {
         downloaded.deinit(alloc);
         return server_err;

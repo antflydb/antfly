@@ -27,6 +27,8 @@ pub const AddTestsOptions = struct {
     run_lib_usermgr_tests: *std.Build.Step.Run,
 };
 pub const AddTestsResult = struct {
+    run_lib_api_standalone_backup_restore_tests: *std.Build.Step.Run,
+    distributed_query_availability_step: *std.Build.Step,
     run_public_api_parity_aggregate_tests: *std.Build.Step.Run,
     run_lib_api_auth_tests: *std.Build.Step.Run,
     run_algebraic_dynamic_template_tests: *std.Build.Step.Run,
@@ -207,6 +209,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "reranker component paging includes the post-rerank offset",
         "reranker paging preserves the underlying retrieval total",
         "distributed join context forwards one absolute deadline to every query callback",
+        "distributed join ownership and transport failures remain retryable and fail closed",
         "distributed join search hit JSON normalizes non-finite scores",
         "distributed join unmatched worker returns only unmatched synthetic hits",
         "distributed join applies auth row filter to right table filter query",
@@ -306,6 +309,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "typed HA route operation requires exact bearer token for internal replication routes",
         "api http server forbids non-admin secret access when auth is enabled",
         "api http server query builder requires table read permission when auth is enabled",
+        "global multi-query rechecks live permission before each table result",
         "api http server restricts runtime schema debug to admins when auth is enabled",
         "api http server serves user management routes when auth is enabled",
         "api http server serves api key and row filter routes",
@@ -367,6 +371,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const authorization_sink_filters = [_][]const u8{
         "api http server document scan requires table read permission",
+        "global multi-query rechecks live permission before each table result",
         "transaction principals bind sessions to credential identity",
         "api transaction sessions enforce principal permissions and row filters",
         "stored destination admission requires write permission on every eventual sink",
@@ -374,6 +379,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "stored destination envelopes cannot be forged and validate on resume",
         "stored destination grants bind credential source and live permissions",
         "api http client forwards bounded raft batch routing context without allocation",
+        "internal service request signing uses the transport clock authority",
         "api http client authenticates only the internal API namespace",
         "MCP document sampling pushes mandatory row filters into storage scans",
         "internal service credentials cannot authorize public inference routes",
@@ -630,6 +636,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "distributed graph rejects doc identity rebuild before cross-range fanout",
             "distributed graph rejects unstamped result refs before cross-range fanout",
             "api distributed graph preserves per-shard snapshots across result refs expansion and hydration",
+            "graph hydrate response wire flattens index identity",
             "distributed graph edge reader routes outgoing and fans out incoming adjacency",
             "query merge preserves common identity read generation",
             "query merge applies distributed typed sort ordering and cursor paging",
@@ -1000,6 +1007,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const api_table_reads_docid_tests = b.addTest(.{
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{
+            "table reads translate request deadlines into the routing clock",
             "distributed reranking widens retrieval and stays coordinator owned",
             "reranker candidate and output windows have distinct bounds",
             "reranker paging preserves the underlying retrieval total",
@@ -1019,6 +1027,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "distributed unit group hydration rejects a cross-revision unit payload",
             "identity-only distributed unit groups consume envelopes without routed reads",
             "hosted distributed grouped hierarchy expands the globally selected shard page",
+            "hosted hierarchy navigation routes projection-safe hydration and advances cursors",
             "query merge treats hierarchy navigation positions as opaque cursor values",
             "query merge treats conflicting hierarchy navigation plans as retryable",
             "query merge treats malformed hierarchy navigation shard tuples as retryable",
@@ -1150,8 +1159,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_api_docid_tests = addFilteredTestRunArtifact(b, lib_api_docid_tests);
     const lib_api_graph_snapshot_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{
+        .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, &.{
             "api distributed graph preserves per-shard snapshots across result refs expansion and hydration",
+            "distributed graph retries once on topology change and succeeds",
+            "graph workers report retired ranges as topology unavailability",
             "distributed graph incoming probe expands only positive source shards",
             "incoming graph route cache is exact and generation fenced",
             "incoming graph route durable hint coalescer is byte bounded",
@@ -1163,7 +1174,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "distributed graph root probe retires resolved keys between shard waves",
             "distributed graph supports cross-range traverse target selectors",
             "distributed graph traverse routes cross-table frontier by table generation",
-        },
+        }),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -1172,6 +1183,41 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_api_graph_snapshot_tests = addFilteredTestRunArtifact(b, lib_api_graph_snapshot_tests);
     const lib_api_graph_snapshot_test_step = b.step("antfly-api-graph-snapshot-test", "Run distributed graph snapshot-vector regression tests");
     lib_api_graph_snapshot_test_step.dependOn(&run_lib_api_graph_snapshot_tests.step);
+    const lib_api_graph_wire_runtime_filters = &.{"graph hydrate response wire flattens index identity"};
+    const lib_api_graph_wire_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, lib_api_graph_wire_runtime_filters),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_api_graph_wire_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        lib_api_graph_wire_tests,
+        lib_api_graph_wire_runtime_filters,
+    );
+    const lib_api_graph_wire_test_step = b.step("lib-api-graph-wire-test", "Run canonical internal graph wire-contract regressions");
+    lib_api_graph_wire_test_step.dependOn(&run_lib_api_graph_wire_tests.step);
+    const lib_api_distributed_query_availability_runtime_filters = &.{"distributed query transport failures become one retryable availability condition"};
+    const lib_api_distributed_query_availability_tests = b.addTest(.{
+        .root_module = api_table_reads_docid_test_mod,
+        .filters = lib_api_distributed_query_availability_runtime_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_api_distributed_query_availability_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        lib_api_distributed_query_availability_tests,
+        lib_api_distributed_query_availability_runtime_filters,
+    );
+    const lib_api_distributed_query_availability_test_step = b.step(
+        "lib-api-distributed-query-availability-test",
+        "Run retryable distributed-query transport classification regressions",
+    );
+    lib_api_distributed_query_availability_test_step.dependOn(&run_lib_api_distributed_query_availability_tests.step);
     const api_derived_coverage_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_derived_coverage_test_root.zig"),
         .target = target,
@@ -1372,6 +1418,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_raft_transition_runtime_docid_tests = addFilteredTestRunArtifact(b, raft_transition_runtime_docid_tests);
     const api_table_writes_production_regression_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
         .filters = &.{
             "provisioned writer cache starts DB workers after stable entry installation",
             "table write source restore acquires lifecycle unless caller reserves it",
@@ -1380,6 +1427,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "native backup reclaims crash-left snapshot attempts from durable markers",
             "native backup reclaims a crash marker before snapshot root creation",
             "native backup never reclaims an old attempt with a live lease",
+            "provisioned table write source create table provisions local indexes and schema",
             "provisioned create succeeds when post-commit runtime status is fenced",
             "provisioned create retries a retired cache lease before structural publication",
             "provisioned create reuses a generation opened by startup reconciliation",
@@ -1469,6 +1517,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "hosted index lifecycle durable wake repairs worker admission failure",
             "structural reconcile retains ordered constant-time repair wake membership across plan resets",
             "resident DB retry preparation waits outside admission for writer publication",
+            "resident DB retry preparation does not block a borrowed std.Io scheduler",
             "admitted resident DB lease never waits for an in-flight writer publication",
             "write cache local mutation preempts stale startup writer",
             "structural reconcile pending set never revisits completed groups",
@@ -1572,6 +1621,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "split transition auto bulk publication retries while a writer lease is active",
             "median key lookup reuses startup writer instead of reopening its root",
             "write cache retirement is allocation-free after entry installation",
+            "write cache transition locks use stable cache roles instead of addresses",
             "provider shutdown barrier closes cached dbs and remains idempotent",
             "provider shutdown barrier joins an in-flight generated embedding call",
             "writer cache metric pin batch release compacts retired entries once",
@@ -1587,12 +1637,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "committed generation reconciliation preserves the validated candidate",
             "generation publication marker parsing preserves allocator exhaustion",
             "manual generation runtime uses an explicit filesystem io authority",
+            "provisioned table write source borrows runtime IO without native fallback",
         },
-        // This intentionally broad lifecycle root compiles the storage,
-        // provider, and public-write surfaces together and peaks near 10.6
-        // GiB on macOS. The claim is scheduler capacity, not a product runtime
-        // budget; Linux retains the measured aggregate default.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
     });
     const run_api_table_writes_production_regression_tests = addFilteredTestRunArtifact(b, api_table_writes_production_regression_tests);
     const run_api_table_writes_production_regression_unit_tests = addFilteredTestRunArtifact(b, api_table_writes_production_regression_tests);
@@ -1605,7 +1651,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     api_table_writes_production_regression_step.dependOn(&run_api_table_writes_production_regression_tests.step);
     const api_create_structural_retry_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
-        .filters = &.{"provisioned create retries a retired cache lease before structural publication"},
+        .filters = &.{
+            "provisioned table write source create table provisions local indexes and schema",
+            "provisioned create retries a retired cache lease before structural publication",
+        },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -1614,7 +1663,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_api_create_structural_retry_tests = addFilteredTestRunArtifact(b, api_create_structural_retry_tests);
     const api_create_structural_retry_step = b.step(
         "antfly-api-create-structural-retry-test",
-        "Run the isolated create structural-publication cache race regression",
+        "Run isolated create metadata and structural-publication regressions",
     );
     api_create_structural_retry_step.dependOn(&run_api_create_structural_retry_tests.step);
     const api_table_writes_restore_repeat_tests = b.addTest(.{
@@ -1746,6 +1795,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_api_standalone_backup_restore_test_step.dependOn(&run_lib_api_standalone_backup_restore_tests.step);
 
     return .{
+        .run_lib_api_standalone_backup_restore_tests = run_lib_api_standalone_backup_restore_tests,
+        .distributed_query_availability_step = lib_api_distributed_query_availability_test_step,
         .run_public_api_parity_aggregate_tests = run_public_api_parity_aggregate_tests,
         .run_lib_api_auth_tests = run_lib_api_auth_tests,
         .run_algebraic_dynamic_template_tests = run_algebraic_dynamic_template_tests,

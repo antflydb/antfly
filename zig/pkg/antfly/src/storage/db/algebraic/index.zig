@@ -3618,7 +3618,7 @@ pub const Index = struct {
     // for std.atomic.Mutex, which has no blocking lock()). Held only around a
     // write transaction, so contention is brief.
     fn lockWrites(self: *Index) void {
-        while (!self.write_mutex.tryLock()) std.Thread.yield() catch {};
+        @import("antfly_platform").sync.lockYielding(&self.write_mutex);
     }
 
     fn unlockWrites(self: *Index) void {
@@ -3660,7 +3660,7 @@ pub const Index = struct {
     }
 
     fn lockHllObservations(self: *Index) void {
-        while (!self.hll_observation_mutex.tryLock()) std.Thread.yield() catch {};
+        @import("antfly_platform").sync.lockYielding(&self.hll_observation_mutex);
     }
 
     fn hllObservationStatus(self: *const Index) struct { count: usize, bytes: usize } {
@@ -20793,11 +20793,11 @@ test "algebraic storage accounting serializes concurrent generation writes" {
 
     var start = std.atomic.Value(bool).init(false);
     var workers: [worker_count]Worker = undefined;
-    var threads: [worker_count]std.Thread = undefined;
+    var threads: [worker_count]std.Io.Future(void) = undefined;
     var spawned: usize = 0;
     errdefer {
         start.store(true, .release);
-        for (threads[0..spawned]) |thread| thread.join();
+        for (threads[0..spawned]) |*thread| thread.await(std.testing.io);
     }
     for (&workers, 0..) |*worker, worker_id| {
         worker.* = .{
@@ -20806,11 +20806,11 @@ test "algebraic storage accounting serializes concurrent generation writes" {
             .start = &start,
             .worker_id = worker_id,
         };
-        threads[worker_id] = try std.Thread.spawn(.{}, Worker.run, .{worker});
+        threads[worker_id] = try std.testing.io.concurrent(Worker.run, .{worker});
         spawned += 1;
     }
     start.store(true, .release);
-    for (threads) |thread| thread.join();
+    for (&threads) |*thread| thread.await(std.testing.io);
     spawned = 0;
     for (workers) |worker| if (worker.failure) |err| return err;
 
@@ -22398,10 +22398,10 @@ test "adaptive HLL registry publication is synchronized with readers" {
             }
         }
     };
-    const reader = try std.Thread.spawn(.{}, Reader.run, .{ &idx, &stop });
+    var reader = try std.testing.io.concurrent(Reader.run, .{ &idx, &stop });
     defer {
         stop.store(true, .release);
-        reader.join();
+        reader.await(std.testing.io);
     }
     for (0..max_hll_cardinality_materializations - 1) |i| {
         const name = try std.fmt.allocPrint(alloc, "adaptive-{d}", .{i});

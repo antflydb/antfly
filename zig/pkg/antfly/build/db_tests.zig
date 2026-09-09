@@ -22,12 +22,16 @@ pub const AddTestsOptions = struct {
     antfly_test_mod: *std.Build.Module,
 };
 pub const AddTestsResult = struct {
+    run_lib_db_enrichment_tests: *std.Build.Step.Run,
+    run_lib_db_txn_tests: *std.Build.Step.Run,
     run_lib_db_result_shape_tests: *std.Build.Step.Run,
 };
 
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
     const db_enrichment_filters: []const []const u8 = &.{
+        "enrichment provider deadlines and progress cross native clock boundaries",
+        "db merge artifact import holds both apply locks through copy failure",
         // Preserve the additional selections from the former focused DB root.
         "storage.db.catalog.enrichment_catalog.test.enrichment catalog round trip",
         "storage.db.catalog.enrichment_catalog.test.enrichment catalog round trip without source_template",
@@ -433,6 +437,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "non-replicated transaction recovery honors the per-run page limit",
             "retained terminal transactions honor the extended retry cutoff",
             "topology fence retains committed coordinator recovery obligations",
+            "ttl runtime executes production pass on borrowed VoprIo",
+            "transaction recovery executes production pass on borrowed VoprIo",
         },
     });
     const run_lib_db_txn_tests = addFilteredTestRunArtifact(b, lib_db_txn_tests);
@@ -440,6 +446,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_db_txn_step.dependOn(&run_lib_db_txn_tests.step);
 
     return .{
+        .run_lib_db_enrichment_tests = run_lib_db_enrichment_tests,
+        .run_lib_db_txn_tests = run_lib_db_txn_tests,
         .run_lib_db_result_shape_tests = run_lib_db_result_shape_tests,
     };
 }

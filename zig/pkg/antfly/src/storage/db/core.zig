@@ -21,6 +21,7 @@ const snapshot_admission_mod = @import("snapshot_admission.zig");
 const apply_state = @import("derived/apply_state.zig");
 const index_repair_state = @import("derived/index_repair_state.zig");
 const doc_identity = @import("doc_identity.zig");
+const doc_set = @import("doc_set.zig");
 const range_cardinality = @import("range_cardinality.zig");
 const internal_keys = @import("../internal_keys.zig");
 const docstore_mod = @import("../docstore.zig");
@@ -363,6 +364,46 @@ pub const SplitIndexHandoffs = struct {
     }
 };
 
+/// Shared by serving and recovery wrappers. Summary publication is protected
+/// by the core apply lock; query-set caches also have their own locks because
+/// published-path readers need not hold the apply lock.
+pub const IdentityVisibilityState = struct {
+    alloc: Allocator,
+    summary: ?doc_identity.VisibilitySummary = null,
+    live_mutex: std.atomic.Mutex = .unlocked,
+    live_generation: ?u64 = null,
+    live_set: ?doc_set.ResolvedDocSet = null,
+    nonvisible_mutex: std.atomic.Mutex = .unlocked,
+    nonvisible_generation: ?u64 = null,
+    nonvisible_set: ?doc_set.ResolvedDocSet = null,
+    nonvisible_overflow: bool = false,
+    nonvisible_entries: std.atomic.Value(u64) = .init(0),
+
+    pub fn clearLive(self: *@This()) void {
+        while (!self.live_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.live_mutex.unlock();
+        if (self.live_set) |*cached| cached.deinit(self.alloc);
+        self.live_set = null;
+        self.live_generation = null;
+    }
+
+    pub fn clearNonvisible(self: *@This()) void {
+        while (!self.nonvisible_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.nonvisible_mutex.unlock();
+        if (self.nonvisible_set) |*cached| cached.deinit(self.alloc);
+        self.nonvisible_set = null;
+        self.nonvisible_generation = null;
+        self.nonvisible_overflow = false;
+        self.nonvisible_entries.store(0, .monotonic);
+    }
+
+    pub fn publish(self: *@This(), summary: doc_identity.VisibilitySummary) void {
+        self.summary = summary;
+        self.clearLive();
+        self.clearNonvisible();
+    }
+};
+
 pub const DBCore = struct {
     alloc: Allocator,
     path: []u8,
@@ -382,6 +423,7 @@ pub const DBCore = struct {
     schema: ?schema_mod.TableSchema,
     identity_namespace: doc_identity.Namespace,
     artifact_cleanup_maybe: std.atomic.Value(bool),
+    identity_visibility: IdentityVisibilityState,
 
     pub fn fromOpened(alloc: Allocator, opened: OpenedCoreResources) DBCore {
         return .{
@@ -403,10 +445,13 @@ pub const DBCore = struct {
             .schema = opened.schema,
             .identity_namespace = opened.identity_namespace,
             .artifact_cleanup_maybe = .init(opened.artifact_cleanup_maybe),
+            .identity_visibility = .{ .alloc = alloc },
         };
     }
 
     pub fn deinit(self: *DBCore) void {
+        self.identity_visibility.clearLive();
+        self.identity_visibility.clearNonvisible();
         if (self.schema) |schema| schema_mod.freeSchema(self.alloc, schema);
         self.log_mutex.* = undefined;
         self.alloc.destroy(self.log_mutex);

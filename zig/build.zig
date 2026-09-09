@@ -147,6 +147,8 @@ pub fn build(b: *std.Build) void {
         .{};
     const target = b.standardTargetOptions(.{ .default_target = default_target });
     const optimize = b.standardOptimizeOption(.{});
+    const vopr_dep = b.dependency("vopr", .{ .target = target, .optimize = optimize });
+    const vopr_mod = vopr_dep.module("vopr");
     const strip = b.option(bool, "strip", "Omit debug information from release artifacts") orelse false;
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
@@ -497,13 +499,23 @@ pub fn build(b: *std.Build) void {
     storage_mod.addImport("antfly_platform", platform_mod);
     storage_mod.addImport("antfly_hash", hash_mod);
     const usermgr_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/usermgr/mod.zig"),
+        .root_source_file = b.path("pkg/antfly/src/usermgr_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
     usermgr_mod.link_libc = link_libc;
     usermgr_mod.addImport("antfly_casbin", casbin_mod);
-    usermgr_mod.addImport("usermgr_storage", storage_mod);
+    usermgr_mod.addImport("bloom", bloom_mod);
+    usermgr_mod.addImport("antfly_platform", platform_mod);
+    usermgr_mod.addImport("antfly_hash", hash_mod);
+    const usermgr_test_storage_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    usermgr_test_storage_mod.addImport("antfly_root", usermgr_mod);
+    usermgr_test_storage_mod.addImport("antfly_platform", platform_mod);
+    usermgr_mod.addImport("usermgr_storage", usermgr_test_storage_mod);
     const wasm_bloom_mod = b.createModule(.{
         .root_source_file = b.path("lib/bloom/src/mod.zig"),
         .target = wasm_target,
@@ -827,6 +839,7 @@ pub fn build(b: *std.Build) void {
 
     const antfly_imports = AntflyRootImports{
         .build_options = build_options,
+        .vopr = vopr_mod,
         .lmdb_engine = lmdb_engine_mod,
         .raft_engine = raft_engine_mod,
         .public_openapi = public_openapi_mod,
@@ -1077,6 +1090,19 @@ pub fn build(b: *std.Build) void {
     const lib_httpx_test_step = b.step("lib-httpx-test", "Run standalone lib/httpx tests");
     lib_httpx_test_step.dependOn(&run_httpx_tests.step);
 
+    const httpx_client_lifecycle_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/httpx/src/client_test_root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+        .filters = &.{ "request gate", "request watchdog" },
+    });
+    const run_httpx_client_lifecycle_tests = b.addRunArtifact(httpx_client_lifecycle_tests);
+    b.step("lib-httpx-client-lifecycle-test", "Run HTTP client admission, release, and shutdown contracts").dependOn(&run_httpx_client_lifecycle_tests.step);
+    lib_httpx_test_step.dependOn(&run_httpx_client_lifecycle_tests.step);
+
     const objectstore_tests = b.addTest(.{
         .root_module = objectstore_mod,
         .filters = selectTestFilters(b, &.{}),
@@ -1270,6 +1296,10 @@ pub fn build(b: *std.Build) void {
         .antfly_embedded_db_pkg_mod = antfly_embedded_db_pkg_mod,
         .antfly_embedded_api_pkg_mod = antfly_embedded_api_pkg_mod,
         .antfly_client_pkg_mod = antfly_client_pkg_mod,
+        .embedded_db_mod = embedded.embedded_db_mod,
+        .embedded_support_mod = embedded.embedded_support_mod,
+        .capi_root_mod = embedded.capi_root_mod,
+        .capi_mod = embedded.capi_mod,
         .run_capi_tests = run_capi_tests,
         .run_raft_library_tests = run_raft_library_tests,
     });
@@ -1280,13 +1310,14 @@ pub fn build(b: *std.Build) void {
     const run_lib_ha_compat_tests = owner_tests.run_lib_ha_compat_tests;
     const antfly_test_step = owner_tests.antfly_test_step;
     const unit_test_step = owner_tests.unit_test_step;
-    const sim_test_step = owner_tests.sim_test_step;
+    unit_test_step.dependOn(&run_httpx_client_lifecycle_tests.step);
+    const vopr_test_step = owner_tests.vopr_test_step;
     const integration_test_step = owner_tests.integration_test_step;
     const chaos_test_step = owner_tests.chaos_test_step;
     const compiled_recall_tests = owner_tests.compiled_recall_tests;
 
     const test_step = b.step("test", "Run default package test aggregates");
-    const conformance_test_step = b.step("conformance-test", "Run conformance suites (fetch missing fixtures)");
+    const conformance_test_step = b.step("conformance-test", "Fetch and run conformance suites");
     const soak_test_step = b.step("soak-test", "Run long-running soak test aggregates");
     const lib_test_step = b.step("lib-test", "Run default standalone library tests");
     dependOnAll(conformance_test_step, &.{ lib_toon_conformance_step, lib_image_conformance_run_step });
@@ -1322,7 +1353,7 @@ pub fn build(b: *std.Build) void {
         &run_httpx_tests.step,
     });
     soak_test_step.dependOn(owner_tests.chaos_soak_test_step);
-    soak_test_step.dependOn(owner_tests.storage_sim_soak_step);
+    soak_test_step.dependOn(owner_tests.storage_workload_soak_step);
     const lib_transcribing_tests = b.addTest(.{
         .root_module = transcribing_mod,
     });
@@ -1526,7 +1557,7 @@ pub fn build(b: *std.Build) void {
 
     dependOnAll(antfly_test_step, &.{
         unit_test_step,
-        sim_test_step,
+        vopr_test_step,
         integration_test_step,
         recall_ci_test_step,
         chaos_test_step,

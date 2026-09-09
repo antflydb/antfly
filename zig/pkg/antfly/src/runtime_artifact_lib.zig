@@ -66,6 +66,7 @@ else
 // user-manager adapter likewise imports its storage types through this root.
 pub const aggregation = @import("search/aggregation.zig");
 pub const backup_codec = @import("storage/backup_codec.zig");
+pub const common = @import("common/mod.zig");
 pub const backup_bundle = @import("storage/backup_bundle.zig");
 pub const backup_bundle_io = @import("storage/backup_bundle_io.zig");
 pub const backup_repository = @import("storage/backup_repository.zig");
@@ -84,6 +85,7 @@ pub const portable_backup = @import("storage/portable_backup.zig");
 pub const public_api = @import("api/mod.zig");
 pub const raft = @import("raft/mod.zig");
 pub const storage_backend_erased = @import("storage/backend_erased.zig");
+pub const storage_maintenance = @import("storage/maintenance.zig");
 pub const transactions = @import("storage/transactions.zig");
 pub const traversal = @import("graph/traversal.zig");
 

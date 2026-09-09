@@ -132,7 +132,9 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     if (ctx.target.result.os.tag == .linux or ctx.target.result.os.tag == .macos) {
         const fixture = b.addExecutable(.{
             .name = "inference-cancellation-fixture",
-            .max_rss = @as(usize, if (ctx.hasAccelerator()) 7 else 4) * 1024 * 1024 * 1024,
+            // The CPU fixture reached 4.74 GB after the runtime I/O migration.
+            // Keep headroom so parallel builds reserve its observed footprint.
+            .max_rss = @as(usize, if (ctx.hasAccelerator()) 7 else 6) * 1024 * 1024 * 1024,
             .root_module = b.createModule(.{
                 .root_source_file = ctx.path("tests/cancellation_fixture.zig"),
                 .target = ctx.target,

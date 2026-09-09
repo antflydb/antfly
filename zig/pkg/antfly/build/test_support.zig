@@ -281,3 +281,7 @@ pub const release_scale_test_filters = [_][]const u8{
     "db one real delete keeps filtered full text on complement path across restart",
     "db production ingest preserves high-frequency keyword recall across clean restarts",
 };
+
+pub fn productionVoprCompileMaxRss(target: std.Build.ResolvedTarget) usize {
+    return @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024;
+}

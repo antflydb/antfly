@@ -49,6 +49,11 @@ pub const PublishedGeneration = struct {
     built_at_ns: u64,
     wal_start_lsn: u64,
     wal_end_lsn: u64,
+    /// True when `publication_parent_version` records the exact HEAD from
+    /// which this immutable candidate was built. False is reserved for
+    /// manifests written before publication lineage was encoded.
+    publication_lineage_tracked: bool = false,
+    publication_parent_version: ?u64 = null,
     base_source: ?BaseSourceDescriptor = null,
     stats: PublishedGenerationStats,
     artifacts: []ArtifactRef,
@@ -145,6 +150,8 @@ pub fn cloneManifest(alloc: Allocator, src: PublishedGeneration) !PublishedGener
         .built_at_ns = src.built_at_ns,
         .wal_start_lsn = src.wal_start_lsn,
         .wal_end_lsn = src.wal_end_lsn,
+        .publication_lineage_tracked = src.publication_lineage_tracked,
+        .publication_parent_version = src.publication_parent_version,
         .base_source = base_source_copy,
         .stats = .{
             .document_count = src.stats.document_count,

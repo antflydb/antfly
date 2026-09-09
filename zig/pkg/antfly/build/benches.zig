@@ -61,6 +61,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const platform_mod = options.antfly_imports.platform;
     const bloom_mod = options.antfly_imports.bloom;
     const vector_mod = options.antfly_imports.vector;
+    const structlog_mod = options.antfly_imports.structlog;
     const hash_bench_mod = options.hash_bench_mod;
     const vectorindex_mod = options.antfly_imports.vectorindex;
     const vellum_mod = options.antfly_imports.vellum;
@@ -287,6 +288,13 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .root_module = wal_bench_mod,
     });
 
+    const benchmark_io_test_step = b.step("benchmark-io-test", "Check benchmark partial-start cleanup under Io capacity exhaustion");
+    const wal_bench_io_tests = b.addTest(.{
+        .root_module = wal_bench_mod,
+        .filters = &.{"benchmark partial startup"},
+    });
+    benchmark_io_test_step.dependOn(&b.addRunArtifact(wal_bench_io_tests).step);
+
     const wal_bench_step = b.step("antfly-storage-wal-bench", "Build and install wal_bench");
     wal_bench_step.dependOn(&b.addInstallArtifact(wal_bench, .{}).step);
 
@@ -315,6 +323,12 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .name = "derived_log_bench",
         .root_module = derived_log_bench_mod,
     });
+
+    const derived_log_bench_io_tests = b.addTest(.{
+        .root_module = derived_log_bench_mod,
+        .filters = &.{"benchmark partial startup"},
+    });
+    benchmark_io_test_step.dependOn(&b.addRunArtifact(derived_log_bench_io_tests).step);
 
     const derived_log_bench_step = b.step("antfly-storage-db-derived-bench", "Build and install derived_log_bench");
     derived_log_bench_step.dependOn(&b.addInstallArtifact(derived_log_bench, .{}).step);
@@ -661,7 +675,9 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .target = target,
         .optimize = .ReleaseFast,
     });
-    capi_bench_mod.addImport("antfly-zig", antfly_mod);
+    capi_bench_mod.addImport("antfly_storage_root", antfly_mod);
+    capi_bench_mod.addImport("antfly_vector", vector_mod);
+    capi_bench_mod.addImport("structlog", structlog_mod);
     dense_stack_bench_mod.addImport("antfly_capi", capi_bench_mod);
 
     const dense_stack_bench = b.addExecutable(.{

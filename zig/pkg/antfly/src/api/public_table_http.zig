@@ -139,6 +139,7 @@ pub const TableApi = struct {
         DocIdentityUnavailable,
         ReadRequiresPrimary,
         ReadUnavailable,
+        DistributedQueryUnavailable,
         StorageReadTemporarilyUnavailable,
         IndexRebuilding,
         ModelNotFound,
@@ -740,6 +741,7 @@ pub const QueryTemporarilyUnavailableReason = enum {
     doc_identity_unavailable,
     read_requires_primary,
     standby_read_unavailable,
+    distributed_query_unavailable,
     storage_read_temporarily_unavailable,
     index_rebuilding,
     query_embedding_temporarily_unavailable,
@@ -754,6 +756,7 @@ pub fn queryTemporarilyUnavailableOwnedResponse(
         .doc_identity_unavailable => "doc identity unavailable",
         .read_requires_primary => "read requires primary",
         .standby_read_unavailable => "standby read unavailable",
+        .distributed_query_unavailable => "distributed query unavailable",
         .storage_read_temporarily_unavailable => "storage read temporarily unavailable",
         .index_rebuilding => "required index is rebuilding",
         .query_embedding_temporarily_unavailable => "query embedding temporarily unavailable",
@@ -1524,6 +1527,10 @@ pub fn handleTableQueryRequest(
             error.ReadUnavailable => {
                 std.log.warn("public table query standby unavailable table={s} err={}", .{ table_name, err });
                 return try queryTemporarilyUnavailableOwnedResponse(alloc, .standby_read_unavailable);
+            },
+            error.DistributedQueryUnavailable => {
+                std.log.info("public table distributed query temporarily unavailable table={s}", .{table_name});
+                return try queryTemporarilyUnavailableOwnedResponse(alloc, .distributed_query_unavailable);
             },
             error.StorageReadTemporarilyUnavailable => {
                 std.log.warn("public table query storage temporarily unavailable table={s}", .{table_name});
@@ -3677,6 +3684,8 @@ test "public table query handler preserves structured filter and hierarchy diagn
 }
 
 test "public table query handler preserves retryable failure status" {
+    // Corrupt persistent storage is intentionally logged at error severity;
+    // the strict CI runner requires tests to declare those exercised paths.
     @import("../test_error_logs.zig").expectErrorLogs(2);
 
     const Backend = struct {
@@ -3726,6 +3735,7 @@ test "public table query handler preserves retryable failure status" {
         .{ .err = error.QueryEmbeddingOverloaded, .status = 429, .body = "{\"code\":\"query_embedding_overloaded\",\"error\":\"query_embedding_overloaded\",\"message\":\"query embedding overloaded\",\"retryable\":true}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.EmbedRateLimited, .status = 429, .body = "{\"code\":\"query_embedding_rate_limited\",\"error\":\"query_embedding_rate_limited\",\"message\":\"query embedding rate limited\",\"retryable\":true}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.EmbedTransientFailure, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "query_embedding_temporarily_unavailable", .unavailable_message = "query embedding temporarily unavailable" },
+        .{ .err = error.DistributedQueryUnavailable, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "distributed_query_unavailable", .unavailable_message = "distributed query unavailable" },
         .{ .err = error.EmbedUpstreamFailure, .status = 502, .body = "{\"code\":\"query_embedding_upstream_failure\",\"error\":\"query_embedding_upstream_failure\",\"message\":\"query embedding provider failed\",\"retryable\":false}", .json = true },
         .{ .err = error.IndexRebuilding, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
         .{ .err = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },

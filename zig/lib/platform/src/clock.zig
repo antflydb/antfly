@@ -110,7 +110,7 @@ fn manualNowRealtimeNs(ctx: ?*anyopaque) u64 {
 fn manualSleepMs(ctx: ?*anyopaque, ms: u64) void {
     _ = ctx;
     _ = ms;
-    if (builtin.os.tag != .freestanding) std.Thread.yield() catch {};
+    if (builtin.os.tag != .freestanding) @import("time.zig").yieldNow();
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {

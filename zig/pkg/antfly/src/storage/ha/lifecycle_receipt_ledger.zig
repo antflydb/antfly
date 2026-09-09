@@ -588,5 +588,5 @@ fn freeWalEntries(alloc: Allocator, entries: []wal_mod.WalEntry) void {
 }
 
 fn lock(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) std.Thread.yield() catch {};
+    @import("antfly_platform").sync.lockYielding(mutex);
 }

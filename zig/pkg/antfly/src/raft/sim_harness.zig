@@ -27,7 +27,6 @@ const db_enrichment_runtime_factory = @import("db_enrichment_runtime_factory.zig
 const enrichment_runtime = @import("enrichment_runtime.zig");
 const db_types = @import("../storage/db/types.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
-const feature_reads = @import("feature_reads.zig");
 const transport = @import("transport/mod.zig");
 const transition_checker = @import("transition_checker.zig");
 const transition_runtime_mod = @import("transition_runtime.zig");
@@ -182,6 +181,10 @@ pub const ManagedHttpHostSimulationConfig = struct {
 pub const ManagedHttpHostSimulationDeps = struct {
     host: managed_host.ManagedHttpHostDeps = .{},
     service: service.ManagedServiceDeps = .{},
+    /// Optional application-owned deterministic I/O for the transport driver.
+    /// The clustered harness publishes the server separately and therefore
+    /// never needs to manufacture a Threaded runtime merely to send frames.
+    borrowed_io: ?std.Io = null,
 };
 
 pub const DelayingRequestExecutor = struct {
@@ -265,6 +268,14 @@ pub const VirtualHttpNetwork = struct {
         target_id: u64,
     };
 
+    pub const MessageInfo = struct {
+        id: u64,
+        due_tick: u64,
+        source_id: ?u64,
+        target_id: u64,
+        payload_digest: u64,
+    };
+
     const QueuedRequest = struct {
         due_tick: u64,
         sequence: u64,
@@ -291,23 +302,32 @@ pub const VirtualHttpNetwork = struct {
     routes: std.StringHashMapUnmanaged(transport.RequestExecutor) = .empty,
     partitioned_nodes: std.AutoHashMapUnmanaged(u64, void) = .empty,
     partitioned_links: std.AutoHashMapUnmanaged(Link, void) = .empty,
+    unavailable_nodes: std.AutoHashMapUnmanaged(u64, void) = .empty,
     queued_requests: std.ArrayListUnmanaged(QueuedRequest) = .empty,
+    queue_mutex: std.atomic.Mutex = .unlocked,
     random_drop_prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
     release_prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
     release_policy: ReleasePolicy = .fifo,
     random_drop_numerator: u32 = 0,
     random_drop_denominator: u32 = 0,
     drop_next_count: u32 = 0,
+    reset_next_count: u32 = 0,
     duplicate_next_count: u32 = 0,
     delay_next_ticks_value: u64 = 0,
+    queue_capacity: ?usize = null,
     delivery_mode: DeliveryMode = .immediate,
+    serialize_drains: bool = false,
     virtual_tick: u64 = 0,
     next_sequence: u64 = 0,
+    drain_in_progress: std.atomic.Value(bool) = .init(false),
     request_count: u64 = 0,
     delivered_count: u64 = 0,
     dropped_count: u64 = 0,
     duplicated_count: u64 = 0,
     delayed_count: u64 = 0,
+    reset_count: u64 = 0,
+    unavailable_count: u64 = 0,
+    saturated_count: u64 = 0,
 
     pub fn init(alloc: std.mem.Allocator) VirtualHttpNetwork {
         return .{
@@ -328,6 +348,7 @@ pub const VirtualHttpNetwork = struct {
         self.routes.deinit(self.alloc);
         self.partitioned_nodes.deinit(self.alloc);
         self.partitioned_links.deinit(self.alloc);
+        self.unavailable_nodes.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -376,8 +397,98 @@ pub const VirtualHttpNetwork = struct {
         self.delivery_mode = .immediate;
     }
 
+    /// Suspendable targets can yield back into a second scheduler task while
+    /// one delivery still owns a removed queue entry. Enable single-drainer
+    /// ownership for those targets; ordinary in-process handlers retain the
+    /// established nested-drain semantics used by metadata control loops.
+    pub fn useSerializedDrains(self: *VirtualHttpNetwork) void {
+        self.serialize_drains = true;
+    }
+
     pub fn queuedCount(self: *const VirtualHttpNetwork) usize {
         return self.queued_requests.items.len;
+    }
+
+    /// Returns a canonical logical snapshot of the queue. Enumeration has no
+    /// side effects and never exposes allocation addresses or owned buffers.
+    pub fn queuedMessages(self: *const VirtualHttpNetwork, alloc: std.mem.Allocator) ![]MessageInfo {
+        const result = try alloc.alloc(MessageInfo, self.queued_requests.items.len);
+        errdefer alloc.free(result);
+        for (self.queued_requests.items, result) |queued, *info| {
+            const route = splitVirtualUri(queued.base_uri) orelse return error.InvalidQueuedVirtualRoute;
+            var digest: u64 = 0xcbf29ce484222325;
+            digestBytes(&digest, queued.request.uri);
+            digestBytes(&digest, queued.request.body);
+            info.* = .{
+                .id = queued.sequence +| 1,
+                .due_tick = queued.due_tick,
+                .source_id = queued.request.source_node_id,
+                .target_id = route.node_id,
+                .payload_digest = digest,
+            };
+        }
+        std.mem.sort(MessageInfo, result, {}, struct {
+            fn lessThan(_: void, lhs: MessageInfo, rhs: MessageInfo) bool {
+                return lhs.id < rhs.id;
+            }
+        }.lessThan);
+        return result;
+    }
+
+    pub fn deliverMessage(self: *VirtualHttpNetwork, message_id: u64) !void {
+        const index = self.messageIndex(message_id) orelse return error.UnknownVirtualMessage;
+        if (self.queued_requests.items[index].due_tick > self.virtual_tick) return error.VirtualMessageNotDue;
+        var queued = self.queued_requests.orderedRemove(index);
+        defer queued.deinit(self.queue_alloc);
+        try self.deliverQueued(&queued);
+    }
+
+    pub fn dropMessage(self: *VirtualHttpNetwork, message_id: u64) !void {
+        const index = self.messageIndex(message_id) orelse return error.UnknownVirtualMessage;
+        var queued = self.queued_requests.orderedRemove(index);
+        queued.deinit(self.queue_alloc);
+        self.dropped_count +|= 1;
+    }
+
+    pub fn duplicateMessage(self: *VirtualHttpNetwork, message_id: u64) !u64 {
+        const index = self.messageIndex(message_id) orelse return error.UnknownVirtualMessage;
+        const queued = &self.queued_requests.items[index];
+        const delay = queued.due_tick -| self.virtual_tick;
+        try self.enqueue(queued.base_uri, queued.request, delay);
+        self.duplicated_count +|= 1;
+        return self.next_sequence;
+    }
+
+    /// Extends the selected message's logical deadline. Unlike delay-next,
+    /// this operation is stable under unrelated traffic and is therefore the
+    /// preferred primitive for replayable schedules.
+    pub fn delayMessage(self: *VirtualHttpNetwork, message_id: u64, ticks: u64) !void {
+        const index = self.messageIndex(message_id) orelse return error.UnknownVirtualMessage;
+        const queued = &self.queued_requests.items[index];
+        queued.due_tick = @max(queued.due_tick, self.virtual_tick) +| ticks;
+        self.delayed_count +|= 1;
+    }
+
+    /// Makes a delayed selected message eligible without advancing time.
+    /// Delivery remains a separate scheduler transition.
+    pub fn releaseMessage(self: *VirtualHttpNetwork, message_id: u64) !void {
+        const index = self.messageIndex(message_id) orelse return error.UnknownVirtualMessage;
+        self.queued_requests.items[index].due_tick = self.virtual_tick;
+    }
+
+    pub fn nextDueTick(self: *const VirtualHttpNetwork) ?u64 {
+        var result: ?u64 = null;
+        for (self.queued_requests.items) |queued| {
+            if (queued.due_tick <= self.virtual_tick) continue;
+            if (result == null or queued.due_tick < result.?) result = queued.due_tick;
+        }
+        return result;
+    }
+
+    /// Advances only logical network time. Delivery remains a separately
+    /// selected transition.
+    pub fn advanceClockTicks(self: *VirtualHttpNetwork, ticks: u64) void {
+        self.virtual_tick +|= ticks;
     }
 
     pub fn useFifoRelease(self: *VirtualHttpNetwork) void {
@@ -400,6 +511,7 @@ pub const VirtualHttpNetwork = struct {
     pub fn healAll(self: *VirtualHttpNetwork) void {
         self.partitioned_nodes.clearRetainingCapacity();
         self.partitioned_links.clearRetainingCapacity();
+        self.unavailable_nodes.clearRetainingCapacity();
     }
 
     pub fn isPartitioned(self: *const VirtualHttpNetwork, node_id: u64) bool {
@@ -422,6 +534,14 @@ pub const VirtualHttpNetwork = struct {
         self.drop_next_count +|= 1;
     }
 
+    pub fn dropBurst(self: *VirtualHttpNetwork, count: u32) void {
+        self.drop_next_count +|= count;
+    }
+
+    pub fn resetNext(self: *VirtualHttpNetwork) void {
+        self.reset_next_count +|= 1;
+    }
+
     pub fn duplicateNext(self: *VirtualHttpNetwork) void {
         self.duplicate_next_count +|= 1;
     }
@@ -442,8 +562,25 @@ pub const VirtualHttpNetwork = struct {
         self.random_drop_denominator = 0;
     }
 
+    pub fn setQueueCapacity(self: *VirtualHttpNetwork, capacity: ?usize) void {
+        self.queue_capacity = capacity;
+    }
+
+    pub fn setRouteUnavailable(self: *VirtualHttpNetwork, node_id: u64) !void {
+        try self.unavailable_nodes.put(self.alloc, node_id, {});
+    }
+
+    pub fn restoreRoute(self: *VirtualHttpNetwork, node_id: u64) void {
+        _ = self.unavailable_nodes.remove(node_id);
+    }
+
+    pub fn isRouteUnavailable(self: *const VirtualHttpNetwork, node_id: u64) bool {
+        return self.unavailable_nodes.contains(node_id);
+    }
+
     pub fn clearOneShotFaults(self: *VirtualHttpNetwork) void {
         self.drop_next_count = 0;
+        self.reset_next_count = 0;
         self.duplicate_next_count = 0;
         self.delay_next_ticks_value = 0;
     }
@@ -458,6 +595,10 @@ pub const VirtualHttpNetwork = struct {
         if (self.partitioned_nodes.contains(route.node_id)) {
             self.dropped_count +|= 1;
             return error.VirtualNetworkPartitioned;
+        }
+        if (self.unavailable_nodes.contains(route.node_id)) {
+            self.unavailable_count +|= 1;
+            return error.VirtualNetworkRouteUnavailable;
         }
         if (req.source_node_id) |source_id| {
             if (self.partitioned_links.contains(.{ .source_id = source_id, .target_id = route.node_id })) {
@@ -480,6 +621,11 @@ pub const VirtualHttpNetwork = struct {
             self.drop_next_count -= 1;
             self.dropped_count +|= 1;
             return error.VirtualNetworkDropped;
+        }
+        if (self.reset_next_count > 0) {
+            self.reset_next_count -= 1;
+            self.reset_count +|= 1;
+            return error.VirtualNetworkConnectionReset;
         }
         var delay_ticks: u64 = 0;
         if (self.delay_next_ticks_value > 0) {
@@ -519,12 +665,41 @@ pub const VirtualHttpNetwork = struct {
     }
 
     pub fn drainDue(self: *VirtualHttpNetwork, max_events: ?usize) !usize {
+        if (!self.serialize_drains) {
+            // Preserve the established explicit-step behavior: an in-process
+            // handler may synchronously cause another control-loop drain.
+            var delivered: usize = 0;
+            while (self.nextDueIndex()) |index| {
+                if (max_events) |limit| {
+                    if (delivered >= limit) break;
+                }
+                var queued = self.queued_requests.orderedRemove(index);
+                defer queued.deinit(self.queue_alloc);
+                try self.deliverQueued(&queued);
+                delivered += 1;
+            }
+            return delivered;
+        }
+        // A wire-backed target may suspend while its HTTP request is in
+        // flight. A second scheduler task can then attempt to drain the same
+        // queue. Only one owner may select/remove queue indices at a time;
+        // enqueues remain legal while that owner is suspended and are picked
+        // up by its next loop iteration.
+        if (self.drain_in_progress.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
+            return 0;
+        defer self.drain_in_progress.store(false, .release);
         var delivered: usize = 0;
-        while (self.nextDueIndex()) |index| {
+        while (true) {
             if (max_events) |limit| {
                 if (delivered >= limit) break;
             }
+            lockAtomic(&self.queue_mutex);
+            const index = self.nextDueIndex() orelse {
+                self.queue_mutex.unlock();
+                break;
+            };
             var queued = self.queued_requests.orderedRemove(index);
+            self.queue_mutex.unlock();
             defer queued.deinit(self.queue_alloc);
             try self.deliverQueued(&queued);
             delivered += 1;
@@ -573,6 +748,14 @@ pub const VirtualHttpNetwork = struct {
         const owned_body = try self.queue_alloc.dupe(u8, request.body);
         errdefer if (owned_body.len > 0) self.queue_alloc.free(owned_body);
 
+        lockAtomic(&self.queue_mutex);
+        defer self.queue_mutex.unlock();
+        if (self.queue_capacity) |capacity| {
+            if (self.queued_requests.items.len >= capacity) {
+                self.saturated_count +|= 1;
+                return error.VirtualNetworkQueueFull;
+            }
+        }
         try self.queued_requests.append(self.queue_alloc, .{
             .due_tick = self.virtual_tick +| delay_ticks,
             .sequence = self.next_sequence,
@@ -590,6 +773,10 @@ pub const VirtualHttpNetwork = struct {
         self.next_sequence +|= 1;
     }
 
+    fn lockAtomic(mutex: *std.atomic.Mutex) void {
+        while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
     fn deliverQueued(self: *VirtualHttpNetwork, queued: *const QueuedRequest) !void {
         const split = splitVirtualUri(queued.base_uri) orelse {
             self.dropped_count +|= 1;
@@ -597,6 +784,10 @@ pub const VirtualHttpNetwork = struct {
         };
         if (self.partitioned_nodes.contains(split.node_id)) {
             self.dropped_count +|= 1;
+            return;
+        }
+        if (self.unavailable_nodes.contains(split.node_id)) {
+            self.unavailable_count +|= 1;
             return;
         }
         if (queued.request.source_node_id) |source_id| {
@@ -612,6 +803,22 @@ pub const VirtualHttpNetwork = struct {
         var response = try target.execute(self.alloc, queued.request);
         response.deinit(self.alloc);
         self.delivered_count +|= 1;
+    }
+
+    fn messageIndex(self: *const VirtualHttpNetwork, message_id: u64) ?usize {
+        if (message_id == 0) return null;
+        const sequence = message_id - 1;
+        for (self.queued_requests.items, 0..) |queued, index| {
+            if (queued.sequence == sequence) return index;
+        }
+        return null;
+    }
+
+    fn digestBytes(hash: *u64, bytes: []const u8) void {
+        for (bytes) |byte| {
+            hash.* ^= byte;
+            hash.* *%= 0x100000001b3;
+        }
     }
 
     fn nextDueIndex(self: *VirtualHttpNetwork) ?usize {
@@ -838,6 +1045,103 @@ test "virtual http network can partition and heal target nodes" {
     network.useFifoRelease();
 }
 
+test "virtual http network exposes selected message transitions" {
+    const RecordingExecutor = struct {
+        count: usize = 0,
+        fn executor(self: *@This()) transport.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: transport.HttpRequest) !transport.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.count += 1;
+            return .{ .status = 200 };
+        }
+    };
+    var network = VirtualHttpNetwork.init(std.testing.allocator);
+    defer network.deinit();
+    network.useQueuedDelivery();
+    var target = RecordingExecutor{};
+    try network.registerNode(7, target.executor());
+    network.delayNextTicks(2);
+    var accepted = try network.executor().execute(std.testing.allocator, .{
+        .method = .POST,
+        .uri = "sim://raft-node/7/raft/v1/frame",
+        .source_node_id = 3,
+        .body = "frame",
+    });
+    accepted.deinit(std.testing.allocator);
+
+    const messages = try network.queuedMessages(std.testing.allocator);
+    defer std.testing.allocator.free(messages);
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqual(@as(u64, 1), messages[0].id);
+    try std.testing.expectEqual(@as(u64, 2), messages[0].due_tick);
+    try std.testing.expectEqual(@as(?u64, 3), messages[0].source_id);
+    try std.testing.expectEqual(@as(u64, 7), messages[0].target_id);
+    try std.testing.expectError(error.VirtualMessageNotDue, network.deliverMessage(messages[0].id));
+
+    const duplicate_id = try network.duplicateMessage(messages[0].id);
+    try std.testing.expectEqual(@as(u64, 2), duplicate_id);
+    try network.dropMessage(duplicate_id);
+    try network.delayMessage(messages[0].id, 3);
+    const delayed = try network.queuedMessages(std.testing.allocator);
+    defer std.testing.allocator.free(delayed);
+    try std.testing.expectEqual(@as(u64, 5), delayed[0].due_tick);
+    try network.releaseMessage(messages[0].id);
+    try network.deliverMessage(messages[0].id);
+    try std.testing.expectEqual(@as(usize, 1), target.count);
+    try std.testing.expectEqual(@as(usize, 0), network.queuedCount());
+    try std.testing.expectEqual(@as(u64, 2), network.delayed_count);
+}
+
+test "virtual http network models route reset burst and queue capacity faults" {
+    const RecordingExecutor = struct {
+        count: usize = 0,
+        fn executor(self: *@This()) transport.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: transport.HttpRequest) !transport.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.count += 1;
+            return .{ .status = 200 };
+        }
+    };
+
+    var network = VirtualHttpNetwork.init(std.testing.allocator);
+    defer network.deinit();
+    var target = RecordingExecutor{};
+    try network.registerNode(7, target.executor());
+    const request = transport.HttpRequest{ .method = .POST, .uri = "sim://raft-node/7/raft/v1/frame" };
+
+    try network.setRouteUnavailable(7);
+    try std.testing.expect(network.isRouteUnavailable(7));
+    try std.testing.expectError(error.VirtualNetworkRouteUnavailable, network.executor().execute(std.testing.allocator, request));
+    network.restoreRoute(7);
+
+    network.resetNext();
+    try std.testing.expectError(error.VirtualNetworkConnectionReset, network.executor().execute(std.testing.allocator, request));
+    network.dropBurst(2);
+    try std.testing.expectError(error.VirtualNetworkDropped, network.executor().execute(std.testing.allocator, request));
+    try std.testing.expectError(error.VirtualNetworkDropped, network.executor().execute(std.testing.allocator, request));
+    var delivered = try network.executor().execute(std.testing.allocator, request);
+    delivered.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), target.count);
+    try std.testing.expectEqual(@as(u64, 1), network.unavailable_count);
+    try std.testing.expectEqual(@as(u64, 1), network.reset_count);
+
+    network.useQueuedDelivery();
+    network.setQueueCapacity(1);
+    var accepted = try network.executor().execute(std.testing.allocator, request);
+    accepted.deinit(std.testing.allocator);
+    try std.testing.expectError(error.VirtualNetworkQueueFull, network.executor().execute(std.testing.allocator, request));
+    try std.testing.expectEqual(@as(u64, 1), network.saturated_count);
+    network.setQueueCapacity(null);
+    var accepted_after_heal = try network.executor().execute(std.testing.allocator, request);
+    accepted_after_heal.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), try network.runUntilIdle());
+    try std.testing.expectEqual(@as(usize, 3), target.count);
+}
+
 test "virtual http network delivers queued GET requests synchronously" {
     const RecordingExecutor = struct {
         count: u64 = 0,
@@ -982,50 +1286,50 @@ pub const ManagedHostSimulation = struct {
         try self.runtime.svc.host.host.transferLeader(group_id, transferee);
     }
 
-    pub fn requestReadableLease(self: *ManagedHostSimulation, group_id: u64, request_ctx: []const u8) !void {
-        try self.runtime.svc.requestReadableLease(group_id, request_ctx);
+    pub fn requestReadIndex(self: *ManagedHostSimulation, group_id: u64, request_ctx: []const u8) !void {
+        try self.runtime.svc.requestReadIndex(group_id, request_ctx);
     }
 
-    pub fn prepareEnrichmentRead(self: *ManagedHostSimulation, group_id: u64, kind: read_gate.EnrichmentReadKind) !void {
-        try self.runtime.svc.prepareEnrichmentRead(group_id, kind);
+    pub fn requestEnrichmentReadIndex(self: *ManagedHostSimulation, group_id: u64, kind: read_gate.EnrichmentReadKind) !void {
+        try self.runtime.svc.requestEnrichmentReadIndex(group_id, kind, .read_index);
     }
 
-    pub fn prepareSearchRead(self: *ManagedHostSimulation, group_id: u64) !void {
-        try self.runtime.svc.prepareSearchRead(group_id);
+    pub fn requestSearchReadIndex(self: *ManagedHostSimulation, group_id: u64) !void {
+        try self.runtime.svc.requestSearchReadIndex(group_id);
     }
 
-    pub fn prepareSearchRequest(self: *ManagedHostSimulation, group_id: u64, req: db_types.SearchRequest) !void {
-        try self.runtime.svc.prepareSearchRequest(group_id, req);
+    pub fn requestSearchReadIndexForRequest(self: *ManagedHostSimulation, group_id: u64, req: db_types.SearchRequest) !void {
+        try self.runtime.svc.requestSearchReadIndexForRequest(group_id, req);
     }
 
-    pub fn featureReads(self: *ManagedHostSimulation) feature_reads.FeatureReads {
-        return self.runtime.svc.featureReads();
+    pub fn enrichmentReadIndexes(self: *ManagedHostSimulation) read_gate.EnrichmentReadIndexRequester {
+        return self.runtime.svc.enrichmentReadIndexes();
     }
 
-    pub fn prepareLookupRead(self: *ManagedHostSimulation, group_id: u64) !void {
-        try self.runtime.svc.prepareLookupRead(group_id);
+    pub fn requestLookupReadIndex(self: *ManagedHostSimulation, group_id: u64) !void {
+        try self.runtime.svc.requestLookupReadIndex(group_id);
     }
 
-    pub fn prepareLookupRequest(self: *ManagedHostSimulation, group_id: u64, key: []const u8, opts: db_types.LookupOptions) !void {
-        try self.runtime.svc.prepareLookupRequest(group_id, key, opts);
+    pub fn requestLookupReadIndexForRequest(self: *ManagedHostSimulation, group_id: u64, key: []const u8, opts: db_types.LookupOptions) !void {
+        try self.runtime.svc.requestLookupReadIndexForRequest(group_id, key, opts);
     }
 
-    pub fn prepareScanRead(self: *ManagedHostSimulation, group_id: u64) !void {
-        try self.runtime.svc.prepareScanRead(group_id);
+    pub fn requestScanReadIndex(self: *ManagedHostSimulation, group_id: u64) !void {
+        try self.runtime.svc.requestScanReadIndex(group_id);
     }
 
-    pub fn prepareScanRequest(
+    pub fn requestScanReadIndexForRequest(
         self: *ManagedHostSimulation,
         group_id: u64,
         from_key: []const u8,
         to_key: []const u8,
         opts: db_types.ScanOptions,
     ) !void {
-        try self.runtime.svc.prepareScanRequest(group_id, from_key, to_key, opts);
+        try self.runtime.svc.requestScanReadIndexForRequest(group_id, from_key, to_key, opts);
     }
 
     pub fn readIndex(self: *ManagedHostSimulation, group_id: u64, request_ctx: []const u8) !void {
-        try self.requestReadableLease(group_id, request_ctx);
+        try self.requestReadIndex(group_id, request_ctx);
     }
 
     pub fn proposeConfChangeV2(self: *ManagedHostSimulation, group_id: u64, conf_change: raft_engine.core.ConfChangeV2) !void {
@@ -1073,7 +1377,16 @@ pub const ManagedHttpHostSimulation = struct {
         errdefer updates.deinit();
 
         var host_deps = deps.host;
-        var backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = if (cfg.async_transport)
+        var backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = if (deps.borrowed_io) |io|
+            try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+                .backend = .manual,
+                .borrowed_io = .{
+                    .general = io,
+                    .raft_inbound = io,
+                    .raft_outbound = io,
+                },
+            })
+        else if (cfg.async_transport)
             try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{})
         else
             null;
@@ -1116,6 +1429,10 @@ pub const ManagedHttpHostSimulation = struct {
         self.runtime.stop();
     }
 
+    pub fn disableTransitionOps(self: *ManagedHttpHostSimulation) void {
+        self.runtime.svc.disableTransitionOps();
+    }
+
     pub fn baseUri(self: *ManagedHttpHostSimulation, alloc: std.mem.Allocator) ![]u8 {
         if (self.virtual_base_uri) |uri| return try alloc.dupe(u8, uri);
         return try self.runtime.baseUri(alloc);
@@ -1129,7 +1446,7 @@ pub const ManagedHttpHostSimulation = struct {
         self.virtual_base_uri = try VirtualHttpNetwork.baseUri(self.alloc, node_id);
     }
 
-    fn serverExecutor(self: *ManagedHttpHostSimulation) transport.RequestExecutor {
+    pub fn serverRequestExecutor(self: *ManagedHttpHostSimulation) transport.RequestExecutor {
         return self.runtime.svc.host.http_host.server.executor();
     }
 
@@ -1275,50 +1592,50 @@ pub const ManagedHttpHostSimulation = struct {
         try self.runtime.svc.host.http_host.transferLeader(group_id, transferee);
     }
 
-    pub fn requestReadableLease(self: *ManagedHttpHostSimulation, group_id: u64, request_ctx: []const u8) !void {
-        try self.runtime.svc.requestReadableLease(group_id, request_ctx);
+    pub fn requestReadIndex(self: *ManagedHttpHostSimulation, group_id: u64, request_ctx: []const u8) !void {
+        try self.runtime.svc.requestReadIndex(group_id, request_ctx);
     }
 
-    pub fn prepareEnrichmentRead(self: *ManagedHttpHostSimulation, group_id: u64, kind: read_gate.EnrichmentReadKind) !void {
-        try self.runtime.svc.prepareEnrichmentRead(group_id, kind);
+    pub fn requestEnrichmentReadIndex(self: *ManagedHttpHostSimulation, group_id: u64, kind: read_gate.EnrichmentReadKind) !void {
+        try self.runtime.svc.requestEnrichmentReadIndex(group_id, kind, .read_index);
     }
 
-    pub fn prepareSearchRead(self: *ManagedHttpHostSimulation, group_id: u64) !void {
-        try self.runtime.svc.prepareSearchRead(group_id);
+    pub fn requestSearchReadIndex(self: *ManagedHttpHostSimulation, group_id: u64) !void {
+        try self.runtime.svc.requestSearchReadIndex(group_id);
     }
 
-    pub fn prepareSearchRequest(self: *ManagedHttpHostSimulation, group_id: u64, req: db_types.SearchRequest) !void {
-        try self.runtime.svc.prepareSearchRequest(group_id, req);
+    pub fn requestSearchReadIndexForRequest(self: *ManagedHttpHostSimulation, group_id: u64, req: db_types.SearchRequest) !void {
+        try self.runtime.svc.requestSearchReadIndexForRequest(group_id, req);
     }
 
-    pub fn featureReads(self: *ManagedHttpHostSimulation) feature_reads.FeatureReads {
-        return self.runtime.svc.featureReads();
+    pub fn enrichmentReadIndexes(self: *ManagedHttpHostSimulation) read_gate.EnrichmentReadIndexRequester {
+        return self.runtime.svc.enrichmentReadIndexes();
     }
 
-    pub fn prepareLookupRead(self: *ManagedHttpHostSimulation, group_id: u64) !void {
-        try self.runtime.svc.prepareLookupRead(group_id);
+    pub fn requestLookupReadIndex(self: *ManagedHttpHostSimulation, group_id: u64) !void {
+        try self.runtime.svc.requestLookupReadIndex(group_id);
     }
 
-    pub fn prepareLookupRequest(self: *ManagedHttpHostSimulation, group_id: u64, key: []const u8, opts: db_types.LookupOptions) !void {
-        try self.runtime.svc.prepareLookupRequest(group_id, key, opts);
+    pub fn requestLookupReadIndexForRequest(self: *ManagedHttpHostSimulation, group_id: u64, key: []const u8, opts: db_types.LookupOptions) !void {
+        try self.runtime.svc.requestLookupReadIndexForRequest(group_id, key, opts);
     }
 
-    pub fn prepareScanRead(self: *ManagedHttpHostSimulation, group_id: u64) !void {
-        try self.runtime.svc.prepareScanRead(group_id);
+    pub fn requestScanReadIndex(self: *ManagedHttpHostSimulation, group_id: u64) !void {
+        try self.runtime.svc.requestScanReadIndex(group_id);
     }
 
-    pub fn prepareScanRequest(
+    pub fn requestScanReadIndexForRequest(
         self: *ManagedHttpHostSimulation,
         group_id: u64,
         from_key: []const u8,
         to_key: []const u8,
         opts: db_types.ScanOptions,
     ) !void {
-        try self.runtime.svc.prepareScanRequest(group_id, from_key, to_key, opts);
+        try self.runtime.svc.requestScanReadIndexForRequest(group_id, from_key, to_key, opts);
     }
 
     pub fn readIndex(self: *ManagedHttpHostSimulation, group_id: u64, request_ctx: []const u8) !void {
-        try self.requestReadableLease(group_id, request_ctx);
+        try self.requestReadIndex(group_id, request_ctx);
     }
 
     pub fn proposeConfChangeV2(self: *ManagedHttpHostSimulation, group_id: u64, conf_change: raft_engine.core.ConfChangeV2) !void {
@@ -1349,9 +1666,14 @@ pub const ManagedHttpClusterSimulation = struct {
     pub const Fault = union(enum) {
         partition_node: u64,
         partition_link: VirtualHttpNetwork.Link,
+        route_unavailable: u64,
         drop_next,
+        drop_burst: u32,
+        reset_next,
         duplicate_next,
         delay_next_ticks: u64,
+        queue_capacity: usize,
+        clear_queue_capacity,
         random_drop: VirtualHttpNetwork.RandomDropConfig,
         clear_random_drop,
         release_fifo,
@@ -1377,9 +1699,12 @@ pub const ManagedHttpClusterSimulation = struct {
         for (owned_configs) |*cfg| cfg.async_transport = false;
         const owned_deps = try alloc.dupe(ManagedHttpHostSimulationDeps, deps);
         errdefer alloc.free(owned_deps);
-        for (owned_deps) |*dep| {
+        for (owned_deps, owned_configs) |*dep, cfg| {
             dep.host.http.request_executor = network.executor();
+            dep.host.http.listener_disabled = dep.borrowed_io != null;
             dep.service.transition_retry_clock = network.transitionRetryClock();
+            const node_id = cfg.host.http.host.local_node_id;
+            dep.service.transition_retry_jitter_salt = node_id ^ 0x7472_616e_7369_7469;
         }
 
         const nodes = try alloc.alloc(ManagedHttpHostSimulation, configs.len);
@@ -1399,7 +1724,7 @@ pub const ManagedHttpClusterSimulation = struct {
             initialized += 1;
             const node_id = cfg.host.http.host.local_node_id;
             try nodes[i].useVirtualBaseUri(node_id);
-            try network.registerNode(node_id, nodes[i].serverExecutor());
+            try network.registerNode(node_id, nodes[i].serverRequestExecutor());
         }
 
         return .{
@@ -1490,9 +1815,14 @@ pub const ManagedHttpClusterSimulation = struct {
         switch (fault) {
             .partition_node => |node_id| try self.network.partitionNode(node_id),
             .partition_link => |link| try self.network.partitionLink(link),
+            .route_unavailable => |node_id| try self.network.setRouteUnavailable(node_id),
             .drop_next => self.network.dropNext(),
+            .drop_burst => |count| self.network.dropBurst(count),
+            .reset_next => self.network.resetNext(),
             .duplicate_next => self.network.duplicateNext(),
             .delay_next_ticks => |ticks| self.network.delayNextTicks(ticks),
+            .queue_capacity => |capacity| self.network.setQueueCapacity(capacity),
+            .clear_queue_capacity => self.network.setQueueCapacity(null),
             .random_drop => |cfg| try self.network.configureRandomDrop(cfg),
             .clear_random_drop => self.network.clearRandomDrop(),
             .release_fifo => self.network.useFifoRelease(),
@@ -1504,7 +1834,9 @@ pub const ManagedHttpClusterSimulation = struct {
         switch (fault) {
             .partition_node => |node_id| self.network.healNode(node_id),
             .partition_link => |link| self.network.healLink(link),
-            .drop_next, .duplicate_next, .delay_next_ticks => self.network.clearOneShotFaults(),
+            .route_unavailable => |node_id| self.network.restoreRoute(node_id),
+            .drop_next, .drop_burst, .reset_next, .duplicate_next, .delay_next_ticks => self.network.clearOneShotFaults(),
+            .queue_capacity, .clear_queue_capacity => self.network.setQueueCapacity(null),
             .random_drop, .clear_random_drop => self.network.clearRandomDrop(),
             .release_fifo, .release_random => self.network.useFifoRelease(),
         }
@@ -1513,6 +1845,7 @@ pub const ManagedHttpClusterSimulation = struct {
     pub fn healAll(self: *ManagedHttpClusterSimulation) void {
         self.network.clearOneShotFaults();
         self.network.clearRandomDrop();
+        self.network.setQueueCapacity(null);
         self.network.useFifoRelease();
         self.network.healAll();
     }
@@ -9484,13 +9817,13 @@ test "managed http cluster simulation gates enrichment on explicit readable leas
     try std.testing.expectEqual(enrichment_runtime.LeaseReadState.awaiting_readable, lease_runtime_a.state(3014));
     try std.testing.expect(!lease_runtime_a.isActive(3014));
 
-    try cluster.node(0).featureReads().prepareSearch(3014, .{});
+    try cluster.node(0).enrichmentReadIndexes().requestSearch(3014, .read_index);
     var readable_settle: usize = 0;
     while (readable_settle < 64 and !lease_runtime_a.isActive(3014)) : (readable_settle += 1) {
         try cluster.stepAll();
     }
     try std.testing.expect(lease_runtime_a.isActive(3014));
-    try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().read_lease_requests);
+    try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().read_index_requests);
 
     try cluster.node(0).propose(3014, "lease-gated-transfer");
     try std.testing.expect(try waitForLastIndexInCluster(&cluster, &store_b, 2, 64));
@@ -9507,37 +9840,37 @@ test "managed http cluster simulation gates enrichment on explicit readable leas
     try std.testing.expectEqual(enrichment_runtime.LeaseReadState.awaiting_readable, lease_runtime_b.state(3014));
     try std.testing.expect(!lease_runtime_b.isActive(3014));
 
-    try cluster.node(1).featureReads().prepareSearch(3014, .{});
+    try cluster.node(1).enrichmentReadIndexes().requestSearch(3014, .read_index);
     readable_settle = 0;
     while (readable_settle < 64 and !lease_runtime_b.isActive(3014)) : (readable_settle += 1) {
         try cluster.stepAll();
     }
     try std.testing.expect(lease_runtime_b.isActive(3014));
-    try std.testing.expectEqual(@as(usize, 1), cluster.node(1).serviceMetrics().read_lease_requests);
+    try std.testing.expectEqual(@as(usize, 1), cluster.node(1).serviceMetrics().read_index_requests);
 
     try std.testing.expect(try lease_runtime_b.revokeReadable(3014));
     try std.testing.expectEqual(enrichment_runtime.LeaseReadState.awaiting_readable, lease_runtime_b.state(3014));
     try std.testing.expect(!lease_runtime_b.isActive(3014));
 
-    try cluster.node(1).featureReads().prepareLookup(3014, "doc:a", .{});
+    try cluster.node(1).enrichmentReadIndexes().requestLookup(3014, .read_index);
     readable_settle = 0;
     while (readable_settle < 64 and !lease_runtime_b.isActive(3014)) : (readable_settle += 1) {
         try cluster.stepAll();
     }
     try std.testing.expect(lease_runtime_b.isActive(3014));
-    try std.testing.expectEqual(@as(usize, 2), cluster.node(1).serviceMetrics().read_lease_requests);
+    try std.testing.expectEqual(@as(usize, 2), cluster.node(1).serviceMetrics().read_index_requests);
 
     try std.testing.expect(try lease_runtime_b.revokeReadable(3014));
     try std.testing.expectEqual(enrichment_runtime.LeaseReadState.awaiting_readable, lease_runtime_b.state(3014));
     try std.testing.expect(!lease_runtime_b.isActive(3014));
 
-    try cluster.node(1).featureReads().prepareScan(3014, "doc:a", "doc:z", .{});
+    try cluster.node(1).enrichmentReadIndexes().requestScan(3014, .read_index);
     readable_settle = 0;
     while (readable_settle < 64 and !lease_runtime_b.isActive(3014)) : (readable_settle += 1) {
         try cluster.stepAll();
     }
     try std.testing.expect(lease_runtime_b.isActive(3014));
-    try std.testing.expectEqual(@as(usize, 3), cluster.node(1).serviceMetrics().read_lease_requests);
+    try std.testing.expectEqual(@as(usize, 3), cluster.node(1).serviceMetrics().read_index_requests);
 }
 
 test "managed http cluster simulation gates real db enrichment runtimes on read index" {
@@ -9711,13 +10044,13 @@ test "managed http cluster simulation gates real db enrichment runtimes on read 
     try std.testing.expect(!lease_runtime_a.isActive(3015));
     try std.testing.expect(!lease_runtime_b.isActive(3015));
 
-    try cluster.node(0).featureReads().prepareSearch(3015, .{});
+    try cluster.node(0).enrichmentReadIndexes().requestSearch(3015, .read_index);
     settle_rounds = 0;
     while (settle_rounds < 64 and !lease_runtime_a.isActive(3015)) : (settle_rounds += 1) {
         try cluster.stepAll();
     }
     try std.testing.expect(lease_runtime_a.isActive(3015));
-    try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().read_lease_requests);
+    try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().read_index_requests);
 
     try cluster.node(0).transferLeader(3015, 2);
     try std.testing.expect(try cluster.waitForLeaderId(3015, 2, 64));
@@ -9731,37 +10064,37 @@ test "managed http cluster simulation gates real db enrichment runtimes on read 
     try std.testing.expectEqual(enrichment_runtime.LeaseReadState.awaiting_readable, lease_runtime_b.state(3015));
     try std.testing.expect(!lease_runtime_b.isActive(3015));
 
-    try cluster.node(1).featureReads().prepareSearch(3015, .{});
+    try cluster.node(1).enrichmentReadIndexes().requestSearch(3015, .read_index);
     settle_rounds = 0;
     while (settle_rounds < 64 and !lease_runtime_b.isActive(3015)) : (settle_rounds += 1) {
         try cluster.stepAll();
     }
     try std.testing.expect(lease_runtime_b.isActive(3015));
-    try std.testing.expectEqual(@as(usize, 1), cluster.node(1).serviceMetrics().read_lease_requests);
+    try std.testing.expectEqual(@as(usize, 1), cluster.node(1).serviceMetrics().read_index_requests);
 
     try std.testing.expect(try lease_runtime_b.revokeReadable(3015));
     try std.testing.expectEqual(enrichment_runtime.LeaseReadState.awaiting_readable, lease_runtime_b.state(3015));
     try std.testing.expect(!lease_runtime_b.isActive(3015));
 
-    try cluster.node(1).featureReads().prepareLookup(3015, "doc:a", .{});
+    try cluster.node(1).enrichmentReadIndexes().requestLookup(3015, .read_index);
     settle_rounds = 0;
     while (settle_rounds < 64 and !lease_runtime_b.isActive(3015)) : (settle_rounds += 1) {
         try cluster.stepAll();
     }
     try std.testing.expect(lease_runtime_b.isActive(3015));
-    try std.testing.expectEqual(@as(usize, 2), cluster.node(1).serviceMetrics().read_lease_requests);
+    try std.testing.expectEqual(@as(usize, 2), cluster.node(1).serviceMetrics().read_index_requests);
 
     try std.testing.expect(try lease_runtime_b.revokeReadable(3015));
     try std.testing.expectEqual(enrichment_runtime.LeaseReadState.awaiting_readable, lease_runtime_b.state(3015));
     try std.testing.expect(!lease_runtime_b.isActive(3015));
 
-    try cluster.node(1).featureReads().prepareScan(3015, "doc:a", "doc:z", .{});
+    try cluster.node(1).enrichmentReadIndexes().requestScan(3015, .read_index);
     settle_rounds = 0;
     while (settle_rounds < 64 and !lease_runtime_b.isActive(3015)) : (settle_rounds += 1) {
         try cluster.stepAll();
     }
     try std.testing.expect(lease_runtime_b.isActive(3015));
-    try std.testing.expectEqual(@as(usize, 3), cluster.node(1).serviceMetrics().read_lease_requests);
+    try std.testing.expectEqual(@as(usize, 3), cluster.node(1).serviceMetrics().read_index_requests);
 }
 
 test "managed http cluster simulation starts real db enrichment runtimes across leader transfer" {

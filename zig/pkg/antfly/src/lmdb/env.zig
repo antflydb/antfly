@@ -19,41 +19,6 @@ const format = @import("format.zig");
 const meta = @import("meta.zig");
 const page = @import("page.zig");
 const readers = @import("readers.zig");
-const c = if (builtin.link_libc) @cImport({
-    @cInclude("pthread.h");
-}) else struct {
-    pub const pthread_mutex_t = usize;
-    pub const pthread_cond_t = usize;
-
-    pub fn pthread_mutex_init(_: *pthread_mutex_t, _: ?*anyopaque) c_int {
-        unreachable;
-    }
-    pub fn pthread_mutex_destroy(_: *pthread_mutex_t) c_int {
-        unreachable;
-    }
-    pub fn pthread_mutex_lock(_: *pthread_mutex_t) c_int {
-        unreachable;
-    }
-    pub fn pthread_mutex_unlock(_: *pthread_mutex_t) c_int {
-        unreachable;
-    }
-    pub fn pthread_cond_init(_: *pthread_cond_t, _: ?*anyopaque) c_int {
-        unreachable;
-    }
-    pub fn pthread_cond_destroy(_: *pthread_cond_t) c_int {
-        unreachable;
-    }
-    pub fn pthread_cond_wait(_: *pthread_cond_t, _: *pthread_mutex_t) c_int {
-        unreachable;
-    }
-    pub fn pthread_cond_signal(_: *pthread_cond_t) c_int {
-        unreachable;
-    }
-    pub fn pthread_cond_broadcast(_: *pthread_cond_t) c_int {
-        unreachable;
-    }
-};
-
 fn heapAllocator() std.mem.Allocator {
     if (builtin.link_libc) return std.heap.c_allocator;
     return std.heap.smp_allocator;
@@ -144,17 +109,18 @@ pub const CommitTask = struct {
 };
 
 pub const CommitWorker = struct {
-    mutex: c.pthread_mutex_t = undefined,
-    ready_cond: c.pthread_cond_t = undefined,
-    work_cond: c.pthread_cond_t = undefined,
-    idle_cond: c.pthread_cond_t = undefined,
+    mutex: std.Io.Mutex = .init,
+    ready_cond: std.Io.Condition = .init,
+    work_cond: std.Io.Condition = .init,
+    idle_cond: std.Io.Condition = .init,
     stop: bool = false,
     busy: bool = false,
     ready: bool = false,
     use_async_runtime: bool = false,
     init_err: ?Error = null,
     pending: ?CommitTask = null,
-    thread: ?std.Thread = null,
+    scheduler: std.Io.Threaded,
+    future: ?std.Io.Future(void) = null,
     io_runtime: ?*AsyncRuntime = null,
 
     pub fn create(use_async_runtime: bool) Error!*CommitWorker {
@@ -162,116 +128,104 @@ pub const CommitWorker = struct {
         const alloc = heapAllocator();
         const self = alloc.create(CommitWorker) catch return error.OutOfMemory;
         errdefer alloc.destroy(self);
-        self.* = undefined;
-        if (c.pthread_mutex_init(&self.mutex, null) != 0) return error.Unexpected;
-        errdefer _ = c.pthread_mutex_destroy(&self.mutex);
-        if (c.pthread_cond_init(&self.ready_cond, null) != 0) return error.Unexpected;
-        errdefer _ = c.pthread_cond_destroy(&self.ready_cond);
-        if (c.pthread_cond_init(&self.work_cond, null) != 0) return error.Unexpected;
-        errdefer _ = c.pthread_cond_destroy(&self.work_cond);
-        if (c.pthread_cond_init(&self.idle_cond, null) != 0) return error.Unexpected;
-        errdefer _ = c.pthread_cond_destroy(&self.idle_cond);
-        self.stop = false;
-        self.busy = false;
-        self.ready = false;
-        self.use_async_runtime = use_async_runtime;
-        self.init_err = null;
-        self.pending = null;
-        self.thread = null;
-        self.io_runtime = null;
-        self.thread = std.Thread.spawn(.{}, run, .{self}) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.LockedMemoryLimitExceeded, error.SystemResources, error.ThreadQuotaExceeded => return error.OutOfMemory,
-            else => return error.Unexpected,
+        self.* = .{
+            .use_async_runtime = use_async_runtime,
+            // Keep the persistent coordinator independent of the optional
+            // runtime that it creates on its own worker for commit I/O.
+            .scheduler = std.Io.Threaded.init(alloc, .{
+                .async_limit = .nothing,
+                .concurrent_limit = .limited(1),
+            }),
         };
-        workerLock(&self.mutex);
-        while (!self.ready) {
-            workerWait(&self.ready_cond, &self.mutex);
-        }
-        if (self.init_err) |err| {
-            workerUnlock(&self.mutex);
-            if (self.thread) |thread| thread.join();
-            _ = c.pthread_cond_destroy(&self.idle_cond);
-            _ = c.pthread_cond_destroy(&self.work_cond);
-            _ = c.pthread_cond_destroy(&self.ready_cond);
-            _ = c.pthread_mutex_destroy(&self.mutex);
-            alloc.destroy(self);
-            return err;
-        }
-        workerUnlock(&self.mutex);
+        errdefer self.scheduler.deinit();
+        try self.start();
         return self;
     }
 
+    fn start(self: *CommitWorker) Error!void {
+        const io = self.scheduler.io();
+        self.future = io.concurrent(run, .{self}) catch return error.OutOfMemory;
+        self.mutex.lockUncancelable(io);
+        while (!self.ready) self.ready_cond.waitUncancelable(io, &self.mutex);
+        const init_err = self.init_err;
+        self.mutex.unlock(io);
+        if (init_err) |err| {
+            self.future.?.await(io);
+            self.future = null;
+            return err;
+        }
+    }
+
     pub fn destroy(self: *CommitWorker) void {
-        workerLock(&self.mutex);
+        const io = self.scheduler.io();
+        self.mutex.lockUncancelable(io);
         self.stop = true;
-        workerSignal(&self.work_cond);
-        workerUnlock(&self.mutex);
-        if (self.thread) |thread| thread.join();
-        _ = c.pthread_cond_destroy(&self.idle_cond);
-        _ = c.pthread_cond_destroy(&self.work_cond);
-        _ = c.pthread_cond_destroy(&self.ready_cond);
-        _ = c.pthread_mutex_destroy(&self.mutex);
+        self.work_cond.signal(io);
+        self.mutex.unlock(io);
+        if (self.future) |*future| future.await(io);
+        self.scheduler.deinit();
         heapAllocator().destroy(self);
     }
 
     pub fn submit(self: *CommitWorker, task: CommitTask) void {
-        workerLock(&self.mutex);
-        defer workerUnlock(&self.mutex);
+        const io = self.scheduler.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         while (self.pending != null or self.busy) {
-            workerWait(&self.idle_cond, &self.mutex);
+            self.idle_cond.waitUncancelable(io, &self.mutex);
         }
         self.pending = task;
-        workerSignal(&self.work_cond);
+        self.work_cond.signal(io);
 
         while (self.pending != null or self.busy) {
-            workerWait(&self.idle_cond, &self.mutex);
+            self.idle_cond.waitUncancelable(io, &self.mutex);
         }
     }
 
     fn run(self: *CommitWorker) void {
+        const io = self.scheduler.io();
         var runtime_storage: AsyncRuntime = undefined;
         if (self.use_async_runtime) {
             initAsyncRuntime(&runtime_storage) catch |err| {
-                workerLock(&self.mutex);
+                self.mutex.lockUncancelable(io);
                 self.init_err = err;
                 self.ready = true;
-                workerBroadcast(&self.ready_cond);
-                workerUnlock(&self.mutex);
+                self.ready_cond.broadcast(io);
+                self.mutex.unlock(io);
                 return;
             };
             self.io_runtime = &runtime_storage;
         }
-        workerLock(&self.mutex);
+        self.mutex.lockUncancelable(io);
         self.ready = true;
-        workerBroadcast(&self.ready_cond);
-        workerUnlock(&self.mutex);
+        self.ready_cond.broadcast(io);
+        self.mutex.unlock(io);
         defer if (self.use_async_runtime) {
             deinitAsyncRuntime(&runtime_storage);
             self.io_runtime = null;
         };
 
         while (true) {
-            workerLock(&self.mutex);
+            self.mutex.lockUncancelable(io);
             while (self.pending == null and !self.stop) {
-                workerWait(&self.work_cond, &self.mutex);
+                self.work_cond.waitUncancelable(io, &self.mutex);
             }
             if (self.stop and self.pending == null) {
-                workerUnlock(&self.mutex);
+                self.mutex.unlock(io);
                 return;
             }
             const task = self.pending.?;
             self.pending = null;
             self.busy = true;
-            workerUnlock(&self.mutex);
+            self.mutex.unlock(io);
 
             task.run(self, task.ctx);
 
-            workerLock(&self.mutex);
+            self.mutex.lockUncancelable(io);
             self.busy = false;
-            workerBroadcast(&self.idle_cond);
-            workerUnlock(&self.mutex);
+            self.idle_cond.broadcast(io);
+            self.mutex.unlock(io);
         }
     }
 };
@@ -285,14 +239,14 @@ pub const Environment = struct {
     reader_registry: ?readers.Registry = null,
     commit_worker: ?*CommitWorker = null,
     io_runtime: ?*AsyncRuntime = null,
-    mapping_mutex: std.atomic.Mutex = .unlocked,
+    mapping_mutex: std.Io.Mutex = .init,
     local_readers: usize = 0,
     retired_mappings: std.ArrayListUnmanaged(MappedBytes) = .empty,
-    commit_resource_mutex: std.atomic.Mutex = .unlocked,
-    adaptive_mutex: std.atomic.Mutex = .unlocked,
+    commit_resource_mutex: std.Io.Mutex = .init,
+    adaptive_mutex: std.Io.Mutex = .init,
     adaptive_backend: CommitBackend = .sync,
     adaptive_recheck_after: u64 = 0,
-    commit_stats_mutex: std.atomic.Mutex = .unlocked,
+    commit_stats_mutex: std.Io.Mutex = .init,
     commit_stats: CommitStats = .{},
 
     pub fn open(path: []const u8, opts: EnvironmentOptions) Error!Environment {
@@ -446,13 +400,13 @@ pub const Environment = struct {
 
     pub fn localReaderEnter(self: *Environment) void {
         lockAtomic(&self.mapping_mutex);
-        defer self.mapping_mutex.unlock();
+        defer self.mapping_mutex.unlock(std.Io.Threaded.global_single_threaded.io());
         self.local_readers += 1;
     }
 
     pub fn localReaderLeave(self: *Environment) void {
         lockAtomic(&self.mapping_mutex);
-        defer self.mapping_mutex.unlock();
+        defer self.mapping_mutex.unlock(std.Io.Threaded.global_single_threaded.io());
         std.debug.assert(self.local_readers > 0);
         self.local_readers -= 1;
         if (self.local_readers == 0) self.releaseRetiredMappingsLocked();
@@ -483,13 +437,13 @@ pub const Environment = struct {
 
     pub fn commitStatsSnapshot(self: *Environment) CommitStats {
         lockAtomic(&self.commit_stats_mutex);
-        defer self.commit_stats_mutex.unlock();
+        defer self.commit_stats_mutex.unlock(std.Io.Threaded.global_single_threaded.io());
         return self.commit_stats;
     }
 
     pub fn recordCommitStats(self: *Environment, delta: CommitStatsDelta) void {
         lockAtomic(&self.commit_stats_mutex);
-        defer self.commit_stats_mutex.unlock();
+        defer self.commit_stats_mutex.unlock(std.Io.Threaded.global_single_threaded.io());
         self.commit_stats.publish_calls += delta.publish_calls;
         self.commit_stats.full_publish_calls += delta.full_publish_calls;
         self.commit_stats.selected_sync_calls += delta.selected_sync_calls;
@@ -509,7 +463,7 @@ pub const Environment = struct {
     pub fn ensureCommitWorker(self: *Environment, use_async_runtime: bool) Error!*CommitWorker {
         if (self.opts.read_only) return error.Incompatible;
         lockAtomic(&self.commit_resource_mutex);
-        defer self.commit_resource_mutex.unlock();
+        defer self.commit_resource_mutex.unlock(std.Io.Threaded.global_single_threaded.io());
         if (self.commit_worker == null) {
             self.commit_worker = try CommitWorker.create(use_async_runtime);
         }
@@ -519,7 +473,7 @@ pub const Environment = struct {
     pub fn ensureAsyncRuntime(self: *Environment) Error!*AsyncRuntime {
         if (self.opts.read_only) return error.Incompatible;
         lockAtomic(&self.commit_resource_mutex);
-        defer self.commit_resource_mutex.unlock();
+        defer self.commit_resource_mutex.unlock(std.Io.Threaded.global_single_threaded.io());
         if (self.io_runtime == null) {
             const runtime = heapAllocator().create(AsyncRuntime) catch return error.OutOfMemory;
             errdefer heapAllocator().destroy(runtime);
@@ -539,7 +493,7 @@ pub const Environment = struct {
     fn selectAdaptiveCommitBackendCached(self: *Environment) CommitBackend {
         const stats = self.commitStatsSnapshot();
         lockAtomic(&self.adaptive_mutex);
-        defer self.adaptive_mutex.unlock();
+        defer self.adaptive_mutex.unlock(std.Io.Threaded.global_single_threaded.io());
         if (stats.publish_calls < self.adaptive_recheck_after) {
             return self.adaptive_backend;
         }
@@ -574,7 +528,7 @@ pub const Environment = struct {
 
     fn installRemappedMapping(self: *Environment, remapped: MappedBytes) Error!void {
         lockAtomic(&self.mapping_mutex);
-        defer self.mapping_mutex.unlock();
+        defer self.mapping_mutex.unlock(std.Io.Threaded.global_single_threaded.io());
 
         const previous = self.mapped;
         if (self.local_readers == 0) {
@@ -589,7 +543,7 @@ pub const Environment = struct {
 
     fn releaseRetiredMappings(self: *Environment) void {
         lockAtomic(&self.mapping_mutex);
-        defer self.mapping_mutex.unlock();
+        defer self.mapping_mutex.unlock(std.Io.Threaded.global_single_threaded.io());
         self.releaseRetiredMappingsLocked();
         self.retired_mappings.deinit(heapAllocator());
     }
@@ -600,30 +554,8 @@ pub const Environment = struct {
     }
 };
 
-fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) {
-        std.Thread.yield() catch {};
-    }
-}
-
-fn workerLock(mutex: *c.pthread_mutex_t) void {
-    if (c.pthread_mutex_lock(mutex) != 0) unreachable;
-}
-
-fn workerUnlock(mutex: *c.pthread_mutex_t) void {
-    if (c.pthread_mutex_unlock(mutex) != 0) unreachable;
-}
-
-fn workerWait(cond: *c.pthread_cond_t, mutex: *c.pthread_mutex_t) void {
-    if (c.pthread_cond_wait(cond, mutex) != 0) unreachable;
-}
-
-fn workerSignal(cond: *c.pthread_cond_t) void {
-    if (c.pthread_cond_signal(cond) != 0) unreachable;
-}
-
-fn workerBroadcast(cond: *c.pthread_cond_t) void {
-    if (c.pthread_cond_broadcast(cond) != 0) unreachable;
+fn lockAtomic(mutex: *std.Io.Mutex) void {
+    mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
 }
 
 pub fn initAsyncRuntime(runtime: *AsyncRuntime) Error!void {
@@ -869,4 +801,53 @@ test "environment rejects files without valid meta pages" {
     const file_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/broken.mdb", .{tmp.sub_path});
 
     try std.testing.expectError(error.NoValidMetaPages, Environment.open(file_path, .{ .no_subdir = true }));
+}
+
+test "commit worker serializes synchronous submitters and owns optional I/O" {
+    if (!builtin.link_libc) return error.SkipZigTest;
+    const Context = struct {
+        worker: *CommitWorker,
+        total: std.atomic.Value(u32) = .init(0),
+        active: std.atomic.Value(u32) = .init(0),
+        overlap: std.atomic.Value(bool) = .init(false),
+        runtime_missing: std.atomic.Value(bool) = .init(false),
+        fn task(worker: *CommitWorker, raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.active.fetchAdd(1, .acq_rel) != 0) self.overlap.store(true, .release);
+            if ((worker.io_runtime != null) != worker.use_async_runtime) self.runtime_missing.store(true, .release);
+            _ = self.total.fetchAdd(1, .monotonic);
+            _ = self.active.fetchSub(1, .release);
+        }
+        fn submit(self: *@This()) void {
+            for (0..16) |_| self.worker.submit(.{ .ctx = self, .run = task });
+        }
+    };
+    for ([_]bool{ false, true }) |use_async_runtime| {
+        const worker = try CommitWorker.create(use_async_runtime);
+        defer worker.destroy();
+        try std.testing.expect(worker.ready);
+        var ctx = Context{ .worker = worker };
+        var futures: [4]std.Io.Future(void) = undefined;
+        var started: usize = 0;
+        defer for (futures[0..started]) |*future| future.await(std.testing.io);
+        for (&futures) |*future| {
+            future.* = try std.testing.io.concurrent(Context.submit, .{&ctx});
+            started += 1;
+        }
+        for (futures[0..started]) |*future| future.await(std.testing.io);
+        started = 0;
+        try std.testing.expectEqual(@as(u32, 64), ctx.total.load(.acquire));
+        try std.testing.expect(!ctx.overlap.load(.acquire));
+        try std.testing.expect(!ctx.runtime_missing.load(.acquire));
+    }
+}
+
+test "commit worker maps unavailable scheduling capacity without publishing ready" {
+    var worker = CommitWorker{
+        .scheduler = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .nothing }),
+    };
+    defer worker.scheduler.deinit();
+    try std.testing.expectError(error.OutOfMemory, worker.start());
+    try std.testing.expect(worker.future == null);
+    try std.testing.expect(!worker.ready);
 }

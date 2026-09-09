@@ -2827,7 +2827,7 @@ fn waitForStableSearchPublicationIfSupported(
     if (builtin.os.tag == .freestanding) {
         std.atomic.spinLoopHint();
     } else {
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
 }
 
