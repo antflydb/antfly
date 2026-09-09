@@ -3560,12 +3560,18 @@ test "full cluster VOPR exact replays the composed deployment and recovery" {
         @intFromEnum(Scenario.Mode.graph_topology_churn),
         @intFromEnum(Scenario.Mode.graph_transport_failure),
         @intFromEnum(Scenario.Mode.partial_http_write),
-        @intFromEnum(Scenario.Mode.resource_pressure),
     };
     for (promoted_mode_ordinals) |mode_ordinal| {
         const mode_id = Scenario.mode_ids[mode_ordinal];
         try runExactMode(history_alloc, mode_id, mode_ordinal, 50_000, .complete);
     }
+}
+
+test "full cluster VOPR exact replays resource pressure recovery" {
+    var history_allocator: FixtureAllocator = .init;
+    defer std.debug.assert(history_allocator.deinit() == .ok);
+    const ordinal = @intFromEnum(Scenario.Mode.resource_pressure);
+    try runExactMode(history_allocator.allocator(), Scenario.mode_ids[ordinal], ordinal, 50_000, .complete);
 }
 
 test "full cluster production data plane VOPR active split exact replay" {

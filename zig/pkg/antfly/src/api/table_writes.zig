@@ -8755,6 +8755,7 @@ pub const ProvisionedTableWriteSource = struct {
             .enabled = true,
             .lease_owned = !replicated,
             .owner_id = "provisioned-2pc",
+            .clock = backend_runtime.clock(),
             .interval_ms = 5_000,
             .cutoff_ns = 5 * std.time.ns_per_min,
             .resolver_ctx = self,
@@ -21428,47 +21429,20 @@ pub const ProvisionedTableWriteSource = struct {
     ) !?distributed_txn.CommitOutcome {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceHAWriteGateOptional(self.ha_write_gate);
-        const retry_conflicts = statelessBatchMayRetry(tables);
-        var attempt: u8 = 0;
-        while (true) : (attempt += 1) {
-            const outcome = commitProvisionedBatchOnce(self, ptr, alloc, tables, sync_level, cancellation) catch |err| {
-                if (retry_conflicts and attempt + 1 < stateless_batch_max_attempts and err == error.TopologyChanged) {
-                    sleepNs(statelessBatchRetryDelayNs(attempt));
-                    continue;
-                }
-                return err;
-            };
-            if (outcome) |result| switch (result) {
-                .committed => return result,
-                .conflict => {
-                    // Every conflict outcome is returned only after the
-                    // coordinator has established that no commit decision is
-                    // durable. A fresh transaction ID is therefore safe for a
-                    // predicate-free public batch. Explicit OCC conflicts and
-                    // unknown outcomes remain visible to the caller.
-                    if (retry_conflicts and attempt + 1 < stateless_batch_max_attempts) {
-                        sleepNs(statelessBatchRetryDelayNs(attempt));
-                        continue;
-                    }
-                    return result;
-                },
-            } else return null;
-        }
+        return commitStatelessBatchWithRetries(self, commitProvisionedBatchOnce, alloc, tables, sync_level, cancellation);
     }
 
     fn commitProvisionedBatchOnce(
         self: *ProvisionedTableWriteSource,
-        ptr: *anyopaque,
         alloc: std.mem.Allocator,
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
         if (try self.commitSingleGroupBatch(alloc, tables, sync_level, cancellation)) |outcome| return outcome;
-        const txn_source: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const txn_io: ?Io = if (txn_source.backend_runtime) |runtime| runtime.io() else null;
+        const txn_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
         const txn_id = nextTxnId(txn_io);
-        return commitProvisionedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation) catch |err| {
+        return commitProvisionedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation) catch |err| {
             if (err == error.CommitDecisionUnknown)
                 public_table_http.setLastAmbiguousBatchTxnId(distributed_txn.encodeTxnIdHex(txn_id));
             return err;
@@ -23926,6 +23900,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             .enabled = true,
             .lease_owned = true,
             .owner_id = "hosted-2pc",
+            .clock = backend_runtime.clock(),
             .interval_ms = 5_000,
             .cutoff_ns = 5 * std.time.ns_per_min,
             .resolver_ctx = self,
@@ -24533,10 +24508,20 @@ pub const HostedProvisionedTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
-        const txn_source: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        const txn_io: ?Io = if (txn_source.backend_runtime) |runtime| runtime.io() else null;
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        return commitStatelessBatchWithRetries(self, commitHostedBatchOnce, alloc, tables, sync_level, cancellation);
+    }
+
+    fn commitHostedBatchOnce(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?distributed_txn.CommitOutcome {
+        const txn_io: ?Io = if (self.backend_runtime) |runtime| runtime.io() else null;
         const txn_id = nextTxnId(txn_io);
-        return try commitHostedTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
+        return try commitHostedTransaction(self, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
     }
 
     fn commitTransactionWithId(
@@ -26203,6 +26188,88 @@ test "table transaction identities borrow runtime entropy and realtime" {
     try std.testing.expectEqual(nextTxnTimestamp(first.io()), nextTxnTimestamp(replay.io()));
 }
 
+test "table transaction recovery preserves fresh transactions on the runtime clock" {
+    const alloc = std.testing.allocator;
+    const now_ns = 7 * std.time.ns_per_s;
+    var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{ .realtime_ns = now_ns });
+    defer vopr_io.deinit();
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = vopr_io.io() },
+    });
+    defer runtime.deinit();
+    var provisioned = ProvisionedTableWriteSource.initWithBackendRuntime("unused-recovery-clock", table_catalog.emptyCatalogSource(), &runtime);
+    defer provisioned.deinit();
+    var hosted = HostedProvisionedTableWriteSource.init("unused-recovery-clock", table_catalog.emptyCatalogSource(), undefined, undefined);
+    hosted.backend_runtime = &runtime;
+    for ([_]db_mod.transaction_runtime.Config{ provisioned.transactionRecoveryConfig(), hosted.transactionRecoveryConfig() }) |config| {
+        vopr_io.realtime_ns = now_ns;
+        try std.testing.expect(config.enabled);
+        var backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+        defer backend.close();
+        var store = try backend.runtimeStore(alloc, .{ .name = "recovery-clock" });
+        defer store.deinit();
+        var manager = try transactions_mod.TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        const txn_id: transactions_mod.TxnId = .{7} ** 16;
+        try manager.initTransactionWithParticipantsCreatedAtAndRole(txn_id, now_ns, now_ns, &.{}, true);
+
+        const fresh = try db_mod.transaction_runtime.recoverOnce(alloc, &store, config);
+        try std.testing.expectEqual(@as(u64, 0), fresh.auto_aborted);
+        try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try manager.getTransactionStatus(txn_id));
+
+        vopr_io.realtime_ns = now_ns + config.cutoff_ns + 1;
+        const expired = try db_mod.transaction_runtime.recoverOnce(alloc, &store, config);
+        try std.testing.expectEqual(@as(u64, 1), expired.auto_aborted);
+        try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try manager.getTransactionStatus(txn_id));
+    }
+}
+
+fn commitStatelessBatchWithRetries(
+    source: anytype,
+    comptime commit_once: anytype,
+    alloc: std.mem.Allocator,
+    tables: []const distributed_txn.TableCommitRequest,
+    sync_level: db_mod.types.SyncLevel,
+    cancellation: db_mod.types.CancellationToken,
+) !?distributed_txn.CommitOutcome {
+    const retry_conflicts = statelessBatchMayRetry(tables);
+    var attempt: u8 = 0;
+    while (true) : (attempt += 1) {
+        const outcome = commit_once(source, alloc, tables, sync_level, cancellation) catch |err| {
+            if (retry_conflicts and attempt + 1 < stateless_batch_max_attempts and err == error.TopologyChanged) {
+                try sleepStatelessBatchRetry(source, attempt);
+                continue;
+            }
+            return err;
+        };
+        if (outcome) |result| switch (result) {
+            .committed => return result,
+            .conflict => {
+                // The coordinator returns a conflict only after proving no
+                // commit decision is durable. A new transaction is safe for
+                // a predicate-free stateless batch at either write source.
+                // Explicit OCC and ambiguous outcomes remain caller-visible.
+                if (retry_conflicts and attempt + 1 < stateless_batch_max_attempts) {
+                    try sleepStatelessBatchRetry(source, attempt);
+                    continue;
+                }
+                return result;
+            },
+        } else return null;
+    }
+}
+
+fn sleepStatelessBatchRetry(source: anytype, attempt: u8) !void {
+    const delay_ns = statelessBatchRetryDelayNs(attempt);
+    if (source.backend_runtime) |runtime| {
+        const io = runtime.io() orelse return error.BackendRuntimeIoUnavailable;
+        try io.sleep(.fromNanoseconds(delay_ns), .awake);
+    } else {
+        sleepNs(delay_ns);
+    }
+}
+
 fn statelessBatchMayRetry(tables: []const distributed_txn.TableCommitRequest) bool {
     for (tables) |table| {
         if (table.predicates.len != 0) return false;
@@ -26238,6 +26305,71 @@ test "stateless batch retries are bounded and exclude explicit OCC" {
     try std.testing.expectEqual(std.time.ns_per_ms, statelessBatchRetryDelayNs(0));
     try std.testing.expectEqual(2 * std.time.ns_per_ms, statelessBatchRetryDelayNs(1));
     try std.testing.expectEqual(@as(u8, 3), stateless_batch_max_attempts);
+}
+
+test "shared stateless batch retries borrow IO and preserve unknown outcomes" {
+    const RetryClock = struct {
+        threadlocal var active: ?*@This() = null;
+        elapsed_ns: i96 = 0,
+        calls: usize = 0,
+
+        fn sleep(_: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
+            const self = active.?;
+            self.elapsed_ns += timeout.duration.raw.toNanoseconds();
+            self.calls += 1;
+        }
+    };
+    const Attempt = struct {
+        backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+        failure: ?anyerror = null,
+        calls: usize = 0,
+
+        fn commit(self: *@This(), _: std.mem.Allocator, _: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel, _: db_mod.types.CancellationToken) !?distributed_txn.CommitOutcome {
+            self.calls += 1;
+            if (self.calls < 3) {
+                if (self.failure) |err| return err;
+                return .{ .conflict = .{ .table_name = "docs", .key = "", .message = "participant unavailable" } };
+            }
+            return .{ .committed = .{ .participant_count = 1 } };
+        }
+    };
+    var clock: RetryClock = .{};
+    RetryClock.active = &clock;
+    defer RetryClock.active = null;
+    var io_vtable = std.testing.io.vtable.*;
+    io_vtable.sleep = RetryClock.sleep;
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(std.testing.allocator, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = .{ .userdata = std.testing.io.userdata, .vtable = &io_vtable } },
+    });
+    defer runtime.deinit();
+    const tables = [_]distributed_txn.TableCommitRequest{.{ .table_name = "docs", .writes = &.{.{ .key = "doc:a", .value = "{}" }} }};
+    for ([_]?anyerror{ null, error.TopologyChanged }) |failure| {
+        var attempt = Attempt{ .backend_runtime = &runtime, .failure = failure };
+        clock = .{};
+        const result = (try commitStatelessBatchWithRetries(&attempt, Attempt.commit, std.testing.allocator, &tables, .write, .none)).?;
+        try std.testing.expect(result == .committed);
+        try std.testing.expectEqual(@as(usize, 3), attempt.calls);
+        try std.testing.expectEqual(@as(usize, 2), clock.calls);
+        try std.testing.expectEqual(@as(i96, 3 * std.time.ns_per_ms), clock.elapsed_ns);
+    }
+    for ([_]anyerror{ error.CommitDecisionUnknown, error.RaftBatchWriteOutcomeUnknown, error.UnexpectedHttpStatus }) |failure| {
+        var attempt = Attempt{ .backend_runtime = &runtime, .failure = failure };
+        clock = .{};
+        try std.testing.expectError(failure, commitStatelessBatchWithRetries(&attempt, Attempt.commit, std.testing.allocator, &tables, .write, .none));
+        try std.testing.expectEqual(@as(usize, 1), attempt.calls);
+        try std.testing.expectEqual(@as(usize, 0), clock.calls);
+    }
+    const conditional = [_]distributed_txn.TableCommitRequest{.{
+        .table_name = "docs",
+        .predicates = &.{.{ .key = "doc:a", .expected_version = 7 }},
+    }};
+    var attempt = Attempt{ .backend_runtime = &runtime };
+    clock = .{};
+    const conflict = (try commitStatelessBatchWithRetries(&attempt, Attempt.commit, std.testing.allocator, &conditional, .write, .none)).?;
+    try std.testing.expect(conflict == .conflict);
+    try std.testing.expectEqual(@as(usize, 1), attempt.calls);
+    try std.testing.expectEqual(@as(usize, 0), clock.calls);
 }
 
 test "raft single-group fast path excludes graph projection transforms only" {

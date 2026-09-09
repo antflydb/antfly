@@ -8219,6 +8219,18 @@ pub fn build(b: *std.Build) void {
     // one honest shared amount so the build scheduler cannot co-schedule them
     // under stale per-mode estimates. Linux retains its measured 7 GiB bound.
     const full_cluster_vopr_max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024;
+    const transaction_runtime_filters: []const []const u8 = &.{
+        "table transaction identities borrow runtime entropy and realtime",
+        "table transaction recovery preserves fresh transactions on the runtime clock",
+        "shared stateless batch retries borrow IO and preserve unknown outcomes",
+        "provisioned stateless batch retries definite aborts to the production bound",
+    };
+    const transaction_runtime_regressions = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, transaction_runtime_filters),
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("transaction-runtime-regression-test", "Check transaction identity, recovery clocks, and safe stateless retries").dependOn(&addCuratedTestRunArtifact(b, transaction_runtime_regressions, transaction_runtime_filters).step);
     const migration_regression_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{
@@ -8227,6 +8239,7 @@ pub fn build(b: *std.Build) void {
             "metadata VOPR source seeding preserves arbitrary keys and open range bounds",
             "public api linearizable read driver ignores a delayed earlier generation",
             "table transaction identities borrow runtime entropy and realtime",
+            "table transaction recovery preserves fresh transactions on the runtime clock",
             "transaction attempt budgets follow the borrowed transport clock",
             "pre-decision context deadline has typed admission provenance",
             "internal transaction ingress establishes and validates pre-decision deadline",
@@ -8238,11 +8251,15 @@ pub fn build(b: *std.Build) void {
             "graph workers report retired ranges as topology unavailability",
             "full cluster production data plane VOPR bounded cutoff exact replay",
             "full cluster VOPR exact replays the composed deployment and recovery",
+            "full cluster VOPR exact replays resource pressure recovery",
+            "shared stateless batch retries borrow IO and preserve unknown outcomes",
+            "provisioned stateless batch retries definite aborts to the production bound",
         },
         .max_rss = full_cluster_vopr_max_rss,
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     const run_migration_regressions = b.addRunArtifact(migration_regression_tests);
+    if (b.args) |args| run_migration_regressions.addArgs(args);
     b.step("vopr-migration-regression-test", "Run VOPR I/O migration ownership and replay regressions").dependOn(&run_migration_regressions.step);
 
     const full_cluster_vopr_tests = b.addTest(.{

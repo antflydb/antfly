@@ -671,6 +671,10 @@ Initial source seeding also uses a read-only DB view, so it can coexist with a
 public writer without acquiring a second writer. Filesystem-backed read-only
 views load the existing validated root-identity checkpoint through the borrowed
 filesystem I/O; missing external-backend identities still fail closed.
+The initial snapshot uses `seedGroupSnapshotFromAuthoritativeStoreIfAbsent`
+with typed range bounds and opaque document keys/values. It does not synthesize
+legacy text commands or consume Raft entry indexes. A regression covers an
+open-ended range and keys/values containing the old delimiters.
 Neither fix relaxes LSM's single-writer guard. The split fixture regression
 covers seeding beside a live
 writer, failed initialization and retry, initial status before destination
@@ -1361,6 +1365,14 @@ in-flight graph-transport failure/recovery, partial-HTTP-write, and aggregate
 node-memory denial/recovery modes exact replay in the hosted campaign. After a
 clean worker completes, a production `ServerlessHttpClient` lists `docs` and
 queries version 3 through the real serverless handler and `httpx` listener.
+Transaction creation and recovery use the same `BackendRuntime` realtime
+clock. Borrowing worker I/O alone is insufficient: a host-clock recovery pass
+can expire a fresh virtual-time transaction between begin and prepare.
+`transaction-runtime-regression-test` checks fresh and expired transactions
+through both write-source configurations, along with bounded stateless retry
+behavior and preservation of conditional conflicts and unknown outcomes.
+The resource-pressure recording and exact replay remain in
+`full-cluster-vopr-test` as a separately selectable test.
 Forward-only v50 replaces the older standalone stale-generation cluster mode:
 the production-owner campaign queries version 4 and requires the authoritative
 document after a losing publication CAS and stale-derived-record rejection.
