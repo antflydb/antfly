@@ -346,14 +346,7 @@ Exact query behavior fails closed. A sorted request returns 422 when the engine 
 
 Set `profile: true` while diagnosing. The public sort profile reports the selected plan, source, candidate source, selection reason, exactness, candidate counts, source-load behavior, and rejection reasons. Lower-level executor counters live in logs, traces, and benchmarks, not in SDK responses.
 
-## Decisions
-
-- Relevance-ordered results, text or hybrid: `full_text_search` or `semantic_search` with `limit`, no `order_by`. Add `reranker` and `pruner` when the top of the page has to be right.
-- Exact ordered browsing over a filter: map the sort field with `sortable: true`, use `order_by`, and page with `search_after`. Reserve `offset` for shallow pages.
-- One dominant sort order over a large table: declare it as `index_sort` and let broad queries in that order seek instead of collect.
-- Relationship questions: seed `graph_queries` from `$query_results`, and use `match` with counts when the answer is a number rather than a list.
-
-## Let Your Agent Drive
+## Use Agent Skills
 
 Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
 so a coding agent can execute this guide for you:

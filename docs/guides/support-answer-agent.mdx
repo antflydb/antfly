@@ -204,7 +204,7 @@ The pruner is what stops that:
 
 Let the reranker see more than the model does. A `candidate_count` of 50 with a strict pruner beats a `limit` of 3 with no pruner, because the reranker scores a wide window and the model sees only the survivors. Start strict, watch what gets pruned on real questions, and loosen only when good articles are being cut.
 
-## Let Your Agent Drive
+## Use Agent Skills
 
 Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
 so a coding agent can execute this guide for you:

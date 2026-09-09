@@ -21,7 +21,7 @@ order: 6
 
 Antfly indexes images, audio, and documents in one of three shapes, and the choice decides what runs at write time, what is stored durably, and which providers can maintain the index. ClipClap, the native model, puts text, images, and audio in one vector space, so a plain-language query can return a picture and a picture can return its neighbors.
 
-## Decisions
+## Choose the Ingestion Shape
 
 Antfly supports three explicit multimodal workflows:
 
@@ -249,7 +249,7 @@ is deprecated. Prefer durable extraction for production workflows.
 - Monitor index status and wait for the required coverage before serving a new
   index to users.
 
-## Let Your Agent Drive
+## Use Agent Skills
 
 Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
 so a coding agent can execute this guide for you:

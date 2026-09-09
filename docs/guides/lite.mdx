@@ -314,15 +314,7 @@ antfly lite vacuum app.aflite     # file-level vacuum only
 
 For a production application, pair regular `.afb` backups with `check`.
 
-## Decisions
-
-- **One writer, one machine.** Lite pins one shard and one replica. If two processes need to write the same data, run a normal instance.
-- **Bring your own vectors, or defer them.** With no inference runtime, Lite still indexes and queries the embeddings you supply. Configure a remote provider or ship the full build when the application itself must embed.
-- **Ship the file, back up the bundle.** Snapshot `.aflite` to hand a database to another Lite app. Write a full `.afb` for anything that has to outlive the storage engine: archival retention, object-storage transfer, restore into a normal instance, cross-version migration.
-- **Portable for Lite, native for speed.** Choose the portable representation whenever Lite or another engine will read the bundle. Choose native only for fast restore into a compatible normal Antfly runtime.
-- **Promote when you outgrow it.** The path to a normal instance is one `promote`; nothing about the data model changes.
-
-## Let Your Agent Drive
+## Use Agent Skills
 
 Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
 so a coding agent can execute this guide for you:

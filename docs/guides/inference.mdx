@@ -135,13 +135,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/tables/TABLE/repair/issues \
 
 It lists durable repair issues, not every document in the pending tail. Pending work with no listed issue means the cause is a worker lifecycle problem or inference that is still retrying; the runtime counters and server logs tell those apart.
 
-## Decisions
-
-Run models on Antfly Inference when the data must stay on the machine, when the index is large enough that a per-document network hop would dominate enrichment time, or when you want one process to operate. Reach for an external provider when you need a model the local runtime does not support (see the incompatible list on [Local Model Compatibility](/docs/guides/supported-models)) or a hosted model's quality for generation. Embedding and generation are configured separately, so a table can embed locally and generate through Ollama or a hosted API.
-
-The HTTP surface is documented in the [Inference API reference](/inference/api).
-
-## Let Your Agent Drive
+## Use Agent Skills
 
 Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
 so a coding agent can execute this guide for you:
@@ -155,5 +149,6 @@ Then prompt it with the outcome, for example "Set up local embeddings and rerank
 ## Next Steps
 
 - [Local Model Compatibility](/docs/guides/supported-models): which artifacts load, which are rejected, and why
-- [Build Image Search](/docs/guides/multimodal): the ClipClap embedder on an image index
+- [Multimodal Embeddings](/docs/guides/multimodal): the ClipClap embedder on an image index
 - [Tune Hybrid Search](/docs/guides/hybrid-search): the reranker in a query pipeline
+- [Inference API reference](/inference/api): the HTTP surface

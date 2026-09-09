@@ -252,7 +252,7 @@ The cost of that arrangement is the replication slot. A slot makes PostgreSQL re
 
 That one-way flow is also why the delete decision is yours. PostgreSQL knows a row is gone; only you know whether the document should vanish from search or stay, marked inactive, so that history remains retrievable. `$delete_document` is right for data that should not be found once removed. A soft delete is right when the document is evidence, such as a resolved ticket that still teaches a classifier.
 
-## Let Your Agent Drive
+## Use Agent Skills
 
 Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
 so a coding agent can execute this guide for you:

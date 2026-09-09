@@ -82,10 +82,10 @@ under Build It vary.
    names the specific decision (the heading is fixed, so the first sentence carries the
    content), then the mechanism. One section, even when it holds two decisions.
 
-6. **`## Let Your Agent Drive`**, verbatim shape:
+6. **`## Use Agent Skills`**, verbatim shape:
 
    ```md
-   ## Let Your Agent Drive
+   ## Use Agent Skills
 
    Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
    so a coding agent can execute this guide for you:
@@ -118,12 +118,13 @@ sections vary by subject; the bookends do not.
 3. **Sections by mechanism**, each answering one question the reader has. Headings are
    nouns or short claims, not "How It Works" or "Overview". Tables for state machines
    and option matrices; prose for reasoning.
-4. **`## Decisions`**: when to choose which option, stated as rules with the reason
-   attached. Usually last before the agent section; a page whose main job is a
-   choose-this table (model compatibility) puts it first.
-5. **`## Let Your Agent Drive`** and **`## Next Steps`** as in guides, where a concrete
+4. **`## Use Agent Skills`** and **`## Next Steps`** as in guides, where a concrete
    prompt makes sense. A concept page whose subject an agent would never be prompted to
    "do" (model compatibility, for instance) skips the agent section.
+
+   No closing recap. A section that restates the page as a list of rules ("Decisions",
+   "Summary", "Key Takeaways") is deleted; the guidance belongs in the section that
+   explains the mechanism.
 
 ## Facts
 
