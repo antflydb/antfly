@@ -171,7 +171,7 @@ pub const InferenceExecutionControl = struct {
                 std.atomic.spinLoopHint();
                 spins += 1;
             } else {
-                std.Thread.yield() catch {};
+                @import("antfly_platform").time.yieldNow();
             }
         }
         self.check() catch |err| {

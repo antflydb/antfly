@@ -332,7 +332,7 @@ const SnapshotBuildWorker = struct {
     io_impl: std.Io.Threaded,
     mutex: std.Io.Mutex = .init,
     ready: std.Io.Condition = .init,
-    thread: ?std.Thread = null,
+    future: ?std.Io.Future(void) = null,
     stopping: bool = false,
     running: bool = false,
     pending: ?SnapshotBuildRequest = null,
@@ -342,7 +342,7 @@ const SnapshotBuildWorker = struct {
     result: ?SnapshotBuildResult = null,
 
     fn start(self: *@This()) !void {
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        self.future = try self.io_impl.io().concurrent(run, .{self});
     }
 
     fn deinit(self: *@This()) void {
@@ -352,7 +352,7 @@ const SnapshotBuildWorker = struct {
         if (self.running_source) |source| source.cancel();
         self.ready.broadcast(io);
         self.mutex.unlock(io);
-        if (self.thread) |thread| thread.join();
+        if (self.future) |*future| future.await(io);
         if (self.pending) |*request| request.deinit();
         if (self.result) |*result| result.deinit();
         self.io_impl.deinit();
@@ -2045,7 +2045,10 @@ pub const MultiRaft = struct {
         if (self.snapshot_worker) |worker| return worker;
         const worker = try self.alloc.create(SnapshotBuildWorker);
         errdefer self.alloc.destroy(worker);
-        worker.* = .{ .io_impl = std.Io.Threaded.init(self.alloc, .{}) };
+        worker.* = .{ .io_impl = std.Io.Threaded.init(self.alloc, .{
+            .async_limit = .nothing,
+            .concurrent_limit = .limited(1),
+        }) };
         errdefer worker.io_impl.deinit();
         try worker.start();
         self.snapshot_worker = worker;
@@ -3415,4 +3418,15 @@ test "multi raft progress round drains ready work without advancing raft time" {
     try std.testing.expectEqual(before.virtual_round, after.virtual_round);
     try std.testing.expectEqual(before.virtual_time_ms, after.virtual_time_ms);
     try std.testing.expectEqual(before_advance_time_calls, transport.advance_time_calls);
+}
+
+test "snapshot worker startup failure leaves no task and can be drained" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var worker: SnapshotBuildWorker = .{ .io_impl = std.Io.Threaded.init(std.testing.failing_allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .limited(1),
+    }) };
+    defer worker.deinit();
+    try std.testing.expectError(error.ConcurrencyUnavailable, worker.start());
+    try std.testing.expect(worker.future == null);
 }

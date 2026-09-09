@@ -31,6 +31,7 @@ const worker_runtime = @import("inference_worker.zig");
 
 pub const LinkedInferenceState = struct {
     alloc: std.mem.Allocator,
+    executor: @import("../runtime_io_abi.zig").Receiver,
     /// Host-owned interface protected by standalone's inference-lane lease.
     io: std.Io,
     node: inference.server.Node,
@@ -704,7 +705,7 @@ pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*a
 pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext, supervised: bool) !*anyopaque {
     const data_dir = context.data_dir_ptr[0..context.data_dir_len];
     const alloc = std.heap.c_allocator;
-    const io = try context.executor.get();
+    const executor = try context.executor.receive();
 
     var content_security = if (context.content_security_json.slice()) |json|
         try std.json.parseFromSlice(antfly.common.config.Config.ContentSecurityConfig, alloc, json, .{ .ignore_unknown_fields = true })
@@ -788,7 +789,8 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
 
     state.* = .{
         .alloc = alloc,
-        .io = io,
+        .executor = executor,
+        .io = undefined,
         .node = undefined,
         .warm_models = warm_models,
         .content_security = content_security,
@@ -799,6 +801,7 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
         .route_validator = httpx.Router.init(alloc),
     };
     errdefer state.route_validator.deinit();
+    state.io = state.executor.io();
     state.node = try inference.server.Node.init(alloc, node_config);
     errdefer state.node.deinit();
     try state.node.attachIo(state.io);
@@ -806,7 +809,7 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
         var resolved = context.*;
         resolved.models_dir = .init(state.node.config.models_dir);
         resolved.ml_dir = .init(state.node.config.ml_dir);
-        state.worker = try worker_runtime.Client.create(alloc, io, &resolved);
+        state.worker = try worker_runtime.Client.create(alloc, state.io, &resolved);
     }
     return state;
 }

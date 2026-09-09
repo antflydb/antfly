@@ -4478,7 +4478,7 @@ provenance.
   the honest active-renderer range of one through two, preventing
   the normal Antfly unit-test PDF stub or a start-gate wait count from making
   native integration coverage pass vacuously. The same executable is a
-  dependency of `lib-pdf-test` and the aggregate `unit-test`, so CI runs the
+  dependency of `lib-pdf-test` and the aggregate `antfly-unit-test`, so CI runs the
   production path rather than leaving it as an opt-in check.
 - Durable enrichment tests seed an existing public page vector, stage one
   successful sibling beside a failed page, and verify that retry startup keeps

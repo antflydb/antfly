@@ -822,7 +822,7 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
     {
         var lazy_it = impl.backend_data.native.lazy_weights.iterator();
         while (lazy_it.next()) |entry| {
-            entry.value_ptr.guard = impl.backend_data.native.prefetch.mutexPtr();
+            entry.value_ptr.guard = impl.backend_data.native.prefetch.lockHandle();
         }
     }
     if (impl.backend_data.native.lazy_weights.count() > 0) {
@@ -1102,7 +1102,7 @@ pub fn createPjrtSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
     {
         var lazy_it = impl.backend_data.pjrt.native.lazy_weights.iterator();
         while (lazy_it.next()) |entry| {
-            entry.value_ptr.guard = impl.backend_data.pjrt.native.prefetch.mutexPtr();
+            entry.value_ptr.guard = impl.backend_data.pjrt.native.prefetch.lockHandle();
         }
     }
     if (impl.backend_data.pjrt.native.lazy_weights.count() > 0) {
@@ -8223,34 +8223,13 @@ fn archBackend(ptr: *anyopaque) BackendType {
 fn archClose(ptr: *anyopaque) void {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     switch (self.backend_type) {
-        .native => {
-            native_mod.stopPrefetchWorker(&self.backend_data.native);
-            var it = self.backend_data.native.resident_weights.iterator();
-            while (it.next()) |entry| {
-                var w = entry.value_ptr.*;
-                w.deinit();
-                self.allocator.free(entry.key_ptr.*);
-            }
-            self.backend_data.native.resident_weights.deinit(self.allocator);
-
-            var lazy_it = self.backend_data.native.lazy_weights.iterator();
-            while (lazy_it.next()) |entry| {
-                if (entry.value_ptr.loaded) |*loaded| loaded.deinit();
-                entry.value_ptr.tensor_ref.deinit(self.allocator);
-                self.allocator.free(entry.key_ptr.*);
-            }
-            self.backend_data.native.lazy_weights.deinit(self.allocator);
-            native_mod.deinitPrefetchQueue(&self.backend_data.native);
-            if (self.backend_data.native.residency) |*residency| residency.deinit();
-            if (self.backend_data.native.tensor_store) |tensor_store| tensor_store.deinit();
-            if (self.backend_data.native.tier_cache) |*tier_cache|
-                tier_cache.deinitAdmission();
-        },
+        .native => self.backend_data.native.deinitOwned(),
         .metal => {
             if (comptime build_options.enable_metal) {
                 const gpu_data = gpuBackendData(self);
                 metal_compute_mod.stopPrefetchWorker(gpu_data);
                 metal_compute_mod.deinitSharedNativeProvider(gpu_data);
+                metal_compute_mod.deinitPrefetchQueue(gpu_data);
                 var it = gpu_data.lazy_weights.iterator();
                 while (it.next()) |entry| {
                     if (entry.value_ptr.quantized_storage) |*storage| storage.deinit();
@@ -8260,7 +8239,6 @@ fn archClose(ptr: *anyopaque) void {
                 }
                 gpu_data.lazy_weights.deinit(self.allocator);
                 metal_compute_mod.deinitPackedExpertViews(gpu_data, self.allocator);
-                metal_compute_mod.deinitPrefetchQueue(gpu_data);
                 if (gpu_data.residency) |*residency| residency.deinit();
                 if (gpu_data.jina_lora_adapter) |adapter| adapter.destroy();
                 if (gpu_data.tensor_store) |store| store.deinit();
@@ -8275,27 +8253,7 @@ fn archClose(ptr: *anyopaque) void {
                     client.deinit();
                 }
             }
-            // Clean up the native CPU host-backend weight store.
-            native_mod.stopPrefetchWorker(&self.backend_data.pjrt.native);
-            var it = self.backend_data.pjrt.native.resident_weights.iterator();
-            while (it.next()) |entry| {
-                var w = entry.value_ptr.*;
-                w.deinit();
-                self.allocator.free(entry.key_ptr.*);
-            }
-            self.backend_data.pjrt.native.resident_weights.deinit(self.allocator);
-            var lazy_it = self.backend_data.pjrt.native.lazy_weights.iterator();
-            while (lazy_it.next()) |entry| {
-                if (entry.value_ptr.loaded) |*loaded| loaded.deinit();
-                entry.value_ptr.tensor_ref.deinit(self.allocator);
-                self.allocator.free(entry.key_ptr.*);
-            }
-            self.backend_data.pjrt.native.lazy_weights.deinit(self.allocator);
-            native_mod.deinitPrefetchQueue(&self.backend_data.pjrt.native);
-            if (self.backend_data.pjrt.native.residency) |*residency| residency.deinit();
-            if (self.backend_data.pjrt.native.tensor_store) |tensor_store| tensor_store.deinit();
-            if (self.backend_data.pjrt.native.tier_cache) |*tier_cache|
-                tier_cache.deinitAdmission();
+            self.backend_data.pjrt.native.deinitOwned();
         },
         .cuda => {
             if (comptime build_options.enable_cuda) {
@@ -8306,6 +8264,47 @@ fn archClose(ptr: *anyopaque) void {
         .wasm => {},
     }
     self.allocator.destroy(self);
+}
+
+test "architecture close retires prefetch before destroying weight maps" {
+    const allocator = std.testing.allocator;
+    inline for (.{ BackendType.native, BackendType.pjrt, BackendType.metal }) |backend_type| {
+        if (comptime backend_type == .metal and !build_options.enable_metal) continue;
+        const self = try allocator.create(ArchSession);
+        self.* = .{
+            .allocator = allocator,
+            .arch_config = .{ .gpt = .{
+                .hidden_size = 4,
+                .num_hidden_layers = 1,
+                .num_attention_heads = 1,
+                .intermediate_size = 8,
+                .vocab_size = 16,
+            } },
+            .backend_type = backend_type,
+            .backend_data = switch (backend_type) {
+                .native => .{ .native = .{ .allocator = allocator, .resident_weights = .empty, .lazy_weights = .empty } },
+                .pjrt => .{ .pjrt = .{ .native = .{ .allocator = allocator, .resident_weights = .empty, .lazy_weights = .empty } } },
+                .metal => .{ .metal = .{ .allocator = allocator, .prefix = "", .lazy_weights = .empty } },
+                else => unreachable,
+            },
+        };
+        // An initialized queue must be retired before even an empty map is
+        // destroyed: deinit poisons the map that queue cleanup still iterates.
+        // No model files, GPU device, or PJRT client are needed for teardown.
+        switch (backend_type) {
+            .native => native_mod.initPrefetchQueue(&self.backend_data.native, allocator),
+            .pjrt => native_mod.initPrefetchQueue(&self.backend_data.pjrt.native, allocator),
+            .metal => metal_compute_mod.initPrefetchQueue(&self.backend_data.metal, allocator),
+            else => unreachable,
+        }
+        defer archClose(self);
+        switch (backend_type) {
+            .native => try self.backend_data.native.lazy_weights.ensureTotalCapacity(allocator, 1),
+            .pjrt => try self.backend_data.pjrt.native.lazy_weights.ensureTotalCapacity(allocator, 1),
+            .metal => try self.backend_data.metal.lazy_weights.ensureTotalCapacity(allocator, 1),
+            else => unreachable,
+        }
+    }
 }
 
 test "gemma gguf ffn norm maps to pre-feedforward layernorm" {

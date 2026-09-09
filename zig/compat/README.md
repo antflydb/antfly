@@ -140,7 +140,7 @@ For raw HBC engine comparison, use the isolate tools instead of the DB/adapter
 benchmarks.
 
 - Zig isolate: from `antfly/zig`, run
-  `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build hbc-isolate -- --storage-backend lsm --docs 8192 --dims 128 --queries 25 --repeats 10 --k 10`
+  `ZIG_GLOBAL_CACHE_DIR=.zig-global-cache zig build hbc-isolate && ./zig-out/bin/hbc_isolate --storage-backend lsm --docs 8192 --dims 128 --queries 25 --repeats 10 --k 10`
 
 ## Dense Ingest Isolate
 
@@ -148,7 +148,7 @@ For primary-store ingest comparisons against Pebble on the same document shape
 used by `bench/vectors/dense_stack_bench`, run:
 
 - Zig dense ingest:
-  `zig build dense-stack-bench -- --ingest-only --docs 50000 --dims 1536 --batch-size 500 --sync-level write`
+  `zig build dense-stack-bench && ./zig-out/bin/dense_stack_bench --ingest-only --docs 50000 --dims 1536 --batch-size 500 --sync-level write`
 - Pebble dense ingest:
   `cd compat/pebble_overwrite_go && go run ./cmd/dense_ingest --docs 50000 --dims 1536 --batch-size 500`
 

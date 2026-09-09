@@ -3078,7 +3078,7 @@ test "embedding asset gate blocks late readers behind a queued writer" {
         fn run(self: *@This()) void {
             self.gate.lockExclusive();
             self.acquired.store(true, .release);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             self.gate.unlockExclusive();
         }
     };
@@ -3089,7 +3089,7 @@ test "embedding asset gate blocks late readers behind a queued writer" {
     defer if (shared_held) gate.unlockShared();
 
     var writer = Writer{ .gate = &gate };
-    var writer_thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    var writer_thread = try std.testing.io.concurrent(Writer.run, .{&writer});
     var writer_joined = false;
     defer if (!writer_joined) {
         if (shared_held) {
@@ -3097,7 +3097,7 @@ test "embedding asset gate blocks late readers behind a queued writer" {
             shared_held = false;
         }
         writer.release.store(true, .release);
-        writer_thread.join();
+        writer_thread.await(std.testing.io);
     };
 
     var writer_queued = false;
@@ -3107,7 +3107,7 @@ test "embedding asset gate blocks late readers behind a queued writer" {
             break;
         }
         gate.unlockShared();
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!writer_queued) return error.TestTimeout;
 
@@ -3123,13 +3123,13 @@ test "embedding asset gate blocks late readers behind a queued writer" {
             writer_acquired = true;
             break;
         }
-        std.Thread.yield() catch {};
+        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!writer_acquired) return error.TestTimeout;
     try std.testing.expect(!gate.tryLockShared());
 
     writer.release.store(true, .release);
-    writer_thread.join();
+    writer_thread.await(std.testing.io);
     writer_joined = true;
 
     try std.testing.expect(gate.tryLockShared());
@@ -11080,11 +11080,16 @@ test "ModelManager loads split gliner bundle and exposes runtime pipeline" {
         .{ .manager = &manager, .path = dir_path },
         .{ .manager = &manager, .path = dir_path },
     };
-    var threads: [workers.len]std.Thread = undefined;
-    for (&workers, 0..) |*worker, i| {
-        threads[i] = try std.Thread.spawn(.{}, ColdLoadWorker.run, .{worker});
+    var threads: [workers.len]std.Io.Future(void) = undefined;
+    var started_tasks: usize = 0;
+    defer {
+        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
     }
-    for (&threads) |*thread| thread.join();
+    for (&workers, 0..) |*worker, i| {
+        threads[i] = try std.testing.io.concurrent(ColdLoadWorker.run, .{worker});
+        started_tasks += 1;
+    }
+    for (&threads) |*thread| thread.await(std.testing.io);
     for (workers) |worker| {
         try std.testing.expect(worker.err == null);
         try std.testing.expect(worker.model == workers[0].model);

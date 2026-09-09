@@ -328,6 +328,7 @@ pub fn rerankDocumentsWithOptions(
                         .{ local.ptr, alloc, cfg.model, query, documents },
                     );
                 errdefer alloc.free(scores);
+                try validateScores(scores, documents.len);
                 try request_context.check();
                 return scores;
             }
@@ -408,6 +409,7 @@ pub fn rerankDocumentsWithOptions(
                 return err;
             };
             defer result.deinit();
+            try validateScores(result.scores, documents.len);
             try request_context.check();
             return try alloc.dupe(f32, result.scores);
         },
@@ -419,6 +421,7 @@ pub fn rerankDocumentsWithOptions(
             defer quota.release();
             const scores = try rerankCohere(alloc, http, cfg, token, request_context, quota.limiter().observer(0), query, documents);
             errdefer alloc.free(scores);
+            try validateScores(scores, documents.len);
             try request_context.check();
             return scores;
         },
@@ -458,6 +461,7 @@ pub fn rerankDocumentsWithOptions(
                 .cancellation = httpCancellation(request_context.cancellation),
             });
             errdefer alloc.free(scores);
+            try validateScores(scores, documents.len);
             try request_context.check();
             return scores;
         },
@@ -479,6 +483,13 @@ fn maximumDocumentBytes(documents: []const []const u8) usize {
 fn expectRerankerAuthorization(req: httpx.testing_mod.RequestInfo) !void {
     try std.testing.expectEqualStrings("Bearer test-token", req.header("Authorization") orelse "");
     try std.testing.expectEqualStrings("docs", req.header("X-Antfly-Source-Table") orelse "");
+}
+
+fn validateScores(scores: []const f32, document_count: usize) !void {
+    if (scores.len != document_count) return error.InvalidRerankerResponse;
+    for (scores) |score| {
+        if (!std.math.isFinite(score)) return error.InvalidRerankerResponse;
+    }
 }
 
 fn acquireQuota(cfg: Config, options: Options, source: credential_identity.CredentialSourceIdentity, project: []const u8, location: []const u8, policy: provider_limits.Policy) !provider_limits.Handle {

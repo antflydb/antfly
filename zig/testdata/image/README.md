@@ -21,6 +21,8 @@ Directory layout:
   - animated and static GIF fixtures
 - `bmp/`
   - BMP fixtures, only if BMP parity is retained
+- `webp/`
+  - still-image success fixtures, a valid unsupported animation, and malformed inputs
 - `pdf/`
   - product-path fixtures that exercise PDF image decode behavior
 - `manifest.zon`
@@ -42,3 +44,15 @@ codec lane is implemented or broadened.
 For broader upstream sweeps that should not bloat the checked-in corpus, use the
 opt-in harnesses in [`../../lib/image/e2e`](../../lib/image/e2e), starting with
 the `libjpeg-turbo/seed-corpora` JPEG runner.
+
+Regenerate the synthetic WebP fixtures from the `zig/` directory:
+
+```sh
+zig run lib/image/src/webp_fixture_gen.zig
+```
+
+The generator validates expected decode outcomes before writing rejected fixtures.
+`webp/unsupported/animated-1x1.webp` has complete animation control and a lossless
+frame. `webp/invalid/empty-animation-control.webp` preserves the malformed empty
+animation-control case. Both are checked by ordinary image tests and
+`zig build lib-image-conformance`.

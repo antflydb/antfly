@@ -21,7 +21,7 @@ const manifest_types = @import("types.zig");
 const search_sources = @import("../search_sources.zig");
 
 pub const wire_magic = "AFSM";
-pub const wire_version: u16 = 12;
+pub const wire_version: u16 = 13;
 
 const header_size_v2 = 4 + 2 + 4 + 8 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4;
 const header_size_v3 = header_size_v2 + 1 + 1;
@@ -33,6 +33,7 @@ const header_size_v8 = header_size_v7 + policy_size;
 const header_size_v10 = header_size_v8 + 8;
 const header_size_v11 = header_size_v10 + 1;
 const header_size_v12 = header_size_v11 + 4;
+const header_size_v13 = header_size_v12 + 1 + 8;
 
 fn encodePolicy(buf: []u8, policy: catalog_types.NamespacePolicy) void {
     var pos: usize = 0;
@@ -203,7 +204,7 @@ pub fn encodeAlloc(alloc: Allocator, manifest: manifest_types.Manifest) ![]u8 {
         @intCast(baseSourceEncodedSize(base_source))
     else
         0;
-    var size: usize = header_size_v12 + manifest.namespace.len +
+    var size: usize = header_size_v13 + manifest.namespace.len +
         manifest.stats.schema_json.len +
         manifest.stats.read_schema_json.len +
         manifest.stats.indexes_json.len +
@@ -260,6 +261,10 @@ pub fn encodeAlloc(alloc: Allocator, manifest: manifest_types.Manifest) ![]u8 {
     pos += policy_size;
     std.mem.writeInt(u32, buf[pos..][0..4], base_source_len, .little);
     pos += 4;
+    buf[pos] = @intFromBool(manifest.publication_lineage_tracked);
+    pos += 1;
+    std.mem.writeInt(u64, buf[pos..][0..8], manifest.publication_parent_version orelse 0, .little);
+    pos += 8;
 
     @memcpy(buf[pos..][0..manifest.namespace.len], manifest.namespace);
     pos += manifest.namespace.len;
@@ -410,7 +415,7 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
 
     const version = std.mem.readInt(u16, data[pos..][0..2], .little);
     pos += 2;
-    if (version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8 and version != 10 and version != 11 and version != wire_version) return error.UnsupportedManifestVersion;
+    if (version != 2 and version != 3 and version != 4 and version != 5 and version != 6 and version != 7 and version != 8 and version != 10 and version != 11 and version != 12 and version != wire_version) return error.UnsupportedManifestVersion;
 
     const namespace_len = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += 4;
@@ -504,6 +509,26 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
         pos += 4;
         break :blk value;
     } else 0;
+    const publication_lineage_tracked = if (version >= 13) blk: {
+        if (pos + 1 > data.len) return error.InvalidManifest;
+        const value = switch (data[pos]) {
+            0 => false,
+            1 => true,
+            else => return error.InvalidManifest,
+        };
+        pos += 1;
+        break :blk value;
+    } else false;
+    const publication_parent_version = if (version >= 13) blk: {
+        if (pos + 8 > data.len) return error.InvalidManifest;
+        const value = std.mem.readInt(u64, data[pos..][0..8], .little);
+        pos += 8;
+        break :blk if (value == 0) null else value;
+    } else null;
+    if (!publication_lineage_tracked and publication_parent_version != null) return error.InvalidManifest;
+    if (publication_parent_version) |parent| {
+        if (parent >= manifest_version) return error.InvalidManifest;
+    }
 
     if (pos + namespace_len > data.len) return error.InvalidManifest;
     const namespace = try alloc.dupe(u8, data[pos .. pos + namespace_len]);
@@ -796,6 +821,8 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
         .built_at_ns = built_at_ns,
         .wal_start_lsn = wal_start_lsn,
         .wal_end_lsn = wal_end_lsn,
+        .publication_lineage_tracked = publication_lineage_tracked,
+        .publication_parent_version = publication_parent_version,
         .base_source = base_source,
         .stats = .{
             .document_count = document_count,
@@ -953,7 +980,7 @@ fn decodeBaseSourceAlloc(alloc: Allocator, data: []const u8) !manifest_types.Bas
     return descriptor;
 }
 
-test "manifest codec round-trips deterministically" {
+test "serverless manifest codec round-trips deterministically" {
     const alloc = std.testing.allocator;
     var manifest = manifest_types.Manifest{
         .namespace = try alloc.dupe(u8, "products"),
@@ -961,6 +988,8 @@ test "manifest codec round-trips deterministically" {
         .built_at_ns = 123456,
         .wal_start_lsn = 1000,
         .wal_end_lsn = 1050,
+        .publication_lineage_tracked = true,
+        .publication_parent_version = 40,
         .stats = .{
             .document_count = 99,
             .document_base_version = 42,
@@ -1014,6 +1043,8 @@ test "manifest codec round-trips deterministically" {
 
     try std.testing.expectEqualStrings("products", decoded.namespace);
     try std.testing.expectEqual(@as(u64, 42), decoded.version);
+    try std.testing.expect(decoded.publication_lineage_tracked);
+    try std.testing.expectEqual(@as(?u64, 40), decoded.publication_parent_version);
     try std.testing.expectEqual(@as(u64, 99), decoded.stats.document_count);
     try std.testing.expectEqual(@as(u64, 42), decoded.stats.document_base_version);
     try std.testing.expectEqual(catalog_types.DocumentPublishMode.head_republish, decoded.stats.document_publish_mode);

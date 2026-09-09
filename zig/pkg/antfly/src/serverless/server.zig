@@ -134,7 +134,7 @@ pub const ServerlessServer = struct {
 
     pub fn stopWithDeadline(self: *ServerlessServer, deadline: runtime_lifecycle.ShutdownDeadline) void {
         self.stopListenerWithDeadline(deadline);
-        self.stack.runtime.stop();
+        self.stack.runtime.stopWithDeadline(deadline);
     }
 
     pub fn baseUri(self: *ServerlessServer, alloc: std.mem.Allocator) ![]u8 {
@@ -170,6 +170,10 @@ pub const ServerlessServer = struct {
 
     pub fn listenerFailure(self: *const ServerlessServer) ?anyerror {
         return if (self.listener_task) |*task| task.runtimeFailure() else null;
+    }
+
+    pub fn runtimeFailure(self: *ServerlessServer) ?anyerror {
+        return self.stack.runtime.runtimeFailure();
     }
 
     pub fn httpRuntime(self: *ServerlessServer) *httpx.HttpRuntime {

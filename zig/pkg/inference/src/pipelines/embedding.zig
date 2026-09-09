@@ -3106,11 +3106,7 @@ test "resident masked mean pooling uses backend primitives" {
         .resident_weights = .empty,
         .lazy_weights = .empty,
     };
-    defer {
-        weight_store.resident_weights.deinit(allocator);
-        weight_store.lazy_weights.deinit(allocator);
-        native_mod.deinitPrefetchQueue(&weight_store);
-    }
+    defer weight_store.deinitOwned();
     var compute = native_mod.NativeCompute.init(allocator, &weight_store, null);
     defer compute.deinit();
     var cb = compute.computeBackend();
@@ -3148,11 +3144,7 @@ test "resident text pooling handles flattened batch sequence hidden states" {
         .resident_weights = .empty,
         .lazy_weights = .empty,
     };
-    defer {
-        weight_store.resident_weights.deinit(allocator);
-        weight_store.lazy_weights.deinit(allocator);
-        native_mod.deinitPrefetchQueue(&weight_store);
-    }
+    defer weight_store.deinitOwned();
     var compute = native_mod.NativeCompute.init(allocator, &weight_store, null);
     defer compute.deinit();
     var cb = compute.computeBackend();
@@ -3328,11 +3320,7 @@ test "resident projected input selection supports 3d cls pooling" {
         .resident_weights = .empty,
         .lazy_weights = .empty,
     };
-    defer {
-        weight_store.resident_weights.deinit(allocator);
-        weight_store.lazy_weights.deinit(allocator);
-        native_mod.deinitPrefetchQueue(&weight_store);
-    }
+    defer weight_store.deinitOwned();
     var compute = native_mod.NativeCompute.init(allocator, &weight_store, null);
     defer compute.deinit();
     var cb = compute.computeBackend();
@@ -3383,11 +3371,7 @@ test "resident 2d embedding extraction normalizes before host readback" {
         .resident_weights = .empty,
         .lazy_weights = .empty,
     };
-    defer {
-        weight_store.resident_weights.deinit(allocator);
-        weight_store.lazy_weights.deinit(allocator);
-        native_mod.deinitPrefetchQueue(&weight_store);
-    }
+    defer weight_store.deinitOwned();
     var compute = native_mod.NativeCompute.init(allocator, &weight_store, null);
     defer compute.deinit();
     var cb = compute.computeBackend();

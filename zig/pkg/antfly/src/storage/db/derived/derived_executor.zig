@@ -23,161 +23,38 @@ const runtime_backend = @import("../../runtime_backend.zig");
 const background_runtime_mod = @import("../../background_runtime.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
 const types = @import("../types.zig");
+const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
 
 pub const VisibilityWait = struct {
     cancellation: types.CancellationToken = .none,
     deadline_ns: ?u64 = null,
+    clock: ?platform_clock.Clock = null,
 
     pub fn check(self: @This()) !void {
         if (self.cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
         if (self.deadline_ns) |deadline_ns| {
-            if (platform_time.monotonicNs() >= deadline_ns) return error.EnrichmentWaitTimeout;
+            const now_ns = if (self.clock) |clock|
+                clock.nowRealtimeNs()
+            else
+                platform_time.monotonicNs();
+            if (now_ns >= deadline_ns) return error.EnrichmentWaitTimeout;
         }
     }
 };
 
-const ApplyFnType = *const fn (ctx: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) anyerror!bool;
-const PersistFnType = *const fn (ctx: *anyopaque, index_name: []const u8, sequence: u64, force: bool) anyerror!bool;
-const TruncateFnType = *const fn (ctx: *anyopaque, sequence: u64) anyerror!void;
-const BeginCatchUpFnType = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) anyerror!void;
-const FinishCatchUpFnType = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, success: bool) anyerror!void;
-const CanAdvanceToTargetFnType = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) anyerror!bool;
-const AppliedSequenceAdvancedFnType = *const fn (ctx: *anyopaque, index_name: []const u8, applied_sequence: u64) void;
-
-const async_runtime_mod = if (builtin.os.tag == .freestanding) struct {
-    pub const RuntimeError = error{AsyncWorkerFailed};
-    pub const ApplyFn = ApplyFnType;
-    pub const PersistFn = PersistFnType;
-    pub const TruncateFn = TruncateFnType;
-    pub const BeginCatchUpFn = BeginCatchUpFnType;
-    pub const FinishCatchUpFn = FinishCatchUpFnType;
-    pub const CanAdvanceToTargetFn = CanAdvanceToTargetFnType;
-    pub const AppliedSequenceAdvancedFn = AppliedSequenceAdvancedFnType;
-
-    pub const DerivedRuntime = struct {
-        pub fn init(
-            alloc: Allocator,
-            replay_source: replay_source_mod.Source,
-            ctx: *anyopaque,
-            apply_fn: ApplyFnType,
-            persist_fn: PersistFnType,
-            truncate_fn: TruncateFnType,
-            begin_catch_up_fn: ?BeginCatchUpFnType,
-            finish_catch_up_fn: ?FinishCatchUpFnType,
-            can_advance_to_target_fn: ?CanAdvanceToTargetFnType,
-            applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFnType,
-            resource_manager: ?*resource_manager_mod.ResourceManager,
-        ) @This() {
-            _ = alloc;
-            _ = replay_source;
-            _ = ctx;
-            _ = apply_fn;
-            _ = persist_fn;
-            _ = truncate_fn;
-            _ = begin_catch_up_fn;
-            _ = finish_catch_up_fn;
-            _ = can_advance_to_target_fn;
-            _ = applied_sequence_advanced_fn;
-            _ = resource_manager;
-            return .{};
-        }
-
-        pub fn deinit(self: *@This()) void {
-            self.* = undefined;
-        }
-
-        pub fn hasWorkers(_: *@This()) bool {
-            return false;
-        }
-
-        pub fn failIfUnhealthy(_: *@This()) !void {}
-
-        pub fn addWorker(self: *@This(), name: []const u8, kind: index_manager_mod.ManagedIndexRef, applied_sequence: u64) !void {
-            _ = self;
-            _ = name;
-            _ = kind;
-            _ = applied_sequence;
-            return error.UnsupportedPlatform;
-        }
-
-        pub fn removeWorker(self: *@This(), name: []const u8) void {
-            _ = self;
-            _ = name;
-        }
-
-        pub fn appliedSequence(self: *@This(), name: []const u8) ?u64 {
-            _ = self;
-            _ = name;
-            return null;
-        }
-
-        pub fn snapshotStats(_: *@This()) types.DerivedWorkerStats {
-            return .{};
-        }
-
-        pub fn notifySequence(self: *@This(), sequence: u64) void {
-            _ = self;
-            _ = sequence;
-        }
-
-        pub fn notifyIndexes(self: *@This(), sequence: u64, index_names: []const []const u8) void {
-            _ = self;
-            _ = sequence;
-            _ = index_names;
-        }
-
-        pub fn notifyExceptKind(self: *@This(), sequence: u64, excluded_kind: types.IndexKind) void {
-            _ = self;
-            _ = sequence;
-            _ = excluded_kind;
-        }
-
-        pub fn forceSequence(self: *@This(), sequence: u64) void {
-            _ = self;
-            _ = sequence;
-        }
-
-        pub fn trackBacklogBytes(self: *@This(), sequence: u64, bytes: u64) !void {
-            _ = self;
-            _ = sequence;
-            _ = bytes;
-        }
-
-        pub fn backlogThrottleTargetSequence(_: *@This()) ?u64 {
-            return null;
-        }
-
-        pub fn releaseBacklogThrough(self: *@This(), sequence: u64) void {
-            _ = self;
-            _ = sequence;
-        }
-
-        pub fn waitForAll(self: *@This(), sequence: u64) !void {
-            _ = self;
-            _ = sequence;
-            return error.UnsupportedPlatform;
-        }
-
-        pub fn waitForIndexes(self: *@This(), sequence: u64, index_names: []const []const u8) !void {
-            _ = self;
-            _ = sequence;
-            _ = index_names;
-            return error.UnsupportedPlatform;
-        }
-    };
-} else @import("async_runtime.zig");
+const runtime_types = @import("runtime_types.zig");
 const derived_worker = @import("derived_worker.zig");
 const io_threaded_runtime_mod = @import("io_threaded_runtime.zig");
 
-pub const ApplyFn = async_runtime_mod.ApplyFn;
-pub const PersistFn = async_runtime_mod.PersistFn;
-pub const TruncateFn = async_runtime_mod.TruncateFn;
-pub const BeginCatchUpFn = async_runtime_mod.BeginCatchUpFn;
-pub const FinishCatchUpFn = async_runtime_mod.FinishCatchUpFn;
-pub const CanAdvanceToTargetFn = async_runtime_mod.CanAdvanceToTargetFn;
-pub const AppliedSequenceAdvancedFn = async_runtime_mod.AppliedSequenceAdvancedFn;
-pub const RuntimeError = async_runtime_mod.RuntimeError;
+pub const ApplyFn = runtime_types.ApplyFn;
+pub const PersistFn = runtime_types.PersistFn;
+pub const TruncateFn = runtime_types.TruncateFn;
+pub const BeginCatchUpFn = runtime_types.BeginCatchUpFn;
+pub const FinishCatchUpFn = runtime_types.FinishCatchUpFn;
+pub const CanAdvanceToTargetFn = runtime_types.CanAdvanceToTargetFn;
+pub const AppliedSequenceAdvancedFn = runtime_types.AppliedSequenceAdvancedFn;
+pub const RuntimeError = runtime_types.RuntimeError;
 
 pub const Backend = runtime_backend.Backend;
 

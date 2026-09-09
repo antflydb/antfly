@@ -2472,18 +2472,18 @@ test "delayed replicated restore refresh cannot regress a running job" {
 
     persistence.get_gate.store(1, .release);
     var worker: LoadWorker = .{ .store = &store, .job_id = queued_parsed.value.job_id };
-    const thread = try std.Thread.spawn(.{}, LoadWorker.run, .{&worker});
+    var thread = try std.testing.io.concurrent(LoadWorker.run, .{&worker});
     var joined = false;
     defer {
         persistence.get_gate.store(3, .release);
-        if (!joined) thread.join();
+        if (!joined) thread.await(std.testing.io);
     }
     while (persistence.get_gate.load(.acquire) != 2) std.atomic.spinLoopHint();
 
     const running = (try store.begin(std.testing.allocator, queued_parsed.value.job_id)).?;
     defer std.testing.allocator.free(running);
     persistence.get_gate.store(3, .release);
-    thread.join();
+    thread.await(std.testing.io);
     joined = true;
 
     try std.testing.expect(worker.err == null);

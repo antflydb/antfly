@@ -108,15 +108,11 @@ pub const numeric_response = @import("util/numeric_response.zig");
 
 pub const testing_mod = @import("testing.zig");
 
-pub const executor = @import("concurrency/executor.zig");
 pub const concurrency = @import("concurrency/pool.zig");
 
 pub const RequestSpec = concurrency.RequestSpec;
 pub const RequestResult = concurrency.RequestResult;
 pub const BatchBuilder = concurrency.BatchBuilder;
-
-pub const Executor = executor.Executor;
-pub const Task = executor.Task;
 
 pub const Method = types.Method;
 pub const Version = types.Version;
@@ -218,6 +214,7 @@ pub const Server = server_mod.Server;
 pub const ListenerTask = server_mod.Server.ListenerTask;
 pub const ServerConfig = server_mod.ServerConfig;
 pub const H1DisconnectCancellation = server_mod.H1DisconnectCancellation;
+pub const H1DisconnectProbe = server_mod.H1DisconnectProbe;
 pub const HttpRuntime = http_runtime.HttpRuntime;
 pub const SharedBodyBudget = @import("protocol/body_budget.zig").SharedBodyBudget;
 pub const Context = server_mod.Context;

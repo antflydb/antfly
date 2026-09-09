@@ -4995,7 +4995,7 @@ test "transaction session registry renews and releases separate lease records" {
     const initial_status = (try registry.getStatus(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
     try std.testing.expect(initial_status.lease_expires_at > 0);
 
-    std.Thread.yield() catch {};
+    std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     _ = (try registry.createSavepoint(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
 
     const renewed_status = (try registry.getStatus(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;

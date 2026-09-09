@@ -68,8 +68,9 @@ tags:
       Antfly provides auto-generated SDKs from the OpenAPI specification:
 
       - **Go**: `github.com/antflydb/antfly/go/pkg/sdk`
-      - **TypeScript**: `@antflydb/antfly-ts` (npm)
-      - **Python**: `antfly-python` (PyPI)
+      - **TypeScript**: `@antfly/sdk` (npm)
+      - **Python**: `antfly-sdk` (PyPI)
+      - **Rust**: `antfly-sdk` (crates.io)
 
       All SDKs are type-safe and kept in sync with the API through code generation.
 
@@ -1639,6 +1640,7 @@ components:
             - doc_identity_unavailable
             - read_requires_primary
             - standby_read_unavailable
+            - distributed_query_unavailable
             - storage_read_temporarily_unavailable
             - index_rebuilding
             - query_embedding_temporarily_unavailable
@@ -6353,13 +6355,25 @@ components:
 
     SSEError:
       type: object
-      description: Emitted when an error occurs during retrieval
-      required:
-        - error
+      description: Terminal retrieval failure. Capacity events carry the complete InferenceCapacityError envelope, including message, reason, retryable and retry_after_ms; generic failures may carry only error.
+      required: [error]
       properties:
         error:
           type: string
-          description: Error message
+          description: Error message or stable machine-readable code.
+        message:
+          type: string
+          description: Human-readable error description.
+        reason:
+          type: string
+          enum: [inference_capacity, inference_admission]
+        retryable:
+          type: boolean
+          description: Whether the failure is temporary and the request may be retried.
+        retry_after_ms:
+          type: integer
+          minimum: 1
+          description: Minimum retry delay in milliseconds.
 
     PruneStats:
       type: object
@@ -9266,6 +9280,21 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/QueryConflictError"
+    AgentTemporarilyUnavailable:
+      description: Agent query dependencies or inference capacity are temporarily unavailable.
+      headers:
+        Retry-After:
+          required: true
+          description: Minimum retry delay in seconds.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: "#/components/schemas/QueryTemporarilyUnavailableError"
+              - $ref: "#/components/schemas/InferenceCapacityError"
     QueryTemporarilyUnavailable:
       description: A query dependency or read path is temporarily unavailable and the request is safe to retry
       headers:
@@ -10467,6 +10496,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "503":
+          $ref: "#/components/responses/AgentTemporarilyUnavailable"
         "500":
           description: Internal server error (e.g., LLM call failed)
           content:
@@ -10546,7 +10577,7 @@ paths:
         "502":
           $ref: "#/components/responses/QueryBadGateway"
         "503":
-          $ref: "#/components/responses/QueryTemporarilyUnavailable"
+          $ref: "#/components/responses/AgentTemporarilyUnavailable"
         "504":
           $ref: "#/components/responses/QueryGatewayTimeout"
         "500":

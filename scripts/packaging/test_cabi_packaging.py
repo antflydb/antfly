@@ -105,6 +105,33 @@ class CompletionPackagingTests(unittest.TestCase):
 
 
 class CAbiPackagingTests(unittest.TestCase):
+    def test_release_requires_native_homebrew_validation(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github" / "workflows" / "antfly-artifact-build.yml"
+        ).read_text()
+        job = workflow_job(workflow, "test-macos-homebrew")
+        self.assertIn("runs-on: macos-15", job)
+        self.assertIn("scripts/packaging/test_homebrew_install.sh", job)
+        self.assertIn(
+            "- test-macos-homebrew", workflow_job(workflow, "release-request")
+        )
+
+    def test_homebrew_job_provisions_packaging_toolchains(self) -> None:
+        workflow = (
+            REPO_ROOT / ".github" / "workflows" / "antfly-release.yml"
+        ).read_text()
+        job = workflow_job(workflow, "prepare-zig-homebrew")
+        bootstrap = job.split("      - name: Render formula", 1)[0]
+        self.assertIn("uses: actions/setup-python@", bootstrap)
+        self.assertIn("steps.toolchain.outputs.python_build", bootstrap)
+        self.assertIn("uses: cachix/install-nix-action@", bootstrap)
+        self.assertIn("steps.toolchain.outputs.zig_nixpkgs_revision", bootstrap)
+        self.assertIn("steps.toolchain.outputs.zig_nix_attribute", bootstrap)
+        self.assertIn("steps.toolchain.outputs.zig_version", bootstrap)
+        self.assertIn("nix-build '<nixpkgs>' -A \"$ZIG_NIX_ATTRIBUTE\"", bootstrap)
+        self.assertIn('echo "$zig_path/bin" >> "$GITHUB_PATH"', bootstrap)
+        self.assertIn("grep -q 'dynamically linked'", bootstrap)
+
     def test_linux_abi_release_contract_stays_consistent(self) -> None:
         installer = (REPO_ROOT / "scripts" / "install.sh").read_text()
         minimum_match = re.search(
@@ -606,7 +633,10 @@ class CAbiPackagingTests(unittest.TestCase):
                 "#!/bin/sh\n"
                 'case "$*" in\n'
                 "  *npm-integrity*) printf '%s\\n' \"${FAKE_NPM_INTEGRITY:-}\" ;;\n"
-                "  *npm-tag*) printf '%s\\n' \"${FAKE_NPM_TAG:-}\" ;;\n"
+                "  *npm-tag*)\n"
+                '    if [ -n "${FAKE_NPM_TAG_FILE:-}" ]; then\n'
+                '      cat "$FAKE_NPM_TAG_FILE"\n'
+                "    else printf '%s\\n' \"${FAKE_NPM_TAG:-}\"; fi ;;\n"
                 "  *) exit 2 ;;\n"
                 "esac\n"
             )
@@ -656,6 +686,34 @@ class CAbiPackagingTests(unittest.TestCase):
             env["FAKE_NPM_TAG"] = "1.2.3"
             subprocess.run(command, check=True, env=env, capture_output=True, text=True)
             self.assertIn("publish", log.read_text())
+
+            # Model a successful publish whose tag is initially stale, then
+            # becomes visible on the next read. No real waits or registry writes.
+            tag_file = root / "tag"
+            tag_file.write_text("1.2.2\n")
+            env["FAKE_NPM_TAG_FILE"] = str(tag_file)
+            sleep = fake_bin / "sleep"
+            sleep.write_text('#!/bin/sh\nprintf "1.2.3\\n" > "$FAKE_NPM_TAG_FILE"\n')
+            sleep.chmod(0o755)
+            log.write_text("")
+            propagated = subprocess.run(
+                command, check=True, env=env, capture_output=True, text=True
+            )
+            self.assertIn("waiting for npm dist-tag", propagated.stderr)
+            self.assertEqual(len(log.read_text().splitlines()), 1)
+
+            # A tag that never converges still fails after a bounded wait and
+            # never triggers another publish or an unauthorized dist-tag repair.
+            tag_file.write_text("1.2.2\n")
+            sleep.write_text("#!/bin/sh\nexit 0\n")
+            log.write_text("")
+            stale = subprocess.run(
+                command, env=env, capture_output=True, text=True, check=False
+            )
+            self.assertNotEqual(stale.returncode, 0)
+            self.assertIn("after 30 checks", stale.stderr)
+            self.assertEqual(stale.stderr.count("waiting for npm dist-tag"), 29)
+            self.assertEqual(len(log.read_text().splitlines()), 1)
 
     def test_python_and_npm_packages_preserve_cabi_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -756,6 +814,9 @@ class CAbiPackagingTests(unittest.TestCase):
             )
 
             rendered = formula.read_text()
+            self.assertIn('version "1.2.3"', rendered)
+            self.assertIn("version_scheme 1", rendered)
+            self.assertIn('system "./smoke"', rendered)
             self.assertIn("antfly_1.2.3_Darwin_arm64.tar.gz", rendered)
             self.assertIn("antfly_1.2.3_Linux_arm64_gnu.tar.gz", rendered)
             self.assertIn("antfly_1.2.3_Linux_x86_64_gnu.tar.gz", rendered)

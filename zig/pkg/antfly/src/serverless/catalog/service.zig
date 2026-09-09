@@ -32,6 +32,7 @@ const enrichment_pipeline = @import("../enrichment/pipeline.zig");
 const api_codec = @import("../api/codec.zig");
 const api_types = @import("../api/types.zig");
 const search_sources = @import("../search_sources.zig");
+const maintenance_cancellation = @import("../maintenance_cancellation.zig");
 const vector_segment_mod = @import("../vector_segment/mod.zig");
 const vector_index = @import("../build/vector_index.zig");
 const tables_api = @import("../../api/tables.zig");
@@ -274,20 +275,22 @@ pub const CatalogService = struct {
             manifest.wal_end_lsn
         else
             0;
-        const materialized_search_sources: search_sources.PublishedSearchSources = if (published_head.manifest) |manifest|
+        var materialized_search_sources: search_sources.PublishedSearchSources = if (published_head.manifest) |manifest|
             try search_sources.clonePublishedSearchSourcesAlloc(
                 self.alloc,
                 manifest.stats.published_search_sources,
             )
         else
             .{};
-        const materialized_derived_outputs: search_sources.MaterializedDerivedOutputs = if (published_head.manifest) |manifest|
+        errdefer search_sources.deinitPublishedSearchSources(self.alloc, &materialized_search_sources);
+        var materialized_derived_outputs: search_sources.MaterializedDerivedOutputs = if (published_head.manifest) |manifest|
             try search_sources.cloneMaterializedDerivedOutputsAlloc(
                 self.alloc,
                 manifest.stats.derived_outputs,
             )
         else
             .{};
+        errdefer search_sources.deinitMaterializedDerivedOutputs(self.alloc, &materialized_derived_outputs);
         const latest_wal_lsn = try self.wal.latestLsn(namespace);
         const pending_records = latest_wal_lsn -| published_wal_end_lsn;
         const versions = try self.manifests.listVersionsAlloc(namespace);
@@ -337,11 +340,19 @@ pub const CatalogService = struct {
         const enrichment_completion = try enrichmentCompletionAlloc(self.alloc, self.artifacts, self.manifests, namespace, head_version, effective_policy);
         const pipeline = enrichment_pipeline.builtinPipelineForPolicy(effective_policy);
         const enrichment_active_stage = chooseActiveEnrichmentStage(pipeline, enrichment_completion);
-        const enrichment_head_version = if (enrichment_active_stage) |stage|
+        const atomic_enrichment_progress = if (enrichment_active_stage) |stage|
+            try self.progress.getEnrichmentStageProgress(namespace, stage)
+        else
+            null;
+        const enrichment_head_version = if (atomic_enrichment_progress) |value|
+            value.head_version
+        else if (enrichment_active_stage) |stage|
             try self.progress.getEnrichmentStageHeadVersion(namespace, stage)
         else
             null;
-        const enrichment_doc_offset = if (enrichment_active_stage) |stage|
+        const enrichment_doc_offset = if (atomic_enrichment_progress) |value|
+            value.doc_offset
+        else if (enrichment_active_stage) |stage|
             (try self.progress.getEnrichmentStageDocOffset(namespace, stage)) orelse 0
         else
             0;
@@ -472,12 +483,40 @@ pub const CatalogService = struct {
             !head_republish_recommended and
             (plan.artifact_actions.any() or plan.derived_output_actions.any());
 
+        const owned_namespace = try self.alloc.dupe(u8, namespace);
+        errdefer self.alloc.free(owned_namespace);
+        var published_search_sources = try search_sources.clonePublishedSearchSourcesAlloc(
+            self.alloc,
+            plan.targets.published_search_sources,
+        );
+        errdefer search_sources.deinitPublishedSearchSources(self.alloc, &published_search_sources);
+        const owned_index_config_actions = try cloneIndexConfigPublicationStatusesAlloc(self.alloc, index_config_actions);
+        errdefer freeIndexConfigPublicationStatuses(self.alloc, owned_index_config_actions);
+        const head_full_text_index_actions = try cloneCatalogFullTextIndexActionsAlloc(self.alloc, head_actions.full_text_index_actions);
+        errdefer freeCatalogActions(self.alloc, head_full_text_index_actions);
+        const head_vector_index_actions = try cloneCatalogNamedArtifactActionsAlloc(self.alloc, head_actions.vector_index_actions);
+        errdefer freeCatalogActions(self.alloc, head_vector_index_actions);
+        const head_sparse_index_actions = try cloneCatalogNamedArtifactActionsAlloc(self.alloc, head_actions.sparse_index_actions);
+        errdefer freeCatalogActions(self.alloc, head_sparse_index_actions);
+        const head_graph_index_actions = try cloneCatalogNamedArtifactActionsAlloc(self.alloc, head_actions.graph_index_actions);
+        errdefer freeCatalogActions(self.alloc, head_graph_index_actions);
+        const full_text_index_actions = try cloneFullTextIndexActionsAlloc(self.alloc, plan.full_text_index_actions);
+        errdefer freeCatalogActions(self.alloc, full_text_index_actions);
+        const vector_index_actions = try cloneNamedArtifactActionsAlloc(self.alloc, plan.vector_index_actions);
+        errdefer freeCatalogActions(self.alloc, vector_index_actions);
+        const sparse_index_actions = try cloneNamedArtifactActionsAlloc(self.alloc, plan.sparse_index_actions);
+        errdefer freeCatalogActions(self.alloc, sparse_index_actions);
+        const graph_index_actions = try cloneNamedArtifactActionsAlloc(self.alloc, plan.graph_index_actions);
+        errdefer freeCatalogActions(self.alloc, graph_index_actions);
+        const vector_compaction_driver_index_name = if (vector_compaction.driver_index_name) |value|
+            try self.alloc.dupe(u8, value)
+        else
+            null;
+        errdefer if (vector_compaction_driver_index_name) |value| self.alloc.free(value);
+
         return .{
-            .namespace = try self.alloc.dupe(u8, namespace),
-            .published_search_sources = try search_sources.clonePublishedSearchSourcesAlloc(
-                self.alloc,
-                plan.targets.published_search_sources,
-            ),
+            .namespace = owned_namespace,
+            .published_search_sources = published_search_sources,
             .materialized_search_sources = materialized_search_sources,
             .materialized_derived_outputs = materialized_derived_outputs,
             .head_version = head_version,
@@ -496,10 +535,10 @@ pub const CatalogService = struct {
             .pending_materialization_rebuild = pending_materialization_rebuild,
             .pending_materialization_families = pending_materialization_families,
             .head_artifact_actions = head_actions.artifact_actions,
-            .head_full_text_index_actions = try cloneCatalogFullTextIndexActionsAlloc(self.alloc, head_actions.full_text_index_actions),
-            .head_vector_index_actions = try cloneCatalogNamedArtifactActionsAlloc(self.alloc, head_actions.vector_index_actions),
-            .head_sparse_index_actions = try cloneCatalogNamedArtifactActionsAlloc(self.alloc, head_actions.sparse_index_actions),
-            .head_graph_index_actions = try cloneCatalogNamedArtifactActionsAlloc(self.alloc, head_actions.graph_index_actions),
+            .head_full_text_index_actions = head_full_text_index_actions,
+            .head_vector_index_actions = head_vector_index_actions,
+            .head_sparse_index_actions = head_sparse_index_actions,
+            .head_graph_index_actions = head_graph_index_actions,
             .head_derived_output_actions = head_actions.derived_output_actions,
             .artifact_actions = .{
                 .document_segment = @enumFromInt(@intFromEnum(plan.artifact_actions.document_segment)),
@@ -508,11 +547,11 @@ pub const CatalogService = struct {
                 .sparse_vector = @enumFromInt(@intFromEnum(plan.artifact_actions.sparse_vector)),
                 .graph = @enumFromInt(@intFromEnum(plan.artifact_actions.graph)),
             },
-            .index_config_actions = try cloneIndexConfigPublicationStatusesAlloc(self.alloc, index_config_actions),
-            .full_text_index_actions = try cloneFullTextIndexActionsAlloc(self.alloc, plan.full_text_index_actions),
-            .vector_index_actions = try cloneNamedArtifactActionsAlloc(self.alloc, plan.vector_index_actions),
-            .sparse_index_actions = try cloneNamedArtifactActionsAlloc(self.alloc, plan.sparse_index_actions),
-            .graph_index_actions = try cloneNamedArtifactActionsAlloc(self.alloc, plan.graph_index_actions),
+            .index_config_actions = owned_index_config_actions,
+            .full_text_index_actions = full_text_index_actions,
+            .vector_index_actions = vector_index_actions,
+            .sparse_index_actions = sparse_index_actions,
+            .graph_index_actions = graph_index_actions,
             .derived_output_actions = .{
                 .chunk_preview = @enumFromInt(@intFromEnum(plan.derived_output_actions.chunk_preview)),
                 .chunk_embeddings = @enumFromInt(@intFromEnum(plan.derived_output_actions.chunk_embeddings)),
@@ -526,7 +565,7 @@ pub const CatalogService = struct {
             .mutation_tail_compaction_recommended = mutation_tail_compaction_recommended,
             .vector_compaction_recommended = vector_compaction_recommended,
             .mutation_tail_resolution = mutation_tail_resolution,
-            .vector_compaction_driver_index_name = if (vector_compaction.driver_index_name) |value| try self.alloc.dupe(u8, value) else null,
+            .vector_compaction_driver_index_name = vector_compaction_driver_index_name,
             .vector_compaction_distance_metric = vector_compaction.metric,
             .vector_cluster_count = vector_compaction.cluster_count,
             .vector_target_cluster_count = vector_target_cluster_count,
@@ -673,13 +712,32 @@ pub const CatalogService = struct {
     }
 
     pub fn buildNamespace(self: *CatalogService, namespace: []const u8) !builder_mod.BuildResult {
+        return try self.buildNamespaceGuarded(namespace, null);
+    }
+
+    pub fn buildNamespaceGuarded(
+        self: *CatalogService,
+        namespace: []const u8,
+        publication_guard: ?@import("../build/work_lease.zig").PublicationGuard,
+    ) !builder_mod.BuildResult {
+        return try self.buildNamespaceGuardedUntil(namespace, publication_guard, null);
+    }
+
+    pub fn buildNamespaceGuardedUntil(
+        self: *CatalogService,
+        namespace: []const u8,
+        publication_guard: ?@import("../build/work_lease.zig").PublicationGuard,
+        cancellation: ?maintenance_cancellation.Token,
+    ) !builder_mod.BuildResult {
         const policy = self.getPolicy(namespace) catch catalog_types.NamespacePolicy{};
         var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .publication);
         defer plan.deinit(self.alloc);
-        return try self.builder.publishNamespaceWithMetricAndPlan(
+        return try self.builder.publishNamespaceWithMetricAndPlanGuardedUntil(
             namespace,
             policy.vector_distance_metric,
             plan,
+            publication_guard,
+            cancellation,
         );
     }
 
@@ -1178,6 +1236,11 @@ fn freeNamedArtifactActions(alloc: Allocator, items: []publication_plan.NamedArt
 }
 
 fn freeIndexConfigPublicationStatuses(alloc: Allocator, items: []catalog_types.IndexConfigPublicationStatus) void {
+    for (items) |*item| item.deinit(alloc);
+    if (items.len > 0) alloc.free(items);
+}
+
+fn freeCatalogActions(alloc: Allocator, items: anytype) void {
     for (items) |*item| item.deinit(alloc);
     if (items.len > 0) alloc.free(items);
 }

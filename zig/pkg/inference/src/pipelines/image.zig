@@ -428,6 +428,7 @@ test "clip preprocessing encoded production path matches full tensor contract" {
     const alloc = std.testing.allocator;
     const target_size: usize = 224;
     const output = try preprocessClipBatch(
+        std.testing.io,
         alloc,
         &.{&clip_contract_png_16x8},
         target_size,
@@ -535,36 +536,42 @@ test "clip batch preprocessing matches single image preprocessing" {
     const alloc = std.testing.allocator;
     const images = [_][]const u8{ red_png_2x2[0..], red_png_2x2[0..] };
 
-    const batch = try preprocessClipBatch(
-        alloc,
-        &images,
-        2,
-        .{ 0.0, 0.0, 0.0 },
-        .{ 1.0, 1.0, 1.0 },
-    );
-    defer alloc.free(batch);
-    const single = try preprocessClipBatch(
-        alloc,
-        images[0..1],
-        2,
-        .{ 0.0, 0.0, 0.0 },
-        .{ 1.0, 1.0, 1.0 },
-    );
-    defer alloc.free(single);
+    var inline_io = std.Io.Threaded.init(alloc, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
+    defer inline_io.deinit();
+    for ([_]std.Io{ std.testing.io, inline_io.io() }) |io| {
+        const batch = try preprocessClipBatch(
+            io,
+            alloc,
+            &images,
+            2,
+            .{ 0.0, 0.0, 0.0 },
+            .{ 1.0, 1.0, 1.0 },
+        );
+        defer alloc.free(batch);
+        const single = try preprocessClipBatch(
+            std.testing.io,
+            alloc,
+            images[0..1],
+            2,
+            .{ 0.0, 0.0, 0.0 },
+            .{ 1.0, 1.0, 1.0 },
+        );
+        defer alloc.free(single);
 
-    var caller_owned: [24]f32 = undefined;
-    try preprocessClipBatchIntoBounded(
-        &caller_owned,
-        &images,
-        2,
-        .{ 0.0, 0.0, 0.0 },
-        .{ 1.0, 1.0, 1.0 },
-        .{},
-    );
+        var caller_owned: [24]f32 = undefined;
+        try preprocessClipBatchIntoBounded(
+            &caller_owned,
+            &images,
+            2,
+            .{ 0.0, 0.0, 0.0 },
+            .{ 1.0, 1.0, 1.0 },
+            .{},
+        );
 
-    try std.testing.expectEqualSlices(f32, single, batch[0..single.len]);
-    try std.testing.expectEqualSlices(f32, single, batch[single.len .. single.len * 2]);
-    try std.testing.expectEqualSlices(f32, batch, &caller_owned);
+        try std.testing.expectEqualSlices(f32, single, batch[0..single.len]);
+        try std.testing.expectEqualSlices(f32, single, batch[single.len .. single.len * 2]);
+        try std.testing.expectEqualSlices(f32, batch, &caller_owned);
+    }
 }
 
 test "bounded batch preprocessing preserves input-indexed tensor order" {
@@ -1687,13 +1694,14 @@ pub fn preprocessClipBorrowedRasterBatchIntoWithOptions(
 /// Preprocess CLIP embedding images: resize the shortest edge to target_size,
 /// center crop target_size x target_size, and normalize to CHW f32.
 pub fn preprocessClipBatch(
+    io: std.Io,
     allocator: std.mem.Allocator,
     image_list: []const []const u8,
     target_size: u32,
     mean: [3]f32,
     std_dev: [3]f32,
 ) ![]f32 {
-    return preprocessClipBatchWithOptions(allocator, image_list, target_size, mean, std_dev, .{});
+    return preprocessClipBatchWithOptions(allocator, image_list, target_size, mean, std_dev, .{ .io = io });
 }
 
 pub fn preprocessClipBatchWithOptions(
@@ -2551,4 +2559,20 @@ fn toSharedImage(img: Image) ImageU8 {
             else => .rgb8,
         },
     };
+}
+
+test "clip batch preprocessing drains workers before returning an image error" {
+    var inline_io = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
+    defer inline_io.deinit();
+    const images = [_][]const u8{ red_png_2x2[0..], "invalid image", red_png_2x2[0..] };
+    for ([_]std.Io{ std.testing.io, inline_io.io() }) |io| {
+        try std.testing.expectError(error.ImageDecodeFailed, preprocessClipBatch(
+            io,
+            std.testing.allocator,
+            &images,
+            2,
+            .{ 0, 0, 0 },
+            .{ 1, 1, 1 },
+        ));
+    }
 }

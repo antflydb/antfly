@@ -18,6 +18,9 @@ const builtin = @import("builtin");
 const httpx = @import("httpx");
 
 const api = antfly.public_api;
+// Handler/local modes measure parsing, routing, and execution separately and
+// therefore own the concrete server. Standalone mode measures the runtime API.
+const BenchmarkApiServer = api.http_server.ApiHttpServer;
 const guardrail_build_options = @import("public_query_guardrail_build_options");
 const common = antfly.common;
 const db_mod = antfly.db;
@@ -29,7 +32,6 @@ const platform_time = antfly.platform_time;
 const raft_mod = antfly.raft;
 const http_common = antfly.common.http.http_common;
 const std_http_executor = antfly.common.http.std_http_executor;
-const std_http_listener = antfly.common.http.std_http_listener;
 
 const table_name = "docs";
 const index_name = "dense_idx";
@@ -868,7 +870,7 @@ const FakeStatusSource = struct {
 
 const BenchMetricsSource = struct {
     alloc: std.mem.Allocator,
-    server: *api.ApiHttpServer,
+    server: *BenchmarkApiServer,
     db: *db_mod.DB,
 
     fn readiness(_: *BenchMetricsSource) common.health_server.ReadinessChecker {
@@ -1148,14 +1150,13 @@ const HttpWorkerContext = struct {
 
 const DirectHandlerWorkerContext = struct {
     alloc: std.mem.Allocator,
-    executor: http_common.RequestExecutor,
+    server: *BenchmarkApiServer,
     query_bodies: []const []const u8,
     repeats: usize,
     stats: ConcurrentStats = .{},
     err: ?anyerror = null,
 
     fn run(self: *DirectHandlerWorkerContext) void {
-        const uri = "/tables/" ++ table_name ++ "/query";
         const started = nowNs();
         var local_queries: u64 = 0;
         var local_request_ns: u64 = 0;
@@ -1163,12 +1164,7 @@ const DirectHandlerWorkerContext = struct {
         for (0..self.repeats) |_| {
             for (self.query_bodies) |body| {
                 const request_started = nowNs();
-                var resp = self.executor.execute(self.alloc, .{
-                    .method = .POST,
-                    .uri = uri,
-                    .content_type = "application/json",
-                    .body = body,
-                }) catch |err| {
+                var resp = self.server.handlePublicTableQueryWithContentType(table_name, body, "application/json", null) catch |err| {
                     self.err = err;
                     self.stats.failures += 1;
                     self.stats.total_ns = elapsedSince(started);
@@ -1242,12 +1238,12 @@ fn runHandlerBench(
     var db = try openAndSeedDb(alloc, path[0..path.len], cfg, dataset);
     defer db.close();
 
-    var read_source = api.BoundTableReadSource.init(table_name, 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = api.BoundTableReadSource.init(table_name, 1, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var write_source = api.BoundTableWriteSource.init(table_name, &db);
     var status_source = try FakeStatusSource.init(cfg);
     defer status_source.deinit();
 
-    var server = api.ApiHttpServer.init(
+    var server = BenchmarkApiServer.init(
         alloc,
         .{},
         status_source.iface(),
@@ -1257,7 +1253,7 @@ fn runHandlerBench(
     defer server.deinit();
 
     if (cfg.query_shape.expectsExactSortBudgetRejection()) {
-        try enforcePublicExactSortBudgetRejection(alloc, server.executor(), query_bodies, cfg);
+        try enforcePublicExactSortBudgetRejection(alloc, &server, query_bodies, cfg);
         return;
     }
 
@@ -1272,7 +1268,7 @@ fn runHandlerBench(
     else
         try benchHandlerPipeline(alloc, &server, read_source.source(), query_bodies, cfg);
     std.debug.print("public-query guardrail stage=direct-handler\n", .{});
-    const handler_stats = try benchDirectHandler(alloc, server.executor(), query_bodies, cfg);
+    const handler_stats = try benchDirectHandler(alloc, &server, query_bodies, cfg);
     const profile_stats = if (handler_stats.profile_dense_search_count == 0 and db_stats.profile_dense_search_count > 0)
         db_stats
     else
@@ -1284,7 +1280,7 @@ fn runHandlerBench(
     const handler_concurrent: ConcurrentStats = if (cfg.query_shape.usesExactSort())
         .{}
     else
-        try benchConcurrentDirectHandler(alloc, server.executor(), query_bodies, cfg);
+        try benchConcurrentDirectHandler(alloc, &server, query_bodies, cfg);
 
     const avg_db_ns = db_stats.avgNs();
     const avg_handler_ns = handler_stats.avgNs();
@@ -1422,12 +1418,12 @@ fn runLocalBench(
     var db = try openAndSeedDb(alloc, path[0..path.len], cfg, dataset);
     defer db.close();
 
-    var read_source = api.BoundTableReadSource.init(table_name, 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = api.BoundTableReadSource.init(table_name, 1, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var write_source = api.BoundTableWriteSource.init(table_name, &db);
     var status_source = try FakeStatusSource.init(cfg);
     defer status_source.deinit();
 
-    var server = api.ApiHttpServer.init(
+    var server = BenchmarkApiServer.init(
         alloc,
         .{},
         status_source.iface(),
@@ -1436,16 +1432,25 @@ fn runLocalBench(
     );
     defer server.deinit();
 
-    var listener = std_http_listener.StdHttpListener.init(alloc, .{
-        .bind_host = "127.0.0.1",
-        .bind_port = 0,
-        .serve_in_connection_threads = true,
-        .connection_thread_stack_size = 512 * 1024,
-    }, server.executor());
-    defer listener.deinit();
+    var handler = api.httpx_handler.AntflyApiHandler{ .api_server = &server };
+    try handler.initRuntime(alloc);
+    defer handler.deinitRuntime();
+    var http_server = httpx.Server.initWithConfig(alloc, io, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_connections = 64,
+    });
+    defer http_server.deinit();
+    try handler.registerRoutes(&http_server);
+    var listener = httpx.ListenerTask.init(&http_server);
     try listener.start();
+    defer {
+        listener.requestStop();
+        listener.join() catch {};
+    }
 
-    const base_uri = try listener.baseUri(alloc);
+    const address = http_server.boundAddress() orelse return error.AddressNotAvailable;
+    const base_uri = try std.fmt.allocPrint(alloc, "http://{f}/db/v1", .{address});
     defer alloc.free(base_uri);
 
     var metrics_source = BenchMetricsSource{
@@ -1471,7 +1476,7 @@ fn runLocalBench(
     defer alloc.free(metrics_uri);
 
     if (cfg.query_shape.expectsExactSortBudgetRejection()) {
-        try enforcePublicExactSortBudgetRejection(alloc, server.executor(), query_bodies, cfg);
+        try enforcePublicExactSortBudgetRejection(alloc, &server, query_bodies, cfg);
         return;
     }
 
@@ -1486,7 +1491,7 @@ fn runLocalBench(
     else
         try benchHandlerPipeline(alloc, &server, read_source.source(), query_bodies, cfg);
     std.debug.print("public-query guardrail stage=direct-handler\n", .{});
-    const handler_stats = try benchDirectHandler(alloc, server.executor(), query_bodies, cfg);
+    const handler_stats = try benchDirectHandler(alloc, &server, query_bodies, cfg);
     std.debug.print("public-query guardrail stage=http-query\n", .{});
     var http_stats = try benchHttpQuery(alloc, base_uri, query_bodies, cfg);
     const profile_stats = if (http_stats.profile_dense_search_count == 0 and db_stats.profile_dense_search_count > 0)
@@ -1500,7 +1505,7 @@ fn runLocalBench(
     const handler_concurrent: ConcurrentStats = if (cfg.query_shape.usesExactSort())
         .{}
     else
-        try benchConcurrentDirectHandler(alloc, server.executor(), query_bodies, cfg);
+        try benchConcurrentDirectHandler(alloc, &server, query_bodies, cfg);
     std.debug.print("public-query guardrail stage=http-concurrent\n", .{});
     const concurrent = try benchConcurrentHttpWithPolling(alloc, io, base_uri, query_bodies, health_uri, metrics_uri, null, cfg, null);
     defer concurrent.deinit(alloc);
@@ -2012,21 +2017,15 @@ fn searchResultHasGraphPayload(result: db_mod.types.SearchResult) bool {
 
 fn benchDirectHandler(
     alloc: std.mem.Allocator,
-    executor: http_common.RequestExecutor,
+    server: *BenchmarkApiServer,
     query_bodies: []const []const u8,
     cfg: Config,
 ) !QueryBenchStats {
     var stats: QueryBenchStats = .{};
-    const uri = "/tables/" ++ table_name ++ "/query";
     for (0..cfg.repeats) |_| {
         for (query_bodies, 0..) |body, query_idx| {
             const started = nowNs();
-            var resp = try executor.execute(alloc, .{
-                .method = .POST,
-                .uri = uri,
-                .content_type = "application/json",
-                .body = body,
-            });
+            var resp = try server.handlePublicTableQueryWithContentType(table_name, body, "application/json", null);
             defer resp.deinit(alloc);
             const elapsed = elapsedSince(started);
             if (resp.status != 200) {
@@ -2053,7 +2052,7 @@ fn benchDirectHandler(
 
 fn enforcePublicExactSortBudgetRejection(
     alloc: std.mem.Allocator,
-    executor: http_common.RequestExecutor,
+    server: *BenchmarkApiServer,
     query_bodies: []const []const u8,
     cfg: Config,
 ) !void {
@@ -2074,16 +2073,10 @@ fn enforcePublicExactSortBudgetRejection(
         }
     }
 
-    const uri = "/tables/" ++ table_name ++ "/query";
     var checked: usize = 0;
     for (0..cfg.repeats) |_| {
         for (query_bodies) |body| {
-            var resp = try executor.execute(alloc, .{
-                .method = .POST,
-                .uri = uri,
-                .content_type = "application/json",
-                .body = body,
-            });
+            var resp = try server.handlePublicTableQueryWithContentType(table_name, body, "application/json", null);
             defer resp.deinit(alloc);
             if (resp.status != 422) {
                 std.debug.print("public-query guardrail expected budget rejection status=422 got={d} request={s} body={s}\n", .{
@@ -2164,7 +2157,7 @@ fn profiledDenseBenchQuery(req: db_mod.types.SearchRequest, query_shape: QuerySh
 
 fn benchHandlerPipeline(
     alloc: std.mem.Allocator,
-    server: *api.ApiHttpServer,
+    server: *BenchmarkApiServer,
     source: api.TableReadSource,
     query_bodies: []const []const u8,
     cfg: Config,
@@ -2253,35 +2246,48 @@ fn benchHttpQuery(
 
 fn benchConcurrentDirectHandler(
     alloc: std.mem.Allocator,
-    executor: http_common.RequestExecutor,
+    server: *BenchmarkApiServer,
     query_bodies: []const []const u8,
     cfg: Config,
 ) !ConcurrentStats {
+    var worker_io = std.Io.Threaded.init(alloc, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .limited(cfg.search_threads),
+    });
+    defer worker_io.deinit();
+    const scheduling_io = worker_io.io();
     const workers = try alloc.alloc(DirectHandlerWorkerContext, cfg.search_threads);
     defer alloc.free(workers);
-    const threads = try alloc.alloc(std.Thread, cfg.search_threads);
+    const threads = try alloc.alloc(std.Io.Future(void), cfg.search_threads);
     defer alloc.free(threads);
 
+    var started_tasks: usize = 0;
+    defer for (threads[0..started_tasks]) |*future| future.await(scheduling_io);
     for (workers, 0..) |*worker, i| {
         worker.* = .{
             .alloc = alloc,
-            .executor = executor,
+            .server = server,
             .query_bodies = query_bodies,
             .repeats = cfg.repeats,
         };
-        threads[i] = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, DirectHandlerWorkerContext.run, .{worker});
+        threads[i] = try scheduling_io.concurrent(DirectHandlerWorkerContext.run, .{worker});
+        started_tasks += 1;
     }
 
     var combined: ConcurrentStats = .{};
-    for (threads, workers) |thread, *worker| {
-        thread.join();
-        if (worker.err) |err| return err;
+    var first_error: ?anyerror = null;
+    for (threads, workers) |*future, *worker| {
+        future.await(scheduling_io);
+        if (worker.err) |err| {
+            if (first_error == null) first_error = err;
+        }
         combined.total_ns = @max(combined.total_ns, worker.stats.total_ns);
         combined.request_ns += worker.stats.request_ns;
         combined.max_request_ns = @max(combined.max_request_ns, worker.stats.max_request_ns);
         combined.queries += worker.stats.queries;
         combined.failures += worker.stats.failures;
     }
+    if (first_error) |err| return err;
     return combined;
 }
 
@@ -2296,6 +2302,13 @@ fn benchConcurrentHttpWithPolling(
     cfg: Config,
     rss_pid: ?std.process.Child.Id,
 ) !ConcurrentRun {
+    var worker_io = std.Io.Threaded.init(alloc, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .limited(cfg.search_threads + 4),
+        .stack_size = 512 * 1024,
+    });
+    defer worker_io.deinit();
+    const scheduling_io = worker_io.io();
     const exact_recall_responses = try makeExactRecallCapturedResponses(alloc, cfg);
     errdefer {
         for (exact_recall_responses) |captured| alloc.free(captured.hit_doc_indices);
@@ -2323,26 +2336,26 @@ fn benchConcurrentHttpWithPolling(
         .poll_interval_ms = cfg.poll_interval_ms,
         .stop = &stop,
     } else null;
-    var health_thread: ?std.Thread = null;
-    var metrics_thread: ?std.Thread = null;
-    var status_thread: ?std.Thread = null;
-    var rss_thread: ?std.Thread = null;
+    var health_thread: ?std.Io.Future(void) = null;
+    var metrics_thread: ?std.Io.Future(void) = null;
+    var status_thread: ?std.Io.Future(void) = null;
+    var rss_thread: ?std.Io.Future(void) = null;
     defer {
         // Pollers borrow stack-owned contexts, so every exit path must stop
-        // and join each successfully spawned thread before those contexts go
-        // out of scope. joinOptionalThread clears consumed handles and keeps
+        // and await each successfully started task before those contexts go
+        // out of scope. awaitOptionalFuture clears consumed futures and keeps
         // this cleanup safe after the normal-path joins below.
         stop.store(true, .release);
-        joinOptionalThread(&health_thread);
-        joinOptionalThread(&metrics_thread);
-        joinOptionalThread(&status_thread);
-        joinOptionalThread(&rss_thread);
+        awaitOptionalFuture(scheduling_io, &health_thread);
+        awaitOptionalFuture(scheduling_io, &metrics_thread);
+        awaitOptionalFuture(scheduling_io, &status_thread);
+        awaitOptionalFuture(scheduling_io, &rss_thread);
     }
-    health_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, EndpointPollerContext.run, .{&health_poller});
-    metrics_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, EndpointPollerContext.run, .{&metrics_poller});
+    health_thread = try scheduling_io.concurrent(EndpointPollerContext.run, .{&health_poller});
+    metrics_thread = try scheduling_io.concurrent(EndpointPollerContext.run, .{&metrics_poller});
     status_thread = blk: {
         if (status_poller) |*poller| {
-            break :blk try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, EndpointPollerContext.run, .{poller});
+            break :blk try scheduling_io.concurrent(EndpointPollerContext.run, .{poller});
         }
         break :blk null;
     };
@@ -2354,24 +2367,24 @@ fn benchConcurrentHttpWithPolling(
         .stop = &stop,
     } else null;
     rss_thread = if (rss_poller != null)
-        try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, RssPollerContext.run, .{&rss_poller.?})
+        try scheduling_io.concurrent(RssPollerContext.run, .{&rss_poller.?})
     else
         null;
 
     const workers = try alloc.alloc(HttpWorkerContext, cfg.search_threads);
     defer alloc.free(workers);
-    const threads = try alloc.alloc(std.Thread, cfg.search_threads);
+    const threads = try alloc.alloc(std.Io.Future(void), cfg.search_threads);
     defer alloc.free(threads);
 
     var start_gate = ConcurrentStartGate{};
     var spawned_threads: usize = 0;
     var joined_threads: usize = 0;
     errdefer {
-        // Release workers waiting after a partial spawn and join only handles
+        // Release workers waiting after partial startup and await only futures
         // that have not already been consumed by the normal join loop.
         start_gate.aborted.store(true, .release);
         start_gate.start.store(true, .release);
-        for (threads[joined_threads..spawned_threads]) |thread| thread.join();
+        for (threads[joined_threads..spawned_threads]) |*future| future.await(scheduling_io);
     }
     for (workers, 0..) |*worker, i| {
         worker.* = .{
@@ -2385,7 +2398,7 @@ fn benchConcurrentHttpWithPolling(
             // lane's routing and cache pressure without duplicate ownership.
             .exact_recall_responses = if (i == 0) exact_recall_responses else &.{},
         };
-        threads[i] = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, HttpWorkerContext.run, .{worker});
+        threads[i] = try scheduling_io.concurrent(HttpWorkerContext.run, .{worker});
         spawned_threads += 1;
     }
     while (start_gate.ready.load(.acquire) != cfg.search_threads) platform_time.yieldBriefly();
@@ -2393,8 +2406,8 @@ fn benchConcurrentHttpWithPolling(
 
     var combined: ConcurrentStats = .{};
     var worker_err: ?anyerror = null;
-    for (threads, workers) |thread, *worker| {
-        thread.join();
+    for (threads, workers) |*future, *worker| {
+        future.await(scheduling_io);
         joined_threads += 1;
         if (worker.err) |err| {
             if (worker_err == null) worker_err = err;
@@ -2409,10 +2422,10 @@ fn benchConcurrentHttpWithPolling(
     if (worker_err) |err| return err;
 
     stop.store(true, .release);
-    joinOptionalThread(&health_thread);
-    joinOptionalThread(&metrics_thread);
-    joinOptionalThread(&status_thread);
-    joinOptionalThread(&rss_thread);
+    awaitOptionalFuture(scheduling_io, &health_thread);
+    awaitOptionalFuture(scheduling_io, &metrics_thread);
+    awaitOptionalFuture(scheduling_io, &status_thread);
+    awaitOptionalFuture(scheduling_io, &rss_thread);
     if (health_poller.err) |err| return err;
     if (metrics_poller.err) |err| return err;
     if (status_poller) |ctx| if (ctx.err) |err| return err;
@@ -2431,10 +2444,9 @@ fn benchConcurrentHttpWithPolling(
     };
 }
 
-fn joinOptionalThread(thread: *?std.Thread) void {
-    const spawned = thread.* orelse return;
-    thread.* = null;
-    spawned.join();
+fn awaitOptionalFuture(io: std.Io, task: *?std.Io.Future(void)) void {
+    if (task.*) |*future| future.await(io);
+    task.* = null;
 }
 
 fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, elapsed_ns: u64, raw_body: []const u8, cfg: Config, query_idx: usize) !void {
@@ -2981,9 +2993,11 @@ fn enforceSymbolicResultFillGuardrail(cfg: Config, stats: QueryBenchStats) !void
     if (!cfg.query_shape.usesFilter()) return;
     if (cfg.k == 0 or cfg.queries == 0 or cfg.repeats == 0) return;
     const expected = expectedSymbolicMatchStats(cfg);
-    if (expected.min < cfg.k) return;
-
-    const expected_returned: u64 = @intCast(cfg.queries * cfg.repeats * cfg.k);
+    var expected_returned: u64 = 0;
+    for (0..cfg.queries) |query_idx| {
+        const matches = expectedSymbolicMatchCount(querySourceDocIndex(query_idx, cfg), cfg);
+        expected_returned += @intCast(@min(matches, cfg.k) * cfg.repeats);
+    }
     if (stats.response_hit_count >= expected_returned) return;
 
     std.debug.print(
@@ -3711,9 +3725,13 @@ fn seedStandalone(
         .poll_interval_ms = cfg.poll_interval_ms,
         .stop = &stop,
     };
-    const health_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, EndpointPollerContext.run, .{&health_poller});
-    const metrics_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, EndpointPollerContext.run, .{&metrics_poller});
-    const status_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, EndpointPollerContext.run, .{&status_poller});
+    var worker_io = std.Io.Threaded.init(alloc, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .limited(4),
+        .stack_size = 512 * 1024,
+    });
+    defer worker_io.deinit();
+    const scheduling_io = worker_io.io();
     var rss_poller = RssPollerContext{
         .alloc = alloc,
         .io = io,
@@ -3721,17 +3739,21 @@ fn seedStandalone(
         .poll_interval_ms = cfg.poll_interval_ms,
         .stop = &stop,
     };
-    const rss_thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, RssPollerContext.run, .{&rss_poller});
-    var pollers_joined = false;
+    var health_thread: ?std.Io.Future(void) = null;
+    var metrics_thread: ?std.Io.Future(void) = null;
+    var status_thread: ?std.Io.Future(void) = null;
+    var rss_thread: ?std.Io.Future(void) = null;
     defer {
-        if (!pollers_joined) {
-            stop.store(true, .release);
-            health_thread.join();
-            metrics_thread.join();
-            status_thread.join();
-            rss_thread.join();
-        }
+        stop.store(true, .release);
+        awaitOptionalFuture(scheduling_io, &health_thread);
+        awaitOptionalFuture(scheduling_io, &metrics_thread);
+        awaitOptionalFuture(scheduling_io, &status_thread);
+        awaitOptionalFuture(scheduling_io, &rss_thread);
     }
+    health_thread = try scheduling_io.concurrent(EndpointPollerContext.run, .{&health_poller});
+    metrics_thread = try scheduling_io.concurrent(EndpointPollerContext.run, .{&metrics_poller});
+    status_thread = try scheduling_io.concurrent(EndpointPollerContext.run, .{&status_poller});
+    rss_thread = try scheduling_io.concurrent(RssPollerContext.run, .{&rss_poller});
 
     const load_started_ns = nowNs();
     const insert_started_ns = load_started_ns;
@@ -3800,11 +3822,10 @@ fn seedStandalone(
     const visibility = try waitForQueryIndexesReady(alloc, base_uri, cfg.docs, cfg.index_ready_timeout_ms, cfg);
     const visibility_wait_ns = elapsedSince(visibility_started_ns);
     stop.store(true, .release);
-    health_thread.join();
-    metrics_thread.join();
-    status_thread.join();
-    rss_thread.join();
-    pollers_joined = true;
+    awaitOptionalFuture(scheduling_io, &health_thread);
+    awaitOptionalFuture(scheduling_io, &metrics_thread);
+    awaitOptionalFuture(scheduling_io, &status_thread);
+    awaitOptionalFuture(scheduling_io, &rss_thread);
     if (health_poller.err) |err| return err;
     if (metrics_poller.err) |err| return err;
     if (status_poller.err) |err| return err;
@@ -4832,6 +4853,17 @@ fn expectedSymbolicMatchCount(source_doc_idx: usize, cfg: Config) usize {
     var count: usize = 0;
     for (0..cfg.docs) |doc_idx| {
         if (cfg.query_shape.usesFullText() and !std.mem.eql(u8, docBodyTerm(doc_idx), docBodyTerm(source_doc_idx))) continue;
+        // Sparse-only retrieval visits documents with a nonzero dot product;
+        // passing the scalar filter alone does not make a document a match.
+        if (cfg.query_shape == .sparse_filter) {
+            var overlaps = false;
+            for (sparseIndices(doc_idx)) |doc_dimension| {
+                for (sparseIndices(source_doc_idx)) |query_dimension| {
+                    if (doc_dimension == query_dimension) overlaps = true;
+                }
+            }
+            if (!overlaps) continue;
+        }
         if (cfg.query_shape.usesFilter()) {
             const divisor = filterSelectivityDivisor(cfg);
             if (doc_idx % divisor != source_doc_idx % divisor) continue;
@@ -4914,12 +4946,13 @@ fn appendDocCreatedAt(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator
     });
 }
 
+fn sparseIndices(doc_idx: usize) [3]usize {
+    return .{ 7 + (doc_idx % 32), 10_000 + (doc_idx % 64), 20_000 + (doc_idx % 128) };
+}
+
 fn appendSparseIndices(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, doc_idx: usize) !void {
-    try out.print(alloc, "{d},{d},{d}", .{
-        7 + (doc_idx % 32),
-        10_000 + (doc_idx % 64),
-        20_000 + (doc_idx % 128),
-    });
+    const indices = sparseIndices(doc_idx);
+    try out.print(alloc, "{d},{d},{d}", .{ indices[0], indices[1], indices[2] });
 }
 
 fn appendSparseValues(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, doc_idx: usize) !void {
@@ -4931,11 +4964,7 @@ fn appendSparseValues(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator
 }
 
 fn appendSparseEmbeddingObject(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, doc_idx: usize) !void {
-    const indices = [_]usize{
-        7 + (doc_idx % 32),
-        10_000 + (doc_idx % 64),
-        20_000 + (doc_idx % 128),
-    };
+    const indices = sparseIndices(doc_idx);
     const values = [_]f64{
         1.0 + @as(f64, @floatFromInt(doc_idx % 5)) * 0.1,
         0.5 + @as(f64, @floatFromInt(doc_idx % 7)) * 0.05,

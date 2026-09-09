@@ -1975,14 +1975,14 @@ test "credential cache shutdown waits for an in-flight refresh" {
                 const closing = target.closing;
                 target.mutex.unlock(worker_io);
                 if (closing) break;
-                std.Thread.yield() catch {};
+                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
             target.finishFailedRefresh(worker_io);
         }
     };
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{ &cache, io });
+    var thread = try std.testing.io.concurrent(Worker.run, .{ &cache, io });
     cache.deinit(std.testing.allocator);
-    thread.join();
+    thread.await(std.testing.io);
     try std.testing.expect(cache.closing);
     try std.testing.expect(!cache.refreshing);
     try std.testing.expect(cache.cached == null);

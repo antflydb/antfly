@@ -87,6 +87,24 @@ pub const TtlRuntime = if (builtin.os.tag == .freestanding) struct {
         if (self.config.enabled) return error.UnsupportedPlatform;
     }
 
+    pub fn stop(_: *@This()) bool {
+        return false;
+    }
+
+    pub fn pause(_: *@This()) bool {
+        return false;
+    }
+
+    pub fn resumeAfterPause(_: *@This()) !void {}
+
+    pub fn ensureRunning(_: *@This()) !bool {
+        return true;
+    }
+
+    pub fn isStarted(_: *const @This()) bool {
+        return false;
+    }
+
     pub fn runOnce(self: *@This()) !void {
         if (self.config.enabled) return error.UnsupportedPlatform;
     }
@@ -96,7 +114,9 @@ pub const TtlRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 } else struct {
     alloc: Allocator,
-    io_impl: ?*Io.Threaded,
+    /// Borrowed backend-neutral executor. Its implementation is owned by the
+    /// BackendRuntime and may be Threaded or VoprIo.
+    io: ?Io,
     store: backend_erased.Store,
     owns_store: bool,
     delete_ctx: *anyopaque,
@@ -105,6 +125,9 @@ pub const TtlRuntime = if (builtin.os.tag == .freestanding) struct {
     defer_flag: ?*const std.atomic.Value(bool),
     ownership: ownership_mod.State,
     mutex: Io.Mutex = .init,
+    lifecycle_mutex: std.atomic.Mutex = .unlocked,
+    desired_running: bool = false,
+    paused: bool = false,
     shutdown: bool = false,
     stats_value: types.TTLCleanupStats = .{},
     future: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
@@ -119,13 +142,13 @@ pub const TtlRuntime = if (builtin.os.tag == .freestanding) struct {
         backend_runtime: *background_runtime_mod.BackendRuntime,
         config: Config,
     ) !TtlRuntime {
-        const io_impl = backend_runtime.io_impl;
-        if (config.enabled and io_impl == null) return error.MissingBackendRuntimeIo;
+        const io = backend_runtime.io();
+        if (config.enabled and io == null) return error.MissingBackendRuntimeIo;
         var runtime_store = try initRuntimeStore(alloc, store);
         errdefer runtime_store.deinit();
         return .{
             .alloc = alloc,
-            .io_impl = io_impl,
+            .io = io,
             .backend_runtime = backend_runtime,
             .store = runtime_store.store,
             .owns_store = runtime_store.owned,
@@ -145,15 +168,7 @@ pub const TtlRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn deinit(self: *TtlRuntime) void {
-        if (self.io_impl) |io_impl| {
-            const io = io_impl.io();
-            self.mutex.lockUncancelable(io);
-            self.shutdown = true;
-            self.mutex.unlock(io);
-
-            if (self.future) |*future| _ = future.await(io);
-        }
-        self.future = null;
+        _ = self.stop();
         self.ownership.deinit(self.alloc);
         if (self.owns_store) self.store.deinit();
         self.* = undefined;
@@ -161,10 +176,73 @@ pub const TtlRuntime = if (builtin.os.tag == .freestanding) struct {
 
     pub fn start(self: *TtlRuntime) !void {
         if (!self.config.enabled) return;
-        const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
-        _ = io_impl;
-        if (self.future != null) return;
+        lockAtomicWithBackoff(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        self.desired_running = true;
+        self.paused = false;
+        try self.startLocked();
+    }
+
+    pub fn stop(self: *TtlRuntime) bool {
+        if (!self.config.enabled) return false;
+        lockAtomicWithBackoff(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        self.desired_running = false;
+        self.paused = true;
+        return self.stopLocked();
+    }
+
+    pub fn pause(self: *TtlRuntime) bool {
+        if (!self.config.enabled) return false;
+        lockAtomicWithBackoff(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        self.paused = true;
+        const desired = self.desired_running;
+        _ = self.stopLocked();
+        return desired;
+    }
+
+    pub fn resumeAfterPause(self: *TtlRuntime) !void {
+        if (!self.config.enabled) return;
+        lockAtomicWithBackoff(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        self.paused = false;
+        if (self.desired_running) try self.startLocked();
+    }
+
+    pub fn ensureRunning(self: *TtlRuntime) !bool {
+        if (!self.config.enabled) return true;
+        lockAtomicWithBackoff(&self.lifecycle_mutex);
+        defer self.lifecycle_mutex.unlock();
+        if (!self.desired_running) return true;
+        if (self.paused) return false;
+        try self.startLocked();
+        return true;
+    }
+
+    pub fn isStarted(self: *const TtlRuntime) bool {
+        return self.future != null;
+    }
+
+    fn startLocked(self: *TtlRuntime) !void {
+        if (self.future != null or self.paused or !self.desired_running) return;
+        const io = self.io orelse return error.MissingBackendRuntimeIo;
+        self.mutex.lockUncancelable(io);
+        self.shutdown = false;
+        self.mutex.unlock(io);
         self.future = try (try self.backend_runtime.?.maintenanceScheduler()).register(self, workerStep);
+    }
+
+    fn stopLocked(self: *TtlRuntime) bool {
+        const io = self.io orelse return false;
+        if (self.future == null) return false;
+        self.mutex.lockUncancelable(io);
+        self.shutdown = true;
+        self.mutex.unlock(io);
+        self.future.?.cancel(io);
+        self.future = null;
+        self.ownership.release();
+        return true;
     }
 
     pub fn runOnce(self: *TtlRuntime) !void {
@@ -177,7 +255,7 @@ pub const TtlRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn stats(self: *TtlRuntime) types.TTLCleanupStats {
-        const maybe_io = if (self.io_impl) |io_impl| io_impl.io() else null;
+        const maybe_io = self.io;
         if (maybe_io) |io| self.mutex.lockUncancelable(io);
         defer if (maybe_io) |io| self.mutex.unlock(io);
         var snapshot = self.stats_value;
@@ -219,8 +297,7 @@ fn workDeferred(runtime: *const TtlRuntime) bool {
 
 fn ensureLease(runtime: *TtlRuntime, now_ns: u64) bool {
     const now_ms: u64 = @intCast(now_ns / std.time.ns_per_ms);
-    const io_impl = runtime.io_impl orelse return false;
-    const io = io_impl.io();
+    const io = runtime.io orelse return false;
     runtime.mutex.lockUncancelable(io);
     defer runtime.mutex.unlock(io);
     const acquired = runtime.ownership.ensureLease(now_ms) catch {
@@ -334,15 +411,14 @@ fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {
 }
 
 fn isShutdown(runtime: *TtlRuntime) bool {
-    const io_impl = runtime.io_impl orelse return runtime.shutdown;
-    const io = io_impl.io();
+    const io = runtime.io orelse return runtime.shutdown;
     runtime.mutex.lockUncancelable(io);
     defer runtime.mutex.unlock(io);
     return runtime.shutdown;
 }
 
 fn recordRun(runtime: *TtlRuntime, now_ns: u64, summary: ScanSummary, failed: bool) void {
-    const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
+    const maybe_io = runtime.io;
     if (maybe_io) |io| runtime.mutex.lockUncancelable(io);
     defer if (maybe_io) |io| runtime.mutex.unlock(io);
     runtime.stats_value.runs += 1;
@@ -350,6 +426,10 @@ fn recordRun(runtime: *TtlRuntime, now_ns: u64, summary: ScanSummary, failed: bo
     runtime.stats_value.deleted_docs += summary.deleted_docs;
     runtime.stats_value.last_run_ns = now_ns;
     if (failed) runtime.stats_value.error_count += 1;
+}
+
+fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.Thread.yield() catch {};
 }
 
 const TestDeleteContext = struct {
@@ -472,4 +552,89 @@ test "ttl runtime runOnce works with lsm backend store" {
     try std.testing.expectEqual(@as(u32, 1), stats.deleted_docs);
     try std.testing.expectEqual(@as(u64, 1), stats.scanned_timestamps);
     try expectMissingDoc(&runtime_store, alloc, "doc1");
+}
+
+test "ttl runtime executes production pass on borrowed VoprIo" {
+    const vopr = @import("vopr");
+    const alloc = std.testing.allocator;
+    var vopr_io = try vopr.vopr_io.VoprIo.init(.{
+        .required = .of(&.{ .clock_read, .task_scheduling, .synchronization, .sleep }),
+    });
+    defer vopr_io.deinit();
+
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime_store = try backend.runtimeStore(alloc, .{ .name = "vopr-ttl" });
+    defer runtime_store.deinit();
+    _ = try schema_mod.saveSchema(runtime_store, alloc, .{
+        .version = 1,
+        .default_type = "doc",
+        .ttl_duration_ns = 1_000,
+    });
+    try putTestDoc(&runtime_store, alloc, "doc1", "value", 1_000);
+
+    var runtime_owners_closed = false;
+    var backend_runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = vopr_io.io() },
+    });
+    defer if (!runtime_owners_closed) backend_runtime.deinit();
+    var clock = platform_clock.ManualClock{};
+    clock.setRealtimeNs(10_000);
+    var delete_ctx = TestDeleteContext{ .alloc = alloc, .store = &runtime_store };
+    var runtime = try TtlRuntime.init(
+        alloc,
+        &runtime_store,
+        &delete_ctx,
+        TestDeleteContext.deleteCandidates,
+        null,
+        backend_runtime.ptr(),
+        .{
+            .enabled = true,
+            .clock = clock.clock(),
+            .grace_period_ns = 0,
+            .batch_size = 8,
+        },
+    );
+    defer if (!runtime_owners_closed) runtime.deinit();
+
+    try runtime.runOnce();
+    try std.testing.expectEqual(@as(u32, 1), runtime.stats().deleted_docs);
+    try expectMissingDoc(&runtime_store, alloc, "doc1");
+    var lifecycle_ok = false;
+    const Lifecycle = struct {
+        fn run(target: *TtlRuntime, backend_owner: *background_runtime_mod.BackendRuntimeHandle, closed: *bool, passed: *bool) void {
+            // Shared executor ownership outlives the registration. Drain both
+            // inside VoprIo before requiring the scheduler to be quiescent.
+            defer {
+                target.deinit();
+                backend_owner.deinit();
+                closed.* = true;
+            }
+            target.start() catch return;
+            if (!target.isStarted()) return;
+            if (!target.pause()) return;
+            if (target.isStarted()) return;
+            target.resumeAfterPause() catch return;
+            if (!target.isStarted()) return;
+            if (!target.stop()) return;
+            if (target.isStarted()) return;
+            passed.* = true;
+        }
+    };
+    _ = vopr_io.io().async(Lifecycle.run, .{ &runtime, &backend_runtime, &runtime_owners_closed, &lifecycle_ok });
+    const scheduler = vopr_io.scheduler();
+    var enabled: vopr.transition.List = .{};
+    defer enabled.deinit(alloc);
+    var events: vopr.event.Sink = .{};
+    defer events.deinit(alloc);
+    while (!scheduler.quiescent()) {
+        enabled.items.clearRetainingCapacity();
+        try scheduler.enumerateReady(&enabled, alloc);
+        try enabled.canonicalize();
+        try std.testing.expect(enabled.items.items.len != 0);
+        try scheduler.executeReady(enabled.items.items[0].id, &events, alloc);
+    }
+    try std.testing.expect(lifecycle_ok);
+    try vopr_io.ensureNoCapabilityViolation();
 }
