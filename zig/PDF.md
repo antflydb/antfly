@@ -15,8 +15,10 @@ existing atomic primary/artifact commit. Staging pressure declines optional
 sharing and preserves the ordinary bounded execution path. No page rasters
 survive their consumer window. Source-fingerprint changes invalidate staged
 results; forced reprocessing and unchanged-state checks stay with precommit's
-ordinary publication path. Page-vector replay checkpoints are not used by this
-precommit text-result sink.
+ordinary publication path. Reuse binds to full source SHA-256, not the shortened
+telemetry fingerprint. Terminal partial batches can share; a consumer that
+declined an earlier nonterminal window stays disabled. Page-vector replay
+checkpoints are not used by this precommit text-result sink.
 
 The native image decoder has a pull-based row path for 8-bit DeviceGray/RGB/CMYK
 images with raw or single-Flate streams, including TIFF/PNG predictors, color
@@ -34,7 +36,11 @@ Other codecs, color spaces, packed samples, predictor layouts and differently
 sized masks retain their existing guarded paths; this is not a relaxation of
 their limits or an automatic reduction in DPI. The formerly rejected academic
 page has rendered at requested 150 DPI under the unchanged 256 MiB scratch cap;
-full service qualification is recorded separately when complete.
+the final full service run passes all 51 pages with no OCR failures. Two-consumer
+precommit and replay probes each render nine pages exactly once, with equal
+retained text/geometry and complete vector coverage for both consumers. Tests
+also cover terminal-tail sharing and declined-prefix isolation. See
+`scripts/bench/pdf/RESULTS-2026-09-09-STREAMING.md` for final qualification.
 
 The initial source-build ablation exposed two admission defects: reserving every
 lane's 128 MiB decode ceiling made parallel rendering impossible under the

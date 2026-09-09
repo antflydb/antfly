@@ -172,10 +172,14 @@ on a quiet host before making performance claims.
 `--sync-level full_index` (the default) measures precommit enrichment.
 `--sync-level write` measures durable replay; the timer still waits for all
 artifacts, indexes and vector coverage, not just the write acknowledgement.
-Never compare ratios across these paths. Render-window sharing currently lives
-in replay, so use `benchmark.py run --consumers 2 --sync-level write --read-profile`
-to diagnose reuse. The same two-consumer full-index probe tests the separate
-precommit path, which currently renders independently for each consumer.
+Never compare ratios across these paths. Use
+`benchmark.py run --consumers 2 --sync-level write --read-profile` to diagnose
+replay reuse, and `--sync-level full_index` to verify the precommit path's
+invocation-local result staging. Both now use the bounded window scheduler;
+the precommit path retains its atomic publication semantics. Count actual
+render work, including final partial batches, rather than assuming sharing
+from the existence of a scheduler. See
+[streaming and precommit qualification](RESULTS-2026-09-09-STREAMING.md).
 
 `render_matrix.py` uses the same executable, PDFs, models, requested DPI,
 reader capacity four and 256 MiB renderer cap for every configuration. It varies
