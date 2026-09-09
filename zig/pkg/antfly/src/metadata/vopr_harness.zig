@@ -427,20 +427,20 @@ pub const VoprSplitRuntime = struct {
         var source_store = try data_mod.RaftApplyStore.init(alloc, .{ .root_dir = source_root_dir });
         defer source_store.deinit();
 
+        // Read-only DB views do not cache the filesystem root identity.
+        // This fixture owns a stable source path; load its existing,
+        // validated checkpoint without creating an identity or a writer.
+        const root_incarnation = db.durableRootIncarnation() catch |err| switch (err) {
+            error.DurableRootIncarnationUnavailable => identity: {
+                if (db.physical_root_mode != .filesystem_managed) return err;
+                break :identity (try db_root_identity.load(
+                    alloc,
+                    db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable,
+                    source_root_dir,
+                )).incarnation;
+            },
+        };
         if (try source_store.latestBatchForTransition(source_group_id)) |watermark| {
-            // Read-only DB views do not cache the filesystem root identity.
-            // This fixture owns a stable source path; load its existing,
-            // validated checkpoint without creating an identity or a writer.
-            const root_incarnation = db.durableRootIncarnation() catch |err| switch (err) {
-                error.DurableRootIncarnationUnavailable => identity: {
-                    if (db.physical_root_mode != .filesystem_managed) return err;
-                    break :identity (try db_root_identity.load(
-                        alloc,
-                        db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable,
-                        source_root_dir,
-                    )).incarnation;
-                },
-            };
             if (!try source_store.reconcileGroupSnapshotFromAuthoritativeStoreAtRootIncarnation(
                 alloc,
                 source_group_id,
@@ -454,51 +454,18 @@ pub const VoprSplitRuntime = struct {
             return;
         }
 
-        var ops = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (ops.items) |op| alloc.free(op);
-            ops.deinit(alloc);
-        }
-
-        const byte_range = db.getRange();
-        try ops.append(alloc, try std.fmt.allocPrint(alloc, "range:{s}:{s}", .{
-            byte_range.start,
-            byte_range.end,
-        }));
-
-        const lower = try internal_keys.documentRangeLowerAlloc(alloc, byte_range.start);
-        defer alloc.free(lower);
-        const upper = if (byte_range.end.len > 0) try internal_keys.documentRangeUpperAlloc(alloc, byte_range.end) else null;
-        defer if (upper) |owned| alloc.free(owned);
-
-        const scanned = try db.core.store.scanRange(alloc, lower, if (upper) |owned| owned else "");
-        defer docstore_mod.DocStore.freeResults(alloc, scanned);
-        for (scanned) |entry| {
-            const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, entry.key)) orelse continue;
-            defer alloc.free(raw_key);
-            try ops.append(alloc, try std.fmt.allocPrint(alloc, "put:{s}={s}", .{
-                raw_key,
-                entry.value,
-            }));
-        }
-
-        const entries = try alloc.alloc(raft_engine.core.Entry, ops.items.len);
-        defer alloc.free(entries);
-        for (ops.items, 0..) |op, i| {
-            entries[i] = .{
-                .term = 1,
-                .index = i + 1,
-                .entry_type = .normal,
-                .data = op,
-            };
-        }
-        const encoded = try raft_state_machine.encodeCommittedEntries(alloc, entries);
-        defer alloc.free(encoded);
-        try source_store.snapshotBuilder().applyBatch(.{
-            .group_id = source_group_id,
-            .commit_index = entries.len,
-            .entries_bytes = encoded,
-        });
+        // Seed the typed snapshot directly. The legacy delimiter-based test
+        // operations cannot represent arbitrary document keys or open-ended
+        // ranges such as ["doc:m", "") without changing their meaning.
+        if (!try source_store.seedGroupSnapshotFromAuthoritativeStoreIfAbsent(
+            alloc,
+            source_group_id,
+            root_incarnation,
+            db.getRange(),
+            db.core.store,
+            256,
+            2 * 1024 * 1024,
+        )) return error.SplitSourceProjectionAdvanced;
     }
 
     fn dbOptions(self: *const @This(), base: db_mod.OpenOptions) db_mod.OpenOptions {
@@ -519,6 +486,46 @@ fn backendRuntimeForReplicaRoot(
         return if (runtime.hasDbOpenConfigurator()) runtime else null;
     }
     return null;
+}
+
+test "metadata VOPR source seeding preserves arbitrary keys and open range bounds" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/vopr-source-seed", .{tmp.sub_path});
+    defer alloc.free(root);
+    var db = try db_mod.DB.open(alloc, root, .{ .start_index_workers = false });
+    defer db.close();
+    try db.updateRange(.{ .start = "doc:m", .end = "" });
+    const key = "doc:z=1";
+    const value = "{\"value\":\"a=b:c\"}";
+    try db.batch(.{ .writes = &.{.{ .key = key, .value = value }} });
+    var runtime = VoprSplitRuntime{};
+    try runtime.ensureSourceApplyStoreSeededFromDb(alloc, root, 42, &db);
+    {
+        var store = try data_mod.RaftApplyStore.init(alloc, .{ .root_dir = root });
+        defer store.deinit();
+        const range = try store.currentRange(alloc, 42);
+        defer alloc.free(range.start);
+        defer alloc.free(range.end);
+        try std.testing.expectEqualStrings("doc:m", range.start);
+        try std.testing.expectEqualStrings("", range.end);
+        const entries = try store.groupState(alloc, 42);
+        defer data_mod.storage.shard_state_store.freeGroupStateEntries(alloc, entries);
+        try std.testing.expectEqual(@as(usize, 1), entries.len);
+        try std.testing.expectEqualStrings(key, entries[0].key);
+        try std.testing.expectEqualStrings(value, entries[0].value);
+    }
+    // A second observation refreshes the same baseline instead of inventing
+    // another Raft entry or falling back to delimiter-based serialization.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:y", .value = "{}" }} });
+    try runtime.ensureSourceApplyStoreSeededFromDb(alloc, root, 42, &db);
+    var store = try data_mod.RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    try std.testing.expectEqual(@as(u64, 0), (try store.latestBatchForTransition(42)).?.commit_index);
+    const entries = try store.groupState(alloc, 42);
+    defer data_mod.storage.shard_state_store.freeGroupStateEntries(alloc, entries);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
 }
 
 test "metadata VOPR split runtime preserves source identity namespace" {
@@ -1213,7 +1220,7 @@ pub fn mirrorGroupBatchToActiveReplicas(
     for (api_base_uris, 0..) |base_uri, i| {
         if (cluster.node(i).status(group_id) != .active) continue;
         var response = try client.fetchGroupBatch(base_uri, group_id, table_name, body);
-        defer response.deinit(std.heap.page_allocator);
+        defer response.deinit(client.alloc);
         // This coarse fixture has no DataServer repair scheduler. Own the
         // bounded initial-index materialization through the production repair
         // endpoint before treating the mirrored replica as query-ready.
@@ -1221,7 +1228,7 @@ pub fn mirrorGroupBatchToActiveReplicas(
             var repair = try client.fetchGroupArtifactRepairRun(base_uri, group_id, table_name,
                 \\{"target":"index","index_name":"full_text_index_v0","limit":16}
             );
-            defer repair.deinit(std.heap.page_allocator);
+            defer repair.deinit(client.alloc);
             var result = try std.json.parseFromSlice(struct { debt_remaining: bool, has_more: bool }, cluster.alloc, repair.body, .{ .ignore_unknown_fields = true });
             defer result.deinit();
             if (!result.value.debt_remaining and !result.value.has_more) break;
@@ -3668,14 +3675,23 @@ pub const MetadataHttpNodeVopr = struct {
         self: MetadataHttpNodeVopr,
         deadline_ns: ?u64,
     ) !metadata_api.CatalogRoutingSnapshot {
+        return self.catalogRoutingSnapshotWithClock(deadline_ns, null);
+    }
+
+    pub fn catalogRoutingSnapshotWithClock(
+        self: MetadataHttpNodeVopr,
+        deadline_ns: ?u64,
+        deadline_io: ?@import("../runtime_io_abi.zig").Borrow,
+    ) !metadata_api.CatalogRoutingSnapshot {
         self.cluster.scheduler_gate.lock();
         defer self.cluster.scheduler_gate.unlock();
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse
             return error.MissingMetadataStore;
-        const projection = try store.captureCatalogProjection(
+        const projection = try store.captureCatalogProjectionWithClock(
             self.cluster.alloc,
             self.cluster.metadata_group_id,
             deadline_ns,
+            deadline_io,
         );
         return .{
             .metadata_group_id = self.cluster.metadata_group_id,
@@ -6338,17 +6354,17 @@ const PublicApiLinearizableReadDriver = struct {
     }
 
     fn ensure(self: *@This()) !PublicApiLinearizableReadProof {
-        return try self.ensureUntil(null);
+        return try self.ensureUntil(.init(null));
     }
 
-    fn ensureUntil(self: *@This(), deadline_ns: ?u64) !PublicApiLinearizableReadProof {
+    fn ensureUntil(self: *@This(), budget: api_table_catalog.RoutingBudget) !PublicApiLinearizableReadProof {
         self.ensure_mutex.lockUncancelable(self.io());
         defer self.ensure_mutex.unlock(self.io());
         const cluster = self.cluster orelse return error.MetadataLinearizableReadTimeout;
         cluster.scheduler_gate.lock();
         defer cluster.scheduler_gate.unlock();
-        if (deadline_ns) |deadline| {
-            if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+        if (budget.deadline_ns) |deadline| {
+            if (budget.nowNs() >= deadline) return error.DeadlineExceeded;
         }
         const status_before = cluster.cluster.node(self.node_index).raftStatus(cluster.metadata_group_id) orelse
             return error.MetadataLinearizableReadTimeout;
@@ -6367,8 +6383,8 @@ const PublicApiLinearizableReadDriver = struct {
 
         var rounds: usize = 0;
         while (rounds < self.max_rounds) : (rounds += 1) {
-            if (deadline_ns) |deadline| {
-                if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+            if (budget.deadline_ns) |deadline| {
+                if (budget.nowNs() >= deadline) return error.DeadlineExceeded;
             }
             try cluster.stepAll();
             const read_index = self.completedReadIndex(sequence) orelse continue;
@@ -6435,22 +6451,22 @@ test "public api linearizable read driver ignores a delayed earlier generation" 
 
 fn authoritativePublicApiRoutingNode(
     node: MetadataHttpNodeVopr,
-    deadline_ns: ?u64,
+    budget: api_table_catalog.RoutingBudget,
     external_driver: ?*PublicApiLinearizableReadDriver,
 ) !MetadataHttpNodeVopr {
-    if (deadline_ns) |deadline| {
-        if (platform_time.monotonicNs() >= deadline)
+    if (budget.deadline_ns) |deadline| {
+        if (budget.nowNs() >= deadline)
             return error.CatalogRoutingSnapshotTimeout;
     }
     const proof = if (external_driver) |driver|
-        driver.ensureUntil(deadline_ns) catch |err| switch (err) {
+        driver.ensureUntil(budget) catch |err| switch (err) {
             error.MetadataLinearizableReadTimeout, error.DeadlineExceeded => return error.CatalogRoutingSnapshotTimeout,
             else => return err,
         }
     else blk: {
         const leader_index = node.cluster.currentMetadataLeaderIndex() orelse
             return error.CatalogRoutingSnapshotTimeout;
-        break :blk node.cluster.linearizable_read_drivers[leader_index].ensureUntil(deadline_ns) catch |err| switch (err) {
+        break :blk node.cluster.linearizable_read_drivers[leader_index].ensureUntil(budget) catch |err| switch (err) {
             error.MetadataLinearizableReadTimeout, error.DeadlineExceeded => return error.CatalogRoutingSnapshotTimeout,
             else => return err,
         };
@@ -6521,7 +6537,7 @@ const PublicApiStatusSource = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const target = authoritativePublicApiRoutingNode(
             self.node,
-            request.deadline_ns,
+            .{ .deadline_ns = request.deadline_ns, .io = request.deadline_io },
             self.linearizable_read_driver,
         ) catch |err| switch (err) {
             error.CatalogRoutingSnapshotTimeout => return error.MetadataLinearizableReadTimeout,
@@ -6544,7 +6560,7 @@ const PublicApiStatusSource = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const target = try authoritativePublicApiRoutingNode(
             self.node,
-            deadline_ns,
+            .init(deadline_ns),
             self.linearizable_read_driver,
         );
         return try target.catalogRoutingSnapshot(deadline_ns);
@@ -6886,6 +6902,7 @@ const PublicApiCatalogSource = struct {
     fn iface(self: *@This()) api_table_catalog.CatalogSource {
         return .{
             .ptr = self,
+            .io = @import("../runtime_io_abi.zig").Borrow.init(&(self.node.cluster.backendRuntime(self.node.index).io() orelse std.Options.debug_io)),
             .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
@@ -6908,13 +6925,13 @@ const PublicApiCatalogSource = struct {
 
     fn routingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.metadataNode().catalogRoutingSnapshot(deadline_ns);
+        return try self.metadataNode().catalogRoutingSnapshotWithClock(deadline_ns, self.iface().io);
     }
 
     fn linearizableRoutingSnapshot(ptr: *anyopaque, deadline_ns: ?u64) !metadata_api.CatalogRoutingSnapshot {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const target = try authoritativePublicApiRoutingNode(self.node, deadline_ns, null);
-        return try target.catalogRoutingSnapshot(deadline_ns);
+        const target = try authoritativePublicApiRoutingNode(self.node, self.iface().budget(deadline_ns), null);
+        return try target.catalogRoutingSnapshotWithClock(deadline_ns, self.iface().io);
     }
 
     fn freeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
@@ -7719,6 +7736,17 @@ pub const VoprPublicClusterFixture = struct {
         // reopening live LSM roots through a parallel test-only path.
         merge_runtime.donor_write_source = &self.write_sources[self.graph_restart_node_index];
         merge_runtime.receiver_write_source = &self.write_sources[receiver_leader_index];
+        // Hosted writers do not run DataServer's range-apply bootstrap. Install
+        // the projected bounds before any workload or structural coordinator
+        // opens them; an unbounded donor would erase the receiver during copy.
+        for (ranges) |range| {
+            for (0..node_count) |index| {
+                if (self.cluster.node(index).status(range.group_id) != .active) continue;
+                var lease = try self.write_sources[index].leaseGroupWriter(alloc, range.group_id, "docs");
+                defer lease.release();
+                try lease.db().updateRange(.{ .start = range.start_key, .end = range.end_key orelse "" });
+            }
+        }
         const graph_hook = api_distributed_graph.LifecycleHook{
             .ptr = self,
             .reach_fn = reachDistributedGraphLifecycle,
@@ -8116,11 +8144,28 @@ pub const VoprPublicClusterFixture = struct {
         defer response.deinit(self.alloc);
         self.write_sound = response.status >= 200 and response.status < 300 and
             std.mem.indexOf(u8, response.body, "\"inserted\":3") != null;
-        if (self.write_sound) self.materializeHostedIndexes() catch |err| {
+        if (self.write_sound) self.replicateHostedDocuments() catch |err| {
             self.write_sound = false;
             self.request_errors +|= 1;
             self.last_request_error_code = @intFromError(err);
         };
+    }
+
+    fn replicateHostedDocuments(self: *VoprPublicClusterFixture) !void {
+        // Hosted fixtures own metadata Raft but do not install DataServer's
+        // data apply loop. Mirror these fixed-ID upserts through the internal
+        // batch endpoint before releasing failover, just as the split/merge
+        // public-data fixtures do. Production DataServer histories exercise
+        // replicated admission and acknowledgements themselves.
+        var replica_client = self.client;
+        _ = replica_client.withInternalServiceAuth(vopr_internal_service_secret, "metadata-vopr");
+        try mirrorGroupBatchToActiveReplicas(&self.cluster, &replica_client, self.api_base_uris[0..self.uri_count], data_group_id, "docs",
+            \\{"inserts":{"doc:a":{"title":"alpha","body":"graph source","_edges":{"graph_idx":{"links":[{"target":"doc:z"}]}}}},"sync_level":"full_index"}
+        );
+        try mirrorGroupBatchToActiveReplicas(&self.cluster, &replica_client, self.api_base_uris[0..self.uri_count], graph_data_group_id, "docs",
+            \\{"inserts":{"doc:z":{"title":"zeta","body":"hello distributed world","_edges":{"graph_idx":{"links":[{"target":"doc:y"}]}}},"doc:y":{"title":"gamma","body":"hello cluster"}},"sync_level":"full_index"}
+        );
+        try self.materializeHostedIndexes();
     }
 
     fn materializeHostedIndexes(self: *VoprPublicClusterFixture) !void {
@@ -8183,6 +8228,17 @@ pub const VoprPublicClusterFixture = struct {
         defer response.deinit(self.alloc);
         self.tenant_write_sound = response.status >= 200 and response.status < 300 and
             std.mem.indexOf(u8, response.body, "\"inserted\":1") != null;
+        if (self.tenant_write_sound) {
+            var replica_client = self.client;
+            _ = replica_client.withInternalServiceAuth(vopr_internal_service_secret, "metadata-vopr");
+            mirrorGroupBatchToActiveReplicas(&self.cluster, &replica_client, self.api_base_uris[0..self.uri_count], tenant_data_group_id, "tenant_b_docs",
+                \\{"inserts":{"tenant:z":{"title":"private","body":"tenant-isolation-sentinel"}}}
+            ) catch |err| {
+                self.tenant_write_sound = false;
+                self.request_errors +|= 1;
+                self.last_request_error_code = @intFromError(err);
+            };
+        }
     }
 
     fn runTenantReader(self: *VoprPublicClusterFixture) void {
@@ -11171,7 +11227,7 @@ test "metadata VOPR http cluster serves public lifecycle from a non-host node af
     try std.testing.expectEqual(@as(usize, 1), eventual_routing.value.tables.len);
     try std.testing.expectEqualStrings("docs", eventual_routing.value.tables[0].name);
     var authoritative_routing = try routing.linearizableSnapshot(
-        platform_time.monotonicNs() +| (5 * std.time.ns_per_s),
+        local_catalog.budget(null).nowNs() +| (5 * std.time.ns_per_s),
     );
     defer authoritative_routing.deinit();
     try std.testing.expectEqual(@as(usize, 1), authoritative_routing.value.tables.len);

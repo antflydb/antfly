@@ -10026,7 +10026,7 @@ fn executeProvisionedGraphExpand(
             router,
             group_id,
             routePolicyForConsistency(consistency),
-        )) orelse return error.TableNotFound;
+        )) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
         switch (route) {
             .local => {},
@@ -10151,7 +10151,7 @@ fn executeProvisionedGraphHydrate(
             router,
             group_id,
             routePolicyForConsistency(consistency),
-        )) orelse return error.TableNotFound;
+        )) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
         switch (route) {
             .local => {},
@@ -10220,6 +10220,51 @@ fn executeProvisionedGraphHydrateAttempt(
     return try graphHydrateOnPreparedDb(alloc, db_owner.db(), req, search_req);
 }
 
+test "graph workers report retired ranges as topology unavailability" {
+    const Fixture = struct {
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+        fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64) ![]u64 {
+            return alloc.alloc(u64, 0);
+        }
+        fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return error.UnexpectedHttpRequest;
+        }
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogRead;
+        }
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {
+            unreachable;
+        }
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return error.UnexpectedHttpRequest;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var token: u8 = 0;
+    const catalog = table_catalog.CatalogSource{ .ptr = &token, .vtable = &.{ .admin_snapshot = Fixture.adminSnapshot, .free_admin_snapshot = Fixture.freeAdminSnapshot } };
+    const router = table_router.HostedGroupRouter{ .ptr = &token, .vtable = &.{ .local_node_id = Fixture.localNodeId, .local_status = Fixture.localStatus, .group_node_ids = Fixture.groupNodeIds, .node_base_uri = Fixture.nodeBaseUri } };
+    var hosted = HostedProvisionedTableReadSource.init("unused", catalog, raft_mod.read_gate.alreadyReadSafeBarrier(), router, .{ .ptr = &token, .vtable = &.{ .execute = Fixture.execute } });
+    var provisioned = ProvisionedTableReadSource.init("unused", catalog, raft_mod.read_gate.alreadyReadSafeBarrier());
+    provisioned.distributed_router = router;
+    var context = ProvisionedGraphWorkerContext.init(&provisioned);
+    const expand = distributed_graph.GraphExpandRequest{ .name = @constCast("walk"), .index_name = @constCast("graph_idx"), .frontier = &.{}, .exclude_nodes = &.{}, .exclude_edges = &.{}, .params = .{}, .topology_epoch = 7 };
+    const hydrate = distributed_graph.GraphHydrateRequest{ .keys = &.{}, .topology_epoch = 7 };
+    const edges = distributed_graph.GraphEdgesRequest{ .index_name = @constCast("graph_idx"), .key = @constCast("doc:a"), .direction = .out, .topology_epoch = 7 };
+    // A range selected by an admitted query has disappeared. Keep this distinct
+    // from a missing table so the coordinator can refresh its whole attempt.
+    try std.testing.expectError(error.UnknownGroup, executeHostedGraphExpand(&hosted, alloc, 42, "docs", expand, .read_index));
+    try std.testing.expectError(error.UnknownGroup, executeHostedGraphHydrate(&hosted, alloc, 42, "docs", hydrate, .read_index));
+    try std.testing.expectError(error.UnknownGroup, executeHostedGraphGetEdges(&hosted, alloc, 42, "docs", edges, .read_index));
+    try std.testing.expectError(error.UnknownGroup, executeProvisionedGraphExpand(&context, alloc, 42, "docs", expand, .read_index));
+    try std.testing.expectError(error.UnknownGroup, executeProvisionedGraphHydrate(&context, alloc, 42, "docs", hydrate, .read_index));
+    try std.testing.expectError(error.UnknownGroup, executeProvisionedGraphGetEdges(&context, alloc, 42, "docs", edges, .read_index));
+}
+
 fn executeHostedGraphExpand(
     ptr: *anyopaque,
     alloc: std.mem.Allocator,
@@ -10228,7 +10273,7 @@ fn executeHostedGraphExpand(
     req: distributed_graph.GraphExpandRequest,
     consistency: raft_mod.ReadConsistency,
 ) !distributed_graph.GraphExpandResponse {
-    return (try HostedProvisionedTableReadSource.graphExpandGroupLocal(ptr, alloc, group_id, table_name, req, consistency)) orelse return error.TableNotFound;
+    return (try HostedProvisionedTableReadSource.graphExpandGroupLocal(ptr, alloc, group_id, table_name, req, consistency)) orelse return error.UnknownGroup;
 }
 
 fn executeHostedGraphHydrate(
@@ -10240,7 +10285,7 @@ fn executeHostedGraphHydrate(
     consistency: raft_mod.ReadConsistency,
 ) !distributed_graph.GraphHydrateResponse {
     const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-    var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
+    var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.UnknownGroup;
     defer route.deinit(alloc);
 
     return switch (route) {
@@ -10301,7 +10346,7 @@ fn executeProvisionedGraphGetEdges(
             router,
             group_id,
             routePolicyForConsistency(consistency),
-        )) orelse return error.TableNotFound;
+        )) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
         switch (route) {
             .local => {},
@@ -10387,7 +10432,7 @@ fn executeHostedGraphGetEdges(
     consistency: raft_mod.ReadConsistency,
 ) anyerror!distributed_graph.GraphEdgesResponse {
     const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-    var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
+    var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.UnknownGroup;
     defer route.deinit(alloc);
 
     return switch (route) {

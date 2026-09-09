@@ -7549,7 +7549,7 @@ pub const DB = struct {
             identity_visibility_deletes.deinit(self.alloc);
         }
 
-        const batch_timestamp_ns = if (effective_req.timestamp_ns != 0) effective_req.timestamp_ns else currentTimeNs();
+        const batch_timestamp_ns = if (effective_req.timestamp_ns != 0) effective_req.timestamp_ns else self.backend_runtime.clock().nowRealtimeNs();
 
         for (effective_req.writes, 0..) |write, i| {
             if (isMetadataKey(write.key)) {
@@ -56796,6 +56796,35 @@ test "db close retires runtime owners for memory primary backend" {
         .run = Fns.run,
         .deinit = Fns.deinit,
     }));
+}
+
+test "db implicit batch timestamps use the borrowed runtime clock" {
+    const alloc = std.testing.allocator;
+    var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{ .realtime_ns = 7 * std.time.ns_per_s });
+    defer vopr_io.deinit();
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = vopr_io.io() },
+    });
+    defer runtime.deinit();
+    var directory = try TestDirectory.init("batch-clock");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{
+        .backend_runtime = runtime.ptr(),
+        .executor = .{ .backend = .manual },
+        .primary_backend = .{ .mem = .{} },
+        .physical_root_mode = .external_backend,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{}" }}, .sync_level = .write });
+    try std.testing.expectEqual(@as(u64, 7 * std.time.ns_per_s), try db.getTimestamp(alloc, "doc:a"));
+    vopr_io.realtime_ns += 3 * std.time.ns_per_s;
+    try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{}" }}, .sync_level = .write });
+    try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_s), try db.getTimestamp(alloc, "doc:b"));
+    try db.batch(.{ .writes = &.{.{ .key = "doc:c", .value = "{}" }}, .timestamp_ns = 99, .sync_level = .write });
+    try std.testing.expectEqual(@as(u64, 99), try db.getTimestamp(alloc, "doc:c"));
 }
 
 test "background maintenance services lifecycle runs on borrowed VoprIo" {

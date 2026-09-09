@@ -2658,8 +2658,8 @@ test "data raft apply store accepts restart replay split below the durable water
         });
 
         const shard = store.batchShard(33);
-        shard.mutex.lockUncancelable(store.io_impl.io());
-        defer shard.mutex.unlock(store.io_impl.io());
+        shard.mutex.lockUncancelable(store.runtimeIo());
+        defer shard.mutex.unlock(store.runtimeIo());
         const group_store = (try store.groupStoreLocked(shard, 33, false)) orelse return error.MissingGroupStore;
         var identity_key_buf: [176]u8 = undefined;
         const identity_key = try RaftApplyStore.entryIdentityKeyForGroup(&identity_key_buf, 33, 1);
@@ -2788,8 +2788,8 @@ test "data raft apply store accepts restart replay split below the durable water
         try store.snapshotBuilder().applyBatch(.{ .group_id = 34, .commit_index = 2, .entries_bytes = later });
 
         const shard = store.batchShard(34);
-        shard.mutex.lockUncancelable(store.io_impl.io());
-        defer shard.mutex.unlock(store.io_impl.io());
+        shard.mutex.lockUncancelable(store.runtimeIo());
+        defer shard.mutex.unlock(store.runtimeIo());
         const group_store = (try store.groupStoreLocked(shard, 34, false)) orelse return error.MissingGroupStore;
         var identity_key_buf: [176]u8 = undefined;
         const identity_key = try RaftApplyStore.entryIdentityKeyForGroup(&identity_key_buf, 34, 1);
@@ -2812,9 +2812,9 @@ test "data raft apply store accepts restart replay split below the durable water
         try store.snapshotBuilder().applyBatch(.{ .group_id = 34, .commit_index = 1, .entries_bytes = legacy });
 
         const shard = store.batchShard(34);
-        shard.mutex.lockUncancelable(store.io_impl.io());
+        shard.mutex.lockUncancelable(store.runtimeIo());
         {
-            defer shard.mutex.unlock(store.io_impl.io());
+            defer shard.mutex.unlock(store.runtimeIo());
             const group_store = (try store.groupStoreLocked(shard, 34, false)) orelse return error.MissingGroupStore;
             var coverage_key_buf: [176]u8 = undefined;
             const coverage_key = try RaftApplyStore.entryIdentityCoverageKeyForGroup(&coverage_key_buf, 34);
@@ -2887,8 +2887,8 @@ test "data raft apply store accepts restart replay split below the durable water
     try std.testing.expectError(error.AppliedSnapshotIndexMismatch, store.snapshotBuilder().prepareSnapshot(35, 2));
     {
         const shard = store.batchShard(35);
-        shard.mutex.lockUncancelable(store.io_impl.io());
-        defer shard.mutex.unlock(store.io_impl.io());
+        shard.mutex.lockUncancelable(store.runtimeIo());
+        defer shard.mutex.unlock(store.runtimeIo());
         const group_store = (try store.groupStoreLocked(shard, 35, false)) orelse return error.MissingGroupStore;
         var identity_key_buf: [176]u8 = undefined;
         const identity_key = try RaftApplyStore.entryIdentityKeyForGroup(&identity_key_buf, 35, 1);
@@ -2900,8 +2900,8 @@ test "data raft apply store accepts restart replay split below the durable water
     snapshot.deinit();
     {
         const shard = store.batchShard(35);
-        shard.mutex.lockUncancelable(store.io_impl.io());
-        defer shard.mutex.unlock(store.io_impl.io());
+        shard.mutex.lockUncancelable(store.runtimeIo());
+        defer shard.mutex.unlock(store.runtimeIo());
         const group_store = (try store.groupStoreLocked(shard, 35, false)) orelse return error.MissingGroupStore;
         var identity_key_buf: [176]u8 = undefined;
         for (1..4) |index| {
@@ -2960,8 +2960,8 @@ test "data raft apply store accepts restart replay split below the durable water
 
     {
         const shard = store.batchShard(35);
-        shard.mutex.lockUncancelable(store.io_impl.io());
-        defer shard.mutex.unlock(store.io_impl.io());
+        shard.mutex.lockUncancelable(store.runtimeIo());
+        defer shard.mutex.unlock(store.runtimeIo());
         const group_store = (try store.groupStoreLocked(shard, 35, false)) orelse return error.MissingGroupStore;
         var identity_key_buf: [176]u8 = undefined;
         const identity_key = try RaftApplyStore.entryIdentityKeyForGroup(&identity_key_buf, 35, 4);
@@ -2988,20 +2988,7 @@ test "data raft apply store accepts equivalent restart replay with different bat
                 for (metadata.normal_entries) |entry| alloc.free(entry.data);
                 alloc.free(metadata.normal_entries);
                 alloc.free(metadata.entry_identities);
-                for (metadata.operations) |operation| switch (operation) {
-                    .put => |put| {
-                        alloc.free(put.key);
-                        alloc.free(put.value);
-                    },
-                    .delete => |key| alloc.free(key),
-                    .set_range => |range| {
-                        alloc.free(range.start);
-                        alloc.free(range.end);
-                    },
-                    .prepare_split, .start_split, .finalize_split, .rollback_split => |transition| alloc.free(transition.split_key),
-                    .acknowledge_split, .set_raft_batch_protocol, .flush_split_delta => {},
-                };
-                alloc.free(metadata.operations);
+                RaftApplyStore.freeDataOperations(alloc, metadata.operations);
             }
             try std.testing.expectEqual(@as(usize, 3), metadata.entry_identities.len);
             try std.testing.expectEqual(@as(usize, 2), metadata.normal_entries.len);

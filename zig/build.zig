@@ -5639,6 +5639,7 @@ pub fn build(b: *std.Build) void {
     const lib_metadata_vopr_virtual_smoke_default_filters = [_][]const u8{
         "metadata VOPR candidate status marks explicitly supplied disk sizes known",
         "metadata VOPR split runtime preserves source identity namespace",
+        "metadata VOPR source seeding preserves arbitrary keys and open range bounds",
         "metadata VOPR merge runtime records doc identity reassignment opt-in",
         "metadata VOPR http cluster drives table placement convergence",
         "metadata VOPR http cluster drives split intent through the control loop",
@@ -6898,9 +6899,10 @@ pub fn build(b: *std.Build) void {
     const run_lib_api_docid_tests = addFilteredTestRunArtifact(b, lib_api_docid_tests);
     const lib_api_graph_snapshot_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{
+        .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, &.{
             "api distributed graph preserves per-shard snapshots across result refs expansion and hydration",
             "distributed graph retries once on topology change and succeeds",
+            "graph workers report retired ranges as topology unavailability",
             "distributed graph incoming probe expands only positive source shards",
             "incoming graph route cache is exact and generation fenced",
             "incoming graph route durable hint coalescer is byte bounded",
@@ -6912,7 +6914,7 @@ pub fn build(b: *std.Build) void {
             "distributed graph root probe retires resolved keys between shard waves",
             "distributed graph supports cross-range traverse target selectors",
             "distributed graph traverse routes cross-table frontier by table generation",
-        },
+        }),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -8222,6 +8224,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "metadata VOPR distributed data survives split partition node restart and modeled storage crash",
             "metadata VOPR split runtime preserves source identity namespace",
+            "metadata VOPR source seeding preserves arbitrary keys and open range bounds",
             "public api linearizable read driver ignores a delayed earlier generation",
             "table transaction identities borrow runtime entropy and realtime",
             "transaction attempt budgets follow the borrowed transport clock",
@@ -8229,7 +8232,10 @@ pub fn build(b: *std.Build) void {
             "internal transaction ingress establishes and validates pre-decision deadline",
             "table reads translate request deadlines into the routing clock",
             "catalog route fence dispatch is strict and fail closed",
+            "metadata raft apply store catalog projection uses storage snapshot independently from apply mutex",
             "db modeled index repair adopts replacements with the serving allocator",
+            "db implicit batch timestamps use the borrowed runtime clock",
+            "graph workers report retired ranges as topology unavailability",
             "full cluster production data plane VOPR bounded cutoff exact replay",
             "full cluster VOPR exact replays the composed deployment and recovery",
         },
