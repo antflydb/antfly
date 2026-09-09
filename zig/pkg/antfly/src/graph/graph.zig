@@ -792,7 +792,7 @@ const graph_metric_packed_f64_header_len: usize = 24;
 const graph_metric_build_adoption_cursor_prefix = "@adopt:";
 const graph_metric_partition_plan_key = "meta:metric_partition_plan:v7";
 const graph_metric_partition_census_key = "meta:metric_partition_census:v2";
-const graph_metric_partition_plan_version: u32 = 7;
+const graph_metric_partition_plan_version: u32 = 8;
 const graph_metric_partition_plan_checksum_seed: u64 = 0xA17F_504C_414E_0007;
 // The public API caps top-K at this value. Retaining a rank entry for every
 // score doubles write/storage amplification without improving any supported
@@ -3092,39 +3092,120 @@ pub const GraphIndex = struct {
                 if (plan.edge_generation == try self.graphMetricFilterGeneration(&txn, cfg.edge_filter)) return true;
             };
         }
-        if (!try self.prepareGraphMetricPartitionStep(max_records)) return false;
-        var batch = try self.beginWriteReverseBatch();
-        errdefer batch.abort();
-        // A concurrent planner may already have frozen this filter epoch.
-        // Never replace its ranges merely because an unrelated type changed.
-        const epoch = try self.graphMetricFilterGeneration(&batch, cfg.edge_filter);
-        const existing = self.graphMetricPartitionPlanRaw(&batch, cfg) catch |err| switch (err) {
-            error.GraphMetricBuildSnapshotChanged => null,
-            else => return err,
-        };
-        if (existing) |raw| if (try self.decodeGraphMetricPartitionPlanAlloc(raw)) |value| {
-            var plan = value;
-            defer plan.deinit(self.alloc);
-            if (plan.edge_generation == epoch) {
-                batch.abort();
-                return true;
-            }
-        };
-        var plan = (try self.decodeGraphMetricPartitionPlanAlloc(try batch.get(graph_metric_partition_plan_key))) orelse return error.GraphMetricBuildSnapshotChanged;
-        defer plan.deinit(self.alloc);
-        plan.validateSnapshot(&batch, try readU64OrZero(&batch, graph_edge_generation_key)) catch |err| switch (err) {
-            error.GraphMetricBuildSnapshotChanged => {
-                batch.abort();
-                return false;
-            },
-            else => return err,
-        };
-        plan.edge_generation = epoch;
+        // A filtered census is independent of the global graph generation.
+        // First count selected edges and distinct endpoints, then choose exact
+        // partition boundaries. The same key holds either progress or a plan,
+        // so normal filter-plan GC also reclaims abandoned censuses.
         const key = try self.graphMetricPartitionPlanKeyAlloc(cfg.edge_filter);
         defer self.alloc.free(key);
-        try self.putGraphMetricPartitionPlanAtKeyInBatch(&batch, key, plan);
+        var prior: []u8 = &.{};
+        defer self.alloc.free(prior);
+        var state: partition_census.State = undefined;
+        var phase: u8 = 0;
+        var complete = false;
+        {
+            var txn = try self.beginReadReverseTxn();
+            defer txn.abort();
+            const epoch = try self.graphMetricFilterGeneration(&txn, cfg.edge_filter);
+            state = .{ .generation = epoch, .edge_count = 0, .node_count = 0 };
+            errdefer state.deinit(self.alloc);
+            prior = try self.alloc.dupe(u8, txn.get(key) catch |err| switch (err) {
+                error.NotFound => "",
+                else => return err,
+            });
+            if (try self.decodeGraphMetricPartitionPlanAlloc(prior)) |value| {
+                var plan = value;
+                defer plan.deinit(self.alloc);
+                if (plan.edge_generation == epoch) return true;
+            }
+            if (prior.len > 2 and prior[0] == 0xff and prior[1] <= 2) {
+                if (try partition_census.State.decodeAlloc(self.alloc, prior[2..])) |value| {
+                    var saved = value;
+                    if (saved.generation == epoch) {
+                        state = saved;
+                        phase = prior[1];
+                    } else saved.deinit(self.alloc);
+                }
+            }
+            complete = try self.advanceFilteredPartitionCensus(&txn, cfg, &state, &phase, max_records);
+        }
+        defer state.deinit(self.alloc);
+        var batch = try self.beginWriteReverseBatch();
+        errdefer batch.abort();
+        const current = batch.get(key) catch |err| switch (err) {
+            error.NotFound => "",
+            else => return err,
+        };
+        if (!std.mem.eql(u8, current, prior) or state.generation != try self.graphMetricFilterGeneration(&batch, cfg.edge_filter)) {
+            batch.abort();
+            return false;
+        }
+        if (complete) {
+            var plan = GraphMetricPartitionPlan{
+                .edge_generation = state.generation,
+                .edge_count = state.edge_count,
+                .node_count = state.node_count,
+                .edge_page_count = self.graphMetricDegreeScanPageCount(@intCast(state.edge_count)),
+                .node_page_count = self.graphMetricDegreeReducePageCount(@intCast(state.node_count)),
+                .edge_boundaries = state.edge_boundaries,
+                .node_boundaries = state.node_boundaries,
+            };
+            defer plan.edge_page_units.deinit(self.alloc);
+            for (0..plan.edge_page_count) |page| try plan.edge_page_units.append(self.alloc, graphMetricPartitionSpan(@intCast(state.edge_count), plan.edge_page_count, page).len);
+            try self.putGraphMetricPartitionPlanAtKeyInBatch(&batch, key, plan);
+        } else {
+            const raw = try state.encodeAlloc(self.alloc);
+            defer self.alloc.free(raw);
+            const encoded = try std.mem.concat(self.alloc, u8, &.{ &.{ 0xff, phase }, raw });
+            defer self.alloc.free(encoded);
+            try batch.put(key, encoded);
+        }
         try batch.commit();
-        return true;
+        return complete;
+    }
+
+    fn advanceFilteredPartitionCensus(self: *GraphIndex, txn: anytype, cfg: GraphMetricConfig, state: *partition_census.State, phase: *u8, max_records: usize) !bool {
+        var remaining = max_records;
+        var bytes: usize = 0;
+        while (true) {
+            const nodes = phase.* == 1 or (phase.* == 2 and state.edges_done);
+            const progress = if (nodes) &state.node_cursor else &state.edge_cursor;
+            var cursor = try typed_edges.MergedCursor.init(self.alloc, txn, cfg.edge_filter.types, nodes, progress.*);
+            defer cursor.deinit();
+            while (try cursor.next()) |key| {
+                if (remaining == 0 or (remaining < max_records and bytes +| key.len > 1024 * 1024)) return false;
+                bytes +|= key.len;
+                remaining -= 1;
+                if (phase.* < 2) {
+                    const count = if (nodes) &state.node_count else &state.edge_count;
+                    count.* = std.math.add(u64, count.*, 1) catch return error.GraphMetricBuildBudgetExceeded;
+                } else {
+                    const seen = if (nodes) &state.nodes_seen else &state.edges_seen;
+                    const count = std.math.cast(usize, if (nodes) state.node_count else state.edge_count) orelse return error.GraphMetricBuildBudgetExceeded;
+                    const boundaries = if (nodes) &state.node_boundaries else &state.edge_boundaries;
+                    const pages = if (nodes) self.graphMetricDegreeReducePageCount(count) else self.graphMetricDegreeScanPageCount(count);
+                    const page = boundaries.items.len;
+                    if (page < pages and seen.* == graphMetricPartitionSpan(count, pages, page).start) {
+                        try boundaries.ensureUnusedCapacity(self.alloc, 1);
+                        boundaries.appendAssumeCapacity(try self.alloc.dupe(u8, key));
+                    }
+                    seen.* += 1;
+                    if (seen.* > count) return error.InvalidGraphMetricPartitionCensus;
+                }
+                try self.replaceOwnedBytes(progress, key);
+            }
+            try self.replaceOwnedBytes(progress, "");
+            if (phase.* < 2) {
+                phase.* += 1;
+            } else if (!nodes) {
+                if (state.edges_seen != state.edge_count) return error.InvalidGraphMetricPartitionCensus;
+                state.edges_done = true;
+            } else {
+                if (state.nodes_seen != state.node_count) return error.InvalidGraphMetricPartitionCensus;
+                return true;
+            }
+            if (remaining == 0) return false;
+        }
     }
 
     fn cachedGraphMetricPartitionPlan(self: *GraphIndex) !GraphMetricPartitionPlan {
@@ -3261,7 +3342,7 @@ pub const GraphIndex = struct {
                 if (try parseMetricReverseEdgeKeyView(temp, entry.key, self.index_name)) |parsed_value| {
                     var parsed = parsed_value;
                     defer parsed.deinit(temp);
-                    try postings.append(temp, try typed_edges.keyAlloc(temp, parsed.edge_type.bytes, entry.key));
+                    try postings.append(temp, next_cursor);
                 }
             }
             complete = item == null;
@@ -3276,7 +3357,13 @@ pub const GraphIndex = struct {
             batch.abort();
             return false;
         }
-        for (postings.items) |key| try batch.put(key, "");
+        for (postings.items) |key| {
+            var parsed = (try parseMetricReverseEdgeKeyView(temp, key, self.index_name)) orelse return error.InvalidGraphMetricBuildManifest;
+            defer parsed.deinit(temp);
+            // Mutation scratch is released per edge; only the bounded raw-key
+            // page and decoded endpoints remain in the checkpoint arena.
+            try typed_edges.update(self.alloc, &batch, parsed.edge_type.bytes, key, parsed.source.bytes, parsed.target.bytes, true);
+        }
         if (complete) {
             try batch.put(typed_edges.ready_key, "1");
             batch.delete(typed_edges.cursor_key) catch |err| if (err != error.NotFound) return err;
@@ -6445,9 +6532,8 @@ pub const GraphIndex = struct {
         changes = topology_changes.iterator();
         while (changes.next()) |entry| {
             if (entry.value_ptr.before == entry.value_ptr.after) continue;
-            const key = try typed_edges.keyAlloc(self.alloc, entry.value_ptr.kind, entry.key_ptr.*);
-            defer self.alloc.free(key);
-            if (entry.value_ptr.after) try reverse_batch.put(key, "") else reverse_batch.delete(key) catch |err| if (err != error.NotFound) return err;
+            const mutation = entry.value_ptr.*;
+            try typed_edges.update(self.alloc, &reverse_batch, mutation.kind, entry.key_ptr.*, mutation.source, mutation.target, mutation.after);
         }
         if (prev_edge_count == 0) try reverse_batch.put(typed_edges.ready_key, "1");
         if (changed_types.count() > 0) {
@@ -6471,7 +6557,7 @@ pub const GraphIndex = struct {
         try reverse_batch.commit();
     }
 
-    const TopologyMutation = struct { before: bool, after: bool, kind: []const u8 };
+    const TopologyMutation = struct { before: bool, after: bool, kind: []const u8, source: []const u8, target: []const u8 };
 
     fn rememberTopologyMutation(self: *GraphIndex, txn: anytype, mutations: *std.StringHashMapUnmanaged(TopologyMutation), source: []const u8, target: []const u8, kind: []const u8, after: bool) !void {
         const key = try reverseEdgeKeyAlloc(self.alloc, target, self.index_name, kind, source);
@@ -6485,7 +6571,7 @@ pub const GraphIndex = struct {
             error.NotFound => false,
             else => return err,
         };
-        try mutations.put(self.alloc, key, .{ .before = before, .after = after, .kind = kind });
+        try mutations.put(self.alloc, key, .{ .before = before, .after = after, .kind = kind, .source = source, .target = target });
     }
 
     fn graphMetricTypeEpochKeyAlloc(self: *GraphIndex, kind: []const u8) ![]u8 {
@@ -6527,6 +6613,24 @@ pub const GraphIndex = struct {
     }
 
     pub const MetricEdgeScanBenchmark = struct { visited: usize = 0, matched: usize = 0, checksum: u64 = 0 };
+
+    pub fn benchmarkPartitionCensus(self: *GraphIndex, filter: GraphMetricEdgeFilter) !struct { steps: usize, edges: u64, nodes: u64 } {
+        const cfg = GraphMetricConfig{ .name = "benchmark", .kind = .degree, .edge_filter = filter };
+        const key = try self.graphMetricPartitionPlanKeyAlloc(filter);
+        defer self.alloc.free(key);
+        {
+            var batch = try self.beginWriteReverseBatch();
+            errdefer batch.abort();
+            batch.delete(key) catch |err| if (err != error.NotFound) return err;
+            if (filter.mode == .all) batch.delete(graph_metric_partition_census_key) catch |err| if (err != error.NotFound) return err;
+            try batch.commit();
+        }
+        var steps: usize = 1;
+        while (!try self.prepareGraphMetricPartitionForConfigStep(cfg, 4096)) steps += 1;
+        var plan = try self.cachedGraphMetricPartitionPlanForConfig(cfg);
+        defer plan.deinit(self.alloc);
+        return .{ .steps = steps, .edges = plan.edge_count, .nodes = plan.node_count };
+    }
 
     pub fn benchmarkMetricEdgeScan(self: *GraphIndex, filter: GraphMetricEdgeFilter, reference: bool) !MetricEdgeScanBenchmark {
         var txn = try self.beginReadReverseTxn();
@@ -7574,7 +7678,7 @@ pub const GraphIndex = struct {
     // v17 seals checksummed ordinal coverage and resumes numerical node work
     // by completed-unit offsets instead of borrowed/string dictionary cursors.
     // Older in-flight jobs must restart; published score layout is unchanged.
-    const graph_metric_build_execution_schema_version: u64 = 18;
+    const graph_metric_build_execution_schema_version: u64 = 19;
 
     const GraphMetricBuildManifest = struct {
         execution_schema_version: u64 = graph_metric_build_execution_schema_version,
@@ -9985,7 +10089,11 @@ pub const GraphIndex = struct {
         defer arena.deinit();
         const temp = arena.allocator();
         var nodes = std.ArrayListUnmanaged([]const u8).empty;
-        var cursor: []const u8 = "";
+        // A cursor is progress, not input history. Keep one reusable buffer
+        // outside the arena so long typed keys do not accumulate per edge.
+        var cursor = std.ArrayListUnmanaged(u8).empty;
+        defer cursor.deinit(self.alloc);
+        var retained_input_bytes: usize = 0;
         var scanned: u64 = 0;
         var visited: usize = 0;
         var complete = true;
@@ -9994,12 +10102,18 @@ pub const GraphIndex = struct {
         var cur = try typed_edges.Cursor.init(temp, txn, cfg.edge_filter, page.range_lower, page.range_upper, page.cursor);
         defer cur.deinit();
         while (try cur.next()) |entry| {
-            if (visited == limit) {
+            // Covers decoded/escaped endpoint copies and ordinal lookup
+            // scratch. Permit one oversized record to make forward progress.
+            const envelope = std.math.add(usize, std.math.mul(usize, entry.key.len, 8) catch return error.GraphMetricBuildBudgetExceeded, 256) catch return error.GraphMetricBuildBudgetExceeded;
+            const next_bytes = std.math.add(usize, retained_input_bytes, envelope) catch return error.GraphMetricBuildBudgetExceeded;
+            if (visited == limit or (visited > 0 and next_bytes > 1024 * 1024)) {
                 complete = false;
                 break;
             }
+            retained_input_bytes = next_bytes;
             visited += 1;
-            cursor = try temp.dupe(u8, entry.cursor);
+            cursor.clearRetainingCapacity();
+            try cursor.appendSlice(self.alloc, entry.cursor);
             var parsed = (try parseMetricReverseEdgeKeyView(temp, entry.key, self.index_name)) orelse continue;
             defer parsed.deinit(temp);
             scanned += 1;
@@ -10012,7 +10126,7 @@ pub const GraphIndex = struct {
         const edges = try self.alloc.alloc(ordinal_blocks.Edge, slots.len / 2);
         errdefer self.alloc.free(edges);
         for (edges, 0..) |*edge, i| edge.* = .{ .source = slots[i * 2], .target = slots[i * 2 + 1] };
-        return .{ .edges = edges, .cursor = try self.alloc.dupe(u8, cursor), .scanned = scanned, .complete = complete };
+        return .{ .edges = edges, .cursor = try cursor.toOwnedSlice(self.alloc), .scanned = scanned, .complete = complete };
     }
 
     // Build row-oriented immutable adjacency once. Later iterations schedule
@@ -19170,6 +19284,86 @@ test "graph metric shared topology ordinal cursors bind sealed coverage without 
     try std.testing.expect(std.mem.endsWith(u8, failed.last_error, "cause=InvalidGraphMetricBuildManifest"));
 }
 
+test "graph metric ordinal topology checkpoints stop at byte admission for long typed keys" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-long-type-checkpoint");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-long-type-checkpoint");
+    defer cleanupTmp(rev_path);
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    const kind = "x" ** edge_type_mod.max_bytes;
+    const config = GraphMetricConfig{ .name = "rank", .kind = .pagerank, .edge_filter = .{ .mode = .types, .types = &.{kind} }, .max_iterations = 2 };
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &.{config} });
+    defer graph.close();
+    try graph.batchApply(&.{
+        .{ .source = "a", .target = "b", .edge_type = kind },
+        .{ .source = "b", .target = "a", .edge_type = kind },
+    }, &.{});
+    var started = try graph.ensureGraphMetricPlannedBuild("rank", try graph.graphMetricCurrentGeneration("rank"));
+    started.deinit(alloc);
+    try drainGraphMetricBuildToPublishForTest(&graph, "rank", config, "worker", &.{ .prepare_generation, .scan_edges_and_out_degree, .initialize_ranks });
+    var txn = try graph.beginReadReverseTxn();
+    defer txn.abort();
+    const job = (try graph.metricBuildJob(&txn, "rank")).?;
+    const page = (try graph.metricBuildPage(&txn, "rank", job.job_id, .iterate_contributions, 0, 3)).?;
+    var topology = try graph.ordinalTopologyAlloc(&txn, "rank", config, job.job_id, page, 4096);
+    defer topology.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), topology.edges.len);
+    try std.testing.expect(!topology.complete);
+    try std.testing.expect(topology.cursor.len > kind.len * 2);
+}
+
+test "graph metric filtered census completes during unrelated churn and deduplicates shared endpoints" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-filter-census-churn");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-filter-census-churn");
+    defer cleanupTmp(rev_path);
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    const configs = [_]GraphMetricConfig{.{ .name = "rank", .kind = .pagerank, .edge_filter = .{ .mode = .types, .types = &.{ "links", "cites" } }, .max_iterations = 2 }};
+    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+    defer graph.close();
+    graph.test_partition_target_units = 1;
+    try graph.batchApply(&.{
+        .{ .source = "a", .target = "b", .edge_type = "cites" },
+        .{ .source = "b", .target = "c", .edge_type = "links" },
+    }, &.{});
+    const epoch = try graph.graphMetricCurrentGeneration("rank");
+    var steps: usize = 0;
+    while (!try graph.prepareGraphMetricPartitionForConfigStep(configs[0], 1)) {
+        steps += 1;
+        try std.testing.expect(steps < 32);
+        var id_buf: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "unrelated-{d}", .{steps});
+        try graph.addEdge(id, "unrelated-target", "other", 1, 0, 0, "");
+        if (steps == 3) {
+            graph.close();
+            graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &configs });
+            graph.test_partition_target_units = 1;
+        }
+    }
+    var plan = try graph.cachedGraphMetricPartitionPlanForConfig(configs[0]);
+    defer plan.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), plan.edge_count);
+    try std.testing.expectEqual(@as(u64, 3), plan.node_count);
+    try std.testing.expectEqual(epoch, plan.edge_generation);
+    var published = try graph.runGraphMetricPlannedDrain("rank", epoch, .{ .worker_ids = &.{"worker"}, .max_steps = 2048 });
+    defer published.deinit(alloc);
+    try std.testing.expectEqual(GraphIndex.GraphMetricState.fresh, published.state);
+    try graph.deleteEdge("a", "b", "cites");
+    while (!try graph.prepareGraphMetricPartitionForConfigStep(configs[0], 1)) {}
+    var changed = try graph.cachedGraphMetricPartitionPlanForConfig(configs[0]);
+    defer changed.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), changed.edge_count);
+    try std.testing.expectEqual(@as(u64, 2), changed.node_count);
+}
+
 test "graph metric shared topology dependency epochs survive attribute writes unrelated types and reopen" {
     const alloc = std.testing.allocator;
     var store_buf: [256]u8 = undefined;
@@ -20584,7 +20778,7 @@ test "graph pagerank planned scan page writes durable out-degree intermediates" 
         defer txn.abort();
         const page = try graph.metricBuildPage(&txn, "pagerank", active_job.job_id, .scan_edges_and_out_degree, 0, 1) orelse return error.TestExpectedGraphMetricBuildPage;
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.complete, page.state);
-        try std.testing.expectEqual(@as(u64, 4), page.completed_units);
+        try std.testing.expectEqual(@as(u64, 3), page.completed_units);
         try std.testing.expect(page.output_fingerprint != 0);
         const job = try graph.metricBuildJob(&txn, "pagerank") orelse return error.TestExpectedGraphMetricBuildJob;
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.initialize_ranks, job.phase);
@@ -20615,7 +20809,7 @@ test "graph pagerank planned scan page writes durable out-degree intermediates" 
         defer txn.abort();
         const page = try graph.metricBuildPage(&txn, "pagerank", active_job.job_id, .initialize_ranks, 0, 2) orelse return error.TestExpectedGraphMetricBuildPage;
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPageState.complete, page.state);
-        try std.testing.expectEqual(@as(u64, 4), page.completed_units);
+        try std.testing.expectEqual(@as(u64, 3), page.completed_units);
         try std.testing.expect(page.output_fingerprint != 0);
         const job = try graph.metricBuildJob(&txn, "pagerank") orelse return error.TestExpectedGraphMetricBuildJob;
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.iterate_contributions, job.phase);
@@ -28530,9 +28724,7 @@ test "graph metric filtered scan checkpoints backfill survives reopen and concur
         for ([_][]const u8{ "b", "c" }) |target| {
             const raw = try reverseEdgeKeyAlloc(alloc, target, "links", "cites", "source");
             defer alloc.free(raw);
-            const key = try typed_edges.keyAlloc(alloc, "cites", raw);
-            defer alloc.free(key);
-            try batch.delete(key);
+            try typed_edges.update(alloc, &batch, "cites", raw, "source", target, false);
         }
         try batch.commit();
     }

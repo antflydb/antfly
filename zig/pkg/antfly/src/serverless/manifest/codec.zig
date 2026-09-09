@@ -140,7 +140,7 @@ fn decodePolicy(data: []const u8, pos_ptr: *usize) !catalog_types.NamespacePolic
 
 fn artifactEncodedSize(artifact: manifest_types.ArtifactRef) usize {
     const provenance_bytes = 2 + 8 + 8 + 8 + 8;
-    const integrity_bytes: usize = if (artifact.kind == .graph_metric_segment) 4 + 4 + 32 + 32 + 32 + 8 + 32 + 1 + 1 else 0;
+    const integrity_bytes: usize = if (artifact.kind == .graph_metric_segment) 4 + 4 + 32 + 32 + 32 + 8 + 32 + 32 + 1 + 1 else 0;
     return 1 + 4 + 4 + 8 + 4 + provenance_bytes + integrity_bytes + artifact.name.len + artifact.artifact_id.len + artifact.checksum.len;
 }
 
@@ -372,6 +372,8 @@ pub fn encodeForVersionAlloc(alloc: Allocator, manifest: manifest_types.Manifest
             std.mem.writeInt(u64, buf[pos..][0..8], artifact.graph_metric_config_fingerprint, .little);
             pos += 8;
             @memcpy(buf[pos..][0..32], &artifact.graph_metric_source_checksum);
+            pos += 32;
+            @memcpy(buf[pos..][0..32], &artifact.graph_metric_topology_checksum);
             pos += 32;
             buf[pos] = @intFromEnum(artifact.graph_metric_materialization_state);
             pos += 1;
@@ -703,12 +705,13 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
         var graph_metric_point_index_checksum: [32]u8 = @splat(0);
         var graph_metric_config_fingerprint: u64 = 0;
         var graph_metric_source_checksum: [32]u8 = @splat(0);
+        var graph_metric_topology_checksum: [32]u8 = @splat(0);
         var graph_metric_materialization_state: artifact_ref.GraphMetricMaterializationState = .ready;
         var graph_metric_rejection_reason: artifact_ref.GraphMetricRejectionReason = .none;
         // Graph metrics are admitted only on the current manifest wire above,
         // so there is no partially populated legacy integrity shape here.
         if (kind == .graph_metric_segment) {
-            const integrity_len: usize = 4 + 4 + 32 + 32 + 32 + 8 + 32 + 1 + 1;
+            const integrity_len: usize = 4 + 4 + 32 + 32 + 32 + 8 + 32 + 32 + 1 + 1;
             if (pos + integrity_len > data.len) return error.InvalidManifest;
             graph_metric_control_len = std.mem.readInt(u32, data[pos..][0..4], .little);
             pos += 4;
@@ -723,6 +726,8 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
             graph_metric_config_fingerprint = std.mem.readInt(u64, data[pos..][0..8], .little);
             pos += 8;
             @memcpy(&graph_metric_source_checksum, data[pos..][0..32]);
+            pos += 32;
+            @memcpy(&graph_metric_topology_checksum, data[pos..][0..32]);
             pos += 32;
             graph_metric_materialization_state = std.enums.fromInt(artifact_ref.GraphMetricMaterializationState, data[pos]) orelse return error.InvalidManifest;
             pos += 1;
@@ -764,6 +769,7 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
             .graph_metric_point_index_checksum = graph_metric_point_index_checksum,
             .graph_metric_config_fingerprint = graph_metric_config_fingerprint,
             .graph_metric_source_checksum = graph_metric_source_checksum,
+            .graph_metric_topology_checksum = graph_metric_topology_checksum,
             .graph_metric_materialization_state = graph_metric_materialization_state,
             .graph_metric_rejection_reason = graph_metric_rejection_reason,
         };
@@ -1009,6 +1015,7 @@ test "serverless manifest codec round-trips deterministically" {
         .graph_metric_point_index_checksum = @splat(0x44),
         .graph_metric_config_fingerprint = 0x5678,
         .graph_metric_source_checksum = @splat(0x33),
+        .graph_metric_topology_checksum = @splat(0x55),
     };
 
     const encoded_a = try encodeAlloc(alloc, manifest);
@@ -1046,10 +1053,11 @@ test "serverless manifest codec round-trips deterministically" {
     try std.testing.expectEqual(@as(u32, 17), decoded.artifacts[4].graph_metric_routing_footer_len);
     try std.testing.expectEqualSlices(u8, &([_]u8{0x11} ** 32), &decoded.artifacts[4].graph_metric_control_checksum);
     try std.testing.expectEqualSlices(u8, &([_]u8{0x44} ** 32), &decoded.artifacts[4].graph_metric_point_index_checksum);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0x55} ** 32), &decoded.artifacts[4].graph_metric_topology_checksum);
 
     // The current manifest layout retains the old field positions, but graph
     // metrics deliberately fail closed if a pre-release version is forged.
-    const graph_metric_integrity_bytes: usize = 4 + 4 + 32 + 32 + 32 + 8 + 32 + 1 + 1;
+    const graph_metric_integrity_bytes: usize = 4 + 4 + 32 + 32 + 32 + 8 + 32 + 32 + 1 + 1;
     const materializer_bytes: usize = 8;
     const provenance_bytes: usize = 2 + 8 + 8 + 8;
     var current_artifact_bytes: usize = 0;

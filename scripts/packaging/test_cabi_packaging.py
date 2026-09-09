@@ -117,7 +117,7 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("steps.toolchain.outputs.zig_nixpkgs_revision", bootstrap)
         self.assertIn("steps.toolchain.outputs.zig_nix_attribute", bootstrap)
         self.assertIn("steps.toolchain.outputs.zig_version", bootstrap)
-        self.assertIn("nix-build '<nixpkgs>' -A \"$ZIG_NIX_ATTRIBUTE\"", bootstrap)
+        self.assertIn("nix-build '<nixpkgs>' -A " + '"$ZIG_NIX_ATTRIBUTE"', bootstrap)
         self.assertIn('echo "$zig_path/bin" >> "$GITHUB_PATH"', bootstrap)
         self.assertIn("grep -q 'dynamically linked'", bootstrap)
 
@@ -682,9 +682,7 @@ class CAbiPackagingTests(unittest.TestCase):
             tag_file.write_text("1.2.2\n")
             env["FAKE_NPM_TAG_FILE"] = str(tag_file)
             sleep = fake_bin / "sleep"
-            sleep.write_text(
-                '#!/bin/sh\nprintf "1.2.3\\n" > "$FAKE_NPM_TAG_FILE"\n'
-            )
+            sleep.write_text('#!/bin/sh\nprintf "1.2.3\\n" > "$FAKE_NPM_TAG_FILE"\n')
             sleep.chmod(0o755)
             log.write_text("")
             propagated = subprocess.run(

@@ -46,6 +46,7 @@ pub const Segment = struct {
     kind: graph_mod.GraphMetricKind,
     source_graph_artifact_id: []u8,
     source_graph_checksum: []u8,
+    topology_checksum: [32]u8 = @splat(0),
     config_fingerprint: u64,
     /// Identifies the implementation and admission policy that produced this
     /// artifact. A changed runtime policy invalidates terminal rejections and

@@ -132,6 +132,7 @@ fn cloneArtifactRefAlloc(alloc: Allocator, artifact: ArtifactRef) !ArtifactRef {
         .graph_metric_point_index_checksum = artifact.graph_metric_point_index_checksum,
         .graph_metric_config_fingerprint = artifact.graph_metric_config_fingerprint,
         .graph_metric_source_checksum = artifact.graph_metric_source_checksum,
+        .graph_metric_topology_checksum = artifact.graph_metric_topology_checksum,
         .graph_metric_materialization_state = artifact.graph_metric_materialization_state,
         .graph_metric_rejection_reason = artifact.graph_metric_rejection_reason,
     };

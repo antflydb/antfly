@@ -59,6 +59,7 @@ pub const BuildOptions = struct {
     io: ?std.Io = null,
     max_parallelism: usize = 1,
     topology_requirements: ?metrics.TopologyRequirements = null,
+    topology_checksum: [32]u8 = @splat(0),
     /// Optional current-ordinal vectors recovered from the last compatible
     /// publication. They are borrowed for the duration of the build and are
     /// normalized/validated by the storage-independent kernel.
@@ -162,6 +163,73 @@ pub const PreparedGraphArtifact = struct {
     }
 };
 
+// Hash node strings once, then fixed-width endpoint digests once per edge.
+// Type runs and endpoints are canonical; global ordinal renumbering, weights,
+// isolated documents, and unrelated types cannot change a selected digest.
+fn typeChecksumsAlloc(alloc: Allocator, topology: CompiledTopology, limits: Limits, cancellation: CancellationToken) ![][32]u8 {
+    if (try topologyIdentityWorkBytes(topology) > limits.max_total_identity_work_bytes) return error.GraphMetricBuildBudgetExceeded;
+    if (topology.retained_bytes >= limits.max_peak_memory_bytes) return error.GraphMetricBuildBudgetExceeded;
+    var limiter = try bounded_decode.AllocationLimiter.init(alloc, limits.max_peak_memory_bytes - topology.retained_bytes);
+    return typeChecksumsBoundedAlloc(limiter.allocator(), topology, cancellation) catch |err| {
+        if (err == error.OutOfMemory and limiter.limit_exceeded) return error.GraphMetricBuildBudgetExceeded;
+        return err;
+    };
+}
+
+fn topologyIdentityWorkBytes(topology: CompiledTopology) !u64 {
+    var bytes = std.math.mul(u64, topology.edges.len, 64) catch return error.GraphMetricBuildBudgetExceeded;
+    bytes = std.math.add(u64, bytes, std.math.mul(u64, topology.node_ids.len, 64) catch return error.GraphMetricBuildBudgetExceeded) catch return error.GraphMetricBuildBudgetExceeded;
+    bytes = std.math.add(u64, bytes, std.math.mul(u64, topology.edge_types.len, 128) catch return error.GraphMetricBuildBudgetExceeded) catch return error.GraphMetricBuildBudgetExceeded;
+    for (topology.node_ids) |id| bytes = std.math.add(u64, bytes, id.len) catch return error.GraphMetricBuildBudgetExceeded;
+    for (topology.edge_types) |kind| bytes = std.math.add(u64, bytes, kind.len) catch return error.GraphMetricBuildBudgetExceeded;
+    return bytes;
+}
+
+fn typeChecksumsBoundedAlloc(alloc: Allocator, topology: CompiledTopology, cancellation: CancellationToken) ![][32]u8 {
+    const nodes = try alloc.alloc([32]u8, topology.node_ids.len);
+    defer alloc.free(nodes);
+    for (topology.node_ids, nodes, 0..) |id, *digest, i| {
+        if (i % 256 == 0) try cancellation.check();
+        std.crypto.hash.sha2.Sha256.hash(id, digest, .{});
+    }
+    const result = try alloc.alloc([32]u8, topology.edge_types.len);
+    errdefer alloc.free(result);
+    for (topology.edge_types, result, 0..) |kind, *digest, i| {
+        try cancellation.check();
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("antfly:unweighted-type:v1");
+        var count: [8]u8 = undefined;
+        std.mem.writeInt(u64, &count, kind.len, .little);
+        hash.update(&count);
+        hash.update(kind);
+        const edges = topology.edges[topology.edge_type_offsets[i]..topology.edge_type_offsets[i + 1]];
+        std.mem.writeInt(u64, &count, edges.len, .little);
+        hash.update(&count);
+        for (edges, 0..) |edge, j| {
+            if (j % 4096 == 0) try cancellation.check();
+            hash.update(&nodes[edge.source]);
+            hash.update(&nodes[edge.target]);
+        }
+        hash.final(digest);
+    }
+    return result;
+}
+
+fn selectedTopologyChecksum(topology: CompiledTopology, checksums: []const [32]u8, filter: graph_mod.GraphMetricEdgeFilter) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly:selected-unweighted-topology:v1");
+    for (topology.edge_types, checksums, 0..) |kind, digest, i| {
+        if (topology.edge_type_offsets[i] == topology.edge_type_offsets[i + 1]) continue;
+        if (filter.mode != .all and for (filter.types) |selected| {
+            if (std.mem.eql(u8, selected, kind)) break false;
+        } else true) continue;
+        hash.update(&digest);
+    }
+    var result: [32]u8 = undefined;
+    hash.final(&result);
+    return result;
+}
+
 pub fn artifactNameAlloc(alloc: Allocator, graph_index_name: []const u8, metric_name: []const u8) ![]u8 {
     return metric_segment.artifactNameAlloc(alloc, graph_index_name, metric_name) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -238,6 +306,7 @@ pub fn publishFromGraphPayloadAlloc(alloc: Allocator, artifacts: *artifact_store
         .graph_metric_point_index_checksum = built.artifact.graph_metric_point_index_checksum,
         .graph_metric_config_fingerprint = built.artifact.graph_metric_config_fingerprint,
         .graph_metric_source_checksum = built.artifact.graph_metric_source_checksum,
+        .graph_metric_topology_checksum = built.artifact.graph_metric_topology_checksum,
         .graph_metric_materialization_state = built.artifact.graph_metric_materialization_state,
         .graph_metric_rejection_reason = built.artifact.graph_metric_rejection_reason,
     };
@@ -501,6 +570,50 @@ fn publishPreparedComputationsAlloc(
     errdefer {
         for (refs, initialized) |ref, ready| if (ready) freeArtifactRef(alloc, ref);
     }
+    const topology_checksums = try alloc.alloc([32]u8, configs.len);
+    defer alloc.free(topology_checksums);
+    @memset(topology_checksums, @splat(0));
+    {
+        const work = topologyIdentityWorkBytes(prepared.topology) catch std.math.maxInt(u64);
+        if (work <= limits.max_total_identity_work_bytes -| batch_budget.identity_work_bytes) {
+            batch_budget.identity_work_bytes += work;
+            // Fingerprinting may overlap a cached projection from an earlier
+            // call. Account for it, and make the optional allocation a no-op
+            // when it would crowd out already retained work.
+            var hashing_topology = prepared.topology;
+            if (prepared.cached_projection) |projection| hashing_topology.retained_bytes = try projectionResidentMemoryBytes(projection);
+            const type_checksums = typeChecksumsAlloc(alloc, hashing_topology, limits, cancellation) catch |err| switch (err) {
+                error.GraphMetricBuildBudgetExceeded => null,
+                else => return err,
+            };
+            if (type_checksums) |checksums| {
+                defer alloc.free(checksums);
+                for (configs, topology_checksums) |config, *digest| digest.* = selectedTopologyChecksum(prepared.topology, checksums, config.edge_filter);
+            }
+        }
+    }
+    var inventory = PriorInventory{ .budget = batch_budget };
+    defer inventory.deinit(alloc);
+    for (configs, topology_checksums, 0..) |config, digest, i| {
+        if (prior_artifacts.len == 0) break;
+        const prior = prior_artifacts[i] orelse continue;
+        const zero: [32]u8 = @splat(0);
+        if (std.mem.eql(u8, &digest, &zero)) continue;
+        const request = PublicationRequest{ .graph_index_name = graph_index_name, .source_graph = source_graph, .config = config, .provenance = provenance };
+        if (prior.metadata_version != metric_segment.wire_version or prior.graph_metric_materialization_state != .ready or
+            prior.graph_metric_config_fingerprint != configFingerprint(config) or prior.materializer_fingerprint != materializerFingerprint(limits) or
+            prior.byte_len == 0 or prior.byte_len > limits.max_metric_payload_bytes or
+            !std.mem.eql(u8, &prior.graph_metric_topology_checksum, &digest)) continue;
+        const header = (try inventory.header(alloc, artifacts, prior, request, cancellation)) orelse continue;
+        if (header.version != metric_segment.wire_version or header.kind != config.kind or
+            header.materialization_state != .ready or header.config_fingerprint != configFingerprint(config) or
+            header.materializer_fingerprint != materializerFingerprint(limits) or !std.mem.eql(u8, &header.topology_checksum, &digest)) continue;
+        refs[i] = try aliasRefAlloc(alloc, prior, graph_index_name, config.name, provenance);
+        initialized[i] = true;
+        processed[i] = true;
+        refs[i].computed_at_ms = prior.computed_at_ms;
+        refs[i].graph_metric_source_checksum = try artifact_store.sha256DigestFromChecksum(source_graph.checksum);
+    }
     while (true) {
         const first = for (processed, 0..) |done, i| {
             if (!done) break i;
@@ -537,6 +650,7 @@ fn publishPreparedComputationsAlloc(
             .io = runtime.io,
             .max_parallelism = runtime.max_parallelism,
             .topology_requirements = group_requirements,
+            .topology_checksum = topology_checksums[first],
         };
         const projection_result = preparedProjectionAlloc(alloc, prepared, group_options) catch |err| switch (err) {
             error.GraphMetricBuildBudgetExceeded => {
@@ -666,7 +780,7 @@ fn aliasRefAlloc(alloc: Allocator, original: artifact_ref.ArtifactRef, index_nam
     ref.checksum = try alloc.dupe(u8, original.checksum);
     ref.published_generation = provenance.published_generation;
     ref.edge_generation = provenance.edge_generation;
-    ref.computed_at_ms = provenance.computed_at_ms;
+    ref.computed_at_ms = if (original.computed_at_ms != 0) original.computed_at_ms else provenance.computed_at_ms;
     return ref;
 }
 
@@ -704,6 +818,20 @@ fn admissionPlanUnchanged(alloc: Allocator, requests: []const PublicationRequest
     return index == requests.len;
 }
 
+/// Publication provenance and authenticated computation identity are separate.
+/// A zero identity disables cross-source reuse, never source authentication.
+pub fn metricSourceMatches(header: anytype, graph: artifact_ref.ArtifactRef, metric: artifact_ref.ArtifactRef) bool {
+    const zero: [32]u8 = @splat(0);
+    if (!std.mem.eql(u8, &metric.graph_metric_topology_checksum, &zero)) {
+        const source = artifact_store.sha256DigestFromChecksum(graph.checksum) catch return false;
+        return std.mem.eql(u8, &header.topology_checksum, &metric.graph_metric_topology_checksum) and
+            std.mem.eql(u8, &source, &metric.graph_metric_source_checksum);
+    }
+    return std.mem.eql(u8, &header.topology_checksum, &zero) and
+        std.mem.eql(u8, header.source_graph_artifact_id, graph.artifact_id) and
+        std.mem.eql(u8, header.source_graph_checksum, graph.checksum);
+}
+
 fn priorIdentifiesComputation(prior: artifact_ref.ArtifactRef, request: PublicationRequest, limits: Limits) bool {
     const source_checksum = artifact_store.sha256DigestFromChecksum(request.source_graph.checksum) catch return false;
     return prior.kind == .graph_metric_segment and prior.metadata_version == metric_segment.wire_version and
@@ -735,7 +863,10 @@ const PriorInventory = struct {
         const before = remaining;
         defer self.budget.reuse_read_bytes += before - remaining;
         const prefix = read: {
-            const len = try metric_segment.headerProbeLen(prior.byte_len, request.source_graph.artifact_id, request.source_graph.checksum);
+            _ = request;
+            // A reused artifact can retain original-source strings of a
+            // different length. Its authenticated control length is authoritative.
+            const len = @min(prior.byte_len, prior.graph_metric_control_len);
             // The range verifier authenticates and pins the full object on a
             // cold miss. A separate verify call would duplicate provider HEADs.
             break :read artifacts.getVerifiedRangeAllocWithBudget(alloc, prior.artifact_id, prior.byte_len, prior.checksum, 0, len, cancellation, &remaining) catch |err| switch (err) {
@@ -764,8 +895,7 @@ const PriorInventory = struct {
                         decoded.materializer_fingerprint != materializerFingerprint(limits) or
                         @intFromEnum(decoded.materialization_state) != @intFromEnum(state) or
                         @intFromEnum(decoded.rejection_reason) != @intFromEnum(prior.graph_metric_rejection_reason) or
-                        !std.mem.eql(u8, decoded.source_graph_artifact_id, request.source_graph.artifact_id) or
-                        !std.mem.eql(u8, decoded.source_graph_checksum, request.source_graph.checksum)) continue;
+                        !metricSourceMatches(decoded, request.source_graph, prior)) continue;
                     return prior;
                 }
             }
@@ -924,6 +1054,7 @@ fn putBuildResultAlloc(alloc: Allocator, artifacts: *artifact_store.ArtifactStor
         .graph_metric_point_index_checksum = built.artifact.graph_metric_point_index_checksum,
         .graph_metric_config_fingerprint = built.artifact.graph_metric_config_fingerprint,
         .graph_metric_source_checksum = built.artifact.graph_metric_source_checksum,
+        .graph_metric_topology_checksum = built.artifact.graph_metric_topology_checksum,
         .graph_metric_materialization_state = built.artifact.graph_metric_materialization_state,
         .graph_metric_rejection_reason = built.artifact.graph_metric_rejection_reason,
     };
@@ -2198,10 +2329,15 @@ fn buildFromTopologyAlloc(
     topology: CompiledTopology,
     options: BuildOptions,
 ) !BuildResult {
+    var identified = options;
+    if (typeChecksumsAlloc(alloc, topology, options.limits, options.cancellation)) |checksums| {
+        defer alloc.free(checksums);
+        identified.topology_checksum = selectedTopologyChecksum(topology, checksums, options.config.edge_filter);
+    } else |err| if (err != error.GraphMetricBuildBudgetExceeded) return err;
     var projection = try buildProjectionFromTopologyAlloc(alloc, topology, 0, options);
     defer projection.deinit(alloc);
     projection.decoded_retained_bytes = topology.retained_bytes;
-    return try buildFromProjectionAlloc(alloc, projection, options);
+    return try buildFromProjectionAlloc(alloc, projection, identified);
 }
 
 fn publishHitsPairFromProjectionAlloc(
@@ -2337,6 +2473,7 @@ fn populateGraphMetricIntegrity(ref: *artifact_ref.ArtifactRef, segment: metric_
     ref.graph_metric_routing_checksum = integrity.routing_checksum;
     ref.graph_metric_point_index_checksum = integrity.point_index_checksum;
     ref.graph_metric_config_fingerprint = segment.config_fingerprint;
+    ref.graph_metric_topology_checksum = segment.topology_checksum;
     ref.graph_metric_source_checksum = artifact_store.sha256DigestFromChecksum(segment.source_graph_checksum) catch
         return error.ArtifactIntegrityMismatch;
     ref.graph_metric_materialization_state = @enumFromInt(@intFromEnum(segment.materialization_state));
@@ -2550,6 +2687,7 @@ fn makeMetricSegmentAlloc(alloc: Allocator, options: BuildOptions, result: metri
         .kind = options.config.kind,
         .source_graph_artifact_id = source_artifact_id,
         .source_graph_checksum = source_checksum,
+        .topology_checksum = options.topology_checksum,
         .config_fingerprint = configFingerprint(options.config),
         .materializer_fingerprint = graph_metric_policy.materializerFingerprint(options.limits),
         .published_generation = options.provenance.published_generation,
@@ -2767,6 +2905,64 @@ test "serverless graph metric topology does not alias qualified endpoints with l
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 1 }, compact.outgoing_offsets);
     try std.testing.expectEqual(@as(usize, 0), compact.incoming_sources.len);
     try std.testing.expectEqual(@as(usize, 0), compact.outgoing_targets.len);
+}
+
+test "serverless graph metric semantic reuse authenticates current provenance and skips numerical work" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/semantic-reuse", .{tmp.sub_path});
+    defer alloc.free(root);
+    var fs = try fs_artifact_store.FsStore.init(alloc, root);
+    var artifacts = fs.artifactStore();
+    defer artifacts.deinit();
+    const config = graph_mod.GraphMetricConfig{ .name = "rank", .kind = .pagerank, .max_iterations = 3, .edge_filter = .{ .mode = .types, .types = &.{"cites"} } };
+    var prior: ?artifact_ref.ArtifactRef = null;
+    defer if (prior) |ref| freeArtifactRef(alloc, ref);
+    var first_id: []u8 = &.{};
+    defer alloc.free(first_id);
+    for (0..3) |round| {
+        var graph = graph_segment.Builder{ .alloc = alloc };
+        defer graph.deinit();
+        try graph.addEdge("m", "n", "cites", if (round == 0) 1 else 9, null);
+        if (round > 0) {
+            // Also renumber all global ordinals and add qualified endpoints.
+            try graph.addEdge("a", "b", "other", 1, null);
+            try graph.addEdge("m", "external", "cites", 1, "other-table");
+            try graph.addNode("isolated");
+        }
+        if (round == 2) try graph.addEdge("n", "new", "cites", 1, null);
+        const payload = try graph.encodeAlloc(65536, .none);
+        defer alloc.free(payload);
+        var metadata = try artifacts.put(payload);
+        defer metadata.deinit(alloc);
+        const source = artifact_ref.ArtifactRef{ .kind = .graph_segment, .name = "graph", .artifact_id = metadata.artifact_id, .checksum = metadata.checksum, .byte_len = metadata.byte_len };
+        const request = PublicationRequest{ .graph_index_name = "graph", .source_graph = source, .config = config, .prior_artifact = prior, .provenance = .{ .published_generation = round + 1, .edge_generation = round + 1, .computed_at_ms = (round + 1) * 10 } };
+        var budget = graph_metric_policy.Budget{ .limits = .{} };
+        const refs = try publishRequestsWithPriorAlloc(alloc, &artifacts, &.{request}, if (prior) |ref| &.{ref} else &.{}, .none, .{}, &budget, .{});
+        defer alloc.free(refs);
+        if (prior) |ref| freeArtifactRef(alloc, ref);
+        prior = refs[0];
+        const encoded = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(alloc, prior.?.artifact_id, prior.?.byte_len, prior.?.checksum, .none);
+        defer alloc.free(encoded);
+        const header = try metric_segment.decodeHeader(encoded);
+        try std.testing.expect(metricSourceMatches(header, source, prior.?));
+        var corrupt = prior.?;
+        corrupt.graph_metric_topology_checksum[0] ^= 1;
+        try std.testing.expect(!metricSourceMatches(header, source, corrupt));
+        corrupt = prior.?;
+        corrupt.graph_metric_source_checksum[0] ^= 1;
+        try std.testing.expect(!metricSourceMatches(header, source, corrupt));
+        if (round == 0) first_id = try alloc.dupe(u8, prior.?.artifact_id) else if (round == 1) {
+            try std.testing.expectEqualStrings(first_id, prior.?.artifact_id);
+            try std.testing.expectEqual(@as(u64, 0), budget.work_items);
+            try std.testing.expectEqual(@as(u64, 10), prior.?.computed_at_ms);
+            try std.testing.expectEqual(@as(u64, 2), prior.?.edge_generation);
+        } else {
+            try std.testing.expect(!std.mem.eql(u8, first_id, prior.?.artifact_id));
+            try std.testing.expect(budget.work_items > 0);
+        }
+    }
 }
 
 test "serverless graph metric topology admission tracks distinct edge types" {

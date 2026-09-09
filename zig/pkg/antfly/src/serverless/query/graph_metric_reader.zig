@@ -834,16 +834,11 @@ fn preparePointScoresAlloc(
     const metric_index = session.findNamedArtifactIndex(.graph_metric_segment, artifact_name) orelse return error.MetricNotReady;
     const metric_artifact = session.artifactRef(metric_index) orelse return error.InvalidGraphMetricSegment;
 
-    const control_len = try metric_segment.controlProbeLen(
-        metric_artifact.byte_len,
-        graph_artifact.artifact_id,
-        graph_artifact.checksum,
-        config.edge_filter,
-    );
+    const control_len = metric_artifact.graph_metric_control_len;
     var control_range = try fetchControlAlloc(session, metric_index, metric_artifact, control_len);
     defer control_range.deinit(session.alloc);
     const control = try metric_segment.decodeControl(control_range.bytes, config.edge_filter);
-    try validateControl(control.header, graph_artifact, config);
+    try validateControl(control.header, graph_artifact, metric_artifact, config);
     if (control.header.materialization_state == .rejected) {
         recordRejectionDiagnostic(session, graph_index_name, metric_name, control.header.materializer_fingerprint);
         return error.GraphMetricMaterializationRejected;
@@ -2152,16 +2147,11 @@ pub fn topWithLimitsAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, 
     defer alloc.free(artifact_name);
     const metric_index = session.findNamedArtifactIndex(.graph_metric_segment, artifact_name) orelse return error.MetricNotReady;
     const metric_artifact = session.artifactRef(metric_index) orelse return error.InvalidGraphMetricSegment;
-    const control_len = try metric_segment.controlProbeLen(
-        metric_artifact.byte_len,
-        graph_artifact.artifact_id,
-        graph_artifact.checksum,
-        config.edge_filter,
-    );
+    const control_len = metric_artifact.graph_metric_control_len;
     var control_range = try fetchControlAlloc(session, metric_index, metric_artifact, control_len);
     defer control_range.deinit(session.alloc);
     const control = try metric_segment.decodeControl(control_range.bytes, config.edge_filter);
-    try validateControl(control.header, graph_artifact, config);
+    try validateControl(control.header, graph_artifact, metric_artifact, config);
     if (control.header.materialization_state == .rejected) {
         recordRejectionDiagnostic(session, graph_index_name, metric_name, control.header.materializer_fingerprint);
         return error.GraphMetricMaterializationRejected;
@@ -2288,13 +2278,13 @@ fn findConfig(
 fn validateControl(
     header: metric_segment.codec.Header,
     graph_artifact: anytype,
+    metric_artifact: manifest_mod.ArtifactRef,
     config: graph_mod.GraphMetricConfig,
 ) !void {
     if (header.kind != config.kind or header.config_fingerprint != lake_graph_metric.configFingerprint(config)) {
         return error.MetricStale;
     }
-    if (!std.mem.eql(u8, header.source_graph_artifact_id, graph_artifact.artifact_id) or
-        !std.mem.eql(u8, header.source_graph_checksum, graph_artifact.checksum)) return error.MetricStale;
+    if (!lake_graph_metric.metricSourceMatches(header, graph_artifact, metric_artifact)) return error.MetricStale;
     if (header.materializer_fingerprint != graph_metric_policy.materializerFingerprint(.{})) {
         return error.GraphMetricPolicyStale;
     }
@@ -2326,7 +2316,7 @@ fn loadVerifiedAlloc(alloc: Allocator, session: *runtime_mod.QuerySession, graph
     segment.computed_at_ms = if (metric_artifact.computed_at_ms != 0) metric_artifact.computed_at_ms else @divTrunc(session.manifest.built_at_ns, std.time.ns_per_ms);
     if (segment.kind != config.kind or segment.config_fingerprint != lake_graph_metric.configFingerprint(config) or
         !segment.edge_filter.equivalent(config.edge_filter)) return error.MetricStale;
-    if (!std.mem.eql(u8, segment.source_graph_artifact_id, graph_artifact.artifact_id) or !std.mem.eql(u8, segment.source_graph_checksum, graph_artifact.checksum)) return error.MetricStale;
+    if (!lake_graph_metric.metricSourceMatches(segment, graph_artifact, metric_artifact)) return error.MetricStale;
     if (segment.materializer_fingerprint != graph_metric_policy.materializerFingerprint(.{})) return error.GraphMetricPolicyStale;
     if (segment.materialization_state == .rejected) return switch (segment.rejection_reason) {
         .build_budget_exceeded => {

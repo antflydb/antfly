@@ -22,7 +22,7 @@ discovery and adjacency production, reads the shared canonical membership for
 its own seed/initialization, and uses shared packed tiles for every iteration.
 HITS topology can serve PageRank or eigenvector; a forward-only owner cannot
 satisfy HITS. Published scores keep their existing format; intermediate jobs
-from execution schemas before v18 restart.
+from execution schemas before v19 restart.
 
 Cold scheduled builds first enqueue an index-scoped preparation task keyed by
 generation, filter and required orientation. Concurrent PageRank/eigenvector
@@ -52,7 +52,7 @@ Generation changes and loss of all eligible consumers
 retire preparation; independent numerical/publication lifetimes are unchanged.
 Inline numerical drains propagate coordinator terminal failures as failed status,
 preserving the durable root cause instead of replacing it with an idle-page error.
-Intermediate partition-plan v7 uses 4,096-unit scheduling ranges (capped at 256
+Intermediate partition-plan v8 uses 4,096-unit scheduling ranges (capped at 256
 partitions), with byte/work-bounded checkpoints within each range. Canonical
 256-entry membership/vector chunks remain separate from scheduling page size.
 Tests can inject smaller ranges to exercise takeover and partition boundaries.
@@ -85,7 +85,11 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
   and metadata need not be decoded. Existing stores backfill in bounded,
   checkpointed steps (record and key-memory limits) while connectivity
   mutations maintain postings transactionally; attribute updates do not rewrite
-  these postings.
+  these postings. The v2 covering index also keeps an incidence reference count
+  per (type, endpoint). Insert/delete and idempotent backfill update these counts
+  with edge postings in the same transaction; self-loops count twice. This adds
+  storage and mutation work, shared across all filters, instead of rebuilding a
+  source-wide endpoint set for each cold metric.
   A filter-epoch partition snapshot freezes scheduling boundaries so unrelated
   writes cannot invalidate in-flight discovery or shared topology adoption.
   Removed-filter snapshots are reclaimed in bounded 64-record maintenance
@@ -119,11 +123,22 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
   publication prevents competing coordinators from regressing progress. A graph
   mutation invalidates the obsolete census; it cannot publish mixed-generation
   boundaries. Memory is bounded by the maximum 256 partitions, not graph size.
+  Filtered plans do not depend on that global census: they merge only selected
+  edge and endpoint posting ranges, count exact selected cardinalities, then
+  choose balanced boundaries. Endpoint streams deduplicate nodes shared by
+  selected types using a fanout-bounded heap. Their checkpoint and CAS bind the
+  filter epoch, so unrelated graph churn cannot reset cold planning. Each step
+  also stops at 1 MiB of visited suffix bytes (one oversized record may progress).
 - All-edge scans range-seek past metadata. Filtered scans charge only selected
   postings against their checkpoint limit and persist a type-qualified resume
   key, validated against the filter and scheduling range. Intermediate progress
   counts visited edges; completion seals the entire scheduling range. An
   unbounded final partition cannot walk all metric state.
+  Ordinal topology extraction retains one reusable full resume-key buffer, not
+  one per visited edge. A conservative 1 MiB input-scratch admission limit also
+  bounds decoded endpoints and pending ordinal lookups, allowing one oversized
+  edge to make progress. Long type names therefore cannot multiply a 4,096-record
+  page into hundreds of MiB of retained cursor copies.
 - Initialization writes canonical membership once in checksummed 256-row blocks,
   alongside ordinal assignments. Completed initialization leaves seal exact row
   counts. Vector initialization, iteration, convergence and publication read these addressed blocks,
@@ -179,7 +194,7 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
   HITS lanes are bulk-read before either lane stages mutations. Primary scores,
   ordered staging keys, and the attempt-fenced page cursor commit atomically.
   The coordinator checkpoints the bounded top-K prefix before pointer publication.
-- Execution schema 17 fences older intermediate jobs. Published score epochs
+- Execution schema 19 fences older intermediate jobs. Published score epochs
   retain their existing read contract; an execution-format change does not hide
   previously published results.
 
@@ -187,8 +202,12 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
 
 - Normal and lake ingestion share one ordinal graph builder. Distinct node IDs,
   relationship types, and target tables are interned once; retained edges carry
-  numeric ordinals. Encoding sorts integer edges directly into the current
-  packed wire format, preserving qualified endpoints and isolated local nodes.
+  numeric ordinals. Encoding counts adjacency sizes and scatters directly into
+  the final wire allocation, then sorts each node/direction in place. It does not
+  retain separate forward and reverse edge arrays. Scratch is 24 bytes per
+  dictionary node instead of up to 40 bytes per edge; sparse graphs can have a
+  different tradeoff than dense graphs. Canonical ordering, qualified endpoints
+  and isolated local nodes are preserved.
   Both JSON adapters propagate allocator exhaustion and unwind partial edge
   ownership; allocation failure cannot silently produce an empty graph.
 - Verified packed graph ordinals are prepared once per immutable source.
@@ -201,8 +220,7 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
   allocation; exact construction admission and the live-allocation limiter
   remain authoritative. Serverless additionally reserves local-ID adapters,
   selection permutations and replacement-node buffers before allocation.
-  Materializer epoch 18 invalidates cached rejections made with source-wide
-  group estimates or duplicate-alias work charges.
+  Materializer epoch 19 also binds the semantic-identity admission policy.
 - Preparation has two admission phases. The projection census is charged before
   allocations or edge scans; exact projection construction is charged after the
   census and before CSR allocation. Reserved census work remains charged when
@@ -228,6 +246,23 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
   SHA-256 provider metadata can authenticate a cold object without downloading it.
   Custom stores use conservative full-object admission. Exhausting reuse admission
   skips that optimization and leaves materialization subject to its own budgets.
+- Immutable metric payloads carry a SHA-256 identity of selected unweighted local
+  topology, distinct from the current publication's full graph checksum. Hashing
+  canonical endpoint identities (not ordinals) makes weights, unrelated types,
+  qualified edges and isolated documents irrelevant to this identity. A matching
+  authenticated metric header, configuration and materializer policy allow reuse
+  without projection, kernels or score encoding. The manifest rebinds it to the
+  current graph checksum/generations while preserving the real computation time.
+  Readers validate both semantic binding and current source integrity. Original
+  source strings in the immutable payload need not equal the new publication's
+  strings; authenticated control lengths come from the artifact manifest.
+  Changed graph artifacts are still fully authenticated and prepared before
+  their identities are computed; this is not a source-I/O bypass.
+  Optional hashing has a separate 1 GiB byte-work allowance and live-allocation
+  admission including any retained projection. Per-type digest scratch is freed
+  before numerical work. If admission is exhausted, a zero identity disables
+  cross-source reuse and retains exact-source validation; cold work keeps its
+  independent budget.
 - Optional PageRank warm starts authenticate control, root, directory, selected
   routing pages and primary score windows. Sparse selections skip unrelated
   blocks; consecutive selected blocks share windows up to 1 MiB, narrowed to
@@ -243,8 +278,9 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
   “verified” flag bypasses authentication. Persisting verification evidence would
   require a defined trust and provider-generation contract, not just caching a
   boolean in a manifest.
-- Materializer epoch 17 captures sparse projection and seed-window admission. Serverless remains
-  current-version-only; no obsolete wire decoder or migration path is introduced.
+- Manifest v19 and metric segment v10 are current-version-only. Missing graph
+  provenance starts at the current publication generation; there is no inference
+  from pre-release sidecars and no obsolete wire decoder or migration path.
 
 ## Query and operator views
 

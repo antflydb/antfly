@@ -58,14 +58,6 @@ pub const Edge = struct {
     kind: u32,
     table: u32,
     weight: f32,
-
-    fn less(_: void, a: Edge, b: Edge) bool {
-        if (a.source != b.source) return a.source < b.source;
-        if (a.kind != b.kind) return a.kind < b.kind;
-        if (a.target != b.target) return a.target < b.target;
-        if (a.weight != b.weight) return a.weight < b.weight;
-        return a.table < b.table;
-    }
 };
 
 pub const Builder = struct {
@@ -139,24 +131,22 @@ pub const Builder = struct {
         size = std.math.add(usize, size, std.math.mul(usize, record_count, wire.edge_len) catch return error.GraphSegmentTooLarge) catch return error.GraphSegmentTooLarge;
         size = std.math.add(usize, size, std.math.mul(usize, self.nodeCount(), 12) catch return error.GraphSegmentTooLarge) catch return error.GraphSegmentTooLarge;
         if (size > max_bytes) return error.GraphSegmentTooLarge;
-        const out = try self.alloc.alloc(Edge, self.edges.items.len);
-        defer self.alloc.free(out);
-        const in = try self.alloc.alloc(Edge, local_edges);
-        defer self.alloc.free(in);
-        var in_count: usize = 0;
-        for (self.edges.items, out, 0..) |edge, *mapped, i| {
+        // Count and scatter directly into final adjacency storage. No mapped
+        // forward/reverse Edge arrays coexist with the immutable wire payload.
+        const counts = try self.alloc.alloc([2]u32, node_order.len);
+        defer self.alloc.free(counts);
+        @memset(counts, .{ 0, 0 });
+        for (self.edges.items, 0..) |edge, i| {
             if (i % 4096 == 0) try cancellation.check();
-            mapped.* = .{ .source = node_map[edge.source], .target = node_map[edge.target], .kind = type_map[edge.kind], .table = if (edge.table == wire.no_table) wire.no_table else table_map[edge.table], .weight = edge.weight };
+            const src = node_map[edge.source];
+            counts[src][0] = std.math.add(u32, counts[src][0], 1) catch return error.GraphSegmentTooLarge;
             if (edge.table == wire.no_table) {
-                in[in_count] = mapped.*;
-                std.mem.swap(u32, &in[in_count].source, &in[in_count].target);
-                in_count += 1;
+                const dst = node_map[edge.target];
+                counts[dst][1] = std.math.add(u32, counts[dst][1], 1) catch return error.GraphSegmentTooLarge;
             }
         }
-        std.mem.sort(Edge, out, {}, Edge.less);
-        try cancellation.check();
-        std.mem.sort(Edge, in, {}, Edge.less);
-        try cancellation.check();
+        const positions = try self.alloc.alloc([2]usize, node_order.len);
+        defer self.alloc.free(positions);
         const bytes = try self.alloc.alloc(u8, size);
         errdefer self.alloc.free(bytes);
         @memcpy(bytes[0..4], wire.wire_magic);
@@ -174,30 +164,58 @@ pub const Builder = struct {
                 pos += key.len;
             }
         }
-        var out_pos: usize = 0;
-        var in_pos: usize = 0;
         for (node_order, 0..) |old_node, node| {
             if (node % 256 == 0) try cancellation.check();
             if (!self.nodes.values.values()[old_node]) continue;
-            const out_start = out_pos;
-            while (out_pos < out.len and out[out_pos].source == node) : (out_pos += 1) {}
-            const in_start = in_pos;
-            while (in_pos < in.len and in[in_pos].source == node) : (in_pos += 1) {}
             put(bytes, &pos, @intCast(node));
-            put(bytes, &pos, std.math.cast(u32, out_pos - out_start) orelse return error.GraphSegmentTooLarge);
-            put(bytes, &pos, std.math.cast(u32, in_pos - in_start) orelse return error.GraphSegmentTooLarge);
-            for ([_][]const Edge{ out[out_start..out_pos], in[in_start..in_pos] }) |edges| for (edges, 0..) |edge, i| {
-                if (i % 4096 == 0) try cancellation.check();
-                put(bytes, &pos, edge.target);
-                put(bytes, &pos, edge.kind);
-                put(bytes, &pos, @bitCast(edge.weight));
-                put(bytes, &pos, edge.table);
-            };
+            put(bytes, &pos, counts[node][0]);
+            put(bytes, &pos, counts[node][1]);
+            for (0..2) |direction| {
+                positions[node][direction] = pos;
+                pos += @as(usize, counts[node][direction]) * wire.edge_len;
+            }
         }
-        std.debug.assert(pos == bytes.len and out_pos == out.len and in_pos == in.len);
+        std.debug.assert(pos == bytes.len);
+        for (self.edges.items, 0..) |edge, i| {
+            if (i % 4096 == 0) try cancellation.check();
+            const src = node_map[edge.source];
+            const dst = node_map[edge.target];
+            writeEdge(bytes, &positions[src][0], dst, type_map[edge.kind], edge.weight, if (edge.table == wire.no_table) wire.no_table else table_map[edge.table]);
+            if (edge.table == wire.no_table) writeEdge(bytes, &positions[dst][1], src, type_map[edge.kind], edge.weight, wire.no_table);
+        }
+        for (node_order, 0..) |old_node, node| {
+            if (!self.nodes.values.values()[old_node]) continue;
+            for (0..2) |direction| {
+                try cancellation.check();
+                const end = positions[node][direction];
+                const start = end - @as(usize, counts[node][direction]) * wire.edge_len;
+                const records = std.mem.bytesAsSlice([wire.edge_len]u8, bytes[start..end]);
+                std.mem.sort([wire.edge_len]u8, records, {}, wireEdgeLess);
+            }
+        }
         return bytes;
     }
 };
+
+fn writeEdge(bytes: []u8, pos: *usize, target: u32, kind: u32, weight: f32, table: u32) void {
+    put(bytes, pos, target);
+    put(bytes, pos, kind);
+    put(bytes, pos, @bitCast(weight));
+    put(bytes, pos, table);
+}
+
+fn wireEdgeLess(_: void, a: [wire.edge_len]u8, b: [wire.edge_len]u8) bool {
+    const kind_a = std.mem.readInt(u32, a[4..8], .little);
+    const kind_b = std.mem.readInt(u32, b[4..8], .little);
+    if (kind_a != kind_b) return kind_a < kind_b;
+    const target_a = std.mem.readInt(u32, a[0..4], .little);
+    const target_b = std.mem.readInt(u32, b[0..4], .little);
+    if (target_a != target_b) return target_a < target_b;
+    const weight_a: f32 = @bitCast(std.mem.readInt(u32, a[8..12], .little));
+    const weight_b: f32 = @bitCast(std.mem.readInt(u32, b[8..12], .little));
+    if (weight_a != weight_b) return weight_a < weight_b;
+    return std.mem.readInt(u32, a[12..16], .little) < std.mem.readInt(u32, b[12..16], .little);
+}
 
 fn invert(alloc: Allocator, order: []const u32) ![]u32 {
     const result = try alloc.alloc(u32, order.len);
@@ -233,6 +251,38 @@ test "serverless ordinal graph builder owns identifiers and canonicalizes direct
     try std.testing.expectEqual(@as(usize, 4), view.nodes.len);
     try std.testing.expectEqual(@as(usize, wire.edge_len), view.adjacencies[0].in.len);
     try std.testing.expectError(error.GraphSegmentTooLarge, first.encodeAlloc(a.len - 1, .none));
+}
+
+test "serverless ordinal graph builder packs skewed duplicate and qualified adjacency canonically" {
+    const alloc = std.testing.allocator;
+    var forward = Builder{ .alloc = alloc };
+    defer forward.deinit();
+    var reverse = Builder{ .alloc = alloc };
+    defer reverse.deinit();
+    const nodes = [_][]const u8{ "hub", "a", "b", "remote" };
+    const kinds = [_][]const u8{ "z", "a" };
+    for (0..512) |i| {
+        const j = 511 - i;
+        // A high-degree hub, self-loops, repeated edges, negative weights,
+        // multiple types and qualified endpoints exercise both orientations.
+        try forward.addEdge("hub", nodes[i % nodes.len], kinds[i % kinds.len], @as(f32, @floatFromInt(i % 7)) - 3, if (i % 5 == 0) "other" else null);
+        try reverse.addEdge("hub", nodes[j % nodes.len], kinds[j % kinds.len], @as(f32, @floatFromInt(j % 7)) - 3, if (j % 5 == 0) "other" else null);
+    }
+    const a = try forward.encodeAlloc(64 * 1024, .none);
+    defer alloc.free(a);
+    const b = try reverse.encodeAlloc(64 * 1024, .none);
+    defer alloc.free(b);
+    try std.testing.expectEqualSlices(u8, a, b);
+    var view = try wire.viewAlloc(alloc, a, .{}, .none);
+    defer view.deinit(alloc);
+    var outgoing: usize = 0;
+    var incoming: usize = 0;
+    for (view.adjacencies) |adjacency| {
+        outgoing += adjacency.out.len / wire.edge_len;
+        incoming += adjacency.in.len / wire.edge_len;
+    }
+    try std.testing.expectEqual(@as(usize, 512), outgoing);
+    try std.testing.expectEqual(@as(usize, 409), incoming);
 }
 
 test "serverless ordinal graph builder allocation failure is recoverable by destruction" {

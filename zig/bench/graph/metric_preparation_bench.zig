@@ -206,7 +206,8 @@ pub fn main(init: std.process.Init) !void {
     }
     if (indexing_only) {
         try benchmarkGraphIndexConstruction(&output);
-        return benchmarkTypedEdgeScans(init.io, &output);
+        try benchmarkTypedEdgeScans(init.io, &output);
+        return benchmarkSemanticMetricReuse(init.io, &output);
     }
     if (score_join_only) return benchmarkScoreJoin(&output);
     if (ordinal_cursors_only) return benchmarkOrdinalCursors(init.io, &output);
@@ -495,6 +496,115 @@ fn benchmarkTypedEdgeScans(io: std.Io, out: anytype) !void {
             .matched = measured.matched,
             .median_ns = samples[2],
             .note = "default durable LSM; same selected edge identity checksum; six samples, first discarded; discovery only, excludes fixture writes and numerical execution",
+        }, .{});
+        try out.interface.writeAll(json);
+        try out.interface.writeByte('\n');
+        try out.flush();
+    }
+    for ([_]bool{ true, false }) |reference| {
+        var samples: [5]u64 = undefined;
+        var steps: usize = 0;
+        for (0..6) |sample| {
+            const started = antfly.platform_time.monotonicNs();
+            const result = try index.benchmarkPartitionCensus(if (reference) .{} else filter);
+            const elapsed = antfly.platform_time.monotonicNs() - started;
+            if (result.edges != (if (reference) writes.len else writes.len / types.len) or result.nodes != ids.len) return error.InvalidBenchmarkResult;
+            steps = result.steps;
+            if (sample != 0) samples[sample - 1] = elapsed;
+        }
+        std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+        const json = try std.json.Stringify.valueAlloc(fixture, .{
+            .mode = if (reference) "stateful_global_census" else "stateful_selected_census",
+            .source_edges = writes.len,
+            .selected_edges = writes.len / types.len,
+            .checkpoint_steps = steps,
+            .median_ns = samples[2],
+            .note = "cold plans on default durable LSM; includes clearing prior plan, durable checkpoints, counts and boundaries; excludes fixture writes and numerical execution",
+        }, .{});
+        try out.interface.writeAll(json);
+        try out.interface.writeByte('\n');
+        try out.flush();
+    }
+}
+
+fn benchmarkSemanticMetricReuse(io: std.Io, out: anytype) !void {
+    const alloc = std.heap.smp_allocator;
+    const manifest = antfly.serverless.manifest;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const fixture = arena.allocator();
+    const root = try std.fmt.allocPrint(fixture, "/tmp/antfly-semantic-reuse-{d}", .{antfly.platform_time.monotonicNs()});
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    var fs = try antfly.serverless.artifacts.FsStore.init(alloc, root);
+    var artifacts = fs.artifactStore();
+    defer artifacts.deinit();
+    const ids = try fixture.alloc([]const u8, 1024);
+    for (ids, 0..) |*id, i| id.* = try std.fmt.allocPrint(fixture, "node-{d:0>8}", .{i});
+    var sources: [2]manifest.ArtifactRef = undefined;
+    for (&sources, 0..) |*source, variant| {
+        var builder = graph.Builder{ .alloc = alloc };
+        defer builder.deinit();
+        for (ids, 0..) |id, i| for (0..64) |j| {
+            const target = if (j % 4 == 0) 0 else (i + j * j + 1) % ids.len;
+            try builder.addEdge(id, ids[target], "link", @floatFromInt(variant + 1), null);
+        };
+        const payload = try builder.encodeAlloc(16 * 1024 * 1024, .none);
+        defer alloc.free(payload);
+        var metadata = try artifacts.put(payload);
+        defer metadata.deinit(alloc);
+        source.* = .{ .kind = .graph_segment, .name = "graph", .artifact_id = try fixture.dupe(u8, metadata.artifact_id), .checksum = try fixture.dupe(u8, metadata.checksum), .byte_len = metadata.byte_len };
+    }
+    const config = antfly.graph.GraphMetricConfig{ .name = "rank", .kind = .pagerank, .max_iterations = 30, .tolerance = 1e-15 };
+    const first_request = metric.PublicationRequest{ .graph_index_name = "graph", .source_graph = sources[0], .config = config, .provenance = .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 } };
+    var first_budget = antfly.serverless.build.graph_metric_policy.Budget{ .limits = .{} };
+    const first = try metric.publishRequestsAlloc(alloc, &artifacts, &.{first_request}, .none, .{}, &first_budget, .{});
+    defer {
+        manifest.types.freeArtifactRefs(alloc, first);
+        alloc.free(first);
+    }
+    const first_bytes = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(alloc, first[0].artifact_id, first[0].byte_len, first[0].checksum, .none);
+    defer alloc.free(first_bytes);
+    var expected = try antfly.serverless.graph_metric_segment.decodeAlloc(alloc, first_bytes);
+    defer expected.deinit(alloc);
+    for ([_]bool{ true, false }) |reference| {
+        var samples: [5]u64 = undefined;
+        var measured = PhaseAllocStats{};
+        var work: u64 = 0;
+        for (0..6) |sample| {
+            var stats = PhaseAllocStats{};
+            var tracker = PhaseTrackingAllocator{ .backing = alloc, .stats = &stats };
+            const tracked = tracker.allocator();
+            const request = metric.PublicationRequest{ .graph_index_name = "graph", .source_graph = sources[1], .config = config, .prior_artifact = if (reference) null else first[0], .provenance = .{ .published_generation = 2, .edge_generation = 2, .computed_at_ms = 2 } };
+            var budget = antfly.serverless.build.graph_metric_policy.Budget{ .limits = .{} };
+            const started = antfly.platform_time.monotonicNs();
+            const refs = try metric.publishRequestsWithPriorAlloc(tracked, &artifacts, &.{request}, if (reference) &.{} else first, .none, .{}, &budget, .{});
+            const elapsed = antfly.platform_time.monotonicNs() - started;
+            const bytes = try artifacts.getVerifiedAllocWithCancellationUsingAllocator(alloc, refs[0].artifact_id, refs[0].byte_len, refs[0].checksum, .none);
+            defer alloc.free(bytes);
+            var decoded = try antfly.serverless.graph_metric_segment.decodeAlloc(alloc, bytes);
+            defer decoded.deinit(alloc);
+            if (decoded.scores.len != expected.scores.len) return error.InvalidBenchmarkResult;
+            for (decoded.scores, expected.scores) |actual, wanted| {
+                if (!std.mem.eql(u8, actual.node_id, wanted.node_id) or actual.value != wanted.value) return error.InvalidBenchmarkResult;
+            }
+            if (!reference and (!std.mem.eql(u8, refs[0].artifact_id, first[0].artifact_id) or budget.work_items != 0)) return error.InvalidBenchmarkResult;
+            work = budget.work_items;
+            manifest.types.freeArtifactRefs(tracked, refs);
+            tracked.free(refs);
+            if (stats.current_bytes != 0) return error.InvalidBenchmarkResult;
+            if (sample != 0) samples[sample - 1] = elapsed;
+            measured = stats;
+        }
+        std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+        const json = try std.json.Stringify.valueAlloc(fixture, .{
+            .mode = if (reference) "serverless_weight_change_recompute" else "serverless_weight_change_semantic_reuse",
+            .nodes = ids.len,
+            .edges = ids.len * 64,
+            .median_ns = samples[2],
+            .peak_bytes = measured.peak_bytes,
+            .projection_kernel_work = work,
+            .note = "same weighted source change; exact score parity; includes authenticated cached-source reads, preparation, identity hashing and publication; excludes graph construction and post-run score validation; six samples, first discarded",
         }, .{});
         try out.interface.writeAll(json);
         try out.interface.writeByte('\n');

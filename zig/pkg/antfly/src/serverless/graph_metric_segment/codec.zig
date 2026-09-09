@@ -23,7 +23,7 @@ const types = @import("types.zig");
 pub const wire_magic = "AFGM";
 pub const wire_version: u16 = artifact_ref.graph_metric_segment_wire_version;
 const fixed_header_len = wire_magic.len + @sizeOf(u16) + 4 * @sizeOf(u8) + @sizeOf(u32) +
-    3 * @sizeOf(u64) + 3 * @sizeOf(u32);
+    3 * @sizeOf(u64) + 3 * @sizeOf(u32) + 32;
 const routing_magic = "AFGR";
 // Footer: AFGR/count, flat entries grouped into authenticated 64-entry pages,
 // AFGD directory, AFTK root, root-length/footer-length trailer. The root binds
@@ -56,6 +56,7 @@ pub const Header = struct {
     materializer_fingerprint: u64,
     source_graph_artifact_id: []const u8,
     source_graph_checksum: []const u8,
+    topology_checksum: [32]u8 = @splat(0),
     converged: bool,
     iterations_completed: u32,
     delta: f64,
@@ -637,6 +638,7 @@ pub fn decodeHeader(data: []const u8) !Header {
     const iterations = try readInt(u32, data, &pos);
     const fingerprint = try readInt(u64, data, &pos);
     const materializer_fingerprint = try readInt(u64, data, &pos);
+    const topology_checksum = (try take(data, &pos, 32))[0..32].*;
     const delta: f64 = @bitCast(try readInt(u64, data, &pos));
     if (!validMetricScore(delta)) return error.InvalidGraphMetricSegment;
     switch (materialization_state) {
@@ -655,6 +657,7 @@ pub fn decodeHeader(data: []const u8) !Header {
         .rejection_reason = rejection_reason,
         .config_fingerprint = fingerprint,
         .materializer_fingerprint = materializer_fingerprint,
+        .topology_checksum = topology_checksum,
         .source_graph_artifact_id = source_graph_artifact_id,
         .source_graph_checksum = source_graph_checksum,
         .converged = converged_byte == 1,
@@ -747,6 +750,7 @@ pub fn encodePreparedAlloc(alloc: Allocator, segment: types.Segment, cancellatio
     putInt(u32, data, &pos, segment.iterations_completed);
     putInt(u64, data, &pos, segment.config_fingerprint);
     putInt(u64, data, &pos, segment.materializer_fingerprint);
+    putBytes(data, &pos, &segment.topology_checksum);
     putInt(u64, data, &pos, @bitCast(segment.delta));
     putInt(u32, data, &pos, @intCast(segment.source_graph_artifact_id.len));
     putInt(u32, data, &pos, @intCast(segment.source_graph_checksum.len));
@@ -920,6 +924,7 @@ fn decodeBoundedAlloc(alloc: Allocator, data: []const u8, budget: *bounded_decod
     const iterations = readInt(u32, data, &pos) catch return error.InvalidGraphMetricSegment;
     const fingerprint = readInt(u64, data, &pos) catch return error.InvalidGraphMetricSegment;
     const materializer_fingerprint = readInt(u64, data, &pos) catch return error.InvalidGraphMetricSegment;
+    const topology_checksum = (try take(data, &pos, 32))[0..32].*;
     const delta: f64 = @bitCast(readInt(u64, data, &pos) catch return error.InvalidGraphMetricSegment);
     if (!validMetricScore(delta)) return error.InvalidGraphMetricSegment;
     const artifact_len = readInt(u32, data, &pos) catch return error.InvalidGraphMetricSegment;
@@ -972,7 +977,7 @@ fn decodeBoundedAlloc(alloc: Allocator, data: []const u8, budget: *bounded_decod
         initialized += 1;
     }
     try validateRoutingFooter(data, pos, scores, cancellation);
-    var segment = types.Segment{ .metadata_version = version, .kind = kind, .source_graph_artifact_id = artifact_id, .source_graph_checksum = checksum, .config_fingerprint = fingerprint, .materializer_fingerprint = materializer_fingerprint, .materialization_state = materialization_state, .rejection_reason = rejection_reason, .edge_filter = .{ .mode = if (edge_type_count == 0) .all else .types, .types = edge_types }, .converged = converged_byte == 1, .iterations_completed = iterations, .delta = delta, .scores = scores };
+    var segment = types.Segment{ .metadata_version = version, .kind = kind, .source_graph_artifact_id = artifact_id, .source_graph_checksum = checksum, .config_fingerprint = fingerprint, .materializer_fingerprint = materializer_fingerprint, .topology_checksum = topology_checksum, .materialization_state = materialization_state, .rejection_reason = rejection_reason, .edge_filter = .{ .mode = if (edge_type_count == 0) .all else .types, .types = edge_types }, .converged = converged_byte == 1, .iterations_completed = iterations, .delta = delta, .scores = scores };
     errdefer segment.deinit(alloc);
     try validateSegmentWithCancellation(segment, cancellation);
     return segment;
@@ -1418,6 +1423,7 @@ test "serverless graph metric segment round trips with binary-search lookup" {
     scores[0] = .{ .node_id = try alloc.dupe(u8, "a"), .value = 0.25 };
     scores[1] = .{ .node_id = try alloc.dupe(u8, "b"), .value = 0.75 };
     var segment = types.Segment{ .kind = .pagerank, .source_graph_artifact_id = try alloc.dupe(u8, "sha256:graph"), .source_graph_checksum = try alloc.dupe(u8, "sha256:sum"), .config_fingerprint = 42, .edge_filter = .{}, .converged = true, .iterations_completed = 12, .delta = 0.00001, .scores = scores };
+    segment.topology_checksum = @splat(0x55);
     defer segment.deinit(alloc);
     const encoded = try encodeAlloc(alloc, segment);
     defer alloc.free(encoded);
@@ -1442,9 +1448,11 @@ test "serverless graph metric segment round trips with binary-search lookup" {
     const header = try decodeHeader(encoded[0..header_len]);
     try std.testing.expectEqual(graph_mod.GraphMetricKind.pagerank, header.kind);
     try std.testing.expectEqualStrings(segment.source_graph_artifact_id, header.source_graph_artifact_id);
+    try std.testing.expectEqualSlices(u8, &segment.topology_checksum, &header.topology_checksum);
     var decoded = try decodeAlloc(alloc, encoded);
     defer decoded.deinit(alloc);
     try std.testing.expectEqual(@as(?f64, 0.75), decoded.score("b"));
+    try std.testing.expectEqualSlices(u8, &segment.topology_checksum, &decoded.topology_checksum);
     try std.testing.expect(decoded.score("missing") == null);
     const root_len = routingRootLen(scores.len);
     var root = try decodeRoutingRootAlloc(alloc, encoded[encoded.len - root_len ..], encoded.len, wire_version, .none);

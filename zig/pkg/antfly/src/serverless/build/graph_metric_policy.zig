@@ -23,8 +23,8 @@ const bounded_decode = @import("../bounded_decode.zig");
 
 /// Increment whenever an implementation change can alter admission or output
 /// without changing the user-visible metric configuration.
-// Epoch 18 admits selection-sized groups and counts identical aliases once.
-pub const materializer_epoch: u32 = 18;
+// Epoch 19 separates optional semantic-identity hashing from cold-work admission.
+pub const materializer_epoch: u32 = 19;
 const max_tracked_graph_indexes: usize = 16;
 
 pub const Limits = struct {
@@ -47,6 +47,9 @@ pub const Limits = struct {
     // Reuse authentication is independent of optional warm-start inputs.
     // Includes cold full-content verification and requested control ranges.
     max_total_reuse_read_bytes: u64 = 512 * 1024 * 1024,
+    /// Optional semantic-reuse hashing is byte-accounted independently of
+    /// cold projection/kernel work, so acceleration cannot starve a rebuild.
+    max_total_identity_work_bytes: u64 = 1024 * 1024 * 1024,
     // Bounds the decoded topology, compiled projection, dense kernel vectors,
     // borrowed sortable score views, and encoded output that may coexist for one
     // materialization. Work and payload limits alone do not bound this peak.
@@ -72,6 +75,7 @@ pub const Budget = struct {
     seed_payload_bytes: u64 = 0,
     seed_work_items: u64 = 0,
     reuse_read_bytes: u64 = 0,
+    identity_work_bytes: u64 = 0,
     graph_identity_count: usize = 0,
     graph_identities: [max_tracked_graph_indexes][32]u8 = undefined,
 

@@ -453,3 +453,46 @@ This measures discovery only, excluding writes, migration, and numerical work.
 The covering index adds one empty-value identity key per edge and its write/
 storage cost; existing indexes pay one bounded backfill. These are local phase
 measurements on a shared development host, not end-to-end latency guarantees.
+
+### Direct packing, filter-local census and semantic metric reuse
+
+The same `--indexing-only` command now also measures cold durable partition
+planning and a weight-only PageRank republish. The following ReleaseFast rerun
+uses Apple M4 Max / Zig 0.16.0, six samples with the first discarded. Other
+development builds were active; timings are observations, not latency guarantees.
+
+| Case | Reference | Current | Deterministic check |
+| --- | ---: | ---: | --- |
+| Parse/build/encode, 16-byte IDs | 24.675 ms | 15.639 ms | Identical encoded SHA-256 |
+| Parse/build/encode, 256-byte IDs | 81.795 ms | 28.786 ms | Identical encoded SHA-256 |
+| Selected edge discovery | 14.362 ms | 0.642 ms | Same 4,096 edge identities; 65,536 → 4,096 visits |
+| Cold partition census | 254.022 ms | 87.298 ms | 17 → 3 checkpoint steps; exact selected edge/node totals |
+| Weight-only PageRank republish | 4.418 ms | 3.067 ms | Exactly equal scores; 2,362,369 → 0 projection/kernel work units |
+
+Packing uses the old string builder as the reference. Current peak allocations
+are 3,631,986 and 4,123,506 bytes, versus the reference's 11,276,518 and
+43,471,078 bytes. Compared with the preceding ordinal builder's measured
+6,228,850 and 6,720,370 bytes, direct count/scatter packing removes 2,596,864
+bytes in either fixture. That allocation comparison is deterministic; the
+preceding run's CPU timings are not a controlled incremental comparison.
+
+The census reference is the former whole-graph planning prerequisite, not a
+different algorithm computing a selected plan. Both use the default durable LSM;
+timing includes clearing the old plan and committing all counts, boundaries and
+checkpoints, but excludes fixture ingestion and numerical execution. The selected
+plan has 4,096 edges and 1,024 distinct endpoints, independent of unrelated types.
+The v2 index adds one reference-counted membership record per (type, endpoint),
+with two incidence updates per changed edge in addition to the edge posting.
+This fixture has 16,384 such records. Write/storage amplification is a deliberate
+tradeoff, shared across all metric filters; this benchmark does not measure its
+ingestion cost or the initial backfill.
+
+The republish fixture has 1,024 nodes, 65,536 edges, a high-degree hub and repeated
+edges, with a 30-iteration PageRank cap. Only weights change. Its timer includes
+authenticated cached-source reads, topology preparation, semantic hashing and
+publication; graph construction and post-run score validation are outside it.
+Peak tracked allocations remain 2,755,027 bytes in both cases because source
+preparation dominates the peak. Artifact-store-owned memory is outside that
+tracker. Semantic reuse removes projection/kernel/output work, but still reads
+and prepares a changed source graph; it does not claim a cold object-store I/O
+reduction. The reuse assertion also requires the exact prior metric artifact ID.

@@ -8404,7 +8404,7 @@ pub fn build(b: *std.Build) void {
         "graph metric consumer barrier",
         "ordinal blocks",
         "graph degree planned build honors edge filter during scan page execution",
-        "graph metric filtered scan checkpoints",
+        "graph metric filtered",
         "graph metric partition spans remain balanced at production cardinality",
         "graph metric partition census",
         "partition census owns bounded checkpoints",

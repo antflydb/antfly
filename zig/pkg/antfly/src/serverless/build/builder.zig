@@ -2491,6 +2491,7 @@ pub fn cloneArtifactRefAlloc(alloc: Allocator, artifact: manifest_mod.ArtifactRe
         .graph_metric_point_index_checksum = artifact.graph_metric_point_index_checksum,
         .graph_metric_config_fingerprint = artifact.graph_metric_config_fingerprint,
         .graph_metric_source_checksum = artifact.graph_metric_source_checksum,
+        .graph_metric_topology_checksum = artifact.graph_metric_topology_checksum,
         .graph_metric_materialization_state = artifact.graph_metric_materialization_state,
         .graph_metric_rejection_reason = artifact.graph_metric_rejection_reason,
     };
@@ -3471,13 +3472,11 @@ fn findArtifactRefByName(
     return null;
 }
 
-fn stampGraphTopologyGenerationsAlloc(
-    alloc: Allocator,
+fn stampGraphTopologyGenerations(
     graph_refs: []manifest_mod.ArtifactRef,
     current: ?manifest_mod.Manifest,
-    previous_specs: []const graph_metric_config.IndexSpec,
     next_generation: u64,
-) !void {
+) void {
     for (graph_refs) |*graph_ref| {
         graph_ref.edge_generation = next_generation;
         const manifest = current orelse continue;
@@ -3489,22 +3488,7 @@ fn stampGraphTopologyGenerationsAlloc(
             continue;
         }
 
-        // Pre-provenance manifests did not stamp graph artifacts. Recover the
-        // topology generation from any metric already bound to this graph so a
-        // newly configured sibling receives the same snapshot identity.
-        var inferred_generation: ?u64 = null;
-        for (previous_specs) |spec| {
-            if (!std.mem.eql(u8, spec.index_name, graph_ref.name)) continue;
-            for (spec.configs) |config| {
-                const artifact_name = try graph_metric_segment_mod.artifactNameAlloc(alloc, spec.index_name, config.name);
-                defer alloc.free(artifact_name);
-                const metric_index = findNamedArtifactIndex(manifest, .graph_metric_segment, artifact_name) orelse continue;
-                const candidate = manifest.artifacts[metric_index].edge_generation;
-                if (candidate == 0) continue;
-                inferred_generation = if (inferred_generation) |existing| @min(existing, candidate) else candidate;
-            }
-        }
-        graph_ref.edge_generation = inferred_generation orelse manifest.version;
+        // An unstamped graph first acquires metric provenance now.
     }
 }
 
@@ -3522,18 +3506,9 @@ fn buildGraphMetricArtifactRefsAlloc(
     var requests = std.ArrayListUnmanaged(lake_graph_metric.PublicationRequest).empty;
     defer requests.deinit(alloc);
 
-    const previous_specs = if (current) |manifest|
-        graph_metric_config.parseIndexSpecsAlloc(alloc, manifest.stats.indexes_json) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => try alloc.alloc(graph_metric_config.IndexSpec, 0),
-        }
-    else
-        try alloc.alloc(graph_metric_config.IndexSpec, 0);
-    defer graph_metric_config.freeIndexSpecs(alloc, previous_specs);
-
     // Metric-bearing publications pin a shared topology generation.
     if (specs.len > 0) {
-        try stampGraphTopologyGenerationsAlloc(alloc, graph_refs, current, previous_specs, provenance.edge_generation);
+        stampGraphTopologyGenerations(graph_refs, current, provenance.edge_generation);
     }
 
     const graph_metric_limits = lake_graph_metric.Limits{};

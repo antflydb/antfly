@@ -19,8 +19,8 @@
 /// The only manifest wire that may publish graph-metric artifacts. Serverless
 /// has not shipped, so partial pre-release graph-metric layouts are rejected
 /// instead of becoming a permanent compatibility surface.
-pub const graph_metric_manifest_wire_version: u16 = 18;
-pub const graph_metric_segment_wire_version: u16 = 9;
+pub const graph_metric_manifest_wire_version: u16 = 19;
+pub const graph_metric_segment_wire_version: u16 = 10;
 
 pub const GraphMetricMaterializationState = enum(u8) {
     ready = 0,
@@ -76,6 +76,10 @@ pub const ArtifactRef = struct {
     graph_metric_point_index_checksum: [32]u8 = @splat(0),
     graph_metric_config_fingerprint: u64 = 0,
     graph_metric_source_checksum: [32]u8 = @splat(0),
+    /// Canonical selected unweighted connectivity, independent of source
+    /// payload layout/weights. The metric control authenticates this identity;
+    /// source_checksum binds the current publication to its graph artifact.
+    graph_metric_topology_checksum: [32]u8 = @splat(0),
     graph_metric_materialization_state: GraphMetricMaterializationState = .ready,
     graph_metric_rejection_reason: GraphMetricRejectionReason = .none,
 };
