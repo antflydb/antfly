@@ -47,6 +47,14 @@ pub const Stats = struct {
     inventory_rows_scanned: u64 = 0,
     catalog_metadata_bytes_shared: u64 = 0,
     catalog_metadata_bytes_copied: u64 = 0,
+    inventory_wal_rows: u64 = 0,
+    inventory_wal_retirements: u64 = 0,
+    inventory_delta_installs: u64 = 0,
+    inventory_fallback_installs: u64 = 0,
+    inventory_policy_switches: u64 = 0,
+    inventory_incremental_active: u64 = 0,
+    mark_bitmap_bytes: u64 = 0,
+    mark_fallback_entries: u64 = 0,
     inventory_updates: u64 = 0,
     inventory_update_ns: u64 = 0,
     collection_locked_ns: u64 = 0,
@@ -82,6 +90,8 @@ pub const Stats = struct {
     live_payload_bytes_at_collection: u64 = 0,
     collections: u64 = 0,
     collection_deferrals: u64 = 0,
+    collection_debt_deferrals: u64 = 0,
+    obsolete_payload_debt_bytes: u64 = 0,
     collection_bytes_read: u64 = 0,
     collection_bytes_written: u64 = 0,
     unresolved_primary_commits: u64 = 0,
@@ -211,6 +221,7 @@ pub const Store = struct {
         prepare: *const fn (*anyopaque, []const Prepared) anyerror!void,
         resolve: *const fn (*anyopaque, Allocator, []const u8, Reference) anyerror![]u8,
         unresolved_commit: ?*const fn (*anyopaque) void = null,
+        retired_payloads: ?*const fn (*anyopaque, u64) void = null,
     };
 
     pub fn retain(self: Store) void {
@@ -236,6 +247,7 @@ pub const Session = struct {
     reference_epoch_staged: bool = false,
     primary_commit_attempted: bool = false,
     ownership_failed: bool = false,
+    retired_payload_bytes: u64 = 0,
 
     pub fn create(alloc: Allocator, store: Store) !*Session {
         const self = try alloc.create(Session);
@@ -250,6 +262,9 @@ pub const Session = struct {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         if ((self.prepared_once or (self.reference_mutated and self.primary_commit_attempted)) and !self.committed) {
             if (self.store.vtable.unresolved_commit) |unresolved| unresolved(self.store.ptr);
+        }
+        if (self.committed and self.retired_payload_bytes != 0) {
+            if (self.store.vtable.retired_payloads) |notify| notify(self.store.ptr, self.retired_payload_bytes);
         }
         self.arena.deinit();
         self.store.release();
@@ -299,6 +314,22 @@ pub const Session = struct {
         var owner_key: [ownership_prefix.len + 32]u8 = undefined;
         @memcpy(owner_key[0..ownership_prefix.len], ownership_prefix);
         std.crypto.hash.sha2.Sha256.hash(key, owner_key[ownership_prefix.len..], .{});
+        // Scheduling hint only; primary references and ANN leases still
+        // decide reachability. Read the old owner before replacing it.
+        if (self.store.vtable.retired_payloads != null) {
+            const old = txn.get(&owner_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (old) |owner| {
+                if (owner.len != 36) return error.InvalidVectorOwnershipRecord;
+                const unchanged = if (value) |raw| if (isReference(raw))
+                    std.mem.eql(u8, owner[0..32], &(try Reference.decode(raw)).digest)
+                else
+                    false else false;
+                if (!unchanged) self.retired_payload_bytes +|= @as(u64, std.mem.readInt(u32, owner[32..36], .little)) * 4;
+            }
+        }
         if (value) |raw| {
             if (isReference(raw)) {
                 const reference = try Reference.decode(raw);

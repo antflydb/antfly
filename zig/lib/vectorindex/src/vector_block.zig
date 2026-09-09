@@ -1261,6 +1261,29 @@ pub const Reader = struct {
         } };
     }
 
+    /// Metadata-only access for immutable source mark bitmaps. Admission has
+    /// validated index ordering and keys; payload checksums remain required
+    /// when verifying/copying a marked value.
+    pub fn sourceIdentityAt(self: Reader, index: usize) struct { key: []const u8, dims: u32, vector: bool } {
+        const found = self.entryAssumeValidated(index);
+        return .{ .key = self.data[found.key_offset..][0..found.key_len], .dims = found.dims, .vector = (found.flags & tombstone_flag) == 0 };
+    }
+
+    pub fn sourceIndex(self: Reader, key: []const u8, hash: u64) ?usize {
+        if ((hash & (@as(u64, self.shard_count) - 1)) != self.shard_id) return null;
+        var lo: usize = 0;
+        var hi: usize = self.count;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.compareEntryKeyAssumeValidated(self.entryAssumeValidated(mid), hash, key) == .gt) hi = mid else lo = mid + 1;
+        }
+        if (lo == 0) return null;
+        const index = lo - 1;
+        const found = self.entryAssumeValidated(index);
+        if (self.compareEntryKeyAssumeValidated(found, hash, key) != .eq or (found.flags & tombstone_flag) != 0) return null;
+        return index;
+    }
+
     /// Returns one physical entry in block sort order. This deliberately does
     /// not expose the private index representation: callers receive the same
     /// lazy key/payload checksum guarantees as point lookup while retaining a

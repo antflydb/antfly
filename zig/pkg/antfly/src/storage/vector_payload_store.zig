@@ -14,6 +14,7 @@ const vector_block = @import("antfly_vectorindex").vector_block;
 const Allocator = std.mem.Allocator;
 const resources = @import("resource_manager.zig");
 const time = @import("antfly_platform").time;
+const LiveSet = @import("source_vector_live_set.zig").LiveSet;
 const generation_publication = @import("generation_publication.zig");
 
 pub const Stats = payload.Stats;
@@ -95,6 +96,13 @@ pub const Store = struct {
     shared_catalog: bool = false,
     independent_scan: bool = false,
     incremental_inventory: bool = false,
+    delta_inventory: bool = false,
+    debt_scheduling: bool = false,
+    bitmap_marking: bool = false,
+    inventory_min_payloads: u64 = 0,
+    inventory_requested: bool = false,
+    last_mark_completed_ns: u64 = 0,
+    obsolete_debt: u64 = 0,
     inventory: Inventory = .{},
     // Test-only pause/clock injection exercises an actual in-flight scan.
     mark_test_hook: if (@import("builtin").is_test) ?*const fn (*Store) void else void = if (@import("builtin").is_test) null else {},
@@ -119,9 +127,23 @@ pub const Store = struct {
     /// WAL membership is refreshed at installation, not on every preparation.
     /// Between installations the normal append counters track new payloads.
     const Inventory = struct {
+        const WalEvent = struct {
+            digest: payload.Digest,
+            batch: u64,
+            fn less(_: void, a: @This(), b: @This()) bool {
+                return a.batch < b.batch;
+            }
+        };
         const Occurrence = struct { dims: u32, count: u64 };
         counts: std.AutoHashMapUnmanaged(payload.Digest, Occurrence) = .empty,
-        wal: std.AutoHashMapUnmanaged(payload.Digest, void) = .empty,
+        wal: std.AutoHashMapUnmanaged(payload.Digest, u64) = .empty,
+        wal_events: std.ArrayListUnmanaged(WalEvent) = .empty,
+        wal_head: usize = 0,
+        delta: bool = false,
+        wal_rows: u64 = 0,
+        wal_retirements: u64 = 0,
+        delta_installs: u64 = 0,
+        fallback_installs: u64 = 0,
         segments: std.AutoHashMapUnmanaged(u128, void) = .empty,
         bytes: u64 = 0,
         initialized: bool = false,
@@ -129,8 +151,9 @@ pub const Store = struct {
         fn deinit(self: *@This(), alloc: Allocator) void {
             self.counts.deinit(alloc);
             self.wal.deinit(alloc);
+            self.wal_events.deinit(alloc);
             self.segments.deinit(alloc);
-            self.* = .{};
+            self.* = .{ .delta = self.delta };
         }
         fn id(reader: vector_block.Reader) u128 {
             return (@as(u128, reader.generation) << 64) | reader.shard_id;
@@ -152,16 +175,40 @@ pub const Store = struct {
                 _ = self.counts.remove(digest);
             }
         }
-        fn addWal(self: *@This(), alloc: Allocator, key: []const u8, dims: u32) !void {
+        fn addWal(self: *@This(), alloc: Allocator, key: []const u8, dims: u32, batch: u64) !void {
             if (key.len != 32) return error.InvalidVectorReference;
-            if (!(try self.wal.getOrPut(alloc, key[0..32].*)).found_existing)
+            self.wal_rows += 1;
+            const entry = try self.wal.getOrPut(alloc, key[0..32].*);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = batch;
                 try self.add(alloc, key[0..32].*, dims);
+            } else if (entry.value_ptr.* >= batch) return else entry.value_ptr.* = batch;
+            if (self.delta) try self.wal_events.append(alloc, .{ .digest = key[0..32].*, .batch = batch });
         }
         fn addTree(self: *@This(), alloc: Allocator, node: ?*@import("vector_wal_view.zig").Node) anyerror!void {
             if (node) |n| {
                 try self.addTree(alloc, n.left);
-                if (n.record.kind == .upsert) try self.addWal(alloc, n.record.key, n.record.dims);
+                if (n.record.kind == .upsert) try self.addWal(alloc, n.record.key, n.record.dims, n.record.batch_id);
                 try self.addTree(alloc, n.right);
+            }
+        }
+        fn retireWal(self: *@This(), through: u64) !void {
+            while (self.wal_head < self.wal_events.items.len) {
+                const event = self.wal_events.items[self.wal_head];
+                if (event.batch > through) break;
+                self.wal_head += 1;
+                if (self.wal.get(event.digest)) |latest| {
+                    if (latest != event.batch) continue;
+                    try self.remove(event.digest);
+                    _ = self.wal.remove(event.digest);
+                    self.wal_retirements += 1;
+                }
+            }
+            if (self.wal_head >= self.wal_events.items.len / 2) {
+                const remaining = self.wal_events.items.len - self.wal_head;
+                std.mem.copyForwards(WalEvent, self.wal_events.items[0..remaining], self.wal_events.items[self.wal_head..]);
+                self.wal_events.items.len = remaining;
+                self.wal_head = 0;
             }
         }
         fn sync(self: *@This(), alloc: Allocator, previous: ?*const native.Opened, next: *const native.Opened, rows: *u64) !void {
@@ -172,10 +219,25 @@ pub const Store = struct {
             defer next_segments.deinit(alloc);
             try next_segments.ensureTotalCapacity(alloc, @intCast(next.readers.len));
             for (next.readers) |reader| next_segments.putAssumeCapacity(id(reader), {});
+            // The prepared successor carries a validated WAL-prefix delta.
+            // Normal checkpoints empty the WAL; unknown transitions rebuild.
+            const empty_wal = next.wal_tree == null and next.wal.records.items.len == 0;
+            const reuse = if (empty_wal) native.Store.WalReuse{ .after_batch = std.math.maxInt(u64) } else next.wal_inventory_delta;
+            const use_delta = self.delta and self.initialized and reuse != null;
+            if (use_delta) self.delta_installs += 1 else self.fallback_installs += 1;
             if (self.initialized) {
-                var wal = self.wal.keyIterator();
-                while (wal.next()) |digest| try self.remove(digest.*);
-                self.wal.clearRetainingCapacity();
+                if (use_delta) {
+                    switch (reuse.?) {
+                        .all => {},
+                        .after_batch => |batch| try self.retireWal(batch),
+                    }
+                } else {
+                    var wal = self.wal.keyIterator();
+                    while (wal.next()) |digest| try self.remove(digest.*);
+                    self.wal.clearRetainingCapacity();
+                    self.wal_events.clearRetainingCapacity();
+                    self.wal_head = 0;
+                }
                 for (previous.?.readers) |reader| {
                     if (next_segments.contains(id(reader))) continue;
                     for (0..reader.count) |i| {
@@ -195,10 +257,13 @@ pub const Store = struct {
                     try self.add(alloc, row.key[0..32].*, row.value.vector.dims);
                 }
             }
-            for (next.wal.records.items) |record| {
-                if (record.kind == .upsert) try self.addWal(alloc, record.key, record.dims);
+            if (!use_delta) {
+                for (next.wal.records.items) |record| {
+                    if (record.kind == .upsert) try self.addWal(alloc, record.key, record.dims, record.batch_id);
+                }
+                try self.addTree(alloc, next.wal_tree);
+                if (self.delta) std.mem.sort(WalEvent, self.wal_events.items, {}, WalEvent.less);
             }
-            try self.addTree(alloc, next.wal_tree);
             self.segments.deinit(alloc);
             self.segments = next_segments;
             next_segments = .empty;
@@ -207,6 +272,14 @@ pub const Store = struct {
     };
 
     fn prepareOpened(self: *Store, next: *native.Opened) !void {
+        if (self.inventory_min_payloads != 0) {
+            const desired = self.inventory_requested and self.stats.retained_payloads >= self.inventory_min_payloads;
+            if (desired != self.incremental_inventory) {
+                self.inventory.deinit(self.alloc);
+                self.incremental_inventory = desired;
+                self.stats.inventory_policy_switches += 1;
+            }
+        }
         if (self.shared_catalog) try next.shareSegmentCatalog();
         if (self.incremental_inventory) {
             const started = time.monotonicNs();
@@ -371,7 +444,7 @@ pub const Store = struct {
 
     const Collection = struct {
         input: native.Opened,
-        live: std.AutoHashMap(payload.Digest, u32),
+        live: LiveSet,
         tail: std.AutoHashMap(payload.Digest, u32),
         items: []CollectionItem,
         shards: u32,
@@ -390,6 +463,7 @@ pub const Store = struct {
         primary_epoch: u64,
         ann: payload.Digest,
         rescued: bool = false,
+        debt_at_cut: u64 = 0,
         selected: ?[]@import("antfly_vectorindex").vector_block_manifest.Segment = null,
 
         fn deinit(self: *@This(), alloc: Allocator) void {
@@ -418,15 +492,16 @@ pub const Store = struct {
         ann_reader: usize = 0,
         ann_row: usize = 0,
         ann_wal: usize = 0,
-        verification: ?std.AutoHashMap(payload.Digest, u32).Iterator = null,
+        verification: ?LiveSet.Iterator = null,
         verified_bytes: u64 = 0,
         epoch: u64,
         ann_digest: payload.Digest,
         boundary: native.WalPrefixBoundary,
-        live: std.AutoHashMap(payload.Digest, u32),
+        live: LiveSet,
         tail: std.AutoHashMap(payload.Digest, u32),
         source: native.Opened,
         retained_at_cut: u64,
+        debt_at_cut: u64,
         scopes: ?[]u64,
         outside_lock: bool,
         running: bool = false, // source mutex protects lifetime and scan admission
@@ -770,8 +845,21 @@ pub const Store = struct {
         self.shared_catalog = experimentEnabled("ANTFLY_SOURCE_VECTOR_SHARED_CATALOG");
         self.independent_scan = experimentEnabled("ANTFLY_SOURCE_VECTOR_INDEPENDENT_SCAN");
         self.incremental_inventory = experimentEnabled("ANTFLY_SOURCE_VECTOR_INCREMENTAL_INVENTORY");
+        self.delta_inventory = experimentEnabled("ANTFLY_SOURCE_VECTOR_DELTA_INVENTORY");
+        self.inventory.delta = self.delta_inventory;
+        self.bitmap_marking = experimentEnabled("ANTFLY_SOURCE_VECTOR_BITMAP_MARKING");
+        self.inventory_requested = self.incremental_inventory;
+        if (@import("builtin").link_libc) {
+            if (std.c.getenv("ANTFLY_SOURCE_VECTOR_INVENTORY_MIN_PAYLOADS")) |raw|
+                self.inventory_min_payloads = try std.fmt.parseInt(u64, std.mem.span(raw), 10);
+        }
+        if (self.inventory_min_payloads != 0 and self.inventory_requested and self.receipt == null) try self.inventoryRetainedPayloads();
+        if (self.stats.retained_payloads < self.inventory_min_payloads) self.incremental_inventory = false;
+        self.debt_scheduling = experimentEnabled("ANTFLY_SOURCE_VECTOR_DEBT_SCHEDULING") and payload.ownershipEnabled();
         if (self.shared_catalog) try self.opened.shareSegmentCatalog();
         if (self.incremental_inventory) try self.initializeInventory(experimentEnabled("ANTFLY_SOURCE_VECTOR_LAZY_INVENTORY"));
+        // Existing tables always verify on their first maintenance turn.
+        if (self.stats.retained_payloads == 0) self.last_mark_completed_ns = time.monotonicNs();
         if (@import("builtin").link_libc) {
             if (std.c.getenv("ANTFLY_SOURCE_VECTOR_SCAN_DUTY_PERCENT")) |raw| {
                 const duty = std.fmt.parseInt(u8, std.mem.span(raw), 10) catch 0;
@@ -894,16 +982,16 @@ pub const Store = struct {
         self.stats.retained_payload_bytes = totals.bytes;
     }
 
-    fn inventoryInto(self: *Store, opened: *const native.Opened, unique: *std.AutoHashMap(payload.Digest, u32)) !InventoryTotals {
+    fn inventoryInto(self: *Store, opened: *const native.Opened, unique: anytype) !InventoryTotals {
         const started = time.monotonicNs();
         defer self.stats.inventory_update_ns += time.monotonicNs() -| started;
         self.stats.inventory_updates += 1;
         const FullInventory = struct {
-            fn put(map: *std.AutoHashMap(payload.Digest, u32), key: []const u8, dims: u32) !void {
+            fn put(map: @TypeOf(unique), key: []const u8, dims: u32) !void {
                 if (key.len != 32) return error.InvalidVectorReference;
                 try map.put(key[0..32].*, dims);
             }
-            fn tree(map: *std.AutoHashMap(payload.Digest, u32), node: ?*@import("vector_wal_view.zig").Node) anyerror!void {
+            fn tree(map: @TypeOf(unique), node: ?*@import("vector_wal_view.zig").Node) anyerror!void {
                 if (node) |n| {
                     try tree(map, n.left);
                     if (n.record.kind == .upsert) try put(map, n.record.key, n.record.dims);
@@ -912,6 +1000,9 @@ pub const Store = struct {
             }
         };
         unique.clearRetainingCapacity();
+        if (@TypeOf(unique) == *LiveSet) {
+            if (self.bitmap_marking) try unique.enableBitmaps(opened);
+        }
         for (opened.readers) |reader| for (0..reader.count) |i| {
             const entry = try reader.entryAt(i);
             self.stats.inventory_rows_scanned += 1;
@@ -964,7 +1055,9 @@ pub const Store = struct {
     }
 
     pub fn interface(self: *Store) payload.Store {
-        return .{ .ptr = self, .vtable = &.{ .retain = retain, .release = release, .prepare = prepare, .resolve = resolve, .unresolved_commit = unresolvedCommit } };
+        const normal: payload.Store.VTable = .{ .retain = retain, .release = release, .prepare = prepare, .resolve = resolve, .unresolved_commit = unresolvedCommit };
+        const scheduled: payload.Store.VTable = .{ .retain = retain, .release = release, .prepare = prepare, .resolve = resolve, .unresolved_commit = unresolvedCommit, .retired_payloads = retiredPayloads };
+        return .{ .ptr = self, .vtable = if (self.debt_scheduling) &scheduled else &normal };
     }
 
     fn cast(ptr: *anyopaque) *Store {
@@ -985,6 +1078,13 @@ pub const Store = struct {
         defer self.mutex.unlock();
         std.debug.assert(self.stats.active_sessions > 0);
         self.stats.active_sessions -= 1;
+    }
+
+    fn retiredPayloads(ptr: *anyopaque, bytes: u64) void {
+        const self = cast(ptr);
+        self.lock();
+        defer self.mutex.unlock();
+        self.obsolete_debt +|= bytes;
     }
 
     fn unresolvedCommit(ptr: *anyopaque) void {
@@ -1201,6 +1301,14 @@ pub const Store = struct {
         var successor = try self.opened.prepareWalSuccessor(self.alloc, &encoded, true);
         errdefer successor.deinit();
         self.recordCatalogSuccessor();
+        // Update this rebuildable cache before durability too. If admission or
+        // publication fails, discard it and rebuild from the authoritative view.
+        errdefer if (self.delta_inventory) self.inventory.deinit(self.alloc);
+        if (self.incremental_inventory and self.delta_inventory and self.inventory.initialized) {
+            const inventory_started = time.monotonicNs();
+            defer self.stats.inventory_update_ns += time.monotonicNs() -| inventory_started;
+            for (records.items) |record| try self.inventory.addWal(self.alloc, record.key, @intCast(record.vector.len), encoded.last_committed_batch.?);
+        }
         // Prepare all reader allocations before the durable append. This sync
         // establishes payload durability before ANY subsequent primary commit
         // or asynchronous primary checkpoint can persist its reference.
@@ -1375,6 +1483,20 @@ pub const Store = struct {
         var stats = self.stats;
         stats.prepare_requests = self.prepare_requests.load(.monotonic);
         stats.source_segments = self.opened.readers.len;
+        stats.inventory_incremental_active = @intFromBool(self.incremental_inventory);
+        if (self.marking) |marking| {
+            stats.mark_bitmap_bytes = marking.live.bitmapBytes();
+            stats.mark_fallback_entries = marking.live.map.count();
+        }
+        if (self.collection) |collection| {
+            stats.mark_bitmap_bytes = collection.live.bitmapBytes();
+            stats.mark_fallback_entries = collection.live.map.count();
+        }
+        stats.obsolete_payload_debt_bytes = self.obsolete_debt;
+        stats.inventory_wal_rows = self.inventory.wal_rows;
+        stats.inventory_wal_retirements = self.inventory.wal_retirements;
+        stats.inventory_delta_installs = self.inventory.delta_installs;
+        stats.inventory_fallback_installs = self.inventory.fallback_installs;
         if (self.directory) |directory| {
             stats.directory_bytes_written = directory.bytes_written;
             stats.directory_publications = directory.publications;
@@ -1412,6 +1534,26 @@ pub const Store = struct {
     pub fn collectDeferredMark(self: *Store, primary: *erased.Store) !bool {
         const budget = collectionStepBytes();
         return self.collectStepDeferredMark(primary, if (budget == 0) std.math.maxInt(u64) else budget);
+    }
+
+    /// Scheduling never certifies liveness. Explicit collect/collectStep calls
+    /// bypass this policy; background verification becomes eligible again
+    /// after 30 seconds, subject to the normal reader and memory fences.
+    pub fn collectBackgroundStepDeferredMark(self: *Store, primary: *erased.Store, budget_bytes: u64) !bool {
+        self.lock();
+        const defer_scan = self.shouldDeferMark(time.monotonicNs());
+        if (defer_scan) self.stats.collection_debt_deferrals += 1;
+        self.mutex.unlock();
+        if (defer_scan) return false;
+        return self.collectStepDeferredMark(primary, budget_bytes);
+    }
+
+    fn shouldDeferMark(self: *const Store, now: u64) bool {
+        return self.debt_scheduling and !self.poisoned and self.marking == null and self.collection == null and
+            self.stats.unresolved_primary_commits == 0 and self.last_mark_completed_ns != 0 and
+            now -| self.last_mark_completed_ns < 30 * std.time.ns_per_s and
+            self.obsolete_debt < @max(8 * 1024 * 1024, self.stats.retained_payload_bytes / 20) and
+            self.stats.unreferenced_payload_bytes_at_collection == 0;
     }
 
     pub fn collect(self: *Store, primary: *erased.Store) !bool {
@@ -1468,6 +1610,9 @@ pub const Store = struct {
         // Forty bytes per bucket covers a digest, dimension and metadata;
         // fixed slack covers the header/alignment and the Marking itself.
         // Reserve also for the source lease (and full-GC sealing successor).
+        if (self.bitmap_marking) {
+            return std.math.add(usize, try LiveSet.workspaceBytes(&self.opened), try std.math.add(usize, @sizeOf(Marking) + 4096, try std.math.mul(usize, @intCast(self.opened.catalogMetadataBytes()), 3)));
+        }
         const count = std.math.cast(u32, self.stats.retained_payloads) orelse return error.VectorPayloadCountOverflow;
         const load_capacity = (try std.math.mul(usize, count, 5)) / 4;
         const slots = try std.math.ceilPowerOfTwo(usize, @max(8, try std.math.add(usize, load_capacity, 1)));
@@ -1558,13 +1703,16 @@ pub const Store = struct {
         // The physical inventory bounds the live set at this cut. Allocate
         // its map once before scanning, avoiding old+new hash-table peaks
         // midway through a mark while the post-cut WAL is also growing.
-        var live = std.AutoHashMap(payload.Digest, u32).init(self.alloc);
+        var live = LiveSet.init(self.alloc);
         errdefer live.deinit();
-        try live.ensureTotalCapacity(std.math.cast(u32, self.stats.retained_payloads) orelse return error.ResourceBudgetExceeded);
+        if (self.bitmap_marking) {
+            try live.enableBitmaps(&source_snapshot);
+        } else try live.ensureTotalCapacity(std.math.cast(u32, self.stats.retained_payloads) orelse return error.ResourceBudgetExceeded);
         const marking = try self.alloc.create(Marking);
         marking.* = .{
             .source = source_snapshot,
             .retained_at_cut = self.stats.retained_payloads,
+            .debt_at_cut = self.obsolete_debt,
             .scopes = scopes,
             .outside_lock = self.mark_outside_lock,
             .txn = txn,
@@ -1619,6 +1767,8 @@ pub const Store = struct {
             self.stats.unreferenced_payload_bytes_at_collection = 0;
             self.stats.collections += 1;
             try self.saveCheckpointReceipt(if (marking.rescued_any) null else epoch, if (marking.rescued_any) null else ann_digest);
+            self.last_mark_completed_ns = time.monotonicNs();
+            self.obsolete_debt -|= marking.debt_at_cut;
             marking.deinit(self.alloc);
             self.marking = null;
             return true;
@@ -1633,8 +1783,9 @@ pub const Store = struct {
         var constructing = true;
         var selected = std.ArrayListUnmanaged(@import("antfly_vectorindex").vector_block_manifest.Segment).empty;
         defer selected.deinit(self.alloc);
-        var copy_live = std.AutoHashMap(payload.Digest, u32).init(self.alloc);
+        var copy_live = LiveSet.init(self.alloc);
         defer copy_live.deinit();
+        if (self.bitmap_marking) try copy_live.enableBitmaps(&self.opened);
         const partial = self.selective_gc and !manifest.hasPhysicalBase();
         if (partial) {
             // Retain cold segments byte-for-byte. Updated versions arrive in
@@ -1710,10 +1861,11 @@ pub const Store = struct {
             .primary_epoch = epoch,
             .ann = ann_digest,
             .rescued = marking.rescued_any,
+            .debt_at_cut = marking.debt_at_cut,
             .selected = selected_owned,
             .boundary = marking.boundary,
         };
-        live = std.AutoHashMap(payload.Digest, u32).init(self.alloc);
+        live = LiveSet.init(self.alloc);
         self.collection = collection;
         marking.tail = .init(self.alloc);
         marking.deinit(self.alloc);
@@ -1834,11 +1986,18 @@ pub const Store = struct {
             self.stats.retained_payloads = physical.count;
             self.stats.retained_payload_bytes = physical.bytes;
         }
+        if (self.inventory_min_payloads != 0 and self.incremental_inventory and self.stats.retained_payloads < self.inventory_min_payloads) {
+            self.inventory.deinit(self.alloc);
+            self.incremental_inventory = false;
+            self.stats.inventory_policy_switches += 1;
+        }
         // Includes post-cut preparations conservatively; the next mark decides
         // whether those transactions committed or became orphans.
         self.stats.live_payloads_at_collection = live_count + collection.tail.count();
         self.stats.live_payload_bytes_at_collection = marked_live_bytes;
         self.stats.collections += 1;
+        self.last_mark_completed_ns = time.monotonicNs();
+        self.obsolete_debt -|= collection.debt_at_cut;
         const receipt_epoch: ?u64 = if (collection.tail.count() == 0 and collection.selected == null and !collection.rescued) collection.primary_epoch else null;
         const receipt_ann: ?payload.Digest = if (collection.tail.count() == 0 and collection.selected == null and !collection.rescued) collection.ann else null;
         // Authority and its serving view are installed. Cleanup and receipt
@@ -4005,4 +4164,177 @@ test "source vector payloads independent scan skips apply only before planning a
     try std.testing.expect(!source.continueScanWithoutApply());
     try std.testing.expect(try source.collectStepDeferredMark(&raw, 1));
     try std.testing.expectEqual(@as(u64, 1), source.stats.collection_apply_visits_avoided);
+}
+
+test "source vector payloads delta inventory retires only cut WAL events and preserves duplicate suffix" {
+    const alloc = std.testing.allocator;
+    var inventory: Store.Inventory = .{ .delta = true };
+    defer inventory.deinit(alloc);
+    const first: payload.Digest = [_]u8{1} ** 32;
+    const second: payload.Digest = [_]u8{2} ** 32;
+    // Batch zero is real. Reappearance in a later batch must keep the single
+    // WAL contribution when an earlier occurrence crosses the checkpoint cut.
+    try inventory.addWal(alloc, &first, 2, 0);
+    try inventory.addWal(alloc, &second, 3, 1);
+    try inventory.addWal(alloc, &first, 2, 2);
+    try inventory.add(alloc, first, 2); // same identity also exists in a segment
+    try inventory.retireWal(0);
+    try std.testing.expectEqual(@as(u32, 2), inventory.wal.count());
+    try std.testing.expectEqual(@as(u64, 2), inventory.counts.get(first).?.count);
+    try inventory.retireWal(1);
+    try std.testing.expect(!inventory.counts.contains(second));
+    try inventory.retireWal(2);
+    try std.testing.expectEqual(@as(u64, 1), inventory.counts.get(first).?.count);
+    try std.testing.expectEqual(@as(u64, 8), inventory.bytes);
+    try std.testing.expectEqual(@as(u32, 0), inventory.wal.count());
+    try std.testing.expectEqual(@as(usize, 0), inventory.wal_events.items.len);
+}
+
+test "source vector payloads cost experiments preserve updates deletes old leases and independent inventory" {
+    const alloc = std.testing.allocator;
+    const mem = @import("mem_backend.zig");
+    const docs = @import("docstore.zig");
+    const keys = @import("internal_keys.zig");
+    for ([_]bool{ false, true }) |bitmap| for ([_]bool{ false, true }) |delta| for ([_]u64{ 0, 2 }) |cutoff| {
+        var memory = lsm.MemoryStorage.init(alloc);
+        defer memory.deinit();
+        var backend = mem.Backend.init(alloc, .{});
+        defer backend.close();
+        var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+        defer raw.deinit();
+        var source = try Store.open(alloc, memory.storage(), "/cost-experiments", false);
+        defer source.deinit();
+        source.bitmap_marking = bitmap;
+        source.delta_inventory = delta;
+        source.inventory.delta = delta;
+        source.incremental_inventory = true;
+        source.inventory_requested = true;
+        source.inventory_min_payloads = cutoff;
+        source.append_only = true;
+        source.selective_gc = true;
+        source.mark_outside_lock = true;
+        source.mark_step_rows = 1;
+        source.rescue_reappends = false;
+        var store = try docs.DocStore.openRuntime(alloc, &raw);
+        defer store.close();
+        store.payload_store = source.interface();
+        const a = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model-a");
+        defer alloc.free(a);
+        const b = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model-b");
+        defer alloc.free(b);
+        const old = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2 });
+        defer alloc.free(old);
+        const new = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &.{ 3, 4, 5 });
+        defer alloc.free(new);
+        const ref = try payload.Reference.forArtifact(a, old);
+        try store.put(a, old);
+        try source.checkpoint();
+        if (cutoff != 0) try std.testing.expect(!source.incremental_inventory);
+        try store.put(b, new);
+        try source.checkpoint();
+        try std.testing.expect(source.incremental_inventory);
+        var lease = try source.snapshot(alloc);
+        defer lease.deinit();
+        try store.put(a, new);
+        try std.testing.expect(!try source.collectStepDeferredMark(&raw, 1));
+        // Force a post-cut reappend of the old version; it is protected for
+        // this pass but must disappear after the following mark.
+        try Store.prepare(&source, &.{.{ .reference = ref, .artifact = old }});
+        for (0..3) |_| {
+            var turns: usize = 0;
+            while (!try source.collectStep(&raw, 1)) : (turns += 1) try std.testing.expect(turns < 2048);
+            const expected_count = source.stats.retained_payloads;
+            const expected_bytes = source.stats.retained_payload_bytes;
+            try source.inventoryRetainedPayloads();
+            try std.testing.expectEqual(expected_count, source.stats.retained_payloads);
+            try std.testing.expectEqual(expected_bytes, source.stats.retained_payload_bytes);
+        }
+        try std.testing.expectEqual(@as(u64, 2), source.stats.retained_payloads);
+        try store.delete(a);
+        try store.delete(b);
+        for (0..2048) |_| {
+            if (source.stats.retained_payloads == 0) break;
+            _ = try source.collectStep(&raw, 1);
+        }
+        try std.testing.expectEqual(@as(u64, 0), source.stats.retained_payloads);
+        try source.checkpoint();
+        if (cutoff != 0) try std.testing.expect(!source.incremental_inventory);
+        try std.testing.expect((try lease.get(&ref.digest, std.math.maxInt(u64), 1)) == .vector);
+        for (0..2) |_| {
+            var reopened = try Store.open(alloc, memory.storage(), "/cost-experiments", false);
+            defer reopened.deinit();
+            try reopened.inventoryRetainedPayloads();
+            try std.testing.expectEqual(@as(u64, 0), reopened.stats.retained_payloads);
+        }
+    };
+}
+
+test "source vector payloads debt policy bounds background deferral and explicit collection bypasses it" {
+    const alloc = std.testing.allocator;
+    const mem = @import("mem_backend.zig");
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var backend = mem.Backend.init(alloc, .{});
+    defer backend.close();
+    var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer raw.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/debt-policy", false);
+    defer source.deinit();
+    source.debt_scheduling = true;
+    source.last_mark_completed_ns = 100;
+    try std.testing.expect(source.shouldDeferMark(100 + 29 * std.time.ns_per_s));
+    try std.testing.expect(!source.shouldDeferMark(100 + 30 * std.time.ns_per_s));
+    Store.retiredPayloads(&source, 8 * 1024 * 1024);
+    try std.testing.expect(!source.shouldDeferMark(101));
+    source.obsolete_debt = 0;
+    source.last_mark_completed_ns = time.monotonicNs();
+    try std.testing.expect(!try source.collectBackgroundStepDeferredMark(&raw, 1));
+    try std.testing.expect(source.marking == null);
+    while (!try source.collectStep(&raw, 1)) {}
+    try std.testing.expect(source.stats.collections > 0);
+    source.stats.unresolved_primary_commits = 1;
+    try std.testing.expect(!source.shouldDeferMark(time.monotonicNs()));
+    try std.testing.expect(!try source.collectStep(&raw, 1));
+}
+
+test "source vector payloads debt notification counts committed replacements and deletes only" {
+    if (!payload.ownershipEnabled()) return;
+    const alloc = std.testing.allocator;
+    const mem = @import("mem_backend.zig");
+    const docs = @import("docstore.zig");
+    const keys = @import("internal_keys.zig");
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var backend = mem.Backend.init(alloc, .{});
+    defer backend.close();
+    var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer raw.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/debt-commit", false);
+    defer source.deinit();
+    source.debt_scheduling = true;
+    var store = try docs.DocStore.openRuntime(alloc, &raw);
+    defer store.close();
+    store.payload_store = source.interface();
+    const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
+    defer alloc.free(key);
+    const first = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2 });
+    defer alloc.free(first);
+    const second = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &.{ 3, 4, 5 });
+    defer alloc.free(second);
+    try store.put(key, first);
+    try std.testing.expectEqual(@as(u64, 0), source.obsolete_debt);
+    try store.put(key, first);
+    try std.testing.expectEqual(@as(u64, 0), source.obsolete_debt);
+    {
+        var txn = try store.beginWriteTxn();
+        try txn.put(key, second);
+        txn.abort();
+    }
+    try std.testing.expectEqual(@as(u64, 0), source.obsolete_debt);
+    try store.put(key, second);
+    try std.testing.expectEqual(@as(u64, 8), source.obsolete_debt);
+    try store.delete(key);
+    try std.testing.expectEqual(@as(u64, 20), source.obsolete_debt);
+    while (!try source.collectStep(&raw, 1)) {}
+    try std.testing.expectEqual(@as(u64, 0), source.obsolete_debt);
 }

@@ -12,6 +12,44 @@ Existing planes remain readable without an eager rewrite. This does not change
 the table-level source-ownership setting or exact-score requirements. Frozen
 comparison catalogs and archive locations are in `benchmark-baselines/README.md`.
 
+## Cost-recovery experiments
+
+Four further opt-in treatments are implemented:
+WAL-prefix/append-delta inventory updates, obsolete-debt background scheduling,
+segment bitmap marking with a bounded WAL fallback, and a provisional small-table
+inventory cutoff. None changes defaults. The cutoff is a candidate to measure,
+not an established optimal crossover. Explicit collection, full sync, payload
+ownership, old-reader leases, WAL bounds and memory admission remain intact.
+See the [implementation and qualification ledger](../.benchmark-results/vector-store-cost-recovery/README.md)
+for settings, safety boundaries, validation and the independent A/B matrix.
+
+The isolated 50K ABBA runs passed all 16 workload/reclamation gates and eight
+independent full-inventory audits. Against the prior eager shared-catalog,
+incremental-inventory, unlocked-scan candidate, median paired changes were:
+
+| Treatment | Ready time | Mixed writes/s | Mixed p99 | Fixed churn time |
+| --- | ---: | ---: | ---: | ---: |
+| Append/checkpoint delta inventory | +18.6% | -19.6% | +15.5% | +12.4% |
+| Debt-based background scheduling | -21.2% | -9.8% | -3.9% | -0.9% |
+| Segment bitmap marking | -8.8% | -2.6% | +3.7% | +5.2% |
+| Provisional small-table cutoff | +13.6% | +0.2% | +2.0% | -1.6% |
+
+Delta inventory eliminates eligible WAL retraversal but adds foreground map
+work; inventory and preparation time increased in both pairs. Debt scheduling
+avoids initial marking in both 50K candidates, but one later sparse-GC drain
+took 365 seconds and 57 collections, revisiting 8.85 million mark rows. Garbage
+declined throughout and the debt policy did not defer that drain: the existing
+collector repeatedly chooses one sparse segment per full mark. The other debt
+candidate drained in 2.54 seconds. These are unequal-layout lifecycle results,
+not matched GC microbenchmarks.
+
+Bitmap marking reduced sampled mixed physical footprint 6.5% at 50K, with the
+foreground tradeoffs above. The cutoff did not establish an optimal threshold.
+Debt scheduling and bitmap marking are now being measured separately at 1M to
+test long ingestion and metadata pressure. None of these results changes
+defaults or qualifies an unmeasured combination. Full per-arm results and
+limitations are in the [measurement report](../.benchmark-results/vector-store-cost-recovery/RESULTS.md).
+
 ## Lifecycle fixes and isolated qualification
 
 The completed qualification is recorded under

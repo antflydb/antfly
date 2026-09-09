@@ -4779,6 +4779,46 @@ components:
           type: integer
           format: int64
           description: Immutable catalog array bytes copied by successful source snapshot and WAL-successor allocations; excludes object and root-path allocations.
+        inventory_wal_rows:
+          type: integer
+          format: int64
+          description: WAL identities visited while maintaining the current occurrence cache, including foreground append deltas; resets when the cache is discarded.
+        inventory_wal_retirements:
+          type: integer
+          format: int64
+          description: WAL identity contributions retired by checkpoint deltas; resets when the cache is discarded.
+        inventory_delta_installs:
+          type: integer
+          format: int64
+          description: Inventory installations that used a validated WAL prefix delta; resets when the cache is discarded.
+        inventory_fallback_installs:
+          type: integer
+          format: int64
+          description: Inventory installations that rebuilt WAL membership, including initialization; resets when the cache is discarded.
+        inventory_policy_switches:
+          type: integer
+          format: int64
+          description: Changes between full and incremental physical inventory under the optional size cutoff.
+        inventory_incremental_active:
+          type: integer
+          format: int64
+          description: One when incremental physical inventory is currently enabled, otherwise zero.
+        mark_bitmap_bytes:
+          type: integer
+          format: int64
+          description: Current segment bitmap and offset allocation bytes; excludes pinned source metadata and WAL fallback maps.
+        mark_fallback_entries:
+          type: integer
+          format: int64
+          description: Current WAL-only reachability entries when bitmap marking is enabled, or all mark entries in the hash-map control.
+        collection_debt_deferrals:
+          type: integer
+          format: int64
+          description: Background mark setups deferred by the optional obsolete-debt scheduling policy.
+        obsolete_payload_debt_bytes:
+          type: integer
+          format: int64
+          description: Conservative committed obsolete-payload scheduling debt; not a measurement of reclaimable bytes.
         inventory_updates:
           type: integer
           format: int64

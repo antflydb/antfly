@@ -24401,7 +24401,7 @@ pub const DB = struct {
             if (step_bytes != 0) {
                 try self.refreshSourceVectorOwnershipScopes();
                 const prior_generation = source.currentGeneration();
-                if (try source.collectStepDeferredMark(&self.core.store.runtime_store, step_bytes)) {
+                if (try source.collectBackgroundStepDeferredMark(&self.core.store.runtime_store, step_bytes)) {
                     if (source.currentGeneration() != prior_generation) try self.core.index_manager.refreshSourcePayloadGeneration();
                 } else if (source.collectionPending()) more = true;
             }

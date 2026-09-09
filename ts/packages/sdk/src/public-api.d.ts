@@ -5280,6 +5280,56 @@ export interface components {
             catalog_metadata_bytes_copied?: number;
             /**
              * Format: int64
+             * @description WAL identities visited while maintaining the current occurrence cache, including foreground append deltas; resets when the cache is discarded.
+             */
+            inventory_wal_rows?: number;
+            /**
+             * Format: int64
+             * @description WAL identity contributions retired by checkpoint deltas; resets when the cache is discarded.
+             */
+            inventory_wal_retirements?: number;
+            /**
+             * Format: int64
+             * @description Inventory installations that used a validated WAL prefix delta; resets when the cache is discarded.
+             */
+            inventory_delta_installs?: number;
+            /**
+             * Format: int64
+             * @description Inventory installations that rebuilt WAL membership, including initialization; resets when the cache is discarded.
+             */
+            inventory_fallback_installs?: number;
+            /**
+             * Format: int64
+             * @description Changes between full and incremental physical inventory under the optional size cutoff.
+             */
+            inventory_policy_switches?: number;
+            /**
+             * Format: int64
+             * @description One when incremental physical inventory is currently enabled, otherwise zero.
+             */
+            inventory_incremental_active?: number;
+            /**
+             * Format: int64
+             * @description Current segment bitmap and offset allocation bytes; excludes pinned source metadata and WAL fallback maps.
+             */
+            mark_bitmap_bytes?: number;
+            /**
+             * Format: int64
+             * @description Current WAL-only reachability entries when bitmap marking is enabled, or all mark entries in the hash-map control.
+             */
+            mark_fallback_entries?: number;
+            /**
+             * Format: int64
+             * @description Background mark setups deferred by the optional obsolete-debt scheduling policy.
+             */
+            collection_debt_deferrals?: number;
+            /**
+             * Format: int64
+             * @description Conservative committed obsolete-payload scheduling debt; not a measurement of reclaimable bytes.
+             */
+            obsolete_payload_debt_bytes?: number;
+            /**
+             * Format: int64
              * @description Full physical inventory scans and incremental occurrence-cache updates; this cache is not ownership authority.
              */
             inventory_updates?: number;

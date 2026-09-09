@@ -953,7 +953,7 @@ pub const Store = struct {
         return self.prepareStagedGenerationMode(generation, boundary.covered_source_sequence, staged, if (selected) |segments| .{ .replace_selected = segments } else .replace_base, if (selected == null) &.{} else null, boundary, false, null);
     }
 
-    const WalReuse = union(enum) { all, after_batch: u64 };
+    pub const WalReuse = union(enum) { all, after_batch: u64 };
 
     pub const PreparedPublication = struct {
         next: Store,
@@ -2014,6 +2014,9 @@ pub const Opened = struct {
     wal_order: std.ArrayListUnmanaged(usize),
     wal_tree: ?*wal_view.Node = null,
     wal_tree_initialized: bool = false,
+    /// Installation-only hint, validated against the previous durable prefix.
+    /// Ordinary clones/appends deliberately do not inherit it.
+    wal_inventory_delta: ?Store.WalReuse = null,
     /// Borrowed immutable source generation, owned by the serving generation lease.
     external_payloads: ?*const Opened = null,
     /// Borrowed from the table source owner; clones do not inherit it.
@@ -4103,6 +4106,7 @@ fn openInternalWithState(
             .wal_order = .empty,
             .wal_tree = tree,
             .wal_tree_initialized = true,
+            .wal_inventory_delta = reuse,
         };
     }
     const wal_path = try store.walPathAlloc(store.wal_generation);

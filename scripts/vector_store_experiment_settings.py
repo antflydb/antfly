@@ -113,6 +113,38 @@ TREATMENTS["catalog_inventory_baseline"] = {
     **TREATMENTS["catalog_inventory"],
 }
 CONTROLS["catalog_inventory_baseline"] = dict(CONTROLS["foreground_gc"])
+# Cost-recovery treatments use the qualified eager catalog/inventory control.
+# The cutoff is experimental; 50K/1M only bracket a possible crossover.
+_COST_BASE = {
+    **CONTROLS["foreground_gc"],
+    **TREATMENTS["foreground_gc"],
+    **TREATMENTS["scan_progress"],
+    **TREATMENTS["shared_catalog"],
+    **TREATMENTS["incremental_inventory"],
+    "ANTFLY_SOURCE_VECTOR_LAZY_INVENTORY": "0",
+}
+for name, flags in {
+    "cost_delta_inventory": {"ANTFLY_SOURCE_VECTOR_DELTA_INVENTORY": "1"},
+    "cost_debt_scheduling": {"ANTFLY_SOURCE_VECTOR_DEBT_SCHEDULING": "1"},
+    "cost_bitmap_marking": {"ANTFLY_SOURCE_VECTOR_BITMAP_MARKING": "1"},
+    "cost_small_inventory": {"ANTFLY_SOURCE_VECTOR_INVENTORY_MIN_PAYLOADS": "131072"},
+}.items():
+    CONTROLS[name] = dict(_COST_BASE)
+    TREATMENTS[name] = flags
+_COST_ALL = {
+    key: value
+    for name in (
+        "cost_delta_inventory",
+        "cost_debt_scheduling",
+        "cost_bitmap_marking",
+        "cost_small_inventory",
+    )
+    for key, value in TREATMENTS[name].items()
+}
+CONTROLS["cost_prior_baseline"] = dict(CONTROLS["foreground_gc"])
+TREATMENTS["cost_prior_baseline"] = {**_COST_BASE, **_COST_ALL}
+CONTROLS["cost_source_defaults"] = {}
+TREATMENTS["cost_source_defaults"] = {**_COST_BASE, **_COST_ALL}
 ALL_FLAGS = sorted(
     {key for flags in [*TREATMENTS.values(), *CONTROLS.values()] for key in flags}
 )

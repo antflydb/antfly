@@ -32405,6 +32405,26 @@ pub const VectorSourceStorageStatus = struct {
     catalog_metadata_bytes_shared: ?i64 = null,
     /// Immutable catalog array bytes copied by successful source snapshot and WAL-successor allocations; excludes object and root-path allocations.
     catalog_metadata_bytes_copied: ?i64 = null,
+    /// WAL identities visited while maintaining the current occurrence cache, including foreground append deltas; resets when the cache is discarded.
+    inventory_wal_rows: ?i64 = null,
+    /// WAL identity contributions retired by checkpoint deltas; resets when the cache is discarded.
+    inventory_wal_retirements: ?i64 = null,
+    /// Inventory installations that used a validated WAL prefix delta; resets when the cache is discarded.
+    inventory_delta_installs: ?i64 = null,
+    /// Inventory installations that rebuilt WAL membership, including initialization; resets when the cache is discarded.
+    inventory_fallback_installs: ?i64 = null,
+    /// Changes between full and incremental physical inventory under the optional size cutoff.
+    inventory_policy_switches: ?i64 = null,
+    /// One when incremental physical inventory is currently enabled, otherwise zero.
+    inventory_incremental_active: ?i64 = null,
+    /// Current segment bitmap and offset allocation bytes; excludes pinned source metadata and WAL fallback maps.
+    mark_bitmap_bytes: ?i64 = null,
+    /// Current WAL-only reachability entries when bitmap marking is enabled, or all mark entries in the hash-map control.
+    mark_fallback_entries: ?i64 = null,
+    /// Background mark setups deferred by the optional obsolete-debt scheduling policy.
+    collection_debt_deferrals: ?i64 = null,
+    /// Conservative committed obsolete-payload scheduling debt; not a measurement of reclaimable bytes.
+    obsolete_payload_debt_bytes: ?i64 = null,
     /// Full physical inventory scans and incremental occurrence-cache updates; this cache is not ownership authority.
     inventory_updates: ?i64 = null,
     /// Time spent on full physical inventory scans or incremental occurrence-cache updates.
@@ -32506,6 +32526,16 @@ pub const VectorSourceStorageStatus = struct {
         .{ "inventory_rows_scanned", "inventory_rows_scanned", true },
         .{ "catalog_metadata_bytes_shared", "catalog_metadata_bytes_shared", true },
         .{ "catalog_metadata_bytes_copied", "catalog_metadata_bytes_copied", true },
+        .{ "inventory_wal_rows", "inventory_wal_rows", true },
+        .{ "inventory_wal_retirements", "inventory_wal_retirements", true },
+        .{ "inventory_delta_installs", "inventory_delta_installs", true },
+        .{ "inventory_fallback_installs", "inventory_fallback_installs", true },
+        .{ "inventory_policy_switches", "inventory_policy_switches", true },
+        .{ "inventory_incremental_active", "inventory_incremental_active", true },
+        .{ "mark_bitmap_bytes", "mark_bitmap_bytes", true },
+        .{ "mark_fallback_entries", "mark_fallback_entries", true },
+        .{ "collection_debt_deferrals", "collection_debt_deferrals", true },
+        .{ "obsolete_payload_debt_bytes", "obsolete_payload_debt_bytes", true },
         .{ "inventory_updates", "inventory_updates", true },
         .{ "inventory_update_ns", "inventory_update_ns", true },
         .{ "collection_locked_ns", "collection_locked_ns", true },
@@ -32648,6 +32678,46 @@ pub const VectorSourceStorageStatus = struct {
         }
         if (self.catalog_metadata_bytes_copied) |value| {
             try jw.objectField("catalog_metadata_bytes_copied");
+            try jw.write(value);
+        }
+        if (self.inventory_wal_rows) |value| {
+            try jw.objectField("inventory_wal_rows");
+            try jw.write(value);
+        }
+        if (self.inventory_wal_retirements) |value| {
+            try jw.objectField("inventory_wal_retirements");
+            try jw.write(value);
+        }
+        if (self.inventory_delta_installs) |value| {
+            try jw.objectField("inventory_delta_installs");
+            try jw.write(value);
+        }
+        if (self.inventory_fallback_installs) |value| {
+            try jw.objectField("inventory_fallback_installs");
+            try jw.write(value);
+        }
+        if (self.inventory_policy_switches) |value| {
+            try jw.objectField("inventory_policy_switches");
+            try jw.write(value);
+        }
+        if (self.inventory_incremental_active) |value| {
+            try jw.objectField("inventory_incremental_active");
+            try jw.write(value);
+        }
+        if (self.mark_bitmap_bytes) |value| {
+            try jw.objectField("mark_bitmap_bytes");
+            try jw.write(value);
+        }
+        if (self.mark_fallback_entries) |value| {
+            try jw.objectField("mark_fallback_entries");
+            try jw.write(value);
+        }
+        if (self.collection_debt_deferrals) |value| {
+            try jw.objectField("collection_debt_deferrals");
+            try jw.write(value);
+        }
+        if (self.obsolete_payload_debt_bytes) |value| {
+            try jw.objectField("obsolete_payload_debt_bytes");
             try jw.write(value);
         }
         if (self.inventory_updates) |value| {

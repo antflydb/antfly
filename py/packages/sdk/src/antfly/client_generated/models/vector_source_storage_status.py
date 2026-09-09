@@ -39,6 +39,26 @@ class VectorSourceStorageStatus:
             successful source snapshot and WAL-successor allocations; not resident bytes.
         catalog_metadata_bytes_copied (int | Unset): Immutable catalog array bytes copied by successful source snapshot
             and WAL-successor allocations; excludes object and root-path allocations.
+        inventory_wal_rows (int | Unset): WAL identities visited while maintaining the current occurrence cache,
+            including foreground append deltas; resets when the cache is discarded.
+        inventory_wal_retirements (int | Unset): WAL identity contributions retired by checkpoint deltas; resets when
+            the cache is discarded.
+        inventory_delta_installs (int | Unset): Inventory installations that used a validated WAL prefix delta; resets
+            when the cache is discarded.
+        inventory_fallback_installs (int | Unset): Inventory installations that rebuilt WAL membership, including
+            initialization; resets when the cache is discarded.
+        inventory_policy_switches (int | Unset): Changes between full and incremental physical inventory under the
+            optional size cutoff.
+        inventory_incremental_active (int | Unset): One when incremental physical inventory is currently enabled,
+            otherwise zero.
+        mark_bitmap_bytes (int | Unset): Current segment bitmap and offset allocation bytes; excludes pinned source
+            metadata and WAL fallback maps.
+        mark_fallback_entries (int | Unset): Current WAL-only reachability entries when bitmap marking is enabled, or
+            all mark entries in the hash-map control.
+        collection_debt_deferrals (int | Unset): Background mark setups deferred by the optional obsolete-debt
+            scheduling policy.
+        obsolete_payload_debt_bytes (int | Unset): Conservative committed obsolete-payload scheduling debt; not a
+            measurement of reclaimable bytes.
         inventory_updates (int | Unset): Full physical inventory scans and incremental occurrence-cache updates; this
             cache is not ownership authority.
         inventory_update_ns (int | Unset): Time spent on full physical inventory scans or incremental occurrence-cache
@@ -133,6 +153,16 @@ class VectorSourceStorageStatus:
     inventory_rows_scanned: int | Unset = UNSET
     catalog_metadata_bytes_shared: int | Unset = UNSET
     catalog_metadata_bytes_copied: int | Unset = UNSET
+    inventory_wal_rows: int | Unset = UNSET
+    inventory_wal_retirements: int | Unset = UNSET
+    inventory_delta_installs: int | Unset = UNSET
+    inventory_fallback_installs: int | Unset = UNSET
+    inventory_policy_switches: int | Unset = UNSET
+    inventory_incremental_active: int | Unset = UNSET
+    mark_bitmap_bytes: int | Unset = UNSET
+    mark_fallback_entries: int | Unset = UNSET
+    collection_debt_deferrals: int | Unset = UNSET
+    obsolete_payload_debt_bytes: int | Unset = UNSET
     inventory_updates: int | Unset = UNSET
     inventory_update_ns: int | Unset = UNSET
     collection_locked_ns: int | Unset = UNSET
@@ -233,6 +263,26 @@ class VectorSourceStorageStatus:
         catalog_metadata_bytes_shared = self.catalog_metadata_bytes_shared
 
         catalog_metadata_bytes_copied = self.catalog_metadata_bytes_copied
+
+        inventory_wal_rows = self.inventory_wal_rows
+
+        inventory_wal_retirements = self.inventory_wal_retirements
+
+        inventory_delta_installs = self.inventory_delta_installs
+
+        inventory_fallback_installs = self.inventory_fallback_installs
+
+        inventory_policy_switches = self.inventory_policy_switches
+
+        inventory_incremental_active = self.inventory_incremental_active
+
+        mark_bitmap_bytes = self.mark_bitmap_bytes
+
+        mark_fallback_entries = self.mark_fallback_entries
+
+        collection_debt_deferrals = self.collection_debt_deferrals
+
+        obsolete_payload_debt_bytes = self.obsolete_payload_debt_bytes
 
         inventory_updates = self.inventory_updates
 
@@ -399,6 +449,26 @@ class VectorSourceStorageStatus:
             field_dict["catalog_metadata_bytes_shared"] = catalog_metadata_bytes_shared
         if catalog_metadata_bytes_copied is not UNSET:
             field_dict["catalog_metadata_bytes_copied"] = catalog_metadata_bytes_copied
+        if inventory_wal_rows is not UNSET:
+            field_dict["inventory_wal_rows"] = inventory_wal_rows
+        if inventory_wal_retirements is not UNSET:
+            field_dict["inventory_wal_retirements"] = inventory_wal_retirements
+        if inventory_delta_installs is not UNSET:
+            field_dict["inventory_delta_installs"] = inventory_delta_installs
+        if inventory_fallback_installs is not UNSET:
+            field_dict["inventory_fallback_installs"] = inventory_fallback_installs
+        if inventory_policy_switches is not UNSET:
+            field_dict["inventory_policy_switches"] = inventory_policy_switches
+        if inventory_incremental_active is not UNSET:
+            field_dict["inventory_incremental_active"] = inventory_incremental_active
+        if mark_bitmap_bytes is not UNSET:
+            field_dict["mark_bitmap_bytes"] = mark_bitmap_bytes
+        if mark_fallback_entries is not UNSET:
+            field_dict["mark_fallback_entries"] = mark_fallback_entries
+        if collection_debt_deferrals is not UNSET:
+            field_dict["collection_debt_deferrals"] = collection_debt_deferrals
+        if obsolete_payload_debt_bytes is not UNSET:
+            field_dict["obsolete_payload_debt_bytes"] = obsolete_payload_debt_bytes
         if inventory_updates is not UNSET:
             field_dict["inventory_updates"] = inventory_updates
         if inventory_update_ns is not UNSET:
@@ -567,6 +637,26 @@ class VectorSourceStorageStatus:
 
         catalog_metadata_bytes_copied = d.pop("catalog_metadata_bytes_copied", UNSET)
 
+        inventory_wal_rows = d.pop("inventory_wal_rows", UNSET)
+
+        inventory_wal_retirements = d.pop("inventory_wal_retirements", UNSET)
+
+        inventory_delta_installs = d.pop("inventory_delta_installs", UNSET)
+
+        inventory_fallback_installs = d.pop("inventory_fallback_installs", UNSET)
+
+        inventory_policy_switches = d.pop("inventory_policy_switches", UNSET)
+
+        inventory_incremental_active = d.pop("inventory_incremental_active", UNSET)
+
+        mark_bitmap_bytes = d.pop("mark_bitmap_bytes", UNSET)
+
+        mark_fallback_entries = d.pop("mark_fallback_entries", UNSET)
+
+        collection_debt_deferrals = d.pop("collection_debt_deferrals", UNSET)
+
+        obsolete_payload_debt_bytes = d.pop("obsolete_payload_debt_bytes", UNSET)
+
         inventory_updates = d.pop("inventory_updates", UNSET)
 
         inventory_update_ns = d.pop("inventory_update_ns", UNSET)
@@ -713,6 +803,16 @@ class VectorSourceStorageStatus:
             inventory_rows_scanned=inventory_rows_scanned,
             catalog_metadata_bytes_shared=catalog_metadata_bytes_shared,
             catalog_metadata_bytes_copied=catalog_metadata_bytes_copied,
+            inventory_wal_rows=inventory_wal_rows,
+            inventory_wal_retirements=inventory_wal_retirements,
+            inventory_delta_installs=inventory_delta_installs,
+            inventory_fallback_installs=inventory_fallback_installs,
+            inventory_policy_switches=inventory_policy_switches,
+            inventory_incremental_active=inventory_incremental_active,
+            mark_bitmap_bytes=mark_bitmap_bytes,
+            mark_fallback_entries=mark_fallback_entries,
+            collection_debt_deferrals=collection_debt_deferrals,
+            obsolete_payload_debt_bytes=obsolete_payload_debt_bytes,
             inventory_updates=inventory_updates,
             inventory_update_ns=inventory_update_ns,
             collection_locked_ns=collection_locked_ns,

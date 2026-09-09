@@ -26,6 +26,12 @@ TOTALS = (
     "collection_rescued_payloads",
     "deduplicated_reappend_payloads",
     "deduplicated_reappend_bytes",
+    "inventory_wal_rows",
+    "inventory_wal_retirements",
+    "inventory_delta_installs",
+    "inventory_fallback_installs",
+    "inventory_policy_switches",
+    "collection_debt_deferrals",
 )
 MAXIMA = (
     "collection_max_locked_ns",
