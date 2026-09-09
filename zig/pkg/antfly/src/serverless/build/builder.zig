@@ -3734,7 +3734,8 @@ fn predictDerivedOutputAction(
     };
 }
 
-pub fn buildGraphSegmentAlloc(
+/// Benchmark oracle only: the former string-expanded graph construction.
+pub fn benchmarkReferenceGraphSegmentAlloc(
     alloc: Allocator,
     source_table: []const u8,
     docs: []const query_mod.QueryMaterializedDocument,
@@ -3795,6 +3796,39 @@ pub fn buildGraphSegmentAlloc(
     };
 }
 
+pub fn buildGraphSegmentAlloc(
+    alloc: Allocator,
+    source_table: []const u8,
+    docs: []const query_mod.QueryMaterializedDocument,
+    include_graph: bool,
+) !struct {
+    payload: ?[]u8,
+    edge_count: usize,
+} {
+    if (!include_graph) return .{ .payload = null, .edge_count = 0 };
+    var builder = graph_segment_mod.Builder{ .alloc = alloc };
+    defer builder.deinit();
+
+    for (docs) |doc| {
+        try builder.addNode(doc.doc_id);
+        const parsed_edges = try parseGraphEdgesAlloc(alloc, doc.body);
+        defer freeParsedGraphEdges(alloc, parsed_edges);
+        for (parsed_edges) |edge| {
+            const target_table = if (edge.target_table) |table|
+                if (std.mem.eql(u8, table, source_table)) null else table
+            else
+                null;
+            try builder.addEdge(doc.doc_id, edge.target, edge.edge_type, edge.weight, target_table);
+        }
+    }
+
+    if (builder.edges.items.len == 0) return .{ .payload = null, .edge_count = 0 };
+    return .{
+        .payload = try builder.encodeAlloc(std.math.maxInt(usize), .none),
+        .edge_count = builder.edges.items.len,
+    };
+}
+
 const ParsedGraphEdge = struct {
     target: []u8,
     edge_type: []u8,
@@ -3817,7 +3851,10 @@ fn ensureNode(alloc: Allocator, node_map: *std.StringArrayHashMapUnmanaged(NodeE
 }
 
 fn parseGraphEdgesAlloc(alloc: Allocator, body: []const u8) ![]ParsedGraphEdge {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return try alloc.alloc(ParsedGraphEdge, 0);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return try alloc.alloc(ParsedGraphEdge, 0),
+    };
     defer parsed.deinit();
     if (parsed.value != .object) return try alloc.alloc(ParsedGraphEdge, 0);
     const raw_edges = parsed.value.object.get("graph_edges") orelse return try alloc.alloc(ParsedGraphEdge, 0);
@@ -3840,21 +3877,25 @@ fn parseGraphEdgesAlloc(alloc: Allocator, body: []const u8) ![]ParsedGraphEdge {
         const edge_type_value = item.object.get("edge_type");
         const weight_value = item.object.get("weight");
         const target_table_value = item.object.get("target_table");
+        const owned_target = try alloc.dupe(u8, target_value.string);
+        errdefer alloc.free(owned_target);
+        const owned_type = try alloc.dupe(u8, if (edge_type_value != null and edge_type_value.? == .string) edge_type_value.?.string else "");
+        errdefer alloc.free(owned_type);
+        const owned_table = if (target_table_value != null and target_table_value.? == .string and target_table_value.?.string.len > 0)
+            try alloc.dupe(u8, target_table_value.?.string)
+        else
+            null;
+        errdefer if (owned_table) |table| alloc.free(table);
         try out.append(alloc, .{
-            .target = try alloc.dupe(u8, target_value.string),
-            .edge_type = if (edge_type_value != null and edge_type_value.? == .string) try alloc.dupe(u8, edge_type_value.?.string) else try alloc.dupe(u8, ""),
+            .target = owned_target,
+            .edge_type = owned_type,
             .weight = if (weight_value) |weight| switch (weight) {
                 .float => @floatCast(weight.float),
                 .integer => @floatFromInt(weight.integer),
                 .number_string => std.fmt.parseFloat(f32, weight.number_string) catch 1.0,
                 else => 1.0,
             } else 1.0,
-            .target_table = if (target_table_value != null and
-                target_table_value.? == .string and
-                target_table_value.?.string.len > 0)
-                try alloc.dupe(u8, target_table_value.?.string)
-            else
-                null,
+            .target_table = owned_table,
         });
     }
     return try out.toOwnedSlice(alloc);
@@ -3867,6 +3908,16 @@ fn freeParsedGraphEdges(alloc: Allocator, edges: []ParsedGraphEdge) void {
         if (edge.target_table) |table| alloc.free(table);
     }
     alloc.free(edges);
+}
+
+test "serverless graph builder parser propagates allocation failure without losing edges" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(alloc: Allocator) !void {
+            const edges = try parseGraphEdgesAlloc(alloc, "{\"graph_edges\":[{\"target\":\"b\",\"edge_type\":\"link\",\"target_table\":\"other\"}]}");
+            defer freeParsedGraphEdges(alloc, edges);
+            try std.testing.expectEqual(@as(usize, 1), edges.len);
+        }
+    }.run, .{});
 }
 
 fn sortParsedGraphEdges(edges: []ParsedGraphEdge) void {

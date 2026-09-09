@@ -22,7 +22,7 @@ discovery and adjacency production, reads the shared canonical membership for
 its own seed/initialization, and uses shared packed tiles for every iteration.
 HITS topology can serve PageRank or eigenvector; a forward-only owner cannot
 satisfy HITS. Published scores keep their existing format; intermediate jobs
-from execution schemas before v17 restart.
+from execution schemas before v18 restart.
 
 Cold scheduled builds first enqueue an index-scoped preparation task keyed by
 generation, filter and required orientation. Concurrent PageRank/eigenvector
@@ -73,6 +73,23 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
 
 ## Non-serverless
 
+- Connectivity epochs advance only when a batch changes the final edge identity
+  set. Identical upserts, attribute-only updates, missing deletes, and delete/
+  reinsert replacements do not restart unweighted metric jobs. Each selected
+  relationship type has a durable epoch; a filtered metric depends on their
+  maximum, not unrelated writes. Status generations describe that dependency.
+  All-edge metrics still depend on the global connectivity epoch. Old stores
+  acquire a conservative migration floor without a writer-side full scan.
+- Type-addressable, empty-value covering postings retain reverse-key ordering
+  within each type. Filtered discovery seeks only selected type ranges; weights
+  and metadata need not be decoded. Existing stores backfill in bounded,
+  checkpointed steps (record and key-memory limits) while connectivity
+  mutations maintain postings transactionally; attribute updates do not rewrite
+  these postings.
+  A filter-epoch partition snapshot freezes scheduling boundaries so unrelated
+  writes cannot invalidate in-flight discovery or shared topology adoption.
+  Removed-filter snapshots are reclaimed in bounded 64-record maintenance
+  sweeps, including indexes with no remaining metrics.
 - Metric queries share a storage-independent read plan with serverless: load
   filters, restrict stable source-row ordinals, load ordering columns, select
   top-K, then load display-only columns. Reusable columns follow the selection
@@ -102,10 +119,11 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
   publication prevents competing coordinators from regressing progress. A graph
   mutation invalidates the obsolete census; it cannot publish mixed-generation
   boundaries. Memory is bounded by the maximum 256 partitions, not graph size.
-- Worker edge scans also range-seek past metadata and charge every physical
-  non-metadata record against their checkpoint limit, including excluded records.
-  Progress counts continue to describe matching graph edges, independently of
-  physical work. An unbounded final partition cannot walk all metric state.
+- All-edge scans range-seek past metadata. Filtered scans charge only selected
+  postings against their checkpoint limit and persist a type-qualified resume
+  key, validated against the filter and scheduling range. Intermediate progress
+  counts visited edges; completion seals the entire scheduling range. An
+  unbounded final partition cannot walk all metric state.
 - Initialization writes canonical membership once in checksummed 256-row blocks,
   alongside ordinal assignments. Completed initialization leaves seal exact row
   counts. Vector initialization, iteration, convergence and publication read these addressed blocks,
@@ -167,6 +185,12 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
 
 ## Serverless
 
+- Normal and lake ingestion share one ordinal graph builder. Distinct node IDs,
+  relationship types, and target tables are interned once; retained edges carry
+  numeric ordinals. Encoding sorts integer edges directly into the current
+  packed wire format, preserving qualified endpoints and isolated local nodes.
+  Both JSON adapters propagate allocator exhaustion and unwind partial edge
+  ownership; allocation failure cannot silently produce an empty graph.
 - Verified packed graph ordinals are prepared once per immutable source.
   Compatible projection requirements share preparation when the combined work
   and memory fit. Otherwise, cheaper exact requirements are admitted first.
@@ -263,6 +287,12 @@ Span, range, selected-page and decoded-routing capacities are charged before
 allocation, including possible owned-slice replacement peaks. These reservations
 share the request memory limit, but point-read scratch and routing leases release
 their conservative charge when the read ends and all children have joined.
+Control buffers, routing transport buffers, and decoded routing leases have
+explicit live reservations that retire at their actual ownership boundaries.
+Cold decode reservations transfer into leases without a release/reacquire gap.
+Preparation fanout falls back to one column when a conservative two-column
+memory envelope does not fit; exact reservations, not that envelope, decide
+request eligibility.
 Request-scoped output columns transfer move-only reservations into the staged
 HTTP query cache; replacing or discarding a column releases its prior charge.
 Rebasing reserves the replacement before allocation and commits ownership only

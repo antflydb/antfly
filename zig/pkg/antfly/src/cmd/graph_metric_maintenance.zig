@@ -2046,6 +2046,34 @@ fn requestInProcessServiceMaintenanceForTest(
     return try parseServiceMaintenanceResponse(alloc, response.body);
 }
 
+// Cold iterative admission is a coordinator/worker protocol, not one tick.
+// Stop immediately after numerical admission so freshness and takeover tests
+// still observe an active, unexecuted numerical job.
+fn startInProcessServiceBuildForTest(
+    alloc: std.mem.Allocator,
+    service: *InProcessGraphMetricService,
+    target: ServiceTarget,
+    coordinator: CliConfig,
+) !ServiceMaintenanceResponseWire {
+    var worker = CliConfig{
+        .role = .worker_pool,
+        .runtime_id = "test-topology-preparation",
+        .owner_id = "test-topology-preparation",
+        .coordinator_start_background_builds = false,
+        .max_rounds = 1,
+        .max_pages_per_round = 1,
+        .test_now_ms = coordinator.test_now_ms,
+    };
+    defer worker.deinit(alloc);
+    try worker.worker_ids.append(alloc, "test-topology-worker");
+    for (0..256) |_| {
+        const response = try requestInProcessServiceMaintenanceForTest(alloc, service, target, coordinator, .tick);
+        if (response.result.builds_started > 0) return response;
+        _ = try requestInProcessServiceMaintenanceForTest(alloc, service, target, worker, .tick);
+    }
+    return error.GraphMetricBuildNotStarted;
+}
+
 fn expectParseCliInvalid(alloc: std.mem.Allocator, argv: []const [*:0]const u8) !void {
     var args = std.process.Args.Iterator.init(.{ .vector = argv });
     try std.testing.expectError(error.InvalidArguments, parseCli(alloc, &args));
@@ -3168,7 +3196,7 @@ test "graph metric maintenance service owners preserve pagerank freshness while 
         .group_id = 7,
         .table_name = "docs",
     };
-    const start = try requestInProcessServiceMaintenanceForTest(
+    const start = try startInProcessServiceBuildForTest(
         alloc,
         &service,
         target,
@@ -3181,7 +3209,6 @@ test "graph metric maintenance service owners preserve pagerank freshness while 
             .max_metrics_per_round = 4,
             .max_pages_per_round = 1,
         },
-        .tick,
     );
     try std.testing.expect(start.result.durableProgressed());
     try std.testing.expectEqual(@as(usize, 1), start.result.builds_started);
@@ -3354,12 +3381,11 @@ test "graph metric maintenance service owners fence abandoned pagerank leases an
         .test_hold_after_run_ms = 1,
         .test_now_ms = 1000,
     };
-    const coordinator_a_start = try requestInProcessServiceMaintenanceForTest(
+    const coordinator_a_start = try startInProcessServiceBuildForTest(
         alloc,
         &service,
         target,
         coordinator_a,
-        .tick,
     );
     const coordinator_a_start_stats = coordinator_a_start.stats orelse return error.MissingRuntimeStats;
     try std.testing.expect(coordinator_a_start_stats.lease_owned);

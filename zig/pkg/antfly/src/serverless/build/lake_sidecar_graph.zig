@@ -76,10 +76,8 @@ fn buildGraphSidecarBoundedAlloc(
     try validateOptions(binding, source.kind, options);
     var budget = try lake_build_limits.Budget.init(options.limits);
 
-    var node_map = std.StringArrayHashMapUnmanaged(NodeEdges).empty;
-    defer deinitNodeMap(alloc, &node_map);
-    var neighbor_tables = std.StringArrayHashMapUnmanaged(void).empty;
-    defer deinitNeighborTableMap(alloc, &neighbor_tables);
+    var builder = graph_segment.Builder{ .alloc = alloc };
+    defer builder.deinit();
     var total_edges: usize = 0;
 
     while (true) {
@@ -99,21 +97,16 @@ fn buildGraphSidecarBoundedAlloc(
         }, batch);
 
         const column = batch.findColumn(options.graph_column).?;
-        total_edges = std.math.add(usize, total_edges, try appendBatchGraph(alloc, &node_map, &neighbor_tables, batch, column)) catch
+        total_edges = std.math.add(usize, total_edges, try appendBatchGraph(alloc, &builder, batch, column)) catch
             return error.LakeSidecarBuildBudgetExceeded;
-        const retained_items = std.math.add(usize, node_map.count(), total_edges) catch
+        const retained_items = std.math.add(usize, builder.nodeCount(), total_edges) catch
             return error.LakeSidecarBuildBudgetExceeded;
         try budget.checkRetainedItems(retained_items);
     }
 
     if (total_edges == 0) return error.EmptyLakeSidecarGraphSegment;
 
-    var segment = try nodeMapToSegmentAlloc(alloc, &node_map, &neighbor_tables);
-    defer graph_segment.freeSegment(alloc, &segment);
-
-    const payload = graph_segment.codec.compact.encodeAllocWithLimit(
-        alloc,
-        segment,
+    const payload = builder.encodeAlloc(
         options.limits.max_output_bytes,
         options.cancellation,
     ) catch |err| switch (err) {
@@ -177,8 +170,7 @@ fn validateOptions(
 
 fn appendBatchGraph(
     alloc: Allocator,
-    node_map: *std.StringArrayHashMapUnmanaged(NodeEdges),
-    neighbor_tables: *std.StringArrayHashMapUnmanaged(void),
+    builder: *graph_segment.Builder,
     batch: rowsource.ColumnBatch,
     column: rowsource.ColumnVector,
 ) !usize {
@@ -187,14 +179,14 @@ fn appendBatchGraph(
         .bytes => |values| {
             for (values, 0..) |value, row| {
                 if (column.nulls.isNull(row)) continue;
-                total_edges = std.math.add(usize, total_edges, try appendGraphDocument(alloc, node_map, neighbor_tables, batch.row_refs[row], value)) catch
+                total_edges = std.math.add(usize, total_edges, try appendGraphDocument(alloc, builder, batch.row_refs[row], value)) catch
                     return error.LakeSidecarBuildBudgetExceeded;
             }
         },
         .json => |values| {
             for (values, 0..) |value, row| {
                 if (column.nulls.isNull(row)) continue;
-                total_edges = std.math.add(usize, total_edges, try appendGraphDocument(alloc, node_map, neighbor_tables, batch.row_refs[row], value)) catch
+                total_edges = std.math.add(usize, total_edges, try appendGraphDocument(alloc, builder, batch.row_refs[row], value)) catch
                     return error.LakeSidecarBuildBudgetExceeded;
             }
         },
@@ -205,37 +197,18 @@ fn appendBatchGraph(
 
 fn appendGraphDocument(
     alloc: Allocator,
-    node_map: *std.StringArrayHashMapUnmanaged(NodeEdges),
-    neighbor_tables: *std.StringArrayHashMapUnmanaged(void),
+    builder: *graph_segment.Builder,
     row_ref: rowsource.RowRef,
     source_value: []const u8,
 ) !usize {
     const node_id = try source_binding.rowRefKeyAlloc(alloc, row_ref);
     defer alloc.free(node_id);
-    _ = try ensureNode(alloc, node_map, node_id);
+    try builder.addNode(node_id);
 
     const edges = try parseGraphEdgesAlloc(alloc, source_value);
     defer freeParsedGraphEdges(alloc, edges);
     for (edges) |edge| {
-        const src = try ensureNode(alloc, node_map, node_id);
-        const neighbor_table_id = if (edge.target_table) |table|
-            try internNeighborTable(alloc, neighbor_tables, table)
-        else
-            null;
-        try src.out_edges.append(alloc, .{
-            .neighbor_id = try alloc.dupe(u8, edge.target),
-            .edge_type = try alloc.dupe(u8, edge.edge_type),
-            .weight = edge.weight,
-            .neighbor_table_id = neighbor_table_id,
-        });
-        if (edge.target_table == null) {
-            const dst = try ensureNode(alloc, node_map, edge.target);
-            try dst.in_edges.append(alloc, .{
-                .neighbor_id = try alloc.dupe(u8, node_id),
-                .edge_type = try alloc.dupe(u8, edge.edge_type),
-                .weight = edge.weight,
-            });
-        }
+        try builder.addEdge(node_id, edge.target, edge.edge_type, edge.weight, edge.target_table);
     }
     return edges.len;
 }
@@ -247,26 +220,11 @@ const ParsedGraphEdge = struct {
     target_table: ?[]u8,
 };
 
-const NodeEdges = struct {
-    out_edges: std.ArrayListUnmanaged(graph_segment.Edge) = .empty,
-    in_edges: std.ArrayListUnmanaged(graph_segment.Edge) = .empty,
-};
-
-fn ensureNode(
-    alloc: Allocator,
-    node_map: *std.StringArrayHashMapUnmanaged(NodeEdges),
-    node_id: []const u8,
-) !*NodeEdges {
-    const gop = try node_map.getOrPut(alloc, node_id);
-    if (!gop.found_existing) {
-        gop.key_ptr.* = try alloc.dupe(u8, node_id);
-        gop.value_ptr.* = .{};
-    }
-    return gop.value_ptr;
-}
-
 fn parseGraphEdgesAlloc(alloc: Allocator, value: []const u8) ![]ParsedGraphEdge {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{}) catch return try alloc.alloc(ParsedGraphEdge, 0);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return try alloc.alloc(ParsedGraphEdge, 0),
+    };
     defer parsed.deinit();
     const raw_edges: std.json.Array = switch (parsed.value) {
         .array => |items| items,
@@ -294,14 +252,20 @@ fn parseGraphEdgesAlloc(alloc: Allocator, value: []const u8) ![]ParsedGraphEdge 
         if (target.len == 0) continue;
         const edge_type = jsonObjectStringAny(item.object, &[_][]const u8{ "edge_type", "type" }) orelse "";
         const target_table = jsonObjectStringAny(item.object, &.{"target_table"});
+        const owned_target = try alloc.dupe(u8, target);
+        errdefer alloc.free(owned_target);
+        const owned_type = try alloc.dupe(u8, edge_type);
+        errdefer alloc.free(owned_type);
+        const owned_table = if (target_table) |table|
+            if (table.len > 0) try alloc.dupe(u8, table) else null
+        else
+            null;
+        errdefer if (owned_table) |table| alloc.free(table);
         try out.append(alloc, .{
-            .target = try alloc.dupe(u8, target),
-            .edge_type = try alloc.dupe(u8, edge_type),
+            .target = owned_target,
+            .edge_type = owned_type,
             .weight = if (item.object.get("weight")) |weight| jsonValueAsF32(weight) catch 1.0 else 1.0,
-            .target_table = if (target_table) |table|
-                if (table.len > 0) try alloc.dupe(u8, table) else null
-            else
-                null,
+            .target_table = owned_table,
         });
     }
     const edges = try out.toOwnedSlice(alloc);
@@ -318,6 +282,16 @@ fn freeParsedGraphEdges(alloc: Allocator, edges: []ParsedGraphEdge) void {
     alloc.free(edges);
 }
 
+test "serverless lake graph parser propagates allocation failure without losing edges" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(alloc: Allocator) !void {
+            const edges = try parseGraphEdgesAlloc(alloc, "[{\"target\":\"b\",\"edge_type\":\"link\",\"target_table\":\"other\"}]");
+            defer freeParsedGraphEdges(alloc, edges);
+            try std.testing.expectEqual(@as(usize, 1), edges.len);
+        }
+    }.run, .{});
+}
+
 fn sortParsedGraphEdges(edges: []ParsedGraphEdge) void {
     std.mem.sort(ParsedGraphEdge, edges, {}, lessParsedGraphEdge);
 }
@@ -332,90 +306,11 @@ fn lessParsedGraphEdge(_: void, lhs: ParsedGraphEdge, rhs: ParsedGraphEdge) bool
     return lhs.weight < rhs.weight;
 }
 
-fn nodeMapToSegmentAlloc(
-    alloc: Allocator,
-    node_map: *std.StringArrayHashMapUnmanaged(NodeEdges),
-    neighbor_table_map: *const std.StringArrayHashMapUnmanaged(void),
-) !graph_segment.Segment {
-    const neighbor_tables = try alloc.alloc([]u8, neighbor_table_map.count());
-    errdefer if (neighbor_tables.len > 0) alloc.free(neighbor_tables);
-    var initialized_tables: usize = 0;
-    errdefer for (neighbor_tables[0..initialized_tables]) |table| alloc.free(table);
-    for (neighbor_table_map.keys(), 0..) |table, idx| {
-        neighbor_tables[idx] = try alloc.dupe(u8, table);
-        initialized_tables += 1;
-    }
-    const adjacencies = try alloc.alloc(graph_segment.Adjacency, node_map.count());
-    errdefer alloc.free(adjacencies);
-    var initialized: usize = 0;
-    errdefer {
-        for (adjacencies[0..initialized]) |*adjacency| adjacency.deinit(alloc);
-    }
-
-    for (node_map.keys(), node_map.values(), 0..) |node_id, *node_edges, idx| {
-        sortGraphEdges(node_edges.out_edges.items);
-        sortGraphEdges(node_edges.in_edges.items);
-        adjacencies[idx] = .{
-            .node_id = try alloc.dupe(u8, node_id),
-            .out_edges = try node_edges.out_edges.toOwnedSlice(alloc),
-            .in_edges = try node_edges.in_edges.toOwnedSlice(alloc),
-        };
-        initialized += 1;
-    }
-    std.mem.sort(graph_segment.Adjacency, adjacencies, {}, lessGraphAdjacency);
-    return .{ .neighbor_tables = neighbor_tables, .adjacencies = adjacencies };
-}
-
-fn internNeighborTable(
-    alloc: Allocator,
-    tables: *std.StringArrayHashMapUnmanaged(void),
-    table: []const u8,
-) !u32 {
-    if (tables.getIndex(table)) |index| return std.math.cast(u32, index) orelse error.GraphSegmentTooLarge;
-    const next_id = std.math.cast(u32, tables.count()) orelse return error.GraphSegmentTooLarge;
-    const owned = try alloc.dupe(u8, table);
-    errdefer alloc.free(owned);
-    const gop = try tables.getOrPut(alloc, owned);
-    std.debug.assert(!gop.found_existing);
-    std.debug.assert(gop.index == @as(usize, next_id));
-    return next_id;
-}
-
-fn deinitNeighborTableMap(alloc: Allocator, tables: *std.StringArrayHashMapUnmanaged(void)) void {
-    for (tables.keys()) |table| alloc.free(table);
-    tables.deinit(alloc);
-}
-
 fn optionalStringOrder(lhs: ?[]const u8, rhs: ?[]const u8) std.math.Order {
     if (lhs == null and rhs == null) return .eq;
     if (lhs == null) return .lt;
     if (rhs == null) return .gt;
     return std.mem.order(u8, lhs.?, rhs.?);
-}
-
-fn deinitNodeMap(alloc: Allocator, node_map: *std.StringArrayHashMapUnmanaged(NodeEdges)) void {
-    for (node_map.keys(), node_map.values()) |key, *value| {
-        alloc.free(key);
-        for (value.out_edges.items) |*edge| edge.deinit(alloc);
-        value.out_edges.deinit(alloc);
-        for (value.in_edges.items) |*edge| edge.deinit(alloc);
-        value.in_edges.deinit(alloc);
-    }
-    node_map.deinit(alloc);
-}
-
-fn sortGraphEdges(edges: []graph_segment.Edge) void {
-    std.mem.sort(graph_segment.Edge, edges, {}, lessGraphEdge);
-}
-
-fn lessGraphEdge(_: void, lhs: graph_segment.Edge, rhs: graph_segment.Edge) bool {
-    const lookup_order = graph_segment.edgeLookupOrder(lhs.edge_type, lhs.neighbor_id, rhs.edge_type, rhs.neighbor_id);
-    if (lookup_order != .eq) return lookup_order == .lt;
-    return lhs.weight < rhs.weight;
-}
-
-fn lessGraphAdjacency(_: void, lhs: graph_segment.Adjacency, rhs: graph_segment.Adjacency) bool {
-    return std.mem.order(u8, lhs.node_id, rhs.node_id) == .lt;
 }
 
 fn jsonObjectStringAny(obj: std.json.ObjectMap, keys: []const []const u8) ?[]const u8 {

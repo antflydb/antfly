@@ -6331,7 +6331,7 @@ pub const IndexManager = struct {
                         if (options.auto_idle_options) |auto_options| {
                             if (!graphMetricQueuedPlannedAutoEligible(entry.metric_configs, cfg, auto_options)) continue;
                         } else if (!graphMetricLifecycleCanonical(entry.metric_configs, cfg)) continue;
-                        if (!try entry.index.prepareGraphMetricPartitionStep(4096)) {
+                        if (!try entry.index.prepareGraphMetricPartitionForConfigStep(cfg, 4096)) {
                             result.planning_steps += 1;
                             continue;
                         }

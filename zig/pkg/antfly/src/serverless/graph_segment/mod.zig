@@ -14,6 +14,7 @@
 
 pub const types = @import("types.zig");
 pub const codec = @import("codec.zig");
+pub const Builder = @import("builder.zig").Builder;
 
 pub const Edge = types.Edge;
 pub const EdgeLookup = types.EdgeLookup;
@@ -35,6 +36,7 @@ pub const decodedRetainedBytes = codec.decodedRetainedBytes;
 test "serverless graph segment module compiles" {
     _ = types;
     _ = codec;
+    _ = Builder;
     _ = Edge;
     _ = Adjacency;
     _ = Segment;

@@ -110,6 +110,21 @@ pub const GraphMetricReadBudget = struct {
             return .{ .budget = self.budget, .bytes = bytes };
         }
 
+        /// Move two exclusively owned reservations into one without dropping
+        /// admission between construction and publication. Not for shared
+        /// grow-only scopes until their workers have joined.
+        pub fn absorb(self: *@This(), other: *@This()) void {
+            std.debug.assert(self.budget == other.budget);
+            self.bytes += other.bytes;
+            other.* = .{};
+        }
+
+        pub fn shrinkTo(self: *@This(), bytes: usize) void {
+            std.debug.assert(bytes <= self.bytes);
+            var released = self.split(self.bytes - bytes);
+            released.deinit();
+        }
+
         /// Escaping public output keeps its request charge, but must not keep
         /// a pointer to a query session that can already have been destroyed.
         pub fn detach(self: *@This()) void {

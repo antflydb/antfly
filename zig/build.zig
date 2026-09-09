@@ -4462,6 +4462,10 @@ pub fn build(b: *std.Build) void {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
+        // This root includes the in-process HTTP service and storage runtime.
+        // Mach-O optimized codegen measured 8.4 GiB; allow the same debug
+        // headroom as the broad command root without raising Linux admission.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
     });
     const run_graph_metric_command_tests = addFilteredTestRunArtifact(b, graph_metric_command_tests);
     const graph_metric_command_test_step = b.step("graph-metric-command-test", "Run graph metric maintenance CLI and supervisor tests");
@@ -8551,7 +8555,7 @@ pub fn build(b: *std.Build) void {
         "graph metric consumer barrier",
         "ordinal blocks",
         "graph degree planned build honors edge filter during scan page execution",
-        "graph metric filtered scan checkpoints advance past excluded edges",
+        "graph metric filtered scan checkpoints",
         "graph metric partition spans remain balanced at production cardinality",
         "graph metric partition census",
         "partition census owns bounded checkpoints",

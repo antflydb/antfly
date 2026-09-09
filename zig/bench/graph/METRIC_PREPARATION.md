@@ -432,3 +432,24 @@ while dense seeds read less than the whole artifact by omitting ranked payloads;
 and two concurrent requests for two cold routing pages perform exactly two
 decoded fills even with 63 of the 64 fill slots occupied. The latter checks
 shared lease identity and completion under fill-table saturation.
+
+## Ordinal ingestion and selected-type discovery
+
+Run `zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --indexing-only`.
+On Apple M4 Max / Zig 0.16.0, the following medians discard one warmup and
+retain five samples. Each ingestion fixture has 1,024 nodes and 65,536 edges;
+JSON parsing, construction and encoding are timed, input residency is excluded.
+Every output has identical encoded SHA-256 to the old string-expansion oracle.
+
+| Node ID bytes | String builder → ordinal builder | Peak allocated bytes | Allocation calls |
+| --- | ---: | ---: | ---: |
+| 16 | 23.250 → 17.474 ms | 11,276,518 → 6,228,850 | 438,315 → 162,863 |
+| 256 | 73.502 → 30.934 ms | 43,471,078 → 6,720,370 | 442,411 → 166,959 |
+
+The stateful fixture uses the default durable LSM, 65,536 edges and 16
+relationship types. Selecting one type visits 4,096 postings instead of 65,536
+reverse edges: 0.640 ms versus 14.110 ms. Selected identity checksums match.
+This measures discovery only, excluding writes, migration, and numerical work.
+The covering index adds one empty-value identity key per edge and its write/
+storage cost; existing indexes pay one bounded backfill. These are local phase
+measurements on a shared development host, not end-to-end latency guarantees.

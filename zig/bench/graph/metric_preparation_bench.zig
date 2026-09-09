@@ -196,8 +196,17 @@ pub fn main(init: std.process.Init) !void {
     var topology_only = false;
     var score_join_only = false;
     var ordinal_cursors_only = false;
+    var indexing_only = false;
     while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--indexing-only")) {
+            indexing_only = true;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--ordinal-cursors-only")) ordinal_cursors_only = true else if (std.mem.eql(u8, arg, "--staged-only")) staged_only = true else if (std.mem.eql(u8, arg, "--topology-only")) topology_only = true else if (std.mem.eql(u8, arg, "--score-join-only")) score_join_only = true else return error.InvalidArgument;
+    }
+    if (indexing_only) {
+        try benchmarkGraphIndexConstruction(&output);
+        return benchmarkTypedEdgeScans(init.io, &output);
     }
     if (score_join_only) return benchmarkScoreJoin(&output);
     if (ordinal_cursors_only) return benchmarkOrdinalCursors(init.io, &output);
@@ -376,6 +385,120 @@ pub fn main(init: std.process.Init) !void {
             try output.interface.writeByte('\n');
             try output.flush();
         }
+    }
+}
+
+fn benchmarkGraphIndexConstruction(out: anytype) !void {
+    const alloc = std.heap.smp_allocator;
+    const builder = antfly.serverless.build.builder;
+    for ([_]usize{ 16, 256 }) |id_len| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const fixture = arena.allocator();
+        const ids = try fixture.alloc([]u8, 1024);
+        for (ids, 0..) |*id, i| {
+            id.* = try fixture.alloc(u8, id_len);
+            @memset(id.*, 'x');
+            _ = try std.fmt.bufPrint(id.*[id_len - 8 ..], "{d:0>8}", .{i});
+        }
+        const docs = try fixture.alloc(antfly.serverless.query.QueryMaterializedDocument, ids.len);
+        const InputEdge = struct { target: []const u8, edge_type: []const u8 = "link" };
+        var edges: [64]InputEdge = undefined;
+        for (docs, 0..) |*doc, i| {
+            for (&edges, 0..) |*edge, j| edge.* = .{ .target = ids[(i + j + 1) % ids.len] };
+            doc.* = .{ .doc_id = ids[i], .body = try std.json.Stringify.valueAlloc(fixture, .{ .graph_edges = &edges }, .{}), .last_lsn = 0, .last_timestamp_ns = 0 };
+        }
+        var expected: ?[32]u8 = null;
+        for ([_]bool{ true, false }) |reference| {
+            var samples: [5]u64 = undefined;
+            var measured: PhaseAllocStats = undefined;
+            var payload_len: usize = 0;
+            for (0..6) |sample| {
+                var stats = PhaseAllocStats{};
+                var tracking = PhaseTrackingAllocator{ .backing = alloc, .stats = &stats };
+                const tracked = tracking.allocator();
+                const started = antfly.platform_time.monotonicNs();
+                const payload = if (reference)
+                    (try builder.benchmarkReferenceGraphSegmentAlloc(tracked, "docs", docs, true)).payload orelse return error.InvalidBenchmarkResult
+                else
+                    (try builder.buildGraphSegmentAlloc(tracked, "docs", docs, true)).payload orelse return error.InvalidBenchmarkResult;
+                const elapsed = antfly.platform_time.monotonicNs() - started;
+                payload_len = payload.len;
+                var checksum: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(payload, &checksum, .{});
+                if (expected) |prior| {
+                    if (!std.mem.eql(u8, &prior, &checksum)) return error.InvalidBenchmarkResult;
+                } else expected = checksum;
+                tracked.free(payload);
+                if (stats.current_bytes != 0) return error.InvalidBenchmarkResult;
+                if (sample != 0) samples[sample - 1] = elapsed;
+                measured = stats;
+            }
+            std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+            const json = try std.json.Stringify.valueAlloc(fixture, .{
+                .mode = if (reference) "graph_index_string_reference" else "graph_index_ordinal_builder",
+                .nodes = ids.len,
+                .edges = ids.len * edges.len,
+                .id_bytes = id_len,
+                .median_ns = samples[2],
+                .peak_bytes = measured.peak_bytes,
+                .allocation_count = measured.alloc_count,
+                .payload_bytes = payload_len,
+                .note = "same JSON input; exact encoded SHA256 parity; input residency excluded; six samples, first discarded; parse, construction and encoding included",
+            }, .{});
+            try out.interface.writeAll(json);
+            try out.interface.writeByte('\n');
+            try out.flush();
+        }
+    }
+}
+
+fn benchmarkTypedEdgeScans(io: std.Io, out: anytype) !void {
+    const alloc = std.heap.smp_allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const fixture = arena.allocator();
+    const root = try std.fmt.allocPrint(fixture, "/tmp/antfly-typed-edge-bench-{d}", .{antfly.platform_time.monotonicNs()});
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const store_path = try std.fmt.allocPrint(fixture, "{s}/store\x00", .{root});
+    const reverse_path = try std.fmt.allocPrint(fixture, "{s}/reverse\x00", .{root});
+    var store = try antfly.docstore.DocStore.open(alloc, @ptrCast(store_path.ptr), .{});
+    defer store.close();
+    var index = try antfly.graph.GraphIndex.open(alloc, &store, @ptrCast(reverse_path.ptr), "links", .{});
+    defer index.close();
+    const ids = try fixture.alloc([]const u8, 1024);
+    for (ids, 0..) |*id, i| id.* = try std.fmt.allocPrint(fixture, "node-{d:0>8}", .{i});
+    const types = try fixture.alloc([]const u8, 16);
+    for (types, 0..) |*kind, i| kind.* = try std.fmt.allocPrint(fixture, "type-{d:0>2}", .{i});
+    const writes = try fixture.alloc(antfly.graph.BatchWrite, ids.len * 64);
+    for (writes, 0..) |*write, i| write.* = .{ .source = ids[i / 64], .target = ids[(i / 64 + i % 64 + 1) % ids.len], .edge_type = types[i % types.len] };
+    try index.batchApply(writes, &.{});
+    const filter = antfly.graph.GraphMetricEdgeFilter{ .mode = .types, .types = types[0..1] };
+    const expected = try index.benchmarkMetricEdgeScan(filter, true);
+    for ([_]bool{ true, false }) |reference| {
+        var samples: [5]u64 = undefined;
+        var measured: antfly.graph.GraphIndex.MetricEdgeScanBenchmark = undefined;
+        for (0..6) |sample| {
+            const started = antfly.platform_time.monotonicNs();
+            measured = try index.benchmarkMetricEdgeScan(filter, reference);
+            const elapsed = antfly.platform_time.monotonicNs() - started;
+            if (measured.matched != expected.matched or measured.checksum != expected.checksum) return error.InvalidBenchmarkResult;
+            if (sample != 0) samples[sample - 1] = elapsed;
+        }
+        if (measured.visited != (if (reference) writes.len else writes.len / types.len)) return error.InvalidBenchmarkResult;
+        std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+        const json = try std.json.Stringify.valueAlloc(fixture, .{
+            .mode = if (reference) "stateful_filtered_full_scan" else "stateful_filtered_type_postings",
+            .edges = writes.len,
+            .visited = measured.visited,
+            .matched = measured.matched,
+            .median_ns = samples[2],
+            .note = "default durable LSM; same selected edge identity checksum; six samples, first discarded; discovery only, excludes fixture writes and numerical execution",
+        }, .{});
+        try out.interface.writeAll(json);
+        try out.interface.writeByte('\n');
+        try out.flush();
     }
 }
 
