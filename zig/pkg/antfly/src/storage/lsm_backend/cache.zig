@@ -1318,10 +1318,10 @@ test "cache pending load waiter survives finish removal" {
     };
 
     var waiter = Waiter{};
-    const thread = try std.Thread.spawn(.{}, Waiter.run, .{ &waiter, &cache });
+    var thread = try std.testing.io.concurrent(Waiter.run, .{ &waiter, &cache });
     sleepNs(10 * std.time.ns_per_ms);
     cache.finishLoad("run-1", 1, 1, .run_table_index);
-    thread.join();
+    thread.await(std.testing.io);
 
     if (waiter.err) |err| return err;
     try std.testing.expectEqual(@as(usize, 0), cache.pendingLoadCountForTests());

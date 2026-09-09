@@ -614,18 +614,16 @@ test "shard operation adapter metadata runtime dispatches actions" {
     OwnedShardOperationAdapter.AdmissionTest.gate = &gate;
     defer OwnedShardOperationAdapter.AdmissionTest.gate = null;
     var worker = Worker{ .adapter = concurrent_owner.adapter() };
-    var thread: ?std.Thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
-    defer if (thread) |pending_thread| {
+    var future = try std.testing.io.concurrent(Worker.run, .{&worker});
+    defer {
         gate.release();
-        pending_thread.join();
-    };
+        future.await(std.testing.io);
+    }
 
     gate.waitUntilEntered();
     concurrent_registration.deinit();
     concurrent_owner.deinit();
     gate.release();
-    const joined_thread = thread.?;
-    thread = null;
-    joined_thread.join();
+    future.await(std.testing.io);
     try std.testing.expectEqual(Worker.Result.retired, worker.result);
 }

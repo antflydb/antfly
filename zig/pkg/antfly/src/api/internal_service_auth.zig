@@ -71,11 +71,8 @@ pub fn executeRequest(
     const signing = config orelse return executor.execute(alloc, request);
     if (!requestTargetsInternalApi(request.uri)) return executor.execute(alloc, request);
 
-    const token = try tokenAlloc(
-        alloc,
-        signing,
-        @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)),
-    );
+    const realtime_ns = executor.realtimeNs() orelse platform_time.realtimeNs();
+    const token = try tokenAlloc(alloc, signing, @intCast(@divFloor(realtime_ns, std.time.ns_per_s)));
     defer alloc.free(token);
 
     const headers = try alloc.alloc(http_common.RequestHeader, request.headers.len + 1);

@@ -206,6 +206,10 @@ pub fn applyRestoreSnapshotToPathWithOptions(
     restore: RestoreSource,
     options: RestoreOptions,
 ) !void {
+    var io_scope = try RestoreIoScope.init(alloc, restore);
+    defer io_scope.deinit();
+    var restore_with_io = restore;
+    restore_with_io.io = io_scope.io();
     // Provisioning and Raft admission may discover the same restore intent on
     // adjacent control turns. Check the published generation under a read
     // lease before requesting an exclusive transition: once the exact import
@@ -213,14 +217,14 @@ pub fn applyRestoreSnapshotToPathWithOptions(
     // generation open while it advances restartable runtime-repair phases.
     // Requiring repair completion here would make the idempotent caller fight
     // that owner forever with GenerationTransitionActive.
-    if (try publishedRestoreAlreadyImported(alloc, path, group_id, restore)) return;
+    if (try publishedRestoreAlreadyImported(alloc, path, group_id, restore_with_io)) return;
     var transition = try db_mod.generation_lifecycle.beginProcessExclusiveWithRuntimeAndIo(
         path,
         restore.backend_runtime,
-        restore.open_options.filesystem_io orelse restore.io,
+        io_scope.io(),
     );
     defer transition.deinit();
-    try applyRestoreSnapshotToPathWithExclusiveTransition(&transition, alloc, path, group_id, restore, options);
+    try applyRestoreSnapshotToPathWithExclusiveTransition(&transition, alloc, path, group_id, restore_with_io, options);
 }
 
 pub fn applyRestoreSnapshotToPathWithExclusiveTransition(
@@ -366,7 +370,7 @@ pub fn publishPreparedRestore(
 ) !db_mod.generation_lifecycle.PublicationOutcome {
     try prepared._generation.validateLivePath(path);
     const outcome = try prepared._generation.publish();
-    cleanupSnapshotsForPublishedRestore(alloc, path);
+    cleanupSnapshotsForPublishedRestore(alloc, prepared._generation.io orelse std.Options.debug_io, path);
     return outcome;
 }
 
@@ -1042,10 +1046,10 @@ fn stageRestoreFile(
     return staging_path;
 }
 
-fn cleanupSnapshotsForPublishedRestore(alloc: std.mem.Allocator, path: []const u8) void {
+fn cleanupSnapshotsForPublishedRestore(alloc: std.mem.Allocator, io: std.Io, path: []const u8) void {
     const snapshot_dir = std.fmt.allocPrint(alloc, "{s}.snapshots", .{path}) catch return;
     defer alloc.free(snapshot_dir);
-    destroyPathIfExists(snapshot_dir);
+    destroyPathIfExistsWithIo(io, snapshot_dir);
 }
 
 fn ensureDirPath(path: []const u8) !void {

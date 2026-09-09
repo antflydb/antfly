@@ -26,7 +26,7 @@ pub const wire_version = artifact_ref.graph_metric_manifest_wire_version;
 
 const policy_size = 98;
 const header_size = 4 + 2 + 4 + 8 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4 +
-    4 + 4 + 4 + 4 + 4 + policy_size + 8 + 1 + 4;
+    4 + 4 + 4 + 4 + 4 + policy_size + 8 + 1 + 4 + 1 + 8;
 
 fn encodePolicy(buf: []u8, policy: catalog_types.NamespacePolicy) void {
     var pos: usize = 0;
@@ -273,6 +273,10 @@ pub fn encodeForVersionAlloc(alloc: Allocator, manifest: manifest_types.Manifest
     pos += policy_size;
     std.mem.writeInt(u32, buf[pos..][0..4], base_source_len, .little);
     pos += 4;
+    buf[pos] = @intFromBool(manifest.publication_lineage_tracked);
+    pos += 1;
+    std.mem.writeInt(u64, buf[pos..][0..8], manifest.publication_parent_version orelse 0, .little);
+    pos += 8;
 
     @memcpy(buf[pos..][0..manifest.namespace.len], manifest.namespace);
     pos += manifest.namespace.len;
@@ -527,6 +531,26 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
         pos += 4;
         break :blk value;
     };
+    const publication_lineage_tracked = blk: {
+        if (pos + 1 > data.len) return error.InvalidManifest;
+        const value = switch (data[pos]) {
+            0 => false,
+            1 => true,
+            else => return error.InvalidManifest,
+        };
+        pos += 1;
+        break :blk value;
+    };
+    const publication_parent_version = blk: {
+        if (pos + 8 > data.len) return error.InvalidManifest;
+        const value = std.mem.readInt(u64, data[pos..][0..8], .little);
+        pos += 8;
+        break :blk if (value == 0) null else value;
+    };
+    if (!publication_lineage_tracked and publication_parent_version != null) return error.InvalidManifest;
+    if (publication_parent_version) |parent| {
+        if (parent >= manifest_version) return error.InvalidManifest;
+    }
 
     if (pos + namespace_len > data.len) return error.InvalidManifest;
     const namespace = try alloc.dupe(u8, data[pos .. pos + namespace_len]);
@@ -792,6 +816,8 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
         .built_at_ns = built_at_ns,
         .wal_start_lsn = wal_start_lsn,
         .wal_end_lsn = wal_end_lsn,
+        .publication_lineage_tracked = publication_lineage_tracked,
+        .publication_parent_version = publication_parent_version,
         .base_source = base_source,
         .stats = .{
             .document_count = document_count,
@@ -957,6 +983,8 @@ test "serverless manifest codec round-trips deterministically" {
         .built_at_ns = 123456,
         .wal_start_lsn = 1000,
         .wal_end_lsn = 1050,
+        .publication_lineage_tracked = true,
+        .publication_parent_version = 40,
         .stats = .{
             .document_count = 99,
             .document_base_version = 42,
@@ -1030,6 +1058,8 @@ test "serverless manifest codec round-trips deterministically" {
 
     try std.testing.expectEqualStrings("products", decoded.namespace);
     try std.testing.expectEqual(@as(u64, 42), decoded.version);
+    try std.testing.expect(decoded.publication_lineage_tracked);
+    try std.testing.expectEqual(@as(?u64, 40), decoded.publication_parent_version);
     try std.testing.expectEqual(@as(u64, 99), decoded.stats.document_count);
     try std.testing.expectEqual(@as(u64, 42), decoded.stats.document_base_version);
     try std.testing.expectEqual(catalog_types.DocumentPublishMode.head_republish, decoded.stats.document_publish_mode);

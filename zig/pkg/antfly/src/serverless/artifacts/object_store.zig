@@ -239,7 +239,7 @@ pub const ObjectStore = struct {
             .checksum_sha256_hex = null,
             .if_none_match = true,
             .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
-        }) catch |err| switch (normalizeCancellationError(err)) {
+        }) catch |err| switch (normalizeCancellationError(err, cancellation)) {
             error.PreconditionFailed => {
                 // Content-addressed keys are immutable. Concurrent/idempotent
                 // writers may lose the create race, but the existing object is
@@ -279,7 +279,7 @@ pub const ObjectStore = struct {
         defer self.alloc.free(key);
         var result = self.client.getObject(self.bucket, key, .{
             .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
-        }) catch |err| return normalizeCancellationError(err);
+        }) catch |err| return normalizeCancellationError(err, cancellation);
         defer result.deinit(self.client.allocator);
         try cancellation.check();
         return try dupeWithCancellationAlloc(alloc, result.body, cancellation);
@@ -306,7 +306,7 @@ pub const ObjectStore = struct {
             .skip_metadata_probe = true,
             .max_response_bytes = len,
             .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
-        }) catch |err| return normalizeCancellationError(err);
+        }) catch |err| return normalizeCancellationError(err, cancellation);
         defer result.deinit(self.client.allocator);
         try cancellation.check();
         return try dupeWithCancellationAlloc(alloc, result.body, cancellation);
@@ -358,7 +358,7 @@ pub const ObjectStore = struct {
             .skip_metadata_probe = true,
             .max_response_bytes = len,
             .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
-        }) catch |err| switch (normalizeCancellationError(err)) {
+        }) catch |err| switch (normalizeCancellationError(err, cancellation)) {
             error.PreconditionFailed, error.FileNotFound => return error.ArtifactIntegrityMismatch,
             else => |normalized| return normalized,
         };
@@ -386,7 +386,7 @@ pub const ObjectStore = struct {
         defer self.alloc.free(key);
         var meta = self.client.statObjectWithOptions(self.bucket, key, .{
             .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
-        }) catch |err| return normalizeCancellationError(err);
+        }) catch |err| return normalizeCancellationError(err, cancellation);
         defer meta.deinit(self.client.allocator);
         try cancellation.check();
         return .{
@@ -422,7 +422,7 @@ pub const ObjectStore = struct {
         defer self.alloc.free(key);
         var meta = self.client.statObjectWithOptions(self.bucket, key, .{
             .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
-        }) catch |err| return normalizeCancellationError(err);
+        }) catch |err| return normalizeCancellationError(err, cancellation);
         defer meta.deinit(self.client.allocator);
         if (meta.content_length != expected_byte_len) return error.ArtifactIntegrityMismatch;
         if (meta.checksum_scope == .object) {
@@ -479,7 +479,7 @@ pub const ObjectStore = struct {
                 .skip_metadata_probe = true,
                 .max_response_bytes = @intCast(len),
                 .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
-            }) catch |err| return normalizeCancellationError(err);
+            }) catch |err| return normalizeCancellationError(err, cancellation);
             defer part.deinit(self.client.allocator);
             if (part.body.len != len) return error.ArtifactIntegrityMismatch;
             hasher.update(part.body);
@@ -645,8 +645,25 @@ pub const ObjectStore = struct {
     }
 };
 
-fn normalizeCancellationError(err: anyerror) anyerror {
+fn normalizeCancellationError(err: anyerror, cancellation: CancellationToken) anyerror {
+    // Recover typed lease loss from the transport's boolean-only callback.
+    if (err == error.Cancelled or err == error.Canceled) {
+        cancellation.check() catch |reason| return reason;
+    }
     return if (err == error.Cancelled) error.Canceled else err;
+}
+
+test "serverless objectstore cancellation preserves scoped lease failures" {
+    var state: u8 = 0;
+    const token = CancellationToken{ .ptr = &state, .check_fn = struct {
+        fn check(_: *const anyopaque) !void {
+            return error.WorkLeaseLost;
+        }
+    }.check };
+    try std.testing.expectEqual(error.WorkLeaseLost, normalizeCancellationError(error.Cancelled, token));
+    try std.testing.expectEqual(error.WorkLeaseLost, normalizeCancellationError(error.Canceled, token));
+    try std.testing.expectEqual(error.Canceled, normalizeCancellationError(error.Cancelled, .none));
+    try std.testing.expectEqual(error.Timeout, normalizeCancellationError(error.Timeout, token));
 }
 
 fn dupeWithCancellationAlloc(

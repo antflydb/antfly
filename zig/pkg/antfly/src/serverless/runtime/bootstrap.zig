@@ -69,6 +69,8 @@ pub const BootstrapConfig = struct {
     compaction_enabled: bool = true,
     prune_enabled: bool = true,
     enrichment_enabled: bool = true,
+    work_lease_ttl_ms: u64 = 30_000,
+    work_lease_owner_id: ?[]const u8 = null,
     foreign_registry: ?*const foreign_mod.Registry = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     node_config: ?*const common_config.Config = null,
@@ -430,6 +432,7 @@ pub const OwnedStack = struct {
     wal: wal_mod.WalStore,
     progress_impl: progress_object_store.ObjectProgressStore,
     progress: catalog_mod.ProgressStore,
+    work_lease_impl: build_mod.ObjectWorkLeaseStore,
     catalog_impl: catalog_object_store.ObjectStore,
     catalog_store: catalog_mod.CatalogStore,
     builder: build_mod.Builder,
@@ -525,6 +528,13 @@ pub const OwnedStack = struct {
         } else try progress_object_store.ObjectProgressStore.initRemoteUriWithS3Options(alloc, cfg.progress_uri, cfg.s3_options[3]);
         self.progress = self.progress_impl.progressStore();
         errdefer self.progress.deinit();
+        self.work_lease_impl = try build_mod.ObjectWorkLeaseStore.initWithClient(
+            alloc,
+            self.progress_impl.client,
+            self.progress_impl.bucket,
+            self.progress_impl.prefix,
+        );
+        errdefer self.work_lease_impl.deinit();
 
         var catalog_target = try s3TargetAlloc(alloc, cfg.catalog_uri);
         defer if (catalog_target) |*target| target.deinit(alloc);
@@ -573,16 +583,33 @@ pub const OwnedStack = struct {
         self.status = try runtimeStatusAlloc(alloc, cfg);
         var status_owned = true;
         errdefer if (status_owned) self.status.deinit(alloc);
-        self.runtime = runtime_manager.ManagedRuntime.init(alloc, .{
+        self.runtime = runtime_manager.ManagedRuntime.initWithIo(alloc, io, .{
             .tick_interval_ms = cfg.tick_interval_ms,
             .role = cfg.role,
             .publish_enabled = cfg.publish_enabled,
             .compaction_enabled = cfg.compaction_enabled,
             .prune_enabled = cfg.prune_enabled,
             .enrichment_enabled = cfg.enrichment_enabled,
+            .embedder_options = .{
+                .io = io,
+                .bounded_http_request = true,
+                .secret_store = cfg.secret_store,
+                .remote_content = cfg.remote_content,
+            },
         }, &self.catalog, build_mod.Pruner.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal));
         var runtime_owned = true;
         errdefer if (runtime_owned) self.runtime.deinit();
+        const generated_lease_owner = if (cfg.work_lease_owner_id == null)
+            try workLeaseOwnerIdAlloc(alloc, io)
+        else
+            null;
+        defer if (generated_lease_owner) |owner_id| alloc.free(owner_id);
+        try self.runtime.configureWorkLease(
+            self.work_lease_impl.provider(),
+            cfg.work_lease_owner_id orelse generated_lease_owner.?,
+            std.math.mul(u64, cfg.work_lease_ttl_ms, std.time.ns_per_ms) catch
+                return error.WorkLeaseTtlOverflow,
+        );
         self.runtime.setCompactor(build_mod.Compactor.init(alloc, &self.artifacts, &self.manifests, &self.progress));
         var enricher = enrichment_mod.SparseEnricher.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal);
         var enricher_owned = true;
@@ -594,6 +621,8 @@ pub const OwnedStack = struct {
         if (cfg.embedding_indexes_json) |indexes_json| {
             const embedder_options = managed_embedder.InitOptions{
                 .io = io,
+                .bounded_http_request = true,
+                .secret_store = cfg.secret_store,
                 .remote_content = cfg.remote_content,
                 .provider_runtime = &self.embedding_provider_runtime,
             };
@@ -689,6 +718,7 @@ pub const OwnedStack = struct {
         self.query.deinit();
         if (self.query_cache) |*query_cache| query_cache.deinit();
         self.catalog_store.deinit();
+        self.work_lease_impl.deinit();
         self.progress.deinit();
         self.wal.deinit();
         self.manifests.deinit();
@@ -699,12 +729,28 @@ pub const OwnedStack = struct {
     }
 };
 
+fn workLeaseOwnerIdAlloc(alloc: Allocator, io: std.Io) ![]u8 {
+    var entropy: [2]u64 = undefined;
+    io.random(std.mem.asBytes(&entropy));
+    return try std.fmt.allocPrint(
+        alloc,
+        "serverless-{x:0>16}{x:0>16}",
+        .{ entropy[0], entropy[1] },
+    );
+}
+
 pub fn validateConfig(alloc: Allocator, cfg: BootstrapConfig) !void {
     if (cfg.tick_interval_ms == 0) return error.InvalidTickInterval;
     if (cfg.graph_metric_max_parallelism == 0 or cfg.graph_metric_max_parallelism > build_mod.max_graph_metric_compute_parallelism)
         return error.InvalidGraphMetricBuildOptions;
     if (cfg.manifest_write_version != manifest_mod.codec.wire_version) {
         return error.UnsupportedManifestWriteVersion;
+    }
+    if (cfg.work_lease_ttl_ms == 0) return error.InvalidWorkLeaseTtl;
+    if (cfg.work_lease_owner_id) |owner_id| {
+        if (std.mem.trim(u8, owner_id, &std.ascii.whitespace).len == 0) {
+            return error.InvalidWorkLeaseOwner;
+        }
     }
     if (cfg.query_cache_dir) |path| {
         if (std.mem.trim(u8, path, &std.ascii.whitespace).len == 0) return error.InvalidQueryCacheDir;

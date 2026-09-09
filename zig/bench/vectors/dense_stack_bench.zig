@@ -934,7 +934,8 @@ fn encodeGeneratedChunkedDenseDocJson(alloc: std.mem.Allocator, body: []const u8
 fn runBench(alloc: std.mem.Allocator, path: []const u8, cfg: Config, queries: []const f32) !Result {
     var resource_manager = resource_manager_mod.ResourceManager.init(.{});
     var db = try db_mod.DB.open(alloc, path, .{ .resource_manager = &resource_manager });
-    defer db.close();
+    var db_closed = false;
+    defer if (!db_closed) db.close();
 
     const query_total = cfg.queries * cfg.repeats;
 
@@ -984,11 +985,12 @@ fn runBench(alloc: std.mem.Allocator, path: []const u8, cfg: Config, queries: []
             query_total: usize,
             k: usize,
             next_query: *std.atomic.Value(usize),
-            start_flag: *std.atomic.Value(bool),
+            io: std.Io,
+            start_flag: *std.Io.Event,
             err: ?anyerror = null,
 
             fn run(self: *@This()) void {
-                while (!self.start_flag.load(.acquire)) std.atomic.spinLoopHint();
+                self.start_flag.waitUncancelable(self.io);
                 while (true) {
                     const query_idx = self.next_query.fetchAdd(1, .acq_rel);
                     if (query_idx >= self.query_total) break;
@@ -1012,12 +1014,20 @@ fn runBench(alloc: std.mem.Allocator, path: []const u8, cfg: Config, queries: []
         };
 
         var next_query = std.atomic.Value(usize).init(0);
-        var start_flag = std.atomic.Value(bool).init(false);
+        var worker_io = std.Io.Threaded.init(alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(cfg.search_threads) });
+        defer worker_io.deinit();
+        const scheduling_io = worker_io.io();
+        var start_flag: std.Io.Event = .unset;
         const workers = try alloc.alloc(SearchWorker, cfg.search_threads);
         defer alloc.free(workers);
-        const threads = try alloc.alloc(std.Thread, cfg.search_threads);
+        const threads = try alloc.alloc(std.Io.Future(void), cfg.search_threads);
         defer alloc.free(threads);
 
+        var started_tasks: usize = 0;
+        defer {
+            start_flag.set(scheduling_io);
+            for (threads[0..started_tasks]) |*future| future.await(scheduling_io);
+        }
         for (workers, 0..) |*worker, i| {
             worker.* = .{
                 .db = &db,
@@ -1027,19 +1037,27 @@ fn runBench(alloc: std.mem.Allocator, path: []const u8, cfg: Config, queries: []
                 .query_total = query_total,
                 .k = cfg.k,
                 .next_query = &next_query,
+                .io = scheduling_io,
                 .start_flag = &start_flag,
             };
-            threads[i] = try std.Thread.spawn(.{}, SearchWorker.run, .{worker});
+            threads[i] = try scheduling_io.concurrent(SearchWorker.run, .{worker});
+            started_tasks += 1;
         }
 
         const start_ns = nowNs();
-        start_flag.store(true, .release);
-        for (threads, workers) |thread, worker| {
-            thread.join();
+        start_flag.set(scheduling_io);
+        for (threads, workers) |*future, worker| {
+            future.await(scheduling_io);
             if (worker.err) |err| return err;
         }
         break :blk @divTrunc(elapsedSince(start_ns), query_total);
     };
+
+    // The C API opens its own writer for this root. Capture the direct DB's
+    // resource counters and release its ownership before the C API phases.
+    const resources = captureResourceSummary(&resource_manager);
+    db.close();
+    db_closed = true;
 
     const capi_packed_ns = blk: {
         const zpath = try alloc.dupeZ(u8, path);
@@ -1131,7 +1149,7 @@ fn runBench(alloc: std.mem.Allocator, path: []const u8, cfg: Config, queries: []
         .db_search_concurrent_ns = db_search_concurrent_ns,
         .capi_packed_ns = capi_packed_ns,
         .capi_wire_ns = capi_wire_ns,
-        .resources = captureResourceSummary(&resource_manager),
+        .resources = resources,
     };
 }
 

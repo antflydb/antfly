@@ -3,16 +3,17 @@
 ## Addressed plans and topology preparation (2026-09-09)
 
 Run `zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --indexing-only`.
-Apple M4 Max / Zig 0.16.0, shared host; six samples, first discarded. Current
-wire is v5. The following are local phase measurements, not cloud/HTTP latency.
+Apple M4 Max / Zig 0.16.0, shared host; six samples, first discarded. This run
+includes the merge of main `26e332ed8`. Current wire is v5. The following are
+local phase measurements, not cloud/HTTP latency.
 
 | Phase | Reference | Addressed | Tracked peak / reads |
 | --- | ---: | ---: | --- |
-| Stateful plan validation | 137.750 µs | 10.187 µs | Fixed 76-byte control; no boundary allocations on control path |
-| Serverless narrow filter, warm identity | 15.044 ms | 0.090 ms | Peak 16,135,017 → 64,884 B; reads 11,774,728 → 19,677 B |
-| Serverless narrow filter, cold identity | 13.326 ms | 4.228 ms | Same phase peak; reads 11,774,728 → 11,794,405 B |
-| Serverless all types, warm identity | 15.183 ms | 8.255 ms | Peak 16,135,017 → 5,849,203 B; reads 11,774,728 → 3,181,277 B |
-| Serverless all types, cold identity | 13.282 ms | 12.427 ms | Same phase peak; reads 11,774,728 → 14,956,005 B |
+| Stateful plan validation | 122.328 µs | 9.117 µs | Fixed 76-byte control; no boundary allocations on control path |
+| Serverless narrow filter, warm identity | 12.749 ms | 0.069 ms | Peak 16,135,017 → 64,884 B; reads 11,774,728 → 19,677 B |
+| Serverless narrow filter, cold identity | 12.859 ms | 4.007 ms | Same phase peak; reads 11,774,728 → 11,794,405 B |
+| Serverless all types, warm identity | 12.965 ms | 7.602 ms | Peak 16,135,017 → 5,849,203 B; reads 11,774,728 → 3,181,277 B |
+| Serverless all types, cold identity | 12.785 ms | 11.678 ms | Same phase peak; reads 11,774,728 → 14,956,005 B |
 
 The stateful reference reads and validates the addressed boundary set as well
 as the header; it models the old dependency on all boundary data, not the exact
@@ -41,19 +42,26 @@ compression. Page reads merge nearby ranges into at most 1 MiB windows, except
 that one oversized dictionary page can be admitted on its own.
 
 Ingestion parity remains exact between reference and ordinal encoders. For
-65,536 edges, ordinal JSON-to-artifact medians were 15.864 ms with 16-byte IDs
-and 27.390 ms with 256-byte IDs. The streaming directory builder uses compact
+65,536 edges, ordinal JSON-to-artifact medians were 16.586 ms with 16-byte IDs
+and 28.198 ms with 256-byte IDs (reference: 23.350 and 68.586 ms). The streaming directory builder uses compact
 node offsets and a bounded 65,536-entry digest cache, not an adjacency view or
 graph-wide digest array. A million-node graph no longer loses its directory
 because of the former 64 MiB scratch estimate.
 
-The unchanged-topology republish measured 34 µs versus 2.867 ms recomputation,
+The unchanged-topology republish measured 33 µs versus 3.201 ms recomputation,
 with exact score/artifact identity checks. Stateful coalesced membership
-maintenance measured 102.155 ms versus 474.542 ms per-edge maintenance; this
+maintenance measured 108.527 ms versus 492.333 ms per-edge maintenance; this
 remains an abort-based maintenance benchmark, excluding WAL/commit. These
 results do not establish the benefit of migrating stateful graph strings to
 persistent numeric IDs: that separate indexing decision needs committed-write,
 compaction and traversal measurements including dictionary maintenance.
+
+The same run measured stateful filtered discovery at 0.574 ms using type
+postings versus 13.057 ms scanning all 65,536 edges (4,096 selected), with
+identical selected-edge checksums. Cold selected census planning took 69.908 ms
+and three durable checkpoints versus 217.715 ms and seventeen checkpoints for
+the global census. Census timings include plan reset and committed checkpoints,
+but exclude fixture writes and the numerical kernel.
 
 ## Earlier v4 transactional indexing and directory-first reuse (2026-09-09)
 

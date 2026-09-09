@@ -129,16 +129,28 @@ fn fetchQueryUntilTotal(
     return error.QueryVisibilityTimeout;
 }
 
-fn metadataServiceProgressSource(svc: *metadata_service.MetadataService) raft_mod.ProgressSource {
+fn metadataServiceRaftProgressSource(svc: *metadata_service.MetadataService) raft_mod.ProgressSource {
     return .{
         .ptr = svc,
-        .run_once = runMetadataServiceProgress,
+        .run_once = runMetadataServiceRaftProgress,
     };
 }
 
-fn runMetadataServiceProgress(ptr: *anyopaque) !void {
+fn runMetadataServiceRaftProgress(ptr: *anyopaque) !void {
     const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
-    try svc.runRound();
+    try svc.runRaftRoundOnly();
+}
+
+fn metadataServiceControlProgressSource(svc: *metadata_service.MetadataService) raft_mod.ProgressSource {
+    return .{
+        .ptr = svc,
+        .run_once = runMetadataServiceControlProgress,
+    };
+}
+
+fn runMetadataServiceControlProgress(ptr: *anyopaque) !void {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    try svc.runControlRoundOnly();
 }
 
 fn metadataRuntimeRaftProgressSource(server: *metadata_runtime.Server) raft_mod.ProgressSource {
@@ -164,18 +176,6 @@ fn runMetadataRuntimeControlProgress(ptr: *anyopaque) !void {
     const server: *metadata_runtime.Server = @ptrCast(@alignCast(ptr));
     try server.runControlRoundOnly();
     try server.runCdcRound();
-}
-
-fn dataServerProgressSource(data_server: *data_runtime.DataServer) raft_mod.ProgressSource {
-    return .{
-        .ptr = data_server,
-        .run_once = runDataServerProgress,
-    };
-}
-
-fn runDataServerProgress(ptr: *anyopaque) !void {
-    const data_server: *data_runtime.DataServer = @ptrCast(@alignCast(ptr));
-    try data_server.runRound();
 }
 
 fn dataServerRaftProgressSource(data_server: *data_runtime.DataServer) raft_mod.ProgressSource {
@@ -370,6 +370,19 @@ fn startMetadataAdminListener(
     );
     listener.* = try metadata_http_test_runtime.Runtime.startOwned(alloc, server);
     return try listener.baseUri(alloc);
+}
+
+fn stopMetadataAdminListener(
+    alloc: std.mem.Allocator,
+    base_uri: []u8,
+    server: *metadata_http_server.MetadataHttpServer,
+    listener: *metadata_http_test_runtime.Runtime,
+) void {
+    alloc.free(base_uri);
+    // Registered routes retain callbacks into `server`, so stop and join the
+    // listener before releasing the callback owner.
+    listener.deinit();
+    server.deinit();
 }
 
 const Factory = struct {
@@ -665,7 +678,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        raft_mod.read_gate.noopReadableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -1519,7 +1532,7 @@ test "public api e2e rebuilds schema-migration full-text index on exact backfill
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        raft_mod.read_gate.noopReadableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -1801,7 +1814,7 @@ test "public api e2e rejects table backup during active schema migration" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -1908,7 +1921,7 @@ test "public api e2e rejects table restore for migration-state backup manifests"
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -2024,7 +2037,7 @@ test "public api e2e rejects table restore when target already exists" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -2130,7 +2143,7 @@ test "public api e2e rejects table restore for mismatched backup manifests" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -2244,7 +2257,7 @@ test "public api e2e validates backup and restore request shapes and locations" 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -2443,7 +2456,7 @@ test "public api e2e backs up drops and restores a table" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -2583,9 +2596,7 @@ test "public api split e2e backs up drops and restores a table" {
         &metadata_admin_server,
         &metadata_admin_listener,
     );
-    defer std.testing.allocator.free(metadata_api);
-    defer metadata_admin_server.deinit();
-    defer metadata_admin_listener.deinit();
+    defer stopMetadataAdminListener(std.testing.allocator, metadata_api, &metadata_admin_server, &metadata_admin_listener);
 
     var data_server = try data_runtime.DataServer.initFromMetadataApiUrl(std.testing.allocator, .{
         .replica_root_dir = replica_root,
@@ -2783,6 +2794,8 @@ test "public api standalone-like e2e backs up drops and restores a table" {
     try data_server.start();
     try registerDataServerUntilVisible(&data_server, io_impl.io());
 
+    // Match production's scheduling invariant: metadata/storage control I/O
+    // must never stall the latency-sensitive data-Raft ticker.
     var data_raft_progress = raft_mod.ManagedProgressDriver.init(
         io_impl.io(),
         dataServerRaftProgressSource(&data_server),
@@ -3088,9 +3101,7 @@ test "split data runtime registers a store with metadata" {
         &metadata_admin_server,
         &metadata_admin_listener,
     );
-    defer std.testing.allocator.free(metadata_api);
-    defer metadata_admin_listener.deinit();
-    defer metadata_admin_server.deinit();
+    defer stopMetadataAdminListener(std.testing.allocator, metadata_api, &metadata_admin_server, &metadata_admin_listener);
 
     var data_server = try data_runtime.DataServer.initFromMetadataApiUrl(std.testing.allocator, .{
         .replica_root_dir = data_replica_root,
@@ -3214,9 +3225,7 @@ test "split data runtime serves retrieval agent pipeline queries" {
         &metadata_admin_server,
         &metadata_admin_listener,
     );
-    defer std.testing.allocator.free(metadata_api);
-    defer metadata_admin_listener.deinit();
-    defer metadata_admin_server.deinit();
+    defer stopMetadataAdminListener(std.testing.allocator, metadata_api, &metadata_admin_server, &metadata_admin_listener);
 
     var data_server = try data_runtime.DataServer.initFromMetadataApiUrl(std.testing.allocator, .{
         .replica_root_dir = data_replica_root,
@@ -3310,7 +3319,7 @@ test "public api e2e supports managed semantic search and sparse embeddings" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -3439,7 +3448,7 @@ test "public api e2e adds managed embeddings indexes to existing tables" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -3570,7 +3579,7 @@ test "public api e2e recreates managed embeddings index after corrupt artifact" 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        raft_mod.read_gate.noopReadableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -3745,7 +3754,7 @@ test "public api e2e restores managed embeddings from table backup" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -3926,7 +3935,7 @@ test "public api e2e supports managed sparse embeddings generation" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -4040,7 +4049,7 @@ test "public api e2e supports hybrid query pruner and reranker" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -4178,7 +4187,7 @@ test "public api e2e supports retrieval agent pipeline queries" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -4273,7 +4282,7 @@ test "public api e2e supports retrieval agent generation step" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -4377,7 +4386,7 @@ test "public api e2e supports retrieval agent semantic and hybrid strategies" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -4501,7 +4510,7 @@ test "public api e2e supports retrieval agent tree search pipeline" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -4606,7 +4615,7 @@ test "public api e2e supports retrieval agent tree search from roots" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -4709,7 +4718,7 @@ test "public api e2e supports retrieval agent classification confidence and foll
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -4819,7 +4828,7 @@ test "public api e2e supports retrieval agent fixed-body sse streaming" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -4953,7 +4962,7 @@ test "public api e2e retrieval streaming emits clarification events" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -5072,7 +5081,7 @@ test "public api e2e supports bounded agentic retrieval mode" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -5166,7 +5175,7 @@ test "public api e2e agentic retrieval selects the best declared query" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -5258,7 +5267,7 @@ test "public api e2e agentic retrieval evaluates misses and falls back to the ne
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -5366,7 +5375,7 @@ test "public api e2e agentic retrieval can require clarification and continue fr
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -5473,7 +5482,7 @@ test "public api e2e restores managed sparse embeddings from table backup" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -5668,7 +5677,7 @@ test "public api e2e supports embedding_template remote media helper" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -5842,7 +5851,7 @@ test "public api e2e supports template chunked remote text enrichment and query 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -6090,7 +6099,7 @@ test "public api e2e supports fixed and antfly chunked semantic search" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -6268,7 +6277,7 @@ test "public api e2e restores chunked managed embeddings from table backup" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -6484,9 +6493,7 @@ test "public api e2e supports graph queries" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        // The fixture owns table storage directly and only hosts the metadata
-        // Raft group. Multi-node tests cover the routed read-index barrier.
-        raft_mod.read_gate.noopReadableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -6706,7 +6713,7 @@ test "public api e2e graph queries respect full_index sync level" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        raft_mod.read_gate.noopReadableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -6865,7 +6872,7 @@ test "public api e2e restores graph indexes from table backup" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        raft_mod.read_gate.noopReadableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -7125,13 +7132,12 @@ test "public api smoke e2e queries across split ranges" {
         &metadata_admin_server,
         &metadata_admin_listener,
     );
-    defer std.testing.allocator.free(metadata_api);
-    defer metadata_admin_listener.deinit();
+    defer stopMetadataAdminListener(std.testing.allocator, metadata_api, &metadata_admin_server, &metadata_admin_listener);
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -7344,15 +7350,13 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
         &metadata_admin_server,
         &metadata_admin_listener,
     );
-    defer std.testing.allocator.free(metadata_api);
-    defer metadata_admin_server.deinit();
-    defer metadata_admin_listener.deinit();
+    defer stopMetadataAdminListener(std.testing.allocator, metadata_api, &metadata_admin_server, &metadata_admin_listener);
 
     {
         var bootstrap_read_source = table_reads.ProvisionedTableReadSource.init(
             replica_root,
             table_catalog.CatalogSource.fromMetadataService(&svc),
-            raft_mod.read_gate.noopReadableLeaseRequester(),
+            raft_mod.read_gate.alreadyReadSafeBarrier(),
         );
         var bootstrap_write_source = table_writes.ProvisionedTableWriteSource.init(
             replica_root,
@@ -7473,14 +7477,13 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
         left_group_id,
     });
     defer std.testing.allocator.free(split_body);
-    try metadata_client.requestTableSplit(metadata_api, "docs", split_body);
-
     // Transition callbacks run while the metadata control round is waiting
     // synchronously. Bypass the normal remote cache and reject any fetch to
     // prove shard observation/open consumes the pinned snapshot instead of
     // re-entering the metadata API and deadlocking behind that control round.
     data_server.setRemoteMetadataFetchErrorForTest(error.NotLeader);
     defer data_server.setRemoteMetadataFetchErrorForTest(null);
+    try metadata_client.requestTableSplit(metadata_api, "docs", split_body);
 
     var finalized = false;
     rounds = 0;
@@ -7660,7 +7663,7 @@ test "public api e2e serves cluster backup list and restore routes" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -7914,7 +7917,7 @@ test "public api e2e does not publish or restore a partial cluster backup" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -8045,13 +8048,12 @@ test "public api e2e reports unsupported multi-range tables in cluster backup" {
         &metadata_admin_server,
         &metadata_admin_listener,
     );
-    defer std.testing.allocator.free(metadata_api);
-    defer metadata_admin_listener.deinit();
+    defer stopMetadataAdminListener(std.testing.allocator, metadata_api, &metadata_admin_server, &metadata_admin_listener);
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -8241,13 +8243,12 @@ test "public api smoke e2e commits transaction across split ranges" {
         &metadata_admin_server,
         &metadata_admin_listener,
     );
-    defer std.testing.allocator.free(metadata_api);
-    defer metadata_admin_listener.deinit();
+    defer stopMetadataAdminListener(std.testing.allocator, metadata_api, &metadata_admin_server, &metadata_admin_listener);
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -8416,7 +8417,7 @@ test "public api smoke e2e commits transactions across two tables atomically" {
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
@@ -8614,13 +8615,12 @@ test "public api smoke e2e queries after merge finalization" {
         &metadata_admin_server,
         &metadata_admin_listener,
     );
-    defer std.testing.allocator.free(metadata_api);
-    defer metadata_admin_listener.deinit();
+    defer stopMetadataAdminListener(std.testing.allocator, metadata_api, &metadata_admin_server, &metadata_admin_listener);
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         table_catalog.CatalogSource.fromMetadataService(&svc),
-        svc.raft.readableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,

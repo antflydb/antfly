@@ -164,7 +164,7 @@ test "select accepts repeated and equals-form test filters" {
         "metadata service",
         "--test-filter=table manager",
         "--skip-test-filter",
-        "metadata sim",
+        "metadata VOPR",
         "--expect-error-logs",
         "expected failure path",
         "2",

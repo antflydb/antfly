@@ -56,7 +56,7 @@ pub const RuntimeCadence = struct {
 
 /// Owns the dedicated scheduling lane for one Raft runtime. The source retains
 /// semantic ownership of the Raft service and its synchronization; this driver
-/// owns only cadence, failure propagation, cancellation, and thread lifetime.
+/// owns only cadence, failure propagation, cancellation, and task lifetime.
 /// A driver is one-shot: construct a new driver for a new runtime generation.
 pub const ManagedProgressDriver = struct {
     const State = enum {
@@ -68,7 +68,10 @@ pub const ManagedProgressDriver = struct {
     io: std.Io,
     source: ProgressSource,
     interval_ns: u64,
-    thread: ?std.Thread = null,
+    // Progress must remain independent of capacity in the caller's executor.
+    scheduling_io: ?std.Io = null,
+    progress_io: ?std.Io.Threaded = null,
+    future: ?std.Io.Future(void) = null,
     state: State = .initialized,
     stop_event: std.Io.Event = .unset,
     failure_event: std.Io.Event = .unset,
@@ -104,20 +107,39 @@ pub const ManagedProgressDriver = struct {
         };
     }
 
+    fn schedulingIo(self: *ManagedProgressDriver) std.Io {
+        return self.scheduling_io orelse self.progress_io.?.io();
+    }
+
     pub fn start(self: *ManagedProgressDriver) !void {
         if (self.state != .initialized) return error.AlreadyStarted;
         if (self.interval_ns == 0) return error.InvalidInterval;
         if (comptime builtin.single_threaded) return error.UnsupportedPlatform;
 
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        if (self.scheduling_io == null) self.progress_io = std.Io.Threaded.init(std.heap.page_allocator, .{
+            .async_limit = .nothing,
+            .concurrent_limit = .limited(1),
+        });
+        errdefer {
+            if (self.progress_io) |*owned| owned.deinit();
+            self.progress_io = null;
+        }
+        self.future = try self.schedulingIo().concurrent(run, .{self});
         self.state = .running;
     }
 
     pub fn check(self: *const ManagedProgressDriver) !void {
-        if (self.failed.load(.acquire))
-            return self.failure orelse error.RaftProgressDriverFailed;
+        try self.checkFailure();
         if (self.isStalled(platform_time.monotonicNs()))
             return error.RaftProgressDriverStalled;
+    }
+
+    /// Reports terminal source failures without applying the Raft-specific
+    /// round-duration watchdog. Control-plane users can legitimately spend
+    /// longer than that threshold waiting on bounded storage or HTTP work.
+    pub fn checkFailure(self: *const ManagedProgressDriver) !void {
+        if (self.failed.load(.acquire))
+            return self.failure orelse error.RaftProgressDriverFailed;
     }
 
     pub fn isHealthy(self: *const ManagedProgressDriver) bool {
@@ -148,8 +170,10 @@ pub const ManagedProgressDriver = struct {
     pub fn stop(self: *ManagedProgressDriver) void {
         if (self.state != .running) return;
         self.stop_event.set(self.io);
-        if (self.thread) |thread| thread.join();
-        self.thread = null;
+        if (self.future) |*future| future.await(self.schedulingIo());
+        self.future = null;
+        if (self.progress_io) |*owned| owned.deinit();
+        self.progress_io = null;
         self.state = .stopped;
     }
 
@@ -460,15 +484,22 @@ test "managed raft progress driver advances independently and joins on stop" {
         }
     };
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .nothing,
+    });
     defer io_impl.deinit();
+    var reserved = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+    defer reserved.deinit();
     var counter = Counter{};
     var driver = ManagedProgressDriver.init(io_impl.io(), .{
         .ptr = &counter,
         .run_once = Counter.runOnce,
     }, std.time.ns_per_ms);
+    driver.scheduling_io = reserved.io();
     defer driver.deinit();
     try driver.start();
+    try std.testing.expect(driver.progress_io == null);
 
     const deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
     while (counter.count.load(.acquire) < 3) {
@@ -512,6 +543,7 @@ test "managed raft progress driver publishes source failure" {
         try io_impl.io().sleep(.fromMilliseconds(1), .awake);
     }
     try std.testing.expectError(error.InjectedFailure, driver.check());
+    try std.testing.expectError(error.InjectedFailure, driver.checkFailure());
     try std.testing.expect(!driver.isHealthy());
     try std.testing.expectError(error.InjectedFailure, driver.waitForFailureOrTimeout(std.time.ns_per_s));
 }
@@ -531,6 +563,7 @@ test "managed raft progress driver reports a wedged round unhealthy" {
     driver.round_started_ns.store(platform_time.monotonicNs() -| (2 * std.time.ns_per_ms), .release);
     driver.round_generation.store(1, .release);
     try std.testing.expectError(error.RaftProgressDriverStalled, driver.check());
+    try driver.checkFailure();
     try std.testing.expect(!driver.isHealthy());
 }
 
