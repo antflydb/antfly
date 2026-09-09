@@ -2835,15 +2835,13 @@ pub const LoadedModel = struct {
 
     pub fn rerankingPipeline(self: *LoadedModel, allocator: std.mem.Allocator) RerankingPipeline {
         const tok = self.getTokenizer();
-        const is_qwen3vl_reranker = self.manifest.isQwen3VlReranker();
-        const is_qwen3_text_reranker = self.manifest.isQwen3TextReranker();
-        const is_generative_reranker = is_qwen3vl_reranker or is_qwen3_text_reranker;
+        const is_qwen3_generative_reranker = self.manifest.isQwen3GenerativeReranker();
         var pipeline = RerankingPipeline.init(allocator, self.session, tok, .{
-            .max_length = if (is_generative_reranker)
+            .max_length = if (is_qwen3_generative_reranker)
                 @min(self.manifest.maxTextSequenceLength(), qwen3vl_reranker.default_max_length)
             else
                 self.manifest.maxTextSequenceLength(),
-            .mode = if (is_generative_reranker)
+            .mode = if (is_qwen3_generative_reranker)
                 ScoringMode.generative_yes_no
             else if (self.manifest.hasCapability("late_interaction") or
                 self.manifest.hasCapability("colbert") or
@@ -2852,8 +2850,8 @@ pub const LoadedModel = struct {
                 ScoringMode.late_interaction
             else
                 ScoringMode.cross_encoder,
-            .single_text_encoding = if (is_generative_reranker or self.manifest.prefersGenerationEncodingForLateInteraction()) .generation else .encoder,
-            .generative_prompt = if (is_qwen3_text_reranker) .qwen3_text else .qwen3_vl,
+            .single_text_encoding = if (is_qwen3_generative_reranker or self.manifest.prefersGenerationEncodingForLateInteraction()) .generation else .encoder,
+            .generative_prompt_profile = if (self.manifest.isQwen3TextReranker()) .qwen3_text else .qwen3_vl,
             .add_bos_token = self.manifest.add_bos_token,
             .distributed = runtime.distributed.configFromEnv(),
         });

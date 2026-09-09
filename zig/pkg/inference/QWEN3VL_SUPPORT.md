@@ -235,6 +235,46 @@ free-memory, or swap-growth violations. Run them serially on this 16 GB host;
 if the BF16 MPS lane cannot satisfy the zero-swap envelope, preserve that
 failure report instead of publishing a performance number.
 
+### OCR through `/ai/v1/read`
+
+Qwen3-VL split GGUF generation bundles are also available through the reader
+endpoint. The model stays installed and preloaded as a `generator`;
+`/ai/v1/read` recognizes the bundle's serving role and reuses the resident native
+Metal generation pipeline rather than copying it into `models/readers` or
+loading a second session.
+
+An omitted or whitespace-only `prompt` selects the qualified transcription
+prompt used by the OCR comparison above. Qwen's document parsing modes are
+available through the existing prompt field: use `qwenvl markdown` for
+reading-order text, tables, and layout expressed as Markdown, or `qwenvl html`
+for HTML. The generated markup is returned verbatim in each result's `text`
+field; Qwen generation does not fabricate `fields` or geometric `regions`.
+
+```sh
+curl -sS http://127.0.0.1:8080/ai/v1/read \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "Qwen/Qwen3-VL-2B-Instruct-GGUF:q4-k-m-bundle-v1",
+    "images": [{"url": "file:///path/allowed/document-page.png"}],
+    "prompt": "qwenvl markdown",
+    "max_tokens": 1024
+  }'
+```
+
+The endpoint keeps the existing 64-image envelope and processes Qwen images
+serially under one weighted request admission because each image is an
+independent document result. The default output limit is 256 tokens and the
+public maximum remains 1024. If Qwen reaches that limit, the request fails with
+`OUTPUT_TRUNCATED` (HTTP 400) instead of returning a silently incomplete
+document. Split long PDFs into page images and submit bounded batches; PDF
+rasterization is not performed by this endpoint.
+
+This route uses the current artifact and backend compatibility checks described
+in [model compatibility](MODEL_COMPATIBILITY.md); it does not require an exact
+qualification receipt or catalog entry. The reader adapter accepts split GGUF
+generation bundles on Metal. Reranker bundles and integrated safetensors models
+do not use this adapter.
+
 ### High-precision and MLX-VLM benchmark lanes
 
 The production Qwen3-VL generation receipt remains the qualified Q4_K_M

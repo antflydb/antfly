@@ -89,6 +89,93 @@ pub fn sgemmTransB(
     sgemmTransBSync(m, n, k, alpha, a, b, beta, c_out);
 }
 
+/// Transposed-B SGEMM writing a column panel directly into row-major C.
+/// `c_out` starts at the panel's first column; `output_stride` is the full
+/// matrix row width. Padding columns are neither read nor written.
+pub fn sgemmTransBStrided(
+    io: ?Io,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    a: []const f32,
+    b: []const f32,
+    beta: f32,
+    c_out: []f32,
+    output_stride: usize,
+) Cancelable!void {
+    if (m == 0 or n == 0) return;
+    std.debug.assert(output_stride >= n);
+    std.debug.assert(a.len >= m * k and b.len >= n * k);
+    std.debug.assert(c_out.len >= (m - 1) * output_stride + n);
+    if (io) |runtime_io| try runtime_io.checkCancel();
+    if (k == 0) {
+        for (0..m) |row| {
+            for (c_out[row * output_stride ..][0..n]) |*value| {
+                value.* = if (beta == 0) 0 else value.* * beta;
+            }
+        }
+        return;
+    }
+    if (build_options.enable_system_blas) {
+        c.cblas_sgemm(
+            c.CblasRowMajor,
+            c.CblasNoTrans,
+            c.CblasTrans,
+            @intCast(m),
+            @intCast(n),
+            @intCast(k),
+            alpha,
+            a.ptr,
+            @intCast(@max(k, 1)),
+            b.ptr,
+            @intCast(@max(k, 1)),
+            beta,
+            c_out.ptr,
+            @intCast(output_stride),
+        );
+        if (io) |runtime_io| try runtime_io.checkCancel();
+        return;
+    }
+    if (output_stride == n) {
+        if (io) |runtime_io| return linalg.sgemmTransB(runtime_io, m, n, k, alpha, a, b, beta, c_out);
+        linalg.sgemmTransBSync(m, n, k, alpha, a, b, beta, c_out);
+        return;
+    }
+    // The portable API has no output leading dimension. Callers processing
+    // large panels should retain contiguous scratch for parallel GEMM there.
+    for (0..m) |row| {
+        const output_row = c_out[row * output_stride ..][0..n];
+        const input_row = a[row * k ..][0..k];
+        if (io) |runtime_io| {
+            try linalg.sgemmTransB(runtime_io, 1, n, k, alpha, input_row, b, beta, output_row);
+        } else {
+            linalg.sgemmTransBSync(1, n, k, alpha, input_row, b, beta, output_row);
+        }
+    }
+}
+
+test "sgemmTransBStrided preserves padding offsets and beta" {
+    const a = [_]f32{ 1, -2, 3, 4, 5, -6 };
+    const b = [_]f32{ 1, 2, 3, -4, 5, 6, 7, 8, -9 };
+    var output = [_]f32{17} ** 13;
+    try sgemmTransBStrided(null, 2, 3, 3, 0.5, &a, &b, 0.25, output[1..], 6);
+    for (0..2) |row| {
+        for (0..3) |column| {
+            var expected: f32 = 17 * 0.25;
+            for (0..3) |inner| expected += 0.5 * a[row * 3 + inner] * b[column * 3 + inner];
+            try std.testing.expectApproxEqAbs(expected, output[1 + row * 6 + column], 1e-5);
+        }
+    }
+    for ([_]usize{ 0, 4, 5, 6, 10, 11, 12 }) |index| try std.testing.expectEqual(@as(f32, 17), output[index]);
+    try sgemmTransBStrided(null, 0, 3, 3, 1, &.{}, &.{}, 0, &.{}, 6);
+    try sgemmTransBStrided(null, 2, 3, 0, 1, &.{}, &.{}, 0, output[1..], 6);
+    for (0..2) |row| {
+        for (0..3) |column| try std.testing.expectEqual(@as(f32, 0), output[1 + row * 6 + column]);
+    }
+    for ([_]usize{ 0, 4, 5, 6, 10, 11, 12 }) |index| try std.testing.expectEqual(@as(f32, 17), output[index]);
+}
+
 /// SGEMM with f16 weights consumed directly via @floatCast (F16C / AVX-512
 /// FP16 on x86).  No system-BLAS f16-weight path; always uses linalg.
 pub fn sgemmTransBF16Weights(

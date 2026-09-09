@@ -18786,91 +18786,103 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return tensor;
         }
 
-        const ffn_rows = @as(usize, @intCast(ffn_normed.dim(0)));
-        var gate_proj: MetalTensor = undefined;
-        var up_proj: MetalTensor = undefined;
-        {
-            const ffn_scope = if (block_scope) false else self.beginActivePlannedComputeScopeIfPossible(.dense_linear, .ffn);
-            defer self.endActivePlannedComputeScope(ffn_scope);
-            if (ffn_rows == 1) {
-                const gate_up = (try metal_runtime.decoderRuntimeApplyLinearPair(self.provider_impl, .{
-                    .slot_a = request.gate_ffn_linear_slot,
-                    .slot_b = request.up_ffn_linear_slot,
-                    .input = ffn_normed,
-                    .in_dim = request.hidden_size,
-                    .out_dim = request.intermediate_size,
-                })) orelse {
+        var gated = (try metal_runtime.decoderRuntimeTryApplyBf16GateUp(self.provider_impl, .{
+            .gate_slot = request.gate_ffn_linear_slot,
+            .up_slot = request.up_ffn_linear_slot,
+            .input = ffn_normed,
+            .in_dim = request.hidden_size,
+            .out_dim = request.intermediate_size,
+            .activation = request.activation,
+        })) orelse fallback: {
+            const ffn_rows = @as(usize, @intCast(ffn_normed.dim(0)));
+            var gate_proj: MetalTensor = undefined;
+            var up_proj: MetalTensor = undefined;
+            {
+                const ffn_scope = if (block_scope) false else self.beginActivePlannedComputeScopeIfPossible(.dense_linear, .ffn);
+                defer self.endActivePlannedComputeScope(ffn_scope);
+                if (ffn_rows == 1) {
+                    const gate_up = (try metal_runtime.decoderRuntimeApplyLinearPair(self.provider_impl, .{
+                        .slot_a = request.gate_ffn_linear_slot,
+                        .slot_b = request.up_ffn_linear_slot,
+                        .input = ffn_normed,
+                        .in_dim = request.hidden_size,
+                        .out_dim = request.intermediate_size,
+                    })) orelse {
+                        if (trace_quant) std.debug.print(
+                            "metal-prefill-staged-null layer={d} reason=ffn-pair slot_a={d} slot_b={d} hidden={d} intermediate={d}\n",
+                            .{ attention_layer_index, request.gate_ffn_linear_slot, request.up_ffn_linear_slot, request.hidden_size, request.intermediate_size },
+                        );
+                        return null;
+                    };
+                    gate_proj = gate_up.first;
+                    up_proj = gate_up.second;
+                } else {
+                    gate_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                        .slot = request.gate_ffn_linear_slot,
+                        .input = ffn_normed,
+                        .in_dim = request.hidden_size,
+                        .out_dim = request.intermediate_size,
+                    })) orelse {
+                        if (trace_quant) std.debug.print(
+                            "metal-prefill-staged-null layer={d} reason=ffn-gate-linear slot={d} hidden={d} intermediate={d} rows={d}\n",
+                            .{ attention_layer_index, request.gate_ffn_linear_slot, request.hidden_size, request.intermediate_size, ffn_rows },
+                        );
+                        return null;
+                    };
+                    errdefer gate_proj.deinit();
+                    up_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                        .slot = request.up_ffn_linear_slot,
+                        .input = ffn_normed,
+                        .in_dim = request.hidden_size,
+                        .out_dim = request.intermediate_size,
+                    })) orelse {
+                        if (trace_quant) std.debug.print(
+                            "metal-prefill-staged-null layer={d} reason=ffn-up-linear slot={d} hidden={d} intermediate={d} rows={d}\n",
+                            .{ attention_layer_index, request.up_ffn_linear_slot, request.hidden_size, request.intermediate_size, ffn_rows },
+                        );
+                        gate_proj.deinit();
+                        return null;
+                    };
+                }
+            }
+            defer gate_proj.deinit();
+            defer up_proj.deinit();
+
+            var activated: MetalTensor = undefined;
+            var gated_fallback: MetalTensor = undefined;
+            {
+                const ffn_scope = if (block_scope) false else self.beginActivePlannedComputeScopeIfPossible(.ffn, .ffn);
+                defer self.endActivePlannedComputeScope(ffn_scope);
+                activated = (try metal_runtime.decoderRuntimeApplyActivation(self.provider_impl, .{
+                    .input = gate_proj,
+                    .kind = request.activation,
+                    .dim = request.intermediate_size,
+                }, &self.timing_stats)) orelse {
                     if (trace_quant) std.debug.print(
-                        "metal-prefill-staged-null layer={d} reason=ffn-pair slot_a={d} slot_b={d} hidden={d} intermediate={d}\n",
-                        .{ attention_layer_index, request.gate_ffn_linear_slot, request.up_ffn_linear_slot, request.hidden_size, request.intermediate_size },
+                        "metal-prefill-staged-null layer={d} reason=ffn-activation intermediate={d}\n",
+                        .{ attention_layer_index, request.intermediate_size },
                     );
                     return null;
                 };
-                gate_proj = gate_up.first;
-                up_proj = gate_up.second;
-            } else {
-                gate_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
-                    .slot = request.gate_ffn_linear_slot,
-                    .input = ffn_normed,
-                    .in_dim = request.hidden_size,
-                    .out_dim = request.intermediate_size,
-                })) orelse {
+                errdefer activated.deinit();
+                self.activePlannedComputeBarrier(ffn_scope or block_scope);
+                gated_fallback = (try metal_runtime.decoderRuntimeApplyMultiply(
+                    self.provider_impl,
+                    activated,
+                    up_proj,
+                    request.intermediate_size,
+                )) orelse {
                     if (trace_quant) std.debug.print(
-                        "metal-prefill-staged-null layer={d} reason=ffn-gate-linear slot={d} hidden={d} intermediate={d} rows={d}\n",
-                        .{ attention_layer_index, request.gate_ffn_linear_slot, request.hidden_size, request.intermediate_size, ffn_rows },
+                        "metal-prefill-staged-null layer={d} reason=ffn-multiply intermediate={d}\n",
+                        .{ attention_layer_index, request.intermediate_size },
                     );
-                    return null;
-                };
-                errdefer gate_proj.deinit();
-                up_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
-                    .slot = request.up_ffn_linear_slot,
-                    .input = ffn_normed,
-                    .in_dim = request.hidden_size,
-                    .out_dim = request.intermediate_size,
-                })) orelse {
-                    if (trace_quant) std.debug.print(
-                        "metal-prefill-staged-null layer={d} reason=ffn-up-linear slot={d} hidden={d} intermediate={d} rows={d}\n",
-                        .{ attention_layer_index, request.up_ffn_linear_slot, request.hidden_size, request.intermediate_size, ffn_rows },
-                    );
+                    activated.deinit();
                     return null;
                 };
             }
-        }
-        defer gate_proj.deinit();
-        defer up_proj.deinit();
-
-        var activated: MetalTensor = undefined;
-        var gated: MetalTensor = undefined;
-        {
-            const ffn_scope = if (block_scope) false else self.beginActivePlannedComputeScopeIfPossible(.ffn, .ffn);
-            defer self.endActivePlannedComputeScope(ffn_scope);
-            activated = (try metal_runtime.decoderRuntimeApplyActivation(self.provider_impl, .{
-                .input = gate_proj,
-                .kind = request.activation,
-                .dim = request.intermediate_size,
-            }, &self.timing_stats)) orelse {
-                if (trace_quant) std.debug.print(
-                    "metal-prefill-staged-null layer={d} reason=ffn-activation intermediate={d}\n",
-                    .{ attention_layer_index, request.intermediate_size },
-                );
-                return null;
-            };
-            errdefer activated.deinit();
-            self.activePlannedComputeBarrier(ffn_scope or block_scope);
-            gated = (try metal_runtime.decoderRuntimeApplyMultiply(
-                self.provider_impl,
-                activated,
-                up_proj,
-                request.intermediate_size,
-            )) orelse {
-                if (trace_quant) std.debug.print(
-                    "metal-prefill-staged-null layer={d} reason=ffn-multiply intermediate={d}\n",
-                    .{ attention_layer_index, request.intermediate_size },
-                );
-                return null;
-            };
-        }
-        defer activated.deinit();
+            defer activated.deinit();
+            break :fallback gated_fallback;
+        };
         defer gated.deinit();
 
         var down: MetalTensor = undefined;
@@ -19866,6 +19878,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         theta: f32,
         freq_scale: f32,
         consecutive_pairs: bool,
+        eps: f32,
         value_scale: f32,
         output_index: usize,
     ) !?MetalTensor {
@@ -19883,7 +19896,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .position = 0,
             .theta = theta,
             .freq_scale = freq_scale,
-            .eps = 0.0,
+            .eps = eps,
             .value_scale = value_scale,
             .consecutive_pairs = consecutive_pairs,
         }, heads, seq_len);
@@ -19999,6 +20012,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             request.rope_theta,
             request.rope_freq_scale,
             request.rope_consecutive_pairs,
+            request.eps,
             1.0,
             3,
         )) orelse {
@@ -20017,6 +20031,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             request.rope_theta,
             request.rope_freq_scale,
             request.rope_consecutive_pairs,
+            request.eps,
             1.0,
             4,
         )) orelse {
@@ -20537,48 +20552,61 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (rows == 0 or @as(usize, @intCast(input.dim(1))) != request.hidden_size) return null;
         if (@as(usize, @intCast(residual.dim(0))) != rows or @as(usize, @intCast(residual.dim(1))) != request.hidden_size) return null;
 
-        var gate_proj: MetalTensor = undefined;
-        var up_proj: MetalTensor = undefined;
-        if (try metal_runtime.decoderRuntimeApplyLinearPair(self.provider_impl, .{
-            .slot_a = request.gate_linear_slot,
-            .slot_b = request.up_linear_slot,
+        var gated = (try metal_runtime.decoderRuntimeTryApplyBf16GateUp(self.provider_impl, .{
+            .gate_slot = request.gate_linear_slot,
+            .up_slot = request.up_linear_slot,
             .input = input,
             .in_dim = request.hidden_size,
             .out_dim = request.intermediate_size,
-        })) |pair| {
-            gate_proj = pair.first;
-            up_proj = pair.second;
-        } else {
-            gate_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
-                .slot = request.gate_linear_slot,
+            .activation = request.activation,
+        })) orelse fallback: {
+            var gate_proj: MetalTensor = undefined;
+            var up_proj: MetalTensor = undefined;
+            if (try metal_runtime.decoderRuntimeApplyLinearPair(self.provider_impl, .{
+                .slot_a = request.gate_linear_slot,
+                .slot_b = request.up_linear_slot,
                 .input = input,
                 .in_dim = request.hidden_size,
                 .out_dim = request.intermediate_size,
-            })) orelse return null;
-            errdefer gate_proj.deinit();
-            up_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
-                .slot = request.up_linear_slot,
-                .input = input,
-                .in_dim = request.hidden_size,
-                .out_dim = request.intermediate_size,
-            })) orelse return null;
-        }
-        defer gate_proj.deinit();
-        defer up_proj.deinit();
+            })) |pair| {
+                gate_proj = pair.first;
+                up_proj = pair.second;
+            } else {
+                gate_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                    .slot = request.gate_linear_slot,
+                    .input = input,
+                    .in_dim = request.hidden_size,
+                    .out_dim = request.intermediate_size,
+                })) orelse return null;
+                errdefer gate_proj.deinit();
+                up_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                    .slot = request.up_linear_slot,
+                    .input = input,
+                    .in_dim = request.hidden_size,
+                    .out_dim = request.intermediate_size,
+                })) orelse {
+                    gate_proj.deinit();
+                    return null;
+                };
+            }
+            defer gate_proj.deinit();
+            defer up_proj.deinit();
 
-        var activated = (try metal_runtime.decoderRuntimeApplyActivation(self.provider_impl, .{
-            .input = gate_proj,
-            .kind = request.activation,
-            .dim = request.intermediate_size,
-        }, &self.timing_stats)) orelse return null;
-        defer activated.deinit();
+            var activated = (try metal_runtime.decoderRuntimeApplyActivation(self.provider_impl, .{
+                .input = gate_proj,
+                .kind = request.activation,
+                .dim = request.intermediate_size,
+            }, &self.timing_stats)) orelse return null;
+            defer activated.deinit();
 
-        var gated = (try metal_runtime.decoderRuntimeApplyMultiply(
-            self.provider_impl,
-            activated,
-            up_proj,
-            request.intermediate_size,
-        )) orelse return null;
+            const gated_fallback = (try metal_runtime.decoderRuntimeApplyMultiply(
+                self.provider_impl,
+                activated,
+                up_proj,
+                request.intermediate_size,
+            )) orelse return null;
+            break :fallback gated_fallback;
+        };
         defer gated.deinit();
 
         var projected = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
@@ -24480,7 +24508,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     ) bool {
         const has_ple = switch (request.contract) {
             .gemma4_gated_ple_shared_kv => true,
-            .gemma4_a4b_shared_kv, .gliner_deberta_encoder, .qwen3_dense_text_embedding => false,
+            .gemma4_a4b_shared_kv, .gliner_deberta_encoder, .qwen3_dense_text_prefill => false,
         };
         for (request.layers, 0..) |layer, layer_index| {
             if (request.contract == .gemma4_a4b_shared_kv) {
@@ -24607,7 +24635,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
             },
             .gliner_deberta_encoder => return false,
-            .qwen3_dense_text_embedding => return false,
+            .qwen3_dense_text_prefill => return false,
         }
         const active_decode_frame_requested = enableActiveDecodeFrame();
         if (active_decode_frame_requested and !self.activeDecodeFrameDirectBlocksSupported(request)) {
@@ -25695,7 +25723,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer {
             if (!plan_success) self.timing_stats.prefill_frame_plan_failures += 1;
         }
-        if (request.contract != .gemma4_gated_ple_shared_kv and request.contract != .qwen3_dense_text_embedding) {
+        if (request.contract != .gemma4_gated_ple_shared_kv and request.contract != .qwen3_dense_text_prefill) {
             traceMetalPrefillFramePlan("decline=contract", .{});
             return false;
         }
@@ -25721,7 +25749,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             traceMetalPrefillFramePlan("decline=ple-hidden", .{});
             return false;
         }
-        if (request.contract == .qwen3_dense_text_embedding and
+        if (request.contract == .qwen3_dense_text_prefill and
             (request.batch == 0 or request.seq_len == 0 or request.rows != request.batch * request.seq_len or request.ple_hidden_size != 0 or request.include_tail))
         {
             traceMetalPrefillFramePlan("decline=qwen3-shape batch={d} seq={d} rows={d} ple={d} tail={}", .{ request.batch, request.seq_len, request.rows, request.ple_hidden_size, request.include_tail });
@@ -25886,8 +25914,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .lm_head_slot = request.final_lm_head_slot,
                 .tail_quant_format = tail_quant_format,
                 .include_tail = request.include_tail,
-                .activation_dtype = if (request.contract == .qwen3_dense_text_embedding) .f32 else .f16,
-                .attention_storage = if (request.contract == .qwen3_dense_text_embedding) .dense else .paged,
+                .activation_dtype = if (request.contract == .qwen3_dense_text_prefill) .f32 else .f16,
+                .attention_storage = if (request.contract == .qwen3_dense_text_prefill) .dense else .paged,
                 .layers = layers,
                 .source = @intFromEnum(metal_runtime.ComputeSource.layer),
                 .layer_region = @intFromEnum(metal_runtime.ComputeRegion.layer),
@@ -25921,8 +25949,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         const runtime = self.provider_impl.raw_decode_runtime orelse return self.declinePrefillFrameExecute(.no_runtime);
         if (!metal_runtime.hasActiveFrame(runtime)) return self.declinePrefillFrameExecute(.no_active_frame);
-        if (request.contract == .qwen3_dense_text_embedding) {
-            const ok = try self.executeQwen3DenseEmbeddingFrame(ctx, request);
+        if (request.contract == .qwen3_dense_text_prefill) {
+            const ok = try self.executeQwen3DensePrefillFrame(ctx, request);
             execute_success = ok;
             return ok;
         }
@@ -26043,12 +26071,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return true;
     }
 
-    fn executeQwen3DenseEmbeddingFrame(
+    fn executeQwen3DensePrefillFrame(
         self: *MetalCompute,
         ctx: *anyopaque,
         request: *const ops.DecoderRuntimeGraphCommandPlanFrameRequest,
     ) anyerror!bool {
-        if (request.contract != .qwen3_dense_text_embedding) return self.declinePrefillFrameExecute(.invalid_contract);
+        if (request.contract != .qwen3_dense_text_prefill) return self.declinePrefillFrameExecute(.invalid_contract);
         if (request.rows <= 1 or request.layer_count == 0 or request.layers.len != request.layer_count) return self.declinePrefillFrameExecute(.invalid_shape);
         if (request.batch == 0 or request.seq_len == 0 or request.rows != request.batch * request.seq_len) return self.declinePrefillFrameExecute(.invalid_shape);
         if (request.hidden_size == 0 or request.num_attention_heads == 0 or request.global_head_dim != 0 or request.ple_hidden_size != 0) return self.declinePrefillFrameExecute(.invalid_shape);
@@ -26057,14 +26085,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         var hidden = request.hidden;
         var owns_hidden = false;
-        errdefer if (owns_hidden) freeOp(ctx, hidden);
+        defer if (owns_hidden) freeOp(ctx, hidden);
 
         const full_frame_contract = self.activePrefillFrameFullContract() orelse {
-            if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-embed-frame decline=full-contract\n", .{});
+            if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-prefill-frame decline=full-contract\n", .{});
             return self.declinePrefillFrameExecute(.plan_mismatch);
         };
         var frame_cursor = metal_command_planner.GatedFramePlanCursor.init(frame_plan.view());
         for (request.layers, 0..) |layer, layer_index| {
+            if (request.execution_control) |control| try control.check();
             if (layer.shares_kv or layer.sliding_window != 0) return self.declinePrefillFrameExecute(.invalid_shape);
             const head_dim = layer.head_dim;
             if (head_dim == 0 or layer.kv_heads == 0 or layer.intermediate_size == 0) return self.declinePrefillFrameExecute(.invalid_shape);
@@ -26074,11 +26103,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .kv_seed = false,
                 .include_ple = false,
             }) orelse {
-                if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-embed-frame decline=cursor layer={d} next={d} ops={d}\n", .{ layer_index, frame_cursor.next_index, frame_plan.view().ops.len });
+                if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-prefill-frame decline=cursor layer={d} next={d} ops={d}\n", .{ layer_index, frame_cursor.next_index, frame_plan.view().ops.len });
                 return self.declinePrefillFrameExecute(.plan_mismatch);
             };
             const layer_dispatch = self.activePrefillFrameLayerDispatch(layer_window, full_frame_contract) orelse {
-                if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-embed-frame decline=dispatch layer={d} start={d} end={d}\n", .{ layer_index, layer_window.layer_start, layer_window.layer_end });
+                if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-prefill-frame decline=dispatch layer={d} start={d} end={d}\n", .{ layer_index, layer_window.layer_start, layer_window.layer_end });
                 return self.declinePrefillFrameExecute(.plan_mismatch);
             };
 
@@ -26088,7 +26117,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .hidden_size = request.hidden_size,
                 .eps = request.norm_eps,
             })) orelse {
-                if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-embed-frame decline=attn-rms layer={d}\n", .{layer_index});
+                if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-prefill-frame decline=attn-rms layer={d}\n", .{layer_index});
                 return self.declinePrefillFrameExecute(.plan_mismatch);
             };
             defer freeOp(ctx, attn_normed);
@@ -26150,7 +26179,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     .layer_end = layer_dispatch.window.layer_end,
                 },
             })) orelse {
-                if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-embed-frame decline=block layer={d}\n", .{layer_index});
+                if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-prefill-frame decline=block layer={d}\n", .{layer_index});
                 return self.declinePrefillFrameExecute(.plan_mismatch);
             };
             if (owns_hidden) freeOp(ctx, prev_hidden);
@@ -26159,7 +26188,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
 
         if (!frame_cursor.complete()) {
-            if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-embed-frame decline=incomplete next={d} ops={d}\n", .{ frame_cursor.next_index, frame_plan.view().ops.len });
+            if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-prefill-frame decline=incomplete next={d} ops={d}\n", .{ frame_cursor.next_index, frame_plan.view().ops.len });
             return self.declinePrefillFrameExecute(.plan_mismatch);
         }
         const final_hidden = (try decoderRuntimeApplyRmsNormOp(ctx, &.{
@@ -26168,7 +26197,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .hidden_size = request.hidden_size,
             .eps = request.norm_eps,
         })) orelse {
-            if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-embed-frame decline=final-rms\n", .{});
+            if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-prefill-frame decline=final-rms\n", .{});
             return self.declinePrefillFrameExecute(.plan_mismatch);
         };
         if (owns_hidden) freeOp(ctx, hidden);
@@ -26680,6 +26709,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
             }
         }
+        stats.metal_dense_causal_hd128_dispatches = runtime_stats.dense_causal_hd128_dispatches;
         stats.metal_runtime_buffer_count = runtime_stats.buffer_count +| relative_cache_buffers;
         stats.metal_runtime_total_bytes = runtime_stats.total_bytes +| relative_cache_bytes;
         stats.metal_runtime_private_bytes = runtime_stats.private_bytes +| relative_cache_bytes;
@@ -27022,11 +27052,37 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         current_kv_tokens: usize,
         configured_layer_count: usize,
     ) anyerror!ops.DecoderRuntimePrepareReuseResult {
+        return prepareOrReuseFamily(ctx, allocator, gpt_config, current_kv_tokens, configured_layer_count, true, null);
+    }
+
+    fn decoderRuntimePrepareOrReuseTextPrefillOp(
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        gpt_config: @import("../models/gpt.zig").Config,
+        configured_layer_count: usize,
+        execution_control: ?@import("../execution_control.zig").InferenceExecutionControl,
+    ) anyerror!ops.DecoderRuntimePrepareReuseResult {
+        if (!@import("../architectures/gpt.zig").denseQwen3PrefillEligible(gpt_config)) return .{};
+        return prepareOrReuseFamily(ctx, allocator, gpt_config, 0, configured_layer_count, false, execution_control);
+    }
+
+    fn prepareOrReuseFamily(
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        gpt_config: @import("../models/gpt.zig").Config,
+        current_kv_tokens: usize,
+        configured_layer_count: usize,
+        include_lm_head: bool,
+        execution_control: ?@import("../execution_control.zig").InferenceExecutionControl,
+    ) anyerror!ops.DecoderRuntimePrepareReuseResult {
+        if (execution_control) |control| try control.check();
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const reserve_kv_tokens = decoderRuntimeReserveKvTokens(gpt_config, current_kv_tokens);
-        if (metal_runtime.decoderRuntimeFamilyPrepared(self.provider_impl) and
-            metal_runtime.decoderRuntimePreparedSlotsMatchFamily(self.provider_impl, gpt_config))
-        {
+        const slots_match = if (include_lm_head)
+            metal_runtime.decoderRuntimePreparedSlotsMatchFamily(self.provider_impl, gpt_config)
+        else
+            metal_runtime.decoderRuntimePreparedSlotsMatchTextPrefill(self.provider_impl, gpt_config);
+        if (metal_runtime.decoderRuntimeFamilyPrepared(self.provider_impl) and slots_match) {
             if (reserve_kv_tokens <= metal_runtime.decoderRuntimePreparedKvTokens(self.provider_impl)) {
                 return .{
                     .prepared = true,
@@ -27052,14 +27108,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             };
         }
 
-        const cb = self.computeBackend();
-        const prepared = try metal_runtime.prepareDecodeRuntimeFamily(
-            &cb,
-            allocator,
-            gpt_config,
-            reserve_kv_tokens,
-            configured_layer_count,
-        );
+        var cb = self.computeBackend();
+        cb.execution_control = execution_control;
+        const prepared = if (include_lm_head)
+            try metal_runtime.prepareDecodeRuntimeFamily(&cb, allocator, gpt_config, reserve_kv_tokens, configured_layer_count)
+        else
+            try @import("../backends/decoder_gated_runtime.zig").prepareTextPrefillRuntime(&cb, allocator, gpt_config, reserve_kv_tokens, configured_layer_count);
         if (prepared) metal_runtime.noteDecoderRuntimeFamilyPrepared(self.provider_impl, reserve_kv_tokens);
         return .{
             .prepared = prepared,
@@ -28555,6 +28609,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.directFamilyTimingSnapshot = directFamilyTimingSnapshotOp;
         vt.resetDebugTimingStats = resetDebugTimingStatsOp;
         vt.decoderRuntimePrepareOrReuseFamily = decoderRuntimePrepareOrReuseFamilyOp;
+        vt.decoderRuntimePrepareOrReuseTextPrefill = decoderRuntimePrepareOrReuseTextPrefillOp;
         vt.decoderRuntimeReady = decoderRuntimeReadyOp;
         vt.decoderRuntimeAbsoluteEmbeddingsPrepared = decoderRuntimeAbsoluteEmbeddingsPreparedOp;
         vt.decoderRuntimePrepareGreedy = decoderRuntimePrepareGreedyOp;
@@ -29947,16 +30002,120 @@ test "metal_compute: paged decode attention matches native on Gemma qLen1 f32 ca
     }
 }
 
+test "metal_compute: dense Qwen3 batched head norm rope preserves epsilon" {
+    if (!build_options.enable_metal or !metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const batch = 2;
+    const seq_len = 3;
+    const heads = 2;
+    const head_dim = 128;
+    const width = heads * head_dim;
+    const theta: f32 = 10000.0;
+
+    var store = testMetalWeightStoreInit(allocator);
+    defer store.lazy_weights.deinit(allocator);
+    var compute = try MetalCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    var input_data: [batch * seq_len * width]f32 = undefined;
+    var weight_data: [head_dim]f32 = undefined;
+    for (&input_data, 0..) |*value, i| {
+        // Small-variance heads make an omitted epsilon visible. Include a
+        // zero head, where epsilon is required to produce finite output.
+        value.* = if (i < head_dim) 0 else @as(f32, @floatFromInt(@as(i32, @intCast((i * 13) % 31)) - 15)) * 0.00003;
+    }
+    for (&weight_data, 0..) |*value, i| value.* = 0.7 + @as(f32, @floatFromInt(i % 11)) * 0.03;
+    const input_ct = try cb.fromFloat32Shape(&input_data, &.{ batch * seq_len, width });
+    defer cb.free(input_ct);
+    var input = try compute.ownedDeviceMetalTensorFromCt(input_ct);
+    defer input.deinit();
+    const weight = try cb.fromFloat32Shape(&weight_data, &.{head_dim});
+    defer cb.free(weight);
+    try std.testing.expect(try cb.decoderRuntimePrepareRmsNorm(&.{
+        .slot = 0,
+        .weight = weight,
+        .hidden_size = head_dim,
+    }));
+
+    for ([_]f32{ 1e-6, 1e-4 }) |eps| {
+        for ([_]bool{ false, true }) |consecutive_pairs| {
+            try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+            defer cb.decoderRuntimeCancelFrame() catch {};
+            var output = (try compute.applyBatchedHeadNormRopeDevice(
+                input,
+                batch,
+                seq_len,
+                heads,
+                head_dim,
+                0,
+                head_dim,
+                theta,
+                1.0,
+                consecutive_pairs,
+                eps,
+                1.0,
+                0,
+            )) orelse return error.TestUnexpectedResult;
+            defer output.deinit();
+            try cb.decoderRuntimeSubmitAndWaitFrame();
+            const output_ct = try compute.ctFromOwnedMetalTensor(try output.retainedCopy());
+            defer cb.free(output_ct);
+            const actual = try cb.toFloat32(output_ct, allocator);
+            defer allocator.free(actual);
+
+            // Independent scalar F64 RMS and RoPE reference; positions reset
+            // at the second sequence instead of advancing across the batch.
+            for (0..batch * seq_len * heads) |head| {
+                const base = head * head_dim;
+                var sumsq: f64 = 0;
+                for (input_data[base..][0..head_dim]) |x| sumsq += @as(f64, x) * x;
+                const inv_rms = 1.0 / @sqrt(sumsq / head_dim + eps);
+                const position = (head / heads) % seq_len;
+                for (0..head_dim / 2) |j| {
+                    const first = if (consecutive_pairs) j * 2 else j;
+                    const second = if (consecutive_pairs) first + 1 else j + head_dim / 2;
+                    const angle = @as(f64, @floatFromInt(position)) /
+                        std.math.pow(f64, theta, @as(f64, @floatFromInt(j * 2)) / head_dim);
+                    const x0 = @as(f64, input_data[base + first]) * inv_rms * weight_data[first];
+                    const x1 = @as(f64, input_data[base + second]) * inv_rms * weight_data[second];
+                    try std.testing.expectApproxEqAbs(@as(f32, @floatCast(x0 * @cos(angle) - x1 * @sin(angle))), actual[base + first], 3e-6);
+                    try std.testing.expectApproxEqAbs(@as(f32, @floatCast(x0 * @sin(angle) + x1 * @cos(angle))), actual[base + second], 3e-6);
+                }
+            }
+        }
+    }
+}
+
 test "metal_compute: dense causal attention without kv cache matches native" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
 
+    try expectDenseCausalAttentionMatchesNative(3, 8, 1e-4, false);
+}
+
+test "metal_compute: dense causal attention aligned and ragged f16 tiles match native" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    for ([_]usize{ 32, 64, 128 }) |head_dim| {
+        for ([_]usize{ 31, 32, 33, 64, 65 }) |q_len| {
+            try expectDenseCausalAttentionMatchesNative(q_len, head_dim, 1e-3, false);
+        }
+    }
+}
+
+test "metal_compute: dense causal attention identity corrections match native" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    for ([_]usize{ 32, 65, 257 }) |q_len| {
+        try expectDenseCausalAttentionMatchesNative(q_len, 128, 1e-3, true);
+    }
+}
+
+fn expectDenseCausalAttentionMatchesNative(q_len: usize, head_dim: usize, tolerance: f32, uniform_scores: bool) !void {
     const allocator = std.testing.allocator;
     const num_heads: usize = 4;
     const num_kv_heads: usize = 2;
-    const head_dim: usize = 8;
-    const q_len: usize = 3;
-    const kv_len: usize = 3;
+    const kv_len = q_len;
     const hidden_q = num_heads * head_dim;
     const hidden_kv = num_kv_heads * head_dim;
 
@@ -29977,26 +30136,29 @@ test "metal_compute: dense causal attention without kv cache matches native" {
     defer native_compute.deinit();
     var native_cb = native_compute.computeBackend();
 
-    var q_data: [q_len * hidden_q]f32 = undefined;
-    var k_data: [kv_len * hidden_kv]f32 = undefined;
-    var v_data: [kv_len * hidden_kv]f32 = undefined;
-    for (&q_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 13) % 41)) - 20)) / 19.0;
-    for (&k_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 7) % 31)) - 15)) / 13.0;
-    for (&v_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 11) % 37)) - 18)) / 17.0;
+    const q_data = try allocator.alloc(f32, q_len * hidden_q);
+    defer allocator.free(q_data);
+    const k_data = try allocator.alloc(f32, kv_len * hidden_kv);
+    defer allocator.free(k_data);
+    const v_data = try allocator.alloc(f32, kv_len * hidden_kv);
+    defer allocator.free(v_data);
+    for (q_data, 0..) |*value, idx| value.* = if (uniform_scores) 0 else @as(f32, @floatFromInt(@as(i32, @intCast((idx * 13) % 41)) - 20)) / 19.0;
+    for (k_data, 0..) |*value, idx| value.* = if (uniform_scores) 0 else @as(f32, @floatFromInt(@as(i32, @intCast((idx * 7) % 31)) - 15)) / 13.0;
+    for (v_data, 0..) |*value, idx| value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 11) % 37)) - 18)) / 17.0;
 
     const q_shape = [_]i32{ @intCast(q_len), @intCast(hidden_q) };
     const kv_shape = [_]i32{ @intCast(kv_len), @intCast(hidden_kv) };
-    const metal_q = try metal_cb.fromFloat32Shape(&q_data, &q_shape);
+    const metal_q = try metal_cb.fromFloat32Shape(q_data, &q_shape);
     defer metal_cb.free(metal_q);
-    const metal_k = try metal_cb.fromFloat32Shape(&k_data, &kv_shape);
+    const metal_k = try metal_cb.fromFloat32Shape(k_data, &kv_shape);
     defer metal_cb.free(metal_k);
-    const metal_v = try metal_cb.fromFloat32Shape(&v_data, &kv_shape);
+    const metal_v = try metal_cb.fromFloat32Shape(v_data, &kv_shape);
     defer metal_cb.free(metal_v);
-    const native_q = try native_cb.fromFloat32Shape(&q_data, &q_shape);
+    const native_q = try native_cb.fromFloat32Shape(q_data, &q_shape);
     defer native_cb.free(native_q);
-    const native_k = try native_cb.fromFloat32Shape(&k_data, &kv_shape);
+    const native_k = try native_cb.fromFloat32Shape(k_data, &kv_shape);
     defer native_cb.free(native_k);
-    const native_v = try native_cb.fromFloat32Shape(&v_data, &kv_shape);
+    const native_v = try native_cb.fromFloat32Shape(v_data, &kv_shape);
     defer native_cb.free(native_v);
 
     const attention: ops.AttentionContext = .{
@@ -30006,8 +30168,24 @@ test "metal_compute: dense causal attention without kv cache matches native" {
         .kv_sequence_len = kv_len,
     };
 
-    const metal_out = try metal_cb.gqaPagedAttention(metal_q, metal_k, metal_v, null, attention, 1, num_heads, num_kv_heads, head_dim);
+    // Embedding attention uses device tensors in an active frame. Host-backed
+    // calls outside a frame can select the scalar path and miss the flash route.
+    try std.testing.expect(try metal_cb.decoderRuntimeBeginFrame());
+    defer metal_cb.decoderRuntimeCancelFrame() catch {};
+    const device_q = (try MetalCompute.makeDeviceResident(&metal_cb, metal_q)).?;
+    defer metal_cb.free(device_q);
+    const device_k = (try MetalCompute.makeDeviceResident(&metal_cb, metal_k)).?;
+    defer metal_cb.free(device_k);
+    const device_v = (try MetalCompute.makeDeviceResident(&metal_cb, metal_v)).?;
+    defer metal_cb.free(device_v);
+    const before_dispatches = metal_cb.debugTimingSnapshot().provider.metal_dense_causal_hd128_dispatches;
+    const metal_out = try metal_cb.gqaPagedAttention(device_q, device_k, device_v, null, attention, 1, num_heads, num_kv_heads, head_dim);
     defer metal_cb.free(metal_out);
+    try metal_cb.decoderRuntimeSubmitAndWaitFrame();
+    const after_dispatches = metal_cb.debugTimingSnapshot().provider.metal_dense_causal_hd128_dispatches;
+    const expect_specialized = head_dim == 128 and q_len >= 16 and
+        !getenvBool("TERMITE_METAL_DISABLE_DENSE_CAUSAL_HD128");
+    try std.testing.expectEqual(before_dispatches + @as(u64, if (expect_specialized) 1 else 0), after_dispatches);
     const native_out = try native_cb.gqaPagedAttention(native_q, native_k, native_v, null, attention, 1, num_heads, num_kv_heads, head_dim);
     defer native_cb.free(native_out);
 
@@ -30018,7 +30196,7 @@ test "metal_compute: dense causal attention without kv cache matches native" {
 
     try std.testing.expectEqual(native_data.len, metal_data.len);
     for (native_data, metal_data) |expected, actual| {
-        try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+        try std.testing.expectApproxEqAbs(expected, actual, tolerance);
     }
 }
 

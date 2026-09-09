@@ -40,24 +40,16 @@ pub const SingleTextEncoding = enum {
     generation,
 };
 
-pub const GenerativePrompt = enum { qwen3_vl, qwen3_text };
-
-// Qwen3's text reranker closes an empty thinking block before the yes/no
-// decision. Qwen3-VL uses a different assistant suffix; sharing its prompt
-// would silently change the text checkpoint's scoring semantics.
-const qwen3_text_prefix = "<|im_start|>system\n" ++ qwen3vl_reranker.system_prompt ++
-    "<|im_end|>\n<|im_start|>user\n";
-const qwen3_text_suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
-const qwen3_text_instruction = "Given a web search query, retrieve relevant passages that answer the query";
-
 pub const RerankingConfig = struct {
     max_length: usize = 512,
     batch_size: usize = 32,
     mode: ScoringMode = .cross_encoder,
     single_text_encoding: SingleTextEncoding = .encoder,
     add_bos_token: bool = false,
-    generative_instruction: []const u8 = qwen3vl_reranker.default_instruction,
-    generative_prompt: GenerativePrompt = .qwen3_vl,
+    generative_prompt_profile: qwen3vl_reranker.PromptProfile = .qwen3_vl,
+    /// An empty instruction selects the model-family default from the pinned
+    /// Qwen prompt profile.
+    generative_instruction: []const u8 = "",
     max_prompt_bytes: usize = qwen3vl_reranker.default_max_prompt_bytes,
     /// Dynamic text encoders should execute only through the longest active
     /// pair in the batch rather than paying for max_length padding.
@@ -169,17 +161,17 @@ pub const RerankingPipeline = struct {
         document: []const u8,
     ) ![]i32 {
         const alloc = self.allocator;
-        if (self.config.generative_prompt == .qwen3_text) {
-            return self.encodeQwen3TextPair(query, document);
-        }
-        const prompt = try qwen3vl_reranker.renderTextPromptAlloc(
+        const prompt = try qwen3vl_reranker.renderTextPromptForProfileAlloc(
             alloc,
+            self.config.generative_prompt_profile,
             self.config.generative_instruction,
             query,
             document,
             self.config.max_prompt_bytes,
         );
         defer alloc.free(prompt);
+        if (self.config.generative_prompt_profile == .qwen3_text)
+            return self.encodeQwen3TextPrompt(prompt);
         const raw_ids = try self.tok.encode(alloc, prompt);
         defer alloc.free(raw_ids);
         if (raw_ids.len == 0) return error.InvalidRerankerSequence;
@@ -197,11 +189,12 @@ pub const RerankingPipeline = struct {
         const special_ids = try self.tok.allSpecialTokenIds(alloc);
         defer alloc.free(special_ids);
 
-        const bounded = try qwen3vl_reranker.truncateForScoring(
+        const bounded = try qwen3vl_reranker.truncateForScoringWithProtectedSuffix(
             alloc,
             unsigned_ids,
             self.config.max_length,
             special_ids,
+            qwen3vl_reranker.protectedAssistantSuffixTokens(self.config.generative_prompt_profile),
             .strict_bounded,
         );
         defer alloc.free(bounded);
@@ -214,27 +207,18 @@ pub const RerankingPipeline = struct {
         return result;
     }
 
-    fn encodeQwen3TextPair(self: *RerankingPipeline, query: []const u8, document: []const u8) ![]i32 {
+    fn encodeQwen3TextPrompt(self: *RerankingPipeline, prompt: []const u8) ![]i32 {
         const alloc = self.allocator;
-        const instruction = if (std.mem.eql(u8, self.config.generative_instruction, qwen3vl_reranker.default_instruction) or
-            self.config.generative_instruction.len == 0)
-            qwen3_text_instruction
-        else
-            self.config.generative_instruction;
-        var prompt_bytes = std.math.add(usize, query.len, document.len) catch return error.RerankerPromptTooLarge;
-        prompt_bytes = std.math.add(usize, prompt_bytes, instruction.len) catch return error.RerankerPromptTooLarge;
-        prompt_bytes = std.math.add(usize, prompt_bytes, qwen3_text_prefix.len + qwen3_text_suffix.len +
-            "<Instruct>: \n<Query>: \n<Document>: ".len) catch return error.RerankerPromptTooLarge;
-        if (prompt_bytes > self.config.max_prompt_bytes) return error.RerankerPromptTooLarge;
-        const body = try std.fmt.allocPrint(alloc, "<Instruct>: {s}\n<Query>: {s}\n<Document>: {s}", .{ instruction, query, document });
-        defer alloc.free(body);
-        // Tokenize each section independently, as in Qwen's reference scorer,
-        // and reserve the entire fixed prefix and suffix before truncating.
-        const prefix_ids = try self.tok.encode(alloc, qwen3_text_prefix);
+        // The pinned text reference tokenizes these sections independently and
+        // truncates only the body. VL's special-marker-preserving truncation
+        // changes this contract when documents contain literal special tokens.
+        const prefix = qwen3vl_reranker.qwen3_text_prefix;
+        const suffix = qwen3vl_reranker.qwen3_text_assistant_suffix;
+        const prefix_ids = try self.tok.encode(alloc, prefix);
         defer alloc.free(prefix_ids);
-        const body_ids = try self.tok.encode(alloc, body);
+        const body_ids = try self.tok.encode(alloc, prompt[prefix.len .. prompt.len - suffix.len]);
         defer alloc.free(body_ids);
-        const suffix_ids = try self.tok.encode(alloc, qwen3_text_suffix);
+        const suffix_ids = try self.tok.encode(alloc, suffix);
         defer alloc.free(suffix_ids);
         const result = try joinQwen3TextTokens(alloc, prefix_ids, body_ids, suffix_ids, self.config.max_length);
         errdefer alloc.free(result);
@@ -242,16 +226,12 @@ pub const RerankingPipeline = struct {
         for (result) |id| {
             if (id < 0 or @as(usize, @intCast(id)) >= vocab_size) return error.InvalidRerankerTokenId;
         }
-        if (self.generative_qualification_trace) |trace| {
-            const prompt = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ qwen3_text_prefix, body, qwen3_text_suffix });
-            defer alloc.free(prompt);
-            try trace.appendPair(prompt, result);
-        }
+        if (self.generative_qualification_trace) |trace| try trace.appendPair(prompt, result);
         return result;
     }
 
     fn rerankGenerativeYesNo(self: *RerankingPipeline, query: []const u8, documents: []const []const u8) ![]f32 {
-        if (self.config.max_length < qwen3vl_reranker.protected_assistant_suffix_tokens or
+        if (self.config.max_length < qwen3vl_reranker.protectedAssistantSuffixTokens(self.config.generative_prompt_profile) or
             self.config.batch_size == 0)
         {
             return error.InvalidRerankerConfiguration;
@@ -748,13 +728,14 @@ fn joinQwen3TextTokens(
     return result;
 }
 
-test "Qwen3 text reranking truncates the body without losing its fixed scoring suffix" {
+test "Qwen3 text reranking truncates only body tokens and keeps the complete scoring envelope" {
     const allocator = std.testing.allocator;
-    const ids = try joinQwen3TextTokens(allocator, &.{ 1, 2 }, &.{ 3, 4, 5, 6 }, &.{ 7, 8, 9 }, 7);
+    // A special marker beyond the body budget must be discarded along with
+    // the rest of that tail, never displacing the beginning of the document.
+    const ids = try joinQwen3TextTokens(allocator, &.{ 151644, 1, 2 }, &.{ 3, 4, 5, 151644 }, &.{ 151645, 6, 7 }, 8);
     defer allocator.free(ids);
-    try std.testing.expectEqualSlices(i32, &.{ 1, 2, 3, 4, 7, 8, 9 }, ids);
-    try std.testing.expectError(error.InvalidRerankerConfiguration, joinQwen3TextTokens(allocator, &.{ 1, 2 }, &.{3}, &.{ 7, 8, 9 }, 5));
-    try std.testing.expect(std.mem.endsWith(u8, qwen3_text_suffix, "<think>\n\n</think>\n\n"));
+    try std.testing.expectEqualSlices(i32, &.{ 151644, 1, 2, 3, 4, 151645, 6, 7 }, ids);
+    try std.testing.expectError(error.InvalidRerankerConfiguration, joinQwen3TextTokens(allocator, &.{ 1, 2 }, &.{3}, &.{ 4, 5 }, 4));
 }
 
 fn activeTokenLength(mask: []const i32) usize {
@@ -906,6 +887,41 @@ test "generative yes-no reranking batches exact prompt paths without CLS extract
     try std.testing.expectEqual(@as(usize, 3), trace.raw_logits.items.len);
     try std.testing.expect(std.mem.indexOf(u8, trace.pairs.items[0].rendered_prompt, "<Query>:red planet") != null);
     try std.testing.expectEqual(@as(f32, 0), trace.raw_logits.items[0]);
+}
+
+test "Qwen3 text reranking selects its distinct prompt profile" {
+    const allocator = std.testing.allocator;
+    var tokenizer_state = FakeRerankingTokenizer{};
+    var session_state = FakeRerankingSession{ .fixed_sequence = false };
+    var pipeline = RerankingPipeline.init(
+        allocator,
+        session_state.session(),
+        tokenizer_state.tokenizer(),
+        .{
+            .max_length = 32,
+            .mode = .generative_yes_no,
+            .generative_prompt_profile = .qwen3_text,
+        },
+    );
+    var trace = GenerativeQualificationTrace.init(allocator);
+    defer trace.deinit();
+    pipeline.generative_qualification_trace = &trace;
+
+    const scores = try pipeline.rerank("red planet", &.{"Mars"});
+    defer allocator.free(scores);
+    try std.testing.expectEqual(@as(usize, 1), scores.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), scores[0], 1e-6);
+    try std.testing.expectEqual(@as(usize, 1), trace.pairs.items.len);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        trace.pairs.items[0].rendered_prompt,
+        qwen3vl_reranker.qwen3_text_assistant_suffix,
+    ));
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        trace.pairs.items[0].rendered_prompt,
+        qwen3vl_reranker.qwen3_text_default_instruction,
+    ) != null);
 }
 
 test "reranking execution gate blocks the session forward pass" {

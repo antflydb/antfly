@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Backend-independent Qwen3-VL-Reranker scoring and sequence contracts.
+//! Backend-independent Qwen3 generative-reranker scoring and sequence
+//! contracts for the text-only and vision-language checkpoints.
 //!
 //! The official checkpoint is a conditional-generation model whose pointwise
 //! relevance score is `sigmoid((W_yes - W_no) dot final_hidden)`. It is not a
@@ -22,12 +23,17 @@ const std = @import("std");
 
 pub const yes_token_id: u32 = 9_693;
 pub const no_token_id: u32 = 2_152;
+pub const PromptProfile = enum {
+    qwen3_text,
+    qwen3_vl,
+};
 /// The upstream Qwen helper deliberately defaults below the checkpoint's 32K
 /// context window so reranking has a finite, operationally useful admission
 /// boundary. Operators can raise this only through an explicit pipeline
 /// configuration after qualifying the resulting residency envelope.
 pub const default_max_length: usize = 8_192;
 pub const protected_assistant_suffix_tokens: usize = 5;
+pub const qwen3_text_protected_assistant_suffix_tokens: usize = 9;
 pub const default_max_prompt_bytes: usize = 16 * 1024 * 1024;
 
 pub const system_prompt =
@@ -35,6 +41,8 @@ pub const system_prompt =
     "Note that the answer can only be \"yes\" or \"no\".";
 pub const default_instruction =
     "Given a search query, retrieve relevant candidates that answer the query.";
+pub const qwen3_text_default_instruction =
+    "Given a web search query, retrieve relevant passages that answer the query";
 pub const instruct_prefix = "<Instruct>: ";
 pub const query_prefix = "<Query>:";
 pub const document_prefix = "\n<Document>:";
@@ -42,19 +50,36 @@ pub const image_marker = "<|vision_start|><|image_pad|><|vision_end|>";
 
 const im_start = "<|im_start|>";
 const im_end = "<|im_end|>";
+pub const qwen3_vl_assistant_suffix = im_end ++ "\n" ++ im_start ++ "assistant\n";
+pub const qwen3_text_assistant_suffix = qwen3_vl_assistant_suffix ++ "<think>\n\n</think>\n\n";
+pub const qwen3_text_prefix = im_start ++ "system\n" ++ system_prompt ++
+    im_end ++ "\n" ++ im_start ++ "user\n";
+
+pub fn protectedAssistantSuffixTokens(profile: PromptProfile) usize {
+    return switch (profile) {
+        .qwen3_text => qwen3_text_protected_assistant_suffix_tokens,
+        .qwen3_vl => protected_assistant_suffix_tokens,
+    };
+}
 
 /// Render the text-only form of the checkpoint's pinned chat template. Keeping
 /// this small template explicit avoids making reranker correctness depend on
 /// the general-purpose Jinja renderer and makes oracle drift testable.
-fn renderPromptAlloc(
+fn renderPromptForProfileAlloc(
     allocator: std.mem.Allocator,
+    profile: PromptProfile,
     instruction: []const u8,
     query: []const u8,
     document: []const u8,
     max_prompt_bytes: usize,
 ) ![]u8 {
     if (max_prompt_bytes == 0) return error.InvalidRerankerPromptLimit;
-    const effective_instruction = if (instruction.len == 0) default_instruction else instruction;
+    const effective_instruction = if (instruction.len > 0)
+        instruction
+    else switch (profile) {
+        .qwen3_text => qwen3_text_default_instruction,
+        .qwen3_vl => default_instruction,
+    };
     const fixed_bytes = std.math.add(usize, system_prompt.len, instruct_prefix.len) catch
         return error.RerankerPromptTooLarge;
     const variable_bytes = std.math.add(usize, effective_instruction.len, query.len) catch
@@ -69,24 +94,40 @@ fn renderPromptAlloc(
         return error.RerankerPromptTooLarge;
     }
 
-    const rendered = try std.fmt.allocPrint(
-        allocator,
-        "{s}system\n{s}{s}\n{s}user\n{s}{s}{s}{s}{s}{s}{s}\n{s}assistant\n",
-        .{
-            im_start,
-            system_prompt,
-            im_end,
-            im_start,
-            instruct_prefix,
-            effective_instruction,
-            query_prefix,
-            query,
-            document_prefix,
-            document,
-            im_end,
-            im_start,
-        },
-    );
+    const rendered = switch (profile) {
+        .qwen3_vl => try std.fmt.allocPrint(
+            allocator,
+            "{s}system\n{s}{s}\n{s}user\n{s}{s}{s}{s}{s}{s}{s}\n{s}assistant\n",
+            .{
+                im_start,
+                system_prompt,
+                im_end,
+                im_start,
+                instruct_prefix,
+                effective_instruction,
+                query_prefix,
+                query,
+                document_prefix,
+                document,
+                im_end,
+                im_start,
+            },
+        ),
+        .qwen3_text => try std.fmt.allocPrint(
+            allocator,
+            "{s}{s}{s}\n{s} {s}{s} {s}{s}",
+            .{
+                qwen3_text_prefix,
+                instruct_prefix,
+                effective_instruction,
+                query_prefix,
+                query,
+                document_prefix,
+                document,
+                qwen3_text_assistant_suffix,
+            },
+        ),
+    };
     errdefer allocator.free(rendered);
     if (rendered.len > max_prompt_bytes) return error.RerankerPromptTooLarge;
     return rendered;
@@ -99,7 +140,32 @@ pub fn renderTextPromptAlloc(
     document: []const u8,
     max_prompt_bytes: usize,
 ) ![]u8 {
-    return renderPromptAlloc(allocator, instruction, query, document, max_prompt_bytes);
+    return renderPromptForProfileAlloc(
+        allocator,
+        .qwen3_vl,
+        instruction,
+        query,
+        document,
+        max_prompt_bytes,
+    );
+}
+
+pub fn renderTextPromptForProfileAlloc(
+    allocator: std.mem.Allocator,
+    profile: PromptProfile,
+    instruction: []const u8,
+    query: []const u8,
+    document: []const u8,
+    max_prompt_bytes: usize,
+) ![]u8 {
+    return renderPromptForProfileAlloc(
+        allocator,
+        profile,
+        instruction,
+        query,
+        document,
+        max_prompt_bytes,
+    );
 }
 
 /// Render a document whose text and image markers are already in caller
@@ -123,7 +189,14 @@ pub fn renderMultimodalPromptAlloc(
         offset = index + image_marker.len;
     }
     if (marker_count != expected_images) return error.ImagePlaceholderCountMismatch;
-    return renderPromptAlloc(allocator, instruction, query, document_content, max_prompt_bytes);
+    return renderPromptForProfileAlloc(
+        allocator,
+        .qwen3_vl,
+        instruction,
+        query,
+        document_content,
+        max_prompt_bytes,
+    );
 }
 
 pub const TruncationPolicy = enum {
@@ -234,16 +307,34 @@ pub fn truncateForScoring(
     special_tokens: []const u32,
     policy: TruncationPolicy,
 ) ![]u32 {
+    return truncateForScoringWithProtectedSuffix(
+        allocator,
+        input_ids,
+        max_length,
+        special_tokens,
+        protected_assistant_suffix_tokens,
+        policy,
+    );
+}
+
+pub fn truncateForScoringWithProtectedSuffix(
+    allocator: std.mem.Allocator,
+    input_ids: []const u32,
+    max_length: usize,
+    special_tokens: []const u32,
+    protected_suffix_tokens: usize,
+    policy: TruncationPolicy,
+) ![]u32 {
     if (max_length == 0) return error.InvalidRerankerMaxLength;
     if (input_ids.len <= max_length) return allocator.dupe(u32, input_ids);
-    if (input_ids.len < protected_assistant_suffix_tokens) return error.InvalidRerankerSequence;
+    if (protected_suffix_tokens == 0 or input_ids.len < protected_suffix_tokens) return error.InvalidRerankerSequence;
 
-    const suffix_start = input_ids.len - protected_assistant_suffix_tokens;
+    const suffix_start = input_ids.len - protected_suffix_tokens;
     const prefix_budget = switch (policy) {
-        .strict_bounded => if (max_length < protected_assistant_suffix_tokens)
+        .strict_bounded => if (max_length < protected_suffix_tokens)
             return error.InvalidRerankerMaxLength
         else
-            max_length - protected_assistant_suffix_tokens,
+            max_length - protected_suffix_tokens,
         .upstream_compat => max_length,
     };
     var output = std.ArrayListUnmanaged(u32).empty;
@@ -299,6 +390,27 @@ test "Qwen3-VL reranker text prompt exactly matches the pinned chat template" {
     );
 }
 
+test "Qwen3 text reranker prompt preserves the official thinking suffix" {
+    const prompt = try renderTextPromptForProfileAlloc(
+        std.testing.allocator,
+        .qwen3_text,
+        "",
+        "What is the capital of China?",
+        "The capital of China is Beijing.",
+        4096,
+    );
+    defer std.testing.allocator.free(prompt);
+    try std.testing.expectEqualStrings(
+        "<|im_start|>system\n" ++ system_prompt ++ "<|im_end|>\n" ++
+            "<|im_start|>user\n<Instruct>: " ++ qwen3_text_default_instruction ++
+            "\n<Query>: What is the capital of China?\n<Document>: The capital of China is Beijing." ++
+            qwen3_text_assistant_suffix,
+        prompt,
+    );
+    try std.testing.expectEqual(@as(usize, 9), protectedAssistantSuffixTokens(.qwen3_text));
+    try std.testing.expectEqual(@as(usize, 5), protectedAssistantSuffixTokens(.qwen3_vl));
+}
+
 test "Qwen3-VL reranker multimodal prompt preserves interleaved image order" {
     const document = "before" ++ image_marker ++ "middle" ++ image_marker ++ "after";
     const prompt = try renderMultimodalPromptAlloc(
@@ -347,4 +459,16 @@ test "Qwen3-VL reranker strict truncation preserves markers suffix and hard boun
     defer std.testing.allocator.free(compatible);
     try std.testing.expectEqualSlices(u32, &.{ 10, 101, 11, 12, 102, 13, 14, 15, 201, 202, 203, 204, 205 }, compatible);
     try std.testing.expect(compatible.len <= 10 + protected_assistant_suffix_tokens);
+
+    const text_suffix = try truncateForScoringWithProtectedSuffix(
+        std.testing.allocator,
+        &ids,
+        11,
+        &specials,
+        9,
+        .strict_bounded,
+    );
+    defer std.testing.allocator.free(text_suffix);
+    try std.testing.expectEqualSlices(u32, &.{ 10, 101, 102, 13, 14, 15, 201, 202, 203, 204, 205 }, text_suffix);
+    try std.testing.expectEqual(@as(usize, 11), text_suffix.len);
 }
