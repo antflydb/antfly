@@ -19,10 +19,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const httpx_dep = b.dependency("httpx", .{});
-    const httpx_mod = httpx_dep.module("httpx");
-
-    const exe = addCompiler(b, b.path("."), target, optimize, httpx_mod);
+    const exe = addCompiler(b, b.path("."), target, optimize);
     b.installArtifact(exe);
 
     const run_exe = b.addRunArtifact(exe);
@@ -59,7 +56,6 @@ pub fn addCompiler(
     root: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    httpx_mod: *std.Build.Module,
 ) *std.Build.Step.Compile {
     // Main library module
     const openapi_mod = b.createModule(.{
@@ -78,7 +74,6 @@ pub fn addCompiler(
         }),
     });
     exe.root_module.addImport("openapi", openapi_mod);
-    exe.root_module.addImport("httpx", httpx_mod);
     return exe;
 }
 

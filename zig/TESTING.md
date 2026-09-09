@@ -35,8 +35,10 @@ Editing an embedded schema leaves the CLI, distributed, serverless, and inferenc
 runtime archives cached.
 
 Runtime dependency and cache contracts are checked in CI with
-`python3 -m unittest tools.test_runtime_cache` from `zig/`. The fixture calls the
-real root composition and replaces only the five expensive runtime bodies. It
+`python3 -m unittest tools.test_runtime_cache` from `zig/`, with Zig and uv on
+`PATH` and `zig/deps/snowball` initialized (`git submodule update --init
+zig/deps/snowball` from the repository root). The fixture calls the real root
+composition and replaces only the five expensive runtime bodies. It
 keeps external modules, options, generated assets, backend inputs, and final link
 edges; the inference probe also loads the real inference module. The checks cover:
 
@@ -58,6 +60,12 @@ edges; the inference probe also loads the real inference module. The checks cove
 - Storage options do not invalidate the CLI or inference archives. A real shared
   implementation edit does invalidate its consumers and changes linked behavior;
   an unchanged rebuild reuses compilation and generated outputs.
+- Host generators stay cached across product targets and optimization settings.
+  HTTPX runtime edits do not invalidate the OpenAPI compiler.
+- SQL and Snowball checks and regeneration reuse the same final formatted
+  outputs. Checks report drift without repairing source files; neither operation
+  rewrites cached generator outputs. Schema and Python codegen input changes
+  select these generated-source and cache checks in CI.
 
 Tokenizer constructors and SentencePiece generation live under `lib/tokenizer`.
 Entrypoints supply the same compatible tokenizer modules to inference and Antfly;

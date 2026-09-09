@@ -121,6 +121,19 @@ jobs:
             scripts/run_db_query_matrix.py \
             scripts/test_run_db_query_matrix.py \
             scripts/test_conformance_fixtures.py \
+            ':(glob)specs/openapi/**' \
+            openapi.yaml \
+            scripts/join_openapi.py \
+            scripts/join_public_openapi.py \
+            scripts/openapi_joiner.py \
+            scripts/openapi_inputs.py \
+            scripts/public_openapi_overlays.py \
+            scripts/yaml_to_json.py \
+            scripts/generate_graph_identifier_policy.py \
+            scripts/generate_mcp_schema_fragments.py \
+            scripts/pyproject.toml \
+            scripts/uv.lock \
+            scripts/ci/test_zig_validation_scope.py \
             Makefile \
             .github/workflows/zig-tests.yml \
             .github/workflows/antfly-container.yml

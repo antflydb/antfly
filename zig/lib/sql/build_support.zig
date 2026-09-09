@@ -14,7 +14,7 @@
 
 const std = @import("std");
 pub const Steps = struct {
-    regen: *std.Build.Step.Run,
+    regen: *std.Build.Step.UpdateSourceFiles,
     compare: *std.Build.Step.Run,
     run_generated: *std.Build.Step.Run,
     benchmark: *std.Build.Step.Compile,
@@ -35,25 +35,14 @@ pub fn addSteps(b: *std.Build, options: struct {
     const yacc_codegen = options.codegen;
     const grammar = options.root.path(b, "grammar/antfly_sql.y");
     const generated = options.root.path(b, "grammar/generated/root.zig");
-    const regen_run = b.addRunArtifact(yacc_codegen);
-    regen_run.addFileArg(grammar);
-    const regen_output = regen_run.addOutputFileArg("regen_sql_grammar_root.zig");
-    regen_run.addArg(options.grammar_label);
+    const generate = b.addRunArtifact(yacc_codegen);
+    generate.addFileArg(grammar);
+    const output = generate.addOutputFileArg("sql_grammar_root.zig");
+    generate.addArg(options.grammar_label);
     const update = b.addUpdateSourceFiles();
-    update.addCopyFileToSource(regen_output, generated.getPath(b));
-    const regen_fmt = b.addSystemCommand(&.{ b.graph.zig_exe, "fmt" });
-    regen_fmt.addFileArg(generated);
-    regen_fmt.step.dependOn(&update.step);
-
-    const check_run = b.addRunArtifact(yacc_codegen);
-    check_run.addFileArg(grammar);
-    const check_output = check_run.addOutputFileArg("check_sql_grammar_root.zig");
-    check_run.addArg(options.grammar_label);
-    const check_fmt = b.addSystemCommand(&.{ b.graph.zig_exe, "fmt" });
-    check_fmt.addFileArg(check_output);
+    update.addCopyFileToSource(output, generated.getPath(b));
     const compare = b.addRunArtifact(options.compare_tool);
-    compare.step.dependOn(&check_fmt.step);
-    compare.addFileArg(check_output);
+    compare.addFileArg(output);
     compare.addFileArg(generated);
 
     const generated_compile = b.addTest(.{
@@ -84,7 +73,7 @@ pub fn addSteps(b: *std.Build, options: struct {
     });
 
     return .{
-        .regen = regen_fmt,
+        .regen = update,
         .compare = compare,
         .run_generated = run_generated_compile,
         .benchmark = parser_bench,

@@ -17,11 +17,7 @@
     .name = .openapi_zig,
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{
-        .httpx = .{
-            .path = "../httpx",
-        },
-    },
+    .dependencies = .{},
     .paths = .{
         "build.zig",
         "build_support.zig",

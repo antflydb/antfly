@@ -47,8 +47,6 @@ const pkg_antfly_build_imports = @import("pkg/antfly/build/imports.zig");
 const AntflyRootImports = pkg_antfly_build_imports.AntflyRootImports;
 
 const pkg_antfly_build_snowball = @import("pkg/antfly/build/snowball.zig");
-const addSnowballRegenStep = pkg_antfly_build_snowball.addSnowballRegenStep;
-const addSnowballCheckStep = pkg_antfly_build_snowball.addSnowballCheckStep;
 
 const builtin = @import("builtin");
 const antfly_benches_build = @import("pkg/antfly/build/benches.zig");
@@ -226,10 +224,11 @@ pub fn create(b: *std.Build) ?Artifacts {
         .target = target,
         .optimize = optimize,
     });
-    addSnowballRegenStep(b);
-    addSnowballCheckStep(b);
+    const snowball_steps = pkg_antfly_build_snowball.addSteps(b);
+    b.step("regen-snowball", "Regenerate checked-in Zig Snowball stemmers").dependOn(&snowball_steps.regen.step);
+    b.step("check-snowball", "Check checked-in Zig Snowball stemmers are current").dependOn(&snowball_steps.compare.step);
     const openapi_build = b.lazyImport(@This(), "openapi") orelse return null;
-    const openapi_codegen = openapi_build.addCompiler(b, b.path("lib/openapi"), b.graph.host, .ReleaseSafe, addLocalHttpxModule(b, b.graph.host, .ReleaseSafe));
+    const openapi_codegen = openapi_build.addCompiler(b, b.path("lib/openapi"), b.graph.host, .ReleaseSafe);
     const openapi_sources = addOpenApiSourceSteps(b, openapi_build, openapi_codegen);
     const update_public_openapi = b.addUpdateSourceFiles();
     update_public_openapi.addCopyFileToSource(openapi_sources.public_spec, "../openapi.yaml");

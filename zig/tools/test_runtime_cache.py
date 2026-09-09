@@ -381,6 +381,13 @@ class RuntimeCacheTest(unittest.TestCase):
                         output, rf"compile exe {name} ReleaseSafe \S+ cached"
                     )
 
+        # HTTPX is a dependency of generated consumers, not of the host compiler.
+        httpx = self.own("zig/lib/httpx/src/httpx.zig")
+        httpx.write_bytes(httpx.read_bytes() + b"\n// unrelated HTTP runtime edit\n")
+        output = self.build("cache-host-tools")
+        for name in names:
+            self.assertRegex(output, rf"compile exe {name} ReleaseSafe \S+ cached")
+
         # Real generator source remains an input despite independence from the
         # product profile, target, and inactive backend settings.
         source = self.own("zig/pkg/inference/src/quant_kernel_codegen_main.zig")
@@ -392,6 +399,44 @@ class RuntimeCacheTest(unittest.TestCase):
         for name in names:
             if name != "antfly-quant-kernel-codegen":
                 self.assertRegex(output, rf"compile exe {name} ReleaseSafe \S+ cached")
+
+    def test_sql_and_snowball_generation_contracts(self):
+        sql = self.own("zig/lib/sql/grammar/generated/root.zig")
+        snowball_root = "zig/pkg/antfly/src/search/snowball/generated"
+        for path in (self.root / snowball_root).glob("*.zig"):
+            self.own(f"{snowball_root}/{path.name}")
+        snowball = self.root / snowball_root / "german_stemmer.zig"
+
+        self.build("regen-sql-grammar", "regen-snowball")
+        generated = {
+            path: (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in (self.root / "cache/o").rglob("*.zig")
+        }
+        expected = {path: path.read_bytes() for path in (sql, snowball)}
+        checked = self.build("sql-grammar-generated-check", "check-snowball")
+        self.assertRegex(checked, r"run exe yacc-zig \(sql_grammar_root.zig\) cached")
+        self.assertEqual(
+            len(re.findall(r"run exe snowball \(\w+_stemmer.zig\) cached", checked)),
+            10,
+        )
+        self.assertEqual(len(re.findall(r"format Snowball [\w.]+ cached", checked)), 12)
+
+        # Checking reports drift without repairing it, even with warm generators.
+        for path in expected:
+            path.write_bytes(b"// deliberately stale generated source\n")
+        self.build("sql-grammar-generated-check", "check-snowball", succeeds=False)
+        for path in expected:
+            self.assertEqual(
+                path.read_bytes(), b"// deliberately stale generated source\n"
+            )
+        self.build("regen-sql-grammar", "regen-snowball")
+        for path, content in expected.items():
+            self.assertEqual(path.read_bytes(), content)
+        self.build("sql-grammar-generated-check", "check-snowball")
+
+        # Consumers never rewrite the producer's published files.
+        for path, snapshot in generated.items():
+            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), snapshot)
 
     def test_enabled_backend_identities(self):
         for backend, source in (("metal", METAL), ("cuda", CUDA)):

@@ -95,6 +95,15 @@ pub fn addSnowballCompiler(b: *std.Build) *std.Build.Step.Compile {
 
 const addFileCompareTool = @import("../../../tools/build_support.zig").addFileCompareTool;
 
+fn formatGenerated(b: *std.Build, source: std.Build.LazyPath, basename: []const u8) std.Build.LazyPath {
+    // Formatting produces a separate cached file; the compiler's output stays immutable.
+    const fmt = b.addSystemCommand(&.{ b.graph.zig_exe, "fmt", "--stdin" });
+    fmt.step.name = b.fmt("format Snowball {s}", .{basename});
+    fmt.addFileInput(.{ .cwd_relative = b.graph.zig_exe });
+    fmt.setStdIn(.{ .lazy_path = source });
+    return fmt.captureStdOut(.{ .basename = basename });
+}
+
 pub fn addSnowballGeneratedOutputs(
     b: *std.Build,
     snowball_compiler: *std.Build.Step.Compile,
@@ -106,8 +115,8 @@ pub fn addSnowballGeneratedOutputs(
     const snowball_dep = b.path("deps/snowball");
 
     const wf = b.addWriteFiles();
-    const root = wf.add("root.zig", snowballRootContents(b));
-    const env = wf.addCopyFile(snowball_dep.path(b, "zig/env.zig"), "env.zig");
+    const root = formatGenerated(b, wf.add("root.zig", snowballRootContents(b)), "root.zig");
+    const env = formatGenerated(b, wf.addCopyFile(snowball_dep.path(b, "zig/env.zig"), "env.zig"), "env.zig");
 
     var stemmers: [snowball_languages.len]std.Build.LazyPath = undefined;
     inline for (snowball_languages, 0..) |lang, idx| {
@@ -115,7 +124,8 @@ pub fn addSnowballGeneratedOutputs(
         run.addFileArg(snowball_dep.path(b, b.fmt("algorithms/{s}.sbl", .{lang})));
         run.addArg("-zig");
         run.addArg("-o");
-        stemmers[idx] = run.addOutputFileArg(b.fmt("{s}_stemmer.zig", .{lang}));
+        const basename = b.fmt("{s}_stemmer.zig", .{lang});
+        stemmers[idx] = formatGenerated(b, run.addOutputFileArg(basename), basename);
     }
 
     return .{
@@ -125,8 +135,10 @@ pub fn addSnowballGeneratedOutputs(
     };
 }
 
-pub fn addSnowballRegenStep(b: *std.Build) void {
-    const regen_step = b.step("regen-snowball", "Regenerate checked-in Zig Snowball stemmers");
+pub fn addSteps(b: *std.Build) struct {
+    regen: *std.Build.Step.UpdateSourceFiles,
+    compare: *std.Build.Step.Run,
+} {
     const snowball_compiler = addSnowballCompiler(b);
     const generated = addSnowballGeneratedOutputs(b, snowball_compiler);
 
@@ -137,33 +149,8 @@ pub fn addSnowballRegenStep(b: *std.Build) void {
         update.addCopyFileToSource(generated.stemmers[idx], snowballGeneratedPath(b, "{s}_stemmer.zig", .{lang}));
     }
 
-    const fmt = b.addSystemCommand(&.{
-        b.graph.zig_exe,
-        "fmt",
-        snowball_generated_root,
-    });
-    fmt.step.dependOn(&update.step);
-    regen_step.dependOn(&fmt.step);
-}
-
-pub fn addSnowballCheckStep(b: *std.Build) void {
-    const check_step = b.step("check-snowball", "Check checked-in Zig Snowball stemmers are current");
-    const snowball_compiler = addSnowballCompiler(b);
-    const generated = addSnowballGeneratedOutputs(b, snowball_compiler);
-
-    const fmt = b.addSystemCommand(&.{
-        b.graph.zig_exe,
-        "fmt",
-    });
-    fmt.addFileArg(generated.root);
-    fmt.addFileArg(generated.env);
-    for (snowball_languages, 0..) |_, idx| {
-        fmt.addFileArg(generated.stemmers[idx]);
-    }
-
     const compare_tool = addFileCompareTool(b, b.path("tools"));
     const compare = b.addRunArtifact(compare_tool);
-    compare.step.dependOn(&fmt.step);
     compare.addFileArg(generated.root);
     compare.addFileArg(b.path(snowball_generated_root ++ "/root.zig"));
     compare.addFileArg(generated.env);
@@ -172,5 +159,5 @@ pub fn addSnowballCheckStep(b: *std.Build) void {
         compare.addFileArg(generated.stemmers[idx]);
         compare.addFileArg(b.path(snowballGeneratedPath(b, "{s}_stemmer.zig", .{lang})));
     }
-    check_step.dependOn(&compare.step);
+    return .{ .regen = update, .compare = compare };
 }
