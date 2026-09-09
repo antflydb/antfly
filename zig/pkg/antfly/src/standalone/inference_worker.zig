@@ -74,21 +74,34 @@ fn callbackResult(status: http.CallbackStatus) !void {
     };
 }
 
-pub fn invokeProvider(client: *Client, context: *const bridge.ProviderInvokeContext) ![]u8 {
+pub const ProviderResult = union(enum) {
+    json: []u8,
+    numeric: struct { rows: [][]f32, kind: @FieldType(bridge.NumericResult, "kind") },
+};
+
+pub fn invokeProvider(client: *Client, context: *const bridge.ProviderInvokeContext) !ProviderResult {
+    var arena = std.heap.ArenaAllocator.init(client.alloc);
+    defer arena.deinit();
     var control = ForwardControl{
         .alloc = client.alloc,
         .cancellation = context.cancellation,
         .deadline_ns = if (context.has_deadline != 0) context.deadline_ns else null,
         .progress = context.progress,
     };
-    const data = try std.json.Stringify.valueAlloc(client.alloc, wire.Provider{
-        .operation = context.operation,
-        .deadline_ns = control.deadline_ns,
-    }, .{});
-    defer client.alloc.free(data);
-    const response = try client.invoke(.provider, data, context.request_json.slice(), control.view());
+    try ForwardControl.check(&control);
+    const input = try wire.ProviderInput.init(arena.allocator(), context);
+    const data = try std.json.Stringify.valueAlloc(arena.allocator(), input.options, .{});
+    const response = try client.invokePayload(.provider, data, .{ .body_segments = input.body.segments }, control.view());
     defer response.deinit();
-    return client.alloc.dupe(u8, response.view().body);
+    try ForwardControl.check(&control);
+    const reply_options = try std.json.parseFromSliceLeaky(wire.Reply, arena.allocator(), response.view().metadata, .{});
+    const output = try std.json.parseFromSliceLeaky(wire.ProviderOutput, arena.allocator(), reply_options.options, .{});
+    if (output.kind != .absent) {
+        if (!input.options.numeric) return error.InvalidInferenceNumericResult;
+        return .{ .numeric = .{ .rows = try output.decode(client.alloc, response.view().body), .kind = output.kind } };
+    }
+    if (input.options.numeric) return error.InvalidInferenceNumericResult;
+    return .{ .json = try client.alloc.dupe(u8, response.view().body) };
 }
 
 pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.HttpHandleContext) !httpx.Response {
@@ -127,7 +140,7 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
             response.body = "{\"error\":\"inference request too large\"}";
             return response;
         }
-        if (err == error.ResourceTemporarilyUnavailable) {
+        if (err == error.ResourceTemporarilyUnavailable or err == error.QueueFull) {
             var response = httpx.Response.init(client.alloc, 503);
             errdefer response.deinit();
             try response.headers.append("content-type", "application/json");
@@ -249,6 +262,10 @@ pub const Client = struct {
     }
 
     pub fn invoke(self: *Client, operation: wire.Operation, options: []const u8, data: []const u8, control: rpc.Control) !rpc.OwnedPayload {
+        return self.invokePayload(operation, options, .{ .body = data }, control);
+    }
+
+    fn invokePayload(self: *Client, operation: wire.Operation, options: []const u8, payload: rpc.Payload, control: rpc.Control) !rpc.OwnedPayload {
         while (!self.mutex.tryLock()) {
             if (control.check) |check| try check(control.ptr);
             try self.io.sleep(.fromMilliseconds(1), .awake);
@@ -264,18 +281,24 @@ pub const Client = struct {
             self.active -= 1;
             self.mutex.unlock(self.io);
         }
-        const result = try callPayload(&worker.endpoint, operation, options, data, control);
+        const result = try callSegments(&worker.endpoint, operation, options, payload, control);
         // Hand off an independent response before releasing this worker lease.
         return result.detach();
     }
 };
 
 fn callPayload(endpoint: *rpc.Endpoint, operation: wire.Operation, options: []const u8, data: []const u8, control: rpc.Control) !rpc.OwnedPayload {
+    return callSegments(endpoint, operation, options, .{ .body = data }, control);
+}
+
+fn callSegments(endpoint: *rpc.Endpoint, operation: wire.Operation, options: []const u8, payload: rpc.Payload, control: rpc.Control) !rpc.OwnedPayload {
     const alloc = endpoint.alloc;
-    if (options.len > rpc.max_metadata_bytes or data.len > rpc.max_body_bytes) return error.BodyTooLarge;
+    if (options.len > rpc.max_metadata_bytes) return error.BodyTooLarge;
     const header = try std.json.Stringify.valueAlloc(alloc, wire.Request{ .operation = operation, .options = options }, .{});
     defer alloc.free(header);
-    const response = endpoint.call(.{ .metadata = header, .body = data }, control) catch |err| switch (err) {
+    var framed = payload;
+    framed.metadata = header;
+    const response = endpoint.call(framed, control) catch |err| switch (err) {
         error.InferenceWorkerUnavailable, error.InferenceWorkerRequestFailed, error.BrokenPipe => return error.ResourceTemporarilyUnavailable,
         else => return err,
     };
@@ -432,6 +455,12 @@ const Child = struct {
     configured: bool = false,
     startup_mutex: std.Io.Mutex = .init,
 
+    const ProviderDiagnostic = struct {
+        operation: c_int = 0,
+        request_json: []const u8 = "",
+        has_deadline: bool = false,
+    };
+
     fn closed(_: *anyopaque) void {
         // Loss of the owning database is a hard lifetime boundary, even if a
         // concurrent driver call is wedged and cannot join cooperatively.
@@ -443,11 +472,19 @@ const Child = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const envelope = try requestEnvelope(arena.allocator(), request);
-        return self.execute(arena.allocator(), request, envelope) catch |err|
-            reply(&self.endpoint, bridge.statusFromError(err), "", "");
+        var diagnostic: ProviderDiagnostic = .{};
+        return self.execute(arena.allocator(), request, envelope, &diagnostic) catch |err| {
+            // Diagnose at the error owner, including envelope decoding and
+            // response serialization, before the first lossy RPC status hop.
+            const status = if (envelope.operation == .provider)
+                @import("provider_failure.zig").status(diagnostic.operation, diagnostic.request_json, diagnostic.has_deadline, err)
+            else
+                bridge.statusFromError(err);
+            return reply(&self.endpoint, status, "", "");
+        };
     }
 
-    fn execute(self: *Child, arena: std.mem.Allocator, request: *rpc.Request, envelope: wire.Envelope) !rpc.OwnedPayload {
+    fn execute(self: *Child, arena: std.mem.Allocator, request: *rpc.Request, envelope: wire.Envelope, diagnostic: *ProviderDiagnostic) !rpc.OwnedPayload {
         if (envelope.operation == .initialize) {
             try self.startup_mutex.lock(self.io);
             defer self.startup_mutex.unlock(self.io);
@@ -481,22 +518,53 @@ const Child = struct {
         switch (envelope.operation) {
             .provider => {
                 const provider = try std.json.parseFromSliceLeaky(wire.Provider, arena, envelope.options, .{});
+                diagnostic.operation = provider.operation;
+                diagnostic.has_deadline = provider.deadline_ns != null;
+                var limits = wire.provider_attachment_limits;
+                // Text-only calls keep the existing logical JSON body ceiling.
+                limits.max_metadata_bytes = rpc.max_body_bytes;
+                var media = try wire.attachments.parseAlloc(arena, envelope.data, limits);
+                defer media.deinit();
+                // Metadata borrows the request payload, not the attachment
+                // descriptor allocation freed by media.deinit().
+                diagnostic.request_json = media.metadata;
+                if (media.attachments.len > 0 and media.metadata.len > wire.provider_attachment_limits.max_metadata_bytes) return error.BodyTooLarge;
+                const payloads = try arena.alloc(bridge.ProviderBinaryPayload, media.attachments.len);
+                for (payloads, media.attachments) |*payload, attachment| payload.* = .{
+                    .bytes = .init(attachment.data),
+                    .content_type = .init(attachment.mime_type),
+                };
+                const refs = try arena.alloc(bridge.ProviderAttachmentRef, provider.attachment_refs.len);
+                for (refs, provider.attachment_refs) |*ref, source| {
+                    if (source.attachment_index >= payloads.len) return error.InvalidInput;
+                    ref.* = .{ .attachment_index = source.attachment_index, .item_index = source.item_index, .item_id = .init(source.item_id), .source_fingerprint = .init(source.source_fingerprint), .page_number = source.page_number orelse 0, .has_page_number = @intFromBool(source.page_number != null) };
+                }
                 var response_handle: ?*anyopaque = null;
                 var response: bridge.String = undefined;
+                var numeric: bridge.NumericResult = .{};
                 defer if (response_handle) |handle| host.linkedInferenceDestroyProviderResponse(handle);
                 try host.linkedInferenceInvokeProvider(&.{
                     .abi_version = bridge.abi_version,
                     .handle = state,
                     .operation = provider.operation,
-                    .request_json = .init(envelope.data),
+                    .request_json = .init(media.metadata),
                     .deadline_ns = provider.deadline_ns orelse 0,
                     .has_deadline = @intFromBool(provider.deadline_ns != null),
                     .out_response_handle = &response_handle,
                     .out_response_json = &response,
+                    .out_numeric_result = if (provider.numeric) &numeric else null,
+                    .binary_payloads = payloads.ptr,
+                    .binary_payloads_len = payloads.len,
+                    .attachment_refs = refs.ptr,
+                    .attachment_refs_len = refs.len,
                     .cancellation = .{ .context = request, .is_cancelled = cancelled },
                     .progress = .{ .context = request, .update_progress = progress },
                 });
-                return reply(&self.endpoint, .ok, "", response.slice());
+                if (numeric.kind != .absent) {
+                    const output = try wire.ProviderOutput.encode(arena, numeric);
+                    return reply(&self.endpoint, .ok, try std.json.Stringify.valueAlloc(arena, output.options, .{}), output.body);
+                }
+                return reply(&self.endpoint, .ok, "{}", response.slice());
             },
             .http => {
                 const incoming = try std.json.parseFromSliceLeaky(wire.Http, arena, envelope.options, .{});

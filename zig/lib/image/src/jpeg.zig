@@ -964,6 +964,7 @@ fn decodeProgressiveDcInterleavedScan(
     const total_mcus = mcu_cols * mcu_rows;
 
     for (0..mcu_rows) |mcu_y| {
+        try @import("work_control.zig").check();
         for (0..mcu_cols) |mcu_x| {
             for (scan_components) |scan_component| {
                 for (0..scan_component.component.vertical_sampling) |block_row| {
@@ -1048,6 +1049,7 @@ fn decodeProgressiveDcSingleComponentScanMapped(
     const total_blocks = actual_blocks_x * actual_blocks_y;
 
     for (0..actual_blocks_y) |block_y| {
+        try @import("work_control.zig").check();
         for (0..actual_blocks_x) |block_x| {
             const block_index = block_y * padded_blocks_x + block_x;
             if (successive_high == 0) {
@@ -1090,6 +1092,7 @@ fn decodeProgressiveAcScanMapped(
     const total_blocks = actual_blocks_x * actual_blocks_y;
     var restart_index: u8 = 0;
     for (0..actual_blocks_y) |block_y| {
+        try @import("work_control.zig").check();
         for (0..actual_blocks_x) |block_x| {
             const block_index = block_y * padded_blocks_x + block_x;
             processed_blocks += 1;
@@ -1135,6 +1138,7 @@ fn refineProgressiveAcScanMapped(
     const total_blocks = actual_blocks_x * actual_blocks_y;
     var restart_index: u8 = 0;
     for (0..actual_blocks_y) |block_y| {
+        try @import("work_control.zig").check();
         for (0..actual_blocks_x) |block_x| {
             const block_index = block_y * padded_blocks_x + block_x;
             processed_blocks += 1;
@@ -1295,6 +1299,20 @@ pub fn preprocessClipChw(
     return preprocessClipChwWithOptions(alloc, jpeg_bytes, target_size, mean, std_dev, false);
 }
 
+/// CLIP JPEG preprocessing directly into caller-owned CHW storage. This is
+/// the batch-friendly form: decoded component planes remain temporary, while
+/// the complete normalized tensor is never allocated and copied a second time.
+pub fn preprocessClipChwInto(
+    alloc: Allocator,
+    jpeg_bytes: []const u8,
+    result: []f32,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+) !void {
+    return preprocessClipChwIntoWithOptions(alloc, jpeg_bytes, result, target_size, mean, std_dev, false);
+}
+
 /// CLIP JPEG preprocessing using JPEG DCT scaling. This is a speed/quality
 /// tradeoff and is not bit-identical to full decode plus resize.
 pub fn preprocessClipChwDctScaled(
@@ -1307,6 +1325,17 @@ pub fn preprocessClipChwDctScaled(
     return preprocessClipChwWithOptions(alloc, jpeg_bytes, target_size, mean, std_dev, true);
 }
 
+pub fn preprocessClipChwDctScaledInto(
+    alloc: Allocator,
+    jpeg_bytes: []const u8,
+    result: []f32,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+) !void {
+    return preprocessClipChwIntoWithOptions(alloc, jpeg_bytes, result, target_size, mean, std_dev, true);
+}
+
 fn preprocessClipChwWithOptions(
     alloc: Allocator,
     jpeg_bytes: []const u8,
@@ -1315,10 +1344,30 @@ fn preprocessClipChwWithOptions(
     std_dev: [3]f32,
     allow_dct_scale: bool,
 ) ![]f32 {
-    const structure = try parseStructure(jpeg_bytes);
+    const ts: usize = @intCast(target_size);
+    const result = try alloc.alloc(f32, std.math.mul(usize, 3, std.math.mul(usize, ts, ts) catch return error.JpegDecodeFailed) catch return error.JpegDecodeFailed);
+    errdefer alloc.free(result);
+    try preprocessClipChwIntoWithOptions(alloc, jpeg_bytes, result, target_size, mean, std_dev, allow_dct_scale);
+    return result;
+}
+
+fn preprocessClipChwIntoWithOptions(
+    alloc: Allocator,
+    jpeg_bytes: []const u8,
+    result: []f32,
+    target_size: u32,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    allow_dct_scale: bool,
+) !void {
     if (target_size == 0) return error.JpegDecodeFailed;
+    const ts: usize = @intCast(target_size);
+    const expected = std.math.mul(usize, 3, std.math.mul(usize, ts, ts) catch return error.JpegDecodeFailed) catch
+        return error.JpegDecodeFailed;
+    if (result.len != expected) return error.JpegDecodeFailed;
+    const structure = try parseStructure(jpeg_bytes);
     if (canPureZigDecodeColorBaseline(structure)) {
-        return preprocessClipChwPureZigColorBaseline(alloc, jpeg_bytes, structure, target_size, mean, std_dev, allow_dct_scale);
+        return preprocessClipChwPureZigColorBaselineInto(alloc, jpeg_bytes, structure, result, target_size, mean, std_dev, allow_dct_scale);
     }
     return error.UnsupportedJpegFormat;
 }
@@ -1653,6 +1702,7 @@ fn decodeRgbaPureZigArithmeticProgressive(
 
     if (structure.info.component_count == 1) {
         for (0..progressive.component_blocks_y[0]) |block_y| {
+            try @import("work_control.zig").check();
             for (0..progressive.component_blocks_x[0]) |block_x| {
                 const block_index = block_y * progressive.component_blocks_x[0] + block_x;
                 const spatial = dequantizeAndInverseDctWithSamplePrecision(
@@ -1676,6 +1726,7 @@ fn decodeRgbaPureZigArithmeticProgressive(
         );
         defer freeComponentSamplePlanes(alloc, &component_planes);
         for (0..progressive.mcu_rows) |mcu_y| {
+            try @import("work_control.zig").check();
             for (0..progressive.mcu_cols) |mcu_x| {
                 for (0..structure.info.component_count) |frame_index| {
                     const component = structure.info.components[frame_index];
@@ -1973,6 +2024,7 @@ fn decodeArithmeticProgressiveDcInterleavedScan(
     const total_mcus = mcu_cols * mcu_rows;
 
     for (0..mcu_rows) |mcu_y| {
+        try @import("work_control.zig").check();
         for (0..mcu_cols) |mcu_x| {
             for (scan_components) |scan_component| {
                 for (0..scan_component.component.vertical_sampling) |block_row| {
@@ -2052,6 +2104,7 @@ fn decodeArithmeticProgressiveDcSingleComponentScanMapped(
     var dummy_ac_stats = std.mem.zeroes([max_arithmetic_tables][arithmetic_ac_stat_bins]u8);
 
     for (0..actual_blocks_y) |block_y| {
+        try @import("work_control.zig").check();
         for (0..actual_blocks_x) |block_x| {
             const block_index = block_y * padded_blocks_x + block_x;
             if (successive_high == 0) {
@@ -2111,6 +2164,7 @@ fn decodeArithmeticProgressiveAcScanMapped(
     var dc_contexts = [_]u8{0} ** max_components;
 
     for (0..actual_blocks_y) |block_y| {
+        try @import("work_control.zig").check();
         for (0..actual_blocks_x) |block_x| {
             const block_index = block_y * padded_blocks_x + block_x;
             try decodeArithmeticProgressiveAcFirst(
@@ -2166,6 +2220,7 @@ fn refineArithmeticProgressiveAcScanMapped(
     var dc_contexts = [_]u8{0} ** max_components;
 
     for (0..actual_blocks_y) |block_y| {
+        try @import("work_control.zig").check();
         for (0..actual_blocks_x) |block_x| {
             const block_index = block_y * padded_blocks_x + block_x;
             try refineArithmeticProgressiveAc(
@@ -2231,6 +2286,7 @@ fn decodeRgbaPureZigArithmeticSequential(
         var mcus_decoded: usize = 0;
 
         for (0..blocks_y) |block_y| {
+            try @import("work_control.zig").check();
             for (0..blocks_x) |block_x| {
                 const coeffs = try decodeArithmeticSequentialBlock(
                     &decoder,
@@ -2288,6 +2344,7 @@ fn decodeRgbaPureZigArithmeticSequential(
         defer freeComponentSamplePlanes(alloc, &component_planes);
 
         for (0..mcu_rows) |mcu_y| {
+            try @import("work_control.zig").check();
             for (0..mcu_cols) |mcu_x| {
                 for (0..structure.info.component_count) |frame_index| {
                     const component = structure.info.components[frame_index];
@@ -2577,6 +2634,7 @@ fn decodeRgbaPureZigGrayscaleBaseline(
     const total_mcus = blocks_x * blocks_y;
 
     for (0..blocks_y) |block_y| {
+        try @import("work_control.zig").check();
         for (0..blocks_x) |block_x| {
             const block = try decodeBaselineBlock(&reader, dc_table, ac_table, dc_predictor);
             dc_predictor = block.dc_predictor;
@@ -2663,6 +2721,7 @@ fn decodeRgbaPureZigColorBaseline(
     defer freeComponentSamplePlanes(alloc, &component_planes);
 
     for (0..blocks_y) |mcu_y| {
+        try @import("work_control.zig").check();
         for (0..blocks_x) |mcu_x| {
             for (0..structure.info.component_count) |frame_index| {
                 const component = structure.info.components[frame_index];
@@ -2706,15 +2765,16 @@ fn decodeRgbaPureZigColorBaseline(
     };
 }
 
-fn preprocessClipChwPureZigColorBaseline(
+fn preprocessClipChwPureZigColorBaselineInto(
     alloc: Allocator,
     jpeg_bytes: []const u8,
     structure: Structure,
+    result: []f32,
     target_size: u32,
     mean: [3]f32,
     std_dev: [3]f32,
     allow_dct_scale: bool,
-) ![]f32 {
+) !void {
     const width = structure.info.width;
     const height = structure.info.height;
     const color_encoding = colorEncodingForStructure(structure) orelse return error.JpegDecodeFailed;
@@ -2762,6 +2822,7 @@ fn preprocessClipChwPureZigColorBaseline(
     defer freeComponentSamplePlanes(alloc, &component_planes);
 
     for (0..blocks_y) |mcu_y| {
+        try @import("work_control.zig").check();
         for (0..blocks_x) |mcu_x| {
             for (0..structure.info.component_count) |frame_index| {
                 const component = structure.info.components[frame_index];
@@ -2837,9 +2898,6 @@ fn preprocessClipChwPureZigColorBaseline(
         }
     }
 
-    const ts: usize = @intCast(target_size);
-    const result = try alloc.alloc(f32, 3 * ts * ts);
-    errdefer alloc.free(result);
     writeClipColorPlanesToChw(
         result,
         scaledDimension(width, dct_scale),
@@ -2854,7 +2912,6 @@ fn preprocessClipChwPureZigColorBaseline(
         max_v,
         component_planes,
     );
-    return result;
 }
 
 fn decodeRgbaPureZigLossless(
@@ -2997,6 +3054,7 @@ fn decodeRgbaPureZigProgressive(
 
     if (structure.info.component_count == 1) {
         for (0..progressive.component_blocks_y[0]) |block_y| {
+            try @import("work_control.zig").check();
             for (0..progressive.component_blocks_x[0]) |block_x| {
                 const block_index = block_y * progressive.component_blocks_x[0] + block_x;
                 const spatial = dequantizeAndInverseDctWithSamplePrecision(
@@ -3020,6 +3078,7 @@ fn decodeRgbaPureZigProgressive(
         );
         defer freeComponentSamplePlanes(alloc, &component_planes);
         for (0..progressive.mcu_rows) |mcu_y| {
+            try @import("work_control.zig").check();
             for (0..progressive.mcu_cols) |mcu_x| {
                 for (0..structure.info.component_count) |frame_index| {
                     const component = structure.info.components[frame_index];
@@ -4777,6 +4836,9 @@ test "preprocess clip chw matches full decode resize crop on 420 fixture" {
     const target_size: u32 = 4;
     const fast = try preprocessClipChw(alloc, fixture_bytes, target_size, .{ 0.0, 0.0, 0.0 }, .{ 1.0, 1.0, 1.0 });
     defer alloc.free(fast);
+    var direct: [3 * 4 * 4]f32 = undefined;
+    try preprocessClipChwInto(alloc, fixture_bytes, &direct, target_size, .{ 0.0, 0.0, 0.0 }, .{ 1.0, 1.0, 1.0 });
+    try std.testing.expectEqualSlices(f32, fast, &direct);
 
     try std.testing.expectEqual(@as(u32, 8), full.width);
     try std.testing.expectEqual(@as(u32, 8), full.height);

@@ -37,6 +37,7 @@ pub const Stats = struct {
     lease_expires_at_ms: u64 = 0,
     lease_renew_after_ms: u64 = 0,
     renewal_count: u64 = 0,
+    lease_epoch: u64 = 0,
 };
 
 pub const State = struct {
@@ -53,6 +54,7 @@ pub const State = struct {
     lease_expires_at_ms: u64,
     lease_renew_after_ms: u64,
     renewal_count: u64,
+    lease_epoch: u64,
 
     pub fn init(alloc: Allocator, store: anytype, key: []const u8, config: Config) !State {
         return .{
@@ -69,6 +71,7 @@ pub const State = struct {
             .lease_expires_at_ms = 0,
             .lease_renew_after_ms = 0,
             .renewal_count = 0,
+            .lease_epoch = 0,
         };
     }
 
@@ -96,27 +99,18 @@ pub const State = struct {
         // expiry. Keep the overwhelmingly common runtime tick on this
         // in-memory path and renew early enough to tolerate scheduler stalls.
         if (had_lease and now_ms < self.lease_renew_after_ms) return true;
-        const acquired = try self.lease.tryAcquireDetailed(self.owner_id, now_ms, self.lease_ttl_ms);
-        if (acquired.acquiredLease()) {
+        const acquired = try self.lease.tryAcquireFenced(self.owner_id, now_ms, self.lease_ttl_ms);
+        if (acquired.acquired) {
             self.has_lease = true;
+            self.lease_epoch = acquired.epoch;
+            self.lease_expires_at_ms = acquired.expires_at_ms;
             if (!had_lease) {
                 self.acquisition_count += 1;
                 self.last_acquired_ms = now_ms;
             }
-            if (had_lease and acquired == .renewed) self.renewal_count += 1;
-            if (acquired == .takeover) self.takeover_count += 1;
-            self.lease_expires_at_ms = now_ms +| self.lease_ttl_ms;
-            // Renew with one third of the TTL remaining. A deterministic
-            // per-owner jitter spreads writers sharing the same TTL without
-            // making tests or restart behavior nondeterministic.
-            const renewal_slack = @max(@as(u64, 1), self.lease_ttl_ms / 3);
-            const jitter_window = self.lease_ttl_ms / 10;
-            const jitter = if (jitter_window == 0)
-                0
-            else
-                std.hash.Wyhash.hash(0, self.owner_id) % (jitter_window + 1);
-            const base_renew_after = self.lease_expires_at_ms -| renewal_slack;
-            self.lease_renew_after_ms = base_renew_after -| jitter;
+            if (had_lease and acquired.kind == .renewed) self.renewal_count += 1;
+            if (acquired.kind == .takeover) self.takeover_count += 1;
+            self.updateRenewalDeadline();
             return true;
         }
 
@@ -124,10 +118,54 @@ pub const State = struct {
         return false;
     }
 
+    fn updateRenewalDeadline(self: *State) void {
+        // Renew with one third of the TTL remaining. A deterministic
+        // per-owner jitter spreads writers sharing the same TTL without
+        // making tests or restart behavior nondeterministic.
+        const renewal_slack = @max(@as(u64, 1), self.lease_ttl_ms / 3);
+        const jitter_window = self.lease_ttl_ms / 10;
+        const jitter = if (jitter_window == 0)
+            0
+        else
+            std.hash.Wyhash.hash(0, self.owner_id) % (jitter_window + 1);
+        const base_renew_after = self.lease_expires_at_ms -| renewal_slack;
+        self.lease_renew_after_ms = base_renew_after -| jitter;
+    }
+
+    pub fn heartbeat(self: *State, now_ms: u64) !bool {
+        if (!self.lease_owned) return true;
+        if (!self.has_lease or self.lease_epoch == 0) return false;
+        const renewed = try self.lease.renewFenced(
+            self.owner_id,
+            self.lease_epoch,
+            now_ms,
+            self.lease_ttl_ms,
+        );
+        if (!renewed) {
+            self.noteAcquireFailure();
+            return false;
+        }
+        self.lease_expires_at_ms = std.math.add(u64, now_ms, self.lease_ttl_ms) catch std.math.maxInt(u64);
+        self.renewal_count += 1;
+        self.updateRenewalDeadline();
+        return true;
+    }
+
+    pub fn heartbeatIfDue(self: *State, now_ms: u64) !bool {
+        if (!self.lease_owned) return true;
+        if (!self.has_lease or self.lease_epoch == 0) return false;
+        const renew_margin = @max(@as(u64, 1), self.lease_ttl_ms / 2);
+        if (self.lease_expires_at_ms > now_ms and self.lease_expires_at_ms - now_ms > renew_margin)
+            return true;
+        return try self.heartbeat(now_ms);
+    }
+
     pub fn noteAcquireFailure(self: *State) void {
         self.lease_acquire_failures += 1;
         if (self.has_lease and self.lease_owned) {
             self.has_lease = false;
+            self.lease_epoch = 0;
+            self.lease_expires_at_ms = 0;
             self.lost_leases += 1;
         }
         self.lease_expires_at_ms = 0;
@@ -136,19 +174,21 @@ pub const State = struct {
 
     pub fn release(self: *State) void {
         if (self.lease_owned and self.has_lease) {
-            _ = self.lease.release(self.owner_id) catch false;
+            _ = self.lease.releaseFenced(self.owner_id, self.lease_epoch) catch false;
         }
         self.has_lease = !self.lease_owned;
+        self.lease_epoch = 0;
         self.lease_expires_at_ms = 0;
         self.lease_renew_after_ms = 0;
     }
 
     pub fn releaseHeldLease(self: *State) !bool {
-        const released = if (self.lease_owned)
-            try self.lease.release(self.owner_id)
+        const released = if (self.lease_owned and self.has_lease)
+            try self.lease.releaseFenced(self.owner_id, self.lease_epoch)
         else
             false;
         self.has_lease = !self.lease_owned;
+        self.lease_epoch = 0;
         self.lease_expires_at_ms = 0;
         self.lease_renew_after_ms = 0;
         return released;
@@ -170,6 +210,7 @@ pub const State = struct {
             .lease_expires_at_ms = self.lease_expires_at_ms,
             .lease_renew_after_ms = self.lease_renew_after_ms,
             .renewal_count = self.renewal_count,
+            .lease_epoch = self.lease_epoch,
         };
     }
 };

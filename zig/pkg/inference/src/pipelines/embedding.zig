@@ -19,6 +19,7 @@
 // backend Session (ONNX, native).
 
 const std = @import("std");
+const antfly_image = @import("antfly_image");
 const platform = @import("antfly_platform");
 const backends = @import("../backends/backends.zig");
 const linalg = @import("inference_linalg");
@@ -38,6 +39,36 @@ const embedding_trace = @import("../embedding_trace.zig");
 const InferenceExecutionControl = @import("../execution_control.zig").InferenceExecutionControl;
 
 const qwen3_embedding_resident_override_level = 4;
+
+/// Owns the exact codec-slab admission deltas requested by image preprocessing.
+/// Slabs grow geometrically between waves, so retaining the deltas makes the
+/// process-wide reservation equal the largest physical slab without charging
+/// every request the configured 128 MiB safety ceiling.
+const PreprocessScratchAdmission = struct {
+    allocator: std.mem.Allocator,
+    session: backends.Session,
+    permits: std.ArrayListUnmanaged(session_mod.RunPermit) = .empty,
+
+    fn descriptor(self: *@This()) image.ScratchAdmission {
+        return .{ .context = self, .grow = growOpaque };
+    }
+
+    fn growOpaque(context: *anyopaque, current_bytes: usize, target_bytes: usize) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        if (target_bytes < current_bytes) return error.InvalidBatchPreprocessOptions;
+        const additional = target_bytes - current_bytes;
+        if (additional == 0) return;
+        var permit = try self.session.admitHostPreprocess(additional);
+        errdefer permit.deinit();
+        try self.permits.append(self.allocator, permit);
+    }
+
+    fn deinit(self: *@This()) void {
+        for (self.permits.items) |*permit| permit.deinit();
+        self.permits.deinit(self.allocator);
+        self.permits = .empty;
+    }
+};
 
 const TextInputTensorSet = struct {
     items: [3]Tensor = undefined,
@@ -97,6 +128,8 @@ pub const EmbeddingConfig = struct {
     image_size: u32 = 224,
     /// Model-selected image preprocessing contract.
     image_preprocess_profile: ImagePreprocessProfile = .default,
+    /// BackendRuntime-owned executor used for bounded image decode work.
+    preprocess_io: ?std.Io = null,
     /// For CLAP audio models: mel spectrogram configuration.
     audio_config: audio.AudioConfig = audio.CLAP_CONFIG,
     /// Aggregate audio working-set budget shared by retained decoded PCM,
@@ -247,6 +280,7 @@ pub const EncodedAudioClip = struct {
 };
 
 pub const EmbeddingPipeline = struct {
+    batch_observation: ?*@import("batch_execution.zig").Observation = null,
     allocator: std.mem.Allocator,
     session: backends.Session,
     tok: Tokenizer,
@@ -442,7 +476,7 @@ pub const EmbeddingPipeline = struct {
 
         var input_set = try textInputTensorSet(alloc, input_info, input_ids_tensor, attention_mask_tensor, &shape);
         defer input_set.deinit();
-        return self.embedPreparedTextInputs(
+        const vectors = try self.embedPreparedTextInputs(
             input_set.slice(),
             all_mask,
             ids_i64,
@@ -450,6 +484,8 @@ pub const EmbeddingPipeline = struct {
             effective_len,
             &run_permit,
         );
+        if (self.batch_observation) |observation| observation.record(texts.len);
+        return vectors;
     }
 
     /// Benchmark-facing encoder contract without tokenization or model load.
@@ -791,18 +827,87 @@ pub const EmbeddingPipeline = struct {
     /// Embed a batch of images (raw JPEG/PNG bytes), returning [batch][projection_dim] embeddings.
     /// Requires a vision_session (CLIP/SigLIP model).
     pub fn embedImages(self: *EmbeddingPipeline, images: []const []const u8) anyerror![][]f32 {
-        if (images.len == 0) return try self.allocator.alloc([]f32, 0);
-        try self.lockExecution();
-        defer self.unlockExecution();
-        return self.embedImagesBatch(images) catch |err| {
+        return (try self.embedImagesReported(images)).vectors;
+    }
+
+    pub const ImageBatchResult = struct {
+        vectors: [][]f32,
+        execution: @import("batch_execution.zig").Execution,
+    };
+
+    pub fn embedImagesReported(self: *EmbeddingPipeline, images: []const []const u8) anyerror!ImageBatchResult {
+        if (images.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
+        // The batch primitive acquires the execution gate only after bounded
+        // preprocessing. Fallback reuses that primitive for each item, so
+        // taking the gate here would both serialize preprocessing and attempt
+        // to re-enter the non-reentrant backend lock.
+        const vectors = self.embedImagesBatch(images) catch |err| {
             if (images.len > 1 and shouldFallbackBatchedImageError(err)) {
-                return self.embedImagesIndividually(images);
+                return .{ .vectors = try self.embedImagesIndividually(images), .execution = .fallback };
             }
             return err;
         };
+        return .{ .vectors = vectors, .execution = if (images.len > 1) .native_batch else .serial };
+    }
+
+    fn imageWorkControl(self: *EmbeddingPipeline) antfly_image.work_control.Control {
+        return if (self.execution_control) |*control| control.imageWorkControl() else .{};
+    }
+
+    /// Native broker entry point: invalid media occupies an indexed error slot
+    /// and never enters the encoder. Healthy rows retain their original order.
+    pub fn embedImagesIndexed(self: *EmbeddingPipeline, images: []const []const u8, errors: []?anyerror) !ImageBatchResult {
+        if (errors.len != images.len) return error.InvalidInputShape;
+        if (images.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
+        const vectors = self.embedImagesBatchIndexed(images, errors) catch |err| {
+            if (images.len <= 1 or !shouldFallbackBatchedImageError(err)) return err;
+            const outputs = try self.allocator.alloc([]f32, images.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (outputs[0..initialized]) |vector| self.allocator.free(vector);
+                self.allocator.free(outputs);
+            }
+            for (images, 0..) |_, i| {
+                const single = try self.embedImagesBatchIndexed(images[i..][0..1], errors[i..][0..1]);
+                outputs[i] = single[0];
+                self.allocator.free(single);
+                initialized += 1;
+            }
+            return .{ .vectors = outputs, .execution = .fallback };
+        };
+        var valid: usize = 0;
+        for (errors) |err| if (err == null) {
+            valid += 1;
+        };
+        return .{ .vectors = vectors, .execution = if (valid > 1) .native_batch else .serial };
+    }
+
+    /// Size an image wave before allocating normalized tensors. Permanent
+    /// session limits are monotone in this shape; current pressure is left to
+    /// the real reservation, never converted into singleton retry storms.
+    pub fn imageBatchPrefix(self: *EmbeddingPipeline, media_bytes: []const usize) !usize {
+        const vs = self.vision_session orelse self.session;
+        const row_bytes = try std.math.mul(usize, try std.math.mul(usize, self.config.image_size, self.config.image_size), 3 * @sizeOf(f32));
+        var retained: usize = 0;
+        for (media_bytes, 0..) |bytes, i| {
+            retained = try std.math.add(usize, retained, bytes);
+            if (!try vs.fitsRun(.{ .batch = i + 1, .input_bytes = try std.math.mul(usize, i + 1, row_bytes), .host_preprocess_bytes = retained })) return i;
+            if (self.visual_projection) |projection| {
+                if (projectionInputDim(projection)) |dim| {
+                    const packed_bytes = try std.math.mul(usize, try std.math.mul(usize, i + 1, dim), @sizeOf(f32));
+                    if (!try projection.fitsRun(.{ .batch = i + 1, .sequence = 1, .input_bytes = packed_bytes, .host_preprocess_bytes = packed_bytes })) return i;
+                }
+            }
+        }
+        return media_bytes.len;
     }
 
     fn embedImagesBatch(self: *EmbeddingPipeline, images: []const []const u8) anyerror![][]f32 {
+        return self.embedImagesBatchIndexed(images, null);
+    }
+
+    fn embedImagesBatchIndexed(self: *EmbeddingPipeline, images: []const []const u8, item_errors: ?[]?anyerror) anyerror![][]f32 {
+        if (self.execution_control) |control| try control.check();
         const vs = self.vision_session orelse if (sessionHasInput(self.session, "pixel_values")) self.session else return error.NoVisionSession;
 
         const alloc = self.allocator;
@@ -825,65 +930,102 @@ pub const EmbeddingPipeline = struct {
             encoded_bytes = std.math.add(usize, encoded_bytes, encoded.len) catch
                 return error.ResourceLimitExceeded;
         }
-        var run_permit = try vs.admit(.{
-            .batch = batch,
-            // Pixel area is fully represented by input_bytes. Patch/token
-            // sequence length is backend-specific and must not be guessed from
-            // raw pixels for the transformer activation profile.
-            .sequence = 1,
-            .input_bytes = pixel_bytes,
-            .host_preprocess_bytes = std.math.add(
-                usize,
-                encoded_bytes,
-                std.math.mul(usize, pixel_bytes, 2) catch
-                    return error.ResourceLimitExceeded,
-            ) catch return error.ResourceLimitExceeded,
-        });
-        defer run_permit.deinit();
+        var scratch_admission = PreprocessScratchAdmission{ .allocator = alloc, .session = vs };
+        defer scratch_admission.deinit();
+        const preprocess_options = image.BatchPreprocessOptions{
+            .io = self.config.preprocess_io,
+            .scratch_admission = scratch_admission.descriptor(),
+            .control = self.imageWorkControl(),
+            .item_errors = item_errors,
+        };
+        const preprocess_resident_bytes = std.math.add(usize, encoded_bytes, pixel_bytes) catch
+            return error.ResourceLimitExceeded;
+        // Caller-retained media and the normalized tensor have a stable lease.
+        // Codec slabs acquire exact, independently releasable deltas as they grow.
+        var preprocess_permit = try vs.admitHostPreprocess(preprocess_resident_bytes);
+        defer preprocess_permit.deinit();
 
         // Preprocess all images to [batch, 3, H, W]
         const preprocess_start = embedTimingStart(self.print_timing);
-        const pixel_values = switch (self.config.image_preprocess_profile) {
-            .default => try image.preprocessBatch(
-                alloc,
+        const pixel_values = try alloc.alloc(f32, pixel_elements);
+        var pixel_values_owned = true;
+        defer if (pixel_values_owned) alloc.free(pixel_values);
+        switch (self.config.image_preprocess_profile) {
+            .default => try image.preprocessBatchIntoBounded(
+                pixel_values,
                 images,
                 img_size,
                 image.IMAGENET_MEAN,
                 image.IMAGENET_STD,
+                .bilinear,
+                preprocess_options,
             ),
-            .clip => blk: {
-                // The synchronous pipeline owns only the preprocessing phase;
-                // release its bounded workers before entering the model session.
-                var preprocess_io = std.Io.Threaded.init(alloc, .{
-                    .async_limit = .limited(8),
-                    .concurrent_limit = .limited(8),
-                });
-                defer preprocess_io.deinit();
-                break :blk try image.preprocessClipBatch(
-                    preprocess_io.io(),
-                    alloc,
-                    images,
-                    img_size,
-                    image.IMAGENET_MEAN,
-                    image.IMAGENET_STD,
-                );
-            },
-        };
-        defer alloc.free(pixel_values);
+            .clip => try image.preprocessClipBatchIntoBounded(
+                pixel_values,
+                images,
+                img_size,
+                image.IMAGENET_MEAN,
+                image.IMAGENET_STD,
+                preprocess_options,
+            ),
+        }
         logEmbedTiming("image.preprocess", batch, preprocess_start);
+        scratch_admission.deinit();
+
+        var valid_count = batch;
+        if (item_errors) |errors| {
+            valid_count = 0;
+            const row_len = pixel_elements / batch;
+            for (errors, 0..) |err, index| {
+                if (err != null) continue;
+                if (valid_count != index) std.mem.copyForwards(f32, pixel_values[valid_count * row_len ..][0..row_len], pixel_values[index * row_len ..][0..row_len]);
+                valid_count += 1;
+            }
+            if (valid_count == 0) {
+                const empty = try alloc.alloc([]f32, batch);
+                @memset(empty, &.{});
+                return empty;
+            }
+        }
 
         // Build input tensor
         const sz: i64 = @intCast(img_size);
-        const pv_shape = [_]i64{ @intCast(batch), 3, sz, sz };
-        var pv_tensor = try Tensor.initFloat32(alloc, "pixel_values", &pv_shape, pixel_values);
+        const pv_shape = [_]i64{ @intCast(valid_count), 3, sz, sz };
+        var pv_tensor = try Tensor.initFloat32Owned(alloc, "pixel_values", &pv_shape, pixel_values);
+        pixel_values_owned = false;
         defer pv_tensor.deinit();
+        var input_tensor = pv_tensor.borrowedView("pixel_values");
+        input_tensor.data = pv_tensor.data[0 .. valid_count * 3 * img_size * img_size * @sizeOf(f32)];
+
+        const retained_host_bytes = std.math.add(usize, encoded_bytes, pixel_bytes) catch
+            return error.ResourceLimitExceeded;
+        // Codec scratch is gone once preprocessing returns. Retain only the
+        // encoded sources and adopted normalized tensor while queued for this
+        // session; the run request below credits exactly these still-live
+        // bytes and reserves the remaining host/backend peak.
+        try preprocess_permit.retainHostBytes(retained_host_bytes);
+
+        // Serialize only access to resident backend/session state. Transition
+        // from the retained host lease to a composed run lease while owning
+        // this mutex, so queued preprocessors cannot reserve GPU capacity and
+        // there is no unadmitted release/reacquire interval.
+        try self.lockExecution();
+        defer self.unlockExecution();
+        var run_permit = try vs.admit(.{
+            .batch = valid_count,
+            .sequence = 1,
+            .input_bytes = pixel_bytes,
+            .host_preprocess_bytes = encoded_bytes,
+            .pre_admitted_host_bytes = retained_host_bytes,
+        });
+        defer run_permit.deinit();
 
         if (self.visual_projection) |proj| {
             const resident = self.tryEmbedResidentProjection(
-                &.{pv_tensor},
+                &.{input_tensor},
                 proj,
                 .image,
-                batch,
+                valid_count,
                 "image.encoder.resident",
                 "image.projection.resident",
                 &run_permit,
@@ -891,12 +1033,12 @@ pub const EmbeddingPipeline = struct {
                 if (self.residentProjectionRequired()) return err;
                 return err;
             };
-            if (resident) |embeddings| return embeddings;
+            if (resident) |embeddings| return self.expandIndexedImageVectors(embeddings, item_errors);
         }
 
         // Run vision encoder
         const encoder_start = embedTimingStart(self.print_timing);
-        const outputs = run_permit.runWithControl(&.{pv_tensor}, alloc, self.execution_control) catch |err| {
+        const outputs = run_permit.runWithControl(&.{input_tensor}, alloc, self.execution_control) catch |err| {
             return err;
         };
         logEmbedTiming("image.encoder", batch, encoder_start);
@@ -905,10 +1047,170 @@ pub const EmbeddingPipeline = struct {
             alloc.free(outputs);
         }
 
-        const embeddings = self.imageEmbeddingsFromOutputs(outputs, batch) catch |err| {
+        const embeddings = self.imageEmbeddingsFromOutputs(outputs, valid_count) catch |err| {
             return err;
         };
-        return embeddings;
+        return self.expandIndexedImageVectors(embeddings, item_errors);
+    }
+
+    fn expandIndexedImageVectors(self: *EmbeddingPipeline, vectors: [][]f32, errors: ?[]?anyerror) ![][]f32 {
+        const indexed = errors orelse return vectors;
+        errdefer freeEmbeddingSlices(self.allocator, vectors);
+        const expanded = try self.allocator.alloc([]f32, indexed.len);
+        var cursor: usize = 0;
+        for (indexed, expanded) |err, *output| {
+            if (err != null) {
+                output.* = &.{};
+                continue;
+            }
+            output.* = vectors[cursor];
+            cursor += 1;
+        }
+        self.allocator.free(vectors);
+        return expanded;
+    }
+
+    /// Embed renderer-owned decoded rasters without an encode/decode round
+    /// trip. Buffers remain borrowed for this synchronous call and are copied
+    /// only into the model's normalized f32 input tensor.
+    pub fn embedBorrowedRasters(
+        self: *EmbeddingPipeline,
+        rasters: []const antfly_image.BorrowedRasterAttachment,
+    ) anyerror![][]f32 {
+        return (try self.embedBorrowedRastersReported(rasters)).vectors;
+    }
+
+    pub fn embedBorrowedRastersReported(self: *EmbeddingPipeline, rasters: []const antfly_image.BorrowedRasterAttachment) anyerror!ImageBatchResult {
+        if (rasters.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
+        const vectors = self.embedBorrowedRastersBatch(rasters) catch |err| {
+            if (rasters.len > 1 and shouldFallbackBatchedImageError(err)) {
+                const embeddings = try self.allocator.alloc([]f32, rasters.len);
+                var initialized: usize = 0;
+                errdefer {
+                    for (embeddings[0..initialized]) |embedding| self.allocator.free(embedding);
+                    self.allocator.free(embeddings);
+                }
+                for (rasters, 0..) |_, index| {
+                    const single = try self.embedBorrowedRastersBatch(rasters[index .. index + 1]);
+                    defer self.allocator.free(single);
+                    embeddings[index] = single[0];
+                    initialized += 1;
+                }
+                return .{ .vectors = embeddings, .execution = .fallback };
+            }
+            return err;
+        };
+        return .{ .vectors = vectors, .execution = if (rasters.len > 1) .native_batch else .serial };
+    }
+
+    fn embedBorrowedRastersBatch(
+        self: *EmbeddingPipeline,
+        rasters: []const antfly_image.BorrowedRasterAttachment,
+    ) anyerror![][]f32 {
+        if (self.execution_control) |control| try control.check();
+        const vs = self.vision_session orelse if (sessionHasInput(self.session, "pixel_values")) self.session else return error.NoVisionSession;
+        const alloc = self.allocator;
+        const img_size = self.config.image_size;
+        const batch = rasters.len;
+        const pixel_elements = std.math.mul(
+            usize,
+            std.math.mul(
+                usize,
+                std.math.mul(usize, batch, 3) catch return error.ResourceLimitExceeded,
+                img_size,
+            ) catch return error.ResourceLimitExceeded,
+            img_size,
+        ) catch return error.ResourceLimitExceeded;
+        const pixel_bytes = std.math.mul(usize, pixel_elements, @sizeOf(f32)) catch
+            return error.ResourceLimitExceeded;
+        var raster_bytes: usize = 0;
+        for (rasters) |raster| {
+            try raster.validate();
+            raster_bytes = std.math.add(usize, raster_bytes, raster.bytes.len) catch
+                return error.ResourceLimitExceeded;
+        }
+        var scratch_admission = PreprocessScratchAdmission{ .allocator = alloc, .session = vs };
+        defer scratch_admission.deinit();
+        const preprocess_options = image.BatchPreprocessOptions{
+            .io = self.config.preprocess_io,
+            .scratch_admission = scratch_admission.descriptor(),
+            .control = self.imageWorkControl(),
+        };
+        const preprocess_resident_bytes = std.math.add(usize, raster_bytes, pixel_bytes) catch
+            return error.ResourceLimitExceeded;
+        var preprocess_permit = try vs.admitHostPreprocess(preprocess_resident_bytes);
+        defer preprocess_permit.deinit();
+
+        const pixel_values = try alloc.alloc(f32, pixel_elements);
+        var pixel_values_owned = true;
+        defer if (pixel_values_owned) alloc.free(pixel_values);
+        const preprocess_start = embedTimingStart(self.print_timing);
+        switch (self.config.image_preprocess_profile) {
+            .default => try image.preprocessBorrowedRasterBatchIntoWithOptions(
+                alloc,
+                pixel_values,
+                rasters,
+                img_size,
+                image.IMAGENET_MEAN,
+                image.IMAGENET_STD,
+                .bilinear,
+                preprocess_options,
+            ),
+            .clip => try image.preprocessClipBorrowedRasterBatchIntoWithOptions(
+                alloc,
+                pixel_values,
+                rasters,
+                img_size,
+                image.IMAGENET_MEAN,
+                image.IMAGENET_STD,
+                preprocess_options,
+            ),
+        }
+        logEmbedTiming("image.preprocess.raster", batch, preprocess_start);
+        scratch_admission.deinit();
+
+        const sz: i64 = @intCast(img_size);
+        const pv_shape = [_]i64{ @intCast(batch), 3, sz, sz };
+        var pv_tensor = try Tensor.initFloat32Owned(alloc, "pixel_values", &pv_shape, pixel_values);
+        pixel_values_owned = false;
+        defer pv_tensor.deinit();
+
+        const retained_host_bytes = std.math.add(usize, raster_bytes, pixel_bytes) catch
+            return error.ResourceLimitExceeded;
+        try preprocess_permit.retainHostBytes(retained_host_bytes);
+
+        try self.lockExecution();
+        defer self.unlockExecution();
+        var run_permit = try vs.admit(.{
+            .batch = batch,
+            .sequence = 1,
+            .input_bytes = pixel_bytes,
+            .host_preprocess_bytes = raster_bytes,
+            .pre_admitted_host_bytes = retained_host_bytes,
+        });
+        defer run_permit.deinit();
+
+        if (self.visual_projection) |proj| {
+            const resident = try self.tryEmbedResidentProjection(
+                &.{pv_tensor},
+                proj,
+                .image,
+                batch,
+                "image.encoder.resident",
+                "image.projection.resident",
+                &run_permit,
+            );
+            if (resident) |embeddings| return embeddings;
+        }
+
+        const encoder_start = embedTimingStart(self.print_timing);
+        const outputs = try run_permit.runWithControl(&.{pv_tensor}, alloc, self.execution_control);
+        logEmbedTiming("image.encoder", batch, encoder_start);
+        defer {
+            for (outputs) |*output| output.deinit();
+            alloc.free(outputs);
+        }
+        return try self.imageEmbeddingsFromOutputs(outputs, batch);
     }
 
     fn imageEmbeddingsFromOutputs(self: *EmbeddingPipeline, outputs: []Tensor, batch: usize) ![][]f32 {
@@ -955,9 +1257,6 @@ pub const EmbeddingPipeline = struct {
             alloc.free(embeddings);
         }
         for (images, 0..) |img, i| {
-            // The public entry point already owns execution_lock while it
-            // evaluates the batch fallback. Call the unlocked implementation
-            // directly so the non-reentrant mutex is not acquired twice.
             const single = try self.embedImagesBatch(&.{img});
             defer alloc.free(single);
             embeddings[i] = single[0];
@@ -1030,6 +1329,87 @@ pub const EmbeddingPipeline = struct {
         return self.embedAudioPcm(pcm_inputs);
     }
 
+    /// Cross-caller entry point. Decode failures stay indexed; retained PCM and
+    /// feature scratch share one budget. Flush a window before decoding the
+    /// next clip when it does not fit, without retrying a failed model forward.
+    pub fn embedEncodedAudioIndexed(self: *EmbeddingPipeline, clips: []const EncodedAudioClip, errors: []?anyerror) !ImageBatchResult {
+        if (clips.len != errors.len) return error.InvalidInputShape;
+        @memset(errors, null);
+        const alloc = self.allocator;
+        const vectors = try alloc.alloc([]f32, clips.len);
+        @memset(vectors, &.{});
+        errdefer {
+            for (vectors) |row| alloc.free(row);
+            alloc.free(vectors);
+        }
+        const session = self.audio_session orelse if (sessionHasInput(self.session, "input_features")) self.session else return error.NoAudioSession;
+        const decoded = try alloc.alloc(audio.Audio, clips.len);
+        defer alloc.free(decoded);
+        var retained: usize = 0;
+        defer for (decoded[0..retained]) |*clip| clip.deinit();
+        const pcm = try alloc.alloc(audio.PcmAudio, clips.len);
+        defer alloc.free(pcm);
+        const indexes = try alloc.alloc(usize, clips.len);
+        defer alloc.free(indexes);
+        var cursor: usize = 0;
+        var observation = @import("batch_execution.zig").Observation{};
+        var fallback = false;
+        while (cursor < clips.len) {
+            var pcm_bytes: usize = 0;
+            while (cursor < clips.len) {
+                if (self.execution_control) |control| try control.check();
+                const plan = try clapBatchPlan(session, retained + 1);
+                const budget = self.config.max_audio_decode_working_bytes;
+                const fits = plan.feature_reserve_bytes < budget and pcm_bytes < budget - plan.feature_reserve_bytes and
+                    try session.fitsRun(.{ .batch = retained + 1, .input_bytes = plan.feature_elements * @sizeOf(f32), .host_preprocess_bytes = pcm_bytes });
+                if (!fits) {
+                    if (retained > 0) break;
+                    errors[cursor] = error.AudioTooLarge;
+                    cursor += 1;
+                    continue;
+                }
+                decoded[retained] = audio.decodeBounded(alloc, clips[cursor].bytes, clips[cursor].decode_options, budget - plan.feature_reserve_bytes - pcm_bytes) catch |err| {
+                    if (err == error.OutOfMemory or err == error.Canceled or err == error.DeadlineExceeded) return err;
+                    if (err == error.AudioTooLarge and retained > 0) break;
+                    errors[cursor] = err;
+                    cursor += 1;
+                    continue;
+                };
+                const clip = decoded[retained];
+                const next_pcm_bytes = pcm_bytes + clip.samples.len * @sizeOf(f32);
+                const decoded_fits = session.fitsRun(.{ .batch = retained + 1, .input_bytes = plan.feature_elements * @sizeOf(f32), .host_preprocess_bytes = next_pcm_bytes }) catch |err| {
+                    decoded[retained].deinit();
+                    return err;
+                };
+                if (!decoded_fits) {
+                    decoded[retained].deinit();
+                    if (retained > 0) break;
+                    errors[cursor] = error.ResourceLimitExceeded;
+                    cursor += 1;
+                    continue;
+                }
+                pcm[retained] = .{ .samples = clip.samples, .sample_rate = clip.sample_rate };
+                indexes[retained] = cursor;
+                retained += 1;
+                pcm_bytes = next_pcm_bytes;
+                cursor += 1;
+            }
+            if (retained == 0) continue;
+            const batch = try self.embedAudioPcmReported(pcm[0..retained]);
+            defer alloc.free(batch.vectors);
+            if (batch.vectors.len != retained) {
+                for (batch.vectors) |row| alloc.free(row);
+                return error.UnexpectedOutputShape;
+            }
+            for (batch.vectors, indexes[0..retained]) |row, index| vectors[index] = row;
+            observation.record(retained);
+            fallback = fallback or batch.execution == .fallback;
+            for (decoded[0..retained]) |*clip| clip.deinit();
+            retained = 0;
+        }
+        return .{ .vectors = vectors, .execution = if (fallback) .fallback else observation.execution(observation.native_items + observation.serial_items) };
+    }
+
     /// Embed a batch of interleaved PCM audio clips, explicitly downmixing to
     /// mono before CLAP preprocessing.
     pub fn embedAudioInterleavedPcm(
@@ -1084,15 +1464,20 @@ pub const EmbeddingPipeline = struct {
     /// Embed a batch of PCM audio clips, returning [batch][embed_dim] embeddings.
     /// Requires an audio_session (CLAP model).
     pub fn embedAudioPcm(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) anyerror![][]f32 {
-        if (audio_clips.len == 0) return try self.allocator.alloc([]f32, 0);
+        return (try self.embedAudioPcmReported(audio_clips)).vectors;
+    }
+
+    pub fn embedAudioPcmReported(self: *EmbeddingPipeline, audio_clips: []const audio.PcmAudio) anyerror!ImageBatchResult {
+        if (audio_clips.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
         try self.lockExecution();
         defer self.unlockExecution();
-        return self.embedAudioPcmBatch(audio_clips) catch |err| {
+        const vectors = self.embedAudioPcmBatch(audio_clips) catch |err| {
             if (audio_clips.len > 1 and err == error.BatchedAudioOutputCollapsed) {
-                return self.embedAudioPcmIndividually(audio_clips);
+                return .{ .vectors = try self.embedAudioPcmIndividually(audio_clips), .execution = .fallback };
             }
             return err;
         };
+        return .{ .vectors = vectors, .execution = if (audio_clips.len > 1) .native_batch else .serial };
     }
 
     fn lockExecution(self: *EmbeddingPipeline) !void {
@@ -3047,7 +3432,9 @@ test "embedImages uses one vision session run for an image batch" {
     };
 
     const images = [_][]const u8{ red_png_2x2[0..], red_png_2x2[0..] };
-    const embeddings = try pipeline.embedImages(&images);
+    const result = try pipeline.embedImagesReported(&images);
+    try std.testing.expectEqual(.native_batch, result.execution);
+    const embeddings = result.vectors;
     defer freeEmbeddingSlices(allocator, embeddings);
 
     try std.testing.expectEqual(@as(usize, 1), fake.run_count);
@@ -3055,6 +3442,41 @@ test "embedImages uses one vision session run for an image batch" {
     try std.testing.expectEqual(@as(usize, 2), embeddings.len);
     try std.testing.expectEqualSlices(f32, &.{ 0.0, 1.0 }, embeddings[0]);
     try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0 }, embeddings[1]);
+}
+
+test "indexed image embedding compacts healthy rows into one backend run" {
+    const alloc = std.testing.allocator;
+    var fake = FakeVisionBatchSession{};
+    var pipeline = EmbeddingPipeline{ .allocator = alloc, .session = fake.session(), .tok = undefined, .vision_session = fake.session(), .config = .{ .normalize = false, .image_size = 2 } };
+    var errors: [3]?anyerror = undefined;
+    const result = try pipeline.embedImagesIndexed(&.{ &red_png_2x2, "broken", &red_png_2x2 }, &errors);
+    defer freeEmbeddingSlices(alloc, result.vectors);
+    try std.testing.expectEqual(.native_batch, result.execution);
+    try std.testing.expectEqual(@as(usize, 1), fake.run_count);
+    try std.testing.expectEqual(@as(usize, 2), fake.last_batch);
+    try std.testing.expect(errors[0] == null and errors[2] == null);
+    try std.testing.expectEqual(error.ImageDecodeFailed, errors[1].?);
+    try std.testing.expectEqual(@as(usize, 0), result.vectors[1].len);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 1 }, result.vectors[0]);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, result.vectors[2]);
+    const empty = try pipeline.embedImagesIndexed(&.{"broken"}, errors[0..1]);
+    defer freeEmbeddingSlices(alloc, empty.vectors);
+    try std.testing.expectEqual(@as(usize, 1), fake.run_count);
+    try std.testing.expectEqual(error.ImageDecodeFailed, errors[0].?);
+}
+
+test "image batch planning respects permanent workspace limits without reserving" {
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    var fake = FakeVisionBatchSession{};
+    var session = fake.session();
+    session.run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 700 }, .static_workspace_bytes = 1, .check_live_memory = false };
+    var pipeline = EmbeddingPipeline{ .allocator = std.testing.allocator, .session = session, .tok = undefined, .vision_session = session, .config = .{ .image_size = 2 } };
+    const single = try session.fitsRun(.{ .batch = 1, .input_bytes = 48, .host_preprocess_bytes = 64 });
+    try std.testing.expect(single);
+    try std.testing.expectEqual(@as(usize, 1), try pipeline.imageBatchPrefix(&.{ 64, 64, 64 }));
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+    try std.testing.expectEqual(@as(usize, 0), fake.run_count);
 }
 
 test "embedImages falls back to per-image runs when batched image shape collapses" {
@@ -3072,7 +3494,9 @@ test "embedImages falls back to per-image runs when batched image shape collapse
     };
 
     const images = [_][]const u8{ red_png_2x2[0..], red_png_2x2[0..] };
-    const embeddings = try pipeline.embedImages(&images);
+    const result = try pipeline.embedImagesReported(&images);
+    try std.testing.expectEqual(.fallback, result.execution);
+    const embeddings = result.vectors;
     defer freeEmbeddingSlices(allocator, embeddings);
 
     try std.testing.expectEqual(@as(usize, 3), fake.run_count);
@@ -3082,6 +3506,106 @@ test "embedImages falls back to per-image runs when batched image shape collapse
     try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0 }, embeddings[1]);
     try std.testing.expect(execution_gate.tryLock());
     execution_gate.unlock();
+}
+
+test "image embedding broker fuses concurrent callers and transfers owned vectors" {
+    const microbatch = @import("../server/executor_microbatch.zig");
+    const shared = std.heap.smp_allocator;
+    var broker = microbatch.Broker.init(std.testing.allocator);
+    defer broker.deinit();
+    const Executor = struct {
+        vision: FakeVisionBatchSession = .{},
+
+        fn run(ptr: *anyopaque, items: []const microbatch.ExecuteItem) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.execute(items) catch |err| {
+                for (items) |item| item.slot.fail(err);
+            };
+        }
+
+        fn execute(self: *@This(), items: []const microbatch.ExecuteItem) !void {
+            const images = try shared.alloc([]const u8, items.len);
+            defer shared.free(images);
+            for (items, images) |item, *encoded| encoded.* = item.payloadAs([]const u8).*;
+            var pipeline = EmbeddingPipeline{
+                .allocator = shared,
+                .session = self.vision.session(),
+                .tok = undefined,
+                .config = .{ .normalize = false, .image_size = 2 },
+                .vision_session = self.vision.session(),
+            };
+            const batch = try pipeline.embedImagesReported(images);
+            defer shared.free(batch.vectors);
+            for (items, batch.vectors) |item, vector| item.slot.setValue([]f32, vector, switch (batch.execution) {
+                .native_batch => .native_batch,
+                .serial => .serial,
+                .fallback => .fallback,
+            });
+        }
+    };
+    const Submit = struct {
+        broker: *microbatch.Broker,
+        executor: *Executor,
+        result: ?microbatch.ItemResult([]f32) = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) std.Io.Cancelable!void {
+            const payload: []const u8 = &red_png_2x2;
+            const results = self.broker.submitBatchControlled([]const u8, []f32, std.testing.io, shared, .{ .model = "clip", .generation = 1, .task = .embed, .transform = "encoded-image", .resource_class = .cpu }, .{ .mode = .native, .preferred_items = 2, .max_items = 2, .max_wait_us = 500_000 }, &.{.{ .bytes = payload.len, .pixels = 4 }}, &.{.{}}, null, .{}, &.{payload}, self.executor, Executor.run) catch |err| {
+                self.err = err;
+                return;
+            };
+            self.result = results[0];
+            shared.free(results);
+        }
+        fn deinit(self: *@This()) void {
+            if (self.result) |result| switch (result.result) {
+                .value => |vector| shared.free(vector),
+                .item_error => {},
+            };
+        }
+    };
+    var executor = Executor{};
+    var first = Submit{ .broker = &broker, .executor = &executor };
+    defer first.deinit();
+    var second = Submit{ .broker = &broker, .executor = &executor };
+    defer second.deinit();
+    var group: std.Io.Group = .init;
+    defer group.cancel(std.testing.io);
+    try group.concurrent(std.testing.io, Submit.run, .{&first});
+    try group.concurrent(std.testing.io, Submit.run, .{&second});
+    try group.await(std.testing.io);
+    if (first.err) |err| return err;
+    if (second.err) |err| return err;
+    try std.testing.expectEqual(@as(usize, 1), executor.vision.run_count);
+    try std.testing.expectEqual(@as(usize, 2), executor.vision.last_batch);
+    try std.testing.expectEqual(first.result.?.execution_id, second.result.?.execution_id);
+    try std.testing.expectEqual(.native_batch, first.result.?.execution);
+    const first_vector = first.result.?.result.value;
+    const second_vector = second.result.?.result.value;
+    try std.testing.expect(first_vector.ptr != second_vector.ptr);
+    try std.testing.expectEqual(@as(f32, 1), first_vector[0] + second_vector[0]);
+}
+
+test "borrowed image embeddings report native singleton and fallback execution" {
+    const allocator = std.testing.allocator;
+    var fake = FakeVisionBatchSession{};
+    var pipeline = EmbeddingPipeline{ .allocator = allocator, .session = fake.session(), .tok = undefined, .config = .{ .normalize = false, .image_size = 2 }, .vision_session = fake.session() };
+    const pixels = [_]u8{ 255, 0, 0, 255 } ** 4;
+    const rasters = [_]antfly_image.BorrowedRasterAttachment{.{ .bytes = &pixels, .width = 2, .height = 2, .stride_bytes = 8 }} ** 2;
+    const native = try pipeline.embedBorrowedRastersReported(&rasters);
+    defer freeEmbeddingSlices(allocator, native.vectors);
+    try std.testing.expectEqual(.native_batch, native.execution);
+    const singleton = try pipeline.embedBorrowedRastersReported(rasters[0..1]);
+    defer freeEmbeddingSlices(allocator, singleton.vectors);
+    try std.testing.expectEqual(.serial, singleton.execution);
+    var collapsing = FakeCollapsingVisionSession{};
+    pipeline.session = collapsing.session();
+    pipeline.vision_session = collapsing.session();
+    const fallback = try pipeline.embedBorrowedRastersReported(&rasters);
+    defer freeEmbeddingSlices(allocator, fallback.vectors);
+    try std.testing.expectEqual(.fallback, fallback.execution);
+    try std.testing.expectEqual(@as(usize, 3), collapsing.run_count);
 }
 
 test "embedAudioPcm falls back under the execution gate without re-entry" {
@@ -3113,6 +3637,36 @@ test "embedAudioPcm falls back under the execution gate without re-entry" {
     try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0 }, embeddings[1]);
     try std.testing.expect(execution_gate.tryLock());
     execution_gate.unlock();
+}
+
+test "audio microbatch isolates corrupt clips and bounds decoded windows" {
+    const allocator = std.testing.allocator;
+    var fake = FakeCollapsingAudioSession{};
+    var pipeline = EmbeddingPipeline{
+        .allocator = allocator,
+        .session = fake.session(),
+        .audio_session = fake.session(),
+        .tok = undefined,
+        .config = .{ .normalize = false },
+    };
+    const samples = [_]f32{0} ** 1024;
+    const wav = try audio.wav.encodeMono(allocator, &samples, .{ .sample_rate = audio.CLAP_CONFIG.sample_rate, .audio_format = 1, .bits_per_sample = 16 });
+    defer allocator.free(wav);
+    const clips = [_]EncodedAudioClip{ .{ .bytes = wav }, .{ .bytes = "invalid audio" }, .{ .bytes = wav } };
+    var errors: [3]?anyerror = undefined;
+    const plan = try clapBatchPlan(fake.session(), 1);
+    pipeline.config.max_audio_decode_working_bytes = plan.feature_reserve_bytes + 2 * samples.len * @sizeOf(f32);
+    const result = try pipeline.embedEncodedAudioIndexed(&clips, &errors);
+    defer freeEmbeddingSlices(allocator, result.vectors);
+    try std.testing.expect(errors[0] == null);
+    try std.testing.expect(errors[1] != null);
+    try std.testing.expect(errors[2] == null);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, result.vectors[0]);
+    try std.testing.expectEqual(@as(usize, 0), result.vectors[1].len);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, result.vectors[2]);
+    try std.testing.expectEqual(@as(usize, 0), fake.collapsed_batch_attempts);
+    try std.testing.expectEqual(@as(usize, 2), fake.run_count);
+    try std.testing.expectEqual(.fallback, result.execution);
 }
 
 test "selectProjectedOutput skips collapsed pooled output for image batch" {
