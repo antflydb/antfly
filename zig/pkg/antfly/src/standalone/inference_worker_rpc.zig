@@ -377,6 +377,7 @@ pub const Endpoint = struct {
         // request has not executed and can be retried after sibling admission
         // drains. Response denial is translated to terminal capacity below:
         // the original request may already have executed successfully.
+        if (self.closed.load(.acquire)) return error.InferenceWorkerUnavailable;
         if (!offer.accepted) return error.QueueFull;
         const parts = payload.body_segments orelse &.{payload.body};
         for (0..parts.len + 1) |index| {

@@ -128,7 +128,10 @@ fn createContext(io: *const std.Io, out_handle: *?*anyopaque) bridge.CreateConte
         .has_max_loaded_models = 0,
         .content_security_json = .{},
         .s3_credentials_json = .{},
-        .runtime_config_json = bridge.String.init("{}"),
+        // This probe validates malformed requests at the production archive
+        // boundary, not model execution. It has no worker CLI entry point or
+        // resource owner; do not launch an isolated model worker recursively.
+        .runtime_config_json = bridge.String.init("{\"embedded_enabled\":false}"),
         .executor = .init(io),
         .out_handle = out_handle,
     };

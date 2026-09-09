@@ -28837,6 +28837,7 @@ test "metal_compute: owned backend handle destroys its request context" {
 }
 
 test "metal_compute: shared provider execution lease rejects overlapping frames and recovers" {
+    const metal_runtime = @import("../backends/metal_runtime.zig");
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
     const alloc = std.testing.allocator;
