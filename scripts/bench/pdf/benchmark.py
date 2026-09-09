@@ -23,6 +23,28 @@ def save(path, value):
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
+def completed_log_offset(path):
+    """Checkpoint the last complete record at a fixed, append-only log EOF.
+
+    A logger may flush one line in several writes. Never wait for it or include
+    a partial record; it remains available to a later checkpoint/validation.
+    Scan backwards in bounded blocks rather than loading the entire server log.
+    """
+    with path.open("rb") as stream:
+        end = stream.seek(0, os.SEEK_END)
+        while end:
+            start = max(0, end - 8192)
+            stream.seek(start)
+            block = stream.read(end - start)
+            if len(block) != end - start:
+                raise ValueError("server log was truncated during checkpoint")
+            newline = block.rfind(b"\n")
+            if newline >= 0:
+                return start + newline + 1
+            end = start
+    return 0
+
+
 def prepare():
     archive_digest = sha256(ROOT / "pdfs.zip")
     if archive_digest != ARCHIVE_SHA256:
@@ -335,9 +357,11 @@ def run_created(args, out):
         )
         startup_seconds = time.perf_counter() - process_started
         for trial in range(args.trials):
-            # Byte offsets bind diagnostic events to this trial without writing
-            # markers into the server-owned log or changing the timed interval.
-            profile_start = (out / "antfly.log").stat().st_size
+            # Checkpoint complete records without writing markers into the
+            # server-owned log or changing the timed interval.
+            profile_start = (
+                completed_log_offset(out / "antfly.log") if args.read_profile else None
+            )
             table_started = time.perf_counter()
             table = f"pdf_bench_{trial}"
             table_url = f"{url}/db/v1/tables/{table}"
@@ -543,7 +567,7 @@ def run_created(args, out):
                 trial=trial,
                 profile_log={
                     "start_byte": profile_start,
-                    "end_byte": (out / "antfly.log").stat().st_size,
+                    "end_byte": completed_log_offset(out / "antfly.log"),
                 }
                 if args.read_profile
                 else None,

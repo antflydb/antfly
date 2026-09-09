@@ -1,7 +1,10 @@
 import copy
+import tempfile
 import unittest
 from collections import Counter
+from pathlib import Path
 
+from benchmark import completed_log_offset
 from qualify_documents import evaluate_run, summarize, verify_trial_profile
 from render_matrix import render_observations
 from test_compare import run
@@ -55,6 +58,32 @@ def attach_profile(entry, logs):
 
 
 class DocumentQualificationTests(unittest.TestCase):
+    def test_checkpoints_during_split_background_writes_preserve_qualification(self):
+        entry = sample()
+        block = entry["log"][
+            : entry["run"]["results"][0]["profile_log"]["end_byte"]
+        ].encode()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "server.log"
+            with path.open("wb", buffering=0) as writer:
+                for row in entry["run"]["results"]:
+                    writer.write(b"background caf\xc3")  # split UTF-8, not a record
+                    start = completed_log_offset(path)
+                    writer.write(b"\xa9\r\n" + block + b"next background message")
+                    end = completed_log_offset(path)
+                    row["profile_log"] = {"start_byte": start, "end_byte": end}
+                    writer.write(b" completed\n")
+            entry["log"] = path.read_bytes()
+        result = evaluate_run(entry["run"], entry["log"], 3, entry["memory_bytes"])
+        self.assertTrue(result["pass"], result)
+        # A render begun after the final checkpoint is still outside its trial;
+        # normalizing offsets must not suppress it once the record completes.
+        self.assertFalse(
+            evaluate_run(entry["run"], entry["log"] + block, 3, entry["memory_bytes"])[
+                "pass"
+            ]
+        )
+
     def assert_profile_fails(self, entry):
         result = evaluate_run(entry["run"], entry["log"], 3, entry["memory_bytes"])
         self.assertFalse(result["pass"], result)

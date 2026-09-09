@@ -84,6 +84,9 @@ the existing output signatures. It requires:
 - Each identical consumer must match the primary's text hashes, page geometry,
   artifact counts and published-vector count, not merely match itself across runs.
 - Trial byte ranges in the original server log bind events to each indexing run.
+  Checkpoints stop at the last complete record in a fixed EOF snapshot, using
+  bounded reads; a concurrent partial log write is not mistaken for a boundary.
+  Partial records remain in the log for subsequent coverage validation.
   Corpus page ranges and indexed manifest fingerprints define the expected set;
   both physical renders and admission windows must cover it exactly once. Missing,
   overlapping, out-of-range or out-of-trial evidence fails closed. Older benchmark
