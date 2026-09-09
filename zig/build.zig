@@ -7997,6 +7997,8 @@ pub fn build(b: *std.Build) void {
         "capacity reservation revalidation fails closed when available space falls",
         "resource manager background deferral follows slice policy",
         "budgeted allocator admits before allocation and releases exact live bytes",
+        "budgeted allocator reclamation is opt in and retries without raising limits",
+        "budgeted allocator reclaim denial does not retry a busy cache",
         "budgeted allocator allows concurrent operations within the shared hard limit",
         "budgeted allocator amortizes manager reservations and releases idle credit",
     };

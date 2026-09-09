@@ -35210,7 +35210,7 @@ fn computeDocumentExtractionAssetRequestDerived(
     else
         db.core.index_manager.resource_manager;
     var extraction_budgeted: ?resource_manager_mod.BudgetedAllocator = if (extraction_resource_manager) |manager|
-        resource_manager_mod.BudgetedAllocator.init(manager, .document_extraction_working_set, alloc, 1)
+        resource_manager_mod.BudgetedAllocator.initReclaiming(manager, .document_extraction_working_set, alloc, 1)
     else
         null;
     defer if (extraction_budgeted) |*budgeted| budgeted.deinit();

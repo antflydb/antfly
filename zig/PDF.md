@@ -5331,6 +5331,24 @@ uses invocation-local text-result staging with the common window scheduler;
 replay retains its own durable staging and publication. Benchmark provenance must pin
 the sync level and require final artifact/vector coverage for either path.
 
+Precommit staged results are an optional, reclaimable cache, not session-long
+working-set ownership. Restoring a typed unit consumes its serialized row and
+releases duplicate bytes, empty map capacity, and unused allocator credit.
+Unconsumed rows participate in resource-manager reclamation so a later source
+download or larger render window can recover their budget. Eviction preserves
+consumer identities and source digests; a missing row follows ordinary execution.
+Cache access is locked, pressure callbacks skip locked borrowers, and teardown
+unregisters and drains callbacks before releasing the owner. Callbacks stop
+evicting rows once the requested deficit is recovered, preserving useful peers.
+
+Document download/preparation allocators explicitly opt into one bounded
+reclaim-and-retry admission attempt. The default budgeted allocator remains
+callback-free for storage transactions and other lock-sensitive callers; the
+cache's own allocator does not invoke reclaimers. Neither path increases hard
+limits or changes render DPI. Tight slice/aggregate-budget regressions cover
+consumed-row release, failed restores, larger window admission, download
+allocation, partial eviction, and concurrent/reentrant borrowed-row protection.
+
 The convergence boundary is a document execution session independent of its
 publication sink: immutable prepared source, bounded page windows, task-specific
 consumers, and typed staged results. Precommit execution must collect into the

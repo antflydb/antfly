@@ -2772,6 +2772,7 @@ pub const BudgetedAllocator = struct {
     credit_quantum: u64,
     budget_denied: bool = false,
     denial_generation: u64 = 0,
+    reclaim_on_denial: bool = false,
 
     pub fn init(
         manager: *ResourceManager,
@@ -2795,6 +2796,20 @@ pub const BudgetedAllocator = struct {
             .max_hard_limit_multiple = max_hard_limit_multiple,
             .credit_quantum = credit_quantum,
         };
+    }
+
+    /// Opt in only at allocation sites whose lock order permits invoking cache
+    /// owners. Ordinary init remains callback-free for storage transactions and
+    /// cache-internal allocators. Admission retries once, without raising limits.
+    pub fn initReclaiming(
+        manager: *ResourceManager,
+        slice: Slice,
+        backing: std.mem.Allocator,
+        max_hard_limit_multiple: u64,
+    ) BudgetedAllocator {
+        var self = init(manager, slice, backing, max_hard_limit_multiple);
+        self.reclaim_on_denial = true;
+        return self;
     }
 
     pub fn deinit(self: *BudgetedAllocator) void {
@@ -2866,9 +2881,24 @@ pub const BudgetedAllocator = struct {
                 minimum,
                 @max(minimum, self.credit_quantum),
                 self.max_hard_limit_multiple,
-            ) catch {
-                self.recordDenial();
-                return false;
+            ) catch |err| {
+                // growReservationAmortized has released the accounting lock.
+                // Ask only for the actual deficit, not amortized spare credit.
+                if (!self.reclaim_on_denial or err != error.ResourceBudgetExceeded or
+                    self.reservation.manager.reclaimForAllocation(self.reservation.slice, minimum) == 0)
+                {
+                    self.recordDenial();
+                    return false;
+                }
+                _ = self.reservation.manager.growReservationAmortized(
+                    &self.reservation,
+                    minimum,
+                    @max(minimum, self.credit_quantum),
+                    self.max_hard_limit_multiple,
+                ) catch {
+                    self.recordDenial();
+                    return false;
+                };
             };
         }
         self.live_bytes = next_live;
@@ -4397,6 +4427,82 @@ test "budgeted allocator admits before allocation and releases exact live bytes"
     defer alloc.free(recovered);
     try std.testing.expect(budgeted.denied());
     try std.testing.expectEqual(@as(u64, 2), budgeted.denialGeneration());
+}
+
+test "budgeted allocator reclamation is opt in and retries without raising limits" {
+    const Cache = struct {
+        retained: Reservation,
+        calls: usize = 0,
+
+        fn reclaim(raw: *anyopaque, target: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const bytes = @min(target, self.retained.bytes);
+            self.retained.shrink(bytes);
+            return bytes;
+        }
+    };
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 64 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(std.testing.allocator);
+    var cache = Cache{ .retained = try manager.reserve(.document_extraction_working_set, 48) };
+    defer cache.retained.release();
+    const identity = try manager.registerReclaimer(.document_extraction_working_set, &cache, Cache.reclaim);
+    defer manager.unregisterReclaimer(identity);
+
+    var ordinary = BudgetedAllocator.init(&manager, .document_extraction_working_set, std.testing.allocator, 1);
+    defer ordinary.deinit();
+    try std.testing.expectError(error.OutOfMemory, ordinary.allocator().alloc(u8, 32));
+    try std.testing.expectEqual(@as(usize, 0), cache.calls);
+    try std.testing.expectEqual(@as(u64, 48), cache.retained.bytes);
+
+    var required = BudgetedAllocator.initReclaiming(&manager, .document_extraction_working_set, std.testing.allocator, 1);
+    defer required.deinit();
+    const bytes = try required.allocator().alloc(u8, 32);
+    defer required.allocator().free(bytes);
+    try std.testing.expectEqual(@as(usize, 1), cache.calls);
+    try std.testing.expectEqual(@as(u64, 32), cache.retained.bytes);
+    try std.testing.expectEqual(@as(u64, 64), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), required.denialGeneration());
+
+    // Even evicting all remaining optional bytes cannot admit this request.
+    // The allocator retries once, retains its original live allocation, and
+    // never increases the configured hard limit or loops over reclaimers.
+    try std.testing.expectError(error.OutOfMemory, required.allocator().alloc(u8, 33));
+    try std.testing.expectEqual(@as(usize, 2), cache.calls);
+    try std.testing.expectEqual(@as(u64, 0), cache.retained.bytes);
+    try std.testing.expectEqual(@as(u64, 32), required.live_bytes);
+    try std.testing.expectEqual(@as(u64, 32), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    try std.testing.expectEqual(@as(u64, 1), required.denialGeneration());
+}
+
+test "budgeted allocator reclaim denial does not retry a busy cache" {
+    const Cache = struct {
+        calls: usize = 0,
+
+        fn reclaim(raw: *anyopaque, _: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return 0;
+        }
+    };
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.document_extraction_working_set)] = .{ .hard_limit_bytes = 64 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(std.testing.allocator);
+    var retained = try manager.reserve(.document_extraction_working_set, 48);
+    defer retained.release();
+    var cache: Cache = .{};
+    const identity = try manager.registerReclaimer(.document_extraction_working_set, &cache, Cache.reclaim);
+    defer manager.unregisterReclaimer(identity);
+    var required = BudgetedAllocator.initReclaiming(&manager, .document_extraction_working_set, std.testing.allocator, 1);
+    defer required.deinit();
+    try std.testing.expectError(error.OutOfMemory, required.allocator().alloc(u8, 32));
+    try std.testing.expectEqual(@as(usize, 1), cache.calls);
+    try std.testing.expectEqual(@as(u64, 1), required.denialGeneration());
+    try std.testing.expectEqual(@as(u64, 0), required.live_bytes);
+    try std.testing.expectEqual(@as(u64, 48), retained.bytes);
 }
 
 test "budgeted allocator allows concurrent operations within the shared hard limit" {
