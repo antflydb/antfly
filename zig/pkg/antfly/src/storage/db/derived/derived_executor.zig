@@ -23,25 +23,8 @@ const runtime_backend = @import("../../runtime_backend.zig");
 const background_runtime_mod = @import("../../background_runtime.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
 const types = @import("../types.zig");
-const platform_clock = @import("antfly_platform").clock;
-const platform_time = @import("antfly_platform").time;
 
-pub const VisibilityWait = struct {
-    cancellation: types.CancellationToken = .none,
-    deadline_ns: ?u64 = null,
-    clock: ?platform_clock.Clock = null,
-
-    pub fn check(self: @This()) !void {
-        if (self.cancellation.isCancelled()) return error.EnrichmentWaitCanceled;
-        if (self.deadline_ns) |deadline_ns| {
-            const now_ns = if (self.clock) |clock|
-                clock.nowRealtimeNs()
-            else
-                platform_time.monotonicNs();
-            if (now_ns >= deadline_ns) return error.EnrichmentWaitTimeout;
-        }
-    }
-};
+pub const VisibilityWait = runtime_types.VisibilityWait;
 
 const runtime_types = @import("runtime_types.zig");
 const derived_worker = @import("derived_worker.zig");
@@ -674,10 +657,10 @@ fn ioThreadedReleaseBacklogThrough(ptr: *anyopaque, sequence: u64) void {
 
 fn ioThreadedWaitForAll(ptr: *anyopaque, sequence: u64, wait: VisibilityWait) !void {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
-    return try runtime.waitForAllWithVisibilityWait(sequence, wait.cancellation, wait.deadline_ns);
+    return try runtime.waitForAllWithVisibilityWait(sequence, wait);
 }
 
 fn ioThreadedWaitForIndexes(ptr: *anyopaque, sequence: u64, index_names: []const []const u8, wait: VisibilityWait) !void {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
-    return try runtime.waitForIndexesWithVisibilityWait(sequence, index_names, wait.cancellation, wait.deadline_ns);
+    return try runtime.waitForIndexesWithVisibilityWait(sequence, index_names, wait);
 }
