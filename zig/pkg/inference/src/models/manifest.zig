@@ -540,11 +540,6 @@ pub const ModelManifest = struct {
         return std.mem.eql(u8, self.inference_bundle_family, qwen3_vl_reranker_gguf_bundle_family);
     }
 
-    pub fn isQwen3TextReranker(self: *const ModelManifest) bool {
-        return self.model_type == .reranker and self.usesGgufWeights() and
-            std.mem.eql(u8, self.config_model_arch, "qwen3");
-    }
-
     pub fn isQwen3VlRerankerSafetensorsBundle(self: *const ModelManifest) bool {
         return std.mem.eql(u8, self.inference_bundle_family, qwen3_vl_reranker_safetensors_bundle_family);
     }
@@ -559,6 +554,18 @@ pub const ModelManifest = struct {
             (self.model_type == .reranker and
                 (std.mem.eql(u8, self.config_model_arch, "qwen3_vl") or
                     std.mem.eql(u8, self.config_model_arch, "qwen3vl")));
+    }
+
+    /// Text-only Qwen3 rerankers use the causal decoder with a generative
+    /// yes/no score head. They must not inherit the last-token embedding or
+    /// CLS cross-encoder contracts merely because the backbone is shared.
+    pub fn isQwen3TextReranker(self: *const ModelManifest) bool {
+        return self.model_type == .reranker and
+            std.mem.eql(u8, self.config_model_arch, "qwen3");
+    }
+
+    pub fn isQwen3GenerativeReranker(self: *const ModelManifest) bool {
+        return self.isQwen3TextReranker() or self.isQwen3VlReranker();
     }
 
     pub fn isQwen3VlBundle(self: *const ModelManifest) bool {
@@ -1025,7 +1032,12 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
     // Load special tokens from tokenizer_config.json
     if (try catalog.readOptional("tokenizer.json")) |tok_bytes| {
         defer allocator.free(tok_bytes);
-        try ignoreNonResourceMetadataError(parseTokenizerJsonSpecialTokens(&manifest, allocator, tok_bytes));
+        // This scan only discovers GLiNER markers. Keep the fresh file read
+        // and its errors, but avoid building a vocabulary-sized JSON tree for
+        // explicitly declared Qwen3 embedders that cannot use those markers.
+        if (!canSkipQwen3EmbedderGlinerTokenScan(&manifest, model_dir_path, tok_bytes)) {
+            try ignoreNonResourceMetadataError(parseTokenizerJsonSpecialTokens(&manifest, allocator, tok_bytes));
+        }
     }
     if (try catalog.readOptional("tokenizer_config.json")) |tc_bytes| {
         defer allocator.free(tc_bytes);
@@ -1037,7 +1049,7 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
     }
 
     try applyImplicitSparseOutputLayout(&manifest, catalog);
-    try applySentenceTransformersPoolingSidecars(&manifest, allocator, catalog);
+    try applySentenceTransformersTaskSidecars(&manifest, allocator, catalog);
     try applyImplicitModelTypeHints(&manifest, model_dir_path);
     try finalizeEmbeddingProfile(&manifest);
 
@@ -1125,7 +1137,7 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
     try fillAutoDetectedGgufPaths(&manifest, allocator, &catalog);
 
     try applyImplicitSparseOutputLayout(&manifest, &catalog);
-    try applySentenceTransformersPoolingSidecars(&manifest, allocator, &catalog);
+    try applySentenceTransformersTaskSidecars(&manifest, allocator, &catalog);
     try applyImplicitModelTypeHints(&manifest, model_dir_path);
     try finalizeEmbeddingProfile(&manifest);
 
@@ -1200,15 +1212,11 @@ fn applyImplicitSparseOutputLayout(manifest: *ModelManifest, catalog: *const Art
     }
 }
 
-/// Detect sentence-transformers-format decoder embedders from their sidecar
-/// files. Qwen3-Embedding ships `config.json` saying `Qwen3ForCausalLM` —
-/// indistinguishable from the generative chat checkpoint — but its ST
-/// sidecars are unambiguous: `modules.json` declares a Pooling module whose
-/// `1_Pooling/config.json` has `pooling_mode_lasttoken: true`, and
-/// `config_sentence_transformers.json` carries the query/document prompts.
-/// Scoped to the qwen3 decoder family; BERT-family ST repos keep their
-/// existing detection paths untouched.
-fn applySentenceTransformersPoolingSidecars(
+/// Detect sentence-transformers-format Qwen3 task models from unambiguous
+/// sidecars. Qwen3-Embedding and Qwen3-Reranker both declare a causal-LM
+/// architecture; Pooling identifies the former and LogitScore the latter.
+/// BERT-family sentence-transformers repos keep their existing paths.
+fn applySentenceTransformersTaskSidecars(
     manifest: *ModelManifest,
     allocator: std.mem.Allocator,
     catalog: *const ArtifactCatalog,
@@ -1226,6 +1234,7 @@ fn applySentenceTransformersPoolingSidecars(
 
     var pooling_dir: ?[]const u8 = null;
     var has_normalize_module = false;
+    var has_logit_score_module = false;
     for (modules_parsed.value.array.items) |module| {
         if (module != .object) continue;
         const type_val = module.object.get("type") orelse continue;
@@ -1238,8 +1247,19 @@ fn applySentenceTransformersPoolingSidecars(
             }
         } else if (std.mem.eql(u8, type_val.string, "sentence_transformers.models.Normalize")) {
             has_normalize_module = true;
+        } else if (std.mem.endsWith(u8, type_val.string, ".LogitScore")) {
+            has_logit_score_module = true;
         }
     }
+    if (has_logit_score_module) {
+        if (!manifest.model_manifest_declarations.model_type) {
+            manifest.model_type = .reranker;
+            manifest.model_type_origin = .config;
+        }
+        if (manifest.inputs.len == 0) try setManifestInputs(allocator, manifest, &.{"text"});
+        return;
+    }
+    if (manifest.embedding_style != .none) return;
     const dir = pooling_dir orelse return;
 
     var pooling_path_buf: [256]u8 = undefined;
@@ -1331,6 +1351,7 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
 
     if (hasRerankPathHint(model_dir_path) and
         (manifest.model_type == .embedder or manifest.model_type == .classifier or
+            std.mem.eql(u8, manifest.config_model_arch, "qwen3") or
             std.mem.eql(u8, manifest.config_model_arch, "qwen3_vl") or
             std.mem.eql(u8, manifest.config_model_arch, "qwen3vl")))
     {
@@ -1574,6 +1595,14 @@ fn applyGgufTokenizerMetadata(
                         if (!declarations.normalize) manifest.normalize = true;
                         if (!declarations.embedding_style and manifest.embedding_style == .none) {
                             manifest.embedding_style = .qwen3_embedding;
+                        }
+                    } else if (pooling_type == 4) {
+                        // llama.cpp RANK pooling marks a generative reranker.
+                        // Its classifier tensor represents yes/no output rows,
+                        // not a CLS-position encoder head.
+                        if (!manifest.model_manifest_declarations.model_type) {
+                            manifest.model_type = .reranker;
+                            manifest.model_type_origin = .config;
                         }
                     }
                 }
@@ -3331,6 +3360,41 @@ fn setGlinerSpecialToken(manifest: *ModelManifest, content: []const u8, token_id
     if (std.mem.eql(u8, content, "[SEP_TEXT]")) manifest.gliner_token_sep_text = token_id;
 }
 
+fn canSkipQwen3EmbedderGlinerTokenScan(manifest: *const ModelManifest, model_dir_path: []const u8, tokenizer_json: []const u8) bool {
+    if (!manifest.model_manifest_declarations.model_type or manifest.model_type != .embedder or
+        !manifest.model_manifest_declarations.embedding_style or manifest.embedding_style != .qwen3_embedding)
+        return false;
+    // Preserve wrapper and multitask models, including GLiNER inferred from
+    // only a path/config hint plus the markers in tokenizer.json.
+    if (manifest.gliner_model_type.len > 0 or hasGlinerPathHint(model_dir_path) or
+        manifest.gliner_head_gguf_path != null or manifest.gliner_head_safetensors_path != null or
+        manifest.tasks.len > 0 or manifest.capabilities.len > 0)
+        return false;
+    if (manifest.config_model_arch.len > 0 and !std.mem.eql(u8, manifest.config_model_arch, "qwen3")) return false;
+    // GGUF metadata can still reveal a wrapper architecture after this scan.
+    // Skip only when the scan cannot discover a marker, including markers
+    // encoded with JSON Unicode escapes. Escaped backslash vocabulary entries
+    // such as "\\\\u" do not qualify unless followed by four hexadecimal digits.
+    // Search for the first byte with the vectorized scalar finder. Short
+    // substring searches otherwise compare every vocabulary byte per marker.
+    var remaining = tokenizer_json;
+    while (std.mem.indexOfScalar(u8, remaining, '[')) |offset| {
+        const candidate = remaining[offset..];
+        inline for (.{ "[P]", "[C]", "[E]", "[R]", "[SEP_TEXT]" }) |marker| {
+            if (std.mem.startsWith(u8, candidate, marker)) return false;
+        }
+        remaining = candidate[1..];
+    }
+    remaining = tokenizer_json;
+    while (std.mem.indexOfScalar(u8, remaining, '\\')) |offset| {
+        remaining = remaining[offset + 1 ..];
+        if (remaining.len >= 5 and remaining[0] == 'u' and
+            std.ascii.isHex(remaining[1]) and std.ascii.isHex(remaining[2]) and
+            std.ascii.isHex(remaining[3]) and std.ascii.isHex(remaining[4])) return false;
+    }
+    return true;
+}
+
 fn parseTokenizerJsonSpecialTokens(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
     defer parsed.deinit();
@@ -3432,6 +3496,82 @@ test "Qwen3-VL reranker path overrides its conditional-generation base role" {
     try applyImplicitModelTypeHints(&manifest, "/models/Qwen/Qwen3-VL-Reranker-2B");
     try std.testing.expectEqual(ModelType.reranker, manifest.model_type);
     try std.testing.expect(manifest.isQwen3VlReranker());
+}
+
+test "Qwen3 reranker path overrides its conditional-generation base role" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+    try parseConfigJson(&manifest, allocator,
+        \\{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3"}
+    );
+    try std.testing.expectEqual(ModelType.generator, manifest.model_type);
+    try applyImplicitModelTypeHints(&manifest, "/models/Qwen/Qwen3-Reranker-0.6B");
+    try std.testing.expectEqual(ModelType.reranker, manifest.model_type);
+    try std.testing.expect(manifest.isQwen3TextReranker());
+    try std.testing.expect(manifest.isQwen3GenerativeReranker());
+}
+
+test "Qwen3 sentence-transformers LogitScore sidecar selects generative reranking" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "model");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/config.json",
+        .data =
+        \\{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3","max_position_embeddings":40960}
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model/modules.json",
+        .data =
+        \\[
+        \\  {"idx":0,"name":"0","path":"","type":"sentence_transformers.base.modules.transformer.Transformer"},
+        \\  {"idx":1,"name":"1","path":"1_LogitScore","type":"sentence_transformers.cross_encoder.modules.logit_score.LogitScore"}
+        \\]
+        ,
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model/model.safetensors", .data = "" });
+
+    const dir_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "model" });
+    defer allocator.free(dir_path);
+    var manifest = try loadFromDir(allocator, dir_path);
+    defer manifest.deinit();
+
+    try std.testing.expectEqual(ModelType.reranker, manifest.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.config, manifest.model_type_origin);
+    try std.testing.expect(manifest.isQwen3TextReranker());
+    try std.testing.expect(manifest.hasInput("text"));
+}
+
+test "Qwen3 LogitScore sidecar preserves an explicit serving role in full and listing manifests" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "config.json",
+        .data = "{\"architectures\":[\"Qwen3ForCausalLM\"],\"model_type\":\"qwen3\"}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "modules.json",
+        .data = "[{\"type\":\"sentence_transformers.cross_encoder.modules.logit_score.LogitScore\"}]",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model_manifest.json", .data = "{\"type\":\"generator\"}" });
+    const model_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(model_dir);
+    var full = try loadFromDir(allocator, model_dir);
+    defer full.deinit();
+    var listing = try loadListingFromDir(allocator, model_dir);
+    defer listing.deinit();
+    for ([_]*const ModelManifest{ &full, &listing }) |manifest| {
+        try std.testing.expectEqual(ModelType.generator, manifest.model_type);
+        try std.testing.expectEqual(ModelTypeOrigin.manifest, manifest.model_type_origin);
+        try std.testing.expect(!manifest.isQwen3TextReranker());
+    }
 }
 
 test "Whisper conditional generation config remains a transcriber" {
@@ -4357,6 +4497,129 @@ test "manifest detects gliner gguf head sidecar" {
     defer manifest.deinit();
     try std.testing.expect(manifest.gliner_head_gguf_path != null);
     try std.testing.expect(std.mem.endsWith(u8, manifest.gliner_head_gguf_path.?, "gliner_head.gguf"));
+}
+
+test "Qwen3 embedder tokenizer scan policy preserves wrappers and undeclared models" {
+    const base = ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .embedder,
+        .embedding_style = .qwen3_embedding,
+        .model_manifest_declarations = .{ .model_type = true, .embedding_style = true },
+    };
+    try std.testing.expect(canSkipQwen3EmbedderGlinerTokenScan(&base, "/models/qwen", "{}"));
+    try std.testing.expect(canSkipQwen3EmbedderGlinerTokenScan(&base, "/models/qwen", "{\"vocab\":{\"\\\\u\":10}}"));
+    inline for (.{ "[", "[[P", "[SEP_TEXT", "\\", "\\u", "\\u123", "\\u12g4", "[X][p]\\n" }) |fragment| {
+        try std.testing.expect(canSkipQwen3EmbedderGlinerTokenScan(&base, "/models/qwen", fragment));
+    }
+    inline for (.{ "[P]", "[C]", "[E]", "[R]", "[SEP_TEXT]", "\\u005bP]", "[\\u0050]", "[P\\u005D" }) |marker| {
+        try std.testing.expect(!canSkipQwen3EmbedderGlinerTokenScan(&base, "/models/qwen", marker));
+    }
+    try std.testing.expect(!canSkipQwen3EmbedderGlinerTokenScan(&base, "/models/qwen", "[[X][SEP_TEXT]"));
+    try std.testing.expect(!canSkipQwen3EmbedderGlinerTokenScan(&base, "/models/qwen", "\\\\u005B"));
+    try std.testing.expect(!canSkipQwen3EmbedderGlinerTokenScan(&base, "/models/GLiNER-wrapper/qwen", "{}"));
+    var variants = [_]ModelManifest{base} ** 9;
+    variants[0].model_manifest_declarations.model_type = false;
+    variants[1].model_manifest_declarations.embedding_style = false;
+    variants[2].model_type = .reranker;
+    variants[3].embedding_style = .none;
+    variants[4].config_model_arch = "extractor";
+    variants[5].gliner_model_type = "gliner2";
+    variants[6].gliner_head_gguf_path = "head.gguf";
+    variants[7].gliner_head_safetensors_path = "head.safetensors";
+    var extra_tasks = [_][]const u8{"extract"};
+    variants[8].tasks = &extra_tasks;
+    for (&variants) |*manifest| try std.testing.expect(!canSkipQwen3EmbedderGlinerTokenScan(manifest, "/models/qwen", "{}"));
+    var extra_capabilities = [_][]const u8{"extraction"};
+    var multitask = base;
+    multitask.capabilities = &extra_capabilities;
+    try std.testing.expect(!canSkipQwen3EmbedderGlinerTokenScan(&multitask, "/models/qwen", "{}"));
+}
+
+test "Qwen3 embedder unused tokenizer scan preserves fresh manifests GGUF and file errors" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const declaration = "{\"type\":\"embedder\",\"embedding_style\":\"qwen3_embedding\",\"pooling\":\"mean\",\"normalize\":false,\"inputs\":[\"text\"]}";
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = declaration });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "tokenizer.json",
+        .data = "{\"added_tokens\":[{\"id\":10,\"content\":\"ordinary\"}]}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "tokenizer_config.json",
+        .data = "{\"eos_token\":\"end\",\"add_eos_token\":false}",
+    });
+    const gguf = try buildTestGgufWithQwen3Pooling(allocator, 3);
+    defer allocator.free(gguf);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = gguf });
+    const model_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(model_dir);
+    {
+        var manifest = try loadFromDir(allocator, model_dir);
+        defer manifest.deinit();
+        try std.testing.expectEqual(@as(i32, 0), manifest.gliner_token_p);
+        try std.testing.expectEqual(ModelType.embedder, manifest.model_type);
+        try std.testing.expectEqual(ModelTypeOrigin.manifest, manifest.model_type_origin);
+        try std.testing.expectEqualStrings("qwen3", manifest.config_model_arch);
+        try std.testing.expectEqual(@as(u32, 32768), manifest.max_position_embeddings);
+        try std.testing.expectEqual(PoolingStrategy.mean, manifest.pooling);
+        try std.testing.expect(!manifest.normalize);
+        try std.testing.expect(manifest.hasInput("text") and !manifest.hasInput("image"));
+        try std.testing.expectEqual(TokenizerType.huggingface, manifest.tokenizer_type.?);
+        try std.testing.expectEqualStrings("end", manifest.eos_token);
+        try std.testing.expect(manifest.add_eos_token);
+        try std.testing.expect(manifest.hasEmbeddingTaskProfile());
+        try std.testing.expectEqualStrings(qwen3_embedding_default_query_prefix, manifest.queryPrefix());
+    }
+    // Markers must survive even when a contradictory wrapper architecture is
+    // discovered only later in GGUF metadata, after the scan decision.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "tokenizer.json",
+        .data = "{\"added_tokens\":[{\"id\":10,\"content\":\"\\u005bP]\"},{\"id\":11,\"content\":\"[C]\"},{\"id\":12,\"content\":\"[E]\"},{\"id\":13,\"content\":\"[R]\"},{\"id\":14,\"content\":\"[SEP_TEXT]\"}]}",
+    });
+    var wrapper_gguf = std.ArrayListUnmanaged(u8).empty;
+    defer wrapper_gguf.deinit(allocator);
+    try wrapper_gguf.appendSlice(allocator, gguf_format.magic);
+    try appendTestLe(u32, allocator, &wrapper_gguf, 3);
+    try appendTestLe(u64, allocator, &wrapper_gguf, 0);
+    try appendTestLe(u64, allocator, &wrapper_gguf, 1);
+    try appendTestMetadataString(allocator, &wrapper_gguf, "general.architecture", "extractor");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = wrapper_gguf.items });
+    {
+        var manifest = try loadFromDir(allocator, model_dir);
+        defer manifest.deinit();
+        try std.testing.expectEqualStrings("extractor", manifest.config_model_arch);
+        try std.testing.expectEqualStrings("gliner2", manifest.gliner_model_type);
+        try std.testing.expectEqual(@as(i32, 10), manifest.gliner_token_p);
+        try std.testing.expectEqual(@as(i32, 14), manifest.gliner_token_sep_text);
+    }
+    // A newly added wrapper sidecar must also preserve all marker IDs.
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = gguf });
+    try tmp.dir.writeFile(io, .{ .sub_path = "gliner_config.json", .data = "{\"model_type\":\"gliner2\"}" });
+    {
+        var manifest = try loadFromDir(allocator, model_dir);
+        defer manifest.deinit();
+        try std.testing.expectEqualStrings("gliner2", manifest.gliner_model_type);
+        try std.testing.expectEqual(@as(i32, 10), manifest.gliner_token_p);
+        try std.testing.expectEqual(@as(i32, 11), manifest.gliner_token_c);
+        try std.testing.expectEqual(@as(i32, 12), manifest.gliner_token_e);
+        try std.testing.expectEqual(@as(i32, 13), manifest.gliner_token_r);
+        try std.testing.expectEqual(@as(i32, 14), manifest.gliner_token_sep_text);
+    }
+    try tmp.dir.deleteFile(io, "gliner_config.json");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model_manifest.json",
+        .data = "{\"type\":\"embedder\",\"embedding_style\":\"qwen3_embedding\",\"pooling\":\"lasst\"}",
+    });
+    try std.testing.expectError(error.InvalidModelManifest, loadFromDir(allocator, model_dir));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = declaration });
+    // A sparse oversized file proves the fresh read still fails before any
+    // JSON scan, without allocating or writing a vocabulary-sized fixture.
+    const oversized = try tmp.dir.createFile(io, "tokenizer.json", .{});
+    defer oversized.close(io);
+    try oversized.setLength(io, 100 * 1024 * 1024 + 1);
+    try std.testing.expectError(error.FileTooLarge, loadFromDir(allocator, model_dir));
 }
 
 test "manifest reads gliner special tokens from tokenizer json" {
@@ -5971,7 +6234,7 @@ test "qwen3 embedding GGUF metadata configures last pooling and full context" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const gguf_bytes = try buildTestGgufWithQwen3Embedding(allocator);
+    const gguf_bytes = try buildTestGgufWithQwen3Pooling(allocator, 3);
     defer allocator.free(gguf_bytes);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "qwen3-embedding-q8_0.gguf", .data = gguf_bytes });
 
@@ -5998,7 +6261,7 @@ test "model manifest execution fields override qwen GGUF metadata" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const gguf_bytes = try buildTestGgufWithQwen3Embedding(allocator);
+    const gguf_bytes = try buildTestGgufWithQwen3Pooling(allocator, 3);
     defer allocator.free(gguf_bytes);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "qwen3-embedding-q8_0.gguf", .data = gguf_bytes });
     try tmp.dir.writeFile(std.testing.io, .{
@@ -6020,6 +6283,43 @@ test "model manifest execution fields override qwen GGUF metadata" {
     try std.testing.expect(!manifest.normalize);
     try std.testing.expectEqual(EmbeddingStyle.none, manifest.embedding_style);
     try std.testing.expectEqual(@as(u32, 32768), manifest.max_position_embeddings);
+}
+
+test "qwen3 rank pooling GGUF metadata configures generative reranking" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const gguf_bytes = try buildTestGgufWithQwen3Pooling(allocator, 4);
+    defer allocator.free(gguf_bytes);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "qwen3-reranker-q8_0.gguf", .data = gguf_bytes });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+    var manifest = try loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+
+    try std.testing.expectEqualStrings("qwen3", manifest.config_model_arch);
+    try std.testing.expectEqual(ModelType.reranker, manifest.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.config, manifest.model_type_origin);
+    try std.testing.expect(manifest.isQwen3TextReranker());
+}
+
+test "qwen3 rank pooling preserves an explicit model manifest serving role" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const gguf_bytes = try buildTestGgufWithQwen3Pooling(allocator, 4);
+    defer allocator.free(gguf_bytes);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "qwen3-reranker-q8_0.gguf", .data = gguf_bytes });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model_manifest.json", .data = "{\"type\":\"generator\"}" });
+    const model_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(model_dir);
+    var manifest = try loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+    try std.testing.expectEqual(ModelType.generator, manifest.model_type);
+    try std.testing.expectEqual(ModelTypeOrigin.manifest, manifest.model_type_origin);
+    try std.testing.expect(!manifest.isQwen3TextReranker());
 }
 
 test "colocated GGUF does not overwrite selected safetensors BERT config" {
@@ -6140,7 +6440,7 @@ fn buildTestGgufWithBertT5Tokenizer(allocator: std.mem.Allocator) ![]u8 {
     return data.toOwnedSlice(allocator);
 }
 
-fn buildTestGgufWithQwen3Embedding(allocator: std.mem.Allocator) ![]u8 {
+fn buildTestGgufWithQwen3Pooling(allocator: std.mem.Allocator, pooling_type: u32) ![]u8 {
     var data = std.ArrayListUnmanaged(u8).empty;
     defer data.deinit(allocator);
 
@@ -6151,7 +6451,7 @@ fn buildTestGgufWithQwen3Embedding(allocator: std.mem.Allocator) ![]u8 {
 
     try appendTestMetadataString(allocator, &data, "general.architecture", "qwen3");
     try appendTestMetadataU32(allocator, &data, "qwen3.context_length", 32768);
-    try appendTestMetadataU32(allocator, &data, "qwen3.pooling_type", 3);
+    try appendTestMetadataU32(allocator, &data, "qwen3.pooling_type", pooling_type);
     try appendTestMetadataString(allocator, &data, "tokenizer.ggml.model", "gpt2");
     try appendTestMetadataStringArray(allocator, &data, "tokenizer.ggml.tokens", &.{
         "<|endoftext|>",

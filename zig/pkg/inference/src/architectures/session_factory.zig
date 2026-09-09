@@ -4180,7 +4180,7 @@ fn shouldKeepResidentGptEmbeddingQuantizedOnly(
 ) bool {
     return switch (config.family) {
         .gemma => isCudaResidentEmbeddingQuantType(tensor_type),
-        .llama, .mistral, .qwen2, .bitnet => std.meta.eql(tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q8_0 }),
+        .llama, .mistral, .qwen2, .qwen3, .bitnet => std.meta.eql(tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q8_0 }),
         else => false,
     };
 }
@@ -4197,6 +4197,24 @@ fn shouldKeepResidentGptWeightQuantizedOnly(
     key: []const u8,
     tensor_type: ?gguf_mod.tensor_types.TensorType,
 ) bool {
+    // Qwen3's resident CPU/GPU paths can consume these Q8 matrices directly.
+    // Keep other formats and auxiliary tensors on their existing load policy
+    // until their quantized-only execution paths have been qualified.
+    if (config.family == .qwen3) {
+        const tt = tensor_type orelse return false;
+        if (!std.meta.eql(tt, gguf_mod.tensor_types.TensorType{ .known = .Q8_0 })) return false;
+        if (std.mem.eql(u8, key, "model.embed_tokens.weight") or
+            std.mem.eql(u8, key, "lm_head.weight") or
+            std.mem.eql(u8, key, "cls.output.weight")) return true;
+        if (!std.mem.startsWith(u8, key, "model.layers.")) return false;
+        return std.mem.endsWith(u8, key, ".self_attn.q_proj.weight") or
+            std.mem.endsWith(u8, key, ".self_attn.k_proj.weight") or
+            std.mem.endsWith(u8, key, ".self_attn.v_proj.weight") or
+            std.mem.endsWith(u8, key, ".self_attn.o_proj.weight") or
+            std.mem.endsWith(u8, key, ".mlp.gate_proj.weight") or
+            std.mem.endsWith(u8, key, ".mlp.up_proj.weight") or
+            std.mem.endsWith(u8, key, ".mlp.down_proj.weight");
+    }
     return switch (config.family) {
         .llama, .mistral, .qwen2, .gemma, .bitnet => blk: {
             if (isGptEmbeddingTableKey(key)) {
@@ -6413,6 +6431,7 @@ fn makeComputeBackend(
                 NativeCompute.initWithIo(allocator, &self.backend_data.native, run_budget, io_handle)
             else
                 NativeCompute.init(allocator, &self.backend_data.native, run_budget);
+            compute.borrow_bf16_linear_weights = self.arch_config == .gpt and self.arch_config.gpt.family == .qwen3;
             break :blk compute.computeBackend();
         },
         .metal => try makeGpuHostedComputeBackend(self, allocator, run_budget),
@@ -7002,6 +7021,10 @@ pub fn attachSharedPrefetchState(session: Session, shared_prefetch: *runtime.tie
     }
 }
 
+fn isQwen3GenerativeRerankerFamily(family: gpt_arch.ModelFamily) bool {
+    return family == .qwen3 or family == .qwen3_vl;
+}
+
 fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
     return archRunImpl(ptr, inputs, allocator, null);
 }
@@ -7288,12 +7311,12 @@ fn archRunImpl(
             const seq_len: usize = @intCast(input_ids_tensor.shape[1]);
             const input_ids = input_ids_tensor.asInt64();
 
-            if (self.task == .classifier and (cfg.family == .qwen3_vl or cfg.family == .qwen3)) {
+            if (self.task == .classifier and isQwen3GenerativeRerankerFamily(cfg.family)) {
                 if (inputs.len < 2 or !std.mem.eql(u8, inputs[1].name, "attention_mask")) {
                     return error.MissingInputs;
                 }
                 const attention_mask = inputs[1].asInt64();
-                const logits = try gpt_arch.qwen3VlRerankerLogits(
+                const logits = try gpt_arch.qwen3RerankerLogits(
                     &cb,
                     allocator,
                     cfg,
@@ -8087,7 +8110,7 @@ fn archInputInfo(ptr: *anyopaque) []const TensorInfo {
 fn archOutputInfo(ptr: *anyopaque) []const TensorInfo {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     if (self.task == .classifier and self.arch_config == .gpt and
-        self.arch_config.gpt.family == .qwen3_vl)
+        isQwen3GenerativeRerankerFamily(self.arch_config.gpt.family))
     {
         return &.{
             .{ .name = "logits", .dtype = .f32, .shape = &.{ -1, 1 } },
@@ -8257,6 +8280,12 @@ test "Qwen3-VL reranker BF16 budget covers mapped and backend weight domains" {
         manifest,
         .{ .gpt = .{ .family = .qwen2 } },
     ));
+}
+
+test "Qwen3 text and vision families share generative reranker session output" {
+    try std.testing.expect(isQwen3GenerativeRerankerFamily(.qwen3));
+    try std.testing.expect(isQwen3GenerativeRerankerFamily(.qwen3_vl));
+    try std.testing.expect(!isQwen3GenerativeRerankerFamily(.qwen2));
 }
 
 test "Qwen3-VL reranker GGUF budget reserves image projector host envelope" {
@@ -8998,6 +9027,39 @@ test "Gemma resident embeddings retain CUDA-supported quantized formats" {
 
     const llama_cfg: gpt_mod.Config = .{ .family = .llama };
     try std.testing.expect(!shouldKeepResidentGptEmbeddingQuantizedOnly(llama_cfg, .{ .known = .Q6_K }));
+}
+
+test "Qwen3 resident quantized-only policy covers Q8 embedding projections and reranker head" {
+    const config: gpt_mod.Config = .{ .family = .qwen3 };
+    const q8: gguf_mod.tensor_types.TensorType = .{ .known = .Q8_0 };
+    try std.testing.expect(shouldKeepResidentGptEmbeddingQuantizedOnly(config, q8));
+    try std.testing.expect(!shouldKeepResidentGptEmbeddingQuantizedOnly(config, .{ .known = .Q4_K }));
+    for ([_][]const u8{
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+        "cls.output.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.v_proj.weight",
+        "model.layers.27.self_attn.o_proj.weight",
+        "model.layers.27.mlp.gate_proj.weight",
+        "model.layers.27.mlp.up_proj.weight",
+        "model.layers.27.mlp.down_proj.weight",
+    }) |key| {
+        try std.testing.expect(shouldKeepResidentGptWeightQuantizedOnly(config, key, q8));
+        try std.testing.expect(!shouldKeepResidentGptWeightQuantizedOnly(config, key, .{ .known = .Q4_K }));
+        try std.testing.expect(!shouldKeepResidentGptWeightQuantizedOnly(config, key, .{ .known = .BF16 }));
+        try std.testing.expect(!shouldKeepResidentGptWeightQuantizedOnly(config, key, null));
+    }
+    for ([_][]const u8{
+        "model.layers.0.input_layernorm.weight",
+        "model.layers.0.self_attn.q_norm.weight",
+        "model.layers.0.self_attn.q_proj.bias",
+        "model.layers.0.block_sparse_moe.experts.0.w1.weight",
+        "model.layers.0.block_sparse_moe.gate.weight",
+        "model.per_layer_input.per_layer_token_embd.weight",
+        "visual.blocks.0.self_attn.q_proj.weight",
+    }) |key| try std.testing.expect(!shouldKeepResidentGptWeightQuantizedOnly(config, key, q8));
 }
 
 test "serving policy does not disable existing gguf weight mappings" {

@@ -1426,6 +1426,10 @@ pub const EmbeddingPipeline = struct {
             return self.residentProjectionFallback(.text, "text.encoder.qwen3.resident", batch, "not_metal_backend");
         }
 
+        if (try self.tryEmbedTextResidentQwen3Graph(cb, cfg, mask, input_ids, batch, seq_len)) |graph_embeddings| {
+            return graph_embeddings;
+        }
+
         const prepare = try cb.decoderRuntimePrepareOrReuseFamily(
             self.allocator,
             cfg,
@@ -1434,10 +1438,6 @@ pub const EmbeddingPipeline = struct {
         );
         if (!prepare.prepared) {
             return self.residentProjectionFallback(.text, "text.prepare.qwen3.resident", batch, "prepare_failed");
-        }
-
-        if (try self.tryEmbedTextResidentQwen3Graph(cb, cfg, mask, input_ids, batch, seq_len)) |graph_embeddings| {
-            return graph_embeddings;
         }
 
         const overrides = decoder_gated_runtime.buildOverridesWithLevel(
@@ -1501,101 +1501,33 @@ pub const EmbeddingPipeline = struct {
         batch: usize,
         seq_len: usize,
     ) !?[][]f32 {
-        if (cfg.num_hidden_layers == 0 or cfg.num_hidden_layers > 256) {
-            return null;
-        }
-        if (input_ids.len != batch * seq_len) return error.ShapeMismatch;
-
-        var layer_storage: [256]ops_mod.DecoderRuntimeLayerSpec = undefined;
-        const layers = decoder_gated_runtime.fillDenseQwen3LayerSpecs(
-            cfg,
-            cfg.num_hidden_layers,
-            &layer_storage,
-        ) catch {
-            return null;
-        };
-
-        const planned = try cb.decoderRuntimePlanPrefillFrame(&.{
-            .contract = .qwen3_dense_text_embedding,
-            .layer_count = layers.len,
-            .rows = batch * seq_len,
-            .batch = batch,
-            .seq_len = seq_len,
-            .hidden_size = cfg.hidden_size,
-            .vocab_size = cfg.vocab_size,
-            .num_attention_heads = cfg.num_attention_heads,
-            .global_head_dim = cfg.global_head_dim,
-            .ple_hidden_size = 0,
-            .final_norm_slot = decoder_gated_runtime.finalNormSlot(cfg.num_hidden_layers),
-            .final_lm_head_slot = 0,
-            .include_tail = false,
-            .layers = layers,
-        });
-        if (!planned) {
-            return null;
-        }
-
-        const embed_w = try gpt_arch.getEmbeddingWeight(cb, cfg);
-        defer cb.free(embed_w);
-        const hidden = try cb.embeddingLookup(embed_w, input_ids, batch * seq_len, cfg.hidden_size);
-        defer cb.free(hidden);
-
-        var active = try cb.decoderRuntimeBeginFrame();
-        if (!active) {
-            return null;
-        }
-        errdefer if (active) cb.decoderRuntimeCancelFrame() catch {};
-
-        var graph_hidden: ?ops_mod.CT = null;
-        const attention = ops_mod.AttentionContext{
-            .mode = .dense_causal,
-            .total_sequence_len = seq_len,
-            .query_sequence_len = seq_len,
-            .kv_sequence_len = seq_len,
-        };
+        const selected_rows = if (self.config.pooling == .last)
+            gpt_arch.activeFinalRowIndices(i32, self.allocator, mask, batch, seq_len) catch |err| switch (err) {
+                error.InvalidRerankerAttentionMask, error.InvalidRerankerInputShape => return null,
+                else => return err,
+            }
+        else
+            null;
+        defer if (selected_rows) |rows| self.allocator.free(rows);
         const encoder_start = embedTimingStart(self.print_timing);
-        const executed = try cb.decoderRuntimeExecuteGraphCommandPlanFrame(&.{
-            .contract = .qwen3_dense_text_embedding,
-            .layer_count = layers.len,
-            .rows = batch * seq_len,
-            .batch = batch,
-            .seq_len = seq_len,
-            .hidden_size = cfg.hidden_size,
-            .vocab_size = cfg.vocab_size,
-            .num_attention_heads = cfg.num_attention_heads,
-            .global_head_dim = cfg.global_head_dim,
-            .ple_hidden_size = 0,
-            .final_norm_slot = decoder_gated_runtime.finalNormSlot(cfg.num_hidden_layers),
-            .norm_eps = cfg.norm_eps,
-            .rope_freq_scale = cfg.rope_freq_scale,
-            .rope_consecutive_pairs = cfg.rope_layout == .consecutive_pairs,
-            .activation = gpt_arch.decoderRuntimeActivationKind(cfg.activation),
-            .attention = attention,
-            .hidden = hidden,
-            .ple_vectors = null,
-            .layers = layers,
-            .output_hidden = &graph_hidden,
-        });
-        if (!executed) {
-            try cb.decoderRuntimeCancelFrame();
-            active = false;
-            return null;
-        }
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        active = false;
+        const output = (try gpt_arch.tryDenseQwen3Prefill(cb, self.allocator, cfg, input_ids, mask, batch, seq_len, .{
+            .output_rows = selected_rows,
+            .profile = embedTimingEnabled(self.print_timing),
+        })) orelse return null;
+        defer cb.free(output);
         logEmbedTiming("text.encoder.qwen3.graph", batch, encoder_start);
-
-        const output = graph_hidden orelse return error.NoOutputTensors;
-        // encoder_outputs.deinit() owns and frees output_storage; a defer
-        // free here would double-free the slice (heap corruption).
-        const output_storage = try self.allocator.alloc(ops_mod.CT, 1);
-        output_storage[0] = output;
+        if (embedTimingEnabled(self.print_timing)) {
+            const stats = cb.debugTimingSnapshot().provider;
+            std.debug.print("qwen3_embedding_metal_timing: batch={d} seq={d} hd128_dispatches={d} stages={any}\n", .{
+                batch, seq_len, stats.metal_dense_causal_hd128_dispatches, stats.metal_stage_timing,
+            });
+        }
+        var output_storage = [_]ops_mod.CT{output};
         var encoder_outputs = session_mod.ResidentOutputs{
-            .outputs = output_storage,
+            .outputs = &output_storage,
             .backend = cb,
             .allocator = self.allocator,
         };
-        defer encoder_outputs.deinit();
 
         var pooled = self.residentPoolTextOutput(&encoder_outputs, mask, batch, seq_len) catch |err| switch (err) {
             error.UnsupportedResidentTextPooling,
@@ -2412,12 +2344,7 @@ fn residentQwen3EmbeddingEligible(session: backends.Session, cfg: gpt_arch.Confi
 fn residentQwen3EmbeddingEligibleForBackend(backend: backends.BackendType, cfg: gpt_arch.Config, embedding_config: EmbeddingConfig) bool {
     if (!embedding_config.resident_qwen3_embedding) return false;
     if (backend != .metal) return false;
-    if (cfg.family != .qwen3) return false;
-    if (cfg.usesMoe() or cfg.hasPle() or cfg.isMultimodal()) return false;
-    if (cfg.num_kv_shared_layers != 0) return false;
-    if (cfg.global_head_dim != 0 or cfg.num_global_key_value_heads != 0) return false;
-    if (cfg.sliding_window != 0) return false;
-    return true;
+    return gpt_arch.denseQwen3PrefillEligible(cfg);
 }
 
 fn envFlagEnabled(value: []const u8) bool {
@@ -2841,6 +2768,9 @@ test "active token length trims trailing padding but keeps at least one token" {
 test "resident qwen3 embedding eligibility accepts dense metal qwen3 only" {
     var cfg = gpt_arch.Config{
         .family = .qwen3,
+        .norm_type = .rms_norm,
+        .position_encoding = .rope,
+        .activation = .silu,
         .hidden_size = 1024,
         .num_hidden_layers = 28,
         .num_attention_heads = 16,

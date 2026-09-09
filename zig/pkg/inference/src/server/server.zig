@@ -1410,6 +1410,7 @@ const max_generate_batch_items: usize = 128;
 const max_read_batch_images: usize = 64;
 const default_read_admission_max_tokens: usize = 256;
 const max_read_tokens: usize = 1024;
+const default_qwen3vl_ocr_prompt = "Transcribe all visible text exactly. Preserve the original reading order, line breaks, punctuation, and accents. Return only the transcription.";
 const default_max_read_batch_bytes: usize = 256 * 1024 * 1024;
 const default_max_request_media_bytes: usize = 100 * 1024 * 1024;
 const read_admission_bytes_per_unit: usize = 16 * 1024 * 1024;
@@ -3056,11 +3057,18 @@ fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) Mod
         const capabilities = if (maybe_manifest) |*man| man.capabilities else &.{};
         const gliner_model_type = if (maybe_manifest) |*man| man.gliner_model_type else "";
         const zero_shot_classification = if (maybe_manifest) |*man| manifestSupportsZeroShotClassification(man) else false;
+        const qwen3vl_reader = if (maybe_manifest) |*man| isQwen3VlReadModel(man) else false;
 
         for (task_names) |task| {
             if (std.mem.eql(u8, task, "chunkers")) continue;
-            if (std.mem.eql(u8, task, "readers") and !try readers_mod.isSupportedModelDir(allocator, entry.path)) continue;
-            if (taskMatchesModelListing(task, @tagName(entry.kind), gliner_model_type, tasks, capabilities, zero_shot_classification)) {
+            if (std.mem.eql(u8, task, "readers") and
+                !qwen3vl_reader and
+                !try readers_mod.isSupportedModelDir(allocator, entry.path)) continue;
+            const matches = if (maybe_manifest) |*man|
+                manifestMatchesModelListingTask(task, @tagName(entry.kind), man)
+            else
+                taskMatchesModelListing(task, @tagName(entry.kind), gliner_model_type, tasks, capabilities, zero_shot_classification);
+            if (matches) {
                 incrementModelCount(&counts, task);
             }
         }
@@ -3083,14 +3091,7 @@ fn collectModelCounts(node: *Node, allocator: std.mem.Allocator, io: std.Io) Mod
         const model_task = @tagName(model.manifest.model_type);
         for (task_names) |task| {
             if (std.mem.eql(u8, task, "chunkers")) continue;
-            if (taskMatchesModelListing(
-                task,
-                model_task,
-                model.manifest.gliner_model_type,
-                model.manifest.tasks,
-                model.manifest.capabilities,
-                manifestSupportsZeroShotClassification(&model.manifest),
-            )) {
+            if (manifestMatchesModelListingTask(task, model_task, &model.manifest)) {
                 incrementModelCount(&counts, task);
             }
         }
@@ -3127,19 +3128,14 @@ fn collectDiscoveredModelCounts(models_dir: []const u8, allocator: std.mem.Alloc
         defer man.deinit();
         if (!model_manager_mod.isManifestPotentiallyLoadableInCurrentBuild(man)) continue;
 
-        const zero_shot_classification = manifestSupportsZeroShotClassification(&man);
+        const qwen3vl_reader = isQwen3VlReadModel(&man);
 
         for (task_names) |task| {
             if (std.mem.eql(u8, task, "chunkers")) continue;
-            if (std.mem.eql(u8, task, "readers") and !(try readers_mod.probeManifest(allocator, entry.path, man)).isSupported()) continue;
-            if (taskMatchesModelListing(
-                task,
-                @tagName(man.model_type),
-                man.gliner_model_type,
-                man.tasks,
-                man.capabilities,
-                zero_shot_classification,
-            )) {
+            if (std.mem.eql(u8, task, "readers") and
+                !qwen3vl_reader and
+                !(try readers_mod.probeManifest(allocator, entry.path, man)).isSupported()) continue;
+            if (manifestMatchesModelListingTask(task, @tagName(man.model_type), &man)) {
                 incrementModelCount(&counts, task);
             }
         }
@@ -3541,42 +3537,12 @@ pub const Node = struct {
             if (self.execution_control) |control| try control.check();
             const node = self.node orelse return error.InvalidGenerationAdmission;
             if (self.prepared) return error.InvalidGenerationAdmission;
-
-            const actual = try directGeneratePreflightForMessages(messages);
-            if (actual.text_bytes != self.expected.text_bytes or
-                actual.decoded_media_bytes != self.expected.decoded_media_bytes or
-                actual.media_count != self.expected.media_count or
-                actual.image_count != self.expected.image_count or
-                actual.has_audio != self.expected.has_audio)
-            {
-                return error.InvalidGenerationAdmission;
-            }
-
-            if (actual.image_count > 0) {
-                const max_dimension = effectiveRequestContentSecurity(node).max_image_dimension;
-                const decoded_pixel_cap = readDecodedPixelCapForLimits(
-                    actual.image_count,
-                    node.inference_admission.capacity,
-                    max_dimension,
-                    self.resident_bytes,
-                );
-                const image_admission = ReadRequestAdmission{
-                    .units = self.reserved_units,
-                    .byte_cap = self.resident_bytes,
-                    .resident_byte_cap = self.resident_bytes,
-                    .decoded_pixel_cap = decoded_pixel_cap,
-                };
-                var decoded_budget = ReadDecodedImageBudget.init(image_admission, max_dimension);
-                for (messages) |message| {
-                    if (message.image_bytes) |images| {
-                        for (images) |image_bytes| try decoded_budget.addImage(image_bytes);
-                    }
-                }
-
-                const required_units = @max(self.reserved_units, decoded_budget.requiredUnits());
-                try node.growAdmissionUnits(self.reserved_units, required_units);
-                self.reserved_units = required_units;
-            }
+            try node.prepareDirectGenerateMessages(
+                messages,
+                self.expected,
+                self.resident_bytes,
+                &self.reserved_units,
+            );
             self.prepared = true;
         }
 
@@ -4463,6 +4429,49 @@ pub const Node = struct {
         };
     }
 
+    fn prepareDirectGenerateMessages(
+        self: *Node,
+        messages: []const generation.Message,
+        expected: DirectGeneratePreflight,
+        resident_bytes: usize,
+        reserved_units: *usize,
+    ) !void {
+        const actual = try directGeneratePreflightForMessages(messages);
+        if (actual.text_bytes != expected.text_bytes or
+            actual.decoded_media_bytes != expected.decoded_media_bytes or
+            actual.media_count != expected.media_count or
+            actual.image_count != expected.image_count or
+            actual.has_audio != expected.has_audio)
+        {
+            return error.InvalidGenerationAdmission;
+        }
+
+        if (actual.image_count == 0) return;
+        const max_dimension = effectiveRequestContentSecurity(self).max_image_dimension;
+        const decoded_pixel_cap = readDecodedPixelCapForLimits(
+            actual.image_count,
+            self.inference_admission.capacity,
+            max_dimension,
+            resident_bytes,
+        );
+        const image_admission = ReadRequestAdmission{
+            .units = reserved_units.*,
+            .byte_cap = resident_bytes,
+            .resident_byte_cap = resident_bytes,
+            .decoded_pixel_cap = decoded_pixel_cap,
+        };
+        var decoded_budget = ReadDecodedImageBudget.init(image_admission, max_dimension);
+        for (messages) |message| {
+            if (message.image_bytes) |images| {
+                for (images) |image_bytes| try decoded_budget.addImage(image_bytes);
+            }
+        }
+
+        const required_units = @max(reserved_units.*, decoded_budget.requiredUnits());
+        try self.growAdmissionUnits(reserved_units.*, required_units);
+        reserved_units.* = required_units;
+    }
+
     pub fn generateMessagesDirectAdmitted(
         self: *Node,
         allocator: std.mem.Allocator,
@@ -4504,6 +4513,13 @@ pub const Node = struct {
         setup_ms: u64 = 0,
         generate_ms: u64 = 0,
         total_ms: u64 = 0,
+    };
+
+    const DirectGenerateOutput = struct {
+        text: []u8,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        truncated: bool,
     };
 
     const NativePromptTokenCount = struct {
@@ -4600,12 +4616,64 @@ pub const Node = struct {
         pin_after_success: bool,
         a4b_request: ?ops.A4bInferenceRequest,
     ) ![]u8 {
+        const output = try self.generateMessagesDirectWithAdmissionResult(
+            allocator,
+            model_name,
+            messages,
+            admission,
+            preferred_backends,
+            cache_default_alias,
+            timing,
+            pin_after_success,
+            a4b_request,
+        );
+        return output.text;
+    }
+
+    fn generateMessagesDirectWithAdmissionResult(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        messages: []const generation.Message,
+        admission: *DirectGenerateAdmission,
+        preferred_backends: ?[]const backends_mod.BackendType,
+        cache_default_alias: bool,
+        timing: ?*DirectGenerateTiming,
+        pin_after_success: bool,
+        a4b_request: ?ops.A4bInferenceRequest,
+    ) !DirectGenerateOutput {
         if (messages.len == 0) return error.InvalidGenerationRequest;
         const admitted_node = admission.node orelse return error.InvalidGenerationAdmission;
         if (admitted_node != self) return error.InvalidGenerationAdmission;
         try admission.prepareMessages(messages);
-        const max_tokens = admission.max_tokens;
-        const execution_control = try admission.boundExecutionControl();
+        return self.generateMessagesDirectPrepared(
+            allocator,
+            model_name,
+            messages,
+            admission.max_tokens,
+            preferred_backends,
+            cache_default_alias,
+            timing,
+            pin_after_success,
+            a4b_request,
+            try admission.boundExecutionControl(),
+        );
+    }
+
+    fn generateMessagesDirectPrepared(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        messages: []const generation.Message,
+        max_tokens: i32,
+        preferred_backends: ?[]const backends_mod.BackendType,
+        cache_default_alias: bool,
+        timing: ?*DirectGenerateTiming,
+        pin_after_success: bool,
+        a4b_request: ?ops.A4bInferenceRequest,
+        supplied_control: InferenceExecutionControl,
+    ) !DirectGenerateOutput {
+        const execution_control = self.bindExecutionControl(null, supplied_control);
         try execution_control.update(.loading_model, 0, 1);
         const started_at_ns = embedTimingNowNs();
 
@@ -4833,7 +4901,12 @@ pub const Node = struct {
         }
         const text = try allocator.dupe(u8, result.text);
         if (pin_after_success) model_handle.pin();
-        return text;
+        return .{
+            .text = text,
+            .prompt_tokens = result.prompt_tokens,
+            .completion_tokens = result.tokens_used,
+            .truncated = std.mem.eql(u8, result.finish_reason, "length"),
+        };
     }
 
     pub fn warmConfiguredModels(self: *Node, allocator: std.mem.Allocator) !void {
@@ -5422,6 +5495,107 @@ pub const Node = struct {
         return attempt.vectors.?;
     }
 
+    const Qwen3VlReadResult = struct {
+        text: []u8,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+
+        fn deinit(self: *Qwen3VlReadResult, allocator: std.mem.Allocator) void {
+            allocator.free(self.text);
+            self.* = undefined;
+        }
+    };
+
+    fn readQwen3VlImagesWithAdmission(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        image_datas: []const []const u8,
+        requested_prompt: ?[]const u8,
+        requested_max_tokens: ?usize,
+        reserved_units: *usize,
+        control: InferenceExecutionControl,
+    ) ![]Qwen3VlReadResult {
+        try control.update(.loading_model, 0, 1);
+        const prompt = qwen3VlReadPrompt(requested_prompt);
+        const max_tokens: i32 = @intCast(requested_max_tokens orelse default_read_admission_max_tokens);
+        // Keep one handle alive across the serial batch so another request
+        // cannot evict the resident decoder/projector between page images.
+        // generateMessagesDirectPrepared acquires a short-lived execution
+        // handle for each item and therefore reuses this same loaded model.
+        var resident_model_handle = try self.model_manager.acquireFromDirWithControl(model_path, control);
+        defer resident_model_handle.release();
+        if (!isQwen3VlReadModel(&resident_model_handle.get().manifest))
+            return error.InvalidModelForReading;
+
+        const out = try allocator.alloc(Qwen3VlReadResult, image_datas.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |*item| item.deinit(allocator);
+            allocator.free(out);
+        }
+
+        for (image_datas, 0..) |image_data, i| {
+            try control.check();
+            const images = [_][]const u8{image_data};
+            const content_parts = [_]generation.Message.ContentPart{
+                .{ .image = 0 },
+                .{ .text = prompt },
+            };
+            const messages = [_]generation.Message{.{
+                .role = "user",
+                .content = prompt,
+                .image_bytes = &images,
+                .content_parts = &content_parts,
+            }};
+            const preflight = try directGeneratePreflightForMessages(&messages);
+            const generation_units = estimateGenerateAdmissionUnitsFromShape(
+                preflight.text_bytes,
+                preflight.media_count,
+                max_tokens,
+            );
+            const required_units = @max(reserved_units.*, generation_units);
+            try self.growAdmissionUnits(reserved_units.*, required_units);
+            reserved_units.* = required_units;
+            try self.prepareDirectGenerateMessages(
+                &messages,
+                preflight,
+                preflight.decoded_media_bytes,
+                reserved_units,
+            );
+
+            var read_timing = DirectGenerateTiming{};
+            const read_timing_enabled = serverGenerateTimingEnabled();
+            const generated = try self.generateMessagesDirectPrepared(
+                allocator,
+                model_path,
+                &messages,
+                max_tokens,
+                null,
+                false,
+                if (read_timing_enabled) &read_timing else null,
+                false,
+                null,
+                control,
+            );
+            if (read_timing_enabled) std.log.info(
+                "qwen3vl_read_timing_ms: page={d} resolve={d} load={d} setup={d} generate={d} total={d}",
+                .{ i, read_timing.resolve_ms, read_timing.load_ms, read_timing.setup_ms, read_timing.generate_ms, read_timing.total_ms },
+            );
+            if (generated.truncated) {
+                allocator.free(generated.text);
+                return error.ReadOutputTruncated;
+            }
+            out[i] = .{
+                .text = generated.text,
+                .prompt_tokens = generated.prompt_tokens,
+                .completion_tokens = generated.completion_tokens,
+            };
+            filled += 1;
+        }
+        return out;
+    }
+
     pub fn readImagesDirect(
         self: *Node,
         allocator: std.mem.Allocator,
@@ -5459,8 +5633,22 @@ pub const Node = struct {
         defer io_impl.deinit();
 
         const request_io = io_impl.io();
-        const model_path = try self.resolveModelPath(request_io, if (model_name.len > 0) model_name else null, "readers");
+        const model_path = try self.resolveReadModelPath(request_io, if (model_name.len > 0) model_name else null);
         defer self.allocator.free(model_path);
+        var admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        defer admission_manifest.deinit();
+        const is_qwen3vl = isQwen3VlReadModel(&admission_manifest);
+
+        if (is_qwen3vl) {
+            const generation_units = estimateGenerateAdmissionUnitsFromShape(
+                qwen3VlReadPrompt(request.prompt).len,
+                1,
+                @intCast(max_tokens orelse default_read_admission_max_tokens),
+            );
+            const required_units = @max(reserved_units, generation_units);
+            try self.growAdmissionUnits(reserved_units, required_units);
+            reserved_units = required_units;
+        }
 
         const downloaded = try allocator.alloc(scraping.DownloadedContent, request.images.len);
         var downloaded_count: usize = 0;
@@ -5497,9 +5685,37 @@ pub const Node = struct {
             image_datas[i] = downloaded[i].data;
         }
 
-        const required_units = @max(admission.units, decoded_budget.requiredUnits());
+        const required_units = @max(reserved_units, decoded_budget.requiredUnits());
         try self.growAdmissionUnits(reserved_units, required_units);
         reserved_units = required_units;
+
+        if (is_qwen3vl) {
+            const qwen_results = try self.readQwen3VlImagesWithAdmission(
+                allocator,
+                model_path,
+                image_datas,
+                request.prompt,
+                max_tokens,
+                &reserved_units,
+                control,
+            );
+            defer {
+                for (qwen_results) |*result| result.deinit(allocator);
+                allocator.free(qwen_results);
+            }
+
+            const out = try allocator.alloc(readers_api.Result, qwen_results.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |*result| readers_api.deinitResult(allocator, result);
+                allocator.free(out);
+            }
+            for (qwen_results, 0..) |result, i| {
+                out[i] = .{ .text = try allocator.dupe(u8, result.text) };
+                initialized += 1;
+            }
+            return out;
+        }
 
         var reader = try readers_mod.LoadedReader.loadFromDirWithControl(
             allocator,
@@ -6060,6 +6276,41 @@ pub const Node = struct {
         errdefer allocator.free(canonical);
         if (!pathHasComponentPrefix(canonical, root)) return error.ModelOutsideModelsDir;
         return canonical;
+    }
+
+    fn resolveReadRequestModelPath(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        name: ?[]const u8,
+    ) ![]const u8 {
+        const scopes = [_][]const u8{ "readers", "generators" };
+        for (scopes) |scope| {
+            if (self.resolveRequestModelPath(allocator, io, name, scope)) |path| {
+                return path;
+            } else |err| switch (requestModelResolutionErrorKind(err)) {
+                .missing => continue,
+                .invalid, .ambiguous, .internal => return err,
+            }
+        }
+        return error.ModelNotFound;
+    }
+
+    fn resolveReadModelPath(
+        self: *Node,
+        io: std.Io,
+        name: ?[]const u8,
+    ) ![]const u8 {
+        const scopes = [_][]const u8{ "readers", "generators" };
+        for (scopes) |scope| {
+            if (self.resolveModelPath(io, name, scope)) |path| {
+                return path;
+            } else |err| switch (requestModelResolutionErrorKind(err)) {
+                .missing => continue,
+                .invalid, .ambiguous, .internal => return err,
+            }
+        }
+        return error.ModelNotFound;
     }
 
     fn requestModelResolutionError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
@@ -12106,9 +12357,25 @@ pub const Node = struct {
 
         // Resolve model
         const model_name: ?[]const u8 = if (body.model.len > 0) body.model else null;
-        const model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, model_name, "readers") catch |err|
+        const model_path = self.resolveReadRequestModelPath(ctx.allocator, ctx.io, model_name) catch |err|
             return requestModelResolutionError(ctx, err);
         defer ctx.allocator.free(model_path);
+        var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        defer admission_manifest.deinit();
+        const is_qwen3vl = isQwen3VlReadModel(&admission_manifest);
+
+        if (is_qwen3vl) {
+            const prompt = qwen3VlReadPrompt(body.prompt);
+            const generation_units = estimateGenerateAdmissionUnitsFromShape(
+                prompt.len,
+                1,
+                @intCast(max_tokens orelse default_read_admission_max_tokens),
+            );
+            const required_units = @max(reserved_units, generation_units);
+            if (try self.growSlotUnits(ctx, reserved_units, required_units)) |resp| return resp;
+            reserved_units = required_units;
+        }
 
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena.deinit();
@@ -12166,9 +12433,65 @@ pub const Node = struct {
             item_owned = false;
         }
 
-        const required_units = @max(admission.units, decoded_budget.requiredUnits());
+        const required_units = @max(reserved_units, decoded_budget.requiredUnits());
         if (try self.growSlotUnits(ctx, reserved_units, required_units)) |resp| return resp;
         reserved_units = required_units;
+
+        if (is_qwen3vl) {
+            if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
+            const qwen_results = self.readQwen3VlImagesWithAdmission(
+                ctx.allocator,
+                model_path,
+                image_datas,
+                body.prompt,
+                max_tokens,
+                &reserved_units,
+                execution_control,
+            ) catch |err| switch (err) {
+                error.ReadOutputTruncated => return ctx.status(400).json(.{
+                    .@"error" = "OUTPUT_TRUNCATED",
+                    .message = "Qwen3-VL reached 'max_tokens' before completing OCR; increase 'max_tokens' and retry",
+                }),
+                error.ImageDecodeFailed => return readImageErrorResponse(ctx, err),
+                error.QueueFull => return transientCapacityFailureResponse(
+                    ctx,
+                    "SERVICE_UNAVAILABLE",
+                    "server at capacity for expanded request workload, try again later",
+                    "inference_admission",
+                ),
+                error.InvalidModelForReading => return ctx.status(400).json(.{
+                    .@"error" = "INVALID_MODEL",
+                    .message = "model does not support Qwen3-VL document reading",
+                }),
+                error.ModelArtifactsChanging,
+                error.IncompleteManagedDownload,
+                => return modelLoadFailureResponse(ctx, err),
+                else => return inferenceFailureResponse(ctx, err),
+            };
+            defer {
+                for (qwen_results) |*result| result.deinit(ctx.allocator);
+                ctx.allocator.free(qwen_results);
+            }
+
+            var prompt_tokens: usize = 0;
+            var completion_tokens: usize = 0;
+            for (qwen_results, 0..) |result, i| {
+                prompt_tokens = std.math.add(usize, prompt_tokens, result.prompt_tokens) catch std.math.maxInt(usize);
+                completion_tokens = std.math.add(usize, completion_tokens, result.completion_tokens) catch std.math.maxInt(usize);
+                results_out[i] = .{
+                    .text = try alloc.dupe(u8, result.text),
+                    .object = "read",
+                    .index = @intCast(i),
+                };
+                filled = i + 1;
+            }
+            return ctx.json(api.ReadResponse{
+                .object = "list",
+                .data = results_out,
+                .model = body.model,
+                .usage = tokenUsage(prompt_tokens, completion_tokens),
+            });
+        }
 
         var reader = readers_mod.LoadedReader.loadFromDirWithControl(
             ctx.allocator,
@@ -12737,14 +13060,8 @@ pub const Node = struct {
                 continue;
             }
             const model_kind = @tagName(manifest.model_type);
-            const reader_candidate = taskMatchesModelListing(
-                "readers",
-                model_kind,
-                manifest.gliner_model_type,
-                manifest.tasks,
-                manifest.capabilities,
-                manifestSupportsZeroShotClassification(&manifest),
-            );
+            const qwen3vl_reader = isQwen3VlReadModel(&manifest);
+            const reader_candidate = manifestMatchesModelListingTask("readers", model_kind, &manifest);
             const compatibility_summary = self.compatibilitySummaryForDir(a, entry.path) catch CompatibilitySummary{
                 .level = .unknown,
                 .code = .artifact_unreadable,
@@ -12753,7 +13070,8 @@ pub const Node = struct {
             discovered_listings.appendAssumeCapacity(.{
                 .entry_index = entry_index,
                 .manifest = manifest,
-                .reader_supported = reader_candidate and (try readers_mod.probeManifest(a, entry.path, manifest)).isSupported(),
+                .reader_supported = reader_candidate and
+                    (qwen3vl_reader or (try readers_mod.probeManifest(a, entry.path, manifest)).isSupported()),
                 .kind = model_kind,
                 .compatibility_level = @tagName(compatibility_summary.level),
             });
@@ -12895,20 +13213,12 @@ pub const Node = struct {
                 const entry = discovered[listing.entry_index];
                 if (std.mem.eql(u8, task, "readers") and !listing.reader_supported) continue;
 
-                const tasks = listing.manifest.tasks;
                 const capabilities = listing.manifest.capabilities;
                 const gliner_model_type = listing.manifest.gliner_model_type;
                 const inputs = listing.manifest.inputs;
                 const has_visual = listing.manifest.visual_model_path != null or listing.manifest.visual_projection_path != null;
                 const has_audio = listing.manifest.audio_model_path != null or listing.manifest.audio_projection_path != null;
-                if (!taskMatchesModelListing(
-                    task,
-                    listing.kind,
-                    gliner_model_type,
-                    tasks,
-                    capabilities,
-                    manifestSupportsZeroShotClassification(&listing.manifest),
-                )) continue;
+                if (!manifestMatchesModelListingTask(task, listing.kind, &listing.manifest)) continue;
                 const listed = try listed_model_names.getOrPut(a, entry.name);
                 if (listed.found_existing) continue;
 
@@ -12957,14 +13267,7 @@ pub const Node = struct {
             for (loaded_listings.items) |listing| {
                 const model = listing.model;
                 const model_task = @tagName(model.manifest.model_type);
-                if (!taskMatchesModelListing(
-                    task,
-                    model_task,
-                    model.manifest.gliner_model_type,
-                    model.manifest.tasks,
-                    model.manifest.capabilities,
-                    manifestSupportsZeroShotClassification(&model.manifest),
-                )) continue;
+                if (!manifestMatchesModelListingTask(task, model_task, &model.manifest)) continue;
                 const listed = try listed_model_names.getOrPut(a, listing.identifier);
                 if (listed.found_existing) continue;
 
@@ -14700,6 +15003,26 @@ fn taskMatchesModelListing(
     if (task.len > 0 and std.mem.eql(u8, task[0 .. task.len - 1], model_kind)) return true;
     return std.mem.eql(u8, task, "extractors") and
         model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "extraction");
+}
+
+/// A Qwen3-VL generation bundle remains a generator for ownership and loading,
+/// but the public read endpoint can also use it as a document reader. Keep that
+/// API capability local to listing/readiness instead of weakening the bundle's
+/// exact generator manifest identity.
+fn manifestMatchesModelListingTask(
+    task: []const u8,
+    model_kind: []const u8,
+    manifest: *const manifest_mod.ModelManifest,
+) bool {
+    if (std.mem.eql(u8, task, "readers") and isQwen3VlReadModel(manifest)) return true;
+    return taskMatchesModelListing(
+        task,
+        model_kind,
+        manifest.gliner_model_type,
+        manifest.tasks,
+        manifest.capabilities,
+        manifestSupportsZeroShotClassification(manifest),
+    );
 }
 
 fn appendModelInfo(
@@ -16718,11 +17041,228 @@ test "read prompt treats empty public values as an omitted OCR prompt" {
     try std.testing.expectEqualStrings("<OCR>", normalizeReadPrompt("<OCR>").?);
 }
 
+test "Qwen3-VL read prompt defaults to the qualified OCR task and preserves document modes" {
+    try std.testing.expectEqualStrings(default_qwen3vl_ocr_prompt, qwen3VlReadPrompt(null));
+    try std.testing.expectEqualStrings(default_qwen3vl_ocr_prompt, qwen3VlReadPrompt(" \n\t"));
+    try std.testing.expectEqualStrings("qwenvl markdown", qwen3VlReadPrompt("qwenvl markdown"));
+    try std.testing.expectEqualStrings("qwenvl html", qwen3VlReadPrompt("qwenvl html"));
+    try std.testing.expectEqualStrings("Extract the invoice number only.", qwen3VlReadPrompt("Extract the invoice number only."));
+}
+
+test "Qwen3-VL read and prepared generation stop cancelled work before model loading" {
+    const allocator = std.testing.allocator;
+    var node = try Node.init(allocator, .{});
+    defer node.deinit();
+    const cancelled = InferenceExecutionControl{
+        .check_fn = struct {
+            fn check(_: ?*anyopaque) !void {
+                return error.Cancelled;
+            }
+        }.check,
+    };
+    var reserved_units: usize = 1;
+    const images = [_][]const u8{"invalid image must never be decoded"};
+    try std.testing.expectError(error.Cancelled, node.readQwen3VlImagesWithAdmission(
+        allocator,
+        "missing-qwen3vl-model",
+        &images,
+        null,
+        null,
+        &reserved_units,
+        cancelled,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), reserved_units);
+
+    const messages = [_]generation.Message{.{ .role = "user", .content = "hello" }};
+    try std.testing.expectError(error.Cancelled, node.generateMessagesDirectPrepared(
+        allocator,
+        "missing-qwen3vl-model",
+        &messages,
+        1,
+        null,
+        false,
+        null,
+        false,
+        null,
+        cancelled,
+    ));
+    try std.testing.expectError(error.Timeout, node.readQwen3VlImagesWithAdmission(
+        allocator,
+        "missing-qwen3vl-model",
+        &images,
+        null,
+        null,
+        &reserved_units,
+        .{ .deadline_ns = 0 },
+    ));
+}
+
+test "Qwen3-VL read routing admits only generation bundles" {
+    const allocator = std.testing.allocator;
+    var generation_manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .generator,
+        .inference_bundle_family = try allocator.dupe(u8, manifest_mod.qwen3_vl_gguf_bundle_family),
+    };
+    defer generation_manifest.deinit();
+    try std.testing.expect(isQwen3VlReadModel(&generation_manifest));
+    try std.testing.expect(manifestMatchesModelListingTask("generators", "generator", &generation_manifest));
+    try std.testing.expect(manifestMatchesModelListingTask("readers", "generator", &generation_manifest));
+
+    generation_manifest.model_type = .reranker;
+    try std.testing.expect(!isQwen3VlReadModel(&generation_manifest));
+    try std.testing.expect(!manifestMatchesModelListingTask("readers", "reranker", &generation_manifest));
+
+    var generic_generator = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .model_type = .generator,
+    };
+    defer generic_generator.deinit();
+    try std.testing.expect(!isQwen3VlReadModel(&generic_generator));
+    try std.testing.expect(!manifestMatchesModelListingTask("readers", "generator", &generic_generator));
+}
+
+test "read model resolution falls back to generators and keeps reader precedence" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "models/generators/owner/qwen");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/generators/owner/qwen/config.json",
+        .data = "{}",
+    });
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    defer allocator.free(models_root);
+
+    var node = try Node.init(allocator, .{ .models_dir = models_root });
+    defer node.deinit();
+    const generator_path = try node.resolveReadRequestModelPath(allocator, std.testing.io, "owner/qwen");
+    defer allocator.free(generator_path);
+    try std.testing.expect(std.mem.endsWith(u8, generator_path, "generators/owner/qwen"));
+
+    try tmp.dir.createDirPath(std.testing.io, "models/readers/owner/qwen");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/readers/owner/qwen/config.json",
+        .data = "{}",
+    });
+    const reader_path = try node.resolveReadRequestModelPath(allocator, std.testing.io, "owner/qwen");
+    defer allocator.free(reader_path);
+    try std.testing.expect(std.mem.endsWith(u8, reader_path, "readers/owner/qwen"));
+}
+
+test "/read recognizes a Qwen3-VL generator bundle before reader model loading" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "models/generators/owner/qwen");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/generators/owner/qwen/config.json",
+        .data = "{\"model_type\":\"qwen3_vl\"}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/generators/owner/qwen/model_manifest.json",
+        .data = "{\"type\":\"generator\",\"inputs\":[\"text\",\"image\"]}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/generators/owner/qwen/antfly_inference_bundle.json",
+        .data = "{\"family\":\"qwen3_vl_gguf_bundle/v1\",\"decoder\":\"config.json\",\"projector\":\"model_manifest.json\"}",
+    });
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    defer allocator.free(models_root);
+
+    var node = try Node.init(allocator, .{ .models_dir = models_root, .max_concurrent_requests = 8 });
+    defer node.deinit();
+    resetRequestWorkTestCounters();
+    var request = try httpx.Request.init(allocator, .POST, "/ai/v1/read");
+    defer request.deinit();
+    try request.setJson(
+        "{\"model\":\"owner/qwen\",\"images\":[{\"url\":\"data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==\"}]}",
+    );
+    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var response = try node.readImages(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "INCOMPATIBLE_MODEL") != null);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+}
+
 test "read admission units scale with image batch and decode length" {
     try std.testing.expectEqual(@as(usize, 1), estimateReadAdmissionUnits(1, null));
     try std.testing.expectEqual(@as(usize, 4), estimateReadAdmissionUnits(4, null));
     try std.testing.expectEqual(@as(usize, 8), estimateReadAdmissionUnits(4, default_read_admission_max_tokens + 1));
     try std.testing.expectEqual(@as(usize, 16), estimateReadAdmissionUnits(4, max_read_tokens));
+}
+
+test "Qwen3-VL read admission includes one serial multimodal generation" {
+    const generation_units = Node.estimateGenerateAdmissionUnitsFromShape(
+        default_qwen3vl_ocr_prompt.len,
+        1,
+        @intCast(default_read_admission_max_tokens),
+    );
+    try std.testing.expectEqual(@as(usize, 5), generation_units);
+    try std.testing.expect(generation_units > estimateReadAdmissionUnits(1, null));
+}
+
+test "Qwen3-VL direct read rejects insufficient generation capacity before fetching media" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "models/generators/owner/qwen");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/generators/owner/qwen/config.json",
+        .data = "{\"model_type\":\"qwen3_vl\"}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/generators/owner/qwen/model_manifest.json",
+        .data = "{\"type\":\"generator\",\"inputs\":[\"text\",\"image\"]}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/generators/owner/qwen/antfly_inference_bundle.json",
+        .data = "{\"family\":\"qwen3_vl_gguf_bundle/v1\",\"decoder\":\"config.json\",\"projector\":\"model_manifest.json\"}",
+    });
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    defer allocator.free(models_root);
+    const model_path = try tmp.dir.realPathFileAlloc(std.testing.io, "models/generators/owner/qwen", allocator);
+    defer allocator.free(model_path);
+    var manifest = try manifest_mod.loadFromDir(allocator, model_path);
+    defer manifest.deinit();
+    try std.testing.expect(isQwen3VlReadModel(&manifest));
+    var node = try Node.init(allocator, .{
+        .models_dir = models_root,
+        .max_concurrent_requests = 4,
+        .content_security = .{ .max_download_size_bytes = 1024 },
+    });
+    defer node.deinit();
+    resetRequestWorkTestCounters();
+
+    const request = readers_api.Request{
+        // Invalid encoded bytes make any premature media preparation fail.
+        .images = &.{"data:image/png;base64,bm90LWFuLWltYWdl"},
+        .inline_content_trust = .trusted_internal,
+    };
+    try std.testing.expectEqual(@as(usize, 1), readRequestAdmission(&node, 1, request.images[0].len, null).units);
+    {
+        // Admission clamps a request to total capacity. Hold a competing slot
+        // so the read's initial unit fits but its generation expansion cannot.
+        try node.acquireAdmissionUnits(1);
+        defer node.releaseAdmissionUnits(1);
+        try std.testing.expectError(error.QueueFull, node.readImagesDirect(allocator, "owner/qwen", request));
+        try std.testing.expectEqual(@as(usize, 1), node.inference_admission.inFlightUnits());
+        try std.testing.expectEqual(@as(usize, 1), node.inference_admission.inFlightRequests());
+    }
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+
+    // With capacity available the request reaches media validation, and its
+    // expanded reservation is still released on that later error.
+    try std.testing.expectError(error.ImageDecodeFailed, node.readImagesDirect(allocator, "owner/qwen", request));
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
 }
 
 test "direct extraction validates read max tokens" {
@@ -22424,6 +22964,16 @@ fn readMaxTokensJsonField(obj: std.json.ObjectMap, name: []const u8) !?usize {
 fn normalizeReadPrompt(prompt: ?[]const u8) ?[]const u8 {
     const value = prompt orelse return null;
     return if (std.mem.trim(u8, value, " \t\r\n").len == 0) null else value;
+}
+
+fn qwen3VlReadPrompt(prompt: ?[]const u8) []const u8 {
+    return normalizeReadPrompt(prompt) orelse default_qwen3vl_ocr_prompt;
+}
+
+fn isQwen3VlReadModel(manifest: *const manifest_mod.ModelManifest) bool {
+    return manifest.model_type == .generator and
+        manifest.isQwen3VlGgufBundle() and
+        !manifest.isQwen3VlReranker();
 }
 
 fn estimateReadAdmissionUnits(image_count: usize, max_tokens: ?usize) usize {

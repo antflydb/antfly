@@ -26,6 +26,7 @@ const managed_receipt = @import("managed_receipt.zig");
 pub const download = @import("download.zig");
 pub const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
 pub const qwen3_embedding_catalog = @import("qwen3_embedding_catalog.zig");
+pub const qwen3_reranker_catalog = @import("qwen3_reranker_catalog.zig");
 
 pub const ModelKind = enum {
     embedder,
@@ -56,6 +57,7 @@ test {
     _ = download;
     _ = qwen3vl_catalog;
     _ = qwen3_embedding_catalog;
+    _ = qwen3_reranker_catalog;
 }
 
 /// Friendly short names accepted by user-facing commands in place of a full
@@ -87,6 +89,9 @@ pub const friendly_aliases = [_]FriendlyAlias{
     .{ .alias = "qwen3-embedding-0.6b", .ref = "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1" },
     .{ .alias = "qwen3-embedding-0.6b-f16", .ref = "Qwen/Qwen3-Embedding-0.6B-GGUF:f16-bundle-v1" },
     .{ .alias = "qwen3-embedding-0.6b-safetensors", .ref = "Qwen/Qwen3-Embedding-0.6B:bf16-safetensors-bundle-v1" },
+    .{ .alias = "qwen3-reranker", .ref = "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:q8-0-bundle-v1" },
+    .{ .alias = "qwen3-reranker-0.6b", .ref = "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:q8-0-bundle-v1" },
+    .{ .alias = "qwen3-reranker-0.6b-safetensors", .ref = "Qwen/Qwen3-Reranker-0.6B:bf16-safetensors-bundle-v1" },
 };
 
 /// Resolve a friendly alias to its pinned `owner/name:variant` reference.
@@ -140,6 +145,10 @@ test "friendly alias refs parse as explicit model refs" {
             try std.testing.expect(
                 qwen3_embedding_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant) != null,
             );
+        } else if (std.mem.startsWith(u8, entry.alias, "qwen3-reranker")) {
+            try std.testing.expect(
+                qwen3_reranker_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant) != null,
+            );
         } else if (std.mem.eql(u8, entry.alias, "bge-m3")) {
             try std.testing.expectEqualStrings("safetensors@" ++ bge_m3_pinned_revision, ref.variant);
         } else {
@@ -191,6 +200,11 @@ test "pull model refs accept friendly Qwen aliases" {
     try std.testing.expectEqualStrings("Qwen", reranker.owner);
     try std.testing.expectEqualStrings("Qwen3-VL-Reranker-2B", reranker.name);
     try std.testing.expectEqualStrings(qwen3vl_catalog.reranker_bundle_variant, reranker.variant);
+
+    const text_reranker = try parseModelRefOrAlias("QWEN3-RERANKER-0.6B");
+    try std.testing.expectEqualStrings("ggml-org", text_reranker.owner);
+    try std.testing.expectEqualStrings("Qwen3-Reranker-0.6B-Q8_0-GGUF", text_reranker.name);
+    try std.testing.expectEqualStrings(qwen3_reranker_catalog.q8_0_bundle_variant, text_reranker.variant);
 }
 
 test "gemma4 qat gguf pulls derive the MTP assistant companion ref" {
@@ -582,6 +596,18 @@ pub const ModelRegistry = struct {
             );
         } else if (qwen3_embedding_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
             try download.downloadPinnedQwen3EmbeddingBundle(
+                self.allocator,
+                io,
+                ref.owner,
+                ref.name,
+                ref.variant,
+                bundle,
+                transaction.staging,
+                hub_config,
+                progress_sink,
+            );
+        } else if (qwen3_reranker_catalog.findBundleForHubRef(ref.owner, ref.name, ref.variant)) |bundle| {
+            try download.downloadPinnedQwen3RerankerBundle(
                 self.allocator,
                 io,
                 ref.owner,

@@ -452,7 +452,9 @@ fn consumeParsedMaxLoadedModelsOption(args: []const []const u8, index: *usize) b
     return true;
 }
 
-fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+/// Also used by the focused resident-server benchmark executable, so its
+/// argument parsing, resource ownership and HTTP routes remain production code.
+pub fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     structlog.init(.{ .formatter = .json, .level = .info });
 
     var host: []const u8 = "127.0.0.1";

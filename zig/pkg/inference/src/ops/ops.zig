@@ -755,6 +755,7 @@ pub const NativeQuantTimingStats = struct {
     decoder_runtime_frame_wait_nanos: u128 = 0,
     decoder_runtime_frame_gpu_nanos: u128 = 0,
     metal_stage_timing: MetalStageTimingSnapshot = .{},
+    metal_dense_causal_hd128_dispatches: u64 = 0,
     metal_tensor_device_owned_buffers_created: u64 = 0,
     metal_tensor_device_owned_buffers_released: u64 = 0,
     metal_tensor_device_owned_live_bytes: u64 = 0,
@@ -2389,6 +2390,8 @@ pub const ComputeBackend = struct {
         /// sequence shape. Backends that do not support this can leave it
         /// null and the caller will see a zero-valued result.
         decoderRuntimePrepareOrReuseFamily: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator, gpt_config: gpt_model.Config, current_kv_tokens: usize, configured_layer_count: usize) anyerror!DecoderRuntimePrepareReuseResult = null,
+        /// Hidden-state-only dense Qwen3 prefill omits the vocabulary head.
+        decoderRuntimePrepareOrReuseTextPrefill: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator, gpt_config: gpt_model.Config, configured_layer_count: usize, execution_control: ?InferenceExecutionControl) anyerror!DecoderRuntimePrepareReuseResult = null,
 
         /// Report whether the backend-owned decoder runtime exists and is
         /// currently available.
@@ -4320,6 +4323,18 @@ pub const ComputeBackend = struct {
     ) !DecoderRuntimePrepareReuseResult {
         if (self.vtable.decoderRuntimePrepareOrReuseFamily) |op| {
             return op(self.ptr, allocator, gpt_config, current_kv_tokens, configured_layer_count);
+        }
+        return .{};
+    }
+
+    pub fn decoderRuntimePrepareOrReuseTextPrefill(
+        self: *const ComputeBackend,
+        allocator: std.mem.Allocator,
+        gpt_config: gpt_model.Config,
+        configured_layer_count: usize,
+    ) !DecoderRuntimePrepareReuseResult {
+        if (self.vtable.decoderRuntimePrepareOrReuseTextPrefill) |op| {
+            return op(self.ptr, allocator, gpt_config, configured_layer_count, self.execution_control);
         }
         return .{};
     }

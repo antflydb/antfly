@@ -288,6 +288,23 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the Antfly inference server");
     run_step.dependOn(&run_exe.step);
 
+    const bench_server = b.addExecutable(.{
+        .name = "antfly-inference-bench-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/benchmark_server.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    bench_server.root_module.addImport("inference", runtime_graph.inference_mod);
+    bench_server.root_module.addImport("build_options", build_options_mod);
+    bench_server.root_module.addImport("structlog", structlog_mod);
+    bench_server.root_module.addImport("antfly_platform", platform_mod);
+    bench_server.root_module.link_libc = link_libc;
+    const install_bench_server = b.addInstallArtifact(bench_server, .{});
+    const bench_server_step = b.step("bench-server", "Build the production HTTP server without the other CLI commands");
+    bench_server_step.dependOn(&install_bench_server.step);
+
     const kernel_jit_package_exe = b.addExecutable(.{
         .name = "antfly-kernel-jit-package",
         .root_module = b.createModule(.{
@@ -1637,6 +1654,23 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addImport("antfly_generating_openapi", generating_openapi_mod);
     tests.root_module.addImport("antfly_extraction_openapi", extraction_openapi_mod);
     tests.root_module.addImport("antfly_extracting", extracting_mod);
+    // Direct reader API tests use the same public request/result module as
+    // the embedded server. Reuse shared dependencies to preserve type identity.
+    const test_reader_config_mod = b.createModule(.{
+        .root_source_file = b.path(b.fmt("{s}/lib/readers/src/config.zig", .{shared_lib_root})),
+        .target = target,
+        .optimize = optimize,
+    });
+    const test_readers_mod = b.createModule(.{
+        .root_source_file = b.path(b.fmt("{s}/lib/readers/src/mod.zig", .{shared_lib_root})),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_readers_mod.addImport("httpx", httpx_mod);
+    test_readers_mod.addImport("inference_api", inference_api_mod);
+    test_readers_mod.addImport("antfly_google", runtime_graph.google_mod);
+    test_readers_mod.addImport("antfly_reader_config", test_reader_config_mod);
+    tests.root_module.addImport("antfly_readers", test_readers_mod);
     tests.root_module.addImport("inference_audio", inference_audio_mod);
     tests.root_module.addImport("inference_chunker", inference_chunker_mod);
     tests.root_module.addImport("jinja", jinja_mod);
