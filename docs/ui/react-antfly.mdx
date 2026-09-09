@@ -1,5 +1,6 @@
 ---
 title: React Antfly
+unlisted: true
 description: UI components for building search applications with React and Antfly
 ---
 
@@ -37,7 +38,7 @@ import {
 } from '@antfly/components';
 
 const MySearchApp = () => (
-  <Antfly url="http://localhost:8080" table="movies">
+  <Antfly url="http://127.0.0.1:8080" table="movies">
     <QueryBox id="mainSearch" mode="live" placeholder="Search movies..." />
     <Facet id="actors" fields={["actors"]} />
     <Facet id="releasedYear" fields={["releasedYear"]} />
@@ -64,7 +65,7 @@ The `<Antfly>` component is the root provider that manages the search state and 
 
 ```jsx
 <Antfly
-  url="http://localhost:8080"
+  url="http://127.0.0.1:8080"
   table="your_table"
   headers={{
     Authorization: "Bearer your-token"
@@ -785,7 +786,7 @@ function MyComponent() {
   // Start streaming
   const handleAsk = () => {
     startStream({
-      url: 'http://localhost:8080/db/v1',
+      url: 'http://127.0.0.1:8080/db/v1',
       request: {
         query: 'how does raft work',
         queries: [{
@@ -987,7 +988,7 @@ const MyApp = () => {
 
   return (
     <Antfly
-      url="http://localhost:8080"
+      url="http://127.0.0.1:8080"
       table="data"
       onChange={(values) => {
         const qs = toUrlQueryString(values);
@@ -1090,7 +1091,7 @@ import {
 
 const MovieSearch = () => {
   return (
-    <Antfly url="http://localhost:8080" table="movies">
+    <Antfly url="http://127.0.0.1:8080" table="movies">
       <div className="search-container">
         <header>
           <QueryBox id="search" mode="live" placeholder="Search movies...">

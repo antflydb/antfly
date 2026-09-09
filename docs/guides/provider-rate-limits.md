@@ -89,7 +89,7 @@ retries reserve again. Requests larger than the entire per-minute budget fail
 immediately. Generation requires a positive output cap (the generator default
 is used when omitted). Media requests are rejected when a token budget is set.
 
-These policies apply to outbound providers. In-process Antfly inference uses
+These policies apply to outbound providers. In-process Antfly Inference uses
 its own admission controls and rejects an enabled outbound `rate_limit`.
 Changing embedding execution limits does not invalidate stored vectors or
 their derived-coverage fingerprints.

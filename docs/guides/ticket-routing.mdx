@@ -1,0 +1,188 @@
+---
+title: "Route Tickets with Retrieval"
+description: "New tickets stream out of PostgreSQL and get assigned a team by the resolved tickets that look most like them"
+order: 4
+---
+
+<Questions>
+- How do I route support tickets automatically?
+- How do I stream tickets from PostgreSQL into Antfly?
+- How do I classify a ticket using similar historical tickets?
+- How do I keep PostgreSQL as the system of record while adding retrieval?
+</Questions>
+
+## The Result
+
+Every ticket written to your Postgres `tickets` table arrives in Antfly on its own, and one call returns the team that should own it, chosen from the resolved tickets that look most like it. Postgres stays the system of record throughout, with no migration and no export job:
+
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "Checkout fails with a 502 after entering card details",
+    "queries": [{
+      "table": "tickets",
+      "filter_query": {"query": "status:resolved"},
+      "semantic_search": "Checkout fails with a 502 after entering card details",
+      "indexes": ["subject_body"],
+      "fields": ["subject", "team", "resolution"],
+      "limit": 20,
+      "reranker": {
+        "provider": "antfly",
+        "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
+        "field": "body",
+        "candidate_count": 50
+      },
+      "pruner": {"min_score_ratio": 0.6}
+    }],
+    "generator": {"provider": "ollama", "model": "gemma3:4b"},
+    "stream": false,
+    "steps": {
+      "generation": {
+        "enabled": true,
+        "system_prompt": "You route support tickets. Given a new ticket and similar resolved tickets, respond with only the team name that should own it, chosen from the teams in the retrieved tickets."
+      }
+    }
+  }'
+```
+
+```json
+{
+  "generation": "payments",
+  "hits": [
+    {
+      "_id": "8812",
+      "_source": {
+        "subject": "502 on checkout submit",
+        "team": "payments",
+        "resolution": "Gateway timeout raised to 30s"
+      }
+    },
+    {
+      "_id": "7905",
+      "_source": {
+        "subject": "Card form errors after submit",
+        "team": "payments",
+        "resolution": "Retry on 5xx from processor"
+      }
+    }
+  ]
+}
+```
+
+## Before You Start
+
+Antfly running with the embedding and reranking models pulled (the [Quickstart](/docs/guides/quickstart) leaves you there), a Postgres with `wal_level = logical`, and its connection string stored as a secret:
+
+```bash
+antfly inference pull hf:Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1 --tasks embed
+antfly inference pull hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0 --tasks rerank
+```
+
+```bash
+curl -X PUT http://127.0.0.1:8080/db/v1/secrets/pg_dsn \
+  -u admin:admin \
+  -H "Content-Type: application/json" \
+  -d '{"value": "postgres://antfly:secret@db.internal:5432/support?sslmode=require"}'
+```
+
+## Build It
+
+### 1. Stream Tickets from PostgreSQL
+
+Antfly has built-in change data capture. A `replication_sources` block on the table subscribes it to Postgres logical replication, and a semantic index in the same call makes every ticket retrievable the moment it lands:
+
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/tables/tickets \
+  -u admin:admin \
+  -H "Content-Type: application/json" \
+  -d '{
+    "replication_sources": [
+      {
+        "type": "postgres",
+        "dsn": "${secret:pg_dsn}",
+        "postgres_table": "tickets",
+        "key_template": "id"
+      }
+    ],
+    "indexes": {
+      "subject_body": {
+        "type": "embeddings",
+        "template": "{{subject}} {{body}}",
+        "embedder": {
+          "provider": "antfly",
+          "model": "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"
+        }
+      }
+    }
+  }'
+```
+
+Every `INSERT` and `UPDATE` on the Postgres table now flows in, resolved tickets included, with their `team` and `resolution` columns intact. The source table needs `subject`, `body`, `status`, `team`, and `resolution` columns for the rest of this guide; a missing `body` gives the reranker empty text to score and no error. Antfly snapshots the existing rows first, so `status.phase` in the table detail moves from `snapshot` to `streaming`; once it does, confirm the rows arrived:
+
+```bash
+antfly query --table tickets --full-text-search 'status:resolved' --fields subject,team --limit 3
+```
+
+Cloud SQL, Supabase, Neon, RDS, and self-hosted Postgres each need a small amount of setup on the database side (publications, replication slots, `wal_level`). [Stream PostgreSQL into Antfly](/docs/guides/cdc-replication) has each one.
+
+### 2. Retrieve Similar Resolved Tickets
+
+When a new ticket arrives, find its nearest neighbors among tickets that already have an outcome:
+
+```bash
+curl -X POST http://127.0.0.1:8080/db/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "table": "tickets",
+    "filter_query": {"query": "status:resolved"},
+    "semantic_search": "Checkout fails with a 502 after entering card details",
+    "indexes": ["subject_body"],
+    "fields": ["subject", "team", "resolution"],
+    "limit": 20,
+    "reranker": {
+      "provider": "antfly",
+      "model": "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF:gguf:Q8_0",
+      "field": "body",
+      "candidate_count": 50
+    },
+    "pruner": {"min_score_ratio": 0.6}
+  }'
+```
+
+The filter restricts the pool to resolved tickets before anything is scored. The semantic side finds the ones that read like this one. The reranker orders them by how well the full body matches, and the pruner drops the ones that only loosely do. Whatever survives is the evidence the routing decision rests on.
+
+### 3. Classify the Ticket
+
+Every surviving neighbor carries a `team`. The simplest classifier is a majority vote over that field in your pipeline code: transparent, fast, and easy to explain when someone asks why a ticket landed where it did.
+
+When the neighbors disagree, let the retrieval agent make the call in the same request. The `system_prompt` on the generation step asks for a team name instead of a prose answer, which is the call shown in The Result. Your pipeline reads `generation` for the decision and `hits` for the evidence, then writes the team back to Postgres like any other update.
+
+### 4. Close the Loop
+
+Because Postgres is the source and replication is always on, corrections feed back in without any extra step. When a person corrects a route and the row updates, the corrected ticket flows back into Antfly and becomes evidence for the next decision. Routing accuracy improves as resolved history grows, with no retraining step and no export job.
+
+## Tradeoffs
+
+The pruner's floor sets how much evidence a routing decision needs before it goes out without a person.
+
+A misrouted ticket is almost always a retrieval failure: the wrong history reached the classifier. The pruner is where you set how much evidence a decision needs. With `min_score_ratio: 0.6`, a ticket unlike anything resolved before comes back with few or no neighbors, and that is the signal to send it to a triage queue instead of guessing.
+
+An agent that routes only when it has strong evidence is one you can trust with the easy cases, which are most of them, so keep that floor in place. Tighten the ratio if you see confident misroutes; loosen it if too much lands in triage while good neighbors are being cut.
+
+## Use Agent Skills
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome, for example "Stream my Postgres tickets table into Antfly with CDC and route new tickets against resolved history", and use this page to judge the result.
+
+## Next Steps
+
+- [Stream PostgreSQL into Antfly](/docs/guides/cdc-replication): provider setup, key templates, column transforms, and what to do when the slot falls behind
+- [Build a Support Answer Agent](/docs/guides/support-answer-agent): answer the ticket instead of routing it
+- [Tune Hybrid Search](/docs/guides/hybrid-search): what the reranker and pruner are doing under the routing query
