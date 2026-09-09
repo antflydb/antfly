@@ -95,7 +95,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, subcommand, "fetch")) {
         const root_dir = args.next() orelse default_seed_corpora_dir;
-        try ensureSeedCorporaAvailable(alloc, root_dir, false, true);
+        try ensureSeedCorporaAvailable(alloc, init.io, root_dir, false, true);
         std.debug.print("seed-corpora ready: {s}\n", .{root_dir});
         return;
     }
@@ -130,7 +130,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        try ensureSeedCorporaAvailable(alloc, config.root_dir, config.refresh, config.allow_fetch);
+        try ensureSeedCorporaAvailable(alloc, init.io, config.root_dir, config.refresh, config.allow_fetch);
         const summary = try runSeedCorporaSweep(alloc, config);
         printSummary(summary);
 
@@ -181,7 +181,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        try ensureSeedCorporaAvailable(alloc, config.root_dir, config.refresh, config.allow_fetch);
+        try ensureSeedCorporaAvailable(alloc, init.io, config.root_dir, config.refresh, config.allow_fetch);
         const summary = try triageDecodeFailuresWithDjpeg(alloc, config);
         printDjpegTriageSummary(summary);
         return;
@@ -193,7 +193,7 @@ pub fn main(init: std.process.Init) !void {
             printUsage(argv0);
             return error.InvalidArguments;
         };
-        try ensureSeedCorporaAvailable(alloc, root_dir, false, true);
+        try ensureSeedCorporaAvailable(alloc, init.io, root_dir, false, true);
         try compareOneWithDjpeg(alloc, root_dir, relative_path);
         return;
     }
@@ -213,7 +213,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        try ensureSeedCorporaAvailable(alloc, config.root_dir, config.refresh, config.allow_fetch);
+        try ensureSeedCorporaAvailable(alloc, init.io, config.root_dir, config.refresh, config.allow_fetch);
         const summary = try triageSuccessfulDecodesWithDjpegParity(alloc, config);
         printDjpegParitySummary(summary);
         return;
@@ -935,7 +935,7 @@ fn resolveDjpegPath(alloc: Allocator) !?[]u8 {
     return null;
 }
 
-fn ensureSeedCorporaAvailable(alloc: Allocator, root_dir: []const u8, refresh: bool, allow_fetch: bool) !void {
+fn ensureSeedCorporaAvailable(alloc: Allocator, io: std.Io, root_dir: []const u8, refresh: bool, allow_fetch: bool) !void {
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
@@ -953,27 +953,23 @@ fn ensureSeedCorporaAvailable(alloc: Allocator, root_dir: []const u8, refresh: b
             );
             return error.SeedCorporaUnavailable;
         }
-        try runChild(alloc, &.{ "git", "clone", "--depth=1", default_seed_corpora_url, root_dir });
+        try runChild(io, &.{ "git", "clone", "--depth=1", default_seed_corpora_url, root_dir });
         return;
     }
 
     if (refresh) {
-        try runChild(alloc, &.{ "git", "-C", root_dir, "pull", "--ff-only" });
+        try runChild(io, &.{ "git", "-C", root_dir, "pull", "--ff-only" });
     }
 }
 
-fn runChild(alloc: Allocator, argv: []const []const u8) !void {
-    _ = alloc;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-
-    var child = try std.process.spawn(io_impl.io(), .{
+fn runChild(io: std.Io, argv: []const []const u8) !void {
+    var child = try std.process.spawn(io, .{
         .argv = argv,
         .stdin = .ignore,
         .stdout = .inherit,
         .stderr = .inherit,
     });
-    const term = try child.wait(io_impl.io());
+    const term = try child.wait(io);
     switch (term) {
         .exited => |code| if (code != 0) return error.ChildProcessFailed,
         else => return error.ChildProcessFailed,

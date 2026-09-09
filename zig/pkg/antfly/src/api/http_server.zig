@@ -6604,27 +6604,7 @@ pub const ApiHttpServer = struct {
             parsed.value,
             &collected_context,
             generation_runner.iface(),
-        ) catch |err| return switch (err) {
-            error.InvalidQueryBuilderRequest => try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid query builder request"),
-            error.InvalidQueryBuilderGeneration, error.InvalidAgentToolCall => try contextual_operations.jsonErrorAlloc(self.alloc, 422, "generator did not submit a valid query tool call"),
-            error.AgentToolLimitExceeded => try contextual_operations.jsonErrorAlloc(self.alloc, 422, "query planning tool budget exhausted"),
-            error.AgentContextLimitExceeded => try contextual_operations.jsonErrorAlloc(self.alloc, 413, "query planning context limit exceeded"),
-            error.UnsupportedAgentToolProvider, error.UnsupportedQueryBuilderGeneration => try contextual_operations.jsonErrorAlloc(self.alloc, 400, "query planning requires a tool-capable generator"),
-            error.GenerateRequestFailed => try contextual_operations.jsonErrorAlloc(self.alloc, 502, "query generation failed"),
-            error.GenerationCapacityUnavailable => try contextualRetryableTextResponse(self.alloc, 503, "inference capacity temporarily unavailable"),
-            error.EmptyResponse => try contextual_operations.jsonErrorAlloc(self.alloc, 502, "generator returned no answer or tool calls"),
-            error.DocIdentityNamespaceMismatch => try contextual_operations.jsonErrorAlloc(self.alloc, 503, "doc identity unavailable"),
-            error.QueryEmbeddingInputTooLarge => try contextual_operations.jsonErrorAlloc(self.alloc, 413, "query embedding input too large"),
-            error.QueryEmbeddingOverloaded => try contextualRetryableTextResponse(self.alloc, 429, "query embedding overloaded"),
-            error.EmbedRateLimited => try contextualRetryableTextResponse(self.alloc, 429, "query embedding rate limited"),
-            error.EmbedTransientFailure => try contextualRetryableTextResponse(self.alloc, 503, "query embedding temporarily unavailable"),
-            error.EmbedUpstreamFailure => try contextual_operations.jsonErrorAlloc(self.alloc, 502, "query embedding provider failed"),
-            error.Timeout => try contextual_operations.jsonErrorAlloc(self.alloc, 504, "query embedding timed out"),
-            else => {
-                std.log.warn("query builder failed err={s}", .{@errorName(err)});
-                return err;
-            },
-        };
+        ) catch |err| return queryBuilderFailureResponse(self.alloc, err);
         return contextual_operations.json(
             // Imported optional query components must be omitted when absent,
             // not emitted as null: the public request schema is non-nullable.
@@ -18760,6 +18740,30 @@ fn contextualUnsupportedQueryResponse(alloc: std.mem.Allocator) !contextual_oper
     };
 }
 
+fn queryBuilderFailureResponse(alloc: std.mem.Allocator, err: anyerror) !contextual_operations.OwnedResponse {
+    return switch (err) {
+        error.InvalidQueryBuilderRequest => try contextual_operations.jsonErrorAlloc(alloc, 400, "invalid query builder request"),
+        error.InvalidQueryBuilderGeneration, error.InvalidAgentToolCall => try contextual_operations.jsonErrorAlloc(alloc, 422, "generator did not submit a valid query tool call"),
+        error.AgentToolLimitExceeded => try contextual_operations.jsonErrorAlloc(alloc, 422, "query planning tool budget exhausted"),
+        error.AgentContextLimitExceeded => try contextual_operations.jsonErrorAlloc(alloc, 413, "query planning context limit exceeded"),
+        error.UnsupportedAgentToolProvider, error.UnsupportedQueryBuilderGeneration => try contextual_operations.jsonErrorAlloc(alloc, 400, "query planning requires a tool-capable generator"),
+        error.GenerateRequestFailed => try contextual_operations.jsonErrorAlloc(alloc, 502, "query generation failed"),
+        error.GenerationCapacityUnavailable => try contextualCapacityResponse(alloc, connections_api.generationCapacityFailure()),
+        error.EmptyResponse => try contextual_operations.jsonErrorAlloc(alloc, 502, "generator returned no answer or tool calls"),
+        error.DocIdentityNamespaceMismatch => try contextualQueryTemporarilyUnavailableResponse(alloc, .doc_identity_unavailable),
+        error.QueryEmbeddingInputTooLarge => try contextual_operations.jsonErrorAlloc(alloc, 413, "query embedding input too large"),
+        error.QueryEmbeddingOverloaded => try contextualRetryableTextResponse(alloc, 429, "query embedding overloaded"),
+        error.EmbedRateLimited => try contextualRetryableTextResponse(alloc, 429, "query embedding rate limited"),
+        error.EmbedTransientFailure => try contextualQueryTemporarilyUnavailableResponse(alloc, .query_embedding_temporarily_unavailable),
+        error.EmbedUpstreamFailure => try contextual_operations.jsonErrorAlloc(alloc, 502, "query embedding provider failed"),
+        error.Timeout => try contextual_operations.jsonErrorAlloc(alloc, 504, "query embedding timed out"),
+        else => {
+            std.log.warn("query builder failed err={s}", .{@errorName(err)});
+            return err;
+        },
+    };
+}
+
 fn contextualQueryTemporarilyUnavailableResponse(
     alloc: std.mem.Allocator,
     reason: public_table_http.QueryTemporarilyUnavailableReason,
@@ -18993,7 +18997,11 @@ test "ambiguous mutation response is explicitly non-retryable" {
 }
 
 fn contextualInferenceCapacityResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
-    var response = try contextualJsonResponse(alloc, 503, connections_api.inferenceAdmissionFailure());
+    return contextualCapacityResponse(alloc, connections_api.inferenceAdmissionFailure());
+}
+
+fn contextualCapacityResponse(alloc: std.mem.Allocator, payload: connections_api.InferenceAdmissionFailure) !contextual_operations.OwnedResponse {
+    var response = try contextualJsonResponse(alloc, 503, payload);
     errdefer response.deinit(alloc);
     const headers = try alloc.alloc(contextual_operations.Header, 1);
     errdefer alloc.free(headers);
@@ -19006,6 +19014,22 @@ fn contextualInferenceCapacityResponse(alloc: std.mem.Allocator) !contextual_ope
     };
     response.headers = headers;
     return response;
+}
+
+test "contextual generation capacity response preserves public retry contract" {
+    const alloc = std.testing.allocator;
+    var response = try queryBuilderFailureResponse(alloc, error.GenerationCapacityUnavailable);
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), response.status);
+    try std.testing.expectEqual(@as(usize, 1), response.headers.len);
+    try std.testing.expectEqualStrings("Retry-After", response.headers[0].name);
+    try std.testing.expectEqualStrings("1", response.headers[0].value);
+    const parsed = try std.json.parseFromSlice(metadata_openapi.InferenceCapacityError, alloc, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("GenerationCapacityUnavailable", parsed.value.@"error");
+    try std.testing.expect(parsed.value.message.len > 0);
+    try std.testing.expect(parsed.value.retryable);
+    try std.testing.expectEqual(@as(i64, 1000), parsed.value.retry_after_ms);
 }
 
 fn extensionLifecycleContextualResponse(alloc: std.mem.Allocator, err: anyerror) !contextual_operations.OwnedResponse {
@@ -29970,6 +29994,77 @@ test "api http server serves table query response envelope" {
     try std.testing.expectEqualStrings("invalid query request", internal_field_resp.body);
 }
 
+test "api http server query string boolean controls survive reopen" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-http-query-string-boolean";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    const Case = struct { query: []const u8, ids: []const []const u8 };
+    const cases = [_]Case{
+        .{ .query = "{\"query\":\"alpha\"}", .ids = &.{ "both", "alpha_only" } },
+        .{ .query = "{\"match\":\"alpha beta\"}", .ids = &.{ "both", "alpha_only", "beta_only" } },
+        .{ .query = "{\"query\":\"body:alpha\"}", .ids = &.{ "both", "alpha_only" } },
+        .{ .query = "{\"query\":\"alpha beta\"}", .ids = &.{"both"} },
+        .{ .query = "{\"query\":\"body:alpha AND body:beta\"}", .ids = &.{"both"} },
+        .{ .query = "{\"query\":\"body:alpha AND body:alpha\"}", .ids = &.{ "both", "alpha_only" } },
+        .{ .query = "{\"conjuncts\":[{\"match\":\"alpha\",\"field\":\"body\"},{\"match\":\"beta\",\"field\":\"body\"}]}", .ids = &.{"both"} },
+        .{ .query = "{\"query\":\"body:alpha OR body:beta\"}", .ids = &.{ "both", "alpha_only", "beta_only" } },
+        .{ .query = "{\"query\":\"body:alpha AND NOT body:beta\"}", .ids = &.{"alpha_only"} },
+        .{ .query = "{\"query\":\"NOT body:alpha\"}", .ids = &.{"beta_only"} },
+        .{ .query = "{\"query\":\"(body:alpha OR body:beta) AND body:gamma\"}", .ids = &.{"alpha_only"} },
+        .{ .query = "{\"query\":\"body:alpha AND body:missing\"}", .ids = &.{} },
+    };
+    for (0..2) |phase| {
+        var db = try db_mod.DB.open(alloc, path, .{});
+        defer db.close();
+        if (phase == 0) {
+            try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
+            try db.batch(.{ .writes = &.{
+                .{ .key = "both", .value = "{\"body\":\"alpha beta\"}" },
+                .{ .key = "alpha_only", .value = "{\"body\":\"alpha gamma\"}" },
+                .{ .key = "beta_only", .value = "{\"body\":\"beta delta\"}" },
+            }, .sync_level = .full_index });
+        }
+        var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+        var source = FakeSource{};
+        var server = ApiHttpServer.init(alloc, .{}, source.iface(), table_source.source(), null);
+        for (cases) |case| {
+            const body = try std.fmt.allocPrint(alloc, "{{\"full_text_search\":{s},\"limit\":10}}", .{case.query});
+            defer alloc.free(body);
+            var resp = try executeHttpxTestRequest(&server, .{
+                .method = .POST,
+                .uri = "/tables/docs/query",
+                .content_type = "application/json",
+                .body = body,
+            });
+            defer resp.deinit(alloc);
+            try std.testing.expectEqual(@as(u16, 200), resp.status);
+            const parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, resp.body, .{});
+            defer parsed.deinit();
+            const hits = parsed.value.responses.?[0].hits.?.hits.?;
+            try std.testing.expectEqual(case.ids.len, hits.len);
+            for (case.ids) |id| {
+                var count: usize = 0;
+                for (hits) |hit| {
+                    if (std.mem.eql(u8, id, hit._id)) count += 1;
+                }
+                try std.testing.expectEqual(@as(usize, 1), count);
+            }
+        }
+    }
+}
+
 test "api http server executes public Query filter roots and compositions" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("antfly-api-http-sdk-filter-roots");
@@ -30944,7 +31039,13 @@ test "api http server query builder maps doc identity mismatch to unavailable" {
 
     try std.testing.expectEqual(@as(u16, 503), resp.status);
     try std.testing.expectEqualStrings("application/json", resp.content_type.?);
-    try std.testing.expectEqualStrings("{\"error\":\"doc identity unavailable\"}", resp.body);
+    const failure = try std.json.parseFromSlice(metadata_openapi.QueryTemporarilyUnavailableError, alloc, resp.body, .{});
+    defer failure.deinit();
+    try std.testing.expectEqualStrings("doc_identity_unavailable", failure.value.code);
+    try std.testing.expectEqualStrings("doc identity unavailable", failure.value.message);
+    try std.testing.expect(failure.value.retryable);
+    const retry_after = resp.header("Retry-After") orelse return error.MissingRetryAfterHeader;
+    try std.testing.expect((try std.fmt.parseInt(u32, retry_after, 10)) > 0);
 }
 
 test "api http server query builder loads structured table index metadata" {
@@ -47186,4 +47287,31 @@ test "api http server executes direct foreign table aggregations through registr
     try std.testing.expect(DummyForeign.query_saw_cancellation);
     try std.testing.expect(DummyForeign.aggregate_saw_no_deadline);
     try std.testing.expect(DummyForeign.aggregate_saw_cancellation);
+}
+
+test "query builder dependency 503 responses preserve public retry contract" {
+    const alloc = std.testing.allocator;
+    const cases = .{
+        .{ error.DocIdentityNamespaceMismatch, "doc_identity_unavailable" },
+        .{ error.EmbedTransientFailure, "query_embedding_temporarily_unavailable" },
+    };
+    inline for (cases) |case| {
+        var response = try queryBuilderFailureResponse(alloc, case[0]);
+        defer response.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 503), response.status);
+        try std.testing.expectEqualStrings("application/json", response.content_type);
+        const parsed = try std.json.parseFromSlice(metadata_openapi.QueryTemporarilyUnavailableError, alloc, response.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case[1], parsed.value.code);
+        try std.testing.expect(parsed.value.retryable);
+        try std.testing.expect(parsed.value.message.len > 0);
+        var retry_header = false;
+        for (response.headers) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "Retry-After")) {
+                try std.testing.expect((try std.fmt.parseInt(u32, header.value, 10)) > 0);
+                retry_header = true;
+            }
+        }
+        try std.testing.expect(retry_header);
+    }
 }

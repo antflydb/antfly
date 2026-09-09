@@ -8079,13 +8079,34 @@ pub const VoprPublicClusterFixture = struct {
         return error.HostedDataPlaneRetirementTimeout;
     }
 
+    fn fetchAvailableBatch(
+        self: *VoprPublicClusterFixture,
+        route_index: usize,
+        table_name: []const u8,
+        body: []const u8,
+    ) !api_http_client.BatchResponse {
+        // Metadata partitions may reject routing before mutation admission.
+        // Retry only the public contract's proven-unavailable classification;
+        // ambiguous transaction or Raft outcomes must remain visible failures.
+        for (0..16) |_| {
+            return self.client.fetchBatch(self.api_base_uris[route_index], table_name, body) catch |err| switch (err) {
+                error.LeaderUnavailable => {
+                    try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+                    continue;
+                },
+                else => return err,
+            };
+        }
+        return error.LeaderUnavailable;
+    }
+
     fn runWriter(self: *VoprPublicClusterFixture) void {
         self.resource_recovered.waitUncancelable(self.sim.io());
         defer {
             self.write_finished = true;
             self.write_done.set(self.sim.io());
         }
-        var response = self.client.fetchBatch(self.api_base_uris[self.client_index], "docs",
+        var response = self.fetchAvailableBatch(self.client_index, "docs",
             \\{"inserts":{"doc:a":{"title":"alpha","body":"graph source","_edges":{"graph_idx":{"links":[{"target":"doc:z"}]}}},"doc:z":{"title":"zeta","body":"hello distributed world","_edges":{"graph_idx":{"links":[{"target":"doc:y"}]}}},"doc:y":{"title":"gamma","body":"hello cluster"}},"sync_level":"full_index"}
         ) catch |err| {
             self.request_errors +|= 1;
@@ -8095,30 +8116,34 @@ pub const VoprPublicClusterFixture = struct {
         defer response.deinit(self.alloc);
         self.write_sound = response.status >= 200 and response.status < 300 and
             std.mem.indexOf(u8, response.body, "\"inserted\":3") != null;
-        if (self.write_sound) self.materializeHostedGraphIndexes() catch |err| {
+        if (self.write_sound) self.materializeHostedIndexes() catch |err| {
             self.write_sound = false;
             self.request_errors +|= 1;
             self.last_request_error_code = @intFromError(err);
         };
     }
 
-    fn materializeHostedGraphIndexes(self: *VoprPublicClusterFixture) !void {
+    fn materializeHostedIndexes(self: *VoprPublicClusterFixture) !void {
         // This hosted fixture has no DataServer maintenance scheduler. After
         // identity bootstrap and writes, drive the production repair endpoint
-        // to completion before releasing the graph reader.
+        // for both graph traversal and its full-text anchor query before reads.
+        var repair_client = self.client;
+        _ = repair_client.withInternalServiceAuth(vopr_internal_service_secret, "metadata-vopr");
         for ([_]u64{ data_group_id, graph_data_group_id }) |group_id| {
             for (self.api_base_uris[0..self.uri_count], 0..) |base_uri, node_index| {
                 if (self.cluster.node(node_index).status(group_id) != .active) continue;
-                for (0..40) |_| {
-                    var response = try self.client.fetchGroupArtifactRepairRun(base_uri, group_id, "docs",
-                        \\{"target":"index","index_name":"graph_idx","limit":16}
-                    );
-                    defer response.deinit(self.alloc);
-                    var result = try std.json.parseFromSlice(struct { debt_remaining: bool, has_more: bool }, self.alloc, response.body, .{ .ignore_unknown_fields = true });
-                    defer result.deinit();
-                    if (!result.value.debt_remaining and !result.value.has_more) break;
-                    try self.cluster.stepAll();
-                } else return error.VoprIndexMaterializationIncomplete;
+                for ([_][]const u8{ graph_index_name, api_tables.default_full_text_index_name }) |index_name| {
+                    const body = try std.fmt.allocPrint(self.alloc, "{{\"target\":\"index\",\"index_name\":\"{s}\",\"limit\":16}}", .{index_name});
+                    defer self.alloc.free(body);
+                    for (0..40) |_| {
+                        var response = try repair_client.fetchGroupArtifactRepairRun(base_uri, group_id, "docs", body);
+                        defer response.deinit(self.alloc);
+                        var result = try std.json.parseFromSlice(struct { debt_remaining: bool, has_more: bool }, self.alloc, response.body, .{ .ignore_unknown_fields = true });
+                        defer result.deinit();
+                        if (!result.value.debt_remaining and !result.value.has_more) break;
+                        try self.cluster.stepAll();
+                    } else return error.VoprIndexMaterializationIncomplete;
+                }
             }
         }
     }
@@ -8148,7 +8173,7 @@ pub const VoprPublicClusterFixture = struct {
             self.tenant_write_done.set(self.sim.io());
         }
         const route_index = (self.client_index + 1) % node_count;
-        var response = self.client.fetchBatch(self.api_base_uris[route_index], "tenant_b_docs",
+        var response = self.fetchAvailableBatch(route_index, "tenant_b_docs",
             \\{"inserts":{"tenant:z":{"title":"private","body":"tenant-isolation-sentinel"}}}
         ) catch |err| {
             self.request_errors +|= 1;
@@ -9002,8 +9027,8 @@ fn metadataVoprActionName(action: MetadataVoprAction) []const u8 {
 
 fn metadataVoprReplayCommand(cfg: MetadataVoprCampaignConfig) []const u8 {
     return switch (cfg.workload) {
-        .smoke => "zig build lib-metadata-vopr-test --summary failures",
-        .expanded => "zig build lib-metadata-vopr-chaos-test --summary failures",
+        .smoke => "zig build antfly-metadata-vopr-test --summary failures",
+        .expanded => "zig build antfly-metadata-vopr-chaos-test --summary failures",
     };
 }
 

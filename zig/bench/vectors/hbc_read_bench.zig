@@ -141,6 +141,16 @@ const StorageHarness = struct {
             return self.backing.writeFileAbsolute(path, contents);
         }
 
+        fn syncContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.syncFileContentsAbsolute(path);
+        }
+
+        fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.syncParentAbsolute(path);
+        }
+
         fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.counters.rename += 1;
@@ -172,7 +182,12 @@ const StorageHarness = struct {
         .file_size = CountingStorage.fileSize,
         .read_file_trailer_alloc = CountingStorage.readFileTrailerAlloc,
         .write_file_absolute = CountingStorage.writeFileAbsolute,
+        .sync_contents_absolute = CountingStorage.syncContentsAbsolute,
+        .sync_parent_absolute = CountingStorage.syncParentAbsolute,
         .rename_absolute = CountingStorage.renameAbsolute,
+        // Both supported backings (MemoryStorage and NativeStorage) guarantee
+        // atomic sibling replacement; the wrapper preserves that capability.
+        .rename_is_atomic = true,
         .delete_file_absolute = CountingStorage.deleteFileAbsolute,
         .delete_tree = CountingStorage.deleteTree,
         .now_ns = CountingStorage.nowNs,
@@ -361,9 +376,9 @@ fn allocPrintZ(allocator: Allocator, comptime fmt: []const u8, args: anytype) ![
     return out;
 }
 
-pub fn main(init: std.process.Init) !void {
+pub fn run(init: std.process.Init, args: *std.process.Args.Iterator) !void {
     const allocator = std.heap.c_allocator;
-    const cfg = try parseArgs(init.minimal.args);
+    const cfg = try parseArgs(args);
 
     const dataset = try makeDataset(allocator, cfg);
     defer allocator.free(dataset);
@@ -643,29 +658,27 @@ fn freeItems(allocator: Allocator, items: []hbc.BatchInsertItem) void {
     allocator.free(items);
 }
 
-fn parseArgs(proc_args: std.process.Args) !Config {
+fn parseArgs(args: *std.process.Args.Iterator) !Config {
     var cfg = Config{};
-    var args = std.process.Args.Iterator.init(proc_args);
-    _ = args.skip();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--samples")) {
-            cfg.samples = try parseNextUsize(&args, arg);
+            cfg.samples = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--vectors")) {
-            cfg.vectors = try parseNextUsize(&args, arg);
+            cfg.vectors = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--dims")) {
-            cfg.dims = try parseNextUsize(&args, arg);
+            cfg.dims = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--queries")) {
-            cfg.queries = try parseNextUsize(&args, arg);
+            cfg.queries = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--k")) {
-            cfg.k = try parseNextUsize(&args, arg);
+            cfg.k = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--batch-size")) {
-            cfg.batch_size = try parseNextUsize(&args, arg);
+            cfg.batch_size = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--leaf-size")) {
-            cfg.leaf_size = @intCast(try parseNextUsize(&args, arg));
+            cfg.leaf_size = @intCast(try parseNextUsize(args, arg));
         } else if (std.mem.eql(u8, arg, "--branching-factor")) {
-            cfg.branching_factor = @intCast(try parseNextUsize(&args, arg));
+            cfg.branching_factor = @intCast(try parseNextUsize(args, arg));
         } else if (std.mem.eql(u8, arg, "--seed")) {
-            cfg.seed = try parseNextU64(&args, arg);
+            cfg.seed = try parseNextU64(args, arg);
         } else if (std.mem.eql(u8, arg, "--storage")) {
             const value = args.next() orelse return error.InvalidArgument;
             cfg.storage_mode = std.meta.stringToEnum(StorageSelection, value) orelse return error.InvalidArgument;
@@ -690,9 +703,9 @@ fn parseArgs(proc_args: std.process.Args) !Config {
             const value = args.next() orelse return error.InvalidArgument;
             cfg.centroid_directory_mode = std.meta.stringToEnum(hbc.HBCConfig.CentroidDirectoryMode, value) orelse return error.InvalidArgument;
         } else if (std.mem.eql(u8, arg, "--flat-centroid-block-size")) {
-            cfg.flat_centroid_block_size = try parseNextUsize(&args, arg);
+            cfg.flat_centroid_block_size = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--flat-centroid-probe-count")) {
-            cfg.flat_centroid_probe_count = try parseNextUsize(&args, arg);
+            cfg.flat_centroid_probe_count = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--no-quantization")) {
             cfg.use_quantization = false;
         } else if (std.mem.eql(u8, arg, "--no-reopen")) {

@@ -56278,6 +56278,206 @@ test "db match_all consumes resolved ordinal filter" {
     try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
 }
 
+test "db native document filters preserve paged totals across representations" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+    try db.addIndex(.{ .name = "sp_v1", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\"}" });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha\",\"embedding\":[0,0],\"sparse\":{\"indices\":[1],\"values\":[5]}}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"alpha alpha\",\"embedding\":[1,0],\"sparse\":{\"indices\":[1],\"values\":[4]}}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"alpha alpha alpha\",\"embedding\":[2,0],\"sparse\":{\"indices\":[1],\"values\":[3]}}" },
+            .{ .key = "doc:d", .value = "{\"body\":\"alpha alpha alpha alpha\",\"embedding\":[3,0],\"sparse\":{\"indices\":[1],\"values\":[2]}}" },
+            .{ .key = "doc:e", .value = "{\"body\":\"alpha\",\"embedding\":[4,0],\"sparse\":{\"indices\":[1],\"values\":[1]}}" },
+        },
+        .sync_level = .full_index,
+    });
+    const ids: []const []const u8 = &.{ "doc:a", "doc:b", "doc:c", "doc:d" };
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try db.resolveDocSetForIdsAlloc(alloc, ids),
+        .exclude = .none,
+    };
+    defer filter.deinit(alloc);
+    filter.exclude = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:d"});
+
+    const Shape = enum { match_all, full_text, dense, sparse, primary_store };
+    for (std.enums.values(Shape)) |shape| {
+        if (shape == .primary_store) try std.testing.expect(try db.deleteIndex("ft_v1"));
+        for ([_]types.SearchRequest{
+            .{ .limit = 1 },
+            .{ .limit = 1, .offset = 1 },
+            .{ .limit = 10 },
+            .{ .limit = 1, .offset = 10 },
+            .{ .limit = 1, .count_only = true },
+        }) |page| {
+            // Count-only text collectors omit hit materialization. The primary
+            // store and vector paths leave count-only response shaping to the API.
+            if (page.count_only and shape != .match_all and shape != .full_text) continue;
+            errdefer std.debug.print("shape={s} limit={d} offset={d} count_only={}\n", .{ @tagName(shape), page.limit, page.offset, page.count_only });
+            var req = page;
+            req.include_stored = false;
+            req.query = .{ .match_all = {} };
+            switch (shape) {
+                .match_all, .primary_store => {},
+                .full_text => req.full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+                .dense => {
+                    req.index_name = "dv_v1";
+                    req.dense = .{ .vector = &.{ 0, 0 }, .k = 10 };
+                },
+                .sparse => {
+                    req.index_name = "sp_v1";
+                    req.query = .{ .sparse_knn = .{ .indices = &.{1}, .values = &.{1}, .k = 10 } };
+                },
+            }
+            req.filter_doc_ids = ids;
+            req.filter_doc_ids_positive = true;
+            req.exclude_doc_ids = &.{"doc:d"};
+            var public = try db.search(alloc, req);
+            defer public.deinit();
+            req.filter_doc_ids = &.{};
+            req.filter_doc_ids_positive = false;
+            req.exclude_doc_ids = &.{};
+            req.resolved_doc_filter = &filter;
+            var ordinal = try db.search(alloc, req);
+            defer ordinal.deinit();
+
+            // The native engine counted all three matches before paging. Neither
+            // their representation nor an empty result page changes that count.
+            try std.testing.expectEqual(@as(u32, 3), public.total_hits);
+            try std.testing.expectEqual(types.TotalHitsRelation.exact, public.total_hits_relation);
+            try std.testing.expectEqual(public.total_hits, ordinal.total_hits);
+            try std.testing.expectEqual(public.total_hits_relation, ordinal.total_hits_relation);
+            const expected_page_len: usize = if (page.count_only) 0 else @min(page.limit, 3 -| page.offset);
+            try std.testing.expectEqual(expected_page_len, public.hits.len);
+            try std.testing.expectEqual(public.hits.len, ordinal.hits.len);
+            for (public.hits, ordinal.hits) |expected, actual| {
+                try std.testing.expectEqualStrings(expected.id, actual.id);
+                try std.testing.expectEqual(expected.doc_ordinal, actual.doc_ordinal);
+                try std.testing.expect(!std.mem.eql(u8, actual.id, "doc:d"));
+                try std.testing.expect(!std.mem.eql(u8, actual.id, "doc:e"));
+            }
+        }
+    }
+}
+
+test "db dense filter hydration only looks up required hit ordinals" {
+    const alloc = std.testing.allocator;
+    const Harness = struct {
+        db: DB,
+        lookup_calls: usize = 0,
+        seen_generation: ?u64 = null,
+
+        fn lookup(ctx: ?*anyopaque, allocator: Allocator, index_name: []const u8, vector_ids: []const u64, generation: ?u64) anyerror![]?doc_set.DocOrdinal {
+            const db: *DB = @ptrCast(@alignCast(ctx.?));
+            const self: *@This() = @fieldParentPtr("db", db);
+            self.lookup_calls += 1;
+            self.seen_generation = generation;
+            return try DB.denseOrdinalsForVectorIdsCallback(ctx, allocator, index_name, vector_ids, generation);
+        }
+    };
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var harness = Harness{ .db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false }) };
+    defer harness.db.close();
+    const db = &harness.db;
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha\",\"category\":\"keep\",\"embedding\":[0,0]}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"beta\",\"category\":\"reject\",\"embedding\":[1,0]}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"alpha\",\"category\":\"keep\",\"embedding\":[2,0]}" },
+        },
+        .sync_level = .full_index,
+    });
+    var filter = doc_set.ResolvedDocFilter{ .include = try db.resolveDocSetForIdsAlloc(alloc, &.{ "doc:a", "doc:c" }) };
+    defer filter.deinit(alloc);
+    const generation = try db.currentIdentityReadGenerationForRequest(null);
+    // Exercise the real native collector and post-processor, counting the batch
+    // identity read separately from the identity work that admits candidates.
+    const executor = db_query_search.DenseSearchExecutor{
+        .ctx = db,
+        .text_index_entry = DB.textIndexEntryCallback,
+        .dense_index = DB.denseIndexCallback,
+        .lookup_doc_key = DB.denseDocKeyCallback,
+        .resolve_hit_key = DB.resolveDenseHitKeyCallback,
+        .lookup_vector_id = DB.denseVectorIdCallback,
+        .lookup_vector_ids_for_ordinals = DB.denseVectorIdsForOrdinalsCallback,
+        .all_docs_visible_fast = DB.allDocsVisibleFastCallback,
+        .lookup_doc_ordinal = DB.lookupLiveDocOrdinalNoLockCallback,
+        .lookup_doc_ordinals = DB.lookupLiveDocOrdinalsNoLockCallback,
+        .lookup_doc_ordinals_for_vector_ids = Harness.lookup,
+        .resolve_doc_set_doc_ids = DB.resolveDocSetDocIdsCallback,
+        .resolve_doc_ids_to_doc_set = DB.resolveDocIdsToDocSetCallback,
+        .live_filter_doc_set = DB.liveFilterDocSetCallback,
+        .nonvisible_doc_set = DB.nonVisibleDocSetCallback,
+        .load_projected_document = DB.loadRequiredProjectedSearchDocumentCallback,
+        .hbc_search = DB.hbcSearchCallback,
+        .hbc_search_profiled = DB.hbcSearchProfiledCallback,
+        .exact_dense_search = DB.exactDenseSearchCallback,
+        .postprocess = DB.postprocessVectorSearchResultCallback,
+    };
+    const Case = struct { req: types.SearchRequest, lookups: usize, without_text_index: bool = false };
+    var removed_text_index = false;
+    for ([_]Case{
+        .{ .req = .{ .filter_text = .{ .match = .{ .field = "body", .text = "alpha" } } }, .lookups = 0 },
+        .{ .req = .{ .exclusion_text = .{ .match = .{ .field = "body", .text = "beta" } } }, .lookups = 0 },
+        .{ .req = .{ .filter_query_json = "{\"doc_id\":[\"doc:a\",\"doc:c\"]}" }, .lookups = 0 },
+        .{ .req = .{ .exclusion_query_json = "{\"doc_id\":[\"doc:b\"]}" }, .lookups = 0 },
+        .{ .req = .{ .filter_doc_ids = &.{ "doc:a", "doc:c" }, .filter_doc_ids_positive = true }, .lookups = 1 },
+        .{ .req = .{ .exclude_doc_ids = &.{"doc:b"} }, .lookups = 1 },
+        .{ .req = .{ .resolved_doc_filter = &filter }, .lookups = 1 },
+        // Mix native ID constraints with residual stored predicates in both
+        // positions. Removing resolved predicates must preserve hydration when
+        // either remaining predicate still needs hit identity.
+        .{ .req = .{ .filter_query_json = "{\"term\":{\"category\":\"keep\"}}", .exclusion_query_json = "{\"doc_id\":[\"doc:b\"]}" }, .lookups = 1, .without_text_index = true },
+        .{ .req = .{ .filter_query_json = "{\"doc_id\":[\"doc:a\",\"doc:c\"]}", .exclusion_query_json = "{\"term\":{\"category\":\"reject\"}}" }, .lookups = 1, .without_text_index = true },
+    }, 0..) |case, i| {
+        errdefer std.debug.print("dense hydration case={d}\n", .{i});
+        if (case.without_text_index and !removed_text_index) {
+            try std.testing.expect(try db.deleteIndex("ft_v1"));
+            removed_text_index = true;
+        }
+        var req = case.req;
+        req.index_name = "dv_v1";
+        req.primary_text_index_name = if (removed_text_index) null else "ft_v1";
+        req.identity_read_generation = generation;
+        req.include_stored = false;
+        req.limit = 10;
+        harness.lookup_calls = 0;
+        harness.seen_generation = null;
+        var result = try db_query_search.searchDense(alloc, req, .{ .vector = &.{ 0, 0 }, .k = 10 }, executor);
+        defer result.deinit();
+        try std.testing.expectEqual(case.lookups, harness.lookup_calls);
+        try std.testing.expectEqual(@as(?u64, if (case.lookups == 0) null else generation), harness.seen_generation);
+        try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+        try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+        try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+        try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+        try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+        if (case.lookups > 0) {
+            for (result.hits) |hit| try std.testing.expect(hit.doc_ordinal != null);
+        }
+    }
+}
+
 test "db stats report engine-owned algebraic adaptive observation status" {
     const alloc = std.testing.allocator;
     const algebraic_ir = @import("algebraic/ir.zig");

@@ -443,7 +443,7 @@ histories and their exact replays, including leak and strict error-log checks.
 The Raft transport, determinism, serverless-workflow, focused distributed-query,
 and graph lifecycle gates also pass at this checkpoint. The preceding
 merge/data-Raft checkpoint passed `lib-data-storage-test` 67/67 and
-`lib-data-runtime-test` 125/125 with no leaks. It includes production-envelope
+`antfly-data-runtime-test` 125/125 with no leaks. It includes production-envelope
 replay, pre-covering-receiver bootstrap evidence, finalize/reopen persistence,
 the version-3 capability barrier, rejection of merge controls before durable
 activation, source fencing and receiver-checkpoint snapshot transfer, and
@@ -636,8 +636,8 @@ The lane suffix still describes fidelity:
   smoke and convergence selections. The broader convergence selection includes
   median-key fixtures with native HTTP listeners; virtual Raft transport alone
   is not an end-to-end deterministic I/O claim.
-- `lib-metadata-vopr-test`, `lib-metadata-vopr-data-test`, and
-  `lib-metadata-vopr-chaos-test` retain their seeded campaign selections;
+- `antfly-metadata-vopr-test`, `lib-metadata-vopr-data-test`, and
+  `antfly-metadata-vopr-chaos-test` retain their seeded campaign selections;
   `metadata-vopr-replay-stability-test` checks repeated exact replay.
 - `lib-metadata-vopr-http-integration-test`,
   `lib-metadata-vopr-public-integration-test`, and
@@ -648,7 +648,7 @@ The lane suffix still describes fidelity:
   `lib-metadata-vopr-placement-chaos-test` select the broader fault suites;
   `lib-metadata-vopr-chaos-soak-test` combines those three selections.
 
-The aggregate `vopr-test`, `integration-test`, `chaos-test`, and
+The aggregate `vopr-test`, `antfly-integration-test`, `antfly-chaos-test`, and
 `chaos-soak-test` retain their existing selections.
 
 Metadata planning fixes (2026-09-07): rename validation exposed four failures
@@ -692,14 +692,14 @@ regressions pass **2/2** in both Debug and ReleaseSafe.
 | One-transition scheduling and typed termination | `scheduler.zig`, `scenario.zig`, `outcome.zig` | `zig build vopr-engine-test` |
 | Antfly-independent runtime boundary | `runtime.zig`, `sim_runtime.zig`; `VoprIo` composes the narrow atomic executor into its scheduler; Antfly `DurableJobLane` adapter | `zig build vopr-engine-test vopr-runtime-test` |
 | Deterministic `std.Io` tasks and synchronization | `vopr_io.zig`, `vopr_io_task.zig` | `zig build vopr-engine-test` in Debug and ReleaseSafe |
-| Typed strong-read capabilities | `raft/read_gate.zig` separates enqueue-only `ReadIndexRequester` from synchronous `ReadSafetyBarrier`; managed Raft services expose only initiation, while public table-read sources accept only the barrier type. DataServer implements the barrier with canonical matching-group ReadState plus applied-index completion, starts replicated sources with a fail-closed unavailable barrier, and installs `alreadyReadSafeBarrier` only after explicitly selecting direct non-Raft ownership. The three-owner production history exact-replays follower success/typed stale-leader rejection, old-to-new leader transfer and retry, logical timeout, cancellation cleanup, state-machine group retirement, and graph/full-index visibility. The former readable-lease API, no-op name, service adapters, and metrics were renamed or deleted directly; there are no compatibility aliases | `zig build raft-test root-test lib-data-runtime-test` |
+| Typed strong-read capabilities | `raft/read_gate.zig` separates enqueue-only `ReadIndexRequester` from synchronous `ReadSafetyBarrier`; managed Raft services expose only initiation, while public table-read sources accept only the barrier type. DataServer implements the barrier with canonical matching-group ReadState plus applied-index completion, starts replicated sources with a fail-closed unavailable barrier, and installs `alreadyReadSafeBarrier` only after explicitly selecting direct non-Raft ownership. The three-owner production history exact-replays follower success/typed stale-leader rejection, old-to-new leader transfer and retry, logical timeout, cancellation cleanup, state-machine group retirement, and graph/full-index visibility. The former readable-lease API, no-op name, service adapters, and metrics were renamed or deleted directly; there are no compatibility aliases | `zig build antfly-raft-test antfly-root-test antfly-data-runtime-test` |
 | Modeled files, durability, persistent sector corruption, torn synchronization, streams, datagrams, processes, global quotas, and endpoint-stable reversible listener connection limits | `vopr_io_file.zig`, `vopr_io_net.zig`, `vopr_io_process.zig`; virtual streams distinguish an ordered write-half FIN from full peer read abandonment and hard reset. Both FIN and full-close control remain ordered behind prior payload, while only read abandonment/reset satisfies HTTPX's production-neutral H1 disconnect probe. The forward-only API is named for peer abandonment rather than generic disconnect, full close has its own stable transition identity, and this semantic change directly advances the virtual-OS replay model to v7. Endpoint/payload outage matching exposes a monotonic post-heal witness so scenarios can prove production traffic crossed an armed boundary | `zig build vopr-engine-test data-server-vopr-test production-cluster-graph-cancellation-vopr-test production-cluster-graph-cancellation-transport-fault-vopr-test` |
 | Stable optional safepoints | `vopr_io_instrumentation.zig` | `zig build vopr-engine-test` |
 | Clocks, timers, storage completions, and lifecycle faults | `time.zig`, `clock_fault.zig`, `fault.zig`, storage `sim_runtime.zig` | `zig build vopr-engine-test storage-vopr-runtime-test` |
 | Properties, observations, semantic coverage, cross-revision corpus quarantine, property history, and guided search | `property.zig`, `observation.zig`, `coverage.zig`, `corpus.zig`, `explorer.zig` | `zig build vopr-engine-test vopr-benchmark` |
 | Integrated retroactive flight recording and fielded temporal event queries | `flight_recorder.zig`, `event_query.zig`, `debug_recipe.zig`; bounded recordings own structured fields and verbose text outside canonical bytes, support conjunctive field/text filters and before/after windows, and are populated directly by runner-backed and custom metadata/domain replay paths. Every retained/failing campaign writes `.flight.json`, while every debug recipe packages a filtered reduced-replay window | `zig build vopr-engine-test vopr-meta-test`; `vopr events` and `vopr recipe` are argument-taking commands, not standalone test gates |
 | Saved cross-run event sets, validation, counting, and live streams | `event_set.zig` validates a versioned forward-only query DAG and evaluates selection, union/intersection/difference/complement, distinct/first/last moment, previous/next, and bounded sequence operations across canonical histories. Its tests execute every operator and reject forward references, malformed operators, duplicate names, v0 formats, and the former ad-hoc selector shape. `vopr events` accepts only this saved-plan format and exact-replayed traces, with repeated `--trace`, `--validate`, and `--count`. Forward-only `vopr-event-stream-v2` serializes into a caller-owned fixed-slot SPSC queue: publication cannot allocate, block, or invoke external code, while one consumer may drain concurrently. Release/acquire publication prevents partial records; power-of-two capacity and wrapping monotonic positions preserve bounded operation across counter rollover. Drop-newest backpressure, oversize records, publication after close, delivery, and sink failures have separate atomically sampled saturating counters. Failed delivery retains the oldest record for retry, and close still permits draining. Tests cover invalid capacity, oversize rejection, concurrent producer/consumer accounting, retry, close, and pressure; runner pressure leaves canonical output byte-identical to an unobserved run. Custom observers remain an expert synchronous interface and must not block or panic | `zig build vopr-engine-test vopr-meta-test` |
-| Reversible node and operation service rates | `service_rate.zig` registers unambiguous stable node/operation identities, composes fully checked node/operation costs, charges logical time through borrowed `std.Io`, and heals individual effects by stable fault ID. Accounting distinguishes calls, work units, and logical nanoseconds. Six production-neutral boundaries are integrated: query cache, DataServer Raft and LSM maintenance, distributed graph, replication snapshot/stream, and serverless workflow work. Focused histories prove exact slowed/healed behavior. Full-cluster v23 installs one shared model into DataServer, graph, and serverless owners; v42 adds production replication work on the public/DataServer/Raft path; v43 proves pre-heal snapshot work survives a schema-change interruption and exact duplicate resume; v44 proves the same charged runner survives target-owner reconstruction and bounded reconnect; v45 proves it survives source-session failure and replacement; v46 proves outer lease cancellation composes with delegated charging; v47 adds ownership revalidation between target apply and checkpoint publication; v48 preserves charging while source-catalog and exact-cutover authority transitions cross metadata Raft; v49 installs the query-cache port on the actual node-owned `ApiHttpServer` across deadline expiry, healing, owner reconstruction, and exact recomputation | `zig build vopr-engine-test query-embedding-cache-vopr-test lib-data-runtime-test data-server-vopr-test distributed-query-vopr-test replication-backfill-vopr-test serverless-workflow-vopr-test production-cluster-service-rate-vopr-test production-cluster-query-cache-deadline-restart-vopr-test production-cluster-replication-backfill-vopr-test production-cluster-replication-schema-change-vopr-test production-cluster-replication-owner-restart-vopr-test production-cluster-replication-source-crash-vopr-test production-cluster-replication-cancellation-vopr-test production-cluster-replication-stale-owner-vopr-test production-cluster-replication-topology-change-vopr-test`; cache topology/link/storage/resource overlap and remaining replication fault variants in the deployment remain roadmap breadth |
+| Reversible node and operation service rates | `service_rate.zig` registers unambiguous stable node/operation identities, composes fully checked node/operation costs, charges logical time through borrowed `std.Io`, and heals individual effects by stable fault ID. Accounting distinguishes calls, work units, and logical nanoseconds. Six production-neutral boundaries are integrated: query cache, DataServer Raft and LSM maintenance, distributed graph, replication snapshot/stream, and serverless workflow work. Focused histories prove exact slowed/healed behavior. Full-cluster v23 installs one shared model into DataServer, graph, and serverless owners; v42 adds production replication work on the public/DataServer/Raft path; v43 proves pre-heal snapshot work survives a schema-change interruption and exact duplicate resume; v44 proves the same charged runner survives target-owner reconstruction and bounded reconnect; v45 proves it survives source-session failure and replacement; v46 proves outer lease cancellation composes with delegated charging; v47 adds ownership revalidation between target apply and checkpoint publication; v48 preserves charging while source-catalog and exact-cutover authority transitions cross metadata Raft; v49 installs the query-cache port on the actual node-owned `ApiHttpServer` across deadline expiry, healing, owner reconstruction, and exact recomputation | `zig build vopr-engine-test query-embedding-cache-vopr-test antfly-data-runtime-test data-server-vopr-test distributed-query-vopr-test replication-backfill-vopr-test serverless-workflow-vopr-test production-cluster-service-rate-vopr-test production-cluster-query-cache-deadline-restart-vopr-test production-cluster-replication-backfill-vopr-test production-cluster-replication-schema-change-vopr-test production-cluster-replication-owner-restart-vopr-test production-cluster-replication-source-crash-vopr-test production-cluster-replication-cancellation-vopr-test production-cluster-replication-stale-owner-vopr-test production-cluster-replication-topology-change-vopr-test`; cache topology/link/storage/resource overlap and remaining replication fault variants in the deployment remain roadmap breadth |
 | Integrated per-history and aggregate run/results API with phased health evidence | `runner.zig`, `report.zig`, `health.zig`, `vopr_io.zig`, `vopr-results`; every runner history samples continuous/recovery/final health without changing canonical trace bytes, exact replay rematerializes the evidence, `VoprIo.healthSnapshot` supplies task/descriptor/storage data, and mature P0/P1 adapters add domain progress, recovery, consistency, allocator/crash classification, and cleanup | `zig build vopr-engine-test vopr-contract-test vopr-registry-test vopr-results` |
 | Integrated persistent local run/results index and usage query API | `run_index.zig`, `vopr-index`; atomically persisted `vopr-run-index-v1` projects per-history and aggregate results into canonical run, revision, property, fingerprint, corpus/quarantine, artifact, and budget records. CLI predicates and `vopr-run-index-query-v1` cover every dimension, and the same query renders a static local HTML summary | `zig build vopr-engine-test vopr-meta-test vopr-index` |
 | Automatic debug recipes and deterministic corpus merging | `debug_recipe.zig`, callback-based `reducer.zig`, `corpus.zig`; `vopr-recipe`, `vopr-corpus-merge` | `zig build vopr-engine-test vopr-meta-test` |
@@ -716,7 +716,7 @@ regressions pass **2/2** in both Debug and ReleaseSafe.
 | HA lifecycle | replication, fencing, promotion, retention, restart, and rejoin | `zig build ha-vopr-test ha-chaos-test` |
 | Independent application domains | distributed transaction, data plane, derived workflow, backup/restore, and clock faults | their five focused `*-vopr-test` gates |
 | Production public HTTP on deterministic I/O | `vopr/data_server.zig`, `vopr/http_lifecycle.zig`, borrowed `HttpRuntime` and `BackendRuntime` lanes, transport-neutral metadata executor; chunked upload, keep-alive pipeline, streaming response, and half-close | `zig build data-server-vopr-test` |
-| Production DataServer replicated merge/split seam | `data/runtime.zig`; the focused rollback/fresh-retry history uses one owner and two groups, while `data-server-transition-vopr-test` chains merge into split across three real `DataServer` owners and three replicated groups over time. It uses public HTTP/Raft listeners, routed merge actions, leader transfer, a public post-bootstrap delta write, replicated bootstrap/catch-up/finalize, owner restart, catalog-independent replay, exact routed terminal retry, every-replica range/transition/watermark convergence, document equality, actor-owned teardown, and fresh-root replay of the recorded actor/time schedule on one `VoprIo`. Clock-only stutter is normalized at the explicit physical LSM differential boundary; no different actor may execute, and a recorded actor that does not become ready within the bound is replay divergence. A regression preserves exactly-once split-action lane release when an inline durable job fails | `zig build data-server-transition-vopr-test`; broader `data-server-vopr-test lib-data-runtime-test lib-data-storage-test` gates remain required before release |
+| Production DataServer replicated merge/split seam | `data/runtime.zig`; the focused rollback/fresh-retry history uses one owner and two groups, while `data-server-transition-vopr-test` chains merge into split across three real `DataServer` owners and three replicated groups over time. It uses public HTTP/Raft listeners, routed merge actions, leader transfer, a public post-bootstrap delta write, replicated bootstrap/catch-up/finalize, owner restart, catalog-independent replay, exact routed terminal retry, every-replica range/transition/watermark convergence, document equality, actor-owned teardown, and fresh-root replay of the recorded actor/time schedule on one `VoprIo`. Clock-only stutter is normalized at the explicit physical LSM differential boundary; no different actor may execute, and a recorded actor that does not become ready within the bound is replay divergence. A regression preserves exactly-once split-action lane release when an inline durable job fails | `zig build data-server-transition-vopr-test`; broader `data-server-vopr-test antfly-data-runtime-test lib-data-storage-test` gates remain required before release |
 | Production background ownership and admission | `background_runtime.zig`, `vopr_durable_job_lane.zig`; transaction recovery, TTL, enrichment, text merge, sparse compaction, resolution, promotion, LSM maintenance, quarantine retry, repair, DataServer warmup/catch-up/root/status refresh, and auto-bulk finish work on borrowed `std.Io`/shared owners; `vopr/admission.zig` | `zig build storage-vopr-runtime-test vopr-runtime-test data-server-vopr-test admission-vopr-test` |
 | Real serverless object-store protocols under deterministic provider faults | `objectstore/scripted_fault.zig`, Antfly `vopr/object_store.zig` | `zig build lib-objectstore-test serverless-object-store-vopr-test` |
 | P0/P1 orchestration boundaries | Antfly `vopr/replication_backfill.zig`, `supervision.zig`, `auth_lifecycle.zig`, `serverless_workflow.zig`, `db_index_races.zig` | their focused `*-vopr-test` gates |
@@ -1272,7 +1272,7 @@ runs the real DataServer public listener and `/healthz` request through httpx on
 borrowed `VoprIo`, including partial writes and deadline-first shutdown. Routed
 write/read, Raft, and split/merge internals remain the next microstep boundary.
 
-Focused gates: `lib-metadata-vopr-test`,
+Focused gates: `antfly-metadata-vopr-test`,
 `lib-metadata-vopr-data-test`, `data-server-vopr-test`, and
 `metadata-vopr-replay-stability-test`.
 
@@ -1315,7 +1315,7 @@ fence stores, replication, application, partition, crash, retention, backup,
 promotion, rejoin assessment, stale-owner fencing, and ordered applied-prefix
 properties.
 
-Focused gates: `ha-vopr-test` and `ha-chaos-test`.
+Focused gates: `ha-vopr-test` and `antfly-storage-ha-chaos-test`.
 
 ### Data Plane
 
@@ -1752,7 +1752,7 @@ VOPR work has found concrete production and harness defects:
   no partial response, explicit healing, and exact fresh-request recovery in
   Debug and ReleaseSafe. The focused
   `lib-api-distributed-query-availability-test` keeps the shared classification
-  contract in ordinary root-test discovery.
+  contract in ordinary antfly-root-test discovery.
 - The v40 global-query process-loss history found that Raft leadership and
   catalog routing recovery were insufficient reconstruction evidence. The
   replacement DataServer could have a stable identity, rebound endpoint, and
@@ -2421,7 +2421,7 @@ VOPR work has found concrete production and harness defects:
   rotation, retained values, deletion, layered precedence, malformed/missing
   replacement retention, and injected cancellation through every dispatched
   operation. It runs in `lib-common-secrets-test`
-  and `unit-test`; production semantic E2E tests cover the assembled executable.
+  and `antfly-unit-test`; production semantic E2E tests cover the assembled executable.
   Matching `std.Io` layouts/toolchains alone does not make error-returning
   vtable calls safe across independent Zig compilation units.
 - Native Lite unconditionally constructed its own `std.Io.Threaded`, and its
@@ -2951,7 +2951,7 @@ lsm                   ha
 
 ## Test-Tier Policy
 
-### `root-test`
+### `antfly-root-test`
 
 - Fast root-module compile smoke coverage.
 - No wall-clock sleeps or generated campaigns.
@@ -2967,7 +2967,7 @@ lsm                   ha
 - No legacy real-I/O storage workload pretending to be modeled I/O.
 - `vopr-engine-test` runs only the reusable `lib/vopr` contract.
 
-### `chaos-test`
+### `antfly-chaos-test`
 
 - Longer but transition- or history-bounded deterministic campaigns.
 - Independent labeled nodes for metadata, transaction, Raft, WAL, LMDB, LSM,
@@ -3134,7 +3134,7 @@ exercise the actual owners, not substitute simulation models:
   certification of every auth storage or policy callback boundary.
 
 The focused gates are `raft-read-gate-test`,
-`lib-data-runtime-test -- "data raft read safety barrier"`,
+`antfly-data-runtime-test -- "data raft read safety barrier"`,
 `lib-serverless-manifest-test`, `lib-usermgr-test`, and
 `lib-usermgr-abi-test`. The new read-gate and independent auth-archive gates
 are included in the regular unit aggregate.

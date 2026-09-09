@@ -39,7 +39,7 @@ Use these build targets for the current test split:
 - `zig build vopr-test`
   - deterministic VOPR engine, metadata, Raft, HA, storage, application-domain,
     and production public-HTTP suites
-- `zig build chaos-test`
+- `zig build antfly-chaos-test`
   - delayed transport, restart, partition, and long-running metadata chaos
     coverage
 - `make test`

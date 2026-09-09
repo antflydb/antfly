@@ -82,7 +82,7 @@ Build the zig raft tests with tracing enabled, then validate the trace:
 
 ```bash
 # 1. Build and run raft tests, capturing trace to stderr
-~/bin/zig build -Dwith_tla=true raft-test 2>/tmp/zig-raft-trace.ndjson
+~/bin/zig build -Dwith_tla=true antfly-raft-test 2>/tmp/zig-raft-trace.ndjson
 
 # 2. Segment + validate (the Makefile target does both)
 make tla-trace-raft TRACE_FILES=/tmp/zig-raft-trace.ndjson

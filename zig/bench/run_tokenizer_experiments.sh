@@ -21,10 +21,12 @@ validation=${4:-exact}
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 zig_dir=$(cd -- "${script_dir}/.." && pwd)
 
+(cd "${zig_dir}" && zig build -Doptimize=ReleaseFast bench-tokenizer)
+
 run_benchmark() {
   (
     cd "${zig_dir}"
-    zig build -Doptimize=ReleaseFast bench-tokenizer -- \
+    ./zig-out/bin/tokenizer_benchmark \
       "${tokenizer_json}" "${corpus}" --repeat "${repeat}" \
       --validation "${validation}" --mmap-corpus --prefault-corpus "$@"
   )

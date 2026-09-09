@@ -117,6 +117,19 @@ class WorkflowActionPolicyTests(unittest.TestCase):
             )
             self.assertEqual(validate(root), [root / "ordinary-ci.yml"])
 
+    def test_cosign_workflows_provision_envsubst_before_installer(self) -> None:
+        workflow_dir = Path(__file__).resolve().parents[2] / ".github" / "workflows"
+        for name in ("antfly-operator-container.yml", "antfly-release.yml"):
+            with self.subTest(workflow=name):
+                workflow = (workflow_dir / name).read_text(encoding="utf-8")
+                provision = workflow.index("Install envsubst for cosign installer")
+                installer = workflow.index("uses: sigstore/cosign-installer@")
+                self.assertLess(provision, installer)
+                self.assertIn(
+                    "sudo apt-get install -y --no-install-recommends gettext-base",
+                    workflow[provision:installer],
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5093,6 +5093,29 @@ test "probe rejects vp8x alpha flag mismatch with vp8l header" {
     try std.testing.expectError(error.WebpDecodeFailed, decodeRgba(alloc, opaque_vp8l));
 }
 
+test "checked-in animated webp conformance corpus is valid but unsupported" {
+    const alloc = std.testing.allocator;
+    const test_support = @import("test_support.zig");
+    const bytes = try test_support.readFixtureAlloc(alloc, std.testing.io, "webp/unsupported/animated-1x1.webp");
+    defer alloc.free(bytes);
+
+    const info = try probe(bytes);
+    try std.testing.expect(info.animated);
+    try std.testing.expectEqual(@as(?u32, 1), info.width);
+    try std.testing.expectEqual(@as(?u32, 1), info.height);
+    try std.testing.expectError(error.AnimatedWebpUnsupported, decodeRgba(alloc, bytes));
+}
+
+test "checked-in malformed animation conformance corpus is rejected" {
+    const alloc = std.testing.allocator;
+    const test_support = @import("test_support.zig");
+    const bytes = try test_support.readFixtureAlloc(alloc, std.testing.io, "webp/invalid/empty-animation-control.webp");
+    defer alloc.free(bytes);
+
+    try std.testing.expectError(error.WebpDecodeFailed, probe(bytes));
+    try std.testing.expectError(error.WebpDecodeFailed, decodeRgba(alloc, bytes));
+}
+
 test "decode explicitly rejects animated webp" {
     try std.testing.expectError(error.AnimatedWebpUnsupported, decodeRgba(std.testing.allocator, &webp_vp8x_animated_1x1));
 }

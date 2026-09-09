@@ -318,16 +318,16 @@ metric movement matches the expected mechanism.
 
 Read/scan path:
 
-- `zig build lsm-backend-bench -- --samples 5 --keys 20000 --storage host --cache both > /tmp/lsm-read-before.jsonl`
-- `zig build lsm-backend-bench -- --samples 5 --keys 20000 --storage host --cache both --concurrent-read-threads 16 --concurrent-read-keys 1024 --concurrent-read-repeats 8 > /tmp/lsm-read-concurrent-before.jsonl`
-- `zig build lsm-backend-bench-compare -- --before /tmp/lsm-read-before.jsonl --after /tmp/lsm-read-after.jsonl`
+- `zig build lsm-backend-bench && ./zig-out/bin/lsm_backend_bench --samples 5 --keys 20000 --storage host --cache both > /tmp/lsm-read-before.jsonl`
+- `zig build lsm-backend-bench && ./zig-out/bin/lsm_backend_bench --samples 5 --keys 20000 --storage host --cache both --concurrent-read-threads 16 --concurrent-read-keys 1024 --concurrent-read-repeats 8 > /tmp/lsm-read-concurrent-before.jsonl`
+- `zig build lsm-backend-bench-compare && ./zig-out/bin/lsm_backend_bench_compare --before /tmp/lsm-read-before.jsonl --after /tmp/lsm-read-after.jsonl`
 
 Write path:
 
-- `zig build lsm-write-bench -- --samples 5 --keys 20000 --storage host --mode both > /tmp/lsm-write-before.jsonl`
-- `zig build lsm-write-bench-compare -- --before /tmp/lsm-write-before.jsonl --after /tmp/lsm-write-after.jsonl`
-- `zig build lsm-write-bench -- --samples 5 --keys 20000 --batch-size 100 --flush-threshold 100 --storage host --mode default --workload-set l0_pressure > /tmp/lsm-write-l0-before.jsonl`
-- `zig build lsm-write-bench-compare -- --before /tmp/lsm-write-l0-before.jsonl --after /tmp/lsm-write-l0-after.jsonl`
+- `zig build lsm-write-bench && ./zig-out/bin/lsm_write_bench --samples 5 --keys 20000 --storage host --mode both > /tmp/lsm-write-before.jsonl`
+- `zig build lsm-write-bench-compare && ./zig-out/bin/lsm_write_bench_compare --before /tmp/lsm-write-before.jsonl --after /tmp/lsm-write-after.jsonl`
+- `zig build lsm-write-bench && ./zig-out/bin/lsm_write_bench --samples 5 --keys 20000 --batch-size 100 --flush-threshold 100 --storage host --mode default --workload-set l0_pressure > /tmp/lsm-write-l0-before.jsonl`
+- `zig build lsm-write-bench-compare && ./zig-out/bin/lsm_write_bench_compare --before /tmp/lsm-write-l0-before.jsonl --after /tmp/lsm-write-l0-after.jsonl`
 - Add `--wal-sync-on-commit` when measuring WAL sync latency and retention
   behavior under durable commit pressure.
 - Add `--compact-threshold-runs`, `--l0-soft-limit-runs`,
@@ -340,8 +340,8 @@ Write path:
 
 Collected on 2026-06-02 from this worktree with 3 samples and 20k keys:
 
-- Read command: `zig build lsm-backend-bench -- --samples 3 --keys 20000 --value-size 128 --storage host --cache both > /tmp/lsm-read-current.jsonl`
-- Read comparator smoke: `zig build lsm-backend-bench-compare -- --before /tmp/lsm-read-current.jsonl --after /tmp/lsm-read-current.jsonl`
+- Read command: `zig build lsm-backend-bench && ./zig-out/bin/lsm_backend_bench --samples 3 --keys 20000 --value-size 128 --storage host --cache both > /tmp/lsm-read-current.jsonl`
+- Read comparator smoke: `zig build lsm-backend-bench-compare && ./zig-out/bin/lsm_backend_bench_compare --before /tmp/lsm-read-current.jsonl --after /tmp/lsm-read-current.jsonl`
 - Cached warm hit path: median `ns/op=702.60`, `read_table_block_loads=6`,
   shared block hit/miss `99994/6`.
 - Cached warm full scan: median `ns/op=88.51`, `cursor_block_loads=485`,
@@ -352,8 +352,8 @@ Collected on 2026-06-02 from this worktree with 3 samples and 20k keys:
 - Mixed read/write cache mode: median `ns/op=656.63`, bloom negatives
   `56205`, survivor reads/hits/misses/tombstones `60111/60000/111/0`,
   and shared block hit/miss `59986/14`.
-- L0-pressure command: `zig build lsm-write-bench -- --samples 3 --keys 20000 --batch-size 100 --flush-threshold 100 --storage host --mode default --workload-set l0_pressure > /tmp/lsm-write-l0-current.jsonl`
-- L0-pressure comparator smoke: `zig build lsm-write-bench-compare -- --before /tmp/lsm-write-l0-current.jsonl --after /tmp/lsm-write-l0-current.jsonl`
+- L0-pressure command: `zig build lsm-write-bench && ./zig-out/bin/lsm_write_bench --samples 3 --keys 20000 --batch-size 100 --flush-threshold 100 --storage host --mode default --workload-set l0_pressure > /tmp/lsm-write-l0-current.jsonl`
+- L0-pressure comparator smoke: `zig build lsm-write-bench-compare && ./zig-out/bin/lsm_write_bench_compare --before /tmp/lsm-write-l0-current.jsonl --after /tmp/lsm-write-l0-current.jsonl`
 - L0-pressure load median after the 2026-06-02 base-level target tuning:
   `ns/op=1449.60`, effective L0 soft/hard `4/8`, foreground write-pressure
   compactions `28`, `l0_runs_after=4`, `compactable_l0_runs_after=0`,
@@ -781,7 +781,7 @@ Current symptoms:
   memtable, so replay workers could drive multi-GB Activity Monitor footprint
   even on 50k vector runs.
 - Broad storage verification can still stall in `DB.close()` while draining a
-  durable LSM background runtime. A sample during `lib-storage-test` showed the
+  durable LSM background runtime. A sample during `antfly-storage-test` showed the
   main thread waiting in `Backend.close() -> background.Executor.drain()` while
   runtime worker threads contended in `reapCompleted`/`submit`. That is separate
   from replay-lane filtering, but it is still a RocksDB/Pebble-shaped lifecycle
@@ -866,7 +866,7 @@ Task list:
    - Already-accepted owner jobs still drain deterministically, but maintenance
      callbacks cannot recursively schedule new work while close is draining the
      owner.
-   - Verification: `lib-storage-test --test-timeout 600s` advanced past the
+   - Verification: `antfly-storage-test --test-timeout 600s` advanced past the
      prior `Backend.close() -> background.Executor.drain()` stall and the new
      owner-close runtime tests passed; that long-suite run later timed out in a
      focused shared-embedding wait that passes independently.
@@ -1808,7 +1808,7 @@ Validated with:
 
 For before/after comparisons on this read-path work, use:
 
-- `zig build lsm-backend-bench -- --samples 5 --keys 20000 --storage host --cache both > /tmp/lsm-bench.jsonl`
+- `zig build lsm-backend-bench && ./zig-out/bin/lsm_backend_bench --samples 5 --keys 20000 --storage host --cache both > /tmp/lsm-bench.jsonl`
 
 The harness emits JSONL with:
 
@@ -1826,7 +1826,7 @@ Run the same command on two revisions and diff the JSON lines by `scenario + wor
 
 To compare two runs directly:
 
-- `zig build lsm-backend-bench-compare -- --before /tmp/lsm-before.jsonl --after /tmp/lsm-after.jsonl`
+- `zig build lsm-backend-bench-compare && ./zig-out/bin/lsm_backend_bench_compare --before /tmp/lsm-before.jsonl --after /tmp/lsm-after.jsonl`
 
 The compare tool:
 

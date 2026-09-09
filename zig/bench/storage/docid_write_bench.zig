@@ -42,9 +42,9 @@ const PhaseResult = struct {
     doc_identity: db_mod.types.DocIdentityStats,
 };
 
-pub fn main(init: std.process.Init) !void {
+pub fn run(init: std.process.Init, args: *std.process.Args.Iterator) !void {
     const alloc = std.heap.c_allocator;
-    const cfg = try parseArgs(init.minimal.args);
+    const cfg = try parseArgs(args);
     const sync_levels = [_]db_mod.types.SyncLevel{ .propose, .write, .full_index };
 
     var stdout_buffer: [4096]u8 = undefined;
@@ -291,17 +291,15 @@ fn printPhase(writer: anytype, result: PhaseResult) !void {
     );
 }
 
-fn parseArgs(args_in: std.process.Args) !Config {
+fn parseArgs(args: *std.process.Args.Iterator) !Config {
     var cfg = Config{};
-    var args = std.process.Args.Iterator.init(args_in);
-    _ = args.skip();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--docs")) {
-            cfg.docs = try parseNextUsize(&args, arg);
+            cfg.docs = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--batch-size")) {
-            cfg.batch_size = try parseNextUsize(&args, arg);
+            cfg.batch_size = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--body-repeat")) {
-            cfg.body_repeat = try parseNextUsize(&args, arg);
+            cfg.body_repeat = try parseNextUsize(args, arg);
         } else if (std.mem.eql(u8, arg, "--sync-level")) {
             const raw = args.next() orelse return error.InvalidArgument;
             cfg.sync_level = db_mod.types.parsePublicSyncLevelText(raw) orelse return error.InvalidArgument;

@@ -49,12 +49,12 @@ const PhaseStats = struct {
     }
 };
 
-pub fn main(init: std.process.Init) !void {
+pub fn run(_: std.process.Init, args: *std.process.Args.Iterator) !void {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
     const alloc = gpa_state.allocator();
 
-    const cfg = try parseArgs(init.minimal.args);
+    const cfg = try parseArgs(args);
     const dataset = try makeDataset(alloc, cfg);
     defer alloc.free(dataset);
 
@@ -129,19 +129,17 @@ pub fn main(init: std.process.Init) !void {
     printPhase("child_mixed_bulk", mixed_stats, cfg.samples);
 }
 
-fn parseArgs(args_in: std.process.Args) !BenchConfig {
+fn parseArgs(args: *std.process.Args.Iterator) !BenchConfig {
     var cfg = BenchConfig{};
-    var args = std.process.Args.Iterator.init(args_in);
-    _ = args.skip();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--docs")) {
-            cfg.docs = try parseNextUsize(&args, "--docs");
+            cfg.docs = try parseNextUsize(args, "--docs");
         } else if (std.mem.eql(u8, arg, "--dims")) {
-            cfg.dims = try parseNextUsize(&args, "--dims");
+            cfg.dims = try parseNextUsize(args, "--dims");
         } else if (std.mem.eql(u8, arg, "--samples")) {
-            cfg.samples = try parseNextUsize(&args, "--samples");
+            cfg.samples = try parseNextUsize(args, "--samples");
         } else if (std.mem.eql(u8, arg, "--seed")) {
-            cfg.seed = try parseNextU64(&args, "--seed");
+            cfg.seed = try parseNextU64(args, "--seed");
         } else if (std.mem.eql(u8, arg, "--split-hilbert")) {
             cfg.split_algo = .hilbert;
         } else if (std.mem.eql(u8, arg, "--bulk-build-hilbert-seeded")) {

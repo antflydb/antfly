@@ -33,6 +33,7 @@ comptime {
     _ = @import("db/algebraic/law.zig");
     _ = @import("db/algebraic/lexical.zig");
     _ = @import("db/algebraic/mod.zig");
+    _ = @import("db/algebraic/ownership_test.zig");
     _ = @import("db/algebraic/path.zig");
     _ = @import("db/algebraic/pathfact.zig");
     _ = @import("db/algebraic/planner.zig");
