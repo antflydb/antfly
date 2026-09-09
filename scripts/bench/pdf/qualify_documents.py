@@ -16,6 +16,86 @@ from render_matrix import render_observations
 SCHEMA = "antfly.pdf.document_qualification.v1"
 
 
+def expected_pages(result, selected):
+    """Bind corpus page ranges to the fingerprints published by indexing."""
+    manifests = result["manifests"]
+    sources = {row["path"]: row["pages"] for row in selected}
+    if (
+        not sources
+        or len(sources) != len(selected)
+        or any(
+            set(mapping) != set(sources)
+            for mapping in (
+                manifests,
+                result["unit_render_geometry"],
+                result["unit_text_sha256"],
+            )
+        )
+    ):
+        raise ValueError("manifest sources do not match the selected corpus")
+    expected = Counter()
+    fingerprints = set()
+    for path, pages in sources.items():
+        fingerprint = manifests[path]["source_fingerprint"]
+        if (
+            not isinstance(fingerprint, str)
+            or not fingerprint
+            or fingerprint == "null"
+            or fingerprint in fingerprints
+            or type(pages) is not int
+            or pages <= 0
+        ):
+            raise ValueError("missing/ambiguous source identity or invalid page count")
+        fingerprints.add(fingerprint)
+        geometry = result["unit_render_geometry"][path]
+        actual_pages = [item["page_number"] for item in geometry.values()]
+        if (
+            any(type(page) is not int for page in actual_pages)
+            or sorted(actual_pages) != list(range(1, pages + 1))
+            or set(geometry) != set(result["unit_text_sha256"][path])
+        ):
+            raise ValueError("retained units do not cover the corpus page range")
+        expected.update((fingerprint, page) for page in range(1, pages + 1))
+    if result["pages"] != sum(sources.values()):
+        raise ValueError("result page count differs from corpus")
+    return expected
+
+
+def verify_trial_profile(observations, expected, memory_bytes, workers):
+    """Require exact render and admission coverage, including partial windows."""
+    renders = Counter()
+    windows = Counter()
+    for row in observations:
+        phase = row["phase"]
+        if phase not in ("pdf_render", "pdf_render_window"):
+            continue
+        source = row["source_fingerprint"]
+        if row.get("failure") != "null":
+            raise ValueError("failed physical render/window")
+        if phase == "pdf_render":
+            renders[(source, int(row["page"]))] += 1
+            continue
+        first, last, count = (
+            int(row[key]) for key in ("first_page", "last_page", "pages")
+        )
+        if not 0 < count == last - first + 1 <= len(expected):
+            raise ValueError("invalid render-window page range")
+        windows.update((source, page) for page in range(first, last + 1))
+        peak = int(row["peak_bytes"])
+        active = int(row["peak_parallelism"])
+        requested = int(row["requested_parallelism"])
+        if not 0 < peak <= memory_bytes or not 1 <= active <= requested <= workers:
+            raise ValueError("invalid tracked memory/parallelism bounds")
+    if renders != expected:
+        raise ValueError(
+            "physical renders do not cover expected source/pages once in this trial"
+        )
+    if windows != expected:
+        raise ValueError(
+            "render windows do not cover expected source/pages once in this trial"
+        )
+
+
 def evaluate_run(run, log, trials, memory_bytes):
     errors = []
     results = run.get("results", [])
@@ -45,48 +125,56 @@ def evaluate_run(run, log, trials, memory_bytes):
                 or not signature["unit_render_geometry"]
             ):
                 raise ValueError("missing two-consumer content/page evidence")
+            consumer = signature["consumer_results"][0]
+            for primary, secondary in (
+                ("unit_text_sha256", "unit_text_sha256"),
+                ("unit_render_geometry", "unit_render_geometry"),
+                ("documents", "manifest_counts"),
+                ("vectors", "searchable_vectors"),
+            ):
+                if signature[primary] != consumer[secondary]:
+                    raise ValueError(f"identical consumers differ: {primary}")
             signatures.append(signature)
         except (KeyError, TypeError, ValueError) as exc:
             errors.append(str(exc))
-    observations = render_observations(log)
+    # Keep byte offsets exact (including CRLF/non-ASCII log content).
+    raw_log = log.encode("utf-8") if isinstance(log, str) else log
+    observations = render_observations(raw_log.decode("utf-8"))
     renders = [row for row in observations if row["phase"] == "pdf_render"]
     windows = [row for row in observations if row["phase"] == "pdf_render_window"]
-    identities = Counter()
     try:
-        for row in renders:
-            source = row["source_fingerprint"]
-            page = int(row["page"])
+        workers = provenance["render_workers"]
+        if type(workers) is not int or workers <= 0:
+            raise ValueError("missing renderer worker bound")
+        cursor = 0
+        excluded = []
+        for trial, row in enumerate(results):
+            bounds = row["profile_log"]
+            start, end = bounds["start_byte"], bounds["end_byte"]
             if (
-                not source
-                or source == "null"
-                or page < 1
-                or row.get("failure") != "null"
+                row["trial"] != trial
+                or type(start) is not int
+                or type(end) is not int
+                or not cursor <= start < end <= len(raw_log)
+                or (start > 0 and raw_log[start - 1 : start] != b"\n")
+                or raw_log[end - 1 : end] != b"\n"
             ):
-                raise ValueError("failed/unattributed physical render")
-            identities[(source, page)] += 1
-        expected = sum(row["pages"] for row in results)
-        if (
-            expected <= 0
-            or len(renders) != expected
-            or any(count != trials for count in identities.values())
-        ):
-            errors.append(
-                "physical renders do not cover each source/page exactly once per trial"
+                raise ValueError("missing/invalid per-trial log boundaries")
+            excluded.append(raw_log[cursor:start])
+            cursor = end
+            verify_trial_profile(
+                render_observations(raw_log[start:end].decode("utf-8")),
+                expected_pages(row, provenance["selected"]),
+                memory_bytes,
+                workers,
             )
-        if not windows:
-            errors.append("missing render-window admission evidence")
-        for row in windows:
-            peak = int(row["peak_bytes"])
-            active = int(row["peak_parallelism"])
-            requested = int(row["requested_parallelism"])
-            if (
-                row.get("failure") != "null"
-                or not 0 < peak <= memory_bytes
-                or not 1 <= active <= requested
-            ):
-                errors.append(
-                    "failed window or invalid tracked memory/parallelism bounds"
-                )
+        excluded.append(raw_log[cursor:])
+        if any(
+            row["phase"] in ("pdf_render", "pdf_render_window")
+            for part in excluded
+            for row in render_observations(part.decode("utf-8"))
+        ):
+            raise ValueError("render evidence exists outside indexed trial boundaries")
     except (KeyError, TypeError, ValueError) as exc:
         errors.append(f"invalid profile evidence: {exc}")
     return {
@@ -217,7 +305,9 @@ def main():
                     "sync_level": sync,
                     "memory_bytes": cap,
                     "run": run,
-                    "log": log_path.read_text() if log_path.exists() else "",
+                    "log": log_path.read_bytes().decode("utf-8")
+                    if log_path.exists()
+                    else "",
                 }
             )
             save(args.output / f"run-{len(runs):02d}.json", runs[-1])

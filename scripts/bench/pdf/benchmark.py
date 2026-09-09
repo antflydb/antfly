@@ -335,6 +335,9 @@ def run_created(args, out):
         )
         startup_seconds = time.perf_counter() - process_started
         for trial in range(args.trials):
+            # Byte offsets bind diagnostic events to this trial without writing
+            # markers into the server-owned log or changing the timed interval.
+            profile_start = (out / "antfly.log").stat().st_size
             table_started = time.perf_counter()
             table = f"pdf_bench_{trial}"
             table_url = f"{url}/db/v1/tables/{table}"
@@ -538,6 +541,12 @@ def run_created(args, out):
             )
             result = dict(
                 trial=trial,
+                profile_log={
+                    "start_byte": profile_start,
+                    "end_byte": (out / "antfly.log").stat().st_size,
+                }
+                if args.read_profile
+                else None,
                 seconds=elapsed,
                 acknowledgement_seconds=ack_seconds,
                 startup_seconds=startup_seconds,

@@ -58,9 +58,10 @@ class QualificationRunnerTests(unittest.TestCase):
             {"schema": "wrong", "pass": True},
             {"schema": "fixture.v1", "pass": "true"},
         ):
-            with self.subTest(payload=payload), tempfile.TemporaryDirectory(
-                dir=self.root
-            ) as folder:
+            with (
+                self.subTest(payload=payload),
+                tempfile.TemporaryDirectory(dir=self.root) as folder,
+            ):
                 spec = gate()
                 spec["command"][-1] = (
                     "from pathlib import Path; Path(r'${run}/native.json').write_text("
@@ -91,9 +92,10 @@ class QualificationRunnerTests(unittest.TestCase):
             [sys.executable, "-c", "pass"],
             ["/nonexistent/qualification-binary"],
         ):
-            with self.subTest(command=command), tempfile.TemporaryDirectory(
-                dir=self.root
-            ) as folder:
+            with (
+                self.subTest(command=command),
+                tempfile.TemporaryDirectory(dir=self.root) as folder,
+            ):
                 spec = gate()
                 spec["command"] = command
                 result = qualify.run_gate(spec, self.root, Path(folder) / "gate", {})
@@ -104,9 +106,9 @@ class QualificationRunnerTests(unittest.TestCase):
         stale = self.root / "stale.json"
         stale.write_text('{"schema":"fixture.v1","pass":true}')
         spec = gate()
-        spec["command"][
-            -1
-        ] = f"from pathlib import Path; Path(r'${{run}}/native.json').symlink_to({str(stale)!r})"
+        spec["command"][-1] = (
+            f"from pathlib import Path; Path(r'${{run}}/native.json').symlink_to({str(stale)!r})"
+        )
         result = self.run_gate(spec)
         self.assertFalse(result["pass"])
 
@@ -142,9 +144,10 @@ class QualificationRunnerTests(unittest.TestCase):
     def test_cli_interrupts_clean_up_owned_children_and_retain_failure(self):
         repo = Path(__file__).resolve().parents[3]
         for signum in (signal.SIGINT, signal.SIGTERM):
-            with self.subTest(signum=signum), tempfile.TemporaryDirectory(
-                dir=self.root
-            ) as temp:
+            with (
+                self.subTest(signum=signum),
+                tempfile.TemporaryDirectory(dir=self.root) as temp,
+            ):
                 folder = Path(temp)
                 spec = gate()
                 spec["command"] = [

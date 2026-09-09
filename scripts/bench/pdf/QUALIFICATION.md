@@ -50,6 +50,9 @@ to at most 16 requests; HTTP timeouts apply to every request. The report explici
 states that this does not prove native fusion. Family-specific scheduler/backend
 evidence is still required for that claim.
 
+Both serial batch and concurrent responses also use the family's existing unit
+norm tolerance. Cosine parity alone cannot detect scaled, unnormalized vectors.
+
 Example for an already-running Qwen3 endpoint:
 
 ```sh
@@ -78,6 +81,13 @@ the existing output signatures. It requires:
   selection evidence from the existing harness.
 - Forced OCR and exactly one physical render per source/page/trial for two
   compatible consumers, including terminal partial windows.
+- Each identical consumer must match the primary's text hashes, page geometry,
+  artifact counts and published-vector count, not merely match itself across runs.
+- Trial byte ranges in the original server log bind events to each indexing run.
+  Corpus page ranges and indexed manifest fingerprints define the expected set;
+  both physical renders and admission windows must cover it exactly once. Missing,
+  overlapping, out-of-range or out-of-trial evidence fails closed. Older benchmark
+  results without trial boundaries cannot qualify this gate.
 - Both `full_index` and `write` paths at two distinct renderer caps (256/128 MiB
   by default), identical content hashes, page geometry and published-vector counts.
 - Successful windows with tracked bytes within the requested cap and actual

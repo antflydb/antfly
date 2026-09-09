@@ -87,9 +87,11 @@ class OutputDirectoryTests(unittest.TestCase):
                 "--pr-revision",
                 "b" * 40,
             ]
-            with patch("sys.argv", argv), patch.object(
-                compare, "run_subject", side_effect=[run(), run()]
-            ), patch("builtins.print"):
+            with (
+                patch("sys.argv", argv),
+                patch.object(compare, "run_subject", side_effect=[run(), run()]),
+                patch("builtins.print"),
+            ):
                 self.assertEqual(0, compare.main())
             summary = json.loads((output / "summary.json").read_text())
             self.assertEqual("antfly.pdf.comparison.v1", summary["schema"])

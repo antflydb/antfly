@@ -75,6 +75,15 @@ def gate(name: str, case: str, passed: bool, detail: str) -> dict[str, Any]:
     return {"gate": name, "case": case, "pass": bool(passed), "detail": detail}
 
 
+def unit_norm_gate(case_id: str, norm: float, name: str) -> dict[str, Any]:
+    return gate(
+        name,
+        case_id,
+        math.isfinite(norm) and abs(norm - 1.0) <= NORM_ABS_TOLERANCE,
+        f"|v|={norm:.6f} tol={NORM_ABS_TOLERANCE}",
+    )
+
+
 def load_oracle(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -236,14 +245,7 @@ def case_gates(
     if not rows[0]["pass"]:
         return rows
     norm = l2_norm(server_vector)
-    rows.append(
-        gate(
-            "unit_norm",
-            case_id,
-            math.isfinite(norm) and abs(norm - 1.0) <= NORM_ABS_TOLERANCE,
-            f"|v|={norm:.6f} tol={NORM_ABS_TOLERANCE}",
-        )
-    )
+    rows.append(unit_norm_gate(case_id, norm, "unit_norm"))
     if norm <= 0.0:
         rows.append(
             gate("oracle_cosine", case_id, False, "server vector has zero norm")
@@ -278,14 +280,7 @@ def mrl_gates(
     if not rows[0]["pass"]:
         return rows
     norm = l2_norm(server_reduced)
-    rows.append(
-        gate(
-            "mrl_unit_norm",
-            case_id,
-            math.isfinite(norm) and abs(norm - 1.0) <= NORM_ABS_TOLERANCE,
-            f"|v|={norm:.6f} tol={NORM_ABS_TOLERANCE}",
-        )
-    )
+    rows.append(unit_norm_gate(case_id, norm, "mrl_unit_norm"))
     if norm <= 0.0:
         rows.append(
             gate(
@@ -323,6 +318,10 @@ def batch_gates(
                 f"width {len(batch_vector)} != {len(single_vector)}",
             )
         ]
+    norm = l2_norm(batch_vector)
+    norm_row = unit_norm_gate(case_id, norm, "batch_unit_norm")
+    if not math.isfinite(norm) or norm <= 0.0:
+        return [norm_row]
     value = cosine(batch_vector, single_vector)
     return [
         gate(
@@ -330,7 +329,8 @@ def batch_gates(
             case_id,
             value >= BATCH_MIN_COSINE,
             f"cosine={value:.6f} min={BATCH_MIN_COSINE}",
-        )
+        ),
+        norm_row,
     ]
 
 
@@ -456,7 +456,11 @@ def concurrent_request_gates(args, cases, single_vectors, default_instruction):
                 for (case_id, body, expected), actual in zip(window, vectors):
                     for row in batch_gates(case_id, expected, actual):
                         row.update(
-                            gate="cross_request_vs_single",
+                            gate=(
+                                "cross_request_unit_norm"
+                                if row["gate"] == "batch_unit_norm"
+                                else "cross_request_vs_single"
+                            ),
                             round=round_index,
                             dimensions=body.get("dimensions", len(expected)),
                         )
