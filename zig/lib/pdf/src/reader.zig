@@ -24,6 +24,132 @@ const Allocator = std.mem.Allocator;
 
 const DecodedRgbaImage = struct { rgba: []u8, width: u32, height: u32 };
 
+/// Stable-address, pull-based image sample stream. Source PDF bytes are
+/// borrowed; decrypted input (if any), inflate history and predictor rows are
+/// charged to the caller's image-tree allocator. No whole inflated plane.
+const ImageSampleRows = struct {
+    alloc: Allocator,
+    cancellation: CancellationProbe,
+    owned_input: ?[]u8 = null,
+    input: std.Io.Reader,
+    inflate: ?std.compress.flate.Decompress = null,
+    history: []u8 = &.{},
+    current: []u8 = &.{},
+    previous: []u8 = &.{},
+    predictor: i64 = 1,
+    checksum: @import("antfly_hash").Adler32 = .{},
+    components: usize,
+    remaining: usize,
+
+    fn supports(obj: *const syntax.Object) bool {
+        if (obj.* != .stream) return false;
+        const filter = obj.get("Filter") orelse return true;
+        const value = if (filter.* == .array) blk: {
+            if (filter.array.len == 0) return true;
+            if (filter.array.len != 1) return false;
+            break :blk &filter.array[0];
+        } else filter;
+        const name = value.asName() orelse return false;
+        return std.mem.eql(u8, name, "FlateDecode");
+    }
+
+    fn create(reader: *const Reader, obj: *const syntax.Object, width: u32, height: u32, components: usize) !*@This() {
+        if (obj.* != .stream) return error.NotAStream;
+        if (width == 0 or height == 0 or components == 0) return error.InvalidPdfImageData;
+        const self = try reader.alloc.create(@This());
+        self.* = .{ .alloc = reader.alloc, .cancellation = reader.cancellation, .input = .fixed(&.{}), .components = components, .remaining = height };
+        errdefer self.destroy();
+        try reader.checkCancellation();
+        const length = try reader.resolvedStreamDataLength(obj);
+        const end = std.math.add(usize, obj.stream.data_offset, length) catch return error.InvalidObjectOffset;
+        if (end > reader.bytes.len) return error.InvalidObjectOffset;
+        const bytes = if (reader.encrypted_streams.contains(obj.stream.data_offset)) blk: {
+            self.owned_input = try reader.readRawStreamData(obj);
+            break :blk self.owned_input.?;
+        } else reader.bytes[obj.stream.data_offset..end];
+        self.input = .fixed(bytes);
+        if (streamHasFilter(obj.get("Filter"), "FlateDecode")) {
+            self.history = try self.alloc.alloc(u8, std.compress.flate.max_window_len);
+            self.inflate = .init(&self.input, .zlib, self.history);
+            if (obj.get("DecodeParms")) |parms| {
+                var resolved = try reader.resolveDecodeParmsAlloc(parms);
+                defer resolved.deinit(self.alloc);
+                const param = streamFilterParamFor(obj.get("Filter"), &resolved, "FlateDecode");
+                if (param) |p| {
+                    self.predictor = if (p.get("Predictor")) |v| v.asInteger() orelse 1 else 1;
+                    if (self.predictor > 1) {
+                        const columns = if (p.get("Columns")) |v| v.asInteger() orelse 1 else 1;
+                        const colors = if (p.get("Colors")) |v| v.asInteger() orelse 1 else 1;
+                        const bits = if (p.get("BitsPerComponent")) |v| v.asInteger() orelse 8 else 8;
+                        if (columns != width or colors != components or bits != 8 or
+                            (self.predictor != 2 and (self.predictor < 10 or self.predictor > 15))) return error.UnsupportedPredictor;
+                    }
+                }
+            }
+        }
+        const row_bytes = std.math.mul(usize, width, components) catch return error.RenderedPageTooLarge;
+        if (row_bytes > reader.decode_limits.max_decoded_stream_bytes) return error.DecodedStreamTooLarge;
+        self.current = try self.alloc.alloc(u8, row_bytes);
+        if (self.predictor >= 10) {
+            self.previous = try self.alloc.alloc(u8, row_bytes);
+            @memset(self.previous, 0);
+        }
+        return self;
+    }
+
+    fn stream(self: *@This()) *std.Io.Reader {
+        return if (self.inflate) |*inflate| &inflate.reader else &self.input;
+    }
+
+    fn next(self: *@This()) ![]u8 {
+        try self.cancellation.check();
+        if (self.remaining == 0) return error.InvalidPdfImageData;
+        const filter = if (self.predictor >= 10) self.stream().takeByte() catch return error.InvalidFlateStream else 0;
+        var offset: usize = 0;
+        while (offset < self.current.len) {
+            try self.cancellation.check();
+            const end = @min(self.current.len, offset + 64 * 1024);
+            self.stream().readSliceAll(self.current[offset..end]) catch return if (self.inflate != null) error.InvalidFlateStream else error.InvalidPdfImageData;
+            offset = end;
+        }
+        if (self.inflate != null) {
+            if (self.predictor >= 10) self.checksum.update(&.{filter});
+            self.checksum.update(self.current);
+        }
+        if (self.predictor == 2) {
+            for (self.current[self.components..], self.components..) |*byte, i| {
+                if (i & 4095 == 0) try self.cancellation.check();
+                byte.* +%= self.current[i - self.components];
+            }
+        } else if (self.predictor >= 10) {
+            try applyPngPredictorRow(self.current, self.previous, self.components, filter, self.cancellation);
+            @memcpy(self.previous, self.current);
+        }
+        self.remaining -= 1;
+        return self.current;
+    }
+
+    fn finish(self: *@This()) !void {
+        try self.cancellation.check();
+        if (self.remaining != 0) return error.InvalidPdfImageData;
+        var extra: [1]u8 = undefined;
+        // Reach the codec trailer and reject surplus samples: dimensions are
+        // a hard work bound, not permission to drain a decompression bomb.
+        const n = self.stream().readSliceShort(&extra) catch return error.InvalidFlateStream;
+        if (n != 0) return error.InvalidPdfImageData;
+        if (self.inflate) |*inflate| if (inflate.container_metadata.zlib.adler != self.checksum.final()) return error.InvalidFlateStream;
+    }
+
+    fn destroy(self: *@This()) void {
+        const alloc = self.alloc;
+        if (self.owned_input) |bytes| alloc.free(bytes);
+        alloc.free(self.history);
+        alloc.free(self.current);
+        alloc.free(self.previous);
+        alloc.destroy(self);
+    }
+};
+
 const PreparedMatteMask = struct {
     image: DecodedRgbaImage,
 
@@ -322,6 +448,25 @@ const DecodeBudgetAllocator = struct {
     }
 };
 const max_trailing_pdf_bytes: usize = 4096;
+
+test "render heap moving remaps preserve logical materialization charges" {
+    var heap = @import("render_heap.zig").Heap{ .backing_allocator = std.testing.allocator };
+    defer heap.deinit();
+    var budget = DecodeBudgetAllocator.initWithCumulativeLimit(heap.allocator(), 0, 140000, 140000);
+    const alloc = budget.allocator();
+    var bytes = try alloc.alloc(u8, 17);
+    defer alloc.free(bytes);
+    @memset(bytes, 42);
+    for ([_]usize{ 31, 65, 1025, 32769, 80000, 140000 }) |size| {
+        bytes = try alloc.realloc(bytes, size);
+        for (bytes[0..17]) |byte| try std.testing.expectEqual(@as(u8, 42), byte);
+        try std.testing.expectEqual(size, budget.live_bytes);
+        try std.testing.expectEqual(size, budget.materializationCharge());
+    }
+    bytes = try alloc.realloc(bytes, 17);
+    try std.testing.expectEqual(@as(usize, 17), budget.live_bytes);
+    try std.testing.expectEqual(@as(usize, 140000), budget.materializationCharge());
+}
 
 pub const XrefEntry = struct {
     ptr: syntax.ObjRef,
@@ -3637,6 +3782,117 @@ fn objectEncryptionKey(
     };
 }
 
+const FrozenEncryptedStream = struct {
+    data_offset: usize,
+    ptr: syntax.ObjRef,
+};
+
+/// Immutable metadata snapshot used to construct task-local render Readers.
+///
+/// Preparing this value is the only render-fork operation that may touch the
+/// source Reader: it serializes lazy page-index discovery and snapshots the
+/// source's lazily discovered encrypted-stream identities. Once prepared,
+/// worker threads instantiate Readers exclusively from this value and never
+/// access mutable source state. The source Reader and its borrowed document
+/// bytes must outlive this template and every Reader instantiated from it.
+pub const RenderForkTemplate = struct {
+    alloc: Allocator,
+    bytes: []const u8,
+    decode_limits: DecodeLimits,
+    version_minor: u8,
+    startxref_offset: usize,
+    xref_entries: []XrefEntry,
+    trailer: syntax.Object,
+    page_index: []syntax.Object,
+    encryption: ?EncryptionContext,
+    encrypted_stream_registry: *const std.AutoHashMapUnmanaged(usize, syntax.ObjRef),
+    encrypted_stream_generation: u64,
+    encrypted_streams: []FrozenEncryptedStream,
+
+    pub fn deinit(self: *RenderForkTemplate) void {
+        self.alloc.free(self.encrypted_streams);
+        self.* = undefined;
+    }
+
+    /// Instantiate independently mutable render state. This method only reads
+    /// immutable template memory and is safe to call concurrently. `alloc`
+    /// must remain confined to the calling worker.
+    pub fn instantiate(self: *const RenderForkTemplate, alloc: Allocator, cancellation: CancellationProbe) !Reader {
+        try cancellation.check();
+
+        const font_cache = try alloc.create(std.AutoHashMapUnmanaged(u64, PageFont));
+        errdefer alloc.destroy(font_cache);
+        font_cache.* = .empty;
+
+        const image_cache = try alloc.create(DecodedImageCache);
+        errdefer alloc.destroy(image_cache);
+        image_cache.* = .{};
+
+        const encrypted_streams = try alloc.create(std.AutoHashMapUnmanaged(usize, syntax.ObjRef));
+        errdefer alloc.destroy(encrypted_streams);
+        encrypted_streams.* = .empty;
+        errdefer encrypted_streams.deinit(alloc);
+        try encrypted_streams.ensureTotalCapacity(alloc, @intCast(self.encrypted_streams.len));
+        for (self.encrypted_streams) |entry|
+            encrypted_streams.putAssumeCapacity(entry.data_offset, entry.ptr);
+
+        return .{
+            .alloc = alloc,
+            .bytes = self.bytes,
+            .decode_limits = self.decode_limits,
+            .version_minor = self.version_minor,
+            .startxref_offset = self.startxref_offset,
+            .xref_entries = self.xref_entries,
+            .trailer = self.trailer,
+            .page_index = self.page_index,
+            .font_cache = font_cache,
+            .image_cache = image_cache,
+            .encryption = self.encryption,
+            .encrypted_streams = encrypted_streams,
+            .encrypted_stream_generation = self.encrypted_stream_generation,
+            .cancellation = cancellation,
+            .owns_document_metadata = false,
+        };
+    }
+
+    /// Refresh metadata that may have changed during the caller's serial
+    /// preflight phase. No allocation or map walk occurs when the source's
+    /// encrypted-stream registry and decode limits are unchanged.
+    pub fn refreshFrom(self: *RenderForkTemplate, source: *Reader, cancellation: CancellationProbe) !void {
+        try cancellation.check();
+        try source.ensurePageIndex();
+        if (self.bytes.ptr != source.bytes.ptr or
+            self.bytes.len != source.bytes.len or
+            self.xref_entries.ptr != source.xref_entries.ptr or
+            self.xref_entries.len != source.xref_entries.len or
+            self.page_index.ptr != source.page_index.?.ptr or
+            self.page_index.len != source.page_index.?.len or
+            self.encrypted_stream_registry != source.encrypted_streams)
+        {
+            return error.RenderForkTemplateSourceMismatch;
+        }
+        self.decode_limits = source.decode_limits;
+        self.version_minor = source.version_minor;
+        self.startxref_offset = source.startxref_offset;
+        self.trailer = source.trailer;
+        self.encryption = source.encryption;
+
+        if (self.encrypted_stream_generation == source.encrypted_stream_generation) return;
+        self.encrypted_streams = try self.alloc.realloc(self.encrypted_streams, source.encrypted_streams.count());
+        var encrypted_stream_index: usize = 0;
+        var encrypted_stream_iter = source.encrypted_streams.iterator();
+        while (encrypted_stream_iter.next()) |entry| {
+            self.encrypted_streams[encrypted_stream_index] = .{
+                .data_offset = entry.key_ptr.*,
+                .ptr = entry.value_ptr.*,
+            };
+            encrypted_stream_index += 1;
+        }
+        std.debug.assert(encrypted_stream_index == self.encrypted_streams.len);
+        self.encrypted_stream_generation = source.encrypted_stream_generation;
+    }
+};
+
 pub const Reader = struct {
     alloc: Allocator,
     bytes: []const u8,
@@ -3653,6 +3909,10 @@ pub const Reader = struct {
     /// before allocating. The object reference is all that is retained: it is
     /// needed to derive the per-object encryption key at raw-read time.
     encrypted_streams: *std.AutoHashMapUnmanaged(usize, syntax.ObjRef),
+    /// Monotonic generation for the logically mutable encrypted-stream cache.
+    /// All production inserts go through `rememberEncryptedStream`, making
+    /// RenderForkTemplate refresh independent of hash-map count semantics.
+    encrypted_stream_generation: u64 = 0,
     image_decode_target: ?ImageDecodeTarget = null,
     /// Resource dictionary that gives names and Default* substitutions their
     /// dynamic meaning while an image XObject is decoded. Scoped Reader
@@ -3661,6 +3921,10 @@ pub const Reader = struct {
     render_target: ?RenderTarget = null,
     last_render_diagnostics: ?PageRenderDiagnostics = null,
     cancellation: CancellationProbe = .{},
+    /// Render forks borrow the immutable document index from their source
+    /// reader. Mutable decode caches remain fork-local, while this flag keeps
+    /// teardown from walking or freeing the shared xref/trailer/page tree.
+    owns_document_metadata: bool = true,
 
     const max_recursive_pdf_objects: usize = 100_000;
 
@@ -3820,10 +4084,19 @@ pub const Reader = struct {
         return reader;
     }
 
+    /// Update task-local decode ceilings between render operations. Callers
+    /// must not mutate limits while a fork or decode is active.
+    pub fn setDecodeLimits(self: *Reader, decode_limits: DecodeLimits) !void {
+        try decode_limits.validate();
+        self.decode_limits = decode_limits;
+    }
+
     pub fn deinit(self: *Reader) void {
-        if (self.page_index) |pages| {
-            for (pages) |*page| page.deinit(self.alloc);
-            self.alloc.free(pages);
+        if (self.owns_document_metadata) {
+            if (self.page_index) |pages| {
+                for (pages) |*page| page.deinit(self.alloc);
+                self.alloc.free(pages);
+            }
         }
         var font_iter = self.font_cache.valueIterator();
         while (font_iter.next()) |font| font.deinit(self.alloc);
@@ -3835,9 +4108,59 @@ pub const Reader = struct {
         }
         self.encrypted_streams.deinit(self.alloc);
         self.alloc.destroy(self.encrypted_streams);
-        self.alloc.free(self.xref_entries);
-        self.trailer.deinit(self.alloc);
+        if (self.owns_document_metadata) {
+            self.alloc.free(self.xref_entries);
+            self.trailer.deinit(self.alloc);
+        }
         self.* = undefined;
+    }
+
+    /// Freeze all source-owned state needed to instantiate render Readers.
+    /// Call this serially before dispatching worker threads. The returned
+    /// template owns only the encrypted-stream snapshot; document metadata and
+    /// bytes remain borrowed from `self`.
+    pub fn prepareRenderForkTemplate(self: *Reader, alloc: Allocator, cancellation: CancellationProbe) !RenderForkTemplate {
+        try cancellation.check();
+        try self.ensurePageIndex();
+
+        const encrypted_streams = try alloc.alloc(FrozenEncryptedStream, self.encrypted_streams.count());
+        errdefer alloc.free(encrypted_streams);
+        var encrypted_stream_index: usize = 0;
+        var encrypted_stream_iter = self.encrypted_streams.iterator();
+        while (encrypted_stream_iter.next()) |entry| {
+            encrypted_streams[encrypted_stream_index] = .{
+                .data_offset = entry.key_ptr.*,
+                .ptr = entry.value_ptr.*,
+            };
+            encrypted_stream_index += 1;
+        }
+        std.debug.assert(encrypted_stream_index == encrypted_streams.len);
+
+        return .{
+            .alloc = alloc,
+            .bytes = self.bytes,
+            .decode_limits = self.decode_limits,
+            .version_minor = self.version_minor,
+            .startxref_offset = self.startxref_offset,
+            .xref_entries = self.xref_entries,
+            .trailer = self.trailer,
+            .page_index = self.page_index.?,
+            .encryption = self.encryption,
+            .encrypted_stream_registry = self.encrypted_streams,
+            .encrypted_streams = encrypted_streams,
+            .encrypted_stream_generation = self.encrypted_stream_generation,
+        };
+    }
+
+    /// Conservative task-local metadata allowance for a render fork. The
+    /// immutable document index is shared and therefore deliberately excluded.
+    pub fn renderForkMetadataBytes(self: *const Reader) !usize {
+        _ = self;
+        // Hash-map growth and decoded object storage are already bounded by
+        // decode_limits.max_working_set_bytes. This allowance is only for the
+        // Reader value and small map/control allocations created before that
+        // budget is exercised; it must not scale with shared document state.
+        return 64 * 1024;
     }
 
     pub fn trailerGet(self: *const Reader, key: []const u8) ?*const syntax.Object {
@@ -3966,10 +4289,26 @@ pub const Reader = struct {
                 // Do not decrypt or retain stream payloads during object
                 // resolution. The downstream raw read knows both its terminal
                 // output allowance and its complete working-set allowance.
-                try self.encrypted_streams.put(self.alloc, stream.data_offset, ptr);
+                try self.rememberEncryptedStream(stream.data_offset, ptr);
             },
             else => {},
         }
+    }
+
+    fn rememberEncryptedStream(self: *const Reader, data_offset: usize, ptr: syntax.ObjRef) !void {
+        if (self.encrypted_streams.get(data_offset)) |existing| {
+            if (existing.id != ptr.id or existing.gen != ptr.gen)
+                return error.InvalidEncryptedPdf;
+            return;
+        }
+        const mutable_self = @constCast(self);
+        const next_generation = std.math.add(
+            u64,
+            mutable_self.encrypted_stream_generation,
+            1,
+        ) catch return error.InvalidEncryptedPdf;
+        try self.encrypted_streams.put(self.alloc, data_offset, ptr);
+        mutable_self.encrypted_stream_generation = next_generation;
     }
 
     pub fn readIndirectObject(self: *const Reader, ptr: syntax.ObjRef) anyerror!syntax.Object {
@@ -8874,6 +9213,9 @@ pub const Reader = struct {
                 .height = jpeg_decoded.height,
             };
         }
+        if (bits_i == 8 and !image_mask) {
+            if (try self.tryDecodeImageRowsAlloc(obj, width, height, &transparency_plan)) |result| return result;
+        }
         const decoded = try self.readDecodedStreamDataWithLimits(obj, local_decode_limits);
         defer self.alloc.free(decoded);
 
@@ -8957,6 +9299,63 @@ pub const Reader = struct {
 
         try self.applyImageTransparencyPlanAlloc(rgba, width, height, &transparency_plan, source_view, context, transparency_live_bytes, mask_depth, if (prepared_matte) |*prepared| prepared else null);
 
+        return .{ .rgba = rgba, .width = width, .height = height };
+    }
+
+    /// Geometry bounds the total decode work; only native RGBA and a pair of
+    /// predictor rows are retained. Never apply the materialized-stream limit
+    /// to cumulative row traffic, and never downsample to make admission fit.
+    /// Other codecs/layouts continue through their existing guarded decoder.
+    fn tryDecodeImageRowsAlloc(self: *const Reader, obj: *const syntax.Object, width: u32, height: u32, plan: *const ImageTransparencyPlan) !?DecodedRgbaImage {
+        if (!ImageSampleRows.supports(obj)) return null;
+        const color_obj = obj.get("ColorSpace") orelse return null;
+        var color = try self.resolveImageColorSpaceForDecodeAlloc(color_obj);
+        defer color.deinit(self.alloc);
+        const name = color.asName() orelse return null;
+        const components: usize = if (std.mem.eql(u8, name, "DeviceRGB") or std.mem.eql(u8, name, "RGB")) 3 else if (std.mem.eql(u8, name, "DeviceGray") or std.mem.eql(u8, name, "G")) 1 else if (std.mem.eql(u8, name, "DeviceCMYK") or std.mem.eql(u8, name, "CMYK")) 4 else return null;
+        const mask_obj: ?*const syntax.Object = switch (plan.*) {
+            .explicit_mask => return null,
+            .soft_mask => |*mask| blk: {
+                if (mask.metadata.width != width or mask.metadata.height != height or
+                    (mask.object.get("BitsPerComponent").?.asInteger() orelse return null) != 8 or
+                    !ImageSampleRows.supports(&mask.object)) return null;
+                break :blk &mask.object;
+            },
+            else => null,
+        };
+        const rows = ImageSampleRows.create(self, obj, width, height, components) catch |err| switch (err) {
+            error.UnsupportedPredictor => return null,
+            else => return err,
+        };
+        defer rows.destroy();
+        const mask_rows = if (mask_obj) |mask| ImageSampleRows.create(self, mask, width, height, 1) catch |err| switch (err) {
+            error.UnsupportedPredictor => return null,
+            else => return err,
+        } else null;
+        defer if (mask_rows) |mask| mask.destroy();
+        const mask_rgba: []u8 = if (mask_rows != null) try self.alloc.alloc(u8, @as(usize, width) * 4) else &.{};
+        defer self.alloc.free(mask_rgba);
+        const stride = @as(usize, width) * 4;
+        const rgba = try self.alloc.alloc(u8, stride * height);
+        errdefer self.alloc.free(rgba);
+        for (0..height) |y| {
+            const samples = try rows.next();
+            const view = ImageSourceSamples{ .data = .{ .u8 = samples }, .pixel_count = width, .component_count = components, .stride = components, .bits_per_component = 8 };
+            if (mask_rows) |mask| {
+                try decodeDeviceColorSpaceToRgba(mask_rgba, width, try mask.next(), "DeviceGray", mask_obj.?.get("Decode"), self.cancellation);
+                if (plan.nativeMatte()) |matte|
+                    try applyResampledMatteToSamples(view, width, 1, mask_rgba, width, 1, false, matte, obj.get("Decode"));
+            }
+            const row = rgba[y * stride ..][0..stride];
+            try decodeDeviceColorSpaceToRgba(row, width, samples, name, obj.get("Decode"), self.cancellation);
+            switch (plan.*) {
+                .color_key => |key| try applyColorKeyMaskFromSamples(row, view, key, self.cancellation),
+                .soft_mask => applyResampledMaskAlpha(row, width, 1, mask_rgba, width, 1, 0, false),
+                else => {},
+            }
+        }
+        try rows.finish();
+        if (mask_rows) |mask| try mask.finish();
         return .{ .rgba = rgba, .width = width, .height = height };
     }
 
@@ -19543,6 +19942,143 @@ test "reader can decode ascii85 stream object" {
     try std.testing.expectEqualStrings("hello", decoded);
 }
 
+test "image row streaming preserves predictors masks and native pixels above stream materialization limit" {
+    const alloc = std.testing.allocator;
+    const pixels = [_]u8{ 10, 30, 50, 20, 60, 100, 50, 40, 90, 250, 210, 150 } ** 4;
+    const alpha = [_]u8{ 0, 64, 128, 255 } ** 4;
+    for ([_]u8{ 1, 2, 10, 11, 12, 13, 14, 15 }) |predictor| {
+        var predicted = std.ArrayList(u8).empty;
+        defer predicted.deinit(alloc);
+        for (0..4) |y| {
+            const row = pixels[y * 12 ..][0..12];
+            const filter: u8 = if (predictor == 15) @intCast(y % 5) else predictor -| 10;
+            if (predictor >= 10) try predicted.append(alloc, filter);
+            for (row, 0..) |value, x| {
+                const left: u8 = if (x >= 3) row[x - 3] else 0;
+                const up: u8 = if (y > 0) pixels[(y - 1) * 12 + x] else 0;
+                const upper_left: u8 = if (y > 0 and x >= 3) pixels[(y - 1) * 12 + x - 3] else 0;
+                const prediction: u8 = if (predictor == 2) left else if (predictor < 10) 0 else switch (filter) {
+                    0 => 0,
+                    1 => left,
+                    2 => up,
+                    3 => @intCast((@as(u16, left) + up) / 2),
+                    4 => paethPredictor(left, up, upper_left),
+                    else => unreachable,
+                };
+                try predicted.append(alloc, value -% prediction);
+            }
+        }
+        var compressed = try std.Io.Writer.Allocating.initCapacity(alloc, 256);
+        defer compressed.deinit();
+        var history: [std.compress.flate.max_window_len]u8 = undefined;
+        var compressor = try std.compress.flate.Compress.init(&compressed.writer, &history, .zlib, .default);
+        try compressor.writer.writeAll(predicted.items);
+        try compressor.finish();
+        const parent = try std.fmt.allocPrint(alloc, "3 0 obj\n<< /Type /XObject /Subtype /Image /Width 4 /Height 4 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 4 0 R /Filter /FlateDecode /DecodeParms << /Predictor {d} /Columns 4 /Colors 3 >> /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ predictor, compressed.written().len, compressed.written() });
+        defer alloc.free(parent);
+        const mask = try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Type /XObject /Subtype /Image /Width 4 /Height 4 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ alpha.len, alpha });
+        defer alloc.free(mask);
+        const pdf = try buildImageDecodeTestPdfAlloc(alloc, &.{
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            "2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+            parent,
+            mask,
+        });
+        defer alloc.free(pdf);
+        var reader = try Reader.init(alloc, pdf);
+        defer reader.deinit();
+        reader.decode_limits.max_decoded_stream_bytes = 12; // one RGB row, not 48 bytes
+        reader.decode_limits.max_working_set_bytes = 256 * 1024;
+        var obj = try reader.readIndirectObject(.{ .id = 3, .gen = 0 });
+        defer obj.deinit(alloc);
+        const decoded = try reader.decodeImageToRgbaAlloc(&obj);
+        defer alloc.free(decoded.rgba);
+        for (0..16) |pixel| {
+            try std.testing.expectEqualSlices(u8, pixels[pixel * 3 ..][0..3], decoded.rgba[pixel * 4 ..][0..3]);
+            try std.testing.expectEqual(alpha[pixel], decoded.rgba[pixel * 4 + 3]);
+        }
+        // General streams remain protected by their materialization limit.
+        try std.testing.expectError(error.DecodedStreamTooLarge, reader.readDecodedStreamData(&obj));
+        reader.decode_limits.max_working_set_bytes = 1024;
+        try std.testing.expectError(error.PdfDecodeWorkingSetTooLarge, reader.decodeImageToRgbaAlloc(&obj));
+    }
+}
+
+test "image row streaming checksum spans vector tails reduction blocks and read chunks" {
+    const alloc = std.testing.allocator;
+    // RGB rows straddle the shared checksum's 16-byte lanes and 5552-byte
+    // reduction blocks, plus the row reader's 64-KiB cancellation slices.
+    for ([_]u32{ 1, 5, 6, 1850, 1851, 21846 }) |width| {
+        const stride = @as(usize, width) * 3;
+        const pixels = try alloc.alloc(u8, stride * 3);
+        defer alloc.free(pixels);
+        for (pixels, 0..) |*byte, index| byte.* = @truncate(index * 31 + index / 17);
+        var compressed = try std.Io.Writer.Allocating.initCapacity(alloc, 256);
+        defer compressed.deinit();
+        var history: [std.compress.flate.max_window_len]u8 = undefined;
+        var compressor = try std.compress.flate.Compress.init(&compressed.writer, &history, .zlib, .default);
+        try compressor.writer.writeAll(pixels);
+        try compressor.finish();
+        const object = try std.fmt.allocPrint(alloc, "1 0 obj\n<< /Width {d} /Height 3 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ width, compressed.written().len, compressed.written() });
+        defer alloc.free(object);
+        const pdf = try buildImageDecodeTestPdfAlloc(alloc, &.{object});
+        defer alloc.free(pdf);
+        var reader = try Reader.init(alloc, pdf);
+        defer reader.deinit();
+        reader.decode_limits.max_decoded_stream_bytes = stride;
+        var obj = try reader.readIndirectObject(.{ .id = 1, .gen = 0 });
+        defer obj.deinit(alloc);
+        const rows = try ImageSampleRows.create(&reader, &obj, width, 3, 3);
+        defer rows.destroy();
+        for (0..3) |y| try std.testing.expectEqualSlices(u8, pixels[y * stride ..][0..stride], try rows.next());
+        try rows.finish();
+        try std.testing.expectEqual(std.hash.Adler32.hash(pixels), rows.checksum.final());
+    }
+}
+
+test "image row streaming rejects truncated surplus corrupt and canceled streams" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "abc", "abcdef", "abcdefg" }) |bytes| {
+        const object = try std.fmt.allocPrint(alloc, "1 0 obj\n<< /Width 1 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ bytes.len, bytes });
+        defer alloc.free(object);
+        const pdf = try buildImageDecodeTestPdfAlloc(alloc, &.{object});
+        defer alloc.free(pdf);
+        var reader = try Reader.init(alloc, pdf);
+        defer reader.deinit();
+        var obj = try reader.readIndirectObject(.{ .id = 1, .gen = 0 });
+        defer obj.deinit(alloc);
+        const rows = try ImageSampleRows.create(&reader, &obj, 1, 2, 3);
+        defer rows.destroy();
+        _ = try rows.next();
+        if (bytes.len < 6) {
+            try std.testing.expectError(error.InvalidPdfImageData, rows.next());
+        } else {
+            _ = try rows.next();
+            if (bytes.len > 6) try std.testing.expectError(error.InvalidPdfImageData, rows.finish()) else try rows.finish();
+        }
+        const Cancel = struct {
+            fn check(_: ?*const anyopaque) bool {
+                return true;
+            }
+        };
+        rows.cancellation = .{ .is_cancelled_fn = Cancel.check };
+        try std.testing.expectError(error.Canceled, rows.next());
+        try std.testing.expectError(error.Canceled, rows.finish());
+    }
+    // Valid zlib header/block with an invalid Adler trailer. The row reader
+    // must consume and validate the trailer rather than stop at expected RGB.
+    const corrupt = "\x78\x01\x01\x06\x00\xf9\xffabcdef\x00\x00\x00\x00";
+    const object = try std.fmt.allocPrint(alloc, "1 0 obj\n<< /Width 1 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ corrupt.len, corrupt });
+    defer alloc.free(object);
+    const pdf = try buildImageDecodeTestPdfAlloc(alloc, &.{object});
+    defer alloc.free(pdf);
+    var reader = try Reader.init(alloc, pdf);
+    defer reader.deinit();
+    var obj = try reader.readIndirectObject(.{ .id = 1, .gen = 0 });
+    defer obj.deinit(alloc);
+    try std.testing.expectError(error.InvalidFlateStream, reader.decodeImageToRgbaAlloc(&obj));
+}
+
 test "reader applies png up predictor after flate decode" {
     const alloc = std.testing.allocator;
     const raw_predicted = &.{ 2, 'h', 'e', 'l', 'l', 'o' };
@@ -20491,6 +21027,38 @@ test "reader extracts empty-password Standard R2 RC4 PDF" {
     };
     defer alloc.free(text);
     try std.testing.expectEqualStrings("Hello RC4-40", std.mem.trim(u8, text, &std.ascii.whitespace));
+}
+
+test "render fork template refresh tracks explicit encrypted stream generation" {
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("../testdata/rc4_40_empty_password_fixture.pdf");
+    var parsed = try Reader.init(alloc, fixture);
+    defer parsed.deinit();
+    var template = try parsed.prepareRenderForkTemplate(alloc, .{});
+    defer template.deinit();
+
+    const synthetic_offset = fixture.len + 1;
+    const synthetic_ptr: syntax.ObjRef = .{ .id = 42, .gen = 0 };
+    const generation_before = parsed.encrypted_stream_generation;
+    try parsed.rememberEncryptedStream(synthetic_offset, synthetic_ptr);
+    try std.testing.expectEqual(generation_before + 1, parsed.encrypted_stream_generation);
+    try template.refreshFrom(&parsed, .{});
+    try std.testing.expectEqual(parsed.encrypted_stream_generation, template.encrypted_stream_generation);
+    try std.testing.expectEqual(parsed.encrypted_streams.count(), template.encrypted_streams.len);
+
+    const snapshot_ptr = template.encrypted_streams.ptr;
+    try template.refreshFrom(&parsed, .{});
+    try std.testing.expectEqual(snapshot_ptr, template.encrypted_streams.ptr);
+
+    // Re-observing an identical stream is idempotent, while a conflicting
+    // replacement is rejected without changing the cache generation.
+    try parsed.rememberEncryptedStream(synthetic_offset, synthetic_ptr);
+    try std.testing.expectEqual(generation_before + 1, parsed.encrypted_stream_generation);
+    try std.testing.expectError(
+        error.InvalidEncryptedPdf,
+        parsed.rememberEncryptedStream(synthetic_offset, .{ .id = 43, .gen = 0 }),
+    );
+    try std.testing.expectEqual(generation_before + 1, parsed.encrypted_stream_generation);
 }
 
 test "stream filter prefix decoding stops before DCT data" {

@@ -132,6 +132,7 @@ fn decodeRgbaChecked(alloc: Allocator, bmp_bytes: []const u8, limits: ?DecodeLim
 
     var y: usize = 0;
     while (y < height) : (y += 1) {
+        try @import("work_control.zig").check();
         const src_y = if (top_down) y else @as(usize, height) - 1 - y;
         const src_row = bmp_bytes[pixel_start + src_y * src_row_stride ..][0..src_row_stride];
         const dst_row = rgba[y * @as(usize, width) * 4 ..][0 .. @as(usize, width) * 4];

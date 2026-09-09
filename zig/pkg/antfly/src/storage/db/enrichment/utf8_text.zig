@@ -95,22 +95,43 @@ pub fn sanitizeWithoutSourceMapAlloc(alloc: Allocator, text: []const u8, context
 }
 
 pub fn replacementAlloc(alloc: Allocator, text: []const u8, context: []const u8) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-
+    var repaired_len: usize = 0;
     var i: usize = 0;
     while (i < text.len) {
         const seq_len = std.unicode.utf8ByteSequenceLength(text[i]) catch 0;
         if (seq_len > 0 and i + seq_len <= text.len and std.unicode.utf8ValidateSlice(text[i .. i + seq_len])) {
-            try out.appendSlice(alloc, text[i .. i + seq_len]);
+            repaired_len = std.math.add(usize, repaired_len, seq_len) catch return error.OutOfMemory;
             i += seq_len;
         } else {
-            try out.appendSlice(alloc, &std.unicode.replacement_character_utf8);
+            repaired_len = std.math.add(
+                usize,
+                repaired_len,
+                std.unicode.replacement_character_utf8.len,
+            ) catch return error.OutOfMemory;
             i += 1;
         }
     }
 
-    const repaired = try out.toOwnedSlice(alloc);
+    const repaired = try alloc.alloc(u8, repaired_len);
+    errdefer alloc.free(repaired);
+    i = 0;
+    var out_index: usize = 0;
+    while (i < text.len) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(text[i]) catch 0;
+        if (seq_len > 0 and i + seq_len <= text.len and std.unicode.utf8ValidateSlice(text[i .. i + seq_len])) {
+            @memcpy(repaired[out_index..][0..seq_len], text[i..][0..seq_len]);
+            out_index += seq_len;
+            i += seq_len;
+        } else {
+            @memcpy(
+                repaired[out_index..][0..std.unicode.replacement_character_utf8.len],
+                &std.unicode.replacement_character_utf8,
+            );
+            out_index += std.unicode.replacement_character_utf8.len;
+            i += 1;
+        }
+    }
+    std.debug.assert(out_index == repaired.len);
     noteInvalidUtf8Repair(context, text.len, repaired.len);
     return repaired;
 }
