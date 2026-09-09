@@ -98,7 +98,9 @@ def check_page_blocks(path: Path) -> None:
                 ast.parse(block)
             except SyntaxError as error:
                 fail(f"{path.name} Python block {index} does not parse: {error}")
-    for index, payload in enumerate(re.findall(r"\s-d '(\{.*?\})'", source, re.DOTALL), start=1):
+    for index, payload in enumerate(
+        re.findall(r"\s-d '(\{.*?\})'", source, re.DOTALL), start=1
+    ):
         try:
             json.loads(payload)
         except json.JSONDecodeError as error:
@@ -107,13 +109,17 @@ def check_page_blocks(path: Path) -> None:
 
 def check_terminology() -> None:
     # `antfly inference <cmd>` (the CLI) is fine; the banned form is the prose name.
-    cli_form = re.compile(r"`[^`]*antfly inference[^`]*`|^\s*antfly inference\b", re.MULTILINE)
+    cli_form = re.compile(
+        r"`[^`]*antfly inference[^`]*`|^\s*antfly inference\b", re.MULTILINE
+    )
     for path in sorted(DOCS_DIR.rglob("*.md*")):
         source = cli_form.sub("", path.read_text(encoding="utf-8"))
         for phrase, reason in BANNED_PHRASES.items():
             for line_number, line in enumerate(source.splitlines(), start=1):
                 if phrase in line:
-                    fail(f"{path.relative_to(REPO)}:{line_number}: {phrase!r} — {reason}")
+                    fail(
+                        f"{path.relative_to(REPO)}:{line_number}: {phrase!r}: {reason}"
+                    )
 
 
 def main() -> int:
