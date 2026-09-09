@@ -72,9 +72,9 @@ def _sorted_query(stateful_api, table_name: str, field: str) -> dict:
             "profile": True,
         },
     )
-    assert (
-        response.status_code == 200
-    ), f"sorted query failed with {response.status_code}: {response.text}"
+    assert response.status_code == 200, (
+        f"sorted query failed with {response.status_code}: {response.text}"
+    )
     return response.json()
 
 
