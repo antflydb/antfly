@@ -11,6 +11,30 @@ from benchmark import artifact_errors, coverage_ready, unit_text_hashes
 
 
 class CompletionTests(unittest.TestCase):
+    def test_render_controls_are_explicit_and_ambient_overrides_removed(self):
+        args = SimpleNamespace(
+            read_profile=False,
+            reader_batch_size=4,
+            render_workers=2,
+            render_prefetch=0,
+            render_memory_bytes=268435456,
+        )
+        environment = benchmark.runtime_environment(
+            args,
+            {
+                "PATH": "/bin",
+                "ANTFLY_SECRET": "ignored",
+                "ANTFLY_ENRICHMENT_OCR_RENDER_PARALLEL_PAGES": "8",
+            },
+        )
+        self.assertNotIn("ANTFLY_SECRET", environment)
+        self.assertEqual(environment["PATH"], "/bin")
+        self.assertEqual(environment[benchmark.RENDER_CONTROLS["render_workers"]], "2")
+        self.assertEqual(environment[benchmark.RENDER_CONTROLS["render_prefetch"]], "0")
+        self.assertEqual(
+            environment[benchmark.RENDER_CONTROLS["render_memory_bytes"]], "268435456"
+        )
+
     def test_geometry_reads_provenance_and_rejects_missing_render_metadata(self):
         manifests = {
             "scan.pdf": {

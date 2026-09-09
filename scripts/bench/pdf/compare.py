@@ -43,6 +43,20 @@ def output_signature(result):
         if any(manifest.get(field) is None for field in fields):
             raise ValueError(f"missing artifact counts: {key}")
         documents[key] = {field: manifest[field] for field in fields}
+    for consumer in result.get("consumer_results", []):
+        if (
+            not consumer.get("unit_text_sha256")
+            or not consumer.get("unit_render_geometry")
+            or consumer.get("searchable_vectors") is None
+            or not consumer.get("manifest_counts")
+        ):
+            raise ValueError("missing secondary consumer output verification")
+        if any(
+            row.get(field) is None
+            for row in consumer["manifest_counts"].values()
+            for field in fields
+        ):
+            raise ValueError("missing secondary consumer artifact counts")
     return {
         "documents": documents,
         "pages": result["pages"],
@@ -50,6 +64,7 @@ def output_signature(result):
         "vectors": vectors[0],
         "unit_text_sha256": result["unit_text_sha256"],
         "unit_render_geometry": result["unit_render_geometry"],
+        "consumer_results": result.get("consumer_results", []),
     }
 
 
@@ -73,6 +88,9 @@ def comparable_pair(before, after, trials):
         "circus_revision",
         "read_profile",
         "reader_batch_size",
+        "render_workers",
+        "render_prefetch",
+        "render_memory_bytes",
     ):
         if field not in before.get("provenance", {}) or before["provenance"].get(
             field
@@ -80,6 +98,17 @@ def comparable_pair(before, after, trials):
             errors.append(f"mismatched or missing provenance.{field}")
     if before.get("provenance", {}).get("read_profile"):
         errors.append("profiling is enabled")
+    consumers = before.get("provenance", {}).get("consumers", 1)
+    if before.get("provenance", {}).get("sync_level", "full_index") != after.get(
+        "provenance", {}
+    ).get("sync_level", "full_index"):
+        errors.append("sync level differs")
+    if consumers != after.get("provenance", {}).get("consumers", 1):
+        errors.append("mismatched consumer count")
+    for run in (before, after):
+        for row in run["results"]:
+            if len(row.get("consumer_results", [])) != consumers - 1:
+                errors.append("missing consumer outputs")
     if not errors:
         for i, (left, right) in enumerate(zip(before["results"], after["results"])):
             try:
@@ -190,6 +219,14 @@ def run_subject(args, out, index, subject):
     ]
     if args.reader_batch_size is not None:
         command.extend(["--reader-batch-size", str(args.reader_batch_size)])
+    command.extend(["--consumers", str(getattr(args, "consumers", 1))])
+    command.extend(["--sync-level", getattr(args, "sync_level", "full_index")])
+    for field in ("render_workers", "render_prefetch", "render_memory_bytes"):
+        value = getattr(args, field, None)
+        if value is not None:
+            command.extend(["--" + field.replace("_", "-"), str(value)])
+    if getattr(args, "read_profile", False):
+        command.append("--read-profile")
     print(f"Running {name}", flush=True)
     with (out / f"{name}.log").open("w") as log:
         child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
@@ -240,12 +277,19 @@ def main():
     parser.add_argument("--name", required=True)
     parser.add_argument(
         "--suite",
-        choices=["scan", "embedded", "text", "small", "qualification"],
+        choices=["scan", "embedded", "text", "small", "throughput", "qualification"],
         default="text",
     )
     parser.add_argument("--mode", choices=["auto", "always"], default="always")
     parser.add_argument("--pairs", type=int, default=2)
     parser.add_argument("--reader-batch-size", type=int, choices=[1, 2, 4, 8, 16])
+    parser.add_argument("--consumers", type=int, choices=[1, 2], default=1)
+    parser.add_argument(
+        "--sync-level", choices=["full_index", "write"], default="full_index"
+    )
+    parser.add_argument("--render-workers", type=int, choices=[1, 2, 4, 8])
+    parser.add_argument("--render-prefetch", type=int, choices=[0, 1])
+    parser.add_argument("--render-memory-bytes", type=int)
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--port", type=int, default=29700)
@@ -254,6 +298,8 @@ def main():
         parser.error("name must be a single safe directory name")
     if min(args.pairs, args.trials, args.timeout) < 1:
         parser.error("pairs, trials and timeout must be positive")
+    if args.render_memory_bytes is not None and args.render_memory_bytes <= 0:
+        parser.error("--render-memory-bytes must be positive")
     for subject in ("main", "pr"):
         if not re.fullmatch(r"[0-9a-f]{40}", getattr(args, f"{subject}_revision")):
             parser.error("revisions must be full commit SHAs")

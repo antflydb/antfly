@@ -8094,11 +8094,11 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
         // This root intentionally links the complete standalone runtime and
-        // embedded inference ABI. The merged document executors plus execution
-        // control peak near 7.6 GiB in macOS debug codegen, so publish an
-        // honest scheduler reservation with normal variance headroom. Linux
-        // retains the measured aggregate default.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 9 else 7) * 1024 * 1024 * 1024,
+        // embedded inference ABI. macOS codegen peaked near 7.6 GiB in Debug
+        // and 9.93 GB in ReleaseFast; reserve headroom for safe parallel builds.
+        // This is a compile-memory scheduling claim, not a service limit.
+        // Linux retains the measured aggregate default.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 11 else 7) * 1024 * 1024 * 1024,
     });
     const lib_standalone_runtime_test_step = b.step("lib-standalone-runtime-test", "Run focused standalone runtime tests");
     const run_lib_standalone_runtime_tests = addFilteredTestRunArtifact(b, lib_standalone_runtime_tests);

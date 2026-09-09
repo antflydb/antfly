@@ -28,6 +28,18 @@ memory requires a bounded streaming image decoder, not relaxing benchmark gates
 or silently reducing requested DPI. See `scripts/bench/pdf/` for the retained
 failed experiments, render-control matrix and multi-consumer qualification.
 
+Final Metal qualification at production source `29dd963a4` confirms four actual
+render workers under the unchanged 256 MiB cap. Two durable-replay consumers
+share nine physical page renders (rather than eighteen), retain identical text
+and geometry, and publish 25 vectors each without an inference-worker restart.
+The larger cohort's prefetch-dependent administration failures are fixed; only
+the independently identified oversized decoded stream remains rejected.
+These profiled checks establish correctness/reuse, not an elapsed-time ratio.
+The separate, unprofiled nine-page comparison against pinned main `98d911a88`
+passes all 12 quality-matched trials: warm elapsed is 8.826 s versus 6.574 s
+(25.5% lower, 1.342× throughput). Host load remains uncontrolled; see
+`scripts/bench/pdf/RESULTS-2026-09-08-RENDER.md` for controls and limitations.
+
 ## Implementation status
 
 Status: bounded document preparation, indexed reader execution, multimodal

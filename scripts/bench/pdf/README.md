@@ -76,16 +76,27 @@ terminated. The fixed default ports are 29680/29681; use `--port` to change them
   seven-page document. Start here to qualify the pipeline.
 - `--suite qualification`: all 11 curated PDFs, 252 pages, including encrypted,
   large, long, and URL-encoded fixtures. Not a full OHR retrieval evaluation.
+- `--suite throughput`: a fixed 51-page cohort: the 16-page academic,
+  17-page administration and 18-page law PDFs. Selected by corpus role before
+  measuring, not by successful run outcomes. Report any failed qualification.
 - `--mode auto`: normal embedded-text extraction with OCR fallback.
 - `--mode always`: OCR every page to exercise rendering and inference batching.
 - `--ocr-model` and `--embed-model`: explicit model identities; defaults pin the
   Florence and BGE safetensors variants. Embedding dimension remains BGE's 384.
 - `--batch`: submit all source rows together; omit for one request per PDF.
+- `--consumers 2`: create two independently named extraction/chunk/vector
+  pipelines on each source row. Completion and parity checks include both;
+  this is not two indexes referencing one already-produced artifact. Use a
+  separate profile to count actual render work rather than assuming sharing.
 - `--reader-batch-size`: explicitly pin reader microbatch capacity to 1, 2, 4,
   8 or 16 on both subjects; omitted uses each subject's default. Record separate
   experiments for each size, including any output divergence.
 - `--read-profile`: enable per-stage reader diagnostics and record the override
   in provenance. Use for failure diagnosis, not timing comparisons.
+- `--render-workers`: request 1, 2, 4 or 8 render lanes; actual admitted workers
+  may be fewer. `--render-prefetch 0|1` controls the next-window overlap.
+  `--render-memory-bytes` pins the renderer cap explicitly. All three overrides
+  are recorded in provenance; ambient settings are still removed.
 - `--trials`: fresh tables within one server process. Model/runtime caches can
   be warm after the first trial. The first trial is **not** a cold-filesystem run.
 
@@ -102,7 +113,9 @@ startup, and table-setup time separately. Completion requires converged artifact
 exact page coverage, nonempty chunks, zero OCR failures, selected OCR for the
 scan, ready indexes, complete/healthy source coverage for every submitted
 document, and published vectors. The byte-origin log must prove every PDF fetch.
-The write API uses `sync_level=full_index`; acknowledgement alone is insufficient.
+The write API defaults to `sync_level=full_index`; `--sync-level write` exercises
+durable replay instead. Both wait for full completion; acknowledgement alone is
+insufficient. Do not change sync level between compared subjects.
 
 Raw manifests, index telemetry, origin access logs, server logs, exact table
 configuration, model/binary hashes, host load, and Circus revision are retained.
@@ -153,3 +166,46 @@ medians of warm trials, records paired ratios, and rejects binary/model drift
 between pairs. These are not cold-filesystem measurements or OCR accuracy scores.
 Host load remains uncontrolled and must be reported; use more alternating pairs
 on a quiet host before making performance claims.
+
+## Render-control ablations
+
+`--sync-level full_index` (the default) measures precommit enrichment.
+`--sync-level write` measures durable replay; the timer still waits for all
+artifacts, indexes and vector coverage, not just the write acknowledgement.
+Never compare ratios across these paths. Render-window sharing currently lives
+in replay, so use `benchmark.py run --consumers 2 --sync-level write --read-profile`
+to diagnose reuse. The same two-consumer full-index probe tests the separate
+precommit path, which currently renders independently for each consumer.
+
+`render_matrix.py` uses the same executable, PDFs, models, requested DPI,
+reader capacity four and 256 MiB renderer cap for every configuration. It varies
+only requested render workers (1/2/4) and prefetch (on/off), reverses the full
+configuration order in the second round, and uses fresh processes/databases.
+The baseline is one worker with prefetch on; `main`/`pr` keys inside its reused
+summary format mean baseline/configuration, **not different branches**.
+
+```sh
+/path/to/venv/bin/python scripts/bench/pdf/render_matrix.py \
+  --work-dir /path/to/pdf-assets --circus-dir /path/to/antfly-circus \
+  --binary /path/to/frozen/pr/antfly --revision FULL_PR_SHA \
+  --name render-text --suite text --rounds 2 --trials 3
+```
+
+Use `--profile --rounds 1 --trials 1` with another name for diagnostic admission
+logs. Profiled experiments deliberately produce no timing ratio. Raw per-window
+grants, requested/effective concurrency and OCR batches are retained; render
+window elapsed time can include prefetch lifetime and is not CPU service time.
+For a larger-workload check, use `--suite throughput`; a reduced `--workers 1`
+matrix isolates prefetch off/on. No failed configuration is dropped from the
+overall qualification. Exact text, DPI, warnings, counts and vector gates still
+apply to every timing comparison; memory-limit changes are not allowed ablations.
+
+The initial pinned production build (`61a08302f`) estimates each lane using the 128 MiB decode ceiling
+plus metadata and raster memory. Consequently two lanes cannot fit its 256 MiB
+renderer cap. A requested worker count above one is not evidence of concurrency;
+check the profile. That build's learned scratch hints only increase the estimate.
+The corrected policy separates hard decode ceilings from concurrency estimates,
+retains the aggregate allocator cap, and retries scratch-pressure failures with
+bounded serial work. Its correctness, actual concurrency, replay reuse and
+quality-matched timings are recorded in
+[the render qualification report](RESULTS-2026-09-08-RENDER.md).

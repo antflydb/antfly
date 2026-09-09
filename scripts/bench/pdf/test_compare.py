@@ -28,6 +28,9 @@ def run(seconds=(10, 8, 6)):
             "circus_revision": "same",
             "read_profile": False,
             "reader_batch_size": None,
+            "render_workers": None,
+            "render_prefetch": None,
+            "render_memory_bytes": None,
         },
         "results": [
             {
@@ -53,6 +56,33 @@ def run(seconds=(10, 8, 6)):
 
 
 class CompareTests(unittest.TestCase):
+    def test_sync_level_paths_are_not_equivalent_experiments(self):
+        before, after = run(), run()
+        after["provenance"]["sync_level"] = "write"
+        self.assertFalse(
+            summarize([{"order": [], "main": before, "pr": after}], 3)[
+                "timing_comparable"
+            ]
+        )
+
+    def test_secondary_consumers_require_independent_output_checks(self):
+        before, after = run(), run()
+        for subject in (before, after):
+            subject["provenance"]["consumers"] = 2
+        self.assertFalse(
+            summarize([{"order": [], "main": before, "pr": after}], 3)[
+                "timing_comparable"
+            ]
+        )
+        for subject in (before, after):
+            for row in subject["results"]:
+                row["consumer_results"] = [{}]
+        self.assertFalse(
+            summarize([{"order": [], "main": before, "pr": after}], 3)[
+                "timing_comparable"
+            ]
+        )
+
     def test_resolution_and_batch_policy_changes_prevent_speedup(self):
         before = run()
         after = run()
@@ -100,6 +130,9 @@ class CompareTests(unittest.TestCase):
             lambda r: r.update(metal_confirmed=False),
             lambda r: r.update(models={"different": True}),
             lambda r: r["provenance"].update(mode="auto"),
+            lambda r: r["provenance"].update(render_workers=4),
+            lambda r: r["provenance"].update(render_prefetch=0),
+            lambda r: r["provenance"].update(render_memory_bytes=1),
         ):
             candidate = run()
             mutation(candidate)

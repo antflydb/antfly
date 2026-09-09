@@ -51,7 +51,9 @@ def prepare():
     print(json.dumps(rows, indent=2), flush=True)
 
 
-def config(mode, ocr_model, embed_model):
+def config(mode, ocr_model, embed_model, consumers=1):
+    from consumers import table_with_consumers
+
     indexes = api.hierarchy_indexes()
     # The Circus adapter predates the typed graph artifact source API.
     graph = indexes["document_units"]
@@ -67,7 +69,7 @@ def config(mode, ocr_model, embed_model):
     for enrichment in indexes["document_text"]["enrichments"]:
         if enrichment["kind"] == "asset":
             enrichment["producer_json"] = json.dumps(producer)
-    return {"num_shards": 1, "indexes": indexes}
+    return table_with_consumers({"num_shards": 1, "indexes": indexes}, consumers)
 
 
 def wait_until(fn, seconds, proc=None):
@@ -181,6 +183,26 @@ def unit_text_hashes(manifests, fetch_unit, geometry=None):
     return hashes
 
 
+RENDER_CONTROLS = {
+    "render_workers": "ANTFLY_ENRICHMENT_OCR_RENDER_PARALLEL_PAGES",
+    "render_prefetch": "ANTFLY_ENRICHMENT_PDF_RENDER_PREFETCH_BATCHES",
+    "render_memory_bytes": "ANTFLY_ENRICHMENT_OCR_RENDER_INFLIGHT_BYTES",
+}
+
+
+def runtime_environment(args, ambient):
+    environment = {k: v for k, v in ambient.items() if not k.startswith("ANTFLY_")}
+    if args.read_profile:
+        environment["ANTFLY_INFERENCE_READ_PROFILE"] = "1"
+    if args.reader_batch_size is not None:
+        environment["ANTFLY_INFERENCE_READ_BATCH_SIZE"] = str(args.reader_batch_size)
+    for field, variable in RENDER_CONTROLS.items():
+        value = getattr(args, field, None)
+        if value is not None:
+            environment[variable] = str(value)
+    return environment
+
+
 def run(args):
     out = ROOT / args.name
     out.mkdir()  # Never reuse a previous database or overwrite a run.
@@ -217,6 +239,10 @@ def run_created(args, out):
     elif args.suite == "embedded":
         roles = {"render_7_pages", "born_digital"}
         selected = [r for r in selected if r["role"] in roles]
+    elif args.suite == "throughput":
+        # Fixed 51-page cohort, chosen by corpus roles, not run outcomes.
+        roles = {"type1_type3_lifetime", "largest_pdf", "law_qa_url_encoding"}
+        selected = [r for r in selected if r["role"] in roles]
     for row in selected:
         if sha256(ROOT / "corpus" / row["path"]) != row["sha256"]:
             raise ValueError(f"Corpus file changed: {row['path']}")
@@ -249,14 +275,8 @@ def run_created(args, out):
         "16000",
     ]
     # Pin admission identically; keep model loading/table setup timing explicit.
-    environment = dict(os.environ)
-    overrides = {k: v for k, v in environment.items() if k.startswith("ANTFLY_")}
-    for key in overrides:
-        environment.pop(key)
-    if args.read_profile:
-        environment["ANTFLY_INFERENCE_READ_PROFILE"] = "1"
-    if args.reader_batch_size is not None:
-        environment["ANTFLY_INFERENCE_READ_BATCH_SIZE"] = str(args.reader_batch_size)
+    overrides = {k: v for k, v in os.environ.items() if k.startswith("ANTFLY_")}
+    environment = runtime_environment(args, os.environ)
     provenance = {
         "binary": str(binary),
         "binary_sha256": sha256(binary),
@@ -270,6 +290,9 @@ def run_created(args, out):
         "removed_environment_keys": sorted(overrides),
         "read_profile": args.read_profile,
         "reader_batch_size": args.reader_batch_size,
+        "consumers": args.consumers,
+        "sync_level": args.sync_level,
+        **{field: getattr(args, field, None) for field in RENDER_CONTROLS},
         "verify_unit_text": args.verify_unit_text,
         "platform": (
             os.uname()._asdict() if hasattr(os.uname(), "_asdict") else list(os.uname())
@@ -315,7 +338,9 @@ def run_created(args, out):
             table_started = time.perf_counter()
             table = f"pdf_bench_{trial}"
             table_url = f"{url}/db/v1/tables/{table}"
-            table_config = config(args.mode, args.ocr_model, args.embed_model)
+            table_config = config(
+                args.mode, args.ocr_model, args.embed_model, args.consumers
+            )
             save(out / "table-config.json", table_config)
             api.json_request("POST", table_url, table_config)
             wait_until(
@@ -349,7 +374,7 @@ def run_created(args, out):
                 response = api.json_request(
                     "POST",
                     table_url + "/batch",
-                    {"inserts": group, "sync_level": "full_index"},
+                    {"inserts": group, "sync_level": args.sync_level},
                     timeout=args.timeout,
                 )
                 responses.append(response)
@@ -362,6 +387,8 @@ def run_created(args, out):
             def complete(
                 table=table, table_url=table_url, trial=trial, count=document_count
             ):
+                from consumers import all_consumers_complete, collect_manifests
+
                 manifests = {
                     r["path"]: api._artifact_manifest(url, table, r["path"])
                     for r in selected
@@ -385,7 +412,20 @@ def run_created(args, out):
                     and coverage.get("source_total") == count
                 ):
                     return None
-                return {"manifests": manifests, "indexes": statuses}
+                consumer_manifests = {}
+                if args.consumers > 1:
+                    consumer_manifests = collect_manifests(
+                        api, table_url, selected, args.consumers
+                    )
+                    if not all_consumers_complete(
+                        api, statuses, consumer_manifests, count, args.consumers
+                    ):
+                        return None
+                return {
+                    "manifests": manifests,
+                    "indexes": statuses,
+                    "consumer_manifests": consumer_manifests,
+                }
 
             finished = wait_until(complete, args.timeout, proc)
             elapsed = time.perf_counter() - started
@@ -423,6 +463,65 @@ def run_created(args, out):
                 errors.append(
                     "Vector coverage did not produce searchable vectors for every document"
                 )
+            consumer_results = []
+            if args.consumers > 1:
+                from consumers import consumer_name
+
+                for consumer in range(1, args.consumers):
+                    name = consumer_name("document_units_v1", consumer)
+                    manifests = finished["consumer_manifests"][name]
+                    errors.extend(
+                        f"{name}: {error}"
+                        for error in artifact_errors(selected, manifests)
+                    )
+                    if args.mode == "always" and any(
+                        manifests[row["path"]].get("ocr_attempted_count")
+                        != row["pages"]
+                        for row in selected
+                    ):
+                        errors.append(f"{name}: forced OCR did not attempt every page")
+                    vector = api._index_statuses(finished["indexes"])[
+                        consumer_name("document_vectors", consumer)
+                    ]
+                    if not coverage_ready(vector, len(records)):
+                        errors.append(f"{name}: incomplete vector coverage")
+                    hashes, geometry = None, {}
+                    if args.verify_unit_text:
+                        try:
+                            hashes = unit_text_hashes(manifests, fetch_unit, geometry)
+                        except (
+                            KeyError,
+                            TypeError,
+                            ValueError,
+                            OSError,
+                            RuntimeError,
+                        ) as exc:
+                            errors.append(
+                                f"{name}: Unit text verification failed: {exc}"
+                            )
+                        finally:
+                            save(out / f"retained-units-{trial}.json", retained_units)
+                    consumer_results.append(
+                        {
+                            "name": name,
+                            "unit_text_sha256": hashes,
+                            "unit_render_geometry": geometry,
+                            "searchable_vectors": vector.get("searchable_vectors"),
+                            "manifest_counts": {
+                                key: {
+                                    field: value.get(field)
+                                    for field in (
+                                        "unit_count",
+                                        "chunk_count",
+                                        "ocr_attempted_count",
+                                        "ocr_selected_count",
+                                        "ocr_failed_count",
+                                    )
+                                }
+                                for key, value in manifests.items()
+                            },
+                        }
+                    )
             accesses = [
                 json.loads(line)
                 for line in (out / "origin.jsonl").read_text().splitlines()
@@ -451,6 +550,7 @@ def run_created(args, out):
                 load=os.getloadavg(),
                 unit_text_sha256=text_hashes,
                 unit_render_geometry=render_geometry,
+                consumer_results=consumer_results,
                 **finished,
             )
             results.append(result)
@@ -460,13 +560,20 @@ def run_created(args, out):
                     {
                         k: v
                         for k, v in result.items()
-                        if k not in ("manifests", "indexes")
+                        if k not in ("manifests", "indexes", "consumer_manifests")
                     }
                 ),
                 flush=True,
             )
             if errors:
                 raise RuntimeError(errors)
+        # Outside every timed interval: retain the resolved model contract for
+        # diagnosing admission/batch-width decisions, not just file identities.
+        try:
+            capabilities = api.json_request("GET", url + "/ai/v1/models", timeout=5)
+        except (OSError, RuntimeError, ValueError) as exc:
+            capabilities = {"diagnostic_error": repr(exc)}
+        save(out / "model-capabilities.json", capabilities)
     except Exception as exc:
         save(
             out / "failure.json", {"error": repr(exc), "completed_trials": len(results)}
@@ -516,7 +623,7 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=29680)
     parser.add_argument(
         "--suite",
-        choices=["scan", "embedded", "text", "small", "qualification"],
+        choices=["scan", "embedded", "text", "small", "throughput", "qualification"],
         default="small",
     )
     parser.add_argument("--ocr-model", default="antflydb/Florence-2-base:safetensors")
@@ -524,6 +631,16 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["auto", "always"], default="auto")
     parser.add_argument("--batch", action="store_true")
     parser.add_argument("--reader-batch-size", type=int, choices=[1, 2, 4, 8, 16])
+    parser.add_argument("--consumers", type=int, choices=[1, 2], default=1)
+    parser.add_argument(
+        "--sync-level",
+        choices=["full_index", "write"],
+        default="full_index",
+        help="Precommit enrichment or durable replay; both wait for full coverage in timing",
+    )
+    parser.add_argument("--render-workers", type=int, choices=[1, 2, 4, 8])
+    parser.add_argument("--render-prefetch", type=int, choices=[0, 1])
+    parser.add_argument("--render-memory-bytes", type=int)
     parser.add_argument(
         "--verify-unit-text",
         action="store_true",
@@ -555,4 +672,6 @@ if __name__ == "__main__":
         )
     if args.trials < 1 or args.timeout <= 0:
         parser.error("--trials and --timeout must be positive")
+    if args.render_memory_bytes is not None and args.render_memory_bytes <= 0:
+        parser.error("--render-memory-bytes must be positive")
     prepare() if args.action == "prepare" else run(args)
