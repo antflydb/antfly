@@ -548,6 +548,7 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 		"inference", "run",
 		"--host", "0.0.0.0",
 		"--port", strconv.Itoa(InferenceAPIPort),
+		"--models-dir", "/models",
 		"--config", "/config/config.json",
 		"--allow-insecure-public-bind",
 	}

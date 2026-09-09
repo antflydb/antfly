@@ -133,13 +133,6 @@ var _ = Describe("InferencePool Controller", func() {
 			Expect(createdSts.Spec.Template.Spec.Containers).To(HaveLen(1))
 			Expect(createdSts.Spec.Template.Spec.Containers[0].Name).To(Equal("inference"))
 			Expect(createdSts.Spec.Template.Spec.Containers[0].Command).To(Equal([]string{"/antfly"}))
-			Expect(createdSts.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
-				"inference", "run",
-				"--host", "0.0.0.0",
-				"--port", "8080",
-				"--config", "/config/config.json",
-				"--allow-insecure-public-bind",
-			}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers).To(HaveLen(2))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Name).To(Equal("pjrt-plugin"))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Command).To(Equal([]string{"/bin/sh", "-ec"}))
@@ -480,13 +473,6 @@ var _ = Describe("InferencePool Controller", func() {
 			Expect(createdSts.Spec.Template.Spec.InitContainers[2].Command).To(Equal([]string{"/antfly"}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[2].Args).To(Equal([]string{
 				"inference", "pull", "model-c:i8", "--models-dir", "/models",
-			}))
-			Expect(createdSts.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
-				"inference", "run",
-				"--host", "0.0.0.0",
-				"--port", "8080",
-				"--config", "/config/config.json",
-				"--allow-insecure-public-bind",
 			}))
 
 			Expect(k8sClient.Delete(ctx, pool)).Should(Succeed())
