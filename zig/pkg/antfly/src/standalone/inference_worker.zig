@@ -140,7 +140,7 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
             response.body = "{\"error\":\"inference request too large\"}";
             return response;
         }
-        if (err == error.ResourceTemporarilyUnavailable) {
+        if (err == error.ResourceTemporarilyUnavailable or err == error.QueueFull) {
             var response = httpx.Response.init(client.alloc, 503);
             errdefer response.deinit();
             try response.headers.append("content-type", "application/json");

@@ -5283,6 +5283,17 @@ generic retryable failure, not a claim that model execution never occurred.
 This preserves useful parallel consumers without repeatedly restarting a whole
 document for admission pressure or blindly replaying successful generation.
 
+The real replay probe also found a separate Metal command-buffer race: the
+cached native provider's creation mutex was released before execution, allowing
+concurrent readers to encode the same mutable frame and abort the inference
+worker. Each model store now leases that provider exclusively through compute
+teardown. Contention returns `QueueFull` without parking an executor or spinning;
+unfinished/submitted frames are retired before handoff. Native fused batches
+remain intact, distinct stores are independent, and prepared provider caches
+remain warm across leases. Multiple lanes for one store require separately
+admitted mutable providers/frames and immutable shared weight ownership; they
+must not share a command buffer or be enabled by removing this lease.
+
 - Whether immutable font program parsing should eventually be frozen and
   shared across render windows. The safe implementation retains a private font
   cache only for the joined waves of one bounded batch and keeps image caches

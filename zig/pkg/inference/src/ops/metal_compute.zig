@@ -1057,6 +1057,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (false) null else {},
     provider_impl: *ProviderImpl,
     owned_native_provider: bool = false,
+    // The cached provider owns mutable command encoders, prepared slots and
+    // frame resources. Its lease covers execution and teardown, not just lazy
+    // creation. Fused model batches share this lane; other stores remain free.
+    shared_provider_lease_io: ?std.Io = null,
     backend_kv_cache: std.AutoHashMapUnmanaged(BackendKvCacheKey, BackendKvCacheEntry) = .empty,
     cyclic_page_table_cache: runtime_root.kv.storage_runtime.CyclicPageTableCache = .{},
     deepseek_v4_device_cache: std.AutoHashMapUnmanaged(DeepSeekV4CacheKey, DeepSeekV4DeviceLayerCache) = .empty,
@@ -1201,8 +1205,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             compute.captureRuntimeFrameBaselines();
             return compute;
         }
-        const lock_io = lockSharedMetalData(data, io);
-        defer unlockSharedMetalData(data, lock_io);
+        const lock_io = try lockSharedMetalData(data, io);
+        errdefer unlockSharedMetalData(data, lock_io);
         const provider_impl = data.shared_metal_native_provider orelse blk: {
             const created = try std.heap.c_allocator.create(MetalNativeProvider);
             errdefer std.heap.c_allocator.destroy(created);
@@ -1218,6 +1222,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .provider = if (false) null else {},
             .provider_impl = provider_impl,
             .owned_native_provider = false,
+            .shared_provider_lease_io = lock_io,
             .io = io,
         };
         compute.captureRuntimeFrameBaselines();
@@ -4314,6 +4319,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     pub fn deinit(self: *MetalCompute) void {
+        defer if (self.shared_provider_lease_io) |lock_io| {
+            self.shared_provider_lease_io = null;
+            unlockSharedMetalData(self.data, lock_io);
+        };
+        // An error/cancellation may leave an unfinished frame. Retire it before
+        // releasing request tensors or handing the shared encoder to a peer.
+        const runtime = self.provider_impl.raw_decode_runtime;
+        if (metal_runtime.hasActiveFrame(runtime)) metal_runtime.cancelFrame(runtime) catch {};
+        if (metal_runtime.hasSubmittedFrame(runtime)) metal_runtime.waitFrame(runtime) catch {};
         self.finishPendingDebertaRelativeProjections(false);
         self.clearActivePrefillFramePlan();
         self.clearPendingPrefillKvDeviceSeeds();
@@ -28772,13 +28786,11 @@ pub fn deinitPackedExpertViews(data: *WeightStore, allocator: std.mem.Allocator)
     gpu_hosted_store_mod.deinitPackedExpertViews(data, allocator);
 }
 
-fn lockSharedMetalData(data: *WeightStore, io: ?std.Io) std.Io {
+fn lockSharedMetalData(data: *WeightStore, io: ?std.Io) !std.Io {
     const lock_io = io orelse if (builtin.is_test) std.testing.io else std.Io.failing;
-    if (io != null or builtin.is_test) {
-        data.shared_metal_native_provider_lock.lockUncancelable(lock_io);
-    } else {
-        while (!data.shared_metal_native_provider_lock.tryLock()) std.atomic.spinLoopHint();
-    }
+    // Never park an inference worker (or a nested caller) behind another
+    // request's GPU stream. The caller/broker can drain and retry admission.
+    if (!data.shared_metal_native_provider_lock.tryLock()) return error.QueueFull;
     return lock_io;
 }
 
@@ -28822,6 +28834,34 @@ test "metal_compute: owned backend handle destroys its request context" {
         compute.* = try MetalCompute.init(allocator, &store, null);
         compute.ownedComputeBackend().deinit();
     }
+}
+
+test "metal_compute: shared provider execution lease rejects overlapping frames and recovers" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var store = testMetalWeightStoreInit(alloc);
+    defer deinitSharedNativeProvider(&store);
+    var first = try MetalCompute.init(alloc, &store, null);
+    var first_owned = true;
+    defer if (first_owned) first.deinit();
+    const provider = first.provider_impl;
+    try metal_runtime.beginFrame(provider.raw_decode_runtime);
+    try std.testing.expectError(error.QueueFull, MetalCompute.init(alloc, &store, null));
+    // Admission denial must not cancel or mutate the current owner's frame.
+    try std.testing.expect(metal_runtime.hasActiveFrame(provider.raw_decode_runtime));
+    // A different model/store has its own independent execution lane.
+    var other_store = testMetalWeightStoreInit(alloc);
+    defer deinitSharedNativeProvider(&other_store);
+    var other = try MetalCompute.init(alloc, &other_store, null);
+    defer other.deinit();
+    first.deinit();
+    first_owned = false;
+    try std.testing.expect(!metal_runtime.hasActiveFrame(provider.raw_decode_runtime));
+    var second = try MetalCompute.init(alloc, &store, null);
+    defer second.deinit();
+    try std.testing.expectEqual(provider, second.provider_impl);
+    try metal_runtime.beginFrame(provider.raw_decode_runtime);
 }
 
 test "metal_compute: native provider is shared across backend lifetimes" {
