@@ -2261,7 +2261,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const raft_harness_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/raft_sim_test_root.zig"),
+        .root_source_file = b.path("pkg/antfly/src/raft_harness_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -9228,14 +9228,33 @@ pub fn build(b: *std.Build) void {
     chaos_progress_tail = chainLabeledRun(b, lib_ha_vopr_tests, "ha-vopr-test", chaos_progress_tail);
     chaos_test_step.dependOn(chaos_progress_tail.?);
 
-    const chaos_soak_test_step = b.step("chaos-soak-test", "Run broad metadata VOPR and raft chaos soaks");
-    var chaos_soak_progress_tail: ?*std.Build.Step = null;
-    chaos_soak_progress_tail = chainLabeledFilteredTests(b, antfly_test_mod, "lib-metadata-vopr-transition-chaos-test", lib_metadata_vopr_transition_chaos_filters, chaos_soak_progress_tail);
-    chaos_soak_progress_tail = chainLabeledFilteredTests(b, antfly_test_mod, "lib-metadata-vopr-public-chaos-test", lib_metadata_vopr_public_chaos_filters, chaos_soak_progress_tail);
-    chaos_soak_progress_tail = chainLabeledFilteredTests(b, antfly_test_mod, "lib-metadata-vopr-placement-chaos-test", lib_metadata_vopr_placement_chaos_filters, chaos_soak_progress_tail);
-    chaos_soak_progress_tail = chainLabeledRun(b, lib_raft_chaos_tests, "lib-raft-chaos-test", chaos_soak_progress_tail);
-    chaos_soak_test_step.dependOn(chaos_soak_progress_tail.?);
-    soak_test_step.dependOn(chaos_soak_test_step);
+    const vopr_soak_test_step = b.step("vopr-soak-test", "Run HA/Raft/data VOPR search campaigns and metadata/Raft native differentials");
+    const vopr_soak_histories = b.option(u64, "vopr-soak-histories", "Histories per VOPR soak campaign") orelse 100;
+    const vopr_soak_seed = b.option(u64, "vopr-soak-seed", "Base seed for VOPR soak campaigns") orelse 0xa17f_5500;
+    const vopr_soak_artifacts = b.option([]const u8, "vopr-soak-artifacts", "Persistent directory for VOPR soak reports and replay corpus") orelse "zig-out/vopr-soak";
+    var vopr_soak_progress_tail: ?*std.Build.Step = null;
+    // One worker makes corpus-guided selection reproducible as a campaign,
+    // in addition to each history's independent exact-replay guarantee.
+    for ([_][]const u8{ "ha", "raft", "distributed-data" }) |scenario| {
+        const campaign = b.addRunArtifact(vopr_cli);
+        campaign.addArgs(&.{
+            "campaign",                      "--scenario",                         scenario,
+            "--histories",                   b.fmt("{d}", .{vopr_soak_histories}), "--seed",
+            b.fmt("{d}", .{vopr_soak_seed}), "--workers",                          "1",
+            "--fail-on-findings",            "--artifact-dir",                     b.pathJoin(&.{ vopr_soak_artifacts, scenario }),
+        });
+        if (vopr_soak_progress_tail) |previous| campaign.step.dependOn(previous);
+        vopr_soak_progress_tail = &campaign.step;
+    }
+    // Retain the existing broad differential coverage during consolidation.
+    // Native HTTP/storage tests do not acquire exact replay by being in this tier.
+    vopr_soak_progress_tail = chainLabeledFilteredTests(b, antfly_test_mod, "lib-metadata-vopr-transition-chaos-test", lib_metadata_vopr_transition_chaos_filters, vopr_soak_progress_tail);
+    vopr_soak_progress_tail = chainLabeledFilteredTests(b, antfly_test_mod, "lib-metadata-vopr-public-chaos-test", lib_metadata_vopr_public_chaos_filters, vopr_soak_progress_tail);
+    vopr_soak_progress_tail = chainLabeledFilteredTests(b, antfly_test_mod, "lib-metadata-vopr-placement-chaos-test", lib_metadata_vopr_placement_chaos_filters, vopr_soak_progress_tail);
+    vopr_soak_progress_tail = chainLabeledRun(b, lib_raft_chaos_tests, "lib-raft-chaos-test", vopr_soak_progress_tail);
+    vopr_soak_test_step.dependOn(vopr_soak_progress_tail.?);
+    b.step("chaos-soak-test", "Compatibility alias for vopr-soak-test").dependOn(vopr_soak_test_step);
+    soak_test_step.dependOn(vopr_soak_test_step);
 
     const template_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/template_test_root.zig"),

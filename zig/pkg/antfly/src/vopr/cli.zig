@@ -1250,6 +1250,7 @@ fn debugCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
 fn campaignCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     var histories: u64 = 100;
+    var fail_on_findings = false;
     var requested_transitions: ?usize = null;
     var workers: usize = 1;
     var seed: u64 = 0xa17f_1000;
@@ -1261,6 +1262,8 @@ fn campaignCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u
         if (std.mem.eql(u8, arg, "--scenario")) {
             scenario = try nextValue(args, &index);
             _ = try defaultCampaignTransitions(scenario);
+        } else if (std.mem.eql(u8, arg, "--fail-on-findings")) {
+            fail_on_findings = true;
         } else if (std.mem.eql(u8, arg, "--histories")) {
             histories = try std.fmt.parseInt(u64, try nextValue(args, &index), 10);
         } else if (std.mem.eql(u8, arg, "--transitions")) {
@@ -1310,9 +1313,17 @@ fn campaignCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u
         spawned += 1;
     }
     for (threads) |thread| thread.join();
+    spawned = 0; // Later report/gate errors must not join consumed handles again.
     try context.exportQuarantineArtifacts();
     try context.reportSummary();
     if (context.first_error) |err| return err;
+    try checkCampaignFindings(context.failures, fail_on_findings);
+}
+
+// Write replay artifacts and reports before failing an automated soak. Search
+// sessions may still opt to inspect findings without a nonzero exit status.
+fn checkCampaignFindings(failures: u64, fail_on_findings: bool) !void {
+    if (fail_on_findings and failures != 0) return error.CampaignPropertyFailure;
 }
 
 fn reduceCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
@@ -1763,8 +1774,11 @@ const CampaignContext = struct {
             const history_index = self.next_history.fetchAdd(1, .monotonic);
             if (history_index >= self.histories) return;
             self.runHistory(history_index) catch |err| {
+                const error_trace = @errorReturnTrace();
                 self.mutex.lock(self.io) catch return;
                 defer self.mutex.unlock(self.io);
+                std.debug.print("VOPR harness error scenario={s} history={d} base_seed={d}: {s}\n", .{ self.scenario, history_index, self.base_seed, @errorName(err) });
+                if (error_trace) |trace| std.debug.dumpErrorReturnTrace(trace);
                 self.harness_errors += 1;
                 if (self.first_error == null) self.first_error = err;
                 return;
@@ -2433,7 +2447,7 @@ fn usage() error{InvalidUsage} {
         \\usage:
         \\  vopr run --scenario metadata|transaction|distributed-data|distributed-transaction|data-plane|derived-workflow|backup-restore|clock-fault|wal|persistent|index-manager|db-split|raft|lmdb|lsm|ha --seed <u64> [--transitions <n>] [--workload smoke|expanded] --trace-out <path>
         \\  vopr replay --trace <path>
-        \\  vopr campaign --scenario metadata|transaction|distributed-data|distributed-transaction|data-plane|derived-workflow|backup-restore|clock-fault|wal|persistent|index-manager|db-split|raft|lmdb|lsm|ha --histories <n> [--transitions <n>] --workers <n> --artifact-dir <path>
+        \\  vopr campaign --scenario metadata|transaction|distributed-data|distributed-transaction|data-plane|derived-workflow|backup-restore|clock-fault|wal|persistent|index-manager|db-split|raft|lmdb|lsm|ha --histories <n> [--transitions <n>] --workers <n> --artifact-dir <path> [--fail-on-findings]
         \\  vopr reduce --trace <path> --out <path> [--attempts <n>]
         \\  vopr promote --trace <path> --name <fixture-name> [--force]
         \\  vopr tla --trace <path> --domain raft|transaction --out <path.ndjson>
@@ -2465,6 +2479,8 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
     var discovered = try antfly.metadata_vopr_harness.discoverMetadataVoprInjectedOverlap(alloc, 0xA17F_FA11);
     defer discovered.deinit();
     try std.testing.expectEqual(@as(usize, 1), discovered.failures.items.len);
+    try std.testing.expectError(error.CampaignPropertyFailure, checkCampaignFindings(discovered.failures.items.len, true));
+    try checkCampaignFindings(discovered.failures.items.len, false);
 
     var replayed = try antfly.metadata_vopr_harness.replayMetadataVoprCampaign(alloc, &discovered);
     replayed.deinit();
@@ -2747,6 +2763,7 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
     defer transaction_campaign.coverage.deinit();
     try transaction_campaign.runHistory(0);
     try transaction_campaign.reportSummary();
+    try checkCampaignFindings(transaction_campaign.failures, true);
     const flight_path = try std.fmt.allocPrint(alloc, "{s}/history-0-1234.flight.json", .{corpus_path});
     defer alloc.free(flight_path);
     const flight_json = try std.Io.Dir.cwd().readFileAlloc(io, flight_path, alloc, .limited(max_trace_bytes));
@@ -2767,6 +2784,18 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
     var parsed_combined = try std.json.parseFromSlice(std.json.Value, alloc, combined_index, .{});
     defer parsed_combined.deinit();
     try std.testing.expectEqual(@as(usize, 2), parsed_combined.value.object.get("runs").?.array.items.len);
+
+    // A report failure happens after workers have joined. It must propagate
+    // as an ordinary command error, without joining those handles twice.
+    const report_error_path = try std.fmt.allocPrint(alloc, "{s}/report-error", .{corpus_path});
+    defer alloc.free(report_error_path);
+    const blocked_report_path = try std.fmt.allocPrint(alloc, "{s}/results.json", .{report_error_path});
+    defer alloc.free(blocked_report_path);
+    try ensureDir(io, blocked_report_path);
+    try std.testing.expectError(error.IsDir, campaignCommand(alloc, io, &.{
+        "--scenario",     "transaction",     "--histories",        "1", "--workers", "1",
+        "--artifact-dir", report_error_path, "--fail-on-findings",
+    }));
 }
 
 test "VOPR scenario registry records and exactly replays every context-free domain" {

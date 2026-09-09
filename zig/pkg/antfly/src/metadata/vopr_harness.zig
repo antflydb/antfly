@@ -52,7 +52,7 @@ const read_gate = @import("../raft/read_gate.zig");
 const raft_shard_ops = @import("../raft/shard_ops.zig");
 const raft_state_machine = @import("../raft/state_machine/mod.zig");
 const peer_resolver = @import("../raft/peer_resolver.zig");
-const raft_sim = @import("../raft/sim_harness.zig");
+const raft_vopr = @import("../raft/vopr_harness.zig");
 const raft_transport = @import("../raft/transport/mod.zig");
 const transition_runtime = @import("../raft/transition_runtime.zig");
 const transition_state = @import("transition_state.zig");
@@ -1457,7 +1457,7 @@ const DistributedDataVoprContext = struct {
 
 pub const DistributedDataVoprScenario = struct {
     pub const name: []const u8 = "distributed-data-vopr";
-    pub const version: u32 = 1;
+    pub const version: u32 = 2;
 
     const completed_property = vopr.id.stable("property", "distributed_data.split_merge_completed");
     const acknowledged_property = vopr.id.stable("property", "distributed_data.acknowledged_data_survives");
@@ -2038,18 +2038,6 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
         }
     }
 
-    var delayed_a: ?raft_sim.DelayingRequestExecutor = null;
-    defer if (delayed_a) |*executor| executor.deinit();
-    var delayed_b: ?raft_sim.DelayingRequestExecutor = null;
-    defer if (delayed_b) |*executor| executor.deinit();
-    var delayed_c: ?raft_sim.DelayingRequestExecutor = null;
-    defer if (delayed_c) |*executor| executor.deinit();
-    if (cfg.delayed_transport) {
-        delayed_a = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
-        delayed_b = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
-        delayed_c = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
-    }
-
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/{s}-a", .{ tmp.sub_path, cfg.path_prefix });
     defer std.testing.allocator.free(root_a);
     const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/{s}-b", .{ tmp.sub_path, cfg.path_prefix });
@@ -2066,23 +2054,16 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/{s}-c.txt", .{ tmp.sub_path, cfg.path_prefix });
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, cfg.table_id, root_a, cat_a),
         makeHostVoprConfig(2, cfg.table_id, root_b, cat_b),
         makeHostVoprConfig(3, cfg.table_id, root_c, cat_c),
     };
-    const deps = if (cfg.delayed_transport)
-        [_]raft_sim.ManagedHttpHostSimulationDeps{
-            makeHostVoprDepsWithTransportExecutor(&factory_a, delayed_a.?.executor()),
-            makeHostVoprDepsWithTransportExecutor(&factory_b, delayed_b.?.executor()),
-            makeHostVoprDepsWithTransportExecutor(&factory_c, delayed_c.?.executor()),
-        }
-    else
-        [_]raft_sim.ManagedHttpHostSimulationDeps{
-            makeHostVoprDeps(&factory_a),
-            makeHostVoprDeps(&factory_b),
-            makeHostVoprDeps(&factory_c),
-        };
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
+    };
 
     var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, cfg.table_id, configs[0..], deps[0..]);
     defer cluster.deinit();
@@ -2128,8 +2109,12 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
     try ensureGroupTextIndex(&cluster, roots[client_index], initial_group_id, api_tables.default_full_text_index_name, 40);
     try std.testing.expect(try waitForNodeProjectedTableFieldContains(&cluster, client_index, "docs", .indexes_json, "\"full_text_index_v0\"", true, cfg.projected_index_rounds));
 
+    // Cluster setup owns the transport executor. Inject delay into that
+    // virtual network so this choice actually changes message eligibility.
+    if (cfg.delayed_transport) cluster.virtual_network.delayNextTicks(2);
     var pre_split_batch = try client.fetchBatch(client_base, "docs", split_seed_batch_body);
     defer pre_split_batch.deinit(std.heap.page_allocator);
+    if (cfg.delayed_transport) try std.testing.expect(cluster.virtual_network.delayed_count > 0);
     try std.testing.expect(std.mem.indexOf(u8, pre_split_batch.body, "\"inserted\":3") != null);
     var acknowledged_model = AcknowledgedPublicDataModel{};
     if (cfg.modeled_storage) {
@@ -2200,13 +2185,15 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
 
     if (cfg.failure_mode == .partition_then_restart_source_with_storage_crash or cfg.storage_crash_after_split) {
         if (!cfg.modeled_storage) return error.ModeledStorageRequired;
-        cluster.cluster.healAll();
+        try healMetadataFaults(&cluster);
         const restart_index = source_leader orelse return error.TestExpectedEqual;
         public_api.deinit();
         public_api_open = false;
         try modeled_devices[restart_index].device().crash();
         try cluster.restartNode(restart_index);
+        try healMetadataFaults(&cluster);
         _ = (try cluster.waitForMetadataLeader(cfg.post_failure_leader_wait_rounds)) orelse return error.TestExpectedEqual;
+        try waitForMetadataReadAuthority(&cluster, cfg.post_failure_leader_wait_rounds);
         try public_api.initLeaderBackedInPlace(std.testing.allocator, &cluster, roots);
         public_api_open = true;
         client = public_api.client;
@@ -2227,7 +2214,7 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
 
     if (cfg.compose_merge) |merge_cfg| {
         if (!cfg.modeled_storage) return error.ModeledStorageRequired;
-        cluster.cluster.healAll();
+        try healMetadataFaults(&cluster);
         try cluster.stepAll();
 
         const merge_leader_index = currentMetadataLeaderIndex(&cluster) orelse
@@ -2305,6 +2292,27 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
         const merge_retirement = try retireFinalizedMergeTransition(cluster.node(merge_verification_index), workflow.controlLoop());
         try std.testing.expectEqual(@as(usize, 1), merge_retirement.removal.range_upserts);
         try std.testing.expectEqual(@as(usize, 1), merge_retirement.removal.range_removals);
+        // A partitioned former leader cannot observe donor retirement. First
+        // prove public recovery on the surviving quorum, then explicitly heal
+        // before requiring the all-replica quiet-suffix oracle below.
+        if (merge_cfg.failure_mode == .partition_metadata_leader) {
+            var degraded_verify = merge_cfg.verify;
+            degraded_verify.removed_absent_count = 2;
+            try verifyComposedMergePublicTraffic(
+                &cluster,
+                &client,
+                public_api.api_base_uris[0..],
+                public_api.catalog_sources[merge_verification_index].iface(),
+                "docs",
+                roots[0..],
+                groups.left_group,
+                groups.right_group,
+                degraded_verify,
+                &acknowledged_model,
+            );
+        }
+        try healMetadataFaults(&cluster);
+        try cluster.stepAll();
         try verifyComposedMergePublicTraffic(
             &cluster,
             &client,
@@ -2405,18 +2413,6 @@ fn runAutomaticMergePublicTrafficScenario(cfg: AutomaticMergePublicTrafficScenar
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    var delayed_a: ?raft_sim.DelayingRequestExecutor = null;
-    defer if (delayed_a) |*executor| executor.deinit();
-    var delayed_b: ?raft_sim.DelayingRequestExecutor = null;
-    defer if (delayed_b) |*executor| executor.deinit();
-    var delayed_c: ?raft_sim.DelayingRequestExecutor = null;
-    defer if (delayed_c) |*executor| executor.deinit();
-    if (cfg.delayed_transport) {
-        delayed_a = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
-        delayed_b = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
-        delayed_c = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
-    }
-
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/{s}-a", .{ tmp.sub_path, cfg.path_prefix });
     defer std.testing.allocator.free(root_a);
     const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/{s}-b", .{ tmp.sub_path, cfg.path_prefix });
@@ -2430,23 +2426,16 @@ fn runAutomaticMergePublicTrafficScenario(cfg: AutomaticMergePublicTrafficScenar
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/{s}-c.txt", .{ tmp.sub_path, cfg.path_prefix });
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, cfg.table_id, root_a, cat_a),
         makeHostVoprConfig(2, cfg.table_id, root_b, cat_b),
         makeHostVoprConfig(3, cfg.table_id, root_c, cat_c),
     };
-    const deps = if (cfg.delayed_transport)
-        [_]raft_sim.ManagedHttpHostSimulationDeps{
-            makeHostVoprDepsWithTransportExecutor(&factory_a, delayed_a.?.executor()),
-            makeHostVoprDepsWithTransportExecutor(&factory_b, delayed_b.?.executor()),
-            makeHostVoprDepsWithTransportExecutor(&factory_c, delayed_c.?.executor()),
-        }
-    else
-        [_]raft_sim.ManagedHttpHostSimulationDeps{
-            makeHostVoprDeps(&factory_a),
-            makeHostVoprDeps(&factory_b),
-            makeHostVoprDeps(&factory_c),
-        };
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
+        makeHostVoprDeps(&factory_a),
+        makeHostVoprDeps(&factory_b),
+        makeHostVoprDeps(&factory_c),
+    };
 
     var cluster = try MetadataHttpClusterVopr.init(std.testing.allocator, cfg.table_id, configs[0..], deps[0..]);
     defer cluster.deinit();
@@ -2497,8 +2486,12 @@ fn runAutomaticMergePublicTrafficScenario(cfg: AutomaticMergePublicTrafficScenar
     try ensureGroupTextIndex(&cluster, roots[left_leader_index], left_group_id, api_tables.default_full_text_index_name, 40);
     try ensureGroupTextIndex(&cluster, roots[right_leader_index], right_group_id, api_tables.default_full_text_index_name, 40);
 
+    // Cluster setup owns the transport executor. Inject delay into that
+    // virtual network so this choice actually changes message eligibility.
+    if (cfg.delayed_transport) cluster.virtual_network.delayNextTicks(2);
     var pre_merge_batch = try client.fetchBatch(client_base, "docs", merge_seed_batch_body);
     defer pre_merge_batch.deinit(std.heap.page_allocator);
+    if (cfg.delayed_transport) try std.testing.expect(cluster.virtual_network.delayed_count > 0);
     try std.testing.expect(std.mem.indexOf(u8, pre_merge_batch.body, "\"inserted\":2") != null);
     try mirrorGroupBatchToActiveReplicas(&cluster, &client, public_api.api_base_uris[0..], left_group_id, "docs", merge_seed_left_batch_body);
     try mirrorGroupBatchToActiveReplicas(&cluster, &client, public_api.api_base_uris[0..], right_group_id, "docs", merge_seed_right_batch_body);
@@ -3500,7 +3493,7 @@ fn makeHostVoprConfig(
     metadata_group_id: u64,
     replica_root_dir: []const u8,
     replica_catalog_path: []const u8,
-) raft_sim.ManagedHttpHostSimulationConfig {
+) raft_vopr.ManagedHttpHostSimulationConfig {
     return .{
         .host = .{
             .http = .{
@@ -3519,14 +3512,14 @@ fn makeHostVoprConfig(
     };
 }
 
-fn makeHostVoprDeps(factory: *TestDescriptorFactory) raft_sim.ManagedHttpHostSimulationDeps {
+fn makeHostVoprDeps(factory: *TestDescriptorFactory) raft_vopr.ManagedHttpHostSimulationDeps {
     return makeHostVoprDepsWithTransportExecutor(factory, null);
 }
 
 fn makeHostVoprDepsWithBorrowedIo(
     factory: *TestDescriptorFactory,
     io: std.Io,
-) raft_sim.ManagedHttpHostSimulationDeps {
+) raft_vopr.ManagedHttpHostSimulationDeps {
     var deps = makeHostVoprDeps(factory);
     deps.borrowed_io = io;
     return deps;
@@ -3535,7 +3528,7 @@ fn makeHostVoprDepsWithBorrowedIo(
 fn makeHostVoprDepsWithTransportExecutor(
     factory: *TestDescriptorFactory,
     request_executor: ?raft_transport.RequestExecutor,
-) raft_sim.ManagedHttpHostSimulationDeps {
+) raft_vopr.ManagedHttpHostSimulationDeps {
     return .{
         .host = .{
             .http = .{
@@ -3620,7 +3613,7 @@ pub const MetadataHttpNodeVopr = struct {
     cluster: *MetadataHttpClusterVopr,
     index: usize,
 
-    fn sim(self: MetadataHttpNodeVopr) *raft_sim.ManagedHttpHostSimulation {
+    fn sim(self: MetadataHttpNodeVopr) *raft_vopr.ManagedHttpHostSimulation {
         return self.cluster.cluster.node(self.index);
     }
 
@@ -4543,8 +4536,8 @@ pub const MetadataHttpClusterVopr = struct {
 
     alloc: std.mem.Allocator,
     metadata_group_id: u64,
-    cluster: raft_sim.ManagedHttpClusterSimulation,
-    virtual_network: *raft_sim.VirtualHttpNetwork,
+    cluster: raft_vopr.ManagedHttpClusterSimulation,
+    virtual_network: *raft_vopr.VirtualHttpNetwork,
     reconcile_leases: []metadata_reconcile_lease.State,
     pending_reconcile_leases: []?metadata_reconcile_lease.ReconcileLeaseRecord,
     pending_reconcile_lease_retry_at_ms: []u64,
@@ -4572,8 +4565,8 @@ pub const MetadataHttpClusterVopr = struct {
     pub fn init(
         alloc: std.mem.Allocator,
         metadata_group_id: u64,
-        configs: []const raft_sim.ManagedHttpHostSimulationConfig,
-        deps: []const raft_sim.ManagedHttpHostSimulationDeps,
+        configs: []const raft_vopr.ManagedHttpHostSimulationConfig,
+        deps: []const raft_vopr.ManagedHttpHostSimulationDeps,
     ) !MetadataHttpClusterVopr {
         const manual_clock = try alloc.create(platform_clock.ManualClock);
         errdefer alloc.destroy(manual_clock);
@@ -4691,7 +4684,7 @@ pub const MetadataHttpClusterVopr = struct {
         }
         const linearizable_read_drivers = try alloc.alloc(PublicApiLinearizableReadDriver, configs.len);
         errdefer alloc.free(linearizable_read_drivers);
-        const vopr_deps = try alloc.dupe(raft_sim.ManagedHttpHostSimulationDeps, deps);
+        const vopr_deps = try alloc.dupe(raft_vopr.ManagedHttpHostSimulationDeps, deps);
         defer alloc.free(vopr_deps);
         for (vopr_deps, linearizable_read_drivers, 0..) |*dep, *driver, index| {
             driver.* = .{
@@ -4700,7 +4693,7 @@ pub const MetadataHttpClusterVopr = struct {
             };
             dep.host.read_state_observer = driver.observer();
         }
-        var raft_cluster = try raft_sim.ManagedHttpClusterSimulation.init(alloc, configs, vopr_deps);
+        var raft_cluster = try raft_vopr.ManagedHttpClusterSimulation.init(alloc, configs, vopr_deps);
         errdefer raft_cluster.deinit();
         var cluster = MetadataHttpClusterVopr{
             .alloc = alloc,
@@ -4888,11 +4881,7 @@ pub const MetadataHttpClusterVopr = struct {
     pub fn restartNode(self: *MetadataHttpClusterVopr, index: usize) !void {
         self.scheduler_gate.lock();
         defer self.scheduler_gate.unlock();
-        const was_started = self.cluster.started;
-        if (was_started) self.cluster.node(index).stop();
-        self.cluster.nodes[index].deinit();
-        self.cluster.nodes[index] = try raft_sim.ManagedHttpHostSimulation.init(self.alloc, self.cluster.configs[index], self.cluster.deps[index]);
-        try self.registerVirtualNode(index);
+        try self.cluster.restartNode(index);
         self.reconcile_leases[index] = metadata_reconcile_lease.State.init(self.cluster.configs[index].host.http.host.local_node_id, .{
             .lease_ttl_ms = 2_000,
             .clock = self.manual_clock.clock(),
@@ -4904,7 +4893,6 @@ pub const MetadataHttpClusterVopr = struct {
         self.pending_cluster_stores[index] = false;
         self.pending_cluster_store_retry_at_ms[index] = 0;
         self.placement_intent_hash_valid[index] = false;
-        if (was_started) try self.cluster.node(index).start();
     }
 
     pub fn waitForMetadataLeader(self: *MetadataHttpClusterVopr, max_rounds: usize) !?usize {
@@ -5161,6 +5149,10 @@ pub const MetadataHttpClusterVopr = struct {
             defer self.reconcile_lease_update_in_flight = false;
             self.node(index).upsertReconcileLease(desired) catch |err| switch (err) {
                 error.NotLeader, error.UnknownGroup => {},
+                // A partition can make an admitted lease proposal uncertain.
+                // Keep it pending and re-observe the committed lease before
+                // retrying; this does not grant authority from an unknown ack.
+                error.MetadataMutationOutcomeUnknown => {},
                 else => return err,
             };
             self.pending_reconcile_leases[index] = desired;
@@ -5381,7 +5373,7 @@ pub const MetadataHttpClusterVopr = struct {
     }
 
     fn nodeBaseUri(self: *MetadataHttpClusterVopr, alloc: std.mem.Allocator, index: usize) ![]u8 {
-        return try raft_sim.VirtualHttpNetwork.baseUri(alloc, self.cluster.configs[index].host.http.host.local_node_id);
+        return try raft_vopr.VirtualHttpNetwork.baseUri(alloc, self.cluster.configs[index].host.http.host.local_node_id);
     }
 
     fn registerVirtualNodes(self: *MetadataHttpClusterVopr) !void {
@@ -6007,6 +5999,41 @@ fn isolateMetadataNode(cluster: *MetadataHttpClusterVopr, isolated_index: usize)
         _ = try cluster.node(isolated_index).sim().upsertPeerRoute(cluster.metadata_group_id, peer_node_id, metadataBlackholeEndpoints());
         _ = try cluster.node(index).sim().upsertPeerRoute(cluster.metadata_group_id, isolated_node_id, metadataBlackholeEndpoints());
     }
+}
+
+fn healMetadataFaults(cluster: *MetadataHttpClusterVopr) !void {
+    cluster.cluster.healAll();
+    // Metadata-only isolation replaces group routes with blackhole endpoints.
+    // Clearing virtual-network partitions alone does not restore those routes.
+    // Restore the actual registered endpoints before the next fault or suffix.
+    for (cluster.cluster.configs, 0..) |peer, peer_index| {
+        const base_uri = try cluster.nodeBaseUri(cluster.alloc, peer_index);
+        defer cluster.alloc.free(base_uri);
+        for (0..cluster.cluster.configs.len) |source_index| {
+            if (source_index == peer_index) continue;
+            _ = try cluster.node(source_index).sim().upsertPeerRoute(
+                cluster.metadata_group_id,
+                peer.host.http.host.local_node_id,
+                &.{.{ .protocol = .http, .address = base_uri, .metadata = "" }},
+            );
+        }
+    }
+}
+
+fn waitForMetadataReadAuthority(cluster: *MetadataHttpClusterVopr, max_rounds: usize) !void {
+    for (0..max_rounds) |_| {
+        try cluster.stepAll();
+        const leader_index = cluster.currentMetadataLeaderIndex() orelse continue;
+        const proof = cluster.linearizable_read_drivers[leader_index].ensure() catch |err| switch (err) {
+            error.NotLeader, error.MetadataLinearizableReadTimeout => continue,
+            else => return err,
+        };
+        _ = proof.authoritativeNode(cluster) catch |err| switch (err) {
+            error.NotLeader, error.MetadataLinearizableReadTimeout => continue,
+        };
+        return;
+    }
+    return error.MetadataLinearizableReadTimeout;
 }
 
 fn waitForMetadataLeaderExcluding(
@@ -7493,7 +7520,7 @@ pub const VoprPublicClusterFixture = struct {
         }
         self.bootstrap_phase = .local_resources_ready;
 
-        var configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+        var configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
             makeHostVoprConfig(1, metadata_group_id, self.roots[0], self.catalogs[0]),
             makeHostVoprConfig(2, metadata_group_id, self.roots[1], self.catalogs[1]),
             makeHostVoprConfig(3, metadata_group_id, self.roots[2], self.catalogs[2]),
@@ -7502,7 +7529,7 @@ pub const VoprPublicClusterFixture = struct {
         // fixture. The send still crosses the virtual fault router and a real
         // httpx/VoprIo socket; it simply completes before the next round.
         for (&configs) |*config| config.host.http.transport.driver.async_send_worker_count = 0;
-        const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+        const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
             makeHostVoprDepsWithBorrowedIo(&self.factories[0], sim.io()),
             makeHostVoprDepsWithBorrowedIo(&self.factories[1], sim.io()),
             makeHostVoprDepsWithBorrowedIo(&self.factories[2], sim.io()),
@@ -9089,7 +9116,7 @@ fn metadataVoprReplayCommand(cfg: MetadataVoprCampaignConfig) []const u8 {
 }
 
 const MetadataVoprCampaignState = struct {
-    active_links: [2]raft_sim.VirtualHttpNetwork.Link = undefined,
+    active_links: [2]raft_vopr.VirtualHttpNetwork.Link = undefined,
     active_link_count: usize = 0,
     active_node_ids: [1]u64 = undefined,
     active_node_count: usize = 0,
@@ -9108,24 +9135,24 @@ const MetadataVoprCampaignState = struct {
             @intFromBool(self.crashed_node_id != null);
     }
 
-    fn containsLink(self: *const MetadataVoprCampaignState, link: raft_sim.VirtualHttpNetwork.Link) bool {
+    fn containsLink(self: *const MetadataVoprCampaignState, link: raft_vopr.VirtualHttpNetwork.Link) bool {
         for (self.active_links[0..self.active_link_count]) |active| {
             if (active.source_id == link.source_id and active.target_id == link.target_id) return true;
         }
         return false;
     }
 
-    fn addLink(self: *MetadataVoprCampaignState, link: raft_sim.VirtualHttpNetwork.Link) !void {
+    fn addLink(self: *MetadataVoprCampaignState, link: raft_vopr.VirtualHttpNetwork.Link) !void {
         if (self.containsLink(link)) return error.MetadataVoprFaultAlreadyActive;
         if (self.active_link_count == self.active_links.len) return error.MetadataVoprFaultBudgetExceeded;
         self.active_links[self.active_link_count] = link;
         self.active_link_count += 1;
     }
 
-    fn removeLink(self: *MetadataVoprCampaignState, link: raft_sim.VirtualHttpNetwork.Link) !void {
+    fn removeLink(self: *MetadataVoprCampaignState, link: raft_vopr.VirtualHttpNetwork.Link) !void {
         for (self.active_links[0..self.active_link_count], 0..) |active, index| {
             if (active.source_id != link.source_id or active.target_id != link.target_id) continue;
-            _ = orderedRemove(raft_sim.VirtualHttpNetwork.Link, self.active_links[0..self.active_link_count], index);
+            _ = orderedRemove(raft_vopr.VirtualHttpNetwork.Link, self.active_links[0..self.active_link_count], index);
             self.active_link_count -= 1;
             return;
         }
@@ -9564,7 +9591,7 @@ const MetadataVoprDriver = struct {
                 for (0..self.cluster.cluster.nodes.len) |target_index| {
                     if (source_index == target_index) continue;
                     const target_id = metadataVoprNodeId(self.cluster, target_index);
-                    const link = raft_sim.VirtualHttpNetwork.Link{ .source_id = source_id, .target_id = target_id };
+                    const link = raft_vopr.VirtualHttpNetwork.Link{ .source_id = source_id, .target_id = target_id };
                     if (self.state.containsLink(link)) continue;
                     const link_id = vopr.id.derive("antfly.metadata.link", source_id, target_id);
                     try appendCandidate(candidates, self.alloc, .{
@@ -9932,7 +9959,7 @@ const MetadataVoprDriver = struct {
                 try self.cluster.cluster.inject(.{ .release_random = self.cfg.seed ^ self.occurrence });
             },
             .start_link_partition => {
-                const link = raft_sim.VirtualHttpNetwork.Link{ .source_id = selected.source_node_id.?, .target_id = selected.target_node_id.? };
+                const link = raft_vopr.VirtualHttpNetwork.Link{ .source_id = selected.source_node_id.?, .target_id = selected.target_node_id.? };
                 try self.cluster.cluster.inject(.{ .partition_link = link });
                 try self.state.addLink(link);
             },
@@ -9942,7 +9969,7 @@ const MetadataVoprDriver = struct {
                 try self.state.addNode(node_id);
             },
             .stop_link_partition => {
-                const link = raft_sim.VirtualHttpNetwork.Link{ .source_id = selected.source_node_id.?, .target_id = selected.target_node_id.? };
+                const link = raft_vopr.VirtualHttpNetwork.Link{ .source_id = selected.source_node_id.?, .target_id = selected.target_node_id.? };
                 self.cluster.cluster.heal(.{ .partition_link = link });
                 try self.state.removeLink(link);
             },
@@ -10198,7 +10225,7 @@ fn metadataVoprStartFollowerLinkPartition(
     if (state.faultCount() != 0) return;
     const leader_index = try metadataVoprLeaderIndex(cluster);
     const follower_index = (leader_index + 1) % cluster.cluster.nodes.len;
-    const link = raft_sim.VirtualHttpNetwork.Link{
+    const link = raft_vopr.VirtualHttpNetwork.Link{
         .source_id = metadataVoprNodeId(cluster, follower_index),
         .target_id = metadataVoprNodeId(cluster, leader_index),
     };
@@ -10619,12 +10646,12 @@ fn runMetadataVoprCampaignWithChoicesAndRaftTrace(
     const cat_c = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-{x}-c.txt", .{ scratch.sub_path, cfg.seed });
     defer alloc.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, cfg.metadata_group_id, root_a, cat_a),
         makeHostVoprConfig(2, cfg.metadata_group_id, root_b, cat_b),
         makeHostVoprConfig(3, cfg.metadata_group_id, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -11003,12 +11030,12 @@ test "metadata VOPR http cluster drives table placement convergence" {
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4000, root_a, cat_a),
         makeHostVoprConfig(2, 4000, root_b, cat_b),
         makeHostVoprConfig(3, 4000, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -11078,12 +11105,12 @@ test "metadata-only cluster preserves external data placements without shadow re
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-only-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4050, root_a, cat_a),
         makeHostVoprConfig(2, 4050, root_b, cat_b),
         makeHostVoprConfig(3, 4050, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -11165,13 +11192,13 @@ test "metadata VOPR http cluster serves public lifecycle from a non-host node af
     const cat_d = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-lifecycle-d.txt", .{tmp.sub_path});
     defer vopr_alloc.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4860, root_a, cat_a),
         makeHostVoprConfig(2, 4860, root_b, cat_b),
         makeHostVoprConfig(3, 4860, root_c, cat_c),
         makeHostVoprConfig(4, 4860, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -11349,12 +11376,12 @@ test "metadata VOPR http cluster seeds default admin for auth-enabled public api
     const cat_c = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-auth-seed-c.txt", .{tmp.sub_path});
     defer vopr_alloc.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4868, root_a, cat_a),
         makeHostVoprConfig(2, 4868, root_b, cat_b),
         makeHostVoprConfig(3, 4868, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -11450,13 +11477,13 @@ test "metadata VOPR http cluster forwards public split flow from a non-host node
     const cat_d = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-split-d.txt", .{tmp.sub_path});
     defer vopr_alloc.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4861, root_a, cat_a),
         makeHostVoprConfig(2, 4861, root_b, cat_b),
         makeHostVoprConfig(3, 4861, root_c, cat_c),
         makeHostVoprConfig(4, 4861, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -11652,13 +11679,13 @@ test "metadata VOPR http cluster forwards public merge flow from a non-host node
     const cat_d = try std.fmt.allocPrint(vopr_alloc, ".zig-cache/tmp/{s}/meta-sim-public-merge-d.txt", .{tmp.sub_path});
     defer vopr_alloc.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4862, root_a, cat_a),
         makeHostVoprConfig(2, 4862, root_b, cat_b),
         makeHostVoprConfig(3, 4862, root_c, cat_c),
         makeHostVoprConfig(4, 4862, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -11877,12 +11904,12 @@ test "metadata VOPR http cluster survives metadata leader restart during placeme
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-r-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4100, root_a, cat_a),
         makeHostVoprConfig(2, 4100, root_b, cat_b),
         makeHostVoprConfig(3, 4100, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -11950,12 +11977,12 @@ test "metadata VOPR http cluster drops table topology across leader restart" {
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-drop-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4200, root_a, cat_a),
         makeHostVoprConfig(2, 4200, root_b, cat_b),
         makeHostVoprConfig(3, 4200, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -12037,12 +12064,12 @@ test "metadata VOPR http cluster converges placement after candidate churn" {
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-churn-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4300, root_a, cat_a),
         makeHostVoprConfig(2, 4300, root_b, cat_b),
         makeHostVoprConfig(3, 4300, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -12137,12 +12164,12 @@ test "metadata VOPR http cluster drives split intent through the control loop" {
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-split-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4400, root_a, cat_a),
         makeHostVoprConfig(2, 4400, root_b, cat_b),
         makeHostVoprConfig(3, 4400, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -12225,12 +12252,12 @@ test "metadata VOPR http cluster drives merge intent through the control loop" {
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-merge-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4500, root_a, cat_a),
         makeHostVoprConfig(2, 4500, root_b, cat_b),
         makeHostVoprConfig(3, 4500, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -12323,12 +12350,12 @@ test "metadata VOPR http cluster drives automatic split through the control loop
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4510, root_a, cat_a),
         makeHostVoprConfig(2, 4510, root_b, cat_b),
         makeHostVoprConfig(3, 4510, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -12424,12 +12451,12 @@ test "metadata VOPR http cluster uses live median key for automatic split planni
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-live-median-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4510, root_a, cat_a),
         makeHostVoprConfig(2, 4510, root_b, cat_b),
         makeHostVoprConfig(3, 4510, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -12533,13 +12560,13 @@ test "metadata VOPR http cluster uses remote live median key when metadata leade
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-remote-median-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4510, root_a, cat_a),
         makeHostVoprConfig(2, 4510, root_b, cat_b),
         makeHostVoprConfig(3, 4510, root_c, cat_c),
         makeHostVoprConfig(4, 4510, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -12649,12 +12676,12 @@ test "metadata VOPR http cluster completes automatic split after metadata leader
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-restart-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4515, root_a, cat_a),
         makeHostVoprConfig(2, 4515, root_b, cat_b),
         makeHostVoprConfig(3, 4515, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -12750,12 +12777,12 @@ test "metadata VOPR http cluster completes automatic split after metadata leader
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-partition-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4516, root_a, cat_a),
         makeHostVoprConfig(2, 4516, root_b, cat_b),
         makeHostVoprConfig(3, 4516, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -12834,11 +12861,11 @@ test "metadata VOPR http cluster completes automatic split under delayed raft tr
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    var delayed_a = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
+    var delayed_a = raft_vopr.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_a.deinit();
-    var delayed_b = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
+    var delayed_b = raft_vopr.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_b.deinit();
-    var delayed_c = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
+    var delayed_c = raft_vopr.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_c.deinit();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-a", .{tmp.sub_path});
@@ -12857,12 +12884,12 @@ test "metadata VOPR http cluster completes automatic split under delayed raft tr
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4517, root_a, cat_a),
         makeHostVoprConfig(2, 4517, root_b, cat_b),
         makeHostVoprConfig(3, 4517, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDepsWithTransportExecutor(&factory_a, delayed_a.executor()),
         makeHostVoprDepsWithTransportExecutor(&factory_b, delayed_b.executor()),
         makeHostVoprDepsWithTransportExecutor(&factory_c, delayed_c.executor()),
@@ -12939,11 +12966,11 @@ test "metadata VOPR http cluster completes automatic split after leader restart 
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    var delayed_a = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
+    var delayed_a = raft_vopr.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_a.deinit();
-    var delayed_b = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
+    var delayed_b = raft_vopr.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_b.deinit();
-    var delayed_c = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
+    var delayed_c = raft_vopr.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_c.deinit();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-restart-a", .{tmp.sub_path});
@@ -12962,12 +12989,12 @@ test "metadata VOPR http cluster completes automatic split after leader restart 
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-restart-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4519, root_a, cat_a),
         makeHostVoprConfig(2, 4519, root_b, cat_b),
         makeHostVoprConfig(3, 4519, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDepsWithTransportExecutor(&factory_a, delayed_a.executor()),
         makeHostVoprDepsWithTransportExecutor(&factory_b, delayed_b.executor()),
         makeHostVoprDepsWithTransportExecutor(&factory_c, delayed_c.executor()),
@@ -13063,12 +13090,12 @@ test "metadata VOPR http cluster completes automatic split after source group le
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-source-restart-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4544, root_a, cat_a),
         makeHostVoprConfig(2, 4544, root_b, cat_b),
         makeHostVoprConfig(3, 4544, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -13165,12 +13192,12 @@ test "metadata VOPR http cluster completes automatic split after destination gro
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-destination-restart-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4545, root_a, cat_a),
         makeHostVoprConfig(2, 4545, root_b, cat_b),
         makeHostVoprConfig(3, 4545, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -13276,11 +13303,11 @@ test "metadata VOPR http cluster completes automatic split after leader partitio
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    var delayed_a = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
+    var delayed_a = raft_vopr.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_a.deinit();
-    var delayed_b = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
+    var delayed_b = raft_vopr.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_b.deinit();
-    var delayed_c = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
+    var delayed_c = raft_vopr.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_c.deinit();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-partition-a", .{tmp.sub_path});
@@ -13299,12 +13326,12 @@ test "metadata VOPR http cluster completes automatic split after leader partitio
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-split-delay-partition-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4521, root_a, cat_a),
         makeHostVoprConfig(2, 4521, root_b, cat_b),
         makeHostVoprConfig(3, 4521, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDepsWithTransportExecutor(&factory_a, delayed_a.executor()),
         makeHostVoprDepsWithTransportExecutor(&factory_b, delayed_b.executor()),
         makeHostVoprDepsWithTransportExecutor(&factory_c, delayed_c.executor()),
@@ -13483,6 +13510,25 @@ test "metadata VOPR distributed data survives split partition node restart and m
     try std.testing.expectEqual(@as(usize, 0), recorded.failures.items.len);
     var replayed = try replayDistributedDataVoprCampaign(std.testing.allocator, &recorded);
     replayed.deinit();
+
+    // Search history 1 at base seed 0xa17f5500 exposed the missing healing
+    // suffix after merge-leader isolation. Force both partition boundaries.
+    const Scenario = DistributedDataVoprScenario;
+    const selections = [_]vopr.id.StableId{
+        Scenario.delayed_on_id,
+        Scenario.split_partition_metadata_id,
+        Scenario.merge_partition_metadata_id,
+        Scenario.execute_id,
+    };
+    var scripted = vopr.choice.Scripted{ .selections = &selections };
+    var partitioned = try runDistributedDataVoprCampaignWithChoices(std.testing.allocator, .{
+        .seed = 0xa17f5500,
+        .table_id = 86608,
+    }, scripted.source(), null);
+    defer partitioned.deinit();
+    try std.testing.expectEqual(@as(usize, 0), partitioned.failures.items.len);
+    var partitioned_replay = try replayDistributedDataVoprCampaign(std.testing.allocator, &partitioned);
+    partitioned_replay.deinit();
 }
 
 test "metadata VOPR http cluster drives automatic merge through the control loop" {
@@ -13513,12 +13559,12 @@ test "metadata VOPR http cluster drives automatic merge through the control loop
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4520, root_a, cat_a),
         makeHostVoprConfig(2, 4520, root_b, cat_b),
         makeHostVoprConfig(3, 4520, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -13620,12 +13666,12 @@ test "metadata VOPR http cluster completes automatic merge after metadata leader
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-restart-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4525, root_a, cat_a),
         makeHostVoprConfig(2, 4525, root_b, cat_b),
         makeHostVoprConfig(3, 4525, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -13726,12 +13772,12 @@ test "metadata VOPR http cluster completes automatic merge after donor group lea
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-donor-restart-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4546, root_a, cat_a),
         makeHostVoprConfig(2, 4546, root_b, cat_b),
         makeHostVoprConfig(3, 4546, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -13833,12 +13879,12 @@ test "metadata VOPR http cluster completes automatic merge after receiver group 
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-receiver-restart-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4547, root_a, cat_a),
         makeHostVoprConfig(2, 4547, root_b, cat_b),
         makeHostVoprConfig(3, 4547, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -13940,12 +13986,12 @@ test "metadata VOPR http cluster completes automatic merge after metadata leader
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-partition-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4526, root_a, cat_a),
         makeHostVoprConfig(2, 4526, root_b, cat_b),
         makeHostVoprConfig(3, 4526, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -14032,11 +14078,11 @@ test "metadata VOPR http cluster completes automatic merge under delayed raft tr
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    var delayed_a = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
+    var delayed_a = raft_vopr.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_a.deinit();
-    var delayed_b = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
+    var delayed_b = raft_vopr.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_b.deinit();
-    var delayed_c = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
+    var delayed_c = raft_vopr.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_c.deinit();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-a", .{tmp.sub_path});
@@ -14052,12 +14098,12 @@ test "metadata VOPR http cluster completes automatic merge under delayed raft tr
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4529, root_a, cat_a),
         makeHostVoprConfig(2, 4529, root_b, cat_b),
         makeHostVoprConfig(3, 4529, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDepsWithTransportExecutor(&factory_a, delayed_a.executor()),
         makeHostVoprDepsWithTransportExecutor(&factory_b, delayed_b.executor()),
         makeHostVoprDepsWithTransportExecutor(&factory_c, delayed_c.executor()),
@@ -14142,11 +14188,11 @@ test "metadata VOPR http cluster completes automatic merge after leader restart 
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    var delayed_a = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
+    var delayed_a = raft_vopr.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_a.deinit();
-    var delayed_b = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
+    var delayed_b = raft_vopr.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_b.deinit();
-    var delayed_c = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
+    var delayed_c = raft_vopr.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_c.deinit();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-restart-a", .{tmp.sub_path});
@@ -14162,12 +14208,12 @@ test "metadata VOPR http cluster completes automatic merge after leader restart 
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-restart-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4531, root_a, cat_a),
         makeHostVoprConfig(2, 4531, root_b, cat_b),
         makeHostVoprConfig(3, 4531, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDepsWithTransportExecutor(&factory_a, delayed_a.executor()),
         makeHostVoprDepsWithTransportExecutor(&factory_b, delayed_b.executor()),
         makeHostVoprDepsWithTransportExecutor(&factory_c, delayed_c.executor()),
@@ -14255,11 +14301,11 @@ test "metadata VOPR http cluster completes automatic merge after leader partitio
     var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
     var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
 
-    var delayed_a = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
+    var delayed_a = raft_vopr.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_a.deinit();
-    var delayed_b = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
+    var delayed_b = raft_vopr.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_b.deinit();
-    var delayed_c = raft_sim.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
+    var delayed_c = raft_vopr.DelayingRequestExecutor.init(std.testing.allocator, 2 * std.time.ns_per_ms);
     defer delayed_c.deinit();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-partition-a", .{tmp.sub_path});
@@ -14275,12 +14321,12 @@ test "metadata VOPR http cluster completes automatic merge after leader partitio
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-merge-delay-partition-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4532, root_a, cat_a),
         makeHostVoprConfig(2, 4532, root_b, cat_b),
         makeHostVoprConfig(3, 4532, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDepsWithTransportExecutor(&factory_a, delayed_a.executor()),
         makeHostVoprDepsWithTransportExecutor(&factory_b, delayed_b.executor()),
         makeHostVoprDepsWithTransportExecutor(&factory_c, delayed_c.executor()),
@@ -14495,12 +14541,12 @@ test "metadata VOPR http cluster survives leader restart before forced automatic
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-auto-reallocate-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4530, root_a, cat_a),
         makeHostVoprConfig(2, 4530, root_b, cat_b),
         makeHostVoprConfig(3, 4530, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -14543,9 +14589,33 @@ test "metadata VOPR http cluster survives leader restart before forced automatic
     try cluster.restartNode(leader_index);
     const new_leader = (try cluster.waitForMetadataLeader(32)) orelse return error.TestExpectedEqual;
 
+    const request = (try cluster.node(new_leader).getProjectedReallocationRequest()) orelse return error.TestExpectedReallocationRequest;
+    // Pre-request size reports cannot acknowledge a forced scan. The durable
+    // request must survive restart until every placed voter observes its ID.
+    const awaiting_reports = try requireLeasedReconcile(cluster.node(new_leader), &auto_loop);
+    try std.testing.expectEqual(@as(usize, 0), awaiting_reports.split_admissions);
+    try std.testing.expectEqual(request.request_id, (try cluster.node(new_leader).getProjectedReallocationRequest()).?.request_id);
+    for (0..64) |_| {
+        const all_observed = for (0..cluster.cluster.nodes.len) |index| {
+            const observed = (try cluster.node(index).getProjectedReallocationRequest()) orelse break false;
+            if (observed.request_id != request.request_id) break false;
+        } else true;
+        if (all_observed) break;
+        try cluster.stepAll();
+    } else return error.TestExpectedVotersToObserveReallocationRequest;
+    var fresh_status = makeGroupStatus(4531, 384, 180, cluster.manual_clock.clock().nowRealtimeMs());
+    fresh_status.observed_reallocation_request_id = request.request_id;
+    try reportHealthyStoreStatuses(cluster.node(new_leader), &.{fresh_status});
+    try cluster.stepAll();
+
     const summary = try requireLeasedReconcile(cluster.node(new_leader), &auto_loop);
     try std.testing.expectEqual(@as(usize, 1), summary.split_admissions);
-    try std.testing.expect((try cluster.node(new_leader).getProjectedReallocationRequest()) == null);
+    // Admission starts the split; it does not complete the forced scan. Keep
+    // the request until the resulting topology has converged observations.
+    try std.testing.expectEqual(request.request_id, (try cluster.node(new_leader).getProjectedReallocationRequest()).?.request_id);
+    const repeated = try requireLeasedReconcile(cluster.node(new_leader), &auto_loop);
+    try std.testing.expectEqual(@as(usize, 0), repeated.split_admissions);
+    try std.testing.expectEqual(request.request_id, (try cluster.node(new_leader).getProjectedReallocationRequest()).?.request_id);
 }
 
 test "metadata VOPR http cluster publishes split topology after finalize" {
@@ -14576,12 +14646,12 @@ test "metadata VOPR http cluster publishes split topology after finalize" {
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/meta-sim-split-final-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4700, root_a, cat_a),
         makeHostVoprConfig(2, 4700, root_b, cat_b),
         makeHostVoprConfig(3, 4700, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -14665,12 +14735,12 @@ test "metadata VOPR http cluster publishes merge topology after finalize" {
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/meta-sim-merge-final-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4800, root_a, cat_a),
         makeHostVoprConfig(2, 4800, root_b, cat_b),
         makeHostVoprConfig(3, 4800, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -14763,12 +14833,12 @@ test "metadata VOPR http cluster provisions split destination replicas across no
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/meta-sim-split-multi-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4810, root_a, cat_a),
         makeHostVoprConfig(2, 4810, root_b, cat_b),
         makeHostVoprConfig(3, 4810, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -14848,12 +14918,12 @@ test "metadata VOPR http cluster retires merge donor replicas across nodes" {
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/meta-sim-merge-multi-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4820, root_a, cat_a),
         makeHostVoprConfig(2, 4820, root_b, cat_b),
         makeHostVoprConfig(3, 4820, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -15024,12 +15094,12 @@ test "metadata VOPR http cluster forwards public table io from a non-host node" 
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/meta-sim-api-forward-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4830, root_a, cat_a),
         makeHostVoprConfig(2, 4830, root_b, cat_b),
         makeHostVoprConfig(3, 4830, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -15275,12 +15345,12 @@ test "metadata VOPR http cluster forwards public table io across split ranges fr
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/meta-sim-api-split-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4840, root_a, cat_a),
         makeHostVoprConfig(2, 4840, root_b, cat_b),
         makeHostVoprConfig(3, 4840, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -15543,12 +15613,12 @@ test "metadata VOPR http cluster forwards public table io after merge finalizati
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/meta-sim-api-merge-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4850, root_a, cat_a),
         makeHostVoprConfig(2, 4850, root_b, cat_b),
         makeHostVoprConfig(3, 4850, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -15723,12 +15793,12 @@ test "metadata VOPR http cluster reconverges placement from committed node membe
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-nodes-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4600, root_a, cat_a),
         makeHostVoprConfig(2, 4600, root_b, cat_b),
         makeHostVoprConfig(3, 4600, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -15818,12 +15888,12 @@ test "metadata VOPR http cluster reconverges placement from committed live store
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-stores-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4700, root_a, cat_a),
         makeHostVoprConfig(2, 4700, root_b, cat_b),
         makeHostVoprConfig(3, 4700, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -15913,12 +15983,12 @@ test "metadata VOPR http cluster drains node through shutdown API" {
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-shutdown-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4720, root_a, cat_a),
         makeHostVoprConfig(2, 4720, root_b, cat_b),
         makeHostVoprConfig(3, 4720, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -16005,12 +16075,12 @@ test "metadata VOPR http cluster ignores live stores without available capacity"
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-cap-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4800, root_a, cat_a),
         makeHostVoprConfig(2, 4800, root_b, cat_b),
         makeHostVoprConfig(3, 4800, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -16111,12 +16181,12 @@ test "metadata VOPR http cluster rebalances after store capacity churn" {
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-rebalance-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4900, root_a, cat_a),
         makeHostVoprConfig(2, 4900, root_b, cat_b),
         makeHostVoprConfig(3, 4900, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -16208,12 +16278,12 @@ test "metadata VOPR http cluster survives leader restart after reported store st
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-status-restart-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4950, root_a, cat_a),
         makeHostVoprConfig(2, 4950, root_b, cat_b),
         makeHostVoprConfig(3, 4950, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -16305,12 +16375,12 @@ test "metadata VOPR http cluster transfers reconcile lease on leader restart" {
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-lease-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4970, root_a, cat_a),
         makeHostVoprConfig(2, 4970, root_b, cat_b),
         makeHostVoprConfig(3, 4970, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -16474,7 +16544,7 @@ test "metadata VOPR http cluster recovers from a ready persistence stall without
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-ready-stall-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    var configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    var configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4972, root_a, cat_a),
         makeHostVoprConfig(2, 4972, root_b, cat_b),
         makeHostVoprConfig(3, 4972, root_c, cat_c),
@@ -16491,7 +16561,7 @@ test "metadata VOPR http cluster recovers from a ready persistence stall without
     }
 
     var read_barriers = [_]ReadBarrierRecorder{ .{}, .{}, .{} };
-    var deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    var deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -16616,7 +16686,7 @@ test "metadata VOPR http cluster load balanced backup retries a real election" {
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/backup-election-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4973, root_a, cat_a),
         makeHostVoprConfig(2, 4973, root_b, cat_b),
         makeHostVoprConfig(3, 4973, root_c, cat_c),
@@ -16626,7 +16696,7 @@ test "metadata VOPR http cluster load balanced backup retries a real election" {
         .{ .node_index = 1, .request_scope = 1 },
         .{ .node_index = 2, .request_scope = 1 },
     };
-    var deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    var deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -16906,11 +16976,11 @@ test "metadata VOPR http cluster skips reconcile work without lease ownership" {
     const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-no-lease-b.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_b);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4971, root_a, cat_a),
         makeHostVoprConfig(2, 4971, root_b, cat_b),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
     };
@@ -16978,12 +17048,12 @@ test "metadata VOPR http cluster rebalances away from high lease pressure" {
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-pressure-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 4960, root_a, cat_a),
         makeHostVoprConfig(2, 4960, root_b, cat_b),
         makeHostVoprConfig(3, 4960, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -17107,12 +17177,12 @@ test "metadata VOPR http cluster repairs replica count after store recovery" {
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-repair-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 5000, root_a, cat_a),
         makeHostVoprConfig(2, 5000, root_b, cat_b),
         makeHostVoprConfig(3, 5000, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -17199,12 +17269,12 @@ test "metadata VOPR http cluster spreads multi-range placement across stores" {
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-spread-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 5100, root_a, cat_a),
         makeHostVoprConfig(2, 5100, root_b, cat_b),
         makeHostVoprConfig(3, 5100, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -17298,12 +17368,12 @@ test "metadata VOPR http cluster preserves valid placement when a better store a
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-sticky-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 5200, root_a, cat_a),
         makeHostVoprConfig(2, 5200, root_b, cat_b),
         makeHostVoprConfig(3, 5200, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -17377,12 +17447,12 @@ test "metadata VOPR http cluster rotates replica pairs across tables and ranges"
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-pairs-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 5300, root_a, cat_a),
         makeHostVoprConfig(2, 5300, root_b, cat_b),
         makeHostVoprConfig(3, 5300, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -17499,12 +17569,12 @@ test "metadata VOPR http cluster rebalances one table while preserving another v
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-mixed-rebalance-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 5400, root_a, cat_a),
         makeHostVoprConfig(2, 5400, root_b, cat_b),
         makeHostVoprConfig(3, 5400, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -17638,12 +17708,12 @@ test "metadata VOPR http cluster prefers healthy stores before degraded ones" {
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-health-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 5500, root_a, cat_a),
         makeHostVoprConfig(2, 5500, root_b, cat_b),
         makeHostVoprConfig(3, 5500, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -17719,12 +17789,12 @@ test "metadata VOPR http cluster prefers cross-domain placement for a range" {
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-domain-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 5600, root_a, cat_a),
         makeHostVoprConfig(2, 5600, root_b, cat_b),
         makeHostVoprConfig(3, 5600, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -17803,12 +17873,12 @@ test "metadata VOPR http cluster mixes health domain and minimal-movement policy
     const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-mixed-policy-c.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_c);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 5700, root_a, cat_a),
         makeHostVoprConfig(2, 5700, root_b, cat_b),
         makeHostVoprConfig(3, 5700, root_c, cat_c),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -17933,14 +18003,14 @@ test "metadata VOPR http cluster respects table placement roles under churn" {
     const cat_e = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-role-e.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_e);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 5800, root_a, cat_a),
         makeHostVoprConfig(2, 5800, root_b, cat_b),
         makeHostVoprConfig(3, 5800, root_c, cat_c),
         makeHostVoprConfig(4, 5800, root_d, cat_d),
         makeHostVoprConfig(5, 5800, root_e, cat_e),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -18095,13 +18165,13 @@ test "metadata VOPR http cluster repairs only when a matching placement role app
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-role-repair-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 5900, root_a, cat_a),
         makeHostVoprConfig(2, 5900, root_b, cat_b),
         makeHostVoprConfig(3, 5900, root_c, cat_c),
         makeHostVoprConfig(4, 5900, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),
@@ -18186,13 +18256,13 @@ test "metadata VOPR http cluster rebalances after store class promotion and demo
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-vopr-class-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostVoprConfig(1, 6000, root_a, cat_a),
         makeHostVoprConfig(2, 6000, root_b, cat_b),
         makeHostVoprConfig(3, 6000, root_c, cat_c),
         makeHostVoprConfig(4, 6000, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostVoprDeps(&factory_a),
         makeHostVoprDeps(&factory_b),
         makeHostVoprDeps(&factory_c),

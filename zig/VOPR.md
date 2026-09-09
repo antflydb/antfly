@@ -717,7 +717,7 @@ regressions pass **2/2** in both Debug and ReleaseSafe.
 | Metadata and acknowledged distributed-data durability | real metadata/Raft paths plus modeled storage | `zig build lib-metadata-vopr-test lib-metadata-vopr-data-test` |
 | Per-group Raft scheduling | real `RawNode` message, persist, apply, restart, partition, proposal, and compaction choices | `zig build raft-vopr-test` |
 | Storage differential and real-backend campaigns | WAL, LMDB, LSM, persistent index, index manager, and DB split | `zig build storage-vopr-test` |
-| HA lifecycle | replication, fencing, promotion, retention, restart, and rejoin | `zig build ha-vopr-test ha-chaos-test` |
+| HA lifecycle | replication, fencing, promotion, retention, restart, and rejoin | `zig build ha-vopr-test antfly-storage-ha-chaos-test` |
 | Independent application domains | distributed transaction, data plane, derived workflow, backup/restore, and clock faults | their five focused `*-vopr-test` gates |
 | Production public HTTP on deterministic I/O | `vopr/data_server.zig`, `vopr/http_lifecycle.zig`, borrowed `HttpRuntime` and `BackendRuntime` lanes, transport-neutral metadata executor; chunked upload, keep-alive pipeline, streaming response, and half-close | `zig build data-server-vopr-test` |
 | Production DataServer replicated merge/split seam | `data/runtime.zig`; the focused rollback/fresh-retry history uses one owner and two groups, while `data-server-transition-vopr-test` chains merge into split across three real `DataServer` owners and three replicated groups over time. It uses public HTTP/Raft listeners, routed merge actions, leader transfer, a public post-bootstrap delta write, replicated bootstrap/catch-up/finalize, owner restart, catalog-independent replay, exact routed terminal retry, every-replica range/transition/watermark convergence, document equality, actor-owned teardown, and fresh-root replay of the recorded actor/time schedule on one `VoprIo`. Clock-only stutter is normalized at the explicit physical LSM differential boundary; no different actor may execute, and a recorded actor that does not become ready within the bound is replay divergence. A regression preserves exactly-once split-action lane release when an inline durable job fails | `zig build data-server-transition-vopr-test`; broader `data-server-vopr-test antfly-data-runtime-test lib-data-storage-test` gates remain required before release |
@@ -2988,11 +2988,94 @@ lsm                   ha
   persistent index, index manager, DB split, HA, and application domains.
 - Every failure prints or stores an exact replay artifact.
 
-### `chaos-soak-test`
+### `vopr-soak-test`
 
-- Larger history counts, broader fault budgets, and retained legacy chaos
-  suites.
+- Larger history counts, broader fault budgets, and retained native
+  differentials. `chaos-soak-test` is a compatibility alias for this same DAG.
+- Runs the existing campaign CLI for HA, Raft, and distributed data with
+  `--fail-on-findings`, one worker, and 100 histories per scenario by default.
+  Property findings fail the gate after reports and replay artifacts are
+  written; replay divergence and harness errors also fail it.
+- Retains the metadata transition/public/placement and Raft differential
+  selections from the former soak target. Their native I/O is still native;
+  sharing a tier does not turn them into exact-replay campaigns.
 - Never part of the default fast gate.
+
+```sh
+zig build vopr-soak-test -Doptimize=ReleaseSafe -j1 \
+  -Dvopr-soak-histories=1000 -Dvopr-soak-seed=2709476608 \
+  -Dvopr-soak-artifacts=/tmp/antfly-vopr-soak
+```
+
+The artifact directory has separate `ha`, `raft`, and `distributed-data`
+corpora, with `results.json`, HTML reports, retained traces, and failure
+diagnostics. Reusing a directory resumes its corpus. Reproducing the entire
+guided search requires the same initial corpus as well as the same seed and
+budget; each retained history independently supports exact replay.
+
+### HA, Raft, and scaling follow-up after PR #539
+
+The merged fault algebra supplies explicit overlap, precedence, exclusions,
+fault budgets, and healing. Those engine features are not evidence that every
+production ownership transition has been composed with every fault.
+The bounded `vopr-test` gate is also not evidence of a completed soak run.
+
+The HA lifecycle scenario now uses `VoprIo` files and monotonic time for the
+production primary log, replication slots, standby receive/progress WALs,
+and fencing receipts. Standby apply deadlines borrow the progress WAL clock,
+including deadlines constructed by the production DataServer caller.
+The scenario is version 2; version-1 native-storage traces must be regenerated,
+not silently replayed under different semantics. Its application callback
+still checks an ordered payload model; it does not yet apply into the
+production cluster's DB. Its restart actions close and reopen owners; they
+do not yet inject power loss between individual storage operations.
+
+| Boundary | Existing evidence | Remaining work |
+| --- | --- | --- |
+| Hot standby | Virtual-storage receive/apply/report, durable fencing, promotion, retention, restart, and rejoin histories; bounded apply clock regression | Bind actual DB apply and primary/standby runtime owners to the same production cluster history; test durable fencing receipt recovery and interrupted receive/apply/promotion writes |
+| Raft | Real Raft core scheduling, persistence/apply completion, elections, partitions, restart, compaction, and production DataServer compositions | Overlap metadata leadership loss and data-Raft quorum/learner changes with standby promotion and placement publication |
+| Autoscaling | Metadata membership, live-store capacity churn, placement roles, and rebalancing differentials | Drive scale-out, catch-up, drain, and scale-in through production control loops under replayable faults; prevent premature retirement and placement oscillation |
+| Autosharding | Automatic split/merge control-loop differentials plus focused replicated split/merge and active-split production histories | Combine automatic decisions, disjoint replica sets, snapshot/history retention, standby failover, and restart at ownership cutover |
+| Soak operations | One canonical tier, configurable history/seed budgets, exact replay, corpus retention, and failure exit status | Scheduled sharding, uploaded/merged corpora, quarantine review, and retained run evidence; the target alone does not establish these |
+
+The next combined history should promote a caught-up standby while a shard
+split or move is active, with one metadata-leader/link fault and an explicit
+healing suffix. It must assert a unique writable authority, no loss of
+acknowledged writes, safe-read bounds, complete nonoverlapping ranges,
+every-replica convergence, and bounded recovery. Extend that same history to
+scale-out/scale-in and automatic split/merge decisions before increasing the
+fault cross-product or soak budget. The Go Kubernetes operator and cloud
+provisioning remain separate external control-plane boundaries unless an
+explicit adapter or native differential exercises them.
+
+Initial search at base seed `0xa17f5500` found a Raft oracle failure after a
+crash discarded an unpersisted term. The version-2 Raft scenario checks
+volatile monotonicity within an incarnation and durable term/commit plus
+completed application across restarts. It also preserves each node's append
+and apply lane order, matching the [async Raft storage contract](https://github.com/etcd-io/raft/blob/main/raft.go).
+These corrections preserve checks for lost durable state; they do not suppress
+all regressions after a restart.
+
+The same search found that the distributed-data scenario required retirement
+on all three replicas while one remained partitioned. Version 2 verifies
+surviving-quorum reads and retirement first, explicitly heals, then verifies
+every replica. Healing restores metadata blackhole routes as well as virtual
+network faults, so a later partition cannot accidentally retain an earlier
+one. Metadata uses the shared Raft cluster restart path to preserve virtual
+endpoints and establishes a ReadIndex proof before post-restart writes.
+The delayed-transport choice injects a two-tick delay into the actual virtual
+network and asserts that it was exercised; a supplied native executor was
+previously overwritten during cluster setup. An uncertain reconcile-lease
+proposal remains pending until
+committed authority is observed; it does not abort the whole partition
+history or grant authority from an unknown response. This scenario still
+schedules coarse fault modes around a
+native HTTP differential; its four-choice trace is not packet-level replay
+of the production cluster. The native HA seed-snapshot regression now creates
+its deadline from the DB's runtime clock, matching the production caller.
+The forced-reallocation restart regression keeps the request pending until
+every voter reports the exact observed request ID; pre-request size reports
+cannot acknowledge the scan.
 
 ### Integration and legacy storage tests
 

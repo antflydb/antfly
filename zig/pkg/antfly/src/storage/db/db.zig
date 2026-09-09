@@ -80214,6 +80214,8 @@ test "storage.ha seed snapshot predrains enrichment before exclusive capture" {
     }
     try std.testing.expect(gated.blocked_requests.load(.acquire) > 0);
 
+    const deadline_clock = db.backend_runtime.monotonicClock();
+
     // This is the production deadlock ordering: capture has frozen durable
     // mutations while enrichment still needs a shared lease to publish its
     // result. The final verification must return within its budget, never wait
@@ -80222,22 +80224,22 @@ test "storage.ha seed snapshot predrains enrichment before exclusive capture" {
         var premature_capture = barrier.acquireExclusive();
         defer premature_capture.release();
         gated.allowAll();
-        const premature_started_ns = platform_time.monotonicNs();
+        const premature_started_ns = deadline_clock.nowRealtimeNs();
         if (db.snapshotHASeed("premature", premature_started_ns +| 50 * std.time.ns_per_ms)) |_| {
             return error.TestExpectedSeedSnapshotRuntimeBusy;
         } else |err| {
             try std.testing.expect(err == error.EnrichmentWaitTimeout or err == error.EnrichmentRetryInProgress);
         }
-        try std.testing.expect(platform_time.monotonicNs() -| premature_started_ns < std.time.ns_per_s);
+        try std.testing.expect(deadline_clock.nowRealtimeNs() -| premature_started_ns < std.time.ns_per_s);
     }
 
     // Production performs this drain before taking the exclusive barrier.
-    try db.prepareHASeedSnapshot(platform_time.monotonicNs() +| 10 * std.time.ns_per_s);
+    try db.prepareHASeedSnapshot(deadline_clock.nowRealtimeNs() +| 10 * std.time.ns_per_s);
     var capture = barrier.acquireExclusive();
     defer capture.release();
     const snapshot_size = try db.snapshotHASeed(
         "predrained",
-        platform_time.monotonicNs() +| std.time.ns_per_s,
+        deadline_clock.nowRealtimeNs() +| std.time.ns_per_s,
     );
     try std.testing.expect(snapshot_size > 0);
 }

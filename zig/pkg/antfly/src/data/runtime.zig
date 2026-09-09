@@ -6476,8 +6476,7 @@ pub const DataServer = struct {
             return error.HAStandbyStateChanged;
         }
 
-        const apply_deadline_ns = platform_time.monotonicNs() +|
-            ha_replication_default_apply_window_ns;
+        const apply_deadline_ns = standby.applyDeadlineAfter(ha_replication_default_apply_window_ns);
         const applied = client.applyFetchedWithOptions(
             &batch,
             standby,
