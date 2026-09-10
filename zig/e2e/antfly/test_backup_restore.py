@@ -372,7 +372,17 @@ def _seed_cluster_docs_when_writable(
             return None
         return _check_response(last_response)
 
-    batch = wait_until(attempt, timeout_s=timeout_s, interval_s=0.1)
+    try:
+        batch = wait_until(attempt, timeout_s=timeout_s, interval_s=0.1)
+    except (AssertionError, requests.RequestException) as exc:
+        # Ambiguous outcomes must stay failures, but preserve the routing and
+        # proposal diagnostics before teardown removes this six-process cluster.
+        raise AssertionError(
+            f"backup seed failed for table {table_name}: {exc}; "
+            f"last_status={last_response.status_code if last_response is not None else None}; "
+            f"last_headers={dict(last_response.headers) if last_response is not None else None}\n"
+            f"{cluster.debug_logs()}"
+        ) from exc
     assert batch is not None, (
         f"table {table_name} did not become writable; "
         f"last_response={last_response.text if last_response is not None else None}\n"

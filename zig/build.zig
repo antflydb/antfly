@@ -1761,6 +1761,7 @@ pub fn build(b: *std.Build) void {
     });
     vectorindex_mod.addImport("antfly_vector", vector_mod);
     vectorindex_mod.addImport("antfly_platform", platform_mod);
+    vectorindex_mod.addImport("antfly_hash", hash_mod);
     if (target.result.os.tag == .macos) {
         addMacosSdkPaths(b, vectorindex_mod, target);
         vectorindex_mod.linkFramework("Foundation", .{});
@@ -1774,6 +1775,7 @@ pub fn build(b: *std.Build) void {
     });
     wasm_vectorindex_mod.addImport("antfly_vector", wasm_vector_mod);
     wasm_vectorindex_mod.addImport("antfly_platform", wasm_platform_mod);
+    wasm_vectorindex_mod.addImport("antfly_hash", wasm_hash_mod);
     const casbin_mod = b.createModule(.{
         .root_source_file = b.path("lib/casbin/src/mod.zig"),
         .target = target,
@@ -3215,10 +3217,24 @@ pub fn build(b: *std.Build) void {
 
     const lib_vectorindex_tests = b.addTest(.{
         .root_module = vectorindex_mod,
+        .filters = b.args orelse &.{},
     });
     const run_lib_vectorindex_tests = b.addRunArtifact(lib_vectorindex_tests);
     const lib_vectorindex_test_step = b.step("lib-vectorindex-test", "Run standalone lib/vectorindex tests");
     lib_vectorindex_test_step.dependOn(&run_lib_vectorindex_tests.step);
+
+    const vector_kernel_mod = b.createModule(.{ .root_source_file = b.path("lib/vector/src/quantizer.zig"), .target = target, .optimize = optimize });
+    vector_kernel_mod.addImport("protobuf", protobuf_mod);
+    const vector_kernel_tests = b.addTest(.{ .root_module = vector_kernel_mod, .filters = b.args orelse &.{} });
+    const run_vector_kernel_tests = b.addRunArtifact(vector_kernel_tests);
+    b.step("lib-vector-kernel-test", "Run standalone quantizer kernel tests (no external recall fixtures)").dependOn(&run_vector_kernel_tests.step);
+
+    const subgroup_scan_mod = b.createModule(.{ .root_source_file = b.path("tools/bench_subgroup_scan.zig"), .target = target, .optimize = optimize });
+    subgroup_scan_mod.addImport("antfly_vector", vector_mod);
+    subgroup_scan_mod.addImport("antfly_vector_index", vectorindex_mod);
+    const subgroup_scan_bench = b.addExecutable(.{ .name = "bench-subgroup-scan", .root_module = subgroup_scan_mod });
+    const install_subgroup_scan_bench = b.addInstallArtifact(subgroup_scan_bench, .{});
+    b.step("bench-subgroup-scan", "Build offline weighted selection and native range scan benchmark").dependOn(&install_subgroup_scan_bench.step);
 
     const vector_cancellation_tests = b.addTest(.{
         .root_module = vector_mod,
@@ -3940,7 +3956,7 @@ pub fn build(b: *std.Build) void {
         "enrichment index status encodes worker lifecycle diagnostics",
         "compact index repair status keeps corrupt terminal state actionable",
         "data runtime report preserves compact managed repair admission state",
-        "metadata status JSON preserves compact managed repair admission state",
+        "metadata status JSON preserves compact managed index admission state",
         "catalog sources without compact routing fail closed",
         "span routing uses compact catalog snapshot when available",
         "span routing confirms eventual misses with a linearizable compact snapshot",
@@ -3981,8 +3997,8 @@ pub fn build(b: *std.Build) void {
         "managed startup catch-up advances counterless incomplete dense repair",
         "db completed partial managed admission serves and retires redundant repair",
         "db status cannot reopen a quarantined generation from an older publication certificate",
-        "db status cannot reopen managed admission after shadow build handoff",
-        "db initial replay repair cannot reopen admission during shadow reconstruction",
+        "db status retains certified canonical admission during shadow build handoff",
+        "db initial replay repair retains certified canonical admission during shadow reconstruction",
         "db empty managed index does not invent generated coverage recovery debt",
         "db repair preflight retains a canonical generation completed after scheduler selection",
         "db coverage recovery admits a published generation after its admission marker retires",
@@ -4373,6 +4389,7 @@ pub fn build(b: *std.Build) void {
         "created graph index response projects closed nested schemas",
         "index encoders expose graph sources once in normalized config",
         "api http client round-trips public status and internal capability routes",
+        "api http client requires explicit not-proposed marker and tracks delivery phase",
         "index activation client preserves progress and transport classifications",
         "api http retryable embedding failures provide retry guidance",
         "api http server obtains query embedding policy from resource manager",
@@ -4407,6 +4424,7 @@ pub fn build(b: *std.Build) void {
         "api http server exposes ambiguous index mutations without a replay signal",
         "routed table mutation preserves hop budget for provably unsent request",
         "api http server create index installs exact visible config and defers lagging projection",
+        "table-wide native vector work does not block an independently ready index",
         "api http server drop table observes metadata absence before local cleanup",
         "status source reports an absent linearizable read capability without failing",
         "status source rejects every partial routing capability",
@@ -6188,10 +6206,11 @@ pub fn build(b: *std.Build) void {
     const public_api_parity_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, public_api_parity_runtime_filters),
-        // The macOS debug root includes the complete public transport and
-        // generated-contract surface; current measured compilation peaks a
-        // little above the aggregate's generic 7 GiB scheduler claim.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
+        // The macOS debug root includes the complete public transport,
+        // generated-contract, and native-index surface. ReleaseSafe test
+        // compilation currently peaks above 13 GiB; reserve the measured
+        // envelope so the scheduler does not reject a successful compile.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -7214,6 +7233,8 @@ pub fn build(b: *std.Build) void {
             "publication stamps order revisions and require recovery across owners",
             "db vector status revalidates stale repair admission without a query",
             "owner publication stamps order all index kinds independently of counts and callbacks",
+            "source coverage observation is independent of artifact replay progress",
+            "retained source coverage is fenced after every publication merge",
             "target and reducing watermarks commute across every callback permutation",
             "runtime status group batches reject duplicate group ids before publication",
             "table runtime snapshot cache clones stored status",
@@ -7251,6 +7272,8 @@ pub fn build(b: *std.Build) void {
             "synthetic refresh preserves post-fence target facts before serving handoff",
             "table runtime snapshot cache lifecycle transition replaces and fences observations",
             "table runtime snapshot cache batch preserves newer group observations",
+            "consistent boundary publication supersedes later-reserved stale observation",
+            "table runtime snapshot cache missed refresh retains counts without renewing freshness",
             "runtime status cache stable absence removal retires the old table epoch",
             "runtime status snapshots never wait for mutable cache ownership",
             "group read payload preparation and retirement stay off the global cache mutex",
@@ -7508,6 +7531,7 @@ pub fn build(b: *std.Build) void {
             "managed repair visibility edges retire cached readers and runtime status",
             "repair visibility progress does not churn readers without an admission edge",
             "table runtime snapshot cache invalidation fences a stale observed publisher",
+            "maintenance runtime status preserves source observation without inventing targets",
             "targeted structural publication cannot regress an untouched sibling generation",
             "runtime status hook orders completed observation without crossing invalidation",
             "provisioned owner publication advances exact index replay target",
@@ -7553,6 +7577,7 @@ pub fn build(b: *std.Build) void {
             "HA seed request admission drains accepted writes and closes the preflight race",
             "startup cache clear retires dirty identity without a serving owner",
             "dirty auto bulk writer publishes runtime status without closing the cached writer",
+            "auto bulk max-window request waits for idle finish",
             "split transition auto bulk publication retries while a writer lease is active",
             "median key lookup reuses startup writer instead of reopening its root",
             "write cache retirement is allocation-free after entry installation",
@@ -7951,9 +7976,10 @@ pub fn build(b: *std.Build) void {
         "cache falls back to a transient handle when retention exceeds the resource envelope",
         "cache transfers existing usage when resource manager changes",
         "shared LSM cache yields to foreground aggregate admission",
+        "shared LSM resource reclaimer never waits for active accounting",
         "lsm backend resource manager throttles projected immutable state",
-        "lsm backend resource manager rejects before wal apply",
-        "derived backlog tracker accounts and releases payload bytes",
+        "lsm backend resource manager reclaims local durable state before rejecting",
+        "derived backlog tracker accounts payload and sequence ownership",
         "derived backlog tracker fails closed when sequence accounting allocation fails",
         "derived backlog tracker bounds sequence-only admission drain window",
         "hbc shared cache namespaces entries",
@@ -7965,6 +7991,7 @@ pub fn build(b: *std.Build) void {
         "hbc shared detached leases remain physically accounted until release",
         "hbc standalone detached leases remain physically accounted until release",
         "hbc standalone cache yields to foreground aggregate admission",
+        "hbc resource reclaimer never waits for an active cache owner",
         "hbc concurrent vector admission samples at a full steady target",
         "hbc exact-route vector admission samples outside the search epoch",
         "hbc decoded residency lease reserves a complete query and bypasses mid-query sampling",
@@ -7982,6 +8009,9 @@ pub fn build(b: *std.Build) void {
         "hbc vector artifact reads avoid duplicate LSM block residency only with retained vectors",
         "searchWithRequest applies filter prefix and distance bounds",
         "hbc cache reports byte usage to resource manager",
+        "hbc search charges estimated quantized scan bytes to node admission",
+        "dense search bandwidth admission is FIFO and work weighted",
+        "dense search bandwidth admission removes cancelled waiters",
         "hbc resource manager reattachment is idempotent and transfers local cache usage",
         "hbc cache shrinks to resource budget under pressure",
         "resource manager derives elastic HBC cache-class policy from pressure",
@@ -7993,11 +8023,13 @@ pub fn build(b: *std.Build) void {
         "classified batch chooses foreground requester when cache slice is first",
         "resource-managed mapped residency evicts cold segments and preserves hot mappings",
         "provisioned group storage derives all resource budgets",
+        "provisioned dense native authority gate is fail-closed and monotonic",
         "provisioned lsm cache is an elastic share of the node envelope",
         "provisioned HBC cache is an elastic share of the node envelope",
         "standalone resource manager derives elastic storage cache envelopes",
         "effective process memory limit preserves source and clamps explicit requests",
         "resource manager capacity source is immutable after composition",
+        "capacity percentage safety floor is capped on large volumes",
         "capacity reservation revalidation fails closed when available space falls",
         "resource manager background deferral follows slice policy",
         "budgeted allocator admits before allocation and releases exact live bytes",
@@ -8043,6 +8075,10 @@ pub fn build(b: *std.Build) void {
     const dense_index_lifecycle_regression_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{
+            "posting WAL capacity",
+            "native posting initial acceleration",
+            "db online vector publication",
+            "db multi-source dense target",
             "index repair state root-generation reset atomically rebinds replacement debt",
             "index repair state persists through backend storage",
             "index repair state persists intent and provisional replay pin atomically",
@@ -8083,8 +8119,8 @@ pub fn build(b: *std.Build) void {
             "db malformed quarantined dense config does not block healthy artifact counters",
             "db query repair gate revalidates stale debt",
             "db status cannot reopen a quarantined generation from an older publication certificate",
-            "db status cannot reopen managed admission after shadow build handoff",
-            "db initial replay repair cannot reopen admission during shadow reconstruction",
+            "db status retains certified canonical admission during shadow build handoff",
+            "db initial replay repair retains certified canonical admission during shadow reconstruction",
             "db empty managed index does not invent generated coverage recovery debt",
             "db repair preflight retains a canonical generation completed after scheduler selection",
             "db coverage recovery admits a published generation after its admission marker retires",
@@ -9784,12 +9820,41 @@ pub fn build(b: *std.Build) void {
     docstore_test_mod.addImport("bloom", bloom_mod);
     const docstore_unit_tests = b.addTest(.{
         .root_module = docstore_test_mod,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     const run_docstore_unit_tests = b.addRunArtifact(docstore_unit_tests);
 
     const docstore_test_step = b.step("docstore-test", "Run storage/docstore unit tests");
     docstore_test_step.dependOn(&run_docstore_unit_tests.step);
 
+    const vector_payload_test_mod = makeLmdbModule(b, "pkg/antfly/src/vector_payload_store_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    vector_payload_test_mod.addImport("bloom", bloom_mod);
+    vector_payload_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
+    vector_payload_test_mod.addImport("antfly-json", json_mod);
+    vector_payload_test_mod.addImport("structlog", structlog_mod);
+    const vector_payload_tests = b.addTest(.{
+        .root_module = vector_payload_test_mod,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .filters = &.{ "source vector payloads", "vector references", "table storage settings" },
+    });
+    const run_vector_payload_tests = b.addRunArtifact(vector_payload_tests);
+    const vector_payload_test_step = b.step("vector-payload-test", "Run source vector payload ownership and recovery tests");
+    vector_payload_test_step.dependOn(&run_vector_payload_tests.step);
+    unit_test_step.dependOn(&run_vector_payload_tests.step);
+
+    const native_vector_store_test_mod = makeLmdbModule(b, "pkg/antfly/src/native_vector_store_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    native_vector_store_test_mod.addImport("bloom", bloom_mod);
+    native_vector_store_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
+    native_vector_store_test_mod.addImport("antfly-json", json_mod);
+    native_vector_store_test_mod.addImport("structlog", structlog_mod);
+    const native_vector_store_tests = b.addTest(.{
+        .root_module = native_vector_store_test_mod,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .filters = &.{ "storage.vector_block_store", "vector block", "vector WAL", "native compaction", "sealed vector", "empty vector authority", "owned staged base", "cold projection workers", "source vector payloads adaptive" },
+    });
+    const run_native_vector_store_tests = b.addRunArtifact(native_vector_store_tests);
+    const native_vector_store_test_step = b.step("vector-block-store-test", "Run native vector segment publication and recovery tests");
+    native_vector_store_test_step.dependOn(&run_native_vector_store_tests.step);
     const shard_test_mod = makeLmdbModule(b, "pkg/antfly/src/shard_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     shard_test_mod.addImport("bloom", bloom_mod);
     const shard_unit_tests = b.addTest(.{
@@ -10109,6 +10174,7 @@ pub fn build(b: *std.Build) void {
 
     const db_unit_tests = b.addTest(.{
         .root_module = db_test_mod,
+        .filters = selectTestFilters(b, &.{}),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -10133,7 +10199,7 @@ pub fn build(b: *std.Build) void {
         "dense index manager accepts external embedding indexes without enrichments",
         "production external scorers use bounded cache-first artifact batches",
         "progressive filtered l2 traversal preserves exact top k without bound stops",
-        "flat rabitq filtered traversal advances past its initial probe wave safely",
+        "flat rabitq filtered traversal advances then stops on a certified bound",
         "sorted unique vector id subtraction handles sparse and dense exclusions",
     };
     const release_blocker_regression_tests = b.addTest(.{
@@ -10378,6 +10444,14 @@ pub fn build(b: *std.Build) void {
         },
         &.{
             "storage.backend_adapter.",
+            "storage.artifact_payload.",
+            "storage.admission_waiter.",
+            "storage.dense_work_admission.",
+            "storage.maintenance_signal.",
+            "storage.projection_page_cache.",
+            "storage.projection_read_trace.",
+            "storage.vector_payload_store.",
+            "storage.vector_wal_view.",
             "storage.backend_conformance_test.",
             "storage.backend_erased.",
             "storage.backend_types.",
@@ -10392,6 +10466,7 @@ pub fn build(b: *std.Build) void {
             "storage.docstore.",
             "storage.enrichment.",
             "storage.filesystem_capacity.",
+            "storage.generation_publication.",
             "storage.hbc_adapter.",
             "storage.hierarchy_navigation.",
             "storage.index_manager_vopr.",
@@ -10406,6 +10481,7 @@ pub fn build(b: *std.Build) void {
             "storage.persistent.",
             "storage.persistent_vopr.",
             "storage.portable_backup.",
+            "storage.posting_segment_store.",
             "storage.resource_manager.",
             "storage.rowsource.",
             "storage.schema.",
@@ -10414,6 +10490,7 @@ pub fn build(b: *std.Build) void {
             "storage.transactions.",
             "storage.transaction_vopr.",
             "storage.ttl.",
+            "storage.vector_block_store.",
             "storage.vopr_durable_job_lane.",
             "storage.wal.",
             "storage.wal_vopr.",
@@ -10496,7 +10573,10 @@ pub fn build(b: *std.Build) void {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
-        .max_rss = 8 * 1024 * 1024 * 1024,
+        // The consolidated ReleaseFast support artifact now peaks just over
+        // 10 GiB on macOS Zig 0.16. This is a compiler scheduler reservation,
+        // not a runtime memory allowance for Antfly.
+        .max_rss = 12 * 1024 * 1024 * 1024,
     });
     unit_storage_support_tests.step.dependOn(&unit_storage_shard_audit.step);
     const run_unit_storage_support_tests = b.addRunArtifact(unit_storage_support_tests);
@@ -10521,7 +10601,11 @@ pub fn build(b: *std.Build) void {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
-        .max_rss = 8 * 1024 * 1024 * 1024,
+        // The consolidated ReleaseFast engine artifact reaches about 9.1 GiB
+        // on current macOS Zig 0.16 builds. Reserve the measured envelope so
+        // the scheduler can keep independent artifacts parallel without
+        // rejecting this compiler after it crosses the stale 8 GiB estimate.
+        .max_rss = 10 * 1024 * 1024 * 1024,
     });
     unit_storage_engine_tests.step.dependOn(&unit_storage_shard_audit.step);
     const run_unit_storage_engine_tests = b.addRunArtifact(unit_storage_engine_tests);
@@ -10551,7 +10635,10 @@ pub fn build(b: *std.Build) void {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
-        .max_rss = 8 * 1024 * 1024 * 1024,
+        // The consolidated ReleaseFast DB-core artifact now peaks just over
+        // 10 GiB on macOS Zig 0.16. This reserves compiler scheduling capacity;
+        // it does not raise Antfly's runtime memory budget.
+        .max_rss = 12 * 1024 * 1024 * 1024,
     });
     unit_storage_db_core_tests.step.dependOn(&unit_storage_shard_audit.step);
     const unit_storage_compile_step = b.step(
@@ -10779,7 +10866,10 @@ pub fn build(b: *std.Build) void {
                 .path = b.path("pkg/antfly/src/test_runner.zig"),
                 .mode = .simple,
             },
-            .max_rss = 8 * 1024 * 1024 * 1024,
+            // The consolidated service/HTTP lane reaches roughly 9.3 GiB on
+            // macOS Zig 0.16. This is compiler scheduling capacity, not an
+            // Antfly runtime budget; retain headroom for codegen variance.
+            .max_rss = 12 * 1024 * 1024 * 1024,
         });
     }
     const unit_metadata_compile_step = b.step(
@@ -11580,6 +11670,24 @@ pub fn build(b: *std.Build) void {
     const hbc_parity_step = b.step("hbc-parity", "Build and install hbc_parity");
     hbc_parity_step.dependOn(&b.addInstallArtifact(hbc_parity, .{}).step);
 
+    const vector_projection_bounds_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/vectors/vector_projection_bounds_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    vector_projection_bounds_bench_mod.addImport("antfly-zig", antfly_mod);
+    const vector_projection_bounds_bench = b.addExecutable(.{
+        .name = "vector_projection_bounds_bench",
+        .root_module = vector_projection_bounds_bench_mod,
+    });
+    const run_vector_projection_bounds_bench = b.addRunArtifact(vector_projection_bounds_bench);
+    if (b.args) |args| run_vector_projection_bounds_bench.addArgs(args);
+    const vector_projection_bounds_bench_step = b.step(
+        "vector-projection-bounds-bench",
+        "Benchmark persisted float16 projection bounds against legacy query-time scans",
+    );
+    vector_projection_bounds_bench_step.dependOn(&run_vector_projection_bounds_bench.step);
+
     const hbc_isolate_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/tools/hbc_isolate.zig"),
         .target = target,
@@ -11713,12 +11821,12 @@ pub fn build(b: *std.Build) void {
     const storage_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     const storage_bench_root_mod = b.createModule(.{
         .root_source_file = b.path(antfly_benches_build.storage_bench_root),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     antfly_imports.configureRuntime(b, storage_bench_root_mod, false, true, false);
     storage_bench_mod.addImport("antfly-zig", storage_bench_root_mod);
@@ -11730,6 +11838,8 @@ pub fn build(b: *std.Build) void {
     });
 
     storage_bench_step.dependOn(&b.addInstallArtifact(storage_bench, .{}).step);
+    const storage_bench_build_step = b.step("antfly-storage-bench-build", "Compile the consolidated storage benchmark contracts without running them");
+    storage_bench_build_step.dependOn(&storage_bench.step);
 
     const rw_lock_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/rw_lock_bench.zig"),
@@ -11790,6 +11900,57 @@ pub fn build(b: *std.Build) void {
 
     const provisioned_warmup_bench_step = b.step("provisioned-warmup-bench", "Build and install provisioned_warmup_bench");
     provisioned_warmup_bench_step.dependOn(&b.addInstallArtifact(provisioned_warmup_bench, .{}).step);
+    const provisioned_dense_ingest_guardrail_mod = b.createModule(.{
+        .root_source_file = b.path("bench/vectors/provisioned_dense_ingest_guardrail.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    provisioned_dense_ingest_guardrail_mod.addImport("antfly-zig", antfly_mod);
+    provisioned_dense_ingest_guardrail_mod.addImport("antfly_platform", platform_mod);
+    provisioned_dense_ingest_guardrail_mod.addImport("antfly_hash", hash_mod);
+
+    const provisioned_dense_ingest_guardrail = b.addExecutable(.{
+        .name = "provisioned_dense_ingest_guardrail",
+        .root_module = provisioned_dense_ingest_guardrail_mod,
+    });
+    const install_provisioned_dense_ingest_guardrail = b.addInstallArtifact(provisioned_dense_ingest_guardrail, .{});
+
+    const run_provisioned_dense_ingest_guardrail = b.addRunArtifact(provisioned_dense_ingest_guardrail);
+    if (b.args) |args| {
+        run_provisioned_dense_ingest_guardrail.addArgs(args);
+    } else {
+        // Keep deterministic memory regressions fail-closed while allowing
+        // enough wall-clock headroom for slower CI hosts. The cache threshold
+        // is 768 MiB and the process-footprint threshold is 3 GiB.
+        run_provisioned_dense_ingest_guardrail.addArgs(&.{
+            "--docs",
+            "50000",
+            "--dims",
+            "1536",
+            "--batch-size",
+            "100",
+            "--sync-level",
+            "write",
+            "--max-bulk-clone-calls",
+            "0",
+            "--max-bulk-clone-bytes",
+            "0",
+            "--max-bulk-clone-peak-bytes",
+            "0",
+            "--max-data-block-cache-bytes",
+            "805306368",
+            "--max-peak-footprint-bytes",
+            "3221225472",
+            "--max-ingest-ms",
+            "60000",
+        });
+    }
+    const build_provisioned_dense_ingest_guardrail_step = b.step("provisioned-dense-ingest-guardrail-build", "Build the provisioned table dense ingest guardrail without running it");
+    build_provisioned_dense_ingest_guardrail_step.dependOn(&provisioned_dense_ingest_guardrail.step);
+    const install_provisioned_dense_ingest_guardrail_step = b.step("provisioned-dense-ingest-guardrail-install", "Build and install the provisioned table dense ingest guardrail");
+    install_provisioned_dense_ingest_guardrail_step.dependOn(&install_provisioned_dense_ingest_guardrail.step);
+    const provisioned_dense_ingest_guardrail_step = b.step("provisioned-dense-ingest-guardrail", "Benchmark the provisioned table write path without HTTP for VectorDBBench-shaped dense ingest");
+    provisioned_dense_ingest_guardrail_step.dependOn(&run_provisioned_dense_ingest_guardrail.step);
 
     const public_query_guardrail_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/public_query_guardrail.zig"),
@@ -12186,7 +12347,7 @@ pub fn build(b: *std.Build) void {
     assignDefaultAggregateMaxRss(
         b,
         unit_test_step,
-        7 * 1024 * 1024 * 1024,
+        @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
         6 * 1024 * 1024 * 1024,
     );
 
@@ -12283,7 +12444,7 @@ pub fn build(b: *std.Build) void {
     assignDefaultAggregateMaxRss(
         b,
         test_step,
-        7 * 1024 * 1024 * 1024,
+        @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
         6 * 1024 * 1024 * 1024,
     );
 
