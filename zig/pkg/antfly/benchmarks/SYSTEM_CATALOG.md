@@ -34,7 +34,10 @@ HTTP requests, validates results, and stops its servers on exit. It needs the
 normal E2E Python dependencies and permission to open local sockets. Startup,
 table creation, shard-readiness waits, warmup, and measured requests are kept
 separate. Cluster setup waits for each new shard to report a healthy voter and
-a known leader on every metadata node before starting the next table. The output
+a known leader on every metadata node before starting the next table. Resolution
+setup also waits for the entity and document shards before seeding candidates.
+Resolution timeout diagnostics include the source key, expected destinations,
+graph response, and index status. The output
 records the binary SHA-256, platform, complete settings, sample counts, and
 p50/p95/max latency. Supply `--binary` to compare separately built revisions;
 use the same build mode and settings, and run them without competing workloads.

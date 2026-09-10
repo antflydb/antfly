@@ -3,7 +3,8 @@
 Local macOS 26.3.1 ARM64 development builds (`zig build antfly`, Zig 0.16.0).
 Resolution and distributed catalog runs used disposable three-metadata/three-data-node
 clusters on one host; the standalone workload used one server.
-The two resolution runs ran sequentially after builds and tests completed.
+The original exact-key comparison ran sequentially after builds and tests completed.
+The follow-up section explicitly records concurrent compiler activity.
 They are workload observations, not production capacity claims.
 
 ## Scored entity-resolution comparison
@@ -112,6 +113,84 @@ Tenant offboarding (drop planning and apply) took 0.804 ms for 1,000 empty
 namespaces with 1,000 unrelated tables, and 7.805 ms for 10,000 namespaces with
 10,000 unrelated tables. This exercises the removal of nested scans during
 large database drops.
+
+## Request projections and batched candidates: follow-up
+
+Production sources: baseline `7d977f090`, updated `268b1ceb3`. Both are macOS
+development builds. These are **provisional shared-host measurements**: unrelated
+compiler processes were active at run boundaries. Use the results as workload
+observations alongside the deterministic RPC-count and allocation regressions,
+not as isolated capacity estimates. Complete settings, percentiles, hashes, and
+host-load flags are in [the machine-readable results](system_catalog_workloads_2026_09_10.json).
+
+The entity cases use three metadata and three data nodes, three document shards,
+two warmup documents and five measured documents per size, plus 30 steady graph
+queries per mode. Prefix documents repeat ten entity names; redirect documents
+seed a distinct alias and curated survivor for every mention.
+
+| Workload | Mentions | Before p50 / p95 | After p50 / p95 | Observed median ratio |
+| --- | --- | --- | --- | --- |
+| Prefix | 10 | 1.001 / 1.070 s | 0.572 / 0.629 s | 1.8× |
+| Prefix | 100 | 5.870 / 5.903 s | 0.580 / 0.613 s | 10.1× |
+| Redirects | 10 | 0.914 / 1.073 s | 0.461 / 0.590 s | 2.0× |
+| Redirects | 100 | 5.969 / 6.415 s | 0.650 / 0.858 s | 9.2× |
+
+Steady graph-read latencies remain in the same broad range; the large observed
+gain is in completing resolution and promotion. Exact keys and prefixes are
+deduplicated per work unit, redirects use a second bulk read, missing targets
+are cached, and immutable candidate records are decoded once per distinct lookup.
+
+The wide-schema workload declares a searchable body plus 200 additional string
+fields per table. It uses 30 requests after two warmups; NDJSON contains 20
+queries in one HTTP batch.
+
+| Tables | Operation | Before p50 / p95 | After p50 / p95 |
+| --- | --- | --- | --- |
+| 10 | Query | 1.05 / 1.19 ms | 1.14 / 1.27 ms |
+| 10 | Join | 2.06 / 2.21 ms | 2.21 / 2.62 ms |
+| 10 | NDJSON ×20 | 14.27 / 14.80 ms | 13.30 / 13.80 ms |
+| 100 | Query | 2.47 / 2.61 ms | 2.08 / 2.34 ms |
+| 100 | Join | 5.88 / 6.91 ms | 5.06 / 5.50 ms |
+| 100 | NDJSON ×20 | 40.59 / 42.22 ms | 31.43 / 33.20 ms |
+
+Distributed catalog operations use the ordinary schema, one replica per shard
+through an inherited tablespace policy, and ten requests after two warmups.
+Shard-bootstrap waits are outside these intervals. Only the 10-table updated
+run completed; the 100-table run returned HTTP 503
+`storage_read_temporarily_unavailable` during NDJSON measurement. There is no
+successful updated 100-table comparison. The baseline's completed 100-table
+results are retained in the machine-readable artifact.
+
+| Tables | Operation | Before p50 / p95 | After p50 / p95 |
+| --- | --- | --- | --- |
+| 10 | Lookup | 48.4 / 56.3 ms | 28.2 / 52.5 ms |
+| 10 | Query | 53.0 / 59.2 ms | 51.8 / 61.1 ms |
+| 10 | Join | 57.7 / 78.5 ms | 80.3 / 112.2 ms |
+| 10 | NDJSON ×20 | 542.1 / 556.8 ms | 672.1 / 833.3 ms |
+
+The distributed join and NDJSON medians regressed in these runs; host contention
+prevents attributing that difference to this change. One remaining source of
+metadata traffic is internal shard routing: the wire request does not carry the
+coordinator's prepared primary text-index selection, so the receiver still reads
+a query definition. Removing that read safely requires a versioned internal
+execution envelope that carries the selected indexes and catalog identity, with
+receiver validation and a compatibility fallback. It cannot be replaced by
+blindly skipping routing or reusing an unvalidated process-wide definition.
+
+One updated redirect run and one baseline rerun timed out while a document shard
+held the source document but its graph remained empty. Those failures are not
+successful latency samples. Explicit shard readiness was added after the first
+timeout, but did not eliminate the baseline reproduction. The successful updated
+run includes that extra untimed setup; the completed baseline predates it.
+This intermittent readiness/replay problem remains a limitation of the live
+scenario and should be investigated independently of the candidate batching
+speedup. Together with the 100-table storage-read failure, this means the report
+does not establish reliability under load.
+
+Independent regression checks verify one prefix scan for 100 repeated mentions,
+one bulk read for their shared missing redirect, identity retention across retries
+and joins, one reused NDJSON definition with administrative snapshots disabled,
+and legacy/missing lookups within a 4 KiB allocator with 1,000 unrelated databases.
 
 ## Reproduction
 

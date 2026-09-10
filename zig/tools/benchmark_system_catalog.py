@@ -93,6 +93,12 @@ class Api:
                     raise RuntimeError(f"query failed: {result}")
         return value
 
+    def diagnostics(self, path: str):
+        try:
+            return self.request("GET", path)
+        except (requests.RequestException, RuntimeError, ValueError) as error:
+            return {"diagnostic_request_error": str(error)}
+
     def measure(self, operation, samples: int, warmup: int) -> dict:
         for _ in range(warmup):
             operation()
@@ -221,8 +227,15 @@ def catalog_scenario(args, binary: Path) -> dict:
                         "schema": {
                             "type": "object",
                             "properties": {
-                                f"field_{field}": {"type": "string"}
-                                for field in range(args.schema_fields)
+                                "body": {
+                                    "type": "string",
+                                    "x-antfly-types": ["text"],
+                                    "x-antfly-include-in-all": True,
+                                },
+                                **{
+                                    f"field_{field}": {"type": "string"}
+                                    for field in range(args.schema_fields)
+                                },
                             },
                         }
                     }
@@ -248,7 +261,7 @@ def catalog_scenario(args, binary: Path) -> dict:
                     properties = created["schema"]["document_schemas"]["default"][
                         "schema"
                     ]["properties"]
-                    if len(properties) != args.schema_fields:
+                    if len(properties) != args.schema_fields + 1:
                         raise RuntimeError(
                             "table did not retain benchmark schema fields"
                         )
@@ -379,13 +392,17 @@ def graph_nodes(response):
 
 
 def resolution_scenario(args, binary: Path) -> dict:
-    with server(binary, "cluster") as (api, startup, _instance):
-        api.request("POST", "/tables/entities", {"num_shards": 1})
+    with server(binary, "cluster") as (api, startup, instance):
+        entities = api.request("POST", "/tables/entities", {"num_shards": 1})
+        wait_for_catalog_shards(api, instance, entities, args)
         indexes = json.loads(json.dumps(DOCUMENTS_INDEXES))
         indexes["relations_graph"]["resolvers"][0]["candidate_search"] = (
             "prefix" if args.resolution_workload == "prefix" else "exact_key"
         )
-        api.request("POST", "/tables/documents", {"num_shards": 3, "indexes": indexes})
+        documents = api.request(
+            "POST", "/tables/documents", {"num_shards": 3, "indexes": indexes}
+        )
+        wait_for_catalog_shards(api, instance, documents, args)
         checkpoints = []
         for mentions in sorted(set(args.mentions)):
             print(
@@ -486,7 +503,9 @@ def resolution_scenario(args, binary: Path) -> dict:
                         break
                     if time.perf_counter() - start > args.readiness_timeout:
                         raise RuntimeError(
-                            f"resolution timeout: {len(hydrated & expected)}/{mentions} entities"
+                            f"resolution timeout: {len(hydrated & expected)}/{len(expected)} destinations, "
+                            f"document={key}, expected={sorted(expected)}, response={value}, "
+                            f"index_status={api.diagnostics('/tables/documents/indexes/relations_graph')}"
                         )
                     time.sleep(args.poll_ms / 1000)
                 if document >= args.warmup:
