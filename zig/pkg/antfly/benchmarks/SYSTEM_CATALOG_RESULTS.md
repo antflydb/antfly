@@ -199,7 +199,9 @@ measurement. They are not isolated capacity measurements. Complete settings,
 binary hashes, all catalog sizes, steady graph reads, intermediate results, and
 failed-run diagnostics are in [the machine-readable results](system_catalog_indexed_workloads_2026_09_10.json).
 A subsequent ownership fix retains legacy standalone table names through mutation
-publication; it does not change the measured distributed paths.
+publication; it does not change the measured distributed paths. The subsequent
+merge of main at `1d6e3ac69` includes runtime/scheduler/inference changes. These
+measurements predate that merge and are not measurements of its final binary.
 
 The implementation uses transaction-backed point reads and covering parent
 indexes for management, reverse references for DDL dependencies, a versioned
