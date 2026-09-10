@@ -1493,9 +1493,11 @@ pub fn build(b: *std.Build) void {
     cli_test_step.dependOn(&run_cli_tests.step);
 
     const finetune_ctx = finetune_common.fromWorkflow(workflow_ctx);
-    finetune_tools.register(finetune_ctx);
-    finetune_workflows.register(finetune_ctx);
-    finetune_tests.register(finetune_ctx);
+    const finetune_commands = finetune_tools.register(finetune_ctx);
+    const finetune_workflow_commands = finetune_workflows.register(finetune_ctx);
+    const finetune_test_step = finetune_tests.addTests(finetune_ctx, "test-finetune");
+    for (finetune_commands) |command| finetune_test_step.dependOn(&command.executable.step);
+    for (finetune_workflow_commands) |command| finetune_test_step.dependOn(&command.executable.step);
 
     const run_quant_kernel_compiler_tests = b.addRunArtifact(tests);
     run_quant_kernel_compiler_tests.addArg("--test-filter");

@@ -37,8 +37,14 @@ pub fn add(ctx: Context, wasm_jinja: *std.Build.Module, wasm_platform: *std.Buil
     var finetune_ctx = finetune.fromWorkflow(ctx);
     finetune_ctx.publish_targets = false;
     const finetune_step = @import("finetune/tests.zig").addTests(finetune_ctx, "inference-finetune-test");
-    const readiness = @import("finetune/workflows.zig").create(finetune_ctx, "gliner2-entity-training-readiness");
-    ctx.step("gliner2-entity-training-readiness", "Run GLiNER2 entity training readiness").dependOn(&readiness.step);
+    const commands = @import("finetune/tools.zig").register(finetune_ctx);
+    const workflows = @import("finetune/workflows.zig").register(finetune_ctx);
+    for (commands) |command| finetune_step.dependOn(&command.executable.step);
+    for (workflows) |command| {
+        finetune_step.dependOn(&command.executable.step);
+        if (std.mem.eql(u8, command.executable.name, "gliner2-entity-training-readiness"))
+            ctx.step("gliner2-entity-training-readiness", "Run GLiNER2 entity training readiness").dependOn(&command.run.step);
+    }
 
     const suite = tests.create(ctx);
     const bge_tests = benches.createBge(ctx).tests;

@@ -141,7 +141,20 @@ pub const TestSpec = struct {
     filters: []const []const u8 = &.{},
 };
 
-pub fn addCommand(ctx: Context, spec: CommandSpec) *std.Build.Step.Run {
+pub const Command = struct {
+    executable: *std.Build.Step.Compile,
+    run: *std.Build.Step.Run,
+};
+
+/// Return the actual artifacts so entrypoints can compose compile checks from
+/// the same registry that publishes commands, without running model workloads.
+pub fn addCommands(ctx: Context, specs: []const CommandSpec) []const Command {
+    const commands = ctx.b.allocator.alloc(Command, specs.len) catch @panic("OOM");
+    for (specs, commands) |spec, *command| command.* = addCommand(ctx, spec);
+    return commands;
+}
+
+pub fn addCommand(ctx: Context, spec: CommandSpec) Command {
     const b = ctx.b;
     const exe = b.addExecutable(.{
         .name = spec.name,
@@ -166,7 +179,7 @@ pub fn addCommand(ctx: Context, spec: CommandSpec) *std.Build.Step.Run {
         const step = b.step(spec.name, spec.description);
         step.dependOn(&run.step);
     }
-    return run;
+    return .{ .executable = exe, .run = run };
 }
 
 pub fn addTest(ctx: Context, spec: TestSpec) *std.Build.Step {

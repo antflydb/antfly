@@ -14,17 +14,18 @@
 
 const common = @import("common.zig");
 
-const gliner_boundary_imports = &.{ .build_options, .jinja, .inference_hf_tokenizer };
+const gliner_boundary_imports = &.{ .build_options, .jinja, .inference_hf_tokenizer, .inference_internal };
 const gliner_boundary_train_imports = &.{ .build_options, .jinja, .ml, .inference_internal, .inference_hf_tokenizer };
-const reranker_text_imports = &.{ .build_options, .jinja, .inference_tokenizer, .inference_hf_tokenizer };
-const reranker_train_imports = &.{ .build_options, .jinja, .ml, .inference_tokenizer, .inference_hf_tokenizer };
+const reranker_text_imports = &.{ .build_options, .jinja, .inference_tokenizer, .inference_hf_tokenizer, .inference_internal };
+const reranker_train_imports = &.{ .build_options, .jinja, .ml, .inference_tokenizer, .inference_hf_tokenizer, .inference_internal };
 const gemma_lora_imports = &.{ .build_options, .ml, .inference_internal };
 
 const commands = [_]common.CommandSpec{
     .{
         .name = "inspect-layoutlmv3-bundle",
-        .root_source_file = "src/finetune/tools/inspect_layoutlmv3_bundle.zig",
+        .root_source_file = "src/finetune_inspect_layoutlmv3_bundle.zig",
         .description = "Inspect a LayoutLMv3 runtime bundle",
+        .imports = &.{.build_options},
     },
     .{
         .name = "compose-lora-adapters",
@@ -60,7 +61,7 @@ const commands = [_]common.CommandSpec{
         .name = "inspect-gliner2-dataset",
         .root_source_file = "src/finetune/tools/inspect_gliner2_dataset.zig",
         .description = "Inspect GLiNER2 finetune dataset stats, coverage, and encoded batch shapes",
-        .imports = &.{ .build_options, .inference_internal },
+        .imports = &.{.inference_finetune_data},
     },
     .{
         .name = "validate-gliner2-autodiff-run",
@@ -158,9 +159,9 @@ const commands = [_]common.CommandSpec{
     },
     .{
         .name = "eval-fused-chunker",
-        .root_source_file = "src/finetune/eval/eval_fused_chunker.zig",
+        .root_source_file = "src/finetune_eval_fused_chunker.zig",
         .description = "Evaluate a fused chunker-embedder boundary head checkpoint",
-        .imports = &.{.ml},
+        .imports = &.{ .build_options, .ml, .antfly_platform, .inference_linalg },
         .native_link = .default,
     },
     .{
@@ -242,7 +243,7 @@ const commands = [_]common.CommandSpec{
     },
     .{
         .name = "train-eval-reranker-lora-top-layer-cached-surrogate",
-        .root_source_file = "src/finetune/train/train_eval_reranker_lora_top_layer_cached_surrogate.zig",
+        .root_source_file = "src/finetune_train_eval_reranker_lora_top_layer_cached_surrogate.zig",
         .description = "Train and evaluate a bounded surrogate reranker LoRA path from exact top-layer boundary caches",
         .imports = reranker_train_imports,
         .native_link = .default,
@@ -251,19 +252,19 @@ const commands = [_]common.CommandSpec{
         .name = "bootstrap-colqwen2-lora",
         .root_source_file = "src/finetune/tools/bootstrap_colqwen2_lora.zig",
         .description = "Bootstrap a ColQwen2 LoRA adapter bundle",
-        .imports = &.{ .build_options, .ml, .inference_hf_tokenizer },
+        .imports = &.{ .build_options, .ml, .inference_hf_tokenizer, .inference_internal },
     },
     .{
         .name = "inspect-colqwen2-checkpoint",
         .root_source_file = "src/finetune/tools/inspect_colqwen2_checkpoint.zig",
         .description = "Inspect a ColQwen2 checkpoint or adapter bundle",
-        .imports = &.{ .build_options, .ml, .inference_hf_tokenizer },
+        .imports = &.{ .build_options, .ml, .inference_hf_tokenizer, .inference_internal },
     },
     .{
         .name = "inspect-colqwen2-lora-bundle",
         .root_source_file = "src/finetune/tools/inspect_colqwen2_lora_bundle.zig",
         .description = "Inspect a ColQwen2 LoRA adapter bundle",
-        .imports = &.{ .build_options, .ml, .inference_hf_tokenizer },
+        .imports = &.{ .build_options, .ml, .inference_hf_tokenizer, .inference_internal },
     },
     .{
         .name = "materialize-colqwen2-lora",
@@ -275,7 +276,7 @@ const commands = [_]common.CommandSpec{
         .name = "prepare-colqwen2-inputs",
         .root_source_file = "src/finetune/tools/prepare_colqwen2_inputs.zig",
         .description = "Prepare bounded ColQwen2 multimodal finetune inputs",
-        .imports = &.{ .build_options, .ml, .inference_tokenizer, .inference_hf_tokenizer, .antfly_image },
+        .imports = &.{ .build_options, .ml, .inference_tokenizer, .inference_hf_tokenizer, .antfly_image, .inference_internal },
     },
     .{
         .name = "prepare-gemma4-text-dataset",
@@ -314,24 +315,22 @@ const commands = [_]common.CommandSpec{
         .name = "generate-gemma4-pilot-dataset",
         .root_source_file = "src/finetune/tools/generate_gemma4_pilot_dataset.zig",
         .description = "Generate a deterministic Gemma4 chat JSONL dataset for 100-example pilot runs",
-        .imports = &.{ .build_options, .inference_internal },
     },
     .{
         .name = "generate-gemma4-multimodal-pilot-dataset",
         .root_source_file = "src/finetune/tools/generate_gemma4_multimodal_pilot_dataset.zig",
         .description = "Generate a deterministic Gemma4 chat JSONL dataset with image parts for multimodal pilot runs",
-        .imports = &.{ .build_options, .inference_internal },
     },
     .{
         .name = "analyze-gemma4-recursive-lora-sweep",
         .root_source_file = "src/finetune/tools/analyze_gemma4_recursive_lora_sweep.zig",
         .description = "Analyze Gemma4 recursive LoRA sweep comparison and write promotion decision",
-        .imports = &.{ .termite_io_compat, .termite_c_file },
+        .imports = &.{.antfly_platform},
         .link_libc = true,
     },
     .{
         .name = "train-eval-gemma4-lora-bundle",
-        .root_source_file = "src/finetune/train/train_eval_gemma4_lora_bundle.zig",
+        .root_source_file = "src/finetune_train_eval_gemma4_lora_bundle.zig",
         .description = "Run a bounded Gemma4 LoRA train/eval step",
         .imports = &.{ .build_options, .ml, .inference_internal, .inference_hf_tokenizer },
         .native_link = .default,
@@ -356,7 +355,7 @@ const commands = [_]common.CommandSpec{
     },
     .{
         .name = "train-eval-colqwen2-lora-bundle",
-        .root_source_file = "src/finetune/train/train_eval_colqwen2_lora_bundle.zig",
+        .root_source_file = "src/finetune_train_eval_colqwen2_lora_bundle.zig",
         .description = "Run a bounded ColQwen2 LoRA train/eval step",
         .imports = &.{ .build_options, .ml, .inference_internal, .inference_tokenizer, .inference_hf_tokenizer },
         .native_link = .no_accel,
@@ -371,7 +370,7 @@ const commands = [_]common.CommandSpec{
         .name = "inspect-layoutlmv3-lora-bundle",
         .root_source_file = "src/finetune/tools/inspect_layoutlmv3_lora_bundle.zig",
         .description = "Inspect a LayoutLMv3 LoRA adapter bundle",
-        .imports = &.{ .build_options, .ml },
+        .imports = &.{ .build_options, .ml, .inference_internal },
     },
     .{
         .name = "materialize-layoutlmv3-checkpoint",
@@ -383,18 +382,18 @@ const commands = [_]common.CommandSpec{
         .name = "train-layoutlmv3-lora-one-step",
         .root_source_file = "src/finetune/train/train_layoutlmv3_lora_one_step.zig",
         .description = "Run one deterministic LayoutLMv3 LoRA update step",
-        .imports = &.{ .build_options, .ml },
+        .imports = &.{ .build_options, .ml, .inference_internal },
     },
     .{
         .name = "train-eval-layoutlmv3-lora-sequence",
-        .root_source_file = "src/finetune/train/train_eval_layoutlmv3_lora_sequence.zig",
+        .root_source_file = "src/finetune_train_eval_layoutlmv3_lora_sequence.zig",
         .description = "Train and evaluate a bounded LayoutLMv3 sequence head with LoRA adapters",
         .imports = gemma_lora_imports,
         .native_link = .no_accel,
     },
     .{
         .name = "train-eval-layoutlmv3-lora-token",
-        .root_source_file = "src/finetune/train/train_eval_layoutlmv3_lora_token.zig",
+        .root_source_file = "src/finetune_train_eval_layoutlmv3_lora_token.zig",
         .description = "Train and evaluate a bounded LayoutLMv3 token head with LoRA adapters",
         .imports = gemma_lora_imports,
         .native_link = .no_accel,
@@ -403,11 +402,11 @@ const commands = [_]common.CommandSpec{
         .name = "train-fused-chunker",
         .root_source_file = "src/finetune_train_fused_chunker_root.zig",
         .description = "End-to-end training for the fused chunker-embedder model",
-        .imports = &.{ .build_options, .ml, .inference_tokenizer, .inference_hf_tokenizer, .inference_linalg },
+        .imports = &.{ .build_options, .ml, .antfly_platform, .inference_tokenizer, .inference_hf_tokenizer, .inference_linalg },
         .native_link = .default,
     },
 };
 
-pub fn register(ctx: common.Context) void {
-    for (commands) |spec| _ = common.addCommand(ctx, spec);
+pub fn register(ctx: common.Context) []const common.Command {
+    return common.addCommands(ctx, &commands);
 }

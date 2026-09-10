@@ -115,6 +115,7 @@ pub fn build(b: *std.Build) void {
             host_count += 1;
         }
     }
+    profiles.addDataToolChecks(b, &steps);
     if (host_count != 4 or test_count == 0 or !vopr_test_found or !lmdb_test_found or !pjrt_test_found or openapi.dependencies.items.len != 2) @panic("cache fixture did not inspect the expected production graph");
     const wasm = artifacts.wasm;
     inline for (.{ .{ "httpx_profile", "lib/httpx/src/httpx.zig" }, .{ "json_profile", "lib/json/src/mod.zig" } }) |probe| {

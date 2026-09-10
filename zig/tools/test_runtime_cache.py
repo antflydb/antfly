@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 import shutil
@@ -90,7 +91,13 @@ class RuntimeCacheTest(unittest.TestCase):
         return path
 
     def build(
-        self, *targets, version="cache-before", backend=None, settings=(), succeeds=True
+        self,
+        *targets,
+        version="cache-before",
+        backend=None,
+        settings=(),
+        succeeds=True,
+        timeout=240,
     ):
         result = subprocess.run(
             [
@@ -114,7 +121,7 @@ class RuntimeCacheTest(unittest.TestCase):
             text=True,
             capture_output=True,
             check=False,
-            timeout=240,
+            timeout=timeout,
         )
         output = result.stdout + result.stderr
         if succeeds:
@@ -618,6 +625,85 @@ class RuntimeCacheTest(unittest.TestCase):
             self.build(*targets, version="cache-after"),
             r"compile exe train-gliner2-autodiff Debug \S+ cached",
         )
+
+    def test_finetune_data_dependencies(self):
+        names = (
+            "generate-gemma4-pilot-dataset",
+            "generate-gemma4-multimodal-pilot-dataset",
+            "prepare-gemma4-text-dataset",
+            "prepare-gemma4-multimodal-dataset",
+        )
+
+        def check(output, rebuilt=()):
+            for name in names:
+                status = "success" if name in rebuilt else "cached"
+                self.assertRegex(output, rf"compile exe {name} Debug \S+ {status}")
+
+        for standalone in (False, True):
+            with self.subTest(standalone=standalone):
+                if standalone:
+                    self.use_standalone()
+                check(self.build("cache-finetune-data"), rebuilt=names)
+                check(self.build("cache-finetune-data"))
+                files = list((self.root / "cache/o").glob("*/*-pilot.csv"))
+                self.assertGreaterEqual(len(files), 2)
+                before = {path: path.read_bytes() for path in files}
+                summaries = list((self.root / "cache/o").glob("*/*-summary.json"))
+                for path in summaries:
+                    self.assertEqual(
+                        json.loads(path.read_text())["examples_written"], 2
+                    )
+                for backend, settings in (
+                    ("metal", ()),
+                    ("cuda", ()),
+                    (None, ("-Dpjrt=true",)),
+                    (
+                        None,
+                        ("-Donnx=true", f"-Donnx-root={self.root / 'missing-onnx'}"),
+                    ),
+                ):
+                    check(
+                        self.build(
+                            "cache-finetune-data", backend=backend, settings=settings
+                        )
+                    )
+                check(self.build("cache-finetune-data", version="unrelated-version"))
+                for path, content in before.items():
+                    self.assertEqual(path.read_bytes(), content)
+                # An actual generator edit must still change the generated data.
+                source = self.own(
+                    "zig/pkg/inference/src/finetune/tools/generate_gemma4_pilot_dataset.zig"
+                )
+                content = source.read_bytes()
+                source.write_bytes(content.replace(b'"orchid"', b'"lilac"'))
+                try:
+                    check(self.build("cache-finetune-data"), rebuilt=(names[0],))
+                    check(self.build("cache-finetune-data"))
+                    outputs = list((self.root / "cache/o").glob("*/text-pilot.jsonl"))
+                    self.assertTrue(
+                        any(b"lilac" in path.read_bytes() for path in outputs)
+                    )
+                finally:
+                    source.write_bytes(content)
+
+    def test_finetune_command_registry(self):
+        shutil.copyfile(
+            ZIG_ROOT / "tools/fixtures/finetune_commands.zig",
+            self.root / "zig/build.zig",
+        )
+        first = self.build("cache-finetune-commands", timeout=1200)
+        names = re.findall(r"^FINETUNE_COMMAND (.+)$", first, re.MULTILINE)
+        self.assertTrue(names)
+        for name in names:
+            self.assertRegex(
+                first, rf"compile exe {re.escape(name)} Debug \S+ (success|cached)"
+            )
+        warm = self.build("cache-finetune-commands", timeout=1200)
+        self.assertEqual(
+            set(names), set(re.findall(r"^FINETUNE_COMMAND (.+)$", warm, re.MULTILINE))
+        )
+        for name in names:
+            self.assertRegex(warm, rf"compile exe {re.escape(name)} Debug \S+ cached")
 
     def test_wasm_profile_cache_contracts(self):
         for source in ("zig/lib/httpx/src/httpx.zig", "zig/lib/json/src/mod.zig"):

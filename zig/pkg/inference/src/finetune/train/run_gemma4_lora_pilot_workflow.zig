@@ -23,7 +23,7 @@ const generate_gemma4_multimodal_pilot_dataset = @import("../tools/generate_gemm
 const generate_gemma4_pilot_dataset = @import("../tools/generate_gemma4_pilot_dataset.zig");
 const materialize_gemma4_teacher_targets = @import("../tools/materialize_gemma4_teacher_targets.zig");
 const prepare_gemma4_lora_inputs = @import("../tools/prepare_gemma4_lora_inputs.zig");
-const train_eval_gemma4_lora_bundle = @import("train_eval_gemma4_lora_bundle.zig");
+const train_eval_gemma4_lora_bundle = inference.finetune.runners.train_eval_gemma4_lora_bundle;
 
 const CommandMain = *const fn (std.process.Init) anyerror!void;
 

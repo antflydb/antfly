@@ -35,11 +35,11 @@ const inspect_colqwen2_checkpoint = @import("../tools/inspect_colqwen2_checkpoin
 const inspect_colqwen2_lora_bundle = @import("../tools/inspect_colqwen2_lora_bundle.zig");
 const inspect_gemma4_lora_bundle = @import("../tools/inspect_gemma4_lora_bundle.zig");
 const inspect_gliner2_checkpoint = @import("../tools/inspect_gliner2_checkpoint.zig");
-const inspect_gliner2_dataset = @import("../tools/inspect_gliner2_dataset.zig");
+const inspect_gliner2_dataset = dataCommand(@import("../tools/inspect_gliner2_dataset.zig"));
 const inspect_gliner2_lora_bundle = @import("../tools/inspect_gliner2_lora_bundle.zig");
 const inspect_layoutlmv3_bundle = @import("../tools/inspect_layoutlmv3_bundle.zig");
 const inspect_layoutlmv3_lora_bundle = @import("../tools/inspect_layoutlmv3_lora_bundle.zig");
-const inspect_reranker_dataset = @import("../tools/inspect_reranker_dataset.zig");
+const inspect_reranker_dataset = dataCommand(@import("../tools/inspect_reranker_dataset.zig"));
 const inspect_reranker_lora_bundle = @import("../tools/inspect_reranker_lora_bundle.zig");
 const materialize_colqwen2_lora = @import("../tools/materialize_colqwen2_lora.zig");
 const materialize_gemma4_lora = @import("../tools/materialize_gemma4_lora.zig");
@@ -52,8 +52,8 @@ const materialize_reranker_lora = @import("../tools/materialize_reranker_lora.zi
 const prepare_colqwen2_inputs = @import("../tools/prepare_colqwen2_inputs.zig");
 const prepare_entity_cleanup_cache = @import("../tools/prepare_entity_cleanup_cache.zig");
 const prepare_gemma4_lora_inputs = @import("../tools/prepare_gemma4_lora_inputs.zig");
-const prepare_gemma4_multimodal_dataset = @import("../tools/prepare_gemma4_multimodal_dataset.zig");
-const prepare_gemma4_text_dataset = @import("../tools/prepare_gemma4_text_dataset.zig");
+const prepare_gemma4_multimodal_dataset = dataCommand(@import("../tools/prepare_gemma4_multimodal_dataset.zig"));
+const prepare_gemma4_text_dataset = dataCommand(@import("../tools/prepare_gemma4_text_dataset.zig"));
 const prepare_gliner2_entity_cleanup_cache = @import("../tools/prepare_gliner2_entity_cleanup_cache.zig");
 const prepare_gliner2_top_layer_boundary_cache = @import("../tools/prepare_gliner2_top_layer_boundary_cache.zig");
 const prepare_reranker_pooled_cache = @import("../tools/prepare_reranker_pooled_cache.zig");
@@ -389,4 +389,14 @@ test "finetune cli command table has unique canonical commands and adapter argv 
             try std.testing.expect(!std.mem.eql(u8, command.adapter_argv0, other.adapter_argv0));
         }
     }
+}
+
+// Reuse data implementations inside this owner without creating another module
+// instance for types that recipe dispatch already imports.
+fn dataCommand(comptime command: type) type {
+    return struct {
+        pub fn main(init: std.process.Init) !void {
+            return command.runWithData(@import("../../finetune_data_root.zig"), init);
+        }
+    };
 }

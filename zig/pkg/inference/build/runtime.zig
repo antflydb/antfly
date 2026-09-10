@@ -383,6 +383,7 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.link_libc = backend.link_libc;
 
     inference_mod.addImport("inference_internal", inference_mod);
+    inference_internal_mod.addImport("inference_internal", inference_internal_mod);
 
     return .{
         .build_info_mod = shared.build_info_mod,

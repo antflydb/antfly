@@ -65,6 +65,7 @@ pub const finetune = struct {
     pub const graph_input_binder = @import("finetune/graph_input_binder.zig");
     pub const reranker_data = @import("finetune/reranker_data.zig");
     pub const reranker = @import("finetune/reranker.zig");
+    pub const reranker_head = @import("finetune/reranker_head.zig");
     pub const reranker_lora = @import("finetune/reranker_lora.zig");
     pub const fused_chunker_data = @import("finetune/fused_chunker_data.zig");
     pub const fused_chunker = @import("finetune/fused_chunker.zig");
@@ -75,6 +76,7 @@ pub const finetune = struct {
     pub const lora_adapter_set = @import("finetune/lora_adapter_set.zig");
     pub const peft = @import("finetune/peft.zig");
     pub const recipe = @import("finetune/recipe.zig");
+    pub const runners = @import("finetune/runners.zig");
     pub const tokenizer_batch = @import("finetune/tokenizer_batch.zig");
 };
 pub const architectures = struct {

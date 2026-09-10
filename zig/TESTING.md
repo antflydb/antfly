@@ -52,7 +52,19 @@ and WASM entry bodies. They
 keep external modules, options, generated assets, backend inputs, and final link
 edges; the inference probe also loads the real inference module. Native training
 and paged-attention benchmarks retain their actual entry bodies and execute small
-workloads. The checks cover:
+workloads. Finetune command checks also retain every registered executable's real
+entry body and final link. The existing `inference-finetune-test` aggregate (or
+standalone `test-finetune`) compiles these commands without running model workloads;
+the command registries supply the coverage without a second command inventory.
+The checks cover:
+
+- Finetune commands compile with valid module boundaries. Recipe dispatch and
+  standalone training entrypoints share their implementation owner. Dataset
+  generators use standard I/O, while converters and inspectors import the data
+  owner without the inference runtime. Actual bounded generators and converters
+  stay cached across Metal, CUDA, PJRT, ONNX, and release-version changes in both
+  entrypoints, even with ONNX enabled and its installation absent. Generated data
+  remains unchanged; editing a generator rebuilds it and changes its output.
 
 - All six served schemas invalidate only the API kernel; the other archives can
   build with a schema missing.

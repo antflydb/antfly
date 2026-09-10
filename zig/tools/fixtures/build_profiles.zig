@@ -69,6 +69,45 @@ pub fn addBenchmarkProbe(b: *std.Build, artifact: *std.Build.Step.Compile) void 
     b.step(b.fmt("cache-{s}", .{artifact.name}), "Read the actual benchmark/library profile").dependOn(&b.addRunArtifact(artifact).step);
 }
 
+/// Run the real text and multimodal data pipeline with two examples each.
+pub fn addDataToolChecks(b: *std.Build, steps: *std.AutoHashMap(*std.Build.Step, void)) void {
+    const names = [_][]const u8{
+        "generate-gemma4-pilot-dataset", "generate-gemma4-multimodal-pilot-dataset",
+        "prepare-gemma4-text-dataset",   "prepare-gemma4-multimodal-dataset",
+    };
+    var artifacts: [names.len]?*std.Build.Step.Compile = @splat(null);
+    var iterator = steps.keyIterator();
+    while (iterator.next()) |entry| {
+        const artifact = entry.*.cast(std.Build.Step.Compile) orelse continue;
+        for (names, 0..) |name, index| {
+            if (std.mem.eql(u8, artifact.name, name)) artifacts[index] = artifact;
+        }
+    }
+    const data_check = b.step("cache-finetune-data", "Run actual bounded finetune data pipelines");
+    for ([_][]const u8{ "text", "multimodal" }, 0..) |kind, index| {
+        const generator = artifacts[index] orelse @panic("missing registered data generator");
+        const converter = artifacts[index + 2] orelse @panic("missing registered data converter");
+        for ([_]*std.Build.Step.Compile{ generator, converter }) |artifact| {
+            if (artifact.root_module.import_table.contains("inference_internal") or
+                artifact.root_module.import_table.contains("build_options"))
+                @panic("data tools depend on inference runtime settings");
+        }
+        const generate = b.addRunArtifact(generator);
+        const data = generate.addOutputFileArg(b.fmt("{s}-pilot.jsonl", .{kind}));
+        generate.addArg("2");
+        if (index == 1) generate.addFileArg(b.addWriteFiles().add("image.ppm", "P3\n1 1\n255\n0 0 0\n"));
+        const convert = b.addRunArtifact(converter);
+        // The legacy text CSV converter accepts prompt/response records; the
+        // chat pilot generator is used directly by the chat training workflow.
+        convert.addFileArg(if (index == 0) b.addWriteFiles().add("instructions.jsonl", "{\"prompt\":\"first\",\"response\":\"one\"}\n{\"prompt\":\"second\",\"response\":\"two\"}\n") else data);
+        convert.addArg("train");
+        _ = convert.addOutputFileArg(b.fmt("{s}-pilot.csv", .{kind}));
+        _ = convert.addOutputFileArg(b.fmt("{s}-summary.json", .{kind}));
+        data_check.dependOn(&convert.step);
+        data_check.dependOn(&generate.step);
+    }
+}
+
 /// Keep the actual inference qualification test's imports and runner.
 pub fn addPjrtQualificationProbe(b: *std.Build, artifact: *std.Build.Step.Compile) bool {
     if (!artifact.kind.isTest() or artifact.test_runner == null) return false;

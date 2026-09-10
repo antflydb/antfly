@@ -43,8 +43,8 @@ pub fn build(b: *std.Build) void {
             b.step("cache-inference", "Link the actual inference dependency graph").dependOn(&b.addRunArtifact(artifact).step);
         }
         if (std.mem.eql(u8, artifact.name, "generate-gemma4-pilot-dataset")) {
-            // Compile and run the actual tool body: it uses inference internals,
-            // but writes deterministic JSONL without any release metadata.
+            // Compile the actual deterministic JSONL tool, without runtime or
+            // release metadata dependencies.
             for (artifact.root_module.link_objects.items) |object| switch (object) {
                 .other_step => |dependency| if (std.mem.eql(u8, dependency.name, "antfly-build-info")) @panic("pilot tool depends on release metadata"),
                 else => {},
@@ -67,5 +67,6 @@ pub fn build(b: *std.Build) void {
             reporting_found = true;
         }
     }
+    profiles.addDataToolChecks(b, &steps);
     if (!pilot_found or !reporting_found or !pjrt_test_found) @panic("standalone fixture did not find its actual tool consumers");
 }
