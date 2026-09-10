@@ -4866,6 +4866,45 @@ test "runtime status disk usage cache is scoped to one root generation and group
     try std.testing.expectEqual(@as(u64, 800), server.runtime_status_disk_usage_cache.get(8).?.disk_bytes);
 }
 
+test "runtime status disk scan uses primary cardinality while derived indexes catch up" {
+    const alloc = std.testing.allocator;
+    var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+    const catalog = antfly.public_api.table_catalog.CatalogSource{ .ptr = undefined, .vtable = undefined };
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(".", catalog, antfly.raft.read_gate.alreadyReadSafeBarrier()),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(".", catalog),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(1),
+        .backend_runtime = runtime.ptr(),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+    const Scanner = struct {
+        calls: usize = 0,
+        fn scan(ptr: ?*anyopaque, _: std.mem.Allocator, _: []const u8) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.calls += 1;
+            return 4096;
+        }
+    };
+    var scanner: Scanner = .{};
+    // An earlier empty observation cannot hide the new primary documents,
+    // even while derived replay is active and its visible count remains zero.
+    try server.runtime_status_disk_usage_cache.put(alloc, 7, .{ .valid = true, .disk_bytes = 0, .lsm_root_generation = 3 });
+    const observation = server.runtimeStatusDiskUsageBytesBestEffortWithScanner(7, "unused", .{
+        .group_id = 7,
+        .metadata = .{ .lsm_root_generation = 3 },
+        .stats = .{ .source_doc_count = 1, .doc_count = 0, .async_indexing = .{ .dense_catch_up = .{ .active = true } } },
+    }, .{ .ptr = &scanner, .scan_fn = Scanner.scan });
+    try std.testing.expect(observation != null);
+    try std.testing.expectEqual(@as(u64, 4096), observation.?.disk_bytes);
+    try std.testing.expectEqual(@as(usize, 1), scanner.calls);
+}
+
 test "runtime status disk scan retries across a reallocation fence and group invalidation remains scoped" {
     const ControlledScanner = struct {
         entered: std.atomic.Value(bool) = .init(false),
@@ -15404,6 +15443,10 @@ pub const DataServer = struct {
         scanner: RuntimeStatusDiskUsageScanner,
     ) ?RuntimeStatusDiskUsageObservation {
         const active = runtimeStatusHasActiveBackgroundWork(status);
+        // Derived indexes can still report zero while durable primary
+        // documents already exist (notably after split snapshot import).
+        // Use the same authoritative count as the control-plane report.
+        const doc_count = controlPlaneDocumentCount(status.stats);
         const lsm_root_generation = if (status.metadata.lsm_root_generation != 0)
             status.metadata.lsm_root_generation
         else
@@ -15423,7 +15466,7 @@ pub const DataServer = struct {
                 lsm_root_generation,
                 now_ns,
                 active,
-                status.stats.doc_count,
+                doc_count,
                 status.stats.storage_change_token,
             )) {
                 const observation = RuntimeStatusDiskUsageObservation{
@@ -15435,7 +15478,7 @@ pub const DataServer = struct {
             }
             self.runtime_status_disk_usage_cache_mutex.unlock();
 
-            if (active and status.stats.doc_count == 0) return null;
+            if (active and doc_count == 0) return null;
             // Take the generation before scanning. A request that arrives
             // during the scan fences this generation and invalidates the
             // cache entry, so the retry below is the first observation that

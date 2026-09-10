@@ -1797,6 +1797,24 @@ const CampaignContext = struct {
         }
     }
 
+    fn retainReplayDivergence(self: *@This(), alloc: std.mem.Allocator, history_index: u64, seed: u64, artifact: *const vopr.trace.Trace, failure: anyerror) !void {
+        // A failed exact replay is itself a finding. Preserve its candidate
+        // before returning; it must never enter the replay-validated corpus.
+        const bytes = try artifact.renderAlloc(alloc);
+        defer alloc.free(bytes);
+        const path = try std.fmt.allocPrint(alloc, "{s}/history-{d}-{x}.voprtrace", .{ self.artifact_dir, history_index, seed });
+        defer alloc.free(path);
+        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = bytes });
+        const retained_path = try std.heap.smp_allocator.dupe(u8, path);
+        errdefer std.heap.smp_allocator.free(retained_path);
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.retained_artifacts.append(std.heap.smp_allocator, retained_path);
+        self.replay_divergences += 1;
+        if (self.first_error == null) self.first_error = failure;
+        std.debug.print("VOPR exact replay failed scenario={s} history={d} error={s} trace={s}\n", .{ self.scenario, history_index, @errorName(failure), path });
+    }
+
     fn runHistory(self: *@This(), history_index: u64) !void {
         const alloc = std.heap.smp_allocator;
         const seed = self.base_seed +% history_index *% 0x9e37_79b9_7f4a_7c15;
@@ -1814,10 +1832,7 @@ const CampaignContext = struct {
         var recorder = try vopr.flight_recorder.Recorder.init(alloc, 1024);
         defer recorder.deinit();
         var replayed = replayKnownScenarioWithRecorder(alloc, &artifact, &recorder) catch |err| {
-            try self.mutex.lock(self.io);
-            defer self.mutex.unlock(self.io);
-            self.replay_divergences += 1;
-            if (self.first_error == null) self.first_error = err;
+            try self.retainReplayDivergence(alloc, history_index, seed, &artifact, err);
             return;
         };
         replayed.deinit();
@@ -2860,4 +2875,37 @@ test "VOPR scenario registry accepts production HA scaling in run and campaign" 
     try std.testing.expectEqual(@as(usize, 600_000), try defaultCampaignTransitions("ha-scaling"));
     try std.testing.expectError(error.TraceOutputRequired, runCommand(std.testing.allocator, std.testing.io, &.{ "--scenario", "ha-scaling" }));
     try std.testing.expectError(error.InvalidCampaignBudget, campaignCommand(std.testing.allocator, std.testing.io, &.{ "--scenario", "ha-scaling", "--histories", "0" }));
+}
+
+test "VOPR scenario registry preserves replay-divergent candidates outside the corpus" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(path);
+    var context = CampaignContext{
+        .io = io,
+        .histories = 1,
+        .transitions = 3,
+        .scenario = "transaction",
+        .base_seed = 1,
+        .artifact_dir = path,
+        .coverage = vopr.coverage.Tracker.init(alloc),
+        .corpus = vopr.corpus.Corpus.init(alloc),
+    };
+    defer context.deinitReport();
+    defer context.coverage.deinit();
+    defer context.corpus.deinit();
+    var artifact = try antfly.transaction_vopr.record(alloc, 1);
+    defer artifact.deinit();
+    try context.retainReplayDivergence(alloc, 0, 1, &artifact, error.ReplayEnabledSetDiverged);
+    try std.testing.expectEqual(@as(u64, 1), context.replay_divergences);
+    try std.testing.expectEqual(error.ReplayEnabledSetDiverged, context.first_error.?);
+    try std.testing.expectEqual(@as(usize, 0), context.corpus.entries.items.len);
+    const encoded = try std.Io.Dir.cwd().readFileAlloc(io, context.retained_artifacts.items[0], alloc, .limited(max_trace_bytes));
+    defer alloc.free(encoded);
+    const expected = try artifact.renderAlloc(alloc);
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, encoded);
 }

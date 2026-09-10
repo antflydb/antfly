@@ -3302,6 +3302,8 @@ pub const HAScalingScenario = struct {
                 std.hash.autoHash(&frontier, owners.boundary);
                 if (owners.primary) |*primary| std.hash.autoHash(&frontier, primary.lastLsn());
                 std.hash.autoHash(&frontier, owners.promoted_lsn);
+                if (owners.server) |*server|
+                    std.hash.autoHash(&frontier, server.ha_primary_mirror_last_lsn.load(.acquire));
                 std.hash.autoHash(&frontier, owners.observed_progress);
             };
         }

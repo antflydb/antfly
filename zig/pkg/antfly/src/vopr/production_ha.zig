@@ -132,7 +132,7 @@ pub const Owners = struct {
     pub fn verify(self: *Owners, executor: http.RequestExecutor, uri: []const u8, key: []const u8, value: []const u8) !void {
         // Standby reads explicitly request the supported stale-read policy;
         // their visible boundary is checked against durable apply progress.
-        const path = try std.fmt.allocPrint(self.alloc, "{s}/tables/ha_docs/documents/{s}?consistency=stale", .{ uri, key });
+        const path = try std.fmt.allocPrint(self.alloc, "{s}/db/v1/tables/ha_docs/documents/{s}?consistency=stale", .{ uri, key });
         defer self.alloc.free(path);
         var response = try executor.execute(self.alloc, .{ .method = .GET, .uri = path });
         defer response.deinit(self.alloc);
@@ -234,7 +234,13 @@ pub const Owners = struct {
         }
     }
 
+    pub fn beginTeardown(self: *Owners) void {
+        if (self.primary_server) |*server| server.beginTeardown();
+        if (self.server) |*server| server.beginTeardown();
+    }
+
     pub fn destroy(self: *Owners) void {
+        self.beginTeardown();
         self.stopPrimary();
         if (self.server) |*server| {
             server.beginTeardown();
@@ -253,6 +259,14 @@ pub const Owners = struct {
 };
 
 test "production HA owners stream and promote through public HTTP on VoprIo" {
+    try testProductionOwners(false);
+}
+
+test "production HA owners cancel after promotion and drain all borrowed tasks" {
+    try testProductionOwners(true);
+}
+
+fn testProductionOwners(cancel_after_promotion: bool) !void {
     const vopr = @import("vopr");
     var allocator: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
     defer std.debug.assert(allocator.deinit() == .ok);
@@ -264,53 +278,90 @@ test "production HA owners stream and promote through public HTTP on VoprIo" {
     var vopr_io = try vopr.vopr_io.VoprIo.init(.{ .tasks = .{ .stack_size = 8 * 1024 * 1024 } });
     defer vopr_io.deinit();
     var backend = try background.BackendRuntimeHandle.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = vopr_io.io() }, .filesystem_io = vopr_io.io() });
-    defer backend.deinit();
+    var backend_live = true;
+    defer if (backend_live) backend.deinit();
+    var standby_backend = try background.BackendRuntimeHandle.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = vopr_io.io() }, .filesystem_io = vopr_io.io() });
+    defer if (backend_live) standby_backend.deinit();
+    var standby_jobs = @import("../storage/vopr_durable_job_lane.zig").Lane.init(alloc, vopr_io.io());
+    defer standby_jobs.deinit();
+    standby_backend.ptr().durable_jobs = standby_jobs.lane();
+    var jobs = @import("../storage/vopr_durable_job_lane.zig").Lane.init(alloc, vopr_io.io());
+    defer jobs.deinit();
+    backend.ptr().durable_jobs = jobs.lane();
     const Worker = struct {
         alloc: std.mem.Allocator,
         io: std.Io,
-        backend: *background.BackendRuntime,
+        backend: *background.BackendRuntimeHandle,
+        standby_backend: *background.BackendRuntimeHandle,
+        backend_live: *bool,
         root: []const u8,
         done: bool = false,
         failure: ?anyerror = null,
+        owners: ?*Owners = null,
+        cancel_after_promotion: bool,
+        promotion_complete: bool = false,
         fn run(self: *@This()) void {
             self.runInner() catch |err| {
                 self.failure = err;
-                if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
+                if (err != error.Canceled) if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
             };
+            self.standby_backend.deinit();
+            self.backend.deinit();
+            self.backend_live.* = false;
             self.done = true;
         }
         fn runInner(self: *@This()) !void {
             const owners = try Owners.create(self.alloc, self.io, self.root);
-            defer owners.destroy();
+            self.owners = owners;
+            defer {
+                owners.destroy();
+                self.owners = null;
+            }
             var client = @import("../common/http/io_http_executor.zig").IoHttpExecutor.init(self.alloc, self.io, .{ .keep_alive = false });
             defer client.deinit();
-            try owners.startPrimary(self.backend);
+            std.debug.print("HA owner: start primary\n", .{});
+            try owners.startPrimary(self.backend.ptr());
             try owners.write(client.executor(), owners.primary_uri.?,
                 \\{"inserts":{"before":{"title":"before-promotion"}},"sync_level":"write"}
             );
-            try owners.startStandby(self.backend);
+            std.debug.print("HA owner: start standby\n", .{});
+            try owners.startStandby(self.standby_backend.ptr());
             try owners.catchUp(client.executor(), owners.primary_uri.?);
+            std.debug.print("HA owner: verify replicated document\n", .{});
             try owners.verify(client.executor(), owners.uri.?, "before", "before-promotion");
             try owners.standbyAdmin(client.executor(), 409);
+            std.debug.print("HA owner: fence primary\n", .{});
             try owners.fence(client.executor(), owners.primary_uri.?);
             try owners.catchUp(client.executor(), owners.primary_uri.?);
+            std.debug.print("HA owner: stop primary\n", .{});
             owners.stopPrimary();
+            std.debug.print("HA owner: promote standby\n", .{});
             try owners.promote(client.executor());
+            self.promotion_complete = true;
+            if (self.cancel_after_promotion) try self.io.sleep(.fromSeconds(3600), .awake);
             try owners.write(client.executor(), owners.uri.?,
                 \\{"inserts":{"after":{"title":"after-promotion"}},"sync_level":"write"}
             );
+            std.debug.print("HA owner: verify replicated document\n", .{});
             try owners.verify(client.executor(), owners.uri.?, "before", "before-promotion");
             try owners.verify(client.executor(), owners.uri.?, "after", "after-promotion");
+            std.debug.print("HA owner: cleanup\n", .{});
         }
     };
-    var worker = Worker{ .alloc = alloc, .io = vopr_io.io(), .backend = backend.ptr(), .root = root };
+    var worker = Worker{ .alloc = alloc, .io = vopr_io.io(), .backend = &backend, .standby_backend = &standby_backend, .backend_live = &backend_live, .root = root, .cancel_after_promotion = cancel_after_promotion };
     _ = vopr_io.io().async(Worker.run, .{&worker});
     var enabled: vopr.transition.List = .{};
     defer enabled.deinit(alloc);
     var events: vopr.event.Sink = .{};
     defer events.deinit(alloc);
     var choices = vopr.choice.PrefixedCooperativeSeeded.init(&.{}, 0xa17f_aa01);
+    var cancellation_requested = false;
     for (0..100_000) |step| {
+        if (cancel_after_promotion and worker.promotion_complete and !cancellation_requested) {
+            cancellation_requested = true;
+            worker.owners.?.beginTeardown();
+            _ = try vopr_io.cancelAndDrainTasksForTeardown(alloc, 100_000);
+        }
         if (vopr_io.scheduler().quiescent()) break;
         enabled.items.clearRetainingCapacity();
         events.deinit(alloc);
@@ -324,8 +375,14 @@ test "production HA owners stream and promote through public HTTP on VoprIo" {
             .enabled = enabled.items.items,
         });
         try vopr_io.scheduler().executeReady(selected, &events, alloc);
-    } else return error.ProductionHATransitionBudgetExceeded;
-    if (worker.failure) |err| return err;
+    } else {
+        std.debug.print("HA owner budget done={} resources={any}\n", .{ worker.done, vopr_io.resourceSnapshot() });
+        return error.ProductionHATransitionBudgetExceeded;
+    }
+    if (cancel_after_promotion) {
+        try std.testing.expectEqual(error.Canceled, worker.failure.?);
+        try std.testing.expect(vopr_io.scheduler().quiescent());
+    } else if (worker.failure) |err| return err;
     try std.testing.expect(worker.done);
     try vopr_io.ensureNoCapabilityViolation();
 }

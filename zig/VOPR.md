@@ -3049,27 +3049,34 @@ bounded `ha-scaling-vopr-test` records and exactly replays one complete history:
 3. Set automatic sharding thresholds and let production status collection and
    median-key RPCs choose a split. During the active transition, fence the old
    HA writer at its durable tail after another public write, catch up the
-   standby, and restart the Raft deployment's metadata leader. Reopen the durable fence store and promote through the authenticated
-   admin API.
+   standby, and restart the Raft deployment's metadata leader. Reopen the
+   durable fence store and promote through the authenticated admin API.
 4. Accept a public write on the promoted HA owner, verify pre/post-promotion
-   values, and finish the Raft deployment's split while public writes continue. Require three published ranges and converged replicas before allowing
+   values, and finish the Raft deployment's split while public writes continue.
+   Require three published ranges and converged replicas before allowing
    automatic merges. Reunite the split siblings, preserving the independent
-   document-ID namespaces of the two original ranges. Lower replication to two, drain the
-   third owner, verify every remaining replica, and stop the drained process.
+   document-ID namespaces of the two original ranges. Lower replication to two,
+   drain the third owner, verify every remaining replica, and stop the drained process.
 
 The oracles check acknowledged document values, exact range coverage without
 gaps or overlap, standby safe-read/apply bounds, fencing, promotion identity,
 replica convergence, bounded completion, and owner cleanup. HA log/slot/progress
 and fencing writes borrow VOPR storage and clocks, including after promotion.
-Automatic planning borrows the DataServer clock and obtains median keys through
-the production routed shard-DB adapter. Disk-size collection uses the owner's
+Automatic planning borrows the DataServer wall and monotonic clocks, so shard
+cooldown expiry is independent of host time and wall-clock corrections. It
+obtains median keys through the production routed shard-DB adapter. Disk-size collection uses the owner's
 filesystem, including virtual storage, rather than opening a private native
-filesystem. Reconstructed metadata owners reinstall their shard RPC callbacks.
+filesystem. Disk-scan admission uses primary document cardinality while derived
+indexes catch up, so a populated split destination can supply merge evidence.
+Reconstructed metadata owners reinstall their shard RPC callbacks.
 HA replication uses its separate internal bearer credential; the fixture
 configures that credential independently of the HA admin endpoint. Restarted
 Raft owners retain the externally bound listener URL in their registration.
-`ha-production-vopr-test` isolates the production HA lifecycle on `VoprIo`;
+`ha-production-vopr-test` isolates the production HA lifecycle on `VoprIo` and
+cancels immediately after promotion to verify task and network cleanup;
 `ha-scaling-vopr-test` also checks the composed history and exact replay.
+The maintenance coordinator closes admission and exits when its borrowed lane
+is canceled, allowing the remaining registration owners to unwind.
 
 This is a bounded composition, not exhaustive fault coverage. The existing
 fixture retains a native temporary namespace for ancillary stores such as the

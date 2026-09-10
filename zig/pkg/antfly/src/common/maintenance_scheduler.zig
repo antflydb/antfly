@@ -231,10 +231,37 @@ pub const Scheduler = struct {
             self.changed.waitTimeout(self.io, .{ .duration = .{
                 .raw = Io.Duration.fromMilliseconds(@intCast(@max(1, wait_ms))),
                 .clock = .awake,
-            } }) catch {};
+            } }) catch |err| switch (err) {
+                error.Timeout => {},
+                error.Canceled => {
+                    // Deployment cancellation may precede owner destruction.
+                    // Stop admitting passes while registration owners unwind;
+                    // retrying this wait would keep their borrowed lane alive.
+                    self.mutex.lockUncancelable(self.io);
+                    self.stopping = true;
+                    self.mutex.unlock(self.io);
+                    return;
+                },
+            };
         }
     }
 };
+
+test "maintenance scheduler cancellation closes admission before owner destruction" {
+    var threaded = Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(2) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const scheduler = try Scheduler.create(std.testing.allocator, io, 2);
+    defer scheduler.destroy();
+    scheduler.coordinator.?.cancel(io);
+    const Probe = struct {
+        fn step(_: *@This()) ?u64 {
+            return null;
+        }
+    };
+    var probe: Probe = .{};
+    try std.testing.expectError(error.BackendRuntimeShuttingDown, scheduler.register(&probe, Probe.step));
+}
 
 test "maintenance scheduler handles hundreds of parked owners with bounded runnable capacity" {
     var threaded = Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(4) });

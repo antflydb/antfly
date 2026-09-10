@@ -5727,6 +5727,13 @@ pub const Fixture = struct {
             !try self.lookupContains("docs", "doc:x", "production-right") or
             !try self.lookupContains("tenant_b_docs", "tenant:q", "production-tenant"))
             return error.ProductionHAScalingLostAcknowledgedWrite;
+        // Public reads can use a valid routing snapshot while the restarted
+        // metadata quorum is electing. Advance the real control plane before
+        // consulting its committed range projection, with a bounded recovery.
+        for (0..256) |_| {
+            if (self.metadata.?.cluster.currentMetadataLeaderIndex() != null) break;
+            try self.runOneControlRound();
+        } else return error.MetadataLeaderUnavailable;
         const leader = self.metadata.?.cluster.currentMetadataLeaderIndex() orelse return error.MetadataLeaderUnavailable;
         const ranges = try self.metadata.?.cluster.node(leader).listProjectedRanges(self.alloc);
         defer self.metadata.?.cluster.node(leader).freeProjectedRanges(self.alloc, ranges);
@@ -5780,6 +5787,7 @@ pub const Fixture = struct {
         var workflow = metadata_workflow.TableWorkflow.init(self.alloc);
         defer workflow.deinit();
         workflow.controlLoop().setClock(self.backend_runtimes[0].ptr().clock());
+        workflow.loop.reconciler.config.monotonic_clock = self.backend_runtimes[0].ptr().monotonicClock();
         self.ha_shard_db = hosted_shard_ops.HostedShardDbAdapter.init(
             self.alloc,
             try self.metadata.?.externalCatalogSource(0),
@@ -5808,7 +5816,7 @@ pub const Fixture = struct {
         try owners.write(self.executor.executor(), owners.primary_uri.?,
             \\{"inserts":{"ha:before":{"title":"ha-before-scaling"}},"sync_level":"write"}
         );
-        try owners.startStandby(self.backend_runtimes[0].ptr());
+        try owners.startStandby(self.backend_runtimes[1].ptr());
         try owners.catchUp(self.executor.executor(), owners.primary_uri.?);
         try owners.verify(self.executor.executor(), owners.uri.?, "ha:before", "ha-before-scaling");
         try owners.standbyAdmin(self.executor.executor(), 409);
@@ -5830,7 +5838,7 @@ pub const Fixture = struct {
         // No split key, destination, or placement is supplied by this history.
         workflow.loop.reconciler.config.max_shard_size_bytes = 1;
         workflow.loop.reconciler.config.max_shards_per_table = 3;
-        workflow.loop.reconciler.config.shard_cooldown_millis = 0;
+        workflow.loop.reconciler.config.shard_cooldown_millis = 1;
         var admitted: ?u64 = null;
         for (0..256) |_| {
             try self.haReconcile(&workflow);
@@ -6575,6 +6583,7 @@ pub const Fixture = struct {
         self.global_query_transport_fault_endpoint = null;
         self.sim.setOutboundEndpointOutage(null);
         self.driver_stop = true;
+        if (self.ha_owners) |owners| owners.beginTeardown();
         if (self.public_executor_live) self.public_executor.beginShutdown();
         if (self.transition_executor_live) self.transition_executor.beginShutdown();
         if (self.executor_live) self.executor.beginShutdown();

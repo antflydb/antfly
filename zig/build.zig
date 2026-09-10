@@ -8465,7 +8465,7 @@ pub fn build(b: *std.Build) void {
 
     const ha_production_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{"production HA owners stream and promote"},
+        .filters = &.{"production HA owners"},
         .max_rss = full_cluster_vopr_max_rss,
     });
     const run_ha_production_vopr_tests = b.addRunArtifact(ha_production_vopr_tests);

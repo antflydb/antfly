@@ -42,7 +42,8 @@ borrowed-`std.Io` entropy calls.
 The production HA/scaling composition also audits `production_ha.zig`. Its
 primary, standby receive/progress, replication slots, and fencing stores borrow
 the shared VOPR filesystem and clock; promoted slot ownership preserves those
-same dependencies. Automatic sharding borrows the owner's clock, reads disk
+same dependencies. Automatic sharding borrows the owner's wall and monotonic
+clocks, including cooldown expiry independently of realtime corrections, reads disk
 size through its filesystem, and obtains median keys through the production
 shard RPC adapter. Compact observations include HA durable/apply frontiers and production
 Raft progress rather than native paths or addresses. The production fixture's
