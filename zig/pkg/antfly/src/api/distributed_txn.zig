@@ -2001,6 +2001,9 @@ fn executeMultiTableCommitOnce(
         if (firstFanoutError(fanout_slots)) |participant_index| {
             const participant = participants.items[participant_index];
             const err = fanout_slots[participant_index].err.?;
+            std.log.warn("transaction prepare failed table={s} group_id={} err={s}", .{
+                participant.table_name, participant.group_id, @errorName(err),
+            });
             switch (err) {
                 error.IntentConflict, error.VersionConflict => {
                     if (trace_writer) |tw| {

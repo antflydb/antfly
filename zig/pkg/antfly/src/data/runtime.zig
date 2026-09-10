@@ -5600,6 +5600,7 @@ pub const DataServer = struct {
     /// slices directly instead of rebuilding topology indexes and duplicating
     /// every voter/learner set. Guarded by data_raft_reconcile_mutex.
     last_data_raft_local_intents: []antfly.raft.PlacementIntent = &.{},
+    last_data_raft_placement_inputs: ?DataRaftPlacementInputs = null,
     last_data_raft_storage_ownership_fingerprint: ?u64 = null,
     last_data_raft_status_fingerprint: ?u64 = null,
     /// Last successfully reconciled local ownership scope. The post-drop
@@ -9627,13 +9628,14 @@ pub const DataServer = struct {
         return null;
     }
 
-    fn dataRaftForwardIo(self: *DataServer) ?std.Io {
-        // Forwarded HTTP requests need concurrent request, deadline, and
-        // connect tasks. Keep that fanout off the small control executor used
-        // by read barriers and reconciliation. The runtime supplies either
-        // its bounded outbound network lane or the caller's borrowed I/O.
-        const runtime = self.backend_runtime orelse return null;
-        return runtime.raftOutboundIo();
+    fn acquireDataRaftForwardLane(self: *DataServer) !backend_runtime_mod.BackendRuntime.RequestForwardLaneLease {
+        const runtime = self.backend_runtime orelse return error.BackendRuntimeUnavailable;
+        return runtime.acquireRequestForwardLane() catch |err| switch (err) {
+            // This request has not entered transport. Report safe admission
+            // failure through the existing leader-unavailable classification.
+            error.RequestForwardCapacityUnavailable => error.LeaderUnavailable,
+            else => err,
+        };
     }
 
     fn dataRaftMonotonicNs(self: *DataServer) u64 {
@@ -10097,8 +10099,10 @@ pub const DataServer = struct {
                             // registering here guarantees that even a
                             // single-node commit cannot publish its outcome
                             // before the waiter exists.
-                            apply_sm.registerApplyOutcomeWaiter(group_id, index, proposal_term) catch
+                            apply_sm.registerApplyOutcomeWaiter(group_id, index, proposal_term) catch |err| {
+                                std.log.warn("data raft batch outcome waiter failed group_id={} index={} term={} err={s}", .{ group_id, index, proposal_term, @errorName(err) });
                                 return error.RaftBatchWriteOutcomeUnknown;
+                            };
                             outcome_waiter_index = index;
                         }
                     }
@@ -10186,13 +10190,18 @@ pub const DataServer = struct {
                     }) catch return error.RaftBatchWriteOutcomeUnknown;
                     const apply_sm = self.data_raft_apply orelse
                         return error.RaftBatchWriteOutcomeUnknown;
-                    const outcome = apply_sm.takeApplyOutcome(group_id, index) orelse
+                    const outcome = apply_sm.takeApplyOutcome(group_id, index) orelse {
+                        std.log.warn("data raft batch outcome missing group_id={} index={}", .{ group_id, index });
                         return error.RaftBatchWriteOutcomeUnknown;
+                    };
                     outcome_waiter_index = null;
                     switch (outcome) {
                         .succeeded => {},
                         .failed => |failure| return failure.toError(),
-                        .pending, .unknown => return error.RaftBatchWriteOutcomeUnknown,
+                        .pending, .unknown => {
+                            std.log.warn("data raft batch outcome unconfirmed group_id={} index={} outcome={s}", .{ group_id, index, @tagName(outcome) });
+                            return error.RaftBatchWriteOutcomeUnknown;
+                        },
                     }
                     self.reachDataRequestLifecycle(.{
                         .phase = .apply_confirmed,
@@ -10293,9 +10302,11 @@ pub const DataServer = struct {
                                 // executor here escapes VoprIo and gives this
                                 // request a different clock/socket owner than
                                 // the Raft process that selected the route.
+                                var forward_lane = try self.acquireDataRaftForwardLane();
+                                defer forward_lane.release();
                                 var executor = antfly.common.http.IoHttpExecutor.init(
                                     alloc,
-                                    self.dataRaftForwardIo() orelse return error.BackendRuntimeUnavailable,
+                                    forward_lane.io(),
                                     .{},
                                 );
                                 defer executor.deinit();
@@ -10516,9 +10527,11 @@ pub const DataServer = struct {
         const target_store = findSnapshotStoreByNodeId(snapshot.stores, target_node_id) orelse return false;
         if (target_store.api_url.len == 0) return false;
 
+        var forward_lane = try self.acquireDataRaftForwardLane();
+        defer forward_lane.release();
         var executor = antfly.common.http.IoHttpExecutor.init(
             alloc,
-            self.dataRaftForwardIo() orelse return error.BackendRuntimeUnavailable,
+            forward_lane.io(),
             .{},
         );
         defer executor.deinit();
@@ -14860,6 +14873,8 @@ pub const DataServer = struct {
     fn freeCachedDataRaftLocalIntents(self: *DataServer) void {
         self.freeDataRaftLocalIntents(self.last_data_raft_local_intents);
         self.last_data_raft_local_intents = &.{};
+        if (self.last_data_raft_placement_inputs) |*inputs| inputs.deinit(self.alloc);
+        self.last_data_raft_placement_inputs = null;
     }
 
     fn replaceCachedDataRaftLocalIntents(
@@ -14902,14 +14917,17 @@ pub const DataServer = struct {
         const registration = self.store_registration orelse return;
         const metadata_epoch = snapshot.status.metadata_epoch;
 
-        // Lifecycle epochs are local to each metadata process. A fresh quorum
-        // read must inspect its actual plan even if another peer reused the
-        // same counter; only ordinary observations may reuse the local plan.
-        const stable_cached_epoch = authority == .observation and metadata_epoch != 0 and
-            self.last_data_raft_reconciled_metadata_epoch == metadata_epoch;
+        // Compare the inputs that built the admitted plan, including remote
+        // member rows and split bootstrap voters. This allocation-free check
+        // works across peer changes, equal counters, and unrelated lifecycle
+        // activity without reconstructing topology or obtaining another fence.
+        const stable_inputs = if (self.last_data_raft_placement_inputs) |*inputs|
+            inputs.matches(snapshot)
+        else
+            false;
         stable_round: {
-            if (!stable_cached_epoch) break :stable_round;
-            // The epoch-owned plan is immutable. Stable rounds borrow it
+            if (!stable_inputs) break :stable_round;
+            // The admitted plan is immutable. Stable rounds borrow it
             // directly, avoiding topology-index construction and per-group
             // voter/learner duplication while still advancing Raft state.
             const local_intents = self.last_data_raft_local_intents;
@@ -14985,9 +15003,11 @@ pub const DataServer = struct {
         var cache_transferred = false;
         defer if (!cache_transferred) self.freeDataRaftLocalIntents(next_cached_local_intents);
         if (authority == .observation and
-            (self.last_data_raft_reconciled_metadata_epoch == null or
+            (self.last_data_raft_placement_inputs == null or
                 !dataRaftPlacementAuthorityMatches(self.last_data_raft_local_intents, next_cached_local_intents)))
             return error.MetadataReconciliationRequiresAuthority;
+        var next_inputs = try DataRaftPlacementInputs.clone(self.alloc, snapshot);
+        defer next_inputs.deinit(self.alloc);
         var next_group_table_names = try self.buildLocalDataRaftGroupTableNames(snapshot, next_cached_local_intents);
         defer {
             var it = next_group_table_names.valueIterator();
@@ -15184,6 +15204,8 @@ pub const DataServer = struct {
         const status_fingerprint = self.maintainDataRaftLeadership(snapshot, next_cached_local_intents, registration.node_id);
         self.observeDataRaftStatusFingerprint(status_fingerprint);
         self.replaceCachedDataRaftLocalIntents(next_cached_local_intents);
+        self.last_data_raft_placement_inputs = next_inputs;
+        next_inputs = .{};
         cache_transferred = true;
         next_cached_local_intents = &.{};
         if (metadata_epoch != 0) self.last_data_raft_reconciled_metadata_epoch = metadata_epoch;
@@ -18946,6 +18968,46 @@ fn nodeIdInSlice(node_ids: []const u64, node_id: u64) bool {
     }
     return false;
 }
+
+/// Owned inputs for one admitted placement plan. Operational status is absent:
+/// lifecycle ticks and peer-local counters cannot invalidate or validate it.
+/// Comparisons borrow these values; only a changed plan allocates a replacement.
+const DataRaftPlacementInputs = struct {
+    metadata_group_id: u64 = 0,
+    metadata_incarnation: ?antfly.metadata_api.MetadataClusterIncarnation = null,
+    intents: []antfly.raft.PlacementIntent = &.{},
+    split_destinations: []u64 = &.{},
+
+    fn clone(alloc: std.mem.Allocator, snapshot: *const antfly.metadata_api.AdminSnapshot) !@This() {
+        var result: @This() = .{
+            .metadata_group_id = snapshot.status.metadata_group_id,
+            .metadata_incarnation = snapshot.status.metadata_incarnation,
+        };
+        errdefer result.deinit(alloc);
+        result.intents = try clonePlacementIntentsOwned(alloc, snapshot.placement_intents);
+        result.split_destinations = try alloc.alloc(u64, snapshot.split_transitions.len);
+        for (result.split_destinations, snapshot.split_transitions) |*destination, transition|
+            destination.* = transition.destination_group_id;
+        return result;
+    }
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.intents) |intent| antfly.raft.reconciler.freeIntentOwned(alloc, intent);
+        alloc.free(self.intents);
+        alloc.free(self.split_destinations);
+        self.* = .{};
+    }
+
+    fn matches(self: *const @This(), snapshot: *const antfly.metadata_api.AdminSnapshot) bool {
+        if (self.metadata_group_id != snapshot.status.metadata_group_id or
+            !std.meta.eql(self.metadata_incarnation, snapshot.status.metadata_incarnation) or
+            !dataRaftPlacementAuthorityMatches(self.intents, snapshot.placement_intents) or
+            self.split_destinations.len != snapshot.split_transitions.len) return false;
+        for (self.split_destinations, snapshot.split_transitions) |destination, transition|
+            if (destination != transition.destination_group_id) return false;
+        return true;
+    }
+};
 
 const PlacementTopologyIndex = struct {
     const Group = struct {
@@ -26429,8 +26491,14 @@ test "data raft ticker advances consensus independently of control rounds" {
     replacement_intents[0].record.metadata_version += 1;
     replacement.placement_intents = &replacement_intents;
     try std.testing.expectError(error.MetadataReconciliationRequiresAuthority, server.syncDataRaftFromSnapshot(&replacement, .observation));
+    replacement.status.metadata_epoch = snapshot.status.metadata_epoch;
+    try std.testing.expectError(error.MetadataReconciliationRequiresAuthority, server.syncDataRaftFromSnapshot(&replacement, .observation));
+    stale.status.metadata_epoch = snapshot.status.metadata_epoch;
+    try std.testing.expectError(error.MetadataReconciliationRequiresAuthority, server.syncDataRaftFromSnapshot(&stale, .observation));
     // Unchanged placement remains entirely local and borrows the prior plan.
-    try server.syncDataRaftFromSnapshot(&snapshot, .observation);
+    var unchanged = snapshot;
+    unchanged.status.metadata_epoch = 1002;
+    try server.syncDataRaftFromSnapshot(&unchanged, .observation);
     try std.testing.expectEqual(cached_intents_ptr, server.last_data_raft_local_intents.ptr);
 
     {
@@ -35434,8 +35502,10 @@ test "data raft retry clock and sleep borrow VoprIo" {
     defer runtime.deinit();
     var server: DataServer = undefined;
     server.backend_runtime = runtime.ptr();
-    try std.testing.expectEqual(io.userdata, server.dataRaftForwardIo().?.userdata);
-    try std.testing.expectEqual(io.vtable, server.dataRaftForwardIo().?.vtable);
+    var forward_lane = try server.acquireDataRaftForwardLane();
+    defer forward_lane.release();
+    try std.testing.expectEqual(io.userdata, forward_lane.io().userdata);
+    try std.testing.expectEqual(io.vtable, forward_lane.io().vtable);
     try std.testing.expectEqual(@as(u64, 0), server.dataRaftMonotonicNs());
     const metadata_budget = antfly.metadata_http_client.RequestBudget{
         .deadline_ns = 2 * data_raft_batch_leader_retry_sleep_ns,
@@ -41129,6 +41199,19 @@ test "data raft forwarding progresses while the control executor is saturated" {
     }
     try std.testing.expectError(error.ConcurrencyUnavailable, control_io.concurrent(Worker.run, .{ control_io, &release }));
 
+    const raft_io = backend_runtime.ptr().raftOutboundIo().?;
+    var raft_release: std.Io.Event = .unset;
+    var raft_tasks: [@import("../common/threaded_io_limits.zig").backend_runtime_raft_outbound]std.Io.Future(void) = undefined;
+    var raft_started: usize = 0;
+    defer {
+        raft_release.set(raft_io);
+        for (raft_tasks[0..raft_started]) |*task| task.await(raft_io);
+    }
+    for (&raft_tasks) |*task| {
+        task.* = try raft_io.concurrent(Worker.run, .{ raft_io, &raft_release });
+        raft_started += 1;
+    }
+
     var peer = try httpx.TestServer.start(alloc, std.testing.io, &.{.{
         .method = .POST,
         .path = "/internal/v1/groups/7/tables/docs/batch-routed-v1",
@@ -41138,7 +41221,9 @@ test "data raft forwarding progresses while the control executor is saturated" {
     defer peer.deinit();
     var serving = try std.testing.io.concurrent(httpx.TestServer.handleOne, .{&peer});
     defer serving.cancel(std.testing.io) catch {};
-    var executor = antfly.common.http.IoHttpExecutor.init(alloc, server.dataRaftForwardIo().?, .{});
+    var forward_lane = try server.acquireDataRaftForwardLane();
+    defer forward_lane.release();
+    var executor = antfly.common.http.IoHttpExecutor.init(alloc, forward_lane.io(), .{});
     defer executor.deinit();
     var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
     var response = try client.fetchGroupBatchWithForwarding(
@@ -41155,6 +41240,49 @@ test "data raft forwarding progresses while the control executor is saturated" {
     try std.testing.expectEqualStrings("{\"inserted\":1}", response.body);
     try serving.await(std.testing.io);
     try std.testing.expectEqual(@as(usize, 1), peer.route_hits[0]);
+
+    raft_release.set(raft_io);
+    for (raft_tasks[0..raft_started]) |*task| task.await(raft_io);
+    raft_started = 0;
+
+    // The inverse dependency must also hold: long-running forwarded requests
+    // cannot consume the capacity needed to replicate and confirm their work.
+    const forward_io = forward_lane.io();
+    var forward_release: std.Io.Event = .unset;
+    var forward_tasks: [@import("../common/threaded_io_limits.zig").backend_runtime_request_forward]std.Io.Future(void) = undefined;
+    var forward_started: usize = 0;
+    defer {
+        forward_release.set(forward_io);
+        for (forward_tasks[0..forward_started]) |*task| task.await(forward_io);
+    }
+    for (&forward_tasks) |*task| {
+        task.* = try forward_io.concurrent(Worker.run, .{ forward_io, &forward_release });
+        forward_started += 1;
+    }
+    var consensus_peer = try httpx.TestServer.start(alloc, std.testing.io, &.{.{
+        .method = .POST,
+        .path = "/raft/v1/batch",
+        .respond = .{ .status = 200, .body = "{}" },
+        .max_uses = 1,
+    }});
+    defer consensus_peer.deinit();
+    var consensus_serving = try std.testing.io.concurrent(httpx.TestServer.handleOne, .{&consensus_peer});
+    defer consensus_serving.cancel(std.testing.io) catch {};
+    var consensus_executor: antfly.common.http.StdHttpExecutor = undefined;
+    consensus_executor.initSharedInPlace(alloc, .{}, backend_runtime.ptr().raftOutboundIoImpl().?);
+    defer consensus_executor.deinit();
+    const consensus_uri = try std.fmt.allocPrint(alloc, "{s}/raft/v1/batch", .{consensus_peer.baseUrl()});
+    defer alloc.free(consensus_uri);
+    var consensus_response = try consensus_executor.executor().execute(alloc, .{
+        .method = .POST,
+        .uri = consensus_uri,
+        .body = "{}",
+        .timeout_ms = 5000,
+    });
+    defer consensus_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), consensus_response.status);
+    try consensus_serving.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 1), consensus_peer.route_hits[0]);
 }
 
 test "data runtime background worker capacity is reserved and closes with its owner" {

@@ -4,6 +4,42 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## Review follow-up: forwarding capacity and equal placement counters (#694)
+
+Review reproduced two independent defects on `9e5b558ce`. Saturating the shared
+32-worker outbound executor prevented an actual Raft HTTP request from starting
+with `ConcurrencyUnavailable` (`/private/tmp/ci694-review-outbound-capacity.log`).
+Forwarded application writes now acquire a lease on their own bounded executor
+before transport admission. Each lease reserves six workers for the nested
+HTTP/1 request, connect, socket, and deadline tasks; the default 32-worker lane
+admits five simultaneous forwards. Excess requests report the existing safe
+leader-unavailable classification before sending. Teardown closes admission and
+drains leases before destroying the executor. Borrowed I/O remains authoritative.
+The default API allocation changes from 48 to 16 workers to fund the new lane;
+the aggregate remains 252 under the existing 256-worker ceiling. A regression
+proves both forwarding under Raft/control saturation and Raft HTTP progress under
+forwarding saturation. Capacity and shutdown tests cover rejection and draining.
+
+The second regression supplied changed placement with the same peer-local epoch
+as the admitted plan. Before the fix, observation reconciliation succeeded
+instead of requiring authority (`/private/tmp/ci694-review-epoch-collision.log`).
+The stable path now compares owned placement inputs by value: metadata identity,
+all local and remote placement rows, and split destination IDs. Equal counters
+cannot bypass authority for a changed local plan. Unrelated status/counter changes
+reuse the admitted plan without allocation, topology reconstruction, or a quorum
+read. This retains one copy of placement inputs and performs an exact linear
+comparison; changed inputs rebuild the candidate plan before deciding whether
+fresh authority is required. Regressions cover equal-counter replacement/removal,
+unchanged placement with a different counter, and authoritative deletion.
+
+All 176 data-runtime tests and 62 backend-runtime/capacity tests pass with no
+skips or leaks (`/private/tmp/ci694-review-fixes-data-runtime.log` and
+`/private/tmp/ci694-review-fixes-lane-lifecycle.log`). Fresh Linux acceptance is
+required. The prior `9e5b558ce` soak has a seed-write outcome failure; its preserved
+transaction records are aborted on all three shards, which does not establish
+the source of the original ambiguity. Additional bounded prepare/apply outcome
+diagnostics preserve that distinction without changing retries or deadlines.
+
 ## Metadata cache incorrectly orders peer-local lifecycle counters (#694)
 
 Ordinary metadata cache refresh compared `AdminSnapshot.status.metadata_epoch`
@@ -529,8 +565,9 @@ Both known-leader and placement-fallback forwarding used `dataRaftIo()`, which
 selects the runtime's eight-worker control executor. HTTP forwarding submits
 nested request, deadline, and connection tasks. Concurrent transaction
 participants compete with control work for those eight slots, and admission
-failure can occur after a request starts. Forwarding now uses the existing
-bounded outbound Raft network executor. Control waits retain their executor,
+failure can occur after a request starts. The initial fix moved forwarding to
+the bounded outbound Raft network executor. The review follow-up above replaces
+that sharing with a dedicated lane and whole-request admission. Control waits retain their executor,
 and borrowed runtimes retain their caller-supplied transport authority. Neither
 the aggregate worker budget nor the write deadline is increased.
 

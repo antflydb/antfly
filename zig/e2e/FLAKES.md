@@ -1,5 +1,21 @@
 # Zig E2E flakes
 
+## 2026-09-10: review closes forwarding and placement authority gaps (#694)
+
+The `9e5b558ce` mixed soak has a backup seed-write `409 write outcome unknown`
+and therefore fails acceptance. The first failure is preserved in
+`/private/tmp/ci694-first-final-failure.tar.gz`; the durable transaction records
+show abort on all three groups. Its original transport/apply cause is unresolved.
+
+Independent deterministic review probes reproduced Raft transport starvation
+from sharing its executor with forwarded writes, and changed placement bypassing
+authority when two peers return the same lifecycle counter. Forwarding now has
+separate bounded whole-request admission. Placement reuse compares the exact
+plan inputs, including remote member rows and split bootstrap inputs. See
+`../FLAKES.md` for the production contract, resource budget, and before/after
+regressions. Fresh 100/100 runs for each of the three split scenarios must use
+these completed changes; earlier passing subsets do not count.
+
 ## 2026-09-10: data-Raft placement requires authority before retirement (#694)
 
 The preserved `sjng4qip` backup failure contained repeated restored-group
@@ -53,7 +69,7 @@ entries so later failures can be compared with the original signature.
 | Test | CI evidence | Fix commit | Status |
 | --- | --- | --- | --- |
 | Same CLI pipeline, completion regresses between `index get` and `index list` | [PR #696, run 34428885099, job 102726530711](https://github.com/antflydb/antfly/actions/runs/34428885099/job/102726530711?pr=696) | PR #694 | Reproduced with the original Linux CI executable; delayed source callbacks now recognize completed observations within the same catalog epoch. See below. |
-| Same three-by-three backup test, seed batch `409 write outcome unknown` | [PR #694, run 34423487352, job 102714559943](https://github.com/antflydb/antfly/actions/runs/34423487352/job/102714559943) | This change | Reproduced control-executor exhaustion; forwarding moved to outbound Raft executor. The initial 59/60 soak exposed table-create discovery defects, addressed below. Final merged-runtime soak: 90/90 passed (60 ordinary, 30 stalled-route). |
+| Same three-by-three backup test, seed batch `409 write outcome unknown` | [PR #694, run 34423487352, job 102714559943](https://github.com/antflydb/antfly/actions/runs/34423487352/job/102714559943) | This change | Reproduced control-executor exhaustion; review follow-up isolates forwarding from Raft transport with bounded admission. Earlier merged-runtime soak: 90/90 passed (60 ordinary, 30 stalled-route); current 100-per-scenario acceptance remains outstanding. |
 | `test_index_lifecycle.py::test_serverless_named_embedding_indexes_report_publication_actions` | [PR #692, run 34420585088, job 102704104941](https://github.com/antflydb/antfly/actions/runs/34420585088/job/102704104941?pr=692) | This change | Filesystem GET keeps metadata and payload on one open descriptor across atomic publication; see [deterministic reproduction and validation](../FLAKES.md#serverless-build-status-preconditionfailed-during-publication-692). |
 | `test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities` | [PR #690, run 34395199129, job 102623777993](https://github.com/antflydb/antfly/actions/runs/34395199129/job/102623777993?pr=690) | This change | Resolver work moved out of refresh; per-group Raft apply deferral preserves healthy progress; see [runtime investigation and validation](../FLAKES.md#autograph-second-document-write-timeout-690). |
 | `test_retrieval.py::test_retrieval_agent_streaming_fallback_progress` | [PR #657, run 34176604388, job 101914807099](https://github.com/antflydb/antfly/actions/runs/34176604388/job/101914807099?pr=657), head [`bc8f8a20d`](https://github.com/antflydb/antfly/commit/bc8f8a20d34534969decc90813fbcb8f390164f1) | [`47106c1fd`](https://github.com/antflydb/antfly/commit/47106c1fd09e9be5f1e3333363fd77d007813632) | Teardown recovery fixed; original reset cause unknown; 30/30 soak runs passed. |

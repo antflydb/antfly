@@ -10946,7 +10946,10 @@ pub const ApiHttpServer = struct {
             // Preserve the conservative do-not-retry signal, not an internal
             // server error or an assertion that nothing was written.
             error.ClientShuttingDown,
-            => return error.WriteOutcomeUnknown,
+            => {
+                std.log.warn("public table batch outcome unknown table={s} err={s}", .{ table_name, @errorName(err) });
+                return error.WriteOutcomeUnknown;
+            },
             // The public batch path is atomic: multi-group writes use 2PC and
             // the single-group fast path is one Raft command. Preserve the
             // conservative do-not-retry signal if a legacy adapter reports a
