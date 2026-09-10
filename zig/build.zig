@@ -3606,6 +3606,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "preload model spec parser categorizes registry variants and backends",
             "inference runtime preload parser preserves registry variants and explicit backends",
+            "inference run config",
             "inference list accepts models directory before or after flags",
         },
         .test_runner = .{
@@ -5008,6 +5009,7 @@ pub fn build(b: *std.Build) void {
         "data raft draining leader remains stable through membership expansion",
         "data raft removed leader handoff campaigns preferred serving survivor",
         "data raft source lifecycle commands bypass document db apply while receiver checkpoints apply",
+        "data raft apply defers refresh contention before mutation and retries exactly once",
         "data raft retry checkpoints survive changed ready windows and publication failure",
         "data raft document apply identity prevents non-idempotent restart replay",
         "data raft replica retirement removes only retired group apply state",
@@ -5059,6 +5061,7 @@ pub fn build(b: *std.Build) void {
         "data public API listener uses public API request body limit",
         "data server can register a store without enabling data raft",
         "data server registered data raft uses wal state backend by default",
+        "data raft read safety deadline and cancellation cover owner lock admission",
         "data raft read safety barrier completes only after matching ReadState apply",
         "data raft read safety barrier rejects pre-restart responses for both read paths",
         "data raft ticker advances consensus independently of control rounds",
@@ -5248,6 +5251,8 @@ pub fn build(b: *std.Build) void {
     lib_data_storage_test_step.dependOn(&run_lib_data_storage_tests.step);
 
     const db_enrichment_filters: []const []const u8 = &.{
+        "db resolver worker resumes durable backfill after deferred activation and reopen",
+        "db managed resolver changes fence in-flight replay and reset durable cursors",
         "storage.db.db.test.db batch marks generated enrichment replay",
         "storage.db.db.test.db computeEnrichments",
         "storage.db.db.test.db leased enrichment",
@@ -7499,7 +7504,6 @@ pub fn build(b: *std.Build) void {
             "table provisioner admits algebraic index on a non-empty table through generation repair",
             "target index reconciliation never mutates sibling indexes",
             "target index reconciliation retires orphaned inline enrichments after deletion retry",
-            "managed db open modes never drain resolver backfill on raft apply",
             "replica root reconcile enqueues newly admitted managed full text repair",
             "managed repair visibility edges retire cached readers and runtime status",
             "repair visibility progress does not churn readers without an admission edge",
