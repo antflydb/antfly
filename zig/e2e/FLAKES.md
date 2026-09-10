@@ -68,6 +68,14 @@ both tests passed: quickstart **13.37 s**, retry exhaustion **65.73 s**, includi
 quickstart averaged 77.2 s. Focused readiness soaks use the quickstart node ID;
 the retry-policy test remains in the ordinary E2E suite.
 
+Running the new test independently then exposed an additional initial-build
+availability defect: three of four exploratory executions failed while one
+passed. The durable repair checkpoint recorded terminal
+`RepairSourceCoverageIncomplete` for catalog admission, despite a previously
+published healthy image. The [runtime entry](../FLAKES.md#initial-catalog-admission-quarantines-a-healthy-generation-on-shadow-coverage-lag-694)
+records the fix and deterministic before/after regression; fixed-runtime Linux
+validation remains pending.
+
 ### Three-by-three backup seed batch: unknown outcome (#694)
 
 The run reported 394 passed, five skipped, and one failure. Table creation and

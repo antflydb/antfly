@@ -55,6 +55,34 @@ its readiness, maintenance-cycle, query, and restart checks and takes about
 Linux reproduction and soak results are recorded in the
 [E2E history](e2e/FLAKES.md#completed-cli-readiness-regresses-after-publication-696).
 
+## Initial catalog admission quarantines a healthy generation on shadow coverage lag (#694)
+
+Splitting CLI retry exhaustion from the quickstart exposed an additional
+availability failure on the native-storage merge. The separately seeded retry
+test retained one covered image, one terminal source failure, and one pending
+image, but reported `pending` / `queryable=false` instead of
+`queryable_partial`. Three of four independent Linux executions failed; the
+combined quickstart/retry execution passed. These exploratory results are not
+part of final acceptance.
+
+The retained `index_repair.checkpoint` bound the failure to the thumbnail's
+catalog-admission initial build: trigger 10, work class 2, terminal phase 10,
+`RepairSourceCoverageIncomplete`, with an inactive shadow and no activated
+pointer. The generic repair error classification treated an incomplete shadow
+as permanent failure for catalog admission even though the existing canonical
+generation had a certified publication. It already treated this condition as
+recoverable for replacement/artifact repair.
+
+Catalog admission now uses the same recoverable coverage classification for
+both new failures and terminal checkpoints persisted by older binaries. The
+owner can discard only its inactive incomplete candidate and resume normal
+convergence; structurally invalid generations remain gated. Initial admission
+does not re-arm terminal provider outcomes. A durable-state regression failed
+before this change and passes after it, proving recovery to a searchable
+canonical generation and retirement of completed admission debt. All 75 dense
+lifecycle checks passed without leaks. Linux validation is pending the rebuilt
+executable.
+
 ## Restore completion owns progress retirement (#694)
 
 The original Linux baseline also exposed a completed restore whose progress

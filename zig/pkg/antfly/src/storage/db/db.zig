@@ -1037,13 +1037,15 @@ fn retryableIndexRepairTerminalPhase(
 ) ?index_repair_state.Phase {
     const reason = last_error orelse return null;
     if (!std.mem.eql(u8, reason, @errorName(error.RepairSourceCoverageIncomplete))) return null;
-    // Only managed replacement/artifact generations can become complete
-    // after source artifacts are reprocessed. Structural-invalid and
-    // externally supplied generations retain fail-closed classification.
+    // A shadow can lag changing source artifacts during replacement or
+    // initial catalog admission. Resume its durable owner and discard only
+    // the inactive candidate; coverage lag is not structural corruption.
+    // Externally supplied and structurally invalid generations stay closed.
     if (trigger != .operator_generation_rebuild and
         trigger != .storage_format_migration and
         trigger != .artifact_coverage_mismatch and
-        trigger != .replay_artifact_unavailable)
+        trigger != .replay_artifact_unavailable and
+        trigger != .catalog_admission)
     {
         return null;
     }
@@ -16638,12 +16640,11 @@ pub const DB = struct {
                 }
             }
             const capacity_wait = err == error.CapacityUnavailable or err == error.CapacityObservationStale;
+            // Use the same classification for live failures and persisted
+            // terminal states from older binaries. Catalog admission retains
+            // its existing producer outcomes; it does not re-arm failed work.
             const retryable_replacement_coverage =
-                err == error.RepairSourceCoverageIncomplete and
-                (current_trigger == .operator_generation_rebuild or
-                    current_trigger == .storage_format_migration or
-                    current_trigger == .artifact_coverage_mismatch or
-                    current_trigger == .replay_artifact_unavailable);
+                retryableIndexRepairTerminalPhase(@errorName(err), current_trigger) != null;
             const terminal_failure =
                 !retryable_replacement_coverage and indexRepairFailureIsTerminal(err);
             try self.recordIndexRepairAttemptFailure(
@@ -92892,7 +92893,11 @@ test "db coverage recovery admits a published generation after its admission mar
     try testManagedGenerationRepairAdmission(.coverage_recovery);
 }
 
-fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff, replay_handoff, late_completion, coverage_recovery }) !void {
+test "db managed admission recovers legacy terminal source coverage lag" {
+    try testManagedGenerationRepairAdmission(.coverage_lag);
+}
+
+fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff, replay_handoff, late_completion, coverage_recovery, coverage_lag }) !void {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -92923,6 +92928,27 @@ fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff,
     try drainManagedAdmissionSourceReplayForTest(&db, alloc, admission_id);
     try awaitManagedAdmissionPublicationForTest(&db, alloc, admission_id);
     try std.testing.expect(try db.progressiveManagedGenerationIsQueryable(alloc, cfg.name));
+
+    if (mode == .coverage_lag) {
+        // Old binaries permanently quarantined catalog admission when a
+        // concurrent source change made its shadow coverage incomplete.
+        // The canonical checkpoint remains certified and must recover from
+        // this durable state without resetting provider retry outcomes.
+        try db.recordIndexRepairAttemptFailure(alloc, admission_id, "RepairSourceCoverageIncomplete", true);
+        const resumed = try db.advanceIndexRepairIntent(alloc, admission_id, .{});
+        try std.testing.expect(!resumed.terminal);
+        try std.testing.expect(resumed.repaired);
+        try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
+        try db.failIfIndexQuarantined(cfg.name);
+        var result = try db.search(alloc, .{
+            .index_name = cfg.name,
+            .query = .{ .dense_knn = .{ .vector = &.{ 1.0, 0.0, 0.0 }, .k = 1 } },
+            .limit = 1,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        return;
+    }
 
     if (mode == .coverage_recovery) {
         try db.removeIndexRepairIntentAndPin(alloc, admission_id);
