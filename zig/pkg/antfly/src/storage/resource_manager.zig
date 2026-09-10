@@ -18,6 +18,7 @@ const platform_time = @import("antfly_platform").time;
 const shared_platform_time = @import("antfly_platform").time;
 const cache_budget = @import("../common/cache_budget.zig");
 pub const DenseWorkAdmission = @import("dense_work_admission.zig");
+const admission = @import("admission_waiter.zig");
 const dense_perf = @import("dense_perf_experiments.zig");
 pub const ProjectionPageCache = @import("projection_page_cache.zig");
 
@@ -492,10 +493,7 @@ pub const DenseSearchAdmissionStats = struct {
     wait_ns: u64 = 0,
 };
 
-pub const DenseSearchCancellation = struct {
-    ptr: *const anyopaque,
-    is_cancelled: *const fn (*const anyopaque) bool,
-};
+pub const DenseSearchCancellation = admission.Cancellation;
 
 pub const DenseSearchAdmissionLease = struct {
     manager: ?*ResourceManager = null,
@@ -508,14 +506,11 @@ pub const DenseSearchAdmissionLease = struct {
     }
 };
 
-const DenseSearchWaiter = struct {
-    next: ?*DenseSearchWaiter = null,
+const DenseSearchWaiters = admission.Fifo(struct {
     bytes: u64,
     enqueued_ns: u64,
-    io: ?std.Io,
-    ready: std.Io.Event = .unset,
-    admitted: std.atomic.Value(bool) = .init(false),
-};
+});
+const DenseSearchWaiter = DenseSearchWaiters.Waiter;
 
 pub const MemoryStats = struct {
     used_bytes: u64 = 0,
@@ -791,8 +786,7 @@ pub const ResourceManager = struct {
     dense_search_peak_active_bytes: u64 = 0,
     dense_search_active_queries: u64 = 0,
     dense_search_peak_active_queries: u64 = 0,
-    dense_search_wait_head: ?*DenseSearchWaiter = null,
-    dense_search_wait_tail: ?*DenseSearchWaiter = null,
+    dense_search_waiters: DenseSearchWaiters = .{},
     dense_search_queued_queries: u64 = 0,
     dense_search_peak_queued_queries: u64 = 0,
     dense_search_admissions: u64 = 0,
@@ -1245,51 +1239,34 @@ pub const ResourceManager = struct {
     }
 
     fn admitDenseSearchWaitersLocked(self: *ResourceManager) void {
-        while (self.dense_search_wait_head) |waiter| {
-            if (!self.canGrantDenseSearchLocked(waiter.bytes)) return;
-            self.dense_search_wait_head = waiter.next;
-            if (self.dense_search_wait_head == null) self.dense_search_wait_tail = null;
-            waiter.next = null;
+        while (self.dense_search_waiters.head) |head| {
+            if (!self.canGrantDenseSearchLocked(head.payload.bytes)) return;
+            const waiter = self.dense_search_waiters.pop().?;
             self.dense_search_queued_queries -|= 1;
-            self.noteDenseSearchGrantLocked(waiter.bytes);
-            self.dense_search_wait_ns +|= platform_time.monotonicNs() -| waiter.enqueued_ns;
-            waiter.admitted.store(true, .release);
-            if (waiter.io) |io| waiter.ready.set(io);
+            self.noteDenseSearchGrantLocked(waiter.payload.bytes);
+            self.dense_search_wait_ns +|= platform_time.monotonicNs() -| waiter.payload.enqueued_ns;
+            waiter.handoff.publish();
         }
     }
 
-    fn removeDenseSearchWaiterLocked(self: *ResourceManager, target: *DenseSearchWaiter) bool {
-        var previous: ?*DenseSearchWaiter = null;
-        var current = self.dense_search_wait_head;
-        while (current) |waiter| {
-            if (waiter == target) {
-                if (previous) |prior| {
-                    prior.next = waiter.next;
-                } else {
-                    self.dense_search_wait_head = waiter.next;
-                }
-                if (self.dense_search_wait_tail == waiter) self.dense_search_wait_tail = previous;
-                waiter.next = null;
-                self.dense_search_queued_queries -|= 1;
-                return true;
-            }
-            previous = waiter;
-            current = waiter.next;
-        }
-        return false;
-    }
-
-    fn cancelDenseSearchWaiter(self: *ResourceManager, waiter: *DenseSearchWaiter) bool {
+    fn cancelDenseSearchWaiter(self: *ResourceManager, waiter: *DenseSearchWaiter) void {
         lockAtomic(&self.dense_search_admission_mutex);
         defer self.dense_search_admission_mutex.unlock();
-        if (waiter.admitted.load(.acquire)) return false;
-        const removed = self.removeDenseSearchWaiterLocked(waiter);
-        if (removed) {
-            self.dense_search_cancellations +|= 1;
-            self.dense_search_wait_ns +|= platform_time.monotonicNs() -| waiter.enqueued_ns;
-            self.admitDenseSearchWaitersLocked();
+        if (waiter.handoff.isAdmitted()) {
+            // Cancellation was observed before grant but lost the queue-lock
+            // race. No lease escapes: return its charge here exactly once.
+            std.debug.assert(self.dense_search_active_queries > 0);
+            std.debug.assert(self.dense_search_active_bytes >= waiter.payload.bytes);
+            self.dense_search_active_queries -= 1;
+            self.dense_search_active_bytes -= waiter.payload.bytes;
+        } else {
+            const removed = self.dense_search_waiters.remove(waiter);
+            std.debug.assert(removed);
+            self.dense_search_queued_queries -|= 1;
+            self.dense_search_wait_ns +|= platform_time.monotonicNs() -| waiter.payload.enqueued_ns;
         }
-        return removed;
+        self.dense_search_cancellations +|= 1;
+        self.admitDenseSearchWaitersLocked();
     }
 
     /// Acquire a fair node-wide permit for the estimated candidate bytes one
@@ -1311,53 +1288,25 @@ pub const ResourceManager = struct {
         }
 
         lockAtomic(&self.dense_search_admission_mutex);
-        if (self.dense_search_wait_head == null and self.canGrantDenseSearchLocked(bytes)) {
+        if (self.dense_search_waiters.head == null and self.canGrantDenseSearchLocked(bytes)) {
             self.noteDenseSearchGrantLocked(bytes);
             self.dense_search_admission_mutex.unlock();
             return .{ .manager = self, .bytes = bytes };
         }
         var waiter = DenseSearchWaiter{
-            .bytes = bytes,
-            .enqueued_ns = platform_time.monotonicNs(),
-            .io = wait_io,
+            .payload = .{ .bytes = bytes, .enqueued_ns = platform_time.monotonicNs() },
+            .handoff = .{ .io = wait_io },
         };
-        if (self.dense_search_wait_tail) |tail| {
-            tail.next = &waiter;
-        } else {
-            self.dense_search_wait_head = &waiter;
-        }
-        self.dense_search_wait_tail = &waiter;
+        self.dense_search_waiters.enqueue(&waiter);
         self.dense_search_queued_queries += 1;
         self.dense_search_peak_queued_queries = @max(self.dense_search_peak_queued_queries, self.dense_search_queued_queries);
         self.dense_search_waits +|= 1;
         self.dense_search_admission_mutex.unlock();
 
-        while (!waiter.admitted.load(.acquire)) {
-            if (cancellation) |token| {
-                if (token.is_cancelled(token.ptr)) {
-                    const removed = self.cancelDenseSearchWaiter(&waiter);
-                    if (removed) return error.Cancelled;
-                    break;
-                }
-            }
-            if (wait_io) |io| {
-                waiter.ready.waitTimeout(io, .{
-                    .duration = .{
-                        .raw = std.Io.Duration.fromMilliseconds(5),
-                        .clock = .awake,
-                    },
-                }) catch |err| switch (err) {
-                    error.Timeout => {},
-                    error.Canceled => {
-                        const removed = self.cancelDenseSearchWaiter(&waiter);
-                        if (removed) return error.Canceled;
-                        break;
-                    },
-                };
-            } else {
-                platform_time.yieldBriefly();
-            }
-        }
+        waiter.handoff.wait(cancellation) catch |err| {
+            self.cancelDenseSearchWaiter(&waiter);
+            return err;
+        };
         return .{ .manager = self, .bytes = bytes };
     }
 
@@ -1492,7 +1441,7 @@ pub const ResourceManager = struct {
         if (self.dense_read_extra_tasks.load(.acquire) != 0)
             @panic("resource manager deinitialized with active dense read workers");
         lockAtomic(&self.dense_search_admission_mutex);
-        if (self.dense_search_active_queries != 0 or self.dense_search_wait_head != null)
+        if (self.dense_search_active_queries != 0 or self.dense_search_waiters.head != null)
             @panic("resource manager deinitialized with active dense search admission");
         self.dense_search_admission_mutex.unlock();
 
@@ -4050,6 +3999,36 @@ test "dense search bandwidth admission removes cancelled waiters" {
     try std.testing.expectEqual(@as(u64, 0), stats.queued_queries);
     try std.testing.expectEqual(@as(u64, 1), stats.cancellations);
     first.release();
+}
+
+test "dense search bandwidth cancellation racing a grant returns its full charge" {
+    var manager = ResourceManager.init(.{ .dense_search_bandwidth_capacity_bytes = 10 });
+    defer manager.deinit(std.testing.allocator);
+    var blocker = try manager.acquireDenseSearchBandwidth(10, null, null);
+    defer blocker.release();
+    const Cancel = struct {
+        blocker: *DenseSearchAdmissionLease,
+        calls: usize = 0,
+        fn check(ptr: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            self.calls += 1;
+            if (self.calls == 1) return false;
+            self.blocker.release(); // synchronous grant between observing cancellation and removing
+            return true;
+        }
+    };
+    var cancel = Cancel{ .blocker = &blocker };
+    try std.testing.expectError(error.Cancelled, manager.acquireDenseSearchBandwidth(7, .{ .ptr = &cancel, .is_cancelled = Cancel.check }, null));
+    try std.testing.expectEqual(@as(usize, 2), cancel.calls);
+    const stats = manager.denseSearchAdmissionStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.active_bytes);
+    try std.testing.expectEqual(@as(u64, 0), stats.active_queries);
+    try std.testing.expectEqual(@as(u64, 0), stats.queued_queries);
+    try std.testing.expectEqual(@as(u64, 1), stats.cancellations);
+    var next = try manager.acquireDenseSearchBandwidth(10, null, null);
+    next.release();
+    next.release();
+    try std.testing.expectEqual(@as(u64, 0), manager.denseSearchAdmissionStats().active_bytes);
 }
 
 test "resource manager coordinates growable capacity by physical domain" {

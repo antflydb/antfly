@@ -10255,3 +10255,31 @@ with its frozen binary; qualification of this format must use fresh roots.
 The preserved matched 50K/1M control remains the comparison target. No new public
 50K/1M latency, QPS, RSS, footprint, disk or recall result is claimed here.
 Concurrent source-vector edits are being preserved separately from this commit.
+
+#### Shared allocation-free admission handoff (PR review follow-up)
+
+The bandwidth queue published `admitted` before its final event/Io accesses.
+A polling caller could return and retire its stack waiter while the publisher
+still touched it. Both bandwidth and rerank admission now share an intrusive
+FIFO and handoff primitive: detach and charge under the policy lock, signal
+the event, then transfer lifetime with the final release store. Cancellation
+rejoins that same lock and either removes a pending waiter or returns an
+already-granted permit exactly once. Byte weights, helper limits and FIFO
+fairness remain policy-owned; the fast path creates no waiter or allocation.
+
+Debug validation: 72 resource/admission tests and five HBC admission integration
+tests passed. Twenty repetitions of the ten focused queue/lifetime/cancellation
+tests passed without leaks. The tests include immediate waiter destruction
+while its publisher is still returning, token cancellation racing grant, and
+`std.Io` cancellation of a queued stack waiter. Test registration audit and
+repository formatting checks passed.
+
+A local ReleaseFast rerank-admission microbenchmark compared the pre-change
+queue at c8a91ad9e with the shared implementation, using the same harness.
+Five paired runs with 12 callers, capacity four and a fixed 200-spin-hint
+critical section (120,000 acquisitions/run) had median times of 4.729 us/op
+before and 4.760 us/op after. Uncontended acquire/release was approximately
+4.4--5.0 ns/op across the two harness variants. The earlier empty-critical-
+section contention sample was scheduling-sensitive and is not a throughput
+result. These measurements check abstraction overhead, not public query QPS;
+no new 50K/1M readiness, latency, RSS, disk or recall qualification is claimed.

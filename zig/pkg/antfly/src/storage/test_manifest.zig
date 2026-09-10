@@ -9,6 +9,7 @@
 //! duplicate, stale, or multiply-owned entries before any shard is compiled.
 
 comptime {
+    _ = @import("admission_waiter.zig");
     _ = @import("artifact_payload.zig");
     _ = @import("dense_work_admission.zig");
     _ = @import("maintenance_signal.zig");

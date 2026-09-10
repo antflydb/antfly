@@ -2,11 +2,8 @@
 //! separate, nonblocking node budget; a caller never waits for a helper.
 const std = @import("std");
 const time = @import("antfly_platform").time;
-
-pub const Cancellation = struct {
-    ptr: *const anyopaque,
-    is_cancelled: *const fn (*const anyopaque) bool,
-};
+const admission = @import("admission_waiter.zig");
+pub const Cancellation = admission.Cancellation;
 
 pub const Queue = struct {
     mutex: std.atomic.Mutex = .unlocked,
@@ -14,15 +11,8 @@ pub const Queue = struct {
     active: u32 = 0,
     peak: u32 = 0,
     waits: u64 = 0,
-    head: ?*Waiter = null,
-    tail: ?*Waiter = null,
-
-    const Waiter = struct {
-        next: ?*Waiter = null,
-        ready: std.Io.Event = .unset,
-        admitted: std.atomic.Value(bool) = .init(false),
-        io: ?std.Io,
-    };
+    waiters: admission.Fifo(void) = .{},
+    const Waiter = admission.Fifo(void).Waiter;
 
     pub const Lease = struct {
         queue: ?*Queue = null,
@@ -43,34 +33,22 @@ pub const Queue = struct {
 
     fn grant(self: *Queue) void {
         while (self.active < @max(self.capacity, 1)) {
-            const waiter = self.head orelse break;
-            self.head = waiter.next;
-            if (self.head == null) self.tail = null;
+            const waiter = self.waiters.pop() orelse break;
             self.active += 1;
             self.peak = @max(self.peak, self.active);
-            // Signal before publishing admission: after observing admitted,
-            // the owner may retire this stack waiter immediately.
-            if (waiter.io) |io| waiter.ready.set(io);
-            waiter.admitted.store(true, .release);
+            waiter.handoff.publish();
         }
     }
 
     fn cancel(self: *Queue, target: *Waiter) void {
         self.lock();
         defer self.mutex.unlock();
-        if (target.admitted.load(.acquire)) {
+        if (target.handoff.isAdmitted()) {
+            std.debug.assert(self.active > 0);
             self.active -= 1;
         } else {
-            var previous: ?*Waiter = null;
-            var cursor = self.head;
-            while (cursor) |waiter| : (cursor = waiter.next) {
-                if (waiter == target) {
-                    if (previous) |p| p.next = waiter.next else self.head = waiter.next;
-                    if (self.tail == waiter) self.tail = previous;
-                    break;
-                }
-                previous = waiter;
-            }
+            const removed = self.waiters.remove(target);
+            std.debug.assert(removed);
         }
         self.grant();
     }
@@ -78,35 +56,20 @@ pub const Queue = struct {
     pub fn acquire(self: *Queue, io: ?std.Io, cancellation: ?Cancellation) !Lease {
         if (cancellation) |token| if (token.is_cancelled(token.ptr)) return error.Cancelled;
         self.lock();
-        if (self.head == null and self.active < @max(self.capacity, 1)) {
+        if (self.waiters.head == null and self.active < @max(self.capacity, 1)) {
             self.active += 1;
             self.peak = @max(self.peak, self.active);
             self.mutex.unlock();
             return .{ .queue = self };
         }
-        var waiter = Waiter{ .io = io };
-        if (self.tail) |tail| tail.next = &waiter else self.head = &waiter;
-        self.tail = &waiter;
+        var waiter = Waiter{ .handoff = .{ .io = io }, .payload = {} };
+        self.waiters.enqueue(&waiter);
         self.waits +|= 1;
         self.mutex.unlock();
-        while (!waiter.admitted.load(.acquire)) {
-            if (cancellation) |token| if (token.is_cancelled(token.ptr)) {
-                self.cancel(&waiter);
-                return error.Cancelled;
-            };
-            if (io) |runtime| {
-                waiter.ready.waitTimeout(runtime, .{ .duration = .{
-                    .raw = std.Io.Duration.fromMilliseconds(5),
-                    .clock = .awake,
-                } }) catch |err| switch (err) {
-                    error.Timeout => {},
-                    error.Canceled => {
-                        self.cancel(&waiter);
-                        return err;
-                    },
-                };
-            } else time.yieldBriefly();
-        }
+        waiter.handoff.wait(cancellation) catch |err| {
+            self.cancel(&waiter);
+            return err;
+        };
         return .{ .queue = self };
     }
 
@@ -114,7 +77,7 @@ pub const Queue = struct {
     pub fn tryAcquire(self: *Queue) ?Lease {
         if (!self.mutex.tryLock()) return null;
         defer self.mutex.unlock();
-        if (self.head != null or self.active >= @max(self.capacity, 1)) return null;
+        if (self.waiters.head != null or self.active >= @max(self.capacity, 1)) return null;
         self.active += 1;
         self.peak = @max(self.peak, self.active);
         return .{ .queue = self };
@@ -123,7 +86,7 @@ pub const Queue = struct {
     pub fn assertIdle(self: *Queue) void {
         self.lock();
         defer self.mutex.unlock();
-        std.debug.assert(self.active == 0 and self.head == null);
+        std.debug.assert(self.active == 0 and self.waiters.head == null);
     }
 };
 
@@ -154,6 +117,32 @@ test "dense aggregate nonblocking helpers share capacity with caller leases" {
     caller.release();
     queue.assertIdle();
     try std.testing.expectEqual(@as(u32, 2), queue.peak);
+}
+
+test "dense rerank cancellation racing a grant returns the permit exactly once" {
+    var queue = Queue{ .capacity = 1 };
+    var blocker = try queue.acquire(null, null);
+    defer blocker.release();
+    const Cancel = struct {
+        blocker: *Lease,
+        calls: usize = 0,
+        fn check(ptr: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            self.calls += 1;
+            if (self.calls == 1) return false; // preflight
+            self.blocker.release(); // grant the enqueued caller before cancellation rejoins
+            return true;
+        }
+        const Lease = Queue.Lease;
+    };
+    var cancel = Cancel{ .blocker = &blocker };
+    try std.testing.expectError(error.Cancelled, queue.acquire(null, .{ .ptr = &cancel, .is_cancelled = Cancel.check }));
+    try std.testing.expectEqual(@as(usize, 2), cancel.calls);
+    queue.assertIdle();
+    var next = queue.tryAcquire().?;
+    next.release();
+    next.release();
+    queue.assertIdle();
 }
 
 test "dense rerank callers queue FIFO and cancel without retaining capacity" {
@@ -225,4 +214,44 @@ test "dense rerank callers queue FIFO and cancel without retaining capacity" {
     try group.await(io);
     queue.assertIdle();
     try std.testing.expectEqual(@as(u32, 1), queue.peak);
+}
+
+test "dense rerank Io cancellation retires a queued stack waiter" {
+    var runtime = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    const io = runtime.io();
+    var queue = Queue{ .capacity = 1 };
+    var blocker = try queue.acquire(io, null);
+    defer blocker.release();
+    const Worker = struct {
+        queue: *Queue,
+        io: std.Io,
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            var lease = self.queue.acquire(self.io, null) catch |err| {
+                self.err = err;
+                return;
+            };
+            lease.release();
+        }
+    };
+    var worker = Worker{ .queue = &queue, .io = io };
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Worker.run, .{&worker});
+    const deadline = time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        queue.lock();
+        const pending = queue.waiters.head != null;
+        queue.mutex.unlock();
+        if (pending) break;
+        if (time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
+        try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    group.cancel(io);
+    try std.testing.expectEqual(error.Canceled, worker.err.?);
+    try std.testing.expect(queue.waiters.head == null and queue.waiters.tail == null);
+    try std.testing.expectEqual(@as(u32, 1), queue.active);
+    blocker.release();
+    queue.assertIdle();
 }

@@ -10440,6 +10440,7 @@ pub fn build(b: *std.Build) void {
         &.{
             "storage.backend_adapter.",
             "storage.artifact_payload.",
+            "storage.admission_waiter.",
             "storage.dense_work_admission.",
             "storage.maintenance_signal.",
             "storage.projection_page_cache.",
