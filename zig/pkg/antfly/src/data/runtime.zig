@@ -1965,9 +1965,14 @@ const RaftTableApplyStateMachine = struct {
             .ptr = self,
             .vtable = &.{
                 .apply_ready = applyReady,
+                .is_apply_retryable = isApplyRetryable,
                 .retire_group = retireGroup,
             },
         };
+    }
+
+    fn isApplyRetryable(_: *anyopaque, _: u64, err: anyerror) bool {
+        return err == error.RaftApplyWriterUnavailable;
     }
 
     fn applyReady(
@@ -25380,6 +25385,50 @@ test "data raft apply defers refresh contention before mutation and retries exac
         const raw = (try cached.db.get(alloc, "doc:counter")) orelse return error.TestUnexpectedResult;
         defer alloc.free(raw);
         try std.testing.expectEqualStrings("{\"count\":0}", raw);
+    }
+    {
+        var data_sm = antfly.raft.state_machine.DataStateMachine{
+            .alloc = alloc,
+            .applied_sink = antfly.raft.state_machine.noopAppliedIndexSink(),
+            .delegate = apply_sm.stateMachine(),
+        };
+        var routed_sm = antfly.raft.state_machine.RoutedStateMachine{
+            .metadata_state_machine = data_sm.stateMachine(),
+            .data_state_machine = data_sm.stateMachine(),
+        };
+        var host = raft_engine.runtime.MultiRaft.init(alloc, .{ .applied_log_retained_entries = 0 }, .{
+            .state_machine = routed_sm.stateMachine(),
+        });
+        defer host.deinit();
+        var healthy_context: [96]u8 = undefined;
+        const healthy = try apply_sm.read_barriers.register(group_id + 1, &healthy_context);
+        const healthy_states = try alloc.alloc(raft_engine.core.ReadState, 1);
+        healthy_states[0] = .{ .index = 0, .request_ctx = try alloc.dupe(u8, healthy.request_ctx) };
+        try host.pending_apply.append(alloc, .{
+            .group_id = group_id,
+            .snapshot = null,
+            .entries = try raft_engine.core.types.cloneEntries(alloc, &entries),
+            .read_states = &.{},
+            .conf_state = null,
+            .approx_bytes = increment.len,
+        });
+        try host.pending_apply.append(alloc, .{
+            .group_id = group_id + 1,
+            .snapshot = null,
+            .entries = &.{},
+            .read_states = healthy_states,
+            .conf_state = null,
+            .approx_bytes = healthy.request_ctx.len,
+        });
+        var refresh = apply_sm.write_source.tryBeginGroupRefreshActivity("docs", group_id) orelse
+            return error.TestUnexpectedResult;
+        defer refresh.deinit();
+        _ = try host.drainReady(8);
+        // The production router and data wrappers must preserve retryability:
+        // this read completes while the conflicting refresh is still held.
+        try std.testing.expect(apply_sm.read_barriers.takeCompleted(healthy.token));
+        try std.testing.expectEqual(@as(usize, 1), host.pending_apply.items.len);
+        try std.testing.expectEqual(@as(u64, 0), apply_sm.appliedIndex(group_id));
     }
     try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &entries, &read_states);
     try std.testing.expectEqual(@as(u64, 1), apply_sm.appliedIndex(group_id));

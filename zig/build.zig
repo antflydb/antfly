@@ -5250,6 +5250,8 @@ pub fn build(b: *std.Build) void {
     lib_data_storage_test_step.dependOn(&run_lib_data_storage_tests.step);
 
     const db_enrichment_filters: []const []const u8 = &.{
+        "db resolver worker resumes durable backfill after deferred activation and reopen",
+        "db managed resolver changes fence in-flight replay and reset durable cursors",
         "storage.db.db.test.db batch marks generated enrichment replay",
         "storage.db.db.test.db computeEnrichments",
         "storage.db.db.test.db leased enrichment",
@@ -7501,7 +7503,6 @@ pub fn build(b: *std.Build) void {
             "table provisioner admits algebraic index on a non-empty table through generation repair",
             "target index reconciliation never mutates sibling indexes",
             "target index reconciliation retires orphaned inline enrichments after deletion retry",
-            "managed db open modes never drain resolver backfill on raft apply",
             "replica root reconcile enqueues newly admitted managed full text repair",
             "managed repair visibility edges retire cached readers and runtime status",
             "repair visibility progress does not churn readers without an admission edge",

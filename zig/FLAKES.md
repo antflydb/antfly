@@ -34,22 +34,49 @@ A symbolized, unmodified `main` ReleaseFast build reproduced the failure in
 3. The Raft progress thread holds `data_raft_mutex` in `applyReady` and waits
    inside `beginReplicatedApplyOperationLocked` for that same refresh activity.
 
-Committed Raft apply now tries the read-compatible group activity once, including
-nonblocking acquisition of its bookkeeping mutex. Contention returns
-`RaftApplyWriterUnavailable` before any document mutation or cache invalidation.
-The existing state-machine checkpoint retains the committed entry and lets the
-progress owner release its mutex and retry. Structural/generation exclusion and
-read compatibility are preserved. A deferred apply publishes neither success nor
-an applied watermark; matching read barriers still require successful apply.
-The independent read deadline below bounds quorum/apply backpressure as well.
+Managed metadata refresh now persists resolver configuration and durable backfill
+cursors without running resolution or promotion inline. The resolution worker
+owns bounded cursor scans and replay, wakes for catalog-only changes, and reloads
+pending cursors after reopen. Cached cold opens defer resolver workers until the
+stable cache entry has its distributed candidate source, entity sink, and
+promotion-owner callbacks installed.
 
-The regression reserves a real refresh activity while applying a committed
-increment, then repeats with the activity mutex held. Both attempts must return
-before the reservation is released, leave the document and watermark unchanged,
-and keep write/read waiters pending. After release, retry completes the write and
-read barrier; replaying it again leaves the increment applied exactly once. A
-watchdog releases the reservation before joining so the original code fails
-without hanging. This regression is included in the default data-runtime suite.
+Catalog changes use nonblocking resolution/promotion callback fences while a
+managed refresh owns a group activity. A busy worker causes the refresh to yield
+and retry. Material configuration changes atomically reset both durable cursors
+with the catalog, so a previous scan cannot clear a new generation's work.
+Promotion checks the live resolver generation under the same callback fence and
+skips queued artifacts from superseded configurations.
+Removal retains the catalog until artifact retirement and graph replay finish;
+retries do not enqueue deletes for already absent artifacts. Follower retirement
+fences callbacks without waiting for leader-only promotion work. Embedded callers
+retain their synchronous resolver API.
+
+Committed Raft apply also tries the read-compatible group activity once, including
+nonblocking acquisition of its bookkeeping mutex. Contention returns
+`RaftApplyWriterUnavailable` before document mutation or cache invalidation. The
+state-machine checkpoint preserves exactly-once document effects across retries.
+The original nonblocking fix still returned from the entire host drain on this
+error: a review probe showed three rounds with zero healthy read completions or
+transport sends until the blocked group was released.
+
+MultiRaft now classifies replay-safe apply backpressure explicitly and defers only
+the affected group. It preserves that group's snapshot, entry, and ReadState order
+while a persistent cursor gives other groups turns, including with a one-task
+budget. Persisted transport can flush during deferral. Fatal apply/persistence
+errors still stop the turn. Async storage-apply acknowledgements and snapshot
+compaction are emitted only after the corresponding task completes. Legacy apply
+queues retain their completed-prefix contract unless they opt into this scheduling.
+
+Regressions hold real refresh activity and its bookkeeping mutex while applying a
+committed increment. Attempts must return before release, leave the document and
+watermark unchanged, and keep write/read waiters pending. The production router
+must complete another group's read while refresh remains held. After release, the
+increment applies exactly once. MultiRaft tests separately cover transport, bounded
+fairness, snapshot order, fatal errors, opt-in queues, and async acknowledgements.
+DB tests cover durable worker-only backfill after deferred activation/reopen,
+configuration fencing and cursor reset, and resolver retirement on leaders and
+followers. Watchdogs release held owners before joining on regression failure.
 
 ### Read deadline defect
 
@@ -122,3 +149,29 @@ zig build antfly-data-runtime-test -- \
   --test-filter 'data raft retry checkpoints' \
   --test-filter 'production DataServer replicated merge actions run on VoprIo'
 ```
+
+### Architectural follow-up validation (#692)
+
+The review-driven worker ownership and per-group apply changes are tracked in
+[PR #692](https://github.com/antflydb/antfly/pull/692).
+
+- Full standalone Raft suite: 391 tests passed.
+- Full data-runtime suite: 173 tests passed, including production VOPR cases.
+- Resolver/promotion suite: 38 tests passed, including deferred worker
+  activation/reopen, configuration fencing, stale promotion rejection, and
+  follower removal. The final focused data-Raft/VOPR suite also passed 110 tests.
+- Managed writer-cache/restore lifecycle suite: 218 tests passed.
+- Python launcher/resolution checks: 15 passed.
+- Final Linux ReleaseFast soak is running: 38/60 completed successfully at
+  publication, with three workers, eight CPUs (`0-6,8`), and 256 descriptors.
+  Executable SHA-256: `a3c6e7987c0eadc0f633b58373d18ec0e13e0e6529fded12eaf37d966fe317f1`.
+
+Run the durable backfill and catalog lifecycle checks from `zig/`:
+
+```sh
+zig build antfly-storage-db-test -- --test-filter resolver --test-filter reresolve \
+  --test-filter PromotionRuntime --test-filter processResolutionArtifact \
+  --test-filter catchUpWindow --test-filter 'db promotes'
+```
+
+Follow-up validation logs use `/private/tmp/antfly-pr692-*`.
