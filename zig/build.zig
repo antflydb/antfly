@@ -9590,6 +9590,7 @@ pub fn build(b: *std.Build) void {
             "standalone metadata advertises a linearizable owned snapshot",
             "standalone schema mutation supports atomic merge patch and version CAS",
             "standalone routing watch does not report absence after one probe",
+            "standalone routing watch confirms absence before deadline and retries after expiry",
             "standalone metadata catalog source provides compact routing",
             "standalone metadata rejects corrupt catalog without double-freeing owned paths",
             "standalone metadata finalizes schema migration from resident runtime evidence",
