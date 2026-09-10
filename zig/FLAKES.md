@@ -4,6 +4,52 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## Serverless build-status PreconditionFailed during publication (#692)
+
+[CI run 34420585088, job 102704104941](https://github.com/antflydb/antfly/actions/runs/34420585088/job/102704104941?pr=692)
+failed `test_index_lifecycle.py::test_serverless_named_embedding_indexes_report_publication_actions`
+while polling build status after deleting `semantic_a` and republishing the
+remaining named embedding indexes. `/build-status` returned HTTP 500, and the
+server logged `table build status failed ... err=PreconditionFailed`.
+The job finished with 398 passed, five skipped, and this one failure. The
+Autograph test passed; this is separate from the resolver/Raft cycle below.
+
+### Cause and fix
+
+Filesystem object publication writes a complete staged object and atomically
+renames it over the destination. `FilesystemClient.getObject` previously opened
+the path for metadata, closed it, then reopened it to read the payload. If a
+publisher replaced the path between those opens, the second header had a new
+ETag and the reader returned `PreconditionFailed` even for an unconditional GET.
+Concurrent deletion could similarly produce `FileNotFound` after metadata had
+already been selected. Build-status reads mutable progress/HEAD objects through
+this backend, making active publication a trigger for the HTTP failure. The CI
+log does not identify the particular object key that raced.
+
+GET now keeps one file descriptor open for metadata, conditional ETag checks,
+range/part selection, and payload reads. Atomic replacement or unlink leaves
+that selected generation readable through the open descriptor. A later GET
+observes the replacement or deletion. Explicit stale `If-Match` requests still
+fail; response-size limits and cancellation remain in force. No HTTP retries,
+longer polling deadlines, or publication locks are added.
+
+### Deterministic regression and validation
+
+The regression publishes or deletes the object at the existing cancellation
+checkpoint after metadata selection and before payload reading, without
+canceling the read. On unmodified `origin/main` at
+`9f192f9be68219d08944d51552dbf4eb782891f1`, it fails with `PreconditionFailed`
+from the second open in `readObjectRangeAlloc`. With the fix, all 12 cases pass:
+shorter replacement, longer replacement, and deletion, each during full, range,
+part, and matching conditional GETs. Assertions check the original body, size,
+ETag, checksum metadata, and content type, plus subsequent reads and stale ETags.
+
+The standalone object-store suite passes in Debug and ReleaseFast: **69 passed,
+two opt-in cloud integration tests skipped** in each mode. The root
+`lib-objectstore-test` target also passes with the same counts; the suite is now
+included in the default `lib-test` CI aggregate. The focused serverless manifest
+suite passes **12/12**. E2E soak results are recorded below after completion.
+
 ## Autograph second-document write timeout (#690)
 
 [CI run 34395199129, job 102623777993](https://github.com/antflydb/antfly/actions/runs/34395199129/job/102623777993?pr=690)
