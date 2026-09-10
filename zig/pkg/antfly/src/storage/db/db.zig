@@ -75437,6 +75437,29 @@ test "db managed dense enrichment remains searchable after transient rate limits
     try db.runUntilIdle();
 }
 
+fn independentDensePublicationVisibleForTest(db: *DB, alloc: Allocator) !bool {
+    // Materialization counters and a replay cursor can advance before the
+    // asynchronous query publication is visible. The isolation witness is a
+    // successful query while the unrelated producer remains gated; waiting
+    // for global idle would instead require that producer to recover.
+    var result = db.search(alloc, .{
+        .index_name = "title_dense",
+        .dense = .{
+            .vector = &.{ 1.0, 0.0, 0.0 },
+            .k = 1,
+        },
+    }) catch |err| switch (err) {
+        error.IndexRebuilding => return false,
+        else => return err,
+    };
+    defer result.deinit();
+    if (result.total_hits == 0) return false;
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    return true;
+}
+
 test "db retryable chunked producer does not block independent dense publication" {
     const alloc = std.testing.allocator;
 
@@ -75496,6 +75519,8 @@ test "db retryable chunked producer does not block independent dense publication
                 break;
             }
         }
+        if (sibling_published)
+            sibling_published = try independentDensePublicationVisibleForTest(&db, alloc);
         if (sibling_published) break;
         sleepPollInterval();
     }
@@ -75578,7 +75603,7 @@ test "db retryable asset producer batches do not block independent dense publica
     while (attempts < default_test_wait_attempts) : (attempts += 1) {
         const stats = try db.stats(alloc);
         defer types.freeDBStats(alloc, stats);
-        if (gated_asset.blocked_requests.load(.acquire) != 0) {
+        if (gated_asset.blocked_requests.load(.acquire) >= 2) {
             for (stats.indexes) |index_stats| {
                 if (!std.mem.eql(u8, index_stats.name, "title_dense")) continue;
                 sibling_published = index_stats.doc_count == 1 and
@@ -75587,6 +75612,8 @@ test "db retryable asset producer batches do not block independent dense publica
                 break;
             }
         }
+        if (sibling_published)
+            sibling_published = try independentDensePublicationVisibleForTest(&db, alloc);
         if (sibling_published) break;
         sleepPollInterval();
     }
