@@ -2175,14 +2175,15 @@ pub const ApiHttpClient = struct {
                 // peer explicitly reported an ambiguous proposal or whether
                 // the client lost the response after crossing its send
                 // boundary.
-                std.log.warn("internal group batch transport failed group_id={} delivery={s} timeout_ms={?} err={s}", .{
-                    group_id,
-                    @tagName(delivery),
-                    timeout_ms,
-                    @errorName(err),
+                std.log.warn("internal group batch transport lost outcome group_id={} delivery={s} timeout_ms={?} err={s}", .{
+                    group_id, @tagName(delivery), timeout_ms, @errorName(err),
                 });
                 return error.RaftBatchWriteTransportOutcomeUnknown;
             }
+            // Local executor saturation is a rejected attempt only while the
+            // transport certifies that no request bytes could have been sent.
+            if (forwarding != null and delivery == .not_sent and err == error.ConcurrencyUnavailable)
+                return error.LeaderUnavailable;
             return err;
         };
         defer resp.deinit(self.alloc);
@@ -4562,6 +4563,8 @@ test "api http client requires explicit not-proposed marker and tracks delivery 
             marked_timeout,
             failure_before_send,
             failure_after_send,
+            capacity_before_send,
+            capacity_after_send,
             refused_after_send,
             failure_unknown,
         };
@@ -4608,6 +4611,14 @@ test "api http client requires explicit not-proposed marker and tracks delivery 
                     tracker.markMayHaveBeenSent();
                     return error.OutOfMemory;
                 },
+                .capacity_before_send => {
+                    tracker.markNotSent();
+                    return error.ConcurrencyUnavailable;
+                },
+                .capacity_after_send => {
+                    tracker.markMayHaveBeenSent();
+                    return error.ConcurrencyUnavailable;
+                },
                 .refused_after_send => {
                     tracker.markMayHaveBeenSent();
                     return error.ConnectionRefused;
@@ -4647,6 +4658,12 @@ test "api http client requires explicit not-proposed marker and tracks delivery 
     try std.testing.expectError(error.OutOfMemory, OutcomeExecutor.fetch(&client));
 
     executor.mode = .failure_after_send;
+    try std.testing.expectError(error.RaftBatchWriteTransportOutcomeUnknown, OutcomeExecutor.fetch(&client));
+
+    executor.mode = .capacity_before_send;
+    try std.testing.expectError(error.LeaderUnavailable, OutcomeExecutor.fetch(&client));
+
+    executor.mode = .capacity_after_send;
     try std.testing.expectError(error.RaftBatchWriteTransportOutcomeUnknown, OutcomeExecutor.fetch(&client));
 
     executor.mode = .refused_after_send;

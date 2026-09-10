@@ -151,6 +151,15 @@ Final validation on macOS ARM64, native Debug, with remote PR commits through
 - Executable SHA-256:
   `bae3921f715c8e2f0e3a0d0aeb40088391d4600d611b473a79c3c618d87f28df`.
 
+After merging `origin/main` at `8211fc92c4`, the rebuilt native Debug executable
+passed a further **20/20** serial runs: ten ordinary backup/restore runs and ten
+with the stalled alternate metadata status route. The affected Zig suites
+passed 513 tests without leaks, and all 67 Python harness tests passed. The
+merge retained both sets of transport diagnostics and corrected an upstream
+empty-create assertion to include the newly persisted default storage setting.
+Log: `/private/tmp/pr694-main-merge-backup-soak.log`. Executable SHA-256:
+`bbf4146d631ee247fccde9deb3f6de995c68a429ec66179dd8aa15aecaf2f7dd`.
+
 The matching local reproductions establish concrete discovery defects; the
 original failed run's logs do not prove which one it encountered. The clean
 final soak is evidence of the merged behavior, not proof that unrelated

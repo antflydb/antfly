@@ -998,7 +998,7 @@ describe("Listener", () => {
       // Wait for the query with the multi-term search and match_phrase to be sent
       await waitFor(() => {
         const calls = msearchSpy.mock.calls;
-        const hasMatchPhraseQuery = calls.some((call) => {
+        const hasFinalMatchPhraseQuery = calls.some((call) => {
           const queries = call[1] as Array<{ query: Record<string, unknown> }>;
           const fts = queries?.[0]?.query?.full_text_search as Record<string, unknown>;
           if (fts?.disjuncts) {
@@ -1007,10 +1007,11 @@ describe("Listener", () => {
           }
           return false;
         });
-        expect(hasMatchPhraseQuery).toBe(true);
+        expect(hasFinalMatchPhraseQuery).toBe(true);
       });
 
-      // Find the query with match_phrase
+      // Find the final debounced query, not an earlier multi-term request that
+      // may have been dispatched while userEvent was still typing.
       const callWithMatchPhrase = msearchSpy.mock.calls.find((call) => {
         const queries = call[1] as Array<{ query: Record<string, unknown> }>;
         const fts = queries?.[0]?.query?.full_text_search as Record<string, unknown>;
