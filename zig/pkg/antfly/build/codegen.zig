@@ -107,33 +107,6 @@ pub fn addEmbeddedSpecs(b: *std.Build, options: struct {
     return module;
 }
 
-pub fn addCommittedOpenApiModule(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    package_name: []const u8,
-    generated_dir: []const u8,
-) *std.Build.Module {
-    return b.addModule(package_name, .{
-        .root_source_file = b.path(b.fmt("{s}/root.zig", .{generated_dir})),
-        .target = target,
-        .optimize = optimize,
-    });
-}
-
-pub fn addCommittedOpenApiModuleWithHttpx(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    package_name: []const u8,
-    generated_dir: []const u8,
-    httpx_mod: *std.Build.Module,
-) *std.Build.Module {
-    const mod = addCommittedOpenApiModule(b, target, optimize, package_name, generated_dir);
-    mod.addImport("httpx", httpx_mod);
-    return mod;
-}
-
 const GeneratedModule = struct {
     directory: std.Build.LazyPath,
     destination: []const u8,
@@ -302,4 +275,185 @@ pub fn addOpenApiSourceSteps(
         check.addArg(b.pathFromRoot(destination));
     }
     return .{ .regen = regen, .check = check, .public_spec = public_spec };
+}
+
+/// Configure each runtime's schema modules while sharing the committed source tree.
+pub const CommittedOptions = struct {
+    root: std.Build.LazyPath,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    httpx: *std.Build.Module,
+    json: *std.Build.Module,
+    export_modules: bool = false,
+};
+
+pub const CommittedModules = struct {
+    public: *std.Build.Module,
+    client: *std.Build.Module,
+    schema: *std.Build.Module,
+    graph_identifier: *std.Build.Module,
+    indexes: *std.Build.Module,
+    sort: *std.Build.Module,
+    websearch: *std.Build.Module,
+    eval: *std.Build.Module,
+    query: *std.Build.Module,
+    admin: *std.Build.Module,
+    internal: *std.Build.Module,
+    usermgr: *std.Build.Module,
+    metadata: *std.Build.Module,
+    logging: *std.Build.Module,
+    audio: *std.Build.Module,
+    middleware: *std.Build.Module,
+    scraping: *std.Build.Module,
+    s3: *std.Build.Module,
+    inference_config: *std.Build.Module,
+    chunking_api: *std.Build.Module,
+    chunking: *std.Build.Module,
+    embeddings: *std.Build.Module,
+    provider: *std.Build.Module,
+    common: *std.Build.Module,
+    generating: *std.Build.Module,
+    reranking: *std.Build.Module,
+    generating_api: *std.Build.Module,
+    extraction: *std.Build.Module,
+    openai_api: *std.Build.Module,
+};
+
+fn committedModule(b: *std.Build, options: CommittedOptions, name: []const u8, httpx: bool) *std.Build.Module {
+    const settings: std.Build.Module.CreateOptions = .{
+        .root_source_file = options.root.path(b, b.fmt("{s}/root.zig", .{name})),
+        .target = options.target,
+        .optimize = options.optimize,
+    };
+    const module = if (options.export_modules) b.addModule(name, settings) else b.createModule(settings);
+    if (httpx) module.addImport("httpx", options.httpx);
+    return module;
+}
+
+pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) CommittedModules {
+    const public_openapi_mod = committedModule(b, options, "antfly_public_openapi", false);
+    const client_openapi_mod = committedModule(b, options, "antfly_client_openapi", true);
+    const schema_openapi_mod = committedModule(b, options, "antfly_schema_openapi", false);
+    const graph_identifier_openapi_mod = committedModule(b, options, "antfly_graph_identifier_openapi", false);
+    const indexes_openapi_mod = committedModule(b, options, "antfly_indexes_openapi", false);
+    const sort_openapi_mod = committedModule(b, options, "antfly_sort_openapi", false);
+    const websearch_openapi_mod = committedModule(b, options, "antfly_websearch_openapi", false);
+    const eval_openapi_mod = committedModule(b, options, "antfly_eval_openapi", false);
+    const query_openapi_mod = committedModule(b, options, "antfly_query_openapi", false);
+    const admin_openapi_mod = committedModule(b, options, "antfly_admin_openapi", true);
+    const internal_openapi_mod = committedModule(b, options, "antfly_internal_openapi", true);
+    const usermgr_openapi_mod = committedModule(b, options, "antfly_usermgr_openapi", true);
+    const metadata_openapi_mod = committedModule(b, options, "antfly_metadata_openapi", true);
+    const logging_openapi_mod = committedModule(b, options, "antfly_logging_openapi", false);
+    const audio_openapi_mod = committedModule(b, options, "antfly_audio_openapi", false);
+    const middleware_openapi_mod = committedModule(b, options, "antfly_middleware_openapi", false);
+    const scraping_openapi_mod = committedModule(b, options, "antfly_scraping_openapi", false);
+    const s3_openapi_mod = committedModule(b, options, "antfly_s3_openapi", false);
+    const inference_config_openapi_mod = committedModule(b, options, "antfly_inference_config_openapi", false);
+    const chunking_api_openapi_mod = committedModule(b, options, "antfly_chunking_api_openapi", false);
+    const chunking_openapi_mod = committedModule(b, options, "antfly_chunking_openapi", false);
+    const embeddings_openapi_mod = committedModule(b, options, "antfly_embeddings_openapi", false);
+    const provider_openapi_mod = committedModule(b, options, "antfly_provider_openapi", false);
+    const common_openapi_mod = committedModule(b, options, "antfly_common_openapi", false);
+    const generating_openapi_mod = committedModule(b, options, "antfly_generating_openapi", false);
+    const reranking_openapi_mod = committedModule(b, options, "antfly_reranking_openapi", false);
+    embeddings_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
+    generating_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
+    reranking_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
+    public_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
+    client_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
+    const generating_api_openapi_mod = committedModule(b, options, "antfly_generating_api_openapi", false);
+    const extraction_openapi_mod = committedModule(b, options, "antfly_extraction_openapi", false);
+    extraction_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    indexes_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
+    indexes_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    indexes_openapi_mod.addImport("antfly_chunking_openapi", chunking_openapi_mod);
+    indexes_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
+    indexes_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
+    indexes_openapi_mod.addImport("antfly_graph_identifier_openapi", graph_identifier_openapi_mod);
+    websearch_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
+    eval_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    generating_api_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    generating_api_openapi_mod.addImport("antfly_websearch_openapi", websearch_openapi_mod);
+    public_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
+    public_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
+    public_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
+    public_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
+    public_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
+    public_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
+    public_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    public_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
+    public_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
+    client_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
+    client_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
+    client_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
+    client_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
+    client_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
+    client_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    client_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
+    client_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
+    metadata_openapi_mod.addImport("antfly_usermgr_openapi", usermgr_openapi_mod);
+    metadata_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
+    metadata_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
+    metadata_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
+    metadata_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
+    metadata_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
+    metadata_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
+    metadata_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    metadata_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
+    metadata_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
+    chunking_api_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    chunking_openapi_mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
+    audio_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
+    inference_config_openapi_mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
+    inference_config_openapi_mod.addImport("antfly_scraping_openapi", scraping_openapi_mod);
+    inference_config_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
+    inference_config_openapi_mod.addImport("antfly_logging_openapi", logging_openapi_mod);
+    inference_config_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    common_openapi_mod.addImport("antfly_logging_openapi", logging_openapi_mod);
+    common_openapi_mod.addImport("antfly_audio_openapi", audio_openapi_mod);
+    common_openapi_mod.addImport("antfly_middleware_openapi", middleware_openapi_mod);
+    common_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
+    common_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    common_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
+    common_openapi_mod.addImport("antfly_chunking_openapi", chunking_openapi_mod);
+    common_openapi_mod.addImport("antfly_scraping_openapi", scraping_openapi_mod);
+    common_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
+    common_openapi_mod.addImport("antfly_inference_config_openapi", inference_config_openapi_mod);
+
+    const openai_api_mod = committedModule(b, options, "openai_api", true);
+    public_openapi_mod.addImport("antfly-json", options.json);
+    client_openapi_mod.addImport("antfly-json", options.json);
+    metadata_openapi_mod.addImport("antfly-json", options.json);
+    return .{
+        .public = public_openapi_mod,
+        .client = client_openapi_mod,
+        .schema = schema_openapi_mod,
+        .graph_identifier = graph_identifier_openapi_mod,
+        .indexes = indexes_openapi_mod,
+        .sort = sort_openapi_mod,
+        .websearch = websearch_openapi_mod,
+        .eval = eval_openapi_mod,
+        .query = query_openapi_mod,
+        .admin = admin_openapi_mod,
+        .internal = internal_openapi_mod,
+        .usermgr = usermgr_openapi_mod,
+        .metadata = metadata_openapi_mod,
+        .logging = logging_openapi_mod,
+        .audio = audio_openapi_mod,
+        .middleware = middleware_openapi_mod,
+        .scraping = scraping_openapi_mod,
+        .s3 = s3_openapi_mod,
+        .inference_config = inference_config_openapi_mod,
+        .chunking_api = chunking_api_openapi_mod,
+        .chunking = chunking_openapi_mod,
+        .embeddings = embeddings_openapi_mod,
+        .provider = provider_openapi_mod,
+        .common = common_openapi_mod,
+        .generating = generating_openapi_mod,
+        .reranking = reranking_openapi_mod,
+        .generating_api = generating_api_openapi_mod,
+        .extraction = extraction_openapi_mod,
+        .openai_api = openai_api_mod,
+    };
 }

@@ -49,6 +49,11 @@ pub fn build(b: *std.Build) void {
         const artifact = entry.*.cast(std.Build.Step.Compile) orelse continue;
         var configured = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
         inspectConfiguration(b, artifact.step.name, artifact.root_module, artifact.root_module.resolved_target.?, inference.inference_mod.optimize.?, &configured);
+        const arch = artifact.root_module.resolved_target.?.result.cpu.arch;
+        if (arch == .wasm32 or arch == .wasm64) {
+            var wasm_modules = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
+            inspectWasmProfile(artifact.root_module, artifact.root_module.resolved_target.?, &wasm_modules);
+        }
         if (artifact.kind.isTest()) {
             var seen = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
             rejectMetadata(artifact.root_module, inference.build_info_object, &seen);
@@ -80,6 +85,24 @@ pub fn build(b: *std.Build) void {
         }
     }
     if (host_count != 4 or test_count == 0 or openapi.dependencies.items.len != 2) @panic("cache fixture did not inspect the expected production graph");
+    const wasm = artifacts.wasm;
+    inline for (.{ .{ "httpx_profile", "lib/httpx/src/httpx.zig" }, .{ "json_profile", "lib/json/src/mod.zig" } }) |probe| {
+        var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
+        const module = findSourceModule(wasm.root_module, probe[1], &visited) orelse @panic("WASM runtime dependency missing");
+        wasm.root_module.addImport(probe[0], module);
+    }
+    // Keep the actual runtime import graph. Only replace its expensive entry body;
+    // the Python test adds a builtin-mode probe to the real HTTPX/JSON sources.
+    wasm.root_module.root_source_file = sources.add("wasm_profile.zig",
+        \\export fn profile_ok() void {
+        \\    comptime {
+        \\        if (@import("httpx_profile").cache_test_profile != .ReleaseSafe or
+        \\            @import("json_profile").cache_test_profile != .ReleaseSafe)
+        \\            @compileError("WASM dependencies must use ReleaseSafe");
+        \\    }
+        \\}
+    );
+    b.step("cache-wasm", "Check production WASM profiles and cache independence").dependOn(&wasm.step);
     const template_tests = template orelse @panic("missing Antfly template suite");
     template_tests.root_module.root_source_file = sources.add("template_test.zig",
         \\test "unit metadata is stable without a release object" {
@@ -173,6 +196,31 @@ pub fn build(b: *std.Build) void {
         identities.addImports(identity_probe.root_module);
         b.step("cache-identity", "Read enabled backends' actual source identities").dependOn(&b.addRunArtifact(identity_probe).step);
     }
+}
+
+fn findSourceModule(module: *std.Build.Module, suffix: []const u8, seen: *std.AutoHashMap(*std.Build.Module, void)) ?*std.Build.Module {
+    if ((seen.getOrPut(module) catch @panic("OOM")).found_existing) return null;
+    if (module.root_source_file) |source| switch (source) {
+        .src_path => |path| if (std.mem.endsWith(u8, path.sub_path, suffix)) {
+            return module;
+        },
+        else => {},
+    };
+    for (module.import_table.values()) |dependency| {
+        if (findSourceModule(dependency, suffix, seen)) |found| return found;
+    }
+    return null;
+}
+
+fn inspectWasmProfile(module: *std.Build.Module, target: std.Build.ResolvedTarget, seen: *std.AutoHashMap(*std.Build.Module, void)) void {
+    if ((seen.getOrPut(module) catch @panic("OOM")).found_existing) return;
+    if (module.optimize) |optimize| if (optimize != .ReleaseSafe) @panic("WASM module inherits native optimization");
+    if (module.resolved_target) |actual| {
+        if (!std.Target.Query.fromTarget(&actual.result).eql(std.Target.Query.fromTarget(&target.result)))
+            @panic("WASM module inherits a foreign runtime target");
+    }
+    if (module.link_libc == true) @panic("WASM module links native libc");
+    for (module.import_table.values()) |dependency| inspectWasmProfile(dependency, target, seen);
 }
 
 fn inspect(module: *std.Build.Module, unit: runtime.RuntimeLibraryUnit, metadata: *std.Build.Step.Compile, seen: *std.AutoHashMap(*std.Build.Module, void)) void {

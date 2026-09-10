@@ -16,6 +16,12 @@ Constructors return artifacts and runs; entrypoints publish target names and con
 aggregates. Native and WASM configurations remain separate. Runtime archive boundaries, link order, and
 test selections belong to their owners; moving a definition does not change them.
 
+The unified browser runtime in `pkg/antfly/build/wasm.zig` owns a fixed WASM32
+ReleaseSafe configuration, including HTTPX, JSON, OpenAPI, and storage modules.
+Native optimization, target, and storage flags do not configure those modules.
+Native and WASM OpenAPI modules use one wiring constructor with separate module
+instances; SentencePiece modules share the same generated source output.
+
 Python process-lifecycle checks run only when Zig's executor resolver identifies a
 native target. Foreign Linux/macOS fixtures still compile, and the build summary
 reports those process checks as skipped. Ordinary Zig test executables keep Zig's
@@ -28,6 +34,9 @@ the joined public schema into the checked-in trees, including removal of obsolet
 generated files. `make openapi-check` compares them without modifying source files.
 Both use the normal Zig cache; source files, generator options, Python dependency
 locks, and the schema tree supply the inputs. No Git-derived cache key is needed.
+Schema joins resolve references to deterministic owner paths and report the files
+they read through depfiles. Missing required schemas fail the join; generated
+bundles and same-named files elsewhere cannot substitute for them.
 The HTTP API embeds the source schemas through a dedicated module with tracked
 `@embedFile` inputs. The API kernel and HTTP-serving test/benchmark roots attach
 that module explicitly; shared imports and build options carry no schema inputs.
@@ -38,7 +47,7 @@ Runtime dependency and cache contracts are checked in CI with
 `python3 -m unittest tools.test_runtime_cache` from `zig/`, with Zig and uv on
 `PATH` and `zig/deps/snowball` initialized (`git submodule update --init
 zig/deps/snowball` from the repository root). The fixture calls the real root
-composition and replaces only the five expensive runtime bodies. It
+composition and replaces expensive runtime, test, and WASM entry bodies. It
 keeps external modules, options, generated assets, backend inputs, and final link
 edges; the inference probe also loads the real inference module. The checks cover:
 
@@ -62,6 +71,11 @@ edges; the inference probe also loads the real inference module. The checks cove
   an unchanged rebuild reuses compilation and generated outputs.
 - Host generators stay cached across product targets and optimization settings.
   HTTPX runtime edits do not invalidate the OpenAPI compiler.
+- WASM runtime imports retain their target and ReleaseSafe profile. Compiled
+  HTTPX/JSON probes and the WASM artifact remain cached when native target,
+  optimization, or storage options change.
+- Schema joins detect removed and restored inputs, new references, and retargeted
+  symlinks. Warm outputs match a fresh join; unrelated files do not invalidate it.
 - SQL and Snowball checks and regeneration reuse the same final formatted
   outputs. Checks report drift without repairing source files; neither operation
   rewrites cached generator outputs. Schema and Python codegen input changes

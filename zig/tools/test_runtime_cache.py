@@ -160,6 +160,33 @@ class RuntimeCacheTest(unittest.TestCase):
         self.assert_join(warm, "joined", "cached")
         self.assert_join(warm, "prefixed", "cached")
 
+        # Missing repository schemas must fail instead of caching a fallback to
+        # the already-generated bundle. Restoring a changed schema must be read.
+        indexes = self.own("specs/openapi/antfly/indexes.yaml")
+        original_indexes = indexes.read_bytes()
+        indexes.unlink()
+        missing = self.build("cache-openapi", succeeds=False)
+        self.assertIn("indexes.yaml", missing)
+        indexes.write_bytes(
+            original_indexes.replace(
+                b"Configuration for an index", b"Restored schema cache regression"
+            )
+        )
+        restored = self.build("cache-openapi")
+        self.assert_join(restored, "prefixed", "success")
+        self.assert_join(restored, "joined", "cached")
+        self.assert_fresh_public_schema()
+
+        # A same-named file beside the generated bundle cannot shadow its owner.
+        shadow = self.own("indexes.yaml")
+        shadow.write_bytes(
+            original_indexes.replace(
+                b"Configuration for an index", b"Incorrect shadow schema"
+            )
+        )
+        self.assert_join(self.build("cache-openapi"), "prefixed", "cached")
+        self.assert_fresh_public_schema()
+
         unrelated = self.own("specs/openapi/cache-unrelated.yaml")
         unrelated.write_text("unrelated: true\n")
         output = self.build("cache-openapi")
@@ -194,6 +221,68 @@ class RuntimeCacheTest(unittest.TestCase):
         self.assert_join(output, "prefixed", "success")
         warm = self.build("cache-openapi")
         self.assert_join(warm, "prefixed", "cached")
+
+        # Track the logical reference path when a schema is supplied by symlink.
+        first = dependency.with_name("first.yaml")
+        second = dependency.with_name("second.yaml")
+        dependency.rename(first)
+        second.write_text(
+            '{"components":{"schemas":{"CacheProbe":{"type":"boolean"}}}}'
+        )
+        dependency.symlink_to(first.name)
+        self.build("cache-openapi")
+        dependency.unlink()
+        dependency.symlink_to(second.name)
+        self.assert_join(self.build("cache-openapi"), "prefixed", "success")
+        self.assert_fresh_public_schema()
+
+    def assert_fresh_public_schema(self):
+        cached = max(
+            (self.root / "cache/o").glob("*/openapi.public.prefixed.yaml"),
+            key=lambda path: path.stat().st_mtime_ns,
+        )
+        fresh = self.root / "fresh-public.yaml"
+        result = subprocess.run(
+            [
+                "uv",
+                "run",
+                "--project",
+                str(self.root / "scripts"),
+                "--locked",
+                "python",
+                str(self.root / "scripts/join_public_openapi.py"),
+                str(fresh),
+            ],
+            text=True,
+            capture_output=True,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(cached.read_bytes(), fresh.read_bytes())
+
+    def test_wasm_profile_cache_contracts(self):
+        for source in ("zig/lib/httpx/src/httpx.zig", "zig/lib/json/src/mod.zig"):
+            path = self.own(source)
+            path.write_bytes(
+                path.read_bytes()
+                + b'\npub const cache_test_profile = @import("builtin").mode;\n'
+            )
+        self.build("cache-wasm")
+        for settings in (
+            (),
+            ("-Doptimize=ReleaseFast",),
+            (
+                "-Dtarget=x86_64-linux-musl",
+                "-Doptimize=ReleaseFast",
+                "-Dlmdb_evented_async_io=true",
+            ),
+        ):
+            with self.subTest(settings=settings):
+                result = self.build("cache-wasm", settings=settings)
+                self.assertRegex(
+                    result,
+                    r"compile exe antfly_wasm ReleaseSafe wasm32-freestanding cached",
+                )
 
     def assert_join(self, output, kind, status):
         self.assertRegex(output, rf"run uv \(openapi.public.{kind}.yaml\) {status}")

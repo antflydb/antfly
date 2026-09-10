@@ -25,8 +25,6 @@ const tools_build = @import("tools/build_support.zig");
 
 const pkg_antfly_build_codegen = @import("pkg/antfly/build/codegen.zig");
 const addOpenApiRootCheckStep = pkg_antfly_build_codegen.addOpenApiRootCheckStep;
-const addCommittedOpenApiModule = pkg_antfly_build_codegen.addCommittedOpenApiModule;
-const addCommittedOpenApiModuleWithHttpx = pkg_antfly_build_codegen.addCommittedOpenApiModuleWithHttpx;
 const addOpenApiSourceSteps = pkg_antfly_build_codegen.addOpenApiSourceSteps;
 
 const pkg_antfly_build_runtime = @import("pkg/antfly/build/runtime.zig");
@@ -101,6 +99,7 @@ pub fn build(b: *std.Build) void {
 pub const Artifacts = struct {
     runtime: antfly_runtime_build.AddRuntimeResult,
     inference: inference_runtime_build.Graph,
+    wasm: *std.Build.Step.Compile,
 };
 
 /// Compose owners once. Consumers of this constructor can inspect the same
@@ -128,11 +127,6 @@ pub fn create(b: *std.Build) ?Artifacts {
     const vopr_dep = b.dependency("vopr", .{ .target = target, .optimize = optimize });
     const vopr_mod = vopr_dep.module("vopr");
     const strip = b.option(bool, "strip", "Omit debug information from release artifacts") orelse false;
-    const wasm_target = b.resolveTargetQuery(.{
-        .cpu_arch = .wasm32,
-        .os_tag = .freestanding,
-        .cpu_features_add = std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory, .simd128 }),
-    });
     const lmdb_backend = b.option(LmdbBackend, "lmdb_backend", "Select the LMDB backend scaffold (c or zig)") orelse .zig;
     const lmdb_evented_async_io = b.option(bool, "lmdb_evented_async_io", "Use std.Io.Evented for the Zig LMDB async_io backend") orelse false;
     const with_tla = b.option(bool, "with_tla", "Enable TLA+ trace instrumentation (ndjson event logging)") orelse false;
@@ -207,9 +201,13 @@ pub fn create(b: *std.Build) ?Artifacts {
     const standalone_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, lite_local_inference_runtime, true);
     const production_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, false);
     const lmdb_engine_mod = makeLmdbEngineModule(b, target, optimize, link_libc, lmdb_build_options);
-    const lmdb_engine_wasm_mod = makeLmdbEngineModule(b, wasm_target, optimize, false, lmdb_build_options);
     const raft_engine_mod = b.createModule(.{
         .root_source_file = b.path("lib/raft/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const json_mod = b.addModule("antfly-json", .{
+        .root_source_file = b.path("lib/json/src/mod.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -262,96 +260,40 @@ pub fn create(b: *std.Build) ?Artifacts {
     b.step("lib-sql-parser-bench", "Build and install lib-sql-parser-bench").dependOn(&b.addInstallArtifact(yacc_steps.benchmark, .{}).step);
     const openapi_root_check = addOpenApiRootCheckStep(b);
     openapi_check_step.dependOn(&openapi_root_check.step);
-    const antfly_generated_root = "pkg/antfly/src/openapi/generated";
-    const public_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_public_openapi", antfly_generated_root ++ "/antfly_public_openapi");
-    const client_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_client_openapi", antfly_generated_root ++ "/antfly_client_openapi", httpx_mod);
-    const schema_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_schema_openapi", antfly_generated_root ++ "/antfly_schema_openapi");
-    const graph_identifier_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_graph_identifier_openapi", antfly_generated_root ++ "/antfly_graph_identifier_openapi");
-    const indexes_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_indexes_openapi", antfly_generated_root ++ "/antfly_indexes_openapi");
-    const sort_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_sort_openapi", antfly_generated_root ++ "/antfly_sort_openapi");
-    const websearch_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_websearch_openapi", antfly_generated_root ++ "/antfly_websearch_openapi");
-    const eval_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_eval_openapi", antfly_generated_root ++ "/antfly_eval_openapi");
-    const query_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_query_openapi", antfly_generated_root ++ "/antfly_query_openapi");
-    const admin_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_admin_openapi", antfly_generated_root ++ "/antfly_admin_openapi", httpx_mod);
-    const internal_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_internal_openapi", antfly_generated_root ++ "/antfly_internal_openapi", httpx_mod);
-    const usermgr_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_usermgr_openapi", antfly_generated_root ++ "/antfly_usermgr_openapi", httpx_mod);
-    const metadata_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_metadata_openapi", antfly_generated_root ++ "/antfly_metadata_openapi", httpx_mod);
-    const logging_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_logging_openapi", antfly_generated_root ++ "/antfly_logging_openapi");
-    const audio_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_audio_openapi", antfly_generated_root ++ "/antfly_audio_openapi");
-    const middleware_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_middleware_openapi", antfly_generated_root ++ "/antfly_middleware_openapi");
-    const scraping_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_scraping_openapi", antfly_generated_root ++ "/antfly_scraping_openapi");
-    const s3_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_s3_openapi", antfly_generated_root ++ "/antfly_s3_openapi");
-    const inference_config_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_inference_config_openapi", antfly_generated_root ++ "/antfly_inference_config_openapi");
-    const chunking_api_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_chunking_api_openapi", antfly_generated_root ++ "/antfly_chunking_api_openapi");
-    const chunking_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_chunking_openapi", antfly_generated_root ++ "/antfly_chunking_openapi");
-    const embeddings_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_embeddings_openapi", antfly_generated_root ++ "/antfly_embeddings_openapi");
-    const provider_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_provider_openapi", antfly_generated_root ++ "/antfly_provider_openapi");
-    const common_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_common_openapi", antfly_generated_root ++ "/antfly_common_openapi");
-    const generating_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_generating_openapi", antfly_generated_root ++ "/antfly_generating_openapi");
-    const reranking_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_reranking_openapi", antfly_generated_root ++ "/antfly_reranking_openapi");
-    embeddings_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
-    generating_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
-    reranking_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
-    public_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
-    client_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
-    const generating_api_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_generating_api_openapi", antfly_generated_root ++ "/antfly_generating_api_openapi");
-    const extraction_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_extraction_openapi", antfly_generated_root ++ "/antfly_extraction_openapi");
-    extraction_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    indexes_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
-    indexes_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    indexes_openapi_mod.addImport("antfly_chunking_openapi", chunking_openapi_mod);
-    indexes_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
-    indexes_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
-    indexes_openapi_mod.addImport("antfly_graph_identifier_openapi", graph_identifier_openapi_mod);
-    websearch_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
-    eval_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    generating_api_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    generating_api_openapi_mod.addImport("antfly_websearch_openapi", websearch_openapi_mod);
-    public_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
-    public_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
-    public_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
-    public_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
-    public_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
-    public_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
-    public_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    public_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
-    public_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
-    client_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
-    client_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
-    client_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
-    client_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
-    client_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
-    client_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    client_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
-    client_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_usermgr_openapi", usermgr_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_sort_openapi", sort_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
-    chunking_api_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    chunking_openapi_mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
-    audio_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
-    inference_config_openapi_mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
-    inference_config_openapi_mod.addImport("antfly_scraping_openapi", scraping_openapi_mod);
-    inference_config_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
-    inference_config_openapi_mod.addImport("antfly_logging_openapi", logging_openapi_mod);
-    inference_config_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    common_openapi_mod.addImport("antfly_logging_openapi", logging_openapi_mod);
-    common_openapi_mod.addImport("antfly_audio_openapi", audio_openapi_mod);
-    common_openapi_mod.addImport("antfly_middleware_openapi", middleware_openapi_mod);
-    common_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
-    common_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    common_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
-    common_openapi_mod.addImport("antfly_chunking_openapi", chunking_openapi_mod);
-    common_openapi_mod.addImport("antfly_scraping_openapi", scraping_openapi_mod);
-    common_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
-    common_openapi_mod.addImport("antfly_inference_config_openapi", inference_config_openapi_mod);
+    const openapi_modules = pkg_antfly_build_codegen.createCommittedModules(b, .{
+        .root = b.path("pkg/antfly/src/openapi/generated"),
+        .target = target,
+        .optimize = optimize,
+        .httpx = httpx_mod,
+        .json = json_mod,
+        .export_modules = true,
+    });
+    const public_openapi_mod = openapi_modules.public;
+    const client_openapi_mod = openapi_modules.client;
+    const schema_openapi_mod = openapi_modules.schema;
+    const indexes_openapi_mod = openapi_modules.indexes;
+    const sort_openapi_mod = openapi_modules.sort;
+    const eval_openapi_mod = openapi_modules.eval;
+    const query_openapi_mod = openapi_modules.query;
+    const admin_openapi_mod = openapi_modules.admin;
+    const internal_openapi_mod = openapi_modules.internal;
+    const usermgr_openapi_mod = openapi_modules.usermgr;
+    const metadata_openapi_mod = openapi_modules.metadata;
+    const logging_openapi_mod = openapi_modules.logging;
+    const audio_openapi_mod = openapi_modules.audio;
+    const middleware_openapi_mod = openapi_modules.middleware;
+    const scraping_openapi_mod = openapi_modules.scraping;
+    const s3_openapi_mod = openapi_modules.s3;
+    const inference_config_openapi_mod = openapi_modules.inference_config;
+    const chunking_api_openapi_mod = openapi_modules.chunking_api;
+    const chunking_openapi_mod = openapi_modules.chunking;
+    const embeddings_openapi_mod = openapi_modules.embeddings;
+    const common_openapi_mod = openapi_modules.common;
+    const generating_openapi_mod = openapi_modules.generating;
+    const reranking_openapi_mod = openapi_modules.reranking;
+    const generating_api_openapi_mod = openapi_modules.generating_api;
+    const extraction_openapi_mod = openapi_modules.extraction;
+    const openai_api_mod = openapi_modules.openai_api;
 
     // Handlebars template engine
     const handlebars_dep = b.dependency("handlebars", .{ .target = target, .optimize = optimize });
@@ -360,21 +302,12 @@ pub fn create(b: *std.Build) ?Artifacts {
     // Protobuf wire format
     const protobuf_dep = b.dependency("protobuf", .{ .target = target, .optimize = optimize });
     const protobuf_mod = protobuf_dep.module("protobuf");
-    const wasm_protobuf_mod = b.dependency("protobuf", .{ .target = wasm_target, .optimize = .ReleaseSafe }).module("protobuf");
-    const wasm_handlebars_mod = b.dependency("handlebars", .{ .target = wasm_target, .optimize = .ReleaseSafe }).module("handlebars");
     const platform_mod = platform_build.createModule(b, .{
         .root_source_file = b.path("lib/platform/src/root.zig"),
         .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
         .target = target,
         .optimize = optimize,
         .link_libc = link_libc,
-    });
-    const wasm_platform_mod = platform_build.createModule(b, .{
-        .root_source_file = b.path("lib/platform/src/root.zig"),
-        .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
-        .target = wasm_target,
-        .optimize = optimize,
-        .link_libc = false,
     });
     const objectstore_mod = b.createModule(.{
         .root_source_file = b.path("lib/objectstore/src/root.zig"),
@@ -384,11 +317,6 @@ pub fn create(b: *std.Build) ?Artifacts {
     const credentials_mod = b.createModule(.{
         .root_source_file = b.path("lib/credentials/src/root.zig"),
         .target = target,
-        .optimize = optimize,
-    });
-    const wasm_credentials_mod = b.createModule(.{
-        .root_source_file = b.path("lib/credentials/src/root.zig"),
-        .target = wasm_target,
         .optimize = optimize,
     });
     const google_mod = b.createModule(.{
@@ -402,22 +330,6 @@ pub fn create(b: *std.Build) ?Artifacts {
     objectstore_mod.addImport("httpx", httpx_mod);
     objectstore_mod.addImport("antfly_platform", platform_mod);
     objectstore_mod.addImport("antfly_google", google_mod);
-    const wasm_objectstore_mod = b.createModule(.{
-        .root_source_file = b.path("lib/objectstore/src/root.zig"),
-        .target = wasm_target,
-        .optimize = optimize,
-    });
-    const wasm_google_mod = b.createModule(.{
-        .root_source_file = b.path("lib/google/src/root.zig"),
-        .target = wasm_target,
-        .optimize = optimize,
-    });
-    wasm_google_mod.addImport("httpx", httpx_mod);
-    wasm_google_mod.addImport("antfly_credentials", wasm_credentials_mod);
-    wasm_google_mod.addImport("antfly_platform", wasm_platform_mod);
-    wasm_objectstore_mod.addImport("httpx", httpx_mod);
-    wasm_objectstore_mod.addImport("antfly_platform", wasm_platform_mod);
-    wasm_objectstore_mod.addImport("antfly_google", wasm_google_mod);
     const bloom_mod = b.createModule(.{
         .root_source_file = b.path("lib/bloom/src/mod.zig"),
         .target = target,
@@ -429,20 +341,9 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
     });
     vector_mod.addImport("protobuf", protobuf_mod);
-    const wasm_vector_mod = b.createModule(.{
-        .root_source_file = b.path("lib/vector/src/mod.zig"),
-        .target = wasm_target,
-        .optimize = optimize,
-    });
-    wasm_vector_mod.addImport("protobuf", wasm_protobuf_mod);
     const hash_mod = b.createModule(.{
         .root_source_file = b.path("lib/hash/src/mod.zig"),
         .target = target,
-        .optimize = optimize,
-    });
-    const wasm_hash_mod = b.createModule(.{
-        .root_source_file = b.path("lib/hash/src/mod.zig"),
-        .target = wasm_target,
         .optimize = optimize,
     });
     // Standalone benchmark roots force ReleaseFast even when the root build
@@ -465,13 +366,6 @@ pub fn create(b: *std.Build) ?Artifacts {
         vectorindex_mod.linkFramework("Metal", .{});
         vectorindex_mod.addCSourceFile(.{ .file = b.path("lib/vectorindex/src/kmeans_metal.m"), .flags = &.{"-fobjc-arc"} });
     }
-    const wasm_vectorindex_mod = b.createModule(.{
-        .root_source_file = b.path("lib/vectorindex/src/mod.zig"),
-        .target = wasm_target,
-        .optimize = optimize,
-    });
-    wasm_vectorindex_mod.addImport("antfly_vector", wasm_vector_mod);
-    wasm_vectorindex_mod.addImport("antfly_platform", wasm_platform_mod);
     const casbin_mod = b.createModule(.{
         .root_source_file = b.path("lib/casbin/src/mod.zig"),
         .target = target,
@@ -503,11 +397,6 @@ pub fn create(b: *std.Build) ?Artifacts {
     usermgr_test_storage_mod.addImport("antfly_root", usermgr_mod);
     usermgr_test_storage_mod.addImport("antfly_platform", platform_mod);
     usermgr_mod.addImport("usermgr_storage", usermgr_test_storage_mod);
-    const wasm_bloom_mod = b.createModule(.{
-        .root_source_file = b.path("lib/bloom/src/mod.zig"),
-        .target = wasm_target,
-        .optimize = optimize,
-    });
     const vellum_mod = b.createModule(.{
         .root_source_file = b.path("lib/vellum/src/mod.zig"),
         .target = target,
@@ -524,16 +413,6 @@ pub fn create(b: *std.Build) ?Artifacts {
         .target = target,
         .optimize = optimize,
     });
-    const json_mod = b.addModule("antfly-json", .{
-        .root_source_file = b.path("lib/json/src/mod.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    // Raw OpenAPI schema overrides resolve to the shared validated JSON
-    // runtime rather than emitting a private implementation per module.
-    public_openapi_mod.addImport("antfly-json", json_mod);
-    client_openapi_mod.addImport("antfly-json", json_mod);
-    metadata_openapi_mod.addImport("antfly-json", json_mod);
     const toon_mod = b.addModule("antfly_toon", .{
         .root_source_file = b.path("lib/toon/src/mod.zig"),
         .target = target,
@@ -609,9 +488,6 @@ pub fn create(b: *std.Build) ?Artifacts {
     extracting_mod.addImport("httpx", httpx_mod);
     extracting_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
 
-    // Inference dependencies
-    const openai_api_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "openai_api", antfly_generated_root ++ "/openai_api", httpx_mod);
-
     // --- Inference backend detection (must precede module creation) ---
     const image_mod = image_build.createModule(b, b.path("lib/image"), target, optimize, hash_mod);
     const pdf_standard_fonts_mod = b.createModule(.{
@@ -626,23 +502,9 @@ pub fn create(b: *std.Build) ?Artifacts {
     });
     const pdf_mod = pdf_build.createModule(b, b.path("lib/pdf"), target, optimize, image_mod, hash_mod, font_mod, pdf_standard_fonts_mod);
 
-    const wasm_image_mod = image_build.createModule(b, b.path("lib/image"), wasm_target, optimize, wasm_hash_mod);
-    const wasm_pdf_standard_fonts_mod = b.createModule(.{
-        .root_source_file = b.path("pdf_standard_fonts.zig"),
-        .target = wasm_target,
-        .optimize = optimize,
-    });
-    const wasm_font_mod = b.createModule(.{
-        .root_source_file = b.path("lib/font/src/mod.zig"),
-        .target = wasm_target,
-        .optimize = optimize,
-    });
-    const wasm_pdf_mod = pdf_build.createModule(b, b.path("lib/pdf"), wasm_target, optimize, wasm_image_mod, wasm_hash_mod, wasm_font_mod, wasm_pdf_standard_fonts_mod);
-
     const tokenizer_build = @import("lib/tokenizer/build_support.zig");
     const sentencepiece_proto_source = tokenizer_build.generateSentencePieceProto(b, protobuf_dep.artifact("protoc-zig"), b.path("lib/tokenizer"));
     const sentencepiece_proto_mod = tokenizer_build.createSentencePieceProtoModule(b, sentencepiece_proto_source, protobuf_mod);
-    const wasm_sentencepiece_proto_mod = tokenizer_build.createSentencePieceProtoModule(b, sentencepiece_proto_source, wasm_protobuf_mod);
     const inference_jinja_mod = b.createModule(.{
         .root_source_file = b.path("lib/jinja/src/jinja.zig"),
         .target = target,
@@ -919,23 +781,14 @@ pub fn create(b: *std.Build) ?Artifacts {
     antfly_imports.configure(b, antfly_mod, false, link_libc);
     antfly_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
 
+    const wasm = @import("pkg/antfly/build/wasm.zig").add(b, sentencepiece_proto_source);
+    const wasm_step = b.step("wasm", "Build and install the unified Antfly WASM bundle");
+    dependOnAll(wasm_step, wasm.install);
+    wasm.smoke.step.dependOn(wasm_step);
+    b.step("wasm-test", "Build the Antfly WASM bundle and run its Node smoke test").dependOn(&wasm.smoke.step);
     const embedded = antfly_embedded_build.addEmbedded(b, .{
         .optimize = optimize,
         .strip = strip,
-        .wasm_target = wasm_target,
-        .lmdb_engine_wasm_mod = lmdb_engine_wasm_mod,
-        .wasm_protobuf_mod = wasm_protobuf_mod,
-        .wasm_handlebars_mod = wasm_handlebars_mod,
-        .wasm_platform_mod = wasm_platform_mod,
-        .wasm_objectstore_mod = wasm_objectstore_mod,
-        .wasm_vector_mod = wasm_vector_mod,
-        .wasm_hash_mod = wasm_hash_mod,
-        .wasm_vectorindex_mod = wasm_vectorindex_mod,
-        .wasm_bloom_mod = wasm_bloom_mod,
-        .wasm_image_mod = wasm_image_mod,
-        .wasm_pdf_mod = wasm_pdf_mod,
-        .wasm_font_mod = wasm_font_mod,
-        .wasm_sentencepiece_proto_mod = wasm_sentencepiece_proto_mod,
         .antfly_imports = antfly_imports,
         .antfly_mod = antfly_mod,
     });
@@ -1627,5 +1480,5 @@ pub fn create(b: *std.Build) ?Artifacts {
         antfly_tests_build.labelTestRuns(b, unit_test_step);
         antfly_tests_build.labelTestRuns(b, lib_test_step);
     }
-    return .{ .runtime = runtime, .inference = inference_graph };
+    return .{ .runtime = runtime, .inference = inference_graph, .wasm = wasm.artifact };
 }
