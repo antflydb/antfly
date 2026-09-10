@@ -55405,9 +55405,9 @@ fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_
     if (!denseIndexIsArtifactBacked(entry)) return true;
     if (asyncContextHasActiveExternalDenseBulkWork(ctx)) return false;
 
-    const expected_doc_count = (try denseTargetCountForIndexContext(ctx, index_ref.name)) orelse {
+    const expected_doc_count = (try denseTargetCountForIndexContextWithCoverage(ctx, index_ref.name, .materialized)) orelse {
         std.log.warn(
-            "dense replay target advance deferred by missing durable artifact counter index={s}",
+            "dense replay target advance deferred by unavailable materialized coverage index={s}",
             .{index_ref.name},
         );
         return false;
@@ -55465,6 +55465,16 @@ fn denseCoverageMatchesTarget(active_count: u64, expected_count: u64) bool {
 }
 
 fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !?u64 {
+    return try denseTargetCountForIndexContextWithCoverage(ctx, index_name, .all_sources);
+}
+
+const DenseTargetCoverage = enum { all_sources, materialized };
+
+fn denseTargetCountForIndexContextWithCoverage(
+    ctx: *AsyncContext,
+    index_name: []const u8,
+    coverage: DenseTargetCoverage,
+) !?u64 {
     // Inline external vectors have no generated-enrichment incarnation, while
     // one source document can produce multiple chunk-backed or multi-source
     // vectors. Their durable artifact counter remains authoritative.
@@ -55509,8 +55519,8 @@ fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !
     // Outcome counters are created as a complete tuple by the first processed
     // document, so tuple presence alone is not a completion proof. Keep this
     // O(1) by comparing the maintained generation outcome summary with the
-    // maintained range-local primary summary. Publishing is fail-closed until
-    // every source document owned by this range has exactly one terminal
+    // maintained range-local primary summary. All-source certification remains
+    // fail-closed until every source owned by this range has one terminal
     // outcome. The namespace-wide ordinal summary deliberately remains shared
     // across split descendants so it cannot serve as this ownership proof.
     const accounted_without_failures = std.math.add(u64, produced.?, skipped.?) catch
@@ -55522,7 +55532,12 @@ fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !
         ctx.store,
         ctx.index_manager.byte_range,
     );
-    if (accounted != source_count) return null;
+    if (accounted > source_count) return null;
+    if (coverage == .all_sources and accounted != source_count) return null;
+    // Replay consumes available artifacts, independently of provider work
+    // that has not produced one yet. Its materialized target may advance a
+    // certified generation while source coverage remains explicitly pending.
+    // Initial-build/repair cutover continues to require all_sources.
     return produced.?;
 }
 
@@ -56479,7 +56494,11 @@ fn nativeProjectionMaintenanceRound(ctx: *AsyncContext) !bool {
         if (ctx.background_closing.load(.acquire)) return false;
         const checkpoint = manager.denseProjectionCheckpointMetadata(entry.config.name) orelse continue;
         if (checkpoint.status != .rebuilding and checkpoint.status != .clean) continue;
-        const expected = (try denseTargetCountForIndexContext(ctx, entry.config.name)) orelse continue;
+        const expected = (try denseTargetCountForIndexContextWithCoverage(
+            ctx,
+            entry.config.name,
+            if (checkpoint.status == .clean) .materialized else .all_sources,
+        )) orelse continue;
         if (entry.index.stats().active_count != expected) continue;
         const sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse continue;
         if (manager.vectorBlockReadyForDenseIndexAtSequence(entry.config.name, sequence, expected) and
@@ -96746,6 +96765,25 @@ test "db artifact dense target prefers current incarnation outcomes over stale n
         @as(?u64, 2),
         try denseTargetCountForIndexContext(db.async_context, config.name),
     );
+
+    // A later source has no embedding yet. The certified generation must
+    // still advance across source-only replay records; final source coverage
+    // and shadow cutover must remain pending on that same durable state.
+    db.async_context.enrichment_desired_running.store(false, .release);
+    db.enrichment_runtime.?.stop();
+    const applied = try db.core.loadAppliedSequence(alloc, config.name);
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:pending", .value = "{\"body\":\"provider pending\"}" }},
+        .sync_level = .write,
+    });
+    const target = db.core.nextDerivedSequence();
+    try std.testing.expect(target > applied);
+    try std.testing.expectEqual(@as(?u64, null), try denseTargetCountForIndexContext(db.async_context, config.name));
+    try std.testing.expectEqual(@as(?u64, 2), try denseTargetCountForIndexContextWithCoverage(db.async_context, config.name, .materialized));
+    try std.testing.expect(try canAdvanceDerivedToTargetAsync(db.async_context, .{
+        .name = config.name,
+        .kind = .dense_vector,
+    }, applied, target));
 }
 
 test "db multi-source dense target uses physical artifact cardinality" {

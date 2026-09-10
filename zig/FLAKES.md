@@ -55,6 +55,42 @@ its readiness, maintenance-cycle, query, and restart checks and takes about
 Linux reproduction and soak results are recorded in the
 [E2E history](e2e/FLAKES.md#completed-cli-readiness-regresses-after-publication-696).
 
+## Partial-source replay and stale follower restore-job observations (#694)
+
+The `70e0b11869` Linux soak also reproduced an independently seeded retry case
+with one covered, one terminal-failed, and one pending source. The healthy native
+generation contained one searchable vector, but its replay watermark remained at
+5 behind target 12. The target-proof callback required every source to have a
+terminal outcome, even for replay records that could not produce an embedding.
+It repeatedly logged an unavailable artifact counter and prevented projection
+publication while the test deliberately held the later provider request.
+
+Replay now distinguishes the count of materialized embeddings from completion
+of all source work. Generation-scoped outcome tuples still fence the cardinality,
+and replay must prove there are no unapplied applicable artifact records.
+Already-clean projection maintenance uses that materialized target; initial
+build, rebuilding-checkpoint finalization, and shadow cutover retain the strict
+all-sources proof. The regression leaves a real source pending, verifies that
+strict coverage remains unavailable, and permits advancing the certified index
+across its source-only replay tail. Existing overflow, incomplete-coverage, and
+same-name-generation tests retain their fail-closed behavior.
+
+A separate restore poll timed out after 120 seconds because job-detail GETs could
+serve a present but stale follower row. Decoding the retained native SSTs with
+the production table decoder showed job `4153919785164652446` succeeded on
+metadata-1 and metadata-3 at `1789063384173` ms, **15.403 seconds** after creation.
+Metadata-2 retained its running attempt-1 state at `1789063369536` ms. Public
+job-detail reads now require leader authority, matching list and mutation
+operations, and persistence reads require a linearizable fence. A follower with
+an existing row returns the retryable metadata-not-leader response instead of
+hiding a completed job. The regression covers both absent and present follower
+rows. This fixes the stale-read contract; the captured SSTs alone do not explain
+the follower's replication lag.
+
+The focused runs passed 76 dense lifecycle checks and the metadata server
+regression without leaks. Fixed Linux acceptance remains pending; neither the
+failed baseline nor partial counts are accepted as 100/100.
+
 ## Slow Raft sync kills the runtime; targeted activation joins sibling work (#694)
 
 The Linux soak of `70e0b11869` exposed two additional signatures, separate from

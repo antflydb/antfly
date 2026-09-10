@@ -62,7 +62,9 @@ metadata exits after slow successful WAL sync, and a seed batch with unknown
 write outcome. Failure roots and raw worker logs were retained. See the
 [runtime diagnosis](../FLAKES.md#slow-raft-sync-kills-the-runtime-targeted-activation-joins-sibling-work-694)
 for the production changes and remaining write-timeout investigation. A fresh
-100-per-scenario soak is required after those changes.
+100-per-scenario soak is required after those changes. The later partial-source
+replay failure and stale follower job read now have separate
+[production regressions](../FLAKES.md#partial-source-replay-and-stale-follower-restore-job-observations-694).
 
 The CLI quickstart now separates retry exhaustion into
 `test_cli_index_wait_survives_retry_exhaustion_and_restart`. The quickstart
