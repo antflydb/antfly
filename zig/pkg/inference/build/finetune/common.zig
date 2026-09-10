@@ -26,6 +26,7 @@ pub const Import = enum {
     protobuf,
     termite_c_file,
     inference_finetune_data,
+    inference_finetune_assets,
     inference_finetune_tokenizer_batch,
     inference_hf_tokenizer,
     inference_internal,
@@ -93,6 +94,23 @@ pub const Context = struct {
             }),
             // These roots intentionally live directly under src/. Their
             // transitive imports need src as the Zig module boundary.
+            .inference_finetune_assets => blk: {
+                const mod = ctx.b.createModule(.{
+                    .root_source_file = ctx.path("src/finetune_assets_root.zig"),
+                    .target = ctx.target,
+                    .optimize = ctx.optimize,
+                });
+                mod.addImport("build_options", ctx.b.createModule(.{
+                    .root_source_file = ctx.path("src/finetune/assets_options.zig"),
+                    .target = ctx.target,
+                    .optimize = ctx.optimize,
+                }));
+                mod.addImport("ml", ctx.ml_mod);
+                mod.addImport("onnx_graph", ctx.onnx_graph_mod);
+                mod.addImport("jinja", ctx.jinja_mod);
+                mod.addImport("antfly_platform", ctx.antfly_platform_mod);
+                break :blk mod;
+            },
             .inference_finetune_data => ctx.b.createModule(.{
                 .root_source_file = ctx.path("src/finetune_data_root.zig"),
                 .target = ctx.target,

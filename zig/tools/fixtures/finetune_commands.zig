@@ -15,18 +15,24 @@
 const std = @import("std");
 const project = @import("project_build.zig");
 
-/// The production aggregate gets these executable dependencies from the command
-/// registries. Keep every real entry body and final link, without running models.
+/// Inspect the actual aggregate without compiling its commands in a disposable
+/// cache. The normal unit gate already builds every executable in this registry.
 pub fn build(b: *std.Build) void {
     _ = project.create(b);
-    const checks = b.step("cache-finetune-commands", "Compile registered finetune commands");
+    _ = b.step("cache-finetune-registry", "Check command compilation coverage without rebuilding commands");
     const tests = b.top_level_steps.get("inference-finetune-test").?;
-    var count: usize = 0;
+    const specs = @import("pkg/inference/build/finetune/tools.zig").specs ++
+        @import("pkg/inference/build/finetune/workflows.zig").specs;
+    var actual = std.StringHashMap(void).init(b.allocator);
     for (tests.step.dependencies.items) |dependency| {
         const command = dependency.cast(std.Build.Step.Compile) orelse continue;
-        checks.dependOn(dependency);
-        std.debug.print("FINETUNE_COMMAND {s}\n", .{command.name});
-        count += 1;
+        if ((actual.getOrPut(command.name) catch @panic("OOM")).found_existing)
+            @panic("duplicate command in finetune aggregate");
     }
-    if (count == 0) @panic("finetune aggregate has no command compilation coverage");
+    for (specs) |spec| {
+        if (!actual.remove(spec.name))
+            std.debug.panic("finetune aggregate does not compile {s}", .{spec.name});
+        std.debug.print("FINETUNE_COMMAND {s}\n", .{spec.name});
+    }
+    if (actual.count() != 0 or specs.len == 0) @panic("unexpected finetune command coverage");
 }

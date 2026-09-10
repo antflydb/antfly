@@ -20,7 +20,7 @@ const reranker_text_imports = &.{ .build_options, .jinja, .inference_tokenizer, 
 const reranker_train_imports = &.{ .build_options, .jinja, .ml, .inference_tokenizer, .inference_hf_tokenizer, .inference_internal };
 const gemma_lora_imports = &.{ .build_options, .ml, .inference_internal };
 
-const commands = [_]common.CommandSpec{
+pub const specs = [_]common.CommandSpec{
     .{
         .name = "inspect-layoutlmv3-bundle",
         .root_source_file = "src/finetune_inspect_layoutlmv3_bundle.zig",
@@ -31,31 +31,36 @@ const commands = [_]common.CommandSpec{
         .name = "compose-lora-adapters",
         .root_source_file = "src/finetune/tools/compose_lora_adapters.zig",
         .description = "Compose LoRA adapter SafeTensors with optional eval gate",
-        .imports = &.{ .build_options, .inference_internal },
+        .imports = &.{.inference_finetune_assets},
+        .link_libc = true,
     },
     .{
         .name = "bootstrap-gliner2-lora",
         .root_source_file = "src/finetune/tools/bootstrap_gliner2_lora.zig",
         .description = "Bootstrap a GLiNER2 LoRA adapter bundle",
-        .imports = gemma_lora_imports,
+        .imports = &.{.inference_finetune_assets},
+        .link_libc = true,
     },
     .{
         .name = "inspect-gliner2-checkpoint",
         .root_source_file = "src/finetune/tools/inspect_gliner2_checkpoint.zig",
         .description = "Inspect a GLiNER2 checkpoint and optional LoRA bundle",
-        .imports = gemma_lora_imports,
+        .imports = &.{.inference_finetune_assets},
+        .link_libc = true,
     },
     .{
         .name = "inspect-gliner2-lora-bundle",
         .root_source_file = "src/finetune/tools/inspect_gliner2_lora_bundle.zig",
         .description = "Inspect a GLiNER2 LoRA adapter bundle",
-        .imports = gemma_lora_imports,
+        .imports = &.{.inference_finetune_assets},
+        .link_libc = true,
     },
     .{
         .name = "materialize-gliner2-lora",
         .root_source_file = "src/finetune/tools/materialize_gliner2_lora.zig",
         .description = "Materialize a GLiNER2 LoRA adapter bundle into a merged checkpoint",
-        .imports = gemma_lora_imports,
+        .imports = &.{.inference_finetune_assets},
+        .link_libc = true,
     },
     .{
         .name = "inspect-gliner2-dataset",
@@ -67,7 +72,8 @@ const commands = [_]common.CommandSpec{
         .name = "validate-gliner2-autodiff-run",
         .root_source_file = "src/finetune/tools/validate_gliner2_autodiff_run.zig",
         .description = "Validate train-gliner2-autodiff metrics, manifest, and saved adapter parameter files",
-        .imports = gemma_lora_imports,
+        .imports = &.{.inference_finetune_assets},
+        .link_libc = true,
     },
     .{
         .name = "eval-gliner2-autodiff-adapter",
@@ -203,28 +209,28 @@ const commands = [_]common.CommandSpec{
         .name = "materialize-reranker-head",
         .root_source_file = "src/finetune/tools/materialize_reranker_head.zig",
         .description = "Materialize a trained termite-owned reranker head into native checkpoint tensors",
-        .imports = reranker_text_imports,
-        .native_link = .default,
+        .imports = &.{.inference_finetune_assets},
+        .link_libc = true,
     },
     .{
         .name = "bootstrap-reranker-lora",
         .root_source_file = "src/finetune/tools/bootstrap_reranker_lora.zig",
         .description = "Bootstrap a bounded encoder-side LoRA bundle for native text rerankers",
-        .imports = reranker_text_imports,
+        .imports = &.{.inference_finetune_assets},
         .link_libc = true,
     },
     .{
         .name = "inspect-reranker-lora-bundle",
         .root_source_file = "src/finetune/tools/inspect_reranker_lora_bundle.zig",
         .description = "Inspect a bounded encoder-side LoRA bundle for native text rerankers",
-        .imports = reranker_text_imports,
+        .imports = &.{.inference_finetune_assets},
         .link_libc = true,
     },
     .{
         .name = "materialize-reranker-lora",
         .root_source_file = "src/finetune/tools/materialize_reranker_lora.zig",
         .description = "Materialize a bounded encoder-side LoRA bundle into a merged reranker checkpoint",
-        .imports = &.{ .build_options, .jinja, .inference_tokenizer, .inference_hf_tokenizer, .inference_internal },
+        .imports = &.{.inference_finetune_assets},
         .link_libc = true,
     },
     .{
@@ -252,25 +258,29 @@ const commands = [_]common.CommandSpec{
         .name = "bootstrap-colqwen2-lora",
         .root_source_file = "src/finetune/tools/bootstrap_colqwen2_lora.zig",
         .description = "Bootstrap a ColQwen2 LoRA adapter bundle",
-        .imports = &.{ .build_options, .ml, .inference_hf_tokenizer, .inference_internal },
+        .imports = &.{.inference_finetune_assets},
+        .link_libc = true,
     },
     .{
         .name = "inspect-colqwen2-checkpoint",
         .root_source_file = "src/finetune/tools/inspect_colqwen2_checkpoint.zig",
         .description = "Inspect a ColQwen2 checkpoint or adapter bundle",
-        .imports = &.{ .build_options, .ml, .inference_hf_tokenizer, .inference_internal },
+        .imports = &.{.inference_finetune_assets},
+        .link_libc = true,
     },
     .{
         .name = "inspect-colqwen2-lora-bundle",
         .root_source_file = "src/finetune/tools/inspect_colqwen2_lora_bundle.zig",
         .description = "Inspect a ColQwen2 LoRA adapter bundle",
-        .imports = &.{ .build_options, .ml, .inference_hf_tokenizer, .inference_internal },
+        .imports = &.{.inference_finetune_assets},
+        .link_libc = true,
     },
     .{
         .name = "materialize-colqwen2-lora",
         .root_source_file = "src/finetune/tools/materialize_colqwen2_lora.zig",
         .description = "Materialize a ColQwen2 LoRA adapter bundle into a merged checkpoint",
-        .imports = &.{ .build_options, .ml, .inference_hf_tokenizer, .inference_internal },
+        .imports = &.{.inference_finetune_assets},
+        .link_libc = true,
     },
     .{
         .name = "prepare-colqwen2-inputs",
@@ -308,8 +318,8 @@ const commands = [_]common.CommandSpec{
         .name = "materialize-gemma4-recursive-base",
         .root_source_file = "src/finetune/tools/materialize_gemma4_recursive_base.zig",
         .description = "Materialize a compressed Gemma4 recursive base checkpoint",
-        .imports = gemma_lora_imports,
-        .native_link = .default,
+        .imports = &.{.inference_finetune_assets},
+        .link_libc = true,
     },
     .{
         .name = "generate-gemma4-pilot-dataset",
@@ -339,19 +349,22 @@ const commands = [_]common.CommandSpec{
         .name = "bootstrap-gemma4-lora",
         .root_source_file = "src/finetune/tools/bootstrap_gemma4_lora.zig",
         .description = "Bootstrap a Gemma4 LoRA adapter bundle",
-        .imports = gemma_lora_imports,
+        .imports = &.{.inference_finetune_assets},
+        .link_libc = true,
     },
     .{
         .name = "inspect-gemma4-lora-bundle",
         .root_source_file = "src/finetune/tools/inspect_gemma4_lora_bundle.zig",
         .description = "Inspect a Gemma4 LoRA adapter bundle",
-        .imports = gemma_lora_imports,
+        .imports = &.{.inference_finetune_assets},
+        .link_libc = true,
     },
     .{
         .name = "materialize-gemma4-lora",
         .root_source_file = "src/finetune/tools/materialize_gemma4_lora.zig",
         .description = "Materialize a Gemma4 LoRA adapter bundle into a merged checkpoint",
-        .imports = gemma_lora_imports,
+        .imports = &.{.inference_finetune_assets},
+        .link_libc = true,
     },
     .{
         .name = "train-eval-colqwen2-lora-bundle",
@@ -364,19 +377,22 @@ const commands = [_]common.CommandSpec{
         .name = "bootstrap-layoutlmv3-lora",
         .root_source_file = "src/finetune/tools/bootstrap_layoutlmv3_lora.zig",
         .description = "Bootstrap a LayoutLMv3 LoRA adapter bundle",
-        .imports = gemma_lora_imports,
+        .imports = &.{.inference_finetune_assets},
+        .link_libc = true,
     },
     .{
         .name = "inspect-layoutlmv3-lora-bundle",
         .root_source_file = "src/finetune/tools/inspect_layoutlmv3_lora_bundle.zig",
         .description = "Inspect a LayoutLMv3 LoRA adapter bundle",
-        .imports = &.{ .build_options, .ml, .inference_internal },
+        .imports = &.{.inference_finetune_assets},
+        .link_libc = true,
     },
     .{
         .name = "materialize-layoutlmv3-checkpoint",
         .root_source_file = "src/finetune/tools/materialize_layoutlmv3_checkpoint.zig",
         .description = "Materialize a merged LayoutLMv3 checkpoint from a LoRA adapter bundle",
-        .imports = gemma_lora_imports,
+        .imports = &.{.inference_finetune_assets},
+        .link_libc = true,
     },
     .{
         .name = "train-layoutlmv3-lora-one-step",
@@ -408,5 +424,5 @@ const commands = [_]common.CommandSpec{
 };
 
 pub fn register(ctx: common.Context) []const common.Command {
-    return common.addCommands(ctx, &commands);
+    return common.addCommands(ctx, &specs);
 }

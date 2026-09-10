@@ -99,14 +99,21 @@ class RuntimeCacheTest(unittest.TestCase):
         succeeds=True,
         timeout=240,
     ):
+        native_flags = (
+            []
+            if "-Dwasm=true" in settings
+            else [
+                f"-Dmetal={'true' if backend == 'metal' else 'false'}",
+                f"-Dcuda={'true' if backend == 'cuda' else 'false'}",
+                "-Dsystem-blas=false",
+            ]
+        )
         result = subprocess.run(
             [
                 "zig",
                 "build",
                 *targets,
-                f"-Dmetal={'true' if backend == 'metal' else 'false'}",
-                f"-Dcuda={'true' if backend == 'cuda' else 'false'}",
-                "-Dsystem-blas=false",
+                *native_flags,
                 f"-Dantfly-version={version}",
                 *settings,
                 "--summary",
@@ -686,24 +693,177 @@ class RuntimeCacheTest(unittest.TestCase):
                 finally:
                     source.write_bytes(content)
 
+    def test_finetune_asset_dependencies(self):
+        names = (
+            "compose-lora-adapters",
+            "inspect-reranker-lora-bundle",
+            "materialize-reranker-head",
+        )
+
+        def check(output, rebuilt=()):
+            for name in names:
+                status = "success" if name in rebuilt else "cached"
+                self.assertRegex(output, rf"compile exe {name} Debug \S+ {status}")
+
+        def write_tensors(path, tensors):
+            header, data = {}, b""
+            for name, shape, values in tensors:
+                payload = struct.pack(f"<{len(values)}f", *values)
+                header[name] = {
+                    "dtype": "F32",
+                    "shape": shape,
+                    "data_offsets": [len(data), len(data) + len(payload)],
+                }
+                data += payload
+            encoded = json.dumps(header).encode()
+            path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + data)
+
+        def read_tensors(path):
+            content = path.read_bytes()
+            size = struct.unpack("<Q", content[:8])[0]
+            header = json.loads(content[8 : 8 + size])
+            data = content[8 + size :]
+            return {
+                name: struct.unpack(
+                    f"<{(meta['data_offsets'][1] - meta['data_offsets'][0]) // 4}f",
+                    data[slice(*meta["data_offsets"])],
+                )
+                for name, meta in header.items()
+                if name != "__metadata__"
+            }
+
+        for standalone in (False, True):
+            with self.subTest(standalone=standalone):
+                if standalone:
+                    self.use_standalone()
+                inputs = self.build_directory / "cache_asset_inputs"
+                (inputs / "base").mkdir(parents=True)
+                (inputs / "adapter").mkdir()
+                (inputs / "base/config.json").write_text(
+                    json.dumps(
+                        {
+                            "model_type": "bert",
+                            "hidden_size": 2,
+                            "num_hidden_layers": 1,
+                            "num_attention_heads": 1,
+                            "intermediate_size": 2,
+                        }
+                    )
+                )
+                tensor = "bert.encoder.layer.0.attention.self.query"
+                write_tensors(
+                    inputs / "base/model.safetensors",
+                    [(tensor + ".weight", [2, 2], [0.0] * 4)],
+                )
+                write_tensors(
+                    inputs / "adapter/adapter_model.safetensors",
+                    [
+                        (tensor + ".lora_A.weight", [1, 2], [1.0, 2.0]),
+                        (tensor + ".lora_B.weight", [2, 1], [3.0, 4.0]),
+                    ],
+                )
+                write_tensors(
+                    inputs / "head.safetensors",
+                    [
+                        ("legacy_reranker.classifier.weight", [1, 2], [1.0, 2.0]),
+                        ("legacy_reranker.classifier.bias", [1], [0.5]),
+                    ],
+                )
+                old_outputs = set(
+                    (self.root / "cache/o").glob("*/composed-adapter.safetensors")
+                )
+                check(self.build("cache-finetune-assets"), rebuilt=names)
+                check(self.build("cache-finetune-assets"))
+                for backend, settings in (
+                    ("metal", ()),
+                    ("cuda", ()),
+                    (None, ("-Dpjrt=true",)),
+                    (
+                        None,
+                        ("-Donnx=true", f"-Donnx-root={self.root / 'missing-onnx'}"),
+                    ),
+                ):
+                    check(
+                        self.build(
+                            "cache-finetune-assets", backend=backend, settings=settings
+                        )
+                    )
+                check(self.build("cache-finetune-assets", version="unrelated-version"))
+                heads = list(
+                    (self.root / "cache/o").glob(
+                        "*/materialized-head/model.safetensors"
+                    )
+                )
+                self.assertTrue(heads)
+                for output in heads:
+                    self.assertEqual(
+                        read_tensors(output),
+                        {
+                            "classifier.out_proj.weight": (1.0, 2.0),
+                            "classifier.out_proj.bias": (0.5,),
+                        },
+                    )
+                reports = list((self.root / "cache/o").glob("*/asset-inspection.json"))
+                self.assertTrue(reports)
+                for report in reports:
+                    self.assertEqual(
+                        json.loads(report.read_text())["trainable_parameter_count"], 4
+                    )
+                outputs = (
+                    set((self.root / "cache/o").glob("*/composed-adapter.safetensors"))
+                    - old_outputs
+                )
+                self.assertTrue(outputs)
+                for output in outputs:
+                    self.assertEqual(
+                        read_tensors(output)[tensor + ".lora_A.weight"], (1.0, 2.0)
+                    )
+                # Actual source changes still rebuild and change the output.
+                source = self.own("zig/pkg/inference/src/finetune/peft.zig")
+                contents = source.read_text()
+                self.assertIn("input.weight * v", contents)
+                source.write_text(
+                    contents.replace("input.weight * v", "2 * input.weight * v")
+                )
+                try:
+                    check(self.build("cache-finetune-assets"), rebuilt=names)
+                    outputs = list(
+                        (self.root / "cache/o").glob("*/composed-adapter.safetensors")
+                    )
+                    self.assertTrue(
+                        any(
+                            read_tensors(output)[tensor + ".lora_A.weight"]
+                            == (2.0, 4.0)
+                            for output in outputs
+                        )
+                    )
+                finally:
+                    source.write_text(contents)
+                # A failed read after one valid input must return an error,
+                # without double-freeing partially composed tensor storage.
+                self.build("cache-finetune-assets-error")
+
     def test_finetune_command_registry(self):
         shutil.copyfile(
             ZIG_ROOT / "tools/fixtures/finetune_commands.zig",
             self.root / "zig/build.zig",
         )
-        first = self.build("cache-finetune-commands", timeout=1200)
-        names = re.findall(r"^FINETUNE_COMMAND (.+)$", first, re.MULTILINE)
+        output = self.build("cache-finetune-registry")
+        names = re.findall(r"^FINETUNE_COMMAND (.+)$", output, re.MULTILINE)
         self.assertTrue(names)
-        for name in names:
-            self.assertRegex(
-                first, rf"compile exe {re.escape(name)} Debug \S+ (success|cached)"
-            )
-        warm = self.build("cache-finetune-commands", timeout=1200)
-        self.assertEqual(
-            set(names), set(re.findall(r"^FINETUNE_COMMAND (.+)$", warm, re.MULTILINE))
+        self.assertEqual(len(names), len(set(names)))
+        self.assertNotIn("compile exe", output)
+        # Prove the inspection detects lost compilation coverage, without
+        # compiling the missing command or maintaining another test inventory.
+        integration = self.own("zig/pkg/inference/build/integration.zig")
+        contents = integration.read_text()
+        registration = (
+            "for (commands) |command| finetune_step.dependOn(&command.executable.step);"
         )
-        for name in names:
-            self.assertRegex(warm, rf"compile exe {re.escape(name)} Debug \S+ cached")
+        self.assertIn(registration, contents)
+        integration.write_text(contents.replace(registration, "_ = commands;"))
+        failure = self.build("cache-finetune-registry", succeeds=False)
+        self.assertIn("finetune aggregate does not compile", failure)
 
     def test_wasm_profile_cache_contracts(self):
         for source in ("zig/lib/httpx/src/httpx.zig", "zig/lib/json/src/mod.zig"):
@@ -728,6 +888,53 @@ class RuntimeCacheTest(unittest.TestCase):
                 self.assertRegex(
                     result,
                     r"compile exe antfly_wasm ReleaseSafe wasm32-freestanding cached",
+                )
+
+    def test_inference_wasm_dependencies(self):
+        for standalone in (False, True):
+            with self.subTest(standalone=standalone):
+                if standalone:
+                    self.use_standalone()
+                base = ("-Dwasm=true",) if standalone else ()
+                self.build("cache-inference-wasm", settings=base)
+                settings_to_check = [(), ("-Doptimize=ReleaseFast",)]
+                if standalone:
+                    settings_to_check += [
+                        ("-Denable-native-quant-dispatch-stats=true",),
+                        ("-Dskip-openapi=true",),
+                    ]
+                else:
+                    settings_to_check += [("-Donnx=true",), ("-Dpjrt=true",)]
+                for settings in settings_to_check:
+                    output = self.build(
+                        "cache-inference-wasm", settings=base + settings
+                    )
+                    self.assertRegex(
+                        output,
+                        r"compile exe antfly-inference-wasm32 ReleaseSafe wasm32-freestanding cached",
+                    )
+                output = self.build(
+                    "cache-inference-wasm", version="unrelated-version", settings=base
+                )
+                self.assertRegex(
+                    output,
+                    r"compile exe antfly-inference-wasm32 ReleaseSafe wasm32-freestanding cached",
+                )
+                # Positive controls: supported browser settings still rebuild.
+                output = self.build(
+                    "cache-inference-wasm", settings=base + ("-Dwebgpu=true",)
+                )
+                self.assertRegex(
+                    output,
+                    r"compile exe antfly-inference-wasm32 ReleaseSafe wasm32-freestanding success",
+                )
+                output = self.build(
+                    "cache-inference-wasm",
+                    settings=base + ("-Dwasm-memory-model=wasm64",),
+                )
+                self.assertRegex(
+                    output,
+                    r"compile exe antfly-inference-wasm64 ReleaseSafe wasm64-freestanding success",
                 )
 
     def assert_join(self, output, kind, status):

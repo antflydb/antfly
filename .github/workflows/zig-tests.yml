@@ -390,8 +390,8 @@ jobs:
         working-directory: zig
         run: zig build antfly-storage-bench -Doptimize=Debug
 
-      # Runtime cache checks compile registered finetune commands and execute
-      # actual bounded data-tool and CPU benchmark workloads.
+      # The unit gate compiles registered finetune commands once in its normal
+      # cache. These checks inspect coverage and run bounded dependency probes.
       - name: Test bounded-build tooling
         working-directory: zig
         run: >-
@@ -693,8 +693,8 @@ jobs:
       - name: Check generated sources
         run: make zig-generated-check
 
-      # Runtime cache checks compile registered finetune commands and execute
-      # actual bounded data-tool and CPU benchmark workloads.
+      # The unit gate compiles registered finetune commands once in its normal
+      # cache. These checks inspect coverage and run bounded dependency probes.
       - name: Test bounded-build tooling
         working-directory: zig
         run: >-

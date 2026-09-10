@@ -13,34 +13,45 @@
 // limitations under the License.
 
 const std = @import("std");
-const finetune = @import("inference_internal").finetune.colqwen2;
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-
-    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
-    defer args.deinit();
-    _ = args.next();
-
-    const model_input = args.next() orelse return usageError();
-
-    var summary = try finetune.inspectCheckpoint(allocator, model_input);
-    defer finetune.freeInspectionSummary(allocator, &summary);
-
-    const io = init.io;
-    const stdout = std.Io.File.stdout();
-    var buf: [4096]u8 = undefined;
-    var writer = stdout.writer(io, &buf);
-    try std.json.Stringify.value(summary, .{ .whitespace = .indent_2 }, &writer.interface);
-    try writer.interface.writeByte('\n');
-    try writer.interface.flush();
+    return Command(@import("inference_finetune_assets")).main(init);
 }
 
-fn usageError() error{InvalidArguments} {
-    std.debug.print(
-        \\usage: inspect-colqwen2-checkpoint <model_dir_or_checkpoint>
-        \\example: inspect-colqwen2-checkpoint /tmp/colqwen2-base
-        \\
-    , .{});
-    return error.InvalidArguments;
+// Reuse the parser and implementation in the combined CLI without creating a
+// second instance of model/tensor types inside its inference module.
+pub fn Command(comptime assets: type) type {
+    return struct {
+        const finetune = assets.finetune.colqwen2;
+
+        pub fn main(init: std.process.Init) !void {
+            const allocator = init.gpa;
+
+            var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+            defer args.deinit();
+            _ = args.next();
+
+            const model_input = args.next() orelse return usageError();
+
+            var summary = try finetune.inspectCheckpoint(allocator, model_input);
+            defer finetune.freeInspectionSummary(allocator, &summary);
+
+            const io = init.io;
+            const stdout = std.Io.File.stdout();
+            var buf: [4096]u8 = undefined;
+            var writer = stdout.writer(io, &buf);
+            try std.json.Stringify.value(summary, .{ .whitespace = .indent_2 }, &writer.interface);
+            try writer.interface.writeByte('\n');
+            try writer.interface.flush();
+        }
+
+        fn usageError() error{InvalidArguments} {
+            std.debug.print(
+                \\usage: inspect-colqwen2-checkpoint <model_dir_or_checkpoint>
+                \\example: inspect-colqwen2-checkpoint /tmp/colqwen2-base
+                \\
+            , .{});
+            return error.InvalidArguments;
+        }
+    };
 }

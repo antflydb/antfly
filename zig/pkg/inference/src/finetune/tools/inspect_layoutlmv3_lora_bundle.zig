@@ -13,46 +13,57 @@
 // limitations under the License.
 
 const std = @import("std");
-const compat = @import("inference_internal").io.compat;
-const finetune = @import("inference_internal").finetune.layoutlmv3;
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-
-    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
-    defer args.deinit();
-    _ = args.next();
-
-    const base_model_dir = args.next() orelse return usageError();
-    const adapter_model_dir = args.next() orelse return usageError();
-    const report_path = args.next();
-
-    var summary = try finetune.inspectLoRABundle(allocator, base_model_dir, adapter_model_dir);
-    defer finetune.freeLoRABundleInspectionSummary(allocator, &summary);
-
-    if (report_path) |path| {
-        const io = compat.io();
-        var file = try compat.cwd().createFile(io, path, .{ .truncate = true });
-        defer file.close(io);
-        const rendered = try std.json.Stringify.valueAlloc(allocator, summary, .{ .whitespace = .indent_2 });
-        defer allocator.free(rendered);
-        try file.writeStreamingAll(io, rendered);
-        try file.writeStreamingAll(io, "\n");
-    }
-
-    const stdout = std.Io.File.stdout();
-    var buf: [4096]u8 = undefined;
-    var writer = stdout.writer(init.io, &buf);
-    try std.json.Stringify.value(summary, .{ .whitespace = .indent_2 }, &writer.interface);
-    try writer.interface.writeByte('\n');
-    try writer.interface.flush();
+    return Command(@import("inference_finetune_assets")).main(init);
 }
 
-fn usageError() error{InvalidArguments} {
-    std.debug.print(
-        \\usage: inspect-layoutlmv3-lora-bundle <base_model_dir> <adapter_model_dir> [report_path]
-        \\example: inspect-layoutlmv3-lora-bundle /tmp/layoutlmv3-base /tmp/layoutlmv3-lora /tmp/layoutlmv3_lora_inspect.json
-        \\
-    , .{});
-    return error.InvalidArguments;
+// Reuse the parser and implementation in the combined CLI without creating a
+// second instance of model/tensor types inside its inference module.
+pub fn Command(comptime assets: type) type {
+    return struct {
+        const compat = assets.io.compat;
+        const finetune = assets.finetune.layoutlmv3;
+
+        pub fn main(init: std.process.Init) !void {
+            const allocator = init.gpa;
+
+            var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+            defer args.deinit();
+            _ = args.next();
+
+            const base_model_dir = args.next() orelse return usageError();
+            const adapter_model_dir = args.next() orelse return usageError();
+            const report_path = args.next();
+
+            var summary = try finetune.inspectLoRABundle(allocator, base_model_dir, adapter_model_dir);
+            defer finetune.freeLoRABundleInspectionSummary(allocator, &summary);
+
+            if (report_path) |path| {
+                const io = compat.io();
+                var file = try compat.cwd().createFile(io, path, .{ .truncate = true });
+                defer file.close(io);
+                const rendered = try std.json.Stringify.valueAlloc(allocator, summary, .{ .whitespace = .indent_2 });
+                defer allocator.free(rendered);
+                try file.writeStreamingAll(io, rendered);
+                try file.writeStreamingAll(io, "\n");
+            }
+
+            const stdout = std.Io.File.stdout();
+            var buf: [4096]u8 = undefined;
+            var writer = stdout.writer(init.io, &buf);
+            try std.json.Stringify.value(summary, .{ .whitespace = .indent_2 }, &writer.interface);
+            try writer.interface.writeByte('\n');
+            try writer.interface.flush();
+        }
+
+        fn usageError() error{InvalidArguments} {
+            std.debug.print(
+                \\usage: inspect-layoutlmv3-lora-bundle <base_model_dir> <adapter_model_dir> [report_path]
+                \\example: inspect-layoutlmv3-lora-bundle /tmp/layoutlmv3-base /tmp/layoutlmv3-lora /tmp/layoutlmv3_lora_inspect.json
+                \\
+            , .{});
+            return error.InvalidArguments;
+        }
+    };
 }

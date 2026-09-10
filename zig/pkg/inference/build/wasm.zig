@@ -26,18 +26,16 @@ pub fn resolveTarget(ctx: Context) std.Build.ResolvedTarget {
     });
 }
 
-fn wasmBackend(native: runtime_build.BackendOptions) runtime_build.BackendOptions {
-    var backend = native;
-    backend.enable_wasm = true;
-    backend.enable_native = false;
-    backend.link_libc = false;
-    backend.enable_metal = false;
-    backend.enable_cuda = false;
-    backend.enable_onnx = false;
-    backend.enable_pjrt = false;
-    backend.enable_system_blas = false;
-    backend.blas_root = null;
-    return backend;
+// Only browser settings belong to this artifact. An explicit profile keeps new
+// native/server options out of its cache key by default.
+fn wasmBackend(browser: runtime_build.BackendOptions) runtime_build.BackendOptions {
+    return .{
+        .enable_wasm = true,
+        .enable_native = false,
+        .link_libc = false,
+        .enable_webgpu = browser.enable_webgpu,
+        .wasm_memory_model = browser.wasm_memory_model,
+    };
 }
 
 pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mod: *std.Build.Module) *std.Build.Step {

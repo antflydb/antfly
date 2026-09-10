@@ -46,6 +46,23 @@ fn inspect(artifact: *std.Build.Step.Compile, module: *std.Build.Module, seen: *
     for (module.import_table.values()) |dependency| inspect(artifact, dependency, seen);
 }
 
+/// Preserve the browser dependency graph while avoiding unrelated baseline
+/// runtime compilation failures. Real supported options affect the emitted code.
+pub fn addInferenceWasmProbe(b: *std.Build, artifact: *std.Build.Step.Compile) void {
+    if (!std.mem.startsWith(u8, artifact.name, "antfly-inference-wasm")) return;
+    artifact.root_module.root_source_file = b.addWriteFiles().add("inference_wasm_profile.zig",
+        \\export fn browser_capabilities() u32 {
+        \\    const options = @import("build_options");
+        \\    comptime {
+        \\        if (options.enable_native or options.link_libc or options.enable_native_quant_dispatch_stats or options.skip_openapi)
+        \\            @compileError("browser profile inherits native/server configuration");
+        \\    }
+        \\    return @intFromBool(options.enable_webgpu) + @as(u32, @intFromBool(@import("builtin").cpu.arch == .wasm64)) * 2;
+        \\}
+    );
+    b.step("cache-inference-wasm", "Check the actual inference browser profile").dependOn(&artifact.step);
+}
+
 /// Exercise real CPU benchmark bodies; use small profile probes for audio/linalg.
 pub fn addBenchmarkProbe(b: *std.Build, artifact: *std.Build.Step.Compile) void {
     const training = std.mem.eql(u8, artifact.name, "antfly-inference-training-bench");
@@ -106,6 +123,68 @@ pub fn addDataToolChecks(b: *std.Build, steps: *std.AutoHashMap(*std.Build.Step,
         data_check.dependOn(&convert.step);
         data_check.dependOn(&generate.step);
     }
+}
+
+/// Exercise the actual offline I/O consumers; inspect every registered asset
+/// command so a newly added one cannot silently acquire runtime dependencies.
+pub fn addAssetToolChecks(b: *std.Build, steps: *std.AutoHashMap(*std.Build.Step, void)) void {
+    var assets = std.StringHashMap(*std.Build.Step.Compile).init(b.allocator);
+    var iterator = steps.keyIterator();
+    while (iterator.next()) |entry| {
+        const artifact = entry.*.cast(std.Build.Step.Compile) orelse continue;
+        if (!artifact.root_module.import_table.contains("inference_finetune_assets")) continue;
+        var seen = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
+        checkAssetModule(b, artifact.root_module, &seen);
+        assets.put(artifact.name, artifact) catch @panic("OOM");
+    }
+    if (assets.count() == 0) @panic("no offline asset commands registered");
+    const check_step = b.step("cache-finetune-assets", "Run actual bounded offline checkpoint operations");
+    const compose = b.addRunArtifact(assets.get("compose-lora-adapters").?);
+    compose.addArg("--out");
+    _ = compose.addOutputFileArg("composed-adapter.safetensors");
+    compose.addFileArg(b.path("cache_asset_inputs/adapter/adapter_model.safetensors"));
+    check_step.dependOn(&compose.step);
+
+    const inspect_run = b.addRunArtifact(assets.get("inspect-reranker-lora-bundle").?);
+    inspect_run.addDirectoryArg(b.path("cache_asset_inputs/base"));
+    inspect_run.addDirectoryArg(b.path("cache_asset_inputs/adapter"));
+    _ = inspect_run.captureStdOut(.{ .basename = "asset-inspection.json" });
+    check_step.dependOn(&inspect_run.step);
+
+    const materialize = b.addRunArtifact(assets.get("materialize-reranker-head").?);
+    materialize.addDirectoryArg(b.path("cache_asset_inputs/base"));
+    materialize.addFileArg(b.path("cache_asset_inputs/head.safetensors"));
+    _ = materialize.addOutputDirectoryArg("materialized-head");
+    check_step.dependOn(&materialize.step);
+    const rejected = b.addRunArtifact(assets.get("compose-lora-adapters").?);
+    rejected.addArgs(&.{ "--out", "unused.safetensors" });
+    rejected.addFileArg(b.path("cache_asset_inputs/adapter/adapter_model.safetensors"));
+    rejected.addArg("cache_asset_inputs/missing.safetensors");
+    rejected.expectExitCode(1);
+    _ = rejected.captureStdErr(.{});
+    b.step("cache-finetune-assets-error", "Reject an unreadable adapter without corrupting cleanup").dependOn(&rejected.step);
+}
+
+fn checkAssetModule(b: *std.Build, module: *std.Build.Module, seen: *std.AutoHashMap(*std.Build.Module, void)) void {
+    if ((seen.getOrPut(module) catch @panic("OOM")).found_existing) return;
+    var imports = module.import_table.iterator();
+    while (imports.next()) |entry| {
+        const name = entry.key_ptr.*;
+        if (std.mem.eql(u8, name, "inference_internal") or std.mem.eql(u8, name, "build_info") or
+            std.mem.endsWith(u8, name, "jit_identity")) @panic("offline assets import runtime dependencies");
+        if (std.mem.eql(u8, name, "build_options")) {
+            const source = entry.value_ptr.*.root_source_file.?.getPath(b);
+            if (!std.mem.endsWith(u8, source, "/finetune/assets_options.zig"))
+                @panic("offline assets inherit product build options");
+        }
+        checkAssetModule(b, entry.value_ptr.*, seen);
+    }
+    for (module.link_objects.items) |object| switch (object) {
+        .system_lib => @panic("offline assets link an optional native library"),
+        .other_step => @panic("offline assets link a runtime artifact"),
+        else => {},
+    };
+    if (module.frameworks.count() != 0) @panic("offline assets link native frameworks");
 }
 
 /// Keep the actual inference qualification test's imports and runner.

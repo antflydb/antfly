@@ -53,6 +53,7 @@ pub fn build(b: *std.Build) void {
         }
         const artifact = entry.*.cast(std.Build.Step.Compile) orelse continue;
         profiles.check(artifact);
+        profiles.addInferenceWasmProbe(b, artifact);
         profiles.addBenchmarkProbe(b, artifact);
         pjrt_test_found = profiles.addPjrtQualificationProbe(b, artifact) or pjrt_test_found;
         const arch = artifact.root_module.resolved_target.?.result.cpu.arch;
@@ -116,6 +117,7 @@ pub fn build(b: *std.Build) void {
         }
     }
     profiles.addDataToolChecks(b, &steps);
+    profiles.addAssetToolChecks(b, &steps);
     if (host_count != 4 or test_count == 0 or !vopr_test_found or !lmdb_test_found or !pjrt_test_found or openapi.dependencies.items.len != 2) @panic("cache fixture did not inspect the expected production graph");
     const wasm = artifacts.wasm;
     inline for (.{ .{ "httpx_profile", "lib/httpx/src/httpx.zig" }, .{ "json_profile", "lib/json/src/mod.zig" } }) |probe| {

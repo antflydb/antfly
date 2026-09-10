@@ -66,6 +66,16 @@ The checks cover:
   entrypoints, even with ONNX enabled and its installation absent. Generated data
   remains unchanged; editing a generator rebuilds it and changes its output.
 
+- The normal finetune unit aggregate compiles every registered command once in
+  its regular build cache. A configuration-only regression checks aggregate
+  membership against the command registries and detects a removed dependency;
+  it does not repeat those compilations in a disposable cache.
+- Offline adapter/checkpoint commands use a separate asset module with fixed
+  editing capabilities and no runtime/backend links. Actual composition,
+  inspection, and head materialization run on tiny SafeTensors inputs in both
+  entrypoints. Backend flags and release metadata leave their binaries cached;
+  an asset implementation edit rebuilds them and changes the composed weights.
+  Invalid input after a valid adapter returns an error with correct cleanup.
 - All six served schemas invalidate only the API kernel; the other archives can
   build with a schema missing.
 - The remote CLI has no transitive tokenizer, storage-engine, or inference
@@ -128,7 +138,10 @@ The checks cover:
   also cover foreign targets and a separate PDF optimization override.
 - WASM runtime imports retain their target and ReleaseSafe profile. Compiled
   HTTPX/JSON probes and the WASM artifact remain cached when native target,
-  optimization, or storage options change.
+  optimization, or storage options change. Inference's browser profile also
+  ignores native diagnostics and server settings; WebGPU and memory-model
+  changes still rebuild its artifact. The inference probe retains production
+  dependencies and replaces only the entry body.
 - Schema joins detect removed and restored inputs, new references, and retargeted
   symlinks. Warm outputs match a fresh join; unrelated files do not invalidate it.
 - SQL and Snowball checks and regeneration reuse the same final formatted

@@ -16,7 +16,7 @@ const common = @import("common.zig");
 
 const workflow_imports = &.{ .antfly_platform, .build_options, .ml, .inference_internal, .inference_hf_tokenizer };
 
-const workflow_commands = [_]common.CommandSpec{
+pub const specs = [_]common.CommandSpec{
     .{
         .name = "run-gliner2-boundary-task-head-smoke-workflow",
         .root_source_file = "src/finetune/train/run_gliner2_boundary_task_head_smoke_workflow.zig",
@@ -70,5 +70,5 @@ const workflow_commands = [_]common.CommandSpec{
 };
 
 pub fn register(ctx: common.Context) []const common.Command {
-    return common.addCommands(ctx, &workflow_commands);
+    return common.addCommands(ctx, &specs);
 }

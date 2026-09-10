@@ -13,46 +13,57 @@
 // limitations under the License.
 
 const std = @import("std");
-const inference = @import("inference_internal");
-const finetune = inference.finetune.layoutlmv3;
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-
-    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
-    defer args.deinit();
-    _ = args.next();
-
-    const model_dir = args.next() orelse return usageError();
-    const out_dir = args.next() orelse return usageError();
-    const rank_arg = args.next() orelse "16";
-    const alpha_arg = args.next() orelse "32";
-    const base_model_name_or_path = args.next();
-
-    const rank = try std.fmt.parseUnsigned(usize, rank_arg, 10);
-    const alpha = try std.fmt.parseFloat(f32, alpha_arg);
-
-    var summary = try finetune.bootstrapLoRABundle(allocator, model_dir, out_dir, .{
-        .rank = rank,
-        .alpha = alpha,
-        .base_model_name_or_path = base_model_name_or_path,
-    });
-    defer finetune.freeBootstrapSummary(allocator, &summary);
-
-    const io = init.io;
-    const stdout = std.Io.File.stdout();
-    var buf: [4096]u8 = undefined;
-    var writer = stdout.writer(io, &buf);
-    try std.json.Stringify.value(summary, .{ .whitespace = .indent_2 }, &writer.interface);
-    try writer.interface.writeByte('\n');
-    try writer.interface.flush();
+    return Command(@import("inference_finetune_assets")).main(init);
 }
 
-fn usageError() error{InvalidArguments} {
-    std.debug.print(
-        \\usage: bootstrap-layoutlmv3-lora <model_dir> <out_dir> [rank] [alpha] [base_model_name_or_path]
-        \\example: bootstrap-layoutlmv3-lora /tmp/layoutlmv3-base /tmp/layoutlmv3-lora 16 32 microsoft/layoutlmv3-base
-        \\
-    , .{});
-    return error.InvalidArguments;
+// Reuse the parser and implementation in the combined CLI without creating a
+// second instance of model/tensor types inside its inference module.
+pub fn Command(comptime assets: type) type {
+    return struct {
+        const inference = assets;
+        const finetune = inference.finetune.layoutlmv3;
+
+        pub fn main(init: std.process.Init) !void {
+            const allocator = init.gpa;
+
+            var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+            defer args.deinit();
+            _ = args.next();
+
+            const model_dir = args.next() orelse return usageError();
+            const out_dir = args.next() orelse return usageError();
+            const rank_arg = args.next() orelse "16";
+            const alpha_arg = args.next() orelse "32";
+            const base_model_name_or_path = args.next();
+
+            const rank = try std.fmt.parseUnsigned(usize, rank_arg, 10);
+            const alpha = try std.fmt.parseFloat(f32, alpha_arg);
+
+            var summary = try finetune.bootstrapLoRABundle(allocator, model_dir, out_dir, .{
+                .rank = rank,
+                .alpha = alpha,
+                .base_model_name_or_path = base_model_name_or_path,
+            });
+            defer finetune.freeBootstrapSummary(allocator, &summary);
+
+            const io = init.io;
+            const stdout = std.Io.File.stdout();
+            var buf: [4096]u8 = undefined;
+            var writer = stdout.writer(io, &buf);
+            try std.json.Stringify.value(summary, .{ .whitespace = .indent_2 }, &writer.interface);
+            try writer.interface.writeByte('\n');
+            try writer.interface.flush();
+        }
+
+        fn usageError() error{InvalidArguments} {
+            std.debug.print(
+                \\usage: bootstrap-layoutlmv3-lora <model_dir> <out_dir> [rank] [alpha] [base_model_name_or_path]
+                \\example: bootstrap-layoutlmv3-lora /tmp/layoutlmv3-base /tmp/layoutlmv3-lora 16 32 microsoft/layoutlmv3-base
+                \\
+            , .{});
+            return error.InvalidArguments;
+        }
+    };
 }
