@@ -3282,6 +3282,7 @@ pub const ProvisionedTableWriteCache = struct {
                         identity_namespace,
                         .{
                             .drain_resolver_backfill = false,
+                            .defer_resolver_workers = true,
                             .schema_json_before_index_load = schema_json,
                             .inference_api_url = inference_api_url,
                             .ha_write_gate = ha_write_gate,
@@ -3312,6 +3313,7 @@ pub const ProvisionedTableWriteCache = struct {
                         },
                         .start_index_workers = if (open_mode == .startup_catch_up or open_mode == .restore_repair or open_mode == .query_readonly) false else true,
                         .start_optional_runtimes = open_mode != .startup_catch_up and open_mode != .restore_repair and open_mode != .query_readonly,
+                        .start_resolver_workers = false,
                         .index_open_parallelism = if (open_mode == .default_async or open_mode == .writer_no_replay) 1 else null,
                     });
                 errdefer db.close();
@@ -3436,6 +3438,7 @@ pub const ProvisionedTableWriteCache = struct {
             .bulk_ingest_session_open = start_bulk_session,
         };
         self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
+        try owned_entry.db.activateResolverReplayRuntimes();
         try self.entries.append(self.alloc, owned_entry);
         // Artifact-issue mutations invalidate their compact status summary in
         // the same primary-store batch. Rebuild it on the stable, long-lived
@@ -3451,9 +3454,6 @@ pub const ProvisionedTableWriteCache = struct {
             .schema_json = owned_entry.schema_json,
         };
         errdefer self.retireFailedOpenLocked(&cached);
-        if (managedDbOpenModeDrainsResolverBackfill(mode)) {
-            try owned_entry.db.drainResolverBackfill();
-        }
         return cached;
     }
 
@@ -3802,6 +3802,7 @@ pub const ProvisionedTableWriteCache = struct {
             .bulk_ingest_session_open = start_bulk_session,
         };
         self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
+        try owned_entry.db.activateResolverReplayRuntimes();
         prepared.schema_json = null;
         errdefer owned_entry.deinit(self.alloc, self.backend_runtime);
         try self.entries.append(self.alloc, owned_entry);
@@ -3861,6 +3862,7 @@ pub const ProvisionedTableWriteCache = struct {
             .allow_active_generation_adoption = true,
         };
         self.applyRuntimeHooksToDb(&owned_entry.db, group_id, &owned_entry.promotion_owner_state);
+        try owned_entry.db.activateResolverReplayRuntimes();
         errdefer owned_entry.deinit(self.alloc, self.backend_runtime);
 
         try self.replaceTableMetadataLocked(table_name, indexes_json, schema_json);
@@ -11625,6 +11627,15 @@ pub const ProvisionedTableWriteSource = struct {
         self.beginReplicatedApplyOperationLocked(table_name, group_id);
     }
 
+    fn tryBeginReplicatedApplyOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) bool {
+        // The Raft owner must not wait for an activity whose resolver backfill
+        // can call back into Raft. Contention is a pre-mutation retry boundary,
+        // including contention on the activity bookkeeping mutex itself.
+        if (!self.table_activity_mutex.tryLock()) return false;
+        defer self.table_activity_mutex.unlock(self.tableActivityIo());
+        return self.tryBeginReadCompatibleGroupOperationLocked(table_name, group_id);
+    }
+
     fn beginGroupTransitionOperation(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: u64) void {
         const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
@@ -13008,6 +13019,7 @@ pub const ProvisionedTableWriteSource = struct {
             const effective_ha_mirror = haMirrorForManagedDbOpenMode(mode, self.ha_async_mirror);
             var effective_open_options = managed_open_options;
             effective_open_options.drain_resolver_backfill = false;
+            effective_open_options.defer_resolver_workers = true;
             effective_open_options.source_table = table_name;
             effective_open_options.destination_authorizer = self.destination_authorizer;
             effective_open_options.schema_json_before_index_load = prepared_open.?.schema_json;
@@ -13083,6 +13095,7 @@ pub const ProvisionedTableWriteSource = struct {
                         .index_open_parallelism = if (mode == .default_async or mode == .writer_no_replay) 1 else null,
                         .start_index_workers = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) false else true,
                         .start_optional_runtimes = mode != .startup_catch_up and mode != .restore_repair and mode != .query_readonly,
+                        .start_resolver_workers = false,
                         .ttl_cleanup = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
                         .transaction_recovery = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly or mode == .status_only)
                             .{}
@@ -13161,17 +13174,9 @@ pub const ProvisionedTableWriteSource = struct {
                 defer self.local_db_mutex.unlock();
                 cache.retireFailedOpenLocked(&cached);
             }
-            // .default_async opens run on the raft apply thread
-            // (applyReplicatedBatchGroupLocal). Draining resolver backfill there
-            // blocks the raft loop on the promotion pipeline, whose cross-shard
-            // entity upserts need raft applies that are queued behind this very
-            // open — observed as a full apply wedge (batch writes timing out
-            // cluster-wide) in the multinode autograph e2e. The promotion and
-            // resolution workers started by this open drain the same backlog
-            // asynchronously instead.
-            if (managedDbOpenModeDrainsResolverBackfill(mode)) {
-                try cached.db.drainResolverBackfill();
-            }
+            // Resolver backfill belongs to the DB worker. Managed opens can
+            // hold a group activity or the Raft owner and must never execute
+            // callbacks that require either owner to make progress.
             // DB.open starts and resumes derived workers before the cache can
             // attach its provisioned visibility hook. A short persisted replay
             // tail can therefore finish during open and miss the post-watermark
@@ -13862,6 +13867,7 @@ pub const ProvisionedTableWriteSource = struct {
             ranges,
             .{
                 .io = io,
+                .drain_resolver_backfill = false,
                 .backend_runtime = backend_runtime,
                 .restore_open_options = self.restore_open_options,
                 .embedding_options = .{
@@ -13933,7 +13939,7 @@ pub const ProvisionedTableWriteSource = struct {
                     group_id,
                     lsm_root_generation,
                     table.name,
-                    .default,
+                    .default_async,
                     null,
                     null,
                     metadata,
@@ -13953,6 +13959,7 @@ pub const ProvisionedTableWriteSource = struct {
             // cannot lose its pending retry signal. This pass is idempotent;
             // if cleanup already completed it admits the replacement now.
             const index_summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, table.indexes_json, .{
+                .drain_resolver_backfill = false,
                 .embedding_options = .{
                     .antfly_provider = self.antfly_provider,
                     .inference_api_url = self.inference_api_url,
@@ -14680,7 +14687,6 @@ pub const ProvisionedTableWriteSource = struct {
             errdefer if (uncached_db) |*owned| owned.close();
             try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &uncached_db.?);
             self.applyRuntimeHooksToUncachedDb(&uncached_db.?, table_name, group_id, &uncached_promotion_owner_state);
-            try uncached_db.?.drainResolverBackfill();
             break :db_blk &uncached_db.?;
         };
         defer if (uncached_db) |*owned| owned.close();
@@ -21746,7 +21752,12 @@ pub const ProvisionedTableWriteSource = struct {
         // generation-pinned readers; making it read-exclusive would deadlock
         // the barrier behind the apply it is waiting for. Structural and
         // generation transitions remain exclusive in the activity gate.
-        self.beginReplicatedApplyOperation(table_name, group_id);
+        if (metadata_source == .local_persisted) {
+            if (!self.tryBeginReplicatedApplyOperation(table_name, group_id))
+                return error.RaftApplyWriterUnavailable;
+        } else {
+            self.beginReplicatedApplyOperation(table_name, group_id);
+        }
         lockAtomic(&self.local_db_mutex);
         self.invalidateReadCache(table_name);
         self.local_db_mutex.unlock();
@@ -24125,6 +24136,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 identity_namespace,
                 .{
                     .drain_resolver_backfill = false,
+                    .defer_resolver_workers = true,
                     .source_table = table_name,
                     .destination_authorizer = self.destination_authorizer,
                     .schema_json_before_index_load = prepared_open.?.schema_json,
@@ -24162,6 +24174,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 },
                 .start_index_workers = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) false else true,
                 .start_optional_runtimes = mode != .startup_catch_up and mode != .restore_repair and mode != .query_readonly,
+                .start_resolver_workers = false,
                 .ttl_cleanup = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly) .{ .enabled = false } else .{},
                 .transaction_recovery = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly or mode == .status_only)
                     .{}
@@ -24182,9 +24195,6 @@ pub const HostedProvisionedTableWriteSource = struct {
             lockAtomic(&cache.mutex);
             defer cache.mutex.unlock();
             cache.write_cache.retireFailedOpenLocked(&cached);
-        }
-        if (managedDbOpenModeDrainsResolverBackfill(mode)) {
-            try cached.db.drainResolverBackfill();
         }
         return cached;
     }
@@ -28568,25 +28578,6 @@ test "cold repair ownership is resident while generated inspection stays bounded
     );
 }
 
-fn managedDbOpenModeDrainsResolverBackfill(mode: ManagedDbOpenMode) bool {
-    // default_async is the Raft apply path. Resolver/promotion catch-up can
-    // issue cross-shard writes whose completion requires future Raft applies,
-    // so waiting here creates a cyclic dependency and wedges every group on
-    // this apply thread. DB.open already starts the background workers that
-    // drain the same backlog without blocking replicated application.
-    return mode != .default_async;
-}
-
-test "managed db open modes never drain resolver backfill on raft apply" {
-    try std.testing.expect(!managedDbOpenModeDrainsResolverBackfill(.default_async));
-    try std.testing.expect(managedDbOpenModeDrainsResolverBackfill(.default));
-    try std.testing.expect(managedDbOpenModeDrainsResolverBackfill(.writer_no_replay));
-    try std.testing.expect(managedDbOpenModeDrainsResolverBackfill(.startup_catch_up));
-    try std.testing.expect(managedDbOpenModeDrainsResolverBackfill(.restore_repair));
-    try std.testing.expect(managedDbOpenModeDrainsResolverBackfill(.query_readonly));
-    try std.testing.expect(managedDbOpenModeDrainsResolverBackfill(.status_only));
-}
-
 test "managed native restore repair retains target backend admission for staged open" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -28800,7 +28791,8 @@ const ManagedDbOpenOptions = struct {
     /// prevents a cache miss from performing a second, potentially older,
     /// catalog read before creating the database.
     identity_namespace_override: ?doc_identity.Namespace = null,
-    drain_resolver_backfill: bool = true,
+    drain_resolver_backfill: bool = false,
+    defer_resolver_workers: bool = false,
     source_table: []const u8 = "",
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     schema_json_before_index_load: ?[]const u8 = null,
@@ -29209,6 +29201,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                 .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
                 .transaction_recovery = open_options.transaction_recovery,
                 .schema_before_index_load = schema_before_index_load,
+                .start_resolver_workers = !open_options.defer_resolver_workers,
             };
             return switch (open_mode) {
                 .default => if (enrichment_cfg != null)
@@ -29230,6 +29223,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
                         .transaction_recovery = open_options.transaction_recovery,
                         .schema_before_index_load = schema_before_index_load,
+                        .start_resolver_workers = !open_options.defer_resolver_workers,
                     }),
                 .default_async, .writer_no_replay => if (enrichment_cfg != null)
                     try db_mod.DB.open(allocator, db_path, .{
@@ -29249,6 +29243,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
                         .transaction_recovery = open_options.transaction_recovery,
                         .schema_before_index_load = schema_before_index_load,
+                        .start_resolver_workers = !open_options.defer_resolver_workers,
                         .open_mode = .writer_no_replay,
                         // The managed write cache opens DBs synchronously while
                         // table/index metadata can still be settling. Keep
@@ -29273,6 +29268,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
                         .transaction_recovery = open_options.transaction_recovery,
                         .schema_before_index_load = schema_before_index_load,
+                        .start_resolver_workers = !open_options.defer_resolver_workers,
                         .open_mode = .writer_no_replay,
                         .index_open_parallelism = 1,
                     }),
@@ -29288,6 +29284,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                     .prefer_existing_identity_namespace = namespace != null,
                     .ha_write_gate = open_options.ha_write_gate,
                     .schema_before_index_load = schema_before_index_load,
+                    .start_resolver_workers = !open_options.defer_resolver_workers,
                     .open_mode = .writer_no_replay,
                     .start_index_workers = false,
                     .enrichment = if (enrichment_cfg) |configured| blk: {
@@ -29330,6 +29327,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .enrichment = enrichment_cfg,
                         .ha_write_gate = open_options.ha_write_gate,
                         .schema_before_index_load = schema_before_index_load,
+                        .start_resolver_workers = !open_options.defer_resolver_workers,
                         .open_mode = .writer_no_replay,
                         .start_index_workers = false,
                         .start_optional_runtime_workers = false,
@@ -29351,6 +29349,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .prefer_existing_identity_namespace = namespace != null,
                         .ha_write_gate = open_options.ha_write_gate,
                         .schema_before_index_load = schema_before_index_load,
+                        .start_resolver_workers = !open_options.defer_resolver_workers,
                         .open_mode = .writer_no_replay,
                         .start_index_workers = false,
                         .start_optional_runtimes = false,

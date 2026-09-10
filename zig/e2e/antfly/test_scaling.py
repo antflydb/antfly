@@ -29,7 +29,6 @@ from typing import Any
 
 import pytest
 import requests
-
 from conftest import (
     DEFAULT_ANTFLY_BIN,
     REPO_ROOT,
@@ -42,8 +41,8 @@ from conftest import (
     wait_for_server,
 )
 from helpers import wait_until
+from native_debug import debuggable_command
 from port_reservations import LoopbackPortReservations
-
 
 MULTI_SHARD_WRITE_ROUTE_TIMEOUT_S = 120.0
 DATA_NODE_REGISTRATION_TIMEOUT_S = 180.0
@@ -1013,8 +1012,8 @@ class MultiNodeScalingCluster:
             self.metadata_procs.append(
                 self.port_reservations.handoff_to(
                     (node["raft_port"], node["api_port"]),
-                    lambda: subprocess.Popen(
-                        command,
+                    lambda command=command, log=log: subprocess.Popen(
+                        debuggable_command(command),
                         stdout=log,
                         stderr=subprocess.STDOUT,
                         cwd=REPO_ROOT,
@@ -1109,7 +1108,7 @@ class MultiNodeScalingCluster:
         proc = self.port_reservations.handoff_to(
             (node["api_port"], node["raft_port"]),
             lambda: subprocess.Popen(
-                command,
+                debuggable_command(command),
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 cwd=REPO_ROOT,
