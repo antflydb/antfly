@@ -44,6 +44,18 @@ The latter two failures are separate observations, not evidence for the
 forwarding executor cause. The original binary lacks the added underlying
 transport-error diagnostics. Raw worker logs were retained for comparison.
 
+The exact `3ab5f6aba` executable from passing Linux CI run `34439124254`
+then finished **59/60 passed** under the same mixed load: CLI **29/30** and
+backup/restore **30/30**. The remaining CLI failure matched the same completed
+target-6 signature. This exposed the independent exact-index callback path;
+the follow-up fix preserves its completed observation while retaining source
+and delete watermarks. Metadata also now owns atomic restore-progress
+retirement and rejects stale incarnation reports at apply time; see the
+[runtime entry](../FLAKES.md#restore-completion-owns-progress-retirement-694).
+
+Final acceptance requires **100/100 for each affected test**, using the branch
+with the native-storage main merge and all fixes, without failure retries.
+
 ### Three-by-three backup seed batch: unknown outcome (#694)
 
 The run reported 394 passed, five skipped, and one failure. Table creation and

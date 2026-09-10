@@ -4662,6 +4662,21 @@ pub const RaftApplyStore = struct {
             .remove_restore_progress => |record| {
                 const table_name = try self.lookupTableNameTxn(txn, group_id, record.table_id);
                 defer if (table_name) |name| self.alloc.free(name);
+                // Legacy data-node cleanup carries no restore incarnation.
+                // It may only retire orphaned progress; an active intent owns
+                // its observations until metadata atomically completes it.
+                var range_key_buf: [160]u8 = undefined;
+                const range_key = try rangeKeyForGroup(&range_key_buf, group_id, record.group_id);
+                const encoded_range = txn.get(range_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (encoded_range) |encoded| {
+                    const range = try decodeRangeRecord(self.alloc, encoded);
+                    defer metadata_table_manager.freeRange(self.alloc, range);
+                    if (range.table_id == record.table_id and
+                        range.restore_backup_id.len != 0 and range.restore_location.len != 0) return;
+                }
                 var key_buf: [224]u8 = undefined;
                 const key = try restoreProgressKeyForGroup(&key_buf, group_id, record.table_id, record.node_id, record.group_id);
                 txn.delete(key) catch |err| switch (err) {
@@ -14410,6 +14425,7 @@ test "metadata raft apply store restore completion retires progress and rejects 
         .{ .command = .{ .upsert_range = replacement }, .count = 1 },
         .{ .command = .{ .upsert_restore_progress = new_progress }, .count = 2 },
         .{ .command = .{ .upsert_restore_progress = old_progress }, .count = 2 },
+        .{ .command = .{ .remove_restore_progress = .{ .table_id = 41, .node_id = 7, .group_id = 4101 } }, .count = 2 },
         .{ .command = .{ .complete_restore_range = metadata_table_manager.restoreIntentIdentity(original) }, .count = 2 },
         .{ .command = .{ .complete_restore_range = metadata_table_manager.restoreIntentIdentity(replacement) }, .count = 1 },
     };

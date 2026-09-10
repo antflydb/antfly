@@ -36,8 +36,49 @@ assertions or production deadlines were relaxed.
 The ordering regression fails before the fix. With the fix, all 173
 `antfly-api-derived-coverage-test` tests pass on macOS ARM64 without leaks.
 Nine focused publication-fence and owner-lifecycle tests also passed.
+
+The Linux CI executable from `3ab5f6aba` still reproduced this signature in
+1/30 CLI runs. The exact-index notification path independently had the same
+ordering gap. A second deterministic regression publishes source/index target
+6 with applied sequence 6, then delivers that index's target-6 callback. It
+reproduces the false list/detail observation even after the group-level fix.
+Exact-index callbacks now preserve completion only when an authoritative
+observation in the current epoch has both observed and applied the target.
+They still record the source and reducing watermarks, preserving deletion
+authority for future merges; a newer target still fences completion.
+All 174 derived-coverage tests passed before merging the native storage
+implementation, including callback permutations and deletion/replacement cases.
 Linux reproduction and soak results are recorded in the
 [E2E history](e2e/FLAKES.md#completed-cli-readiness-regresses-after-publication-696).
+
+## Restore completion owns progress retirement (#694)
+
+The original Linux baseline also exposed a completed restore whose progress
+did not disappear within 30 seconds. Inspection of retained metadata copies
+showed two replicas with cleared intents/progress and a third with the earlier
+restore state. That observation does not independently establish why the third
+replica lagged. A subsequent `3ab5f6aba` Linux soak passed all 30 backup cases.
+
+Apply-time review found a separate lifecycle gap: completing a restore cleared
+the intent but left progress retirement to data-node refreshes. A delayed
+progress command could recreate a completed restore's row or overwrite a
+replacement restore's progress. Progress-only updates do not advance the
+catalog epoch, so catalog refresh is not a reliable cleanup trigger.
+
+Metadata now retires a range's progress in the same transaction that completes
+its exact restore intent. Cleanup is scoped to that table and range and does
+not depend on the reporting node remaining alive. Progress upserts validate
+the active table/range and full reported restore identity at apply time.
+The completion command also declares its restore-progress snapshot projection.
+Legacy removal commands contain no restore incarnation, so they may retire
+only orphaned progress; they cannot delete an active replacement's observation.
+
+A committed-entry regression fails before the fix with `expected 0, found 1`
+after completion. It verifies atomic retirement, delayed-report rejection,
+replacement identity, stale completion/removal, and preservation of a sibling range.
+All 80 metadata storage tests passed, followed by the strengthened sibling
+regression. Backup failure diagnostics now retain per-replica restore state
+and preserve request-timeout details without retrying ambiguous requests.
 
 ## Metadata mutation discovery exhausts admission time (#694)
 
