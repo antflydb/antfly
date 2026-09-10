@@ -77070,7 +77070,7 @@ test "db dense enrichment republishes unchanged source hash from cached artifact
     try std.testing.expectEqual(@as(usize, 1), counting.calls);
     try std.testing.expectEqual(@as(u64, 1), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
 
-    try db.core.index_manager.resetDenseIndexForArtifactRebuild("dv_v1");
+    try resetDenseIndexForArtifactRebuildForTest(&db, "dv_v1");
     try std.testing.expectEqual(@as(u64, 0), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
 
     try db.batch(.{
@@ -77196,6 +77196,82 @@ fn testDenseChunkArtifactLifecycle(settings: table_storage_mod.Settings) !void {
     try std.testing.expectEqual(@as(u64, 1), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
 }
 
+fn resetDenseIndexForArtifactRebuildForTest(db: *DB, index_name: []const u8) !void {
+    // The native publisher holds catalog pins without the apply lock. Retire
+    // those borrowers before taking apply exclusive and closing the old HBC.
+    var structural = db.beginIndexStructuralMutation("test artifact dense reset", index_name);
+    defer structural.deinit();
+    lockApply(db);
+    defer db.core.unlockApply();
+    try db.core.index_manager.resetDenseIndexForArtifactRebuild(index_name);
+}
+
+test "db artifact dense reset waits for catalog readers before closing storage" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}",
+    });
+
+    // Native publication holds this same catalog pin while reading the live
+    // posting generation, independently of the DB apply lock.
+    var reader = db.tryAcquireIndexCatalogReadLease() orelse return error.TestUnexpectedResult;
+    var reader_held = true;
+    defer if (reader_held) reader.release();
+    const Reset = struct {
+        db: *DB,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) !void {
+            defer self.done.store(true, .release);
+            try resetDenseIndexForArtifactRebuildForTest(self.db, "dense_idx");
+        }
+    };
+    var reset = Reset{ .db = &db };
+    var future = try std.testing.io.concurrent(Reset.run, .{&reset});
+    var joined = false;
+    defer if (!joined) {
+        if (reader_held) {
+            reader.release();
+            reader_held = false;
+        }
+        future.await(std.testing.io) catch {};
+    };
+    const deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
+    while (!db.indexCatalogBarrierActive() and !reset.done.load(.acquire)) {
+        if (monotonicTimeNs() >= deadline) return error.TestTimeout;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(db.indexCatalogBarrierActive());
+    try std.testing.expect(!reset.done.load(.acquire));
+    if (db.tryAcquireIndexCatalogReadLease()) |lease| {
+        var unexpected = lease;
+        unexpected.release();
+        return error.TestUnexpectedResult;
+    }
+    // The old generation remains readable until its final catalog pin leaves.
+    try std.testing.expect(db.core.index_manager.denseIndex("dense_idx").?.index.experimentalPostingDurableAppliedSequence() != null);
+    reader.release();
+    reader_held = false;
+    const result = future.await(std.testing.io);
+    joined = true;
+    try result;
+    try std.testing.expect(!db.indexCatalogBarrierActive());
+    var reopened_reader = db.tryAcquireIndexCatalogReadLease() orelse return error.TestUnexpectedResult;
+    reopened_reader.release();
+}
+
 test "db chunked dense enrichment replays cached artifacts after dense reset without re-embedding" {
     const alloc = std.testing.allocator;
 
@@ -77229,7 +77305,7 @@ test "db chunked dense enrichment replays cached artifacts after dense reset wit
     try std.testing.expect(first_calls > 0);
     try std.testing.expectEqual(@as(u64, 3), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
 
-    try db.core.index_manager.resetDenseIndexForArtifactRebuild("dv_v1");
+    try resetDenseIndexForArtifactRebuildForTest(&db, "dv_v1");
     try std.testing.expectEqual(@as(u64, 0), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
 
     try db.batch(.{
@@ -114181,7 +114257,7 @@ test "db restore dense rebuild publishes mixed progress before worker wait" {
         .sync_level = .full_index,
     });
 
-    try db.core.index_manager.resetDenseIndexForArtifactRebuild("dense_a");
+    try resetDenseIndexForArtifactRebuildForTest(&db, "dense_a");
     var ghost_vector = [_]f32{ 1, 1 };
     try db.core.index_manager.denseIndex("dense_b").?.index.insertVectorForTest(0xdead_beef, &ghost_vector);
     try DB.markRestorePrimaryRestoredForPathWithArtifact(

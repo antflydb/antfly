@@ -5038,6 +5038,9 @@ pub const IndexManager = struct {
     }
 
     pub fn resetDenseIndexForArtifactRebuild(self: *IndexManager, index_name: []const u8) !void {
+        // The caller must drain catalog readers before replacing inline index
+        // storage. Apply serialization alone does not exclude native publishers.
+        std.debug.assert(self.published_dense_admission.load(.acquire) == @as(u32, 1) << 31);
         const entry = self.denseIndex(index_name) orelse return error.IndexNotFound;
         const path = try self.activeIndexPath(index_name);
         defer self.alloc.free(path);

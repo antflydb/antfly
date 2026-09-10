@@ -4,6 +4,39 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## Dense reset fixture bypasses the catalog lifetime barrier (#694)
+
+[Run 34520726158, job 103018251656](https://github.com/antflydb/antfly/actions/runs/34520726158/job/103018251656?pr=694)
+aborted on Linux x86_64 at `00dd1e4aef` during
+`db chunked dense enrichment replays cached artifacts after dense reset without re-embedding`.
+The native publication worker crashed retaining an HBC posting generation through
+`denseProjectionCheckpointMetadata`; the unit process exited with code 134.
+
+The fixture directly closed and reopened the dense index through
+`IndexManager.resetDenseIndexForArtifactRebuild`, bypassing DB structural
+admission. `runUntilIdle` drains replay but does not stop the independently owned
+native publisher. That publisher pins the catalog without holding the apply
+lock, so an unguarded reset can poison the HBC while it is still being read.
+
+All three fixture callers now use a DB helper that acquires the existing
+structural catalog barrier before apply exclusive. The low-level reset asserts
+that catalog admission is closed and readers are drained. The original tests
+retain their background workers and cached-artifact/re-embedding assertions.
+A deterministic regression holds the same catalog pin as native publication,
+verifies reset closes admission without completing, then releases the pin and
+checks reset completes and admission reopens. Before the fix, reset completed
+without the barrier and the regression failed with `TestUnexpectedResult`.
+The regression and all three affected fixtures are included in the focused dense
+lifecycle suite.
+
+With the fix, all 81 focused dense lifecycle checks passed on macOS ARM64 without
+skips or leaks. A separate 25-iteration run of the four reset regressions passed
+100/100 test executions, with the original fixtures' background workers enabled.
+Logs: `/private/tmp/pr694-reset-before.log`, `/private/tmp/pr694-reset-after.log`,
+`/private/tmp/pr694-reset-soak.log`, and `/private/tmp/pr694-reset-dense-suite.log`.
+The failing CI run is Linux evidence; these local passes do not replace the
+Linux rerun of the fixed commit.
+
 ## Completed CLI index readiness regresses after a delayed notification (#696, #694)
 
 [PR #696, run 34428885099, job 102726530711](https://github.com/antflydb/antfly/actions/runs/34428885099/job/102726530711?pr=696)
