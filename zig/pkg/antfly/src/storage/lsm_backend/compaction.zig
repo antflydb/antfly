@@ -151,9 +151,11 @@ const CompactionWork = struct {
     io_bytes: u64,
     run_ids: []u64,
     key_range: ?compaction_scheduler_mod.KeyRange,
+    reservation: ?resource_manager_mod.Reservation = null,
 
     fn deinit(self: *CompactionWork, allocator: std.mem.Allocator) void {
         if (self.run_ids.len > 0) allocator.free(self.run_ids);
+        if (self.reservation) |*lease| lease.release();
         self.* = undefined;
     }
 };
@@ -1874,7 +1876,11 @@ pub fn compactTombstonesScheduled(comptime BackendType: type, backend: *BackendT
         return false;
     };
     defer selected.release(backend);
-    var work = try compactionWorkForPlan(backend.allocator, &backend.runs, selected.plan, score);
+    var work = compactionWorkForSelectedPlanLocked(backend, selected.plan, score) catch |err| {
+        if (err != error.ResourceBudgetExceeded) return err;
+        deferTombstoneGc(backend);
+        return false;
+    };
     defer work.deinit(backend.allocator);
     var grant = backend.acquireCompactionGrant(work) orelse {
         deferTombstoneGc(backend);
@@ -2311,7 +2317,11 @@ fn compactDomainPlan(comptime BackendType: type, backend: *BackendType, l0_limit
         try selectDomainPlanSynchronous(backend, l0_limit, l0_only, max_bytes, allow_oversized, &stats)) orelse return false;
     defer selected.release(backend);
     if (scheduled) {
-        var work = try compactionWorkForPlan(backend.allocator, &backend.runs, selected.plan, score);
+        var work = compactionWorkForSelectedPlanLocked(backend, selected.plan, score) catch |err| {
+            if (err != error.ResourceBudgetExceeded) return err;
+            rememberDeniedCompaction(BackendType, backend, selected.plan, score);
+            return false;
+        };
         defer work.deinit(backend.allocator);
         if (!policy.admits(selected.plan, work.input_bytes)) return false;
         var grant = backend.acquireCompactionGrant(work) orelse {
@@ -2842,6 +2852,9 @@ pub const PendingBulkPlan = struct {
     emitted: usize = 0,
     released: usize = 0,
     selected: ?SelectedPlan = null,
+    work: CompactionWork = .{ .score = 0, .input_runs = 0, .input_bytes = 0, .io_bytes = 0, .run_ids = &.{}, .key_range = null },
+    retry_after_ns: u64 = 0,
+    work_reservation: ?resource_manager_mod.Reservation = null,
     validation: ?DependencyValidation = null,
     reservation: ?resource_manager_mod.Reservation = null,
     output_reservation: ?resource_manager_mod.Reservation = null,
@@ -2872,7 +2885,14 @@ pub const PendingBulkPlan = struct {
     }
     fn advanceLocked(self: *@This(), backend: anytype) !bool {
         if (backend.manifestCoordinationIo()) |io| try io.checkCancel();
-        if (self.phase == .done) return true;
+        if (self.phase == .done) {
+            const selected = self.selected orelse return true;
+            if (selected.plan.validated_generation == backend.run_directory_generation) return true;
+            // Admission retries retain the completed certificate. Validate
+            // only intervening publications, never rediscover the same inputs.
+            self.selected.?.plan.validated_generation = null;
+            self.phase = .validate;
+        }
         backend.directory_planning_slices +|= 1;
         if (self.phase == .validate) {
             if (self.validation == null) {
@@ -2884,7 +2904,9 @@ pub const PendingBulkPlan = struct {
             if (result == .pending and self.validation.?.rebases < 4) return false;
             self.phase = .done;
             if (result == .valid) {
-                self.selected.?.plan.run_indices = self.validation.?.takeIndices();
+                // The rebase cap bounds one attempt to catch a moving epoch,
+                // not the lifetime of a plan parked across admission retries.
+                self.validation.?.rebases = 0;
                 self.selected.?.plan.complete_coverage = self.validation.?.job.covered;
                 self.selected.?.plan.validated_generation = backend.run_directory_generation;
             }
@@ -2909,15 +2931,26 @@ pub const PendingBulkPlan = struct {
         if (self.handles == null) {
             if (backend.options.resource_manager) |manager|
                 self.output_reservation = try manager.reserve(.lsm_table_builder_working_set, range.len * (@sizeOf(Directory.Handle) + @sizeOf(usize)));
+            if (backend.options.resource_manager) |manager|
+                self.work_reservation = try manager.reserve(.lsm_table_builder_working_set, range.len * @sizeOf(u64));
             const handles = try allocator.alloc(Directory.Handle, range.len);
             errdefer allocator.free(handles);
-            self.indices = try allocator.alloc(usize, range.len);
+            const indices = try allocator.alloc(usize, range.len);
+            errdefer allocator.free(indices);
+            self.work.run_ids = try allocator.alloc(u64, range.len);
+            self.indices = indices;
             self.handles = handles;
             self.cursor = self.directory.readCursor();
             self.cursor.?.rank = range.start;
         }
         while (self.emitted < range.len and credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
-            self.handles.?[self.emitted] = self.cursor.?.next().?.retain();
+            const handle = self.cursor.?.next().?.retain();
+            self.handles.?[self.emitted] = handle;
+            self.work.run_ids[self.emitted] = handle.run.id;
+            self.work.input_runs += 1;
+            self.work.input_bytes +|= handle.run.size_bytes;
+            self.work.io_bytes = self.work.input_bytes +| self.work.input_bytes;
+            includeRunInWorkKeyRange(&self.work.key_range, 0, handle.run.*);
             self.indices.?[self.emitted] = range.start + self.emitted;
             self.emitted += 1;
             credits -= 1;
@@ -2933,8 +2966,10 @@ pub const PendingBulkPlan = struct {
     }
     fn take(self: *@This()) ?SelectedPlan {
         if (self.selected) |selected| if (selected.plan.validated_generation != null) {
+            var owned = selected;
+            owned.plan.run_indices = self.validation.?.takeIndices();
             self.selected = null;
-            return selected;
+            return owned;
         };
         return null;
     }
@@ -2963,6 +2998,8 @@ pub const PendingBulkPlan = struct {
         if (self.validation) |*validation| validation.deinit(backend);
         backend.retireCheckpointDirectory(self.directory);
         if (self.output_reservation) |*lease| lease.release();
+        self.work.deinit(backend.allocator);
+        if (self.work_reservation) |*lease| lease.release();
         if (self.reservation) |*lease| lease.release();
         backend.allocator.destroy(self);
     }
@@ -2975,6 +3012,8 @@ pub const PendingBulkPlan = struct {
 
 fn compactBulkDirectory(backend: anytype, policy: BulkPolicy, scheduled: bool, score: u64) !bool {
     if (scheduled and backend.bulk_plan_in_flight) return false;
+    if (scheduled) if (backend.pending_bulk_plan) |pending|
+        if (pending.retry_after_ns > backend.nowNs()) return false;
     if (scheduled and !bulkDirectoryPlanningDue(backend, policy)) return false;
     if (scheduled) if (backend.pending_bulk_plan) |pending| if (!pending.selection.policy.eql(policy)) {
         backend.retireBulkPlanning(pending);
@@ -3003,22 +3042,31 @@ fn compactBulkDirectory(backend: anytype, policy: BulkPolicy, scheduled: bool, s
             try yielded;
         }
     }
-    retire = true;
-    var selected = pending.take() orelse {
+    if (pending.selected == null or pending.selected.?.plan.validated_generation == null) {
+        retire = true;
         if (scheduled and pending.selection.result == null and pending.generation == backend.run_directory_generation) {
             backend.bulk_plan_negative_generation = pending.generation;
             backend.bulk_plan_negative_policy = policy;
         }
         return false;
-    };
-    defer selected.release(backend);
+    }
     if (scheduled or policy.mode == .window) {
-        var work = try compactionWorkForPlan(backend.allocator, &backend.runs, selected.plan, score);
-        defer work.deinit(backend.allocator);
-        var grant = backend.acquireCompactionGrant(work) orelse return false;
+        pending.work.score = score;
+        var grant = backend.acquireCompactionGrant(pending.work) orelse {
+            pending.retry_after_ns = backend.nowNs() +| 100 * std.time.ns_per_ms;
+            return false;
+        };
         defer grant.complete();
+        retire = true;
+        var selected = pending.take().?;
+        defer selected.release(backend);
         try compactPlanAtOptionalMaintenance(@TypeOf(backend.*), backend, selected.plan);
-    } else try compactPlanAt(@TypeOf(backend.*), backend, selected.plan);
+    } else {
+        retire = true;
+        var selected = pending.take().?;
+        defer selected.release(backend);
+        try compactPlanAt(@TypeOf(backend.*), backend, selected.plan);
+    }
     return true;
 }
 
@@ -3352,6 +3400,56 @@ fn allowOversizedSingleCompactionInput(backend: anytype) bool {
     return backend.options.max_compaction_input_allow_oversized_single_job;
 }
 
+/// Selected handles own immutable bounds and byte counts. Do not revisit the
+/// mutable writer tree K times while holding its mutex. Bulk continuations
+/// build this work during emission; GC/domain execution drains equivalent
+/// bounded preparation quanta off-lock through std.Io.
+fn compactionWorkForSelectedPlanLocked(backend: anytype, plan: CompactionPlan, score: u64) !CompactionWork {
+    if (comptime supportsUnlockedBackendCompaction(@TypeOf(backend.*))) if (plan.input_handles) |handles| {
+        backend.retainReaderKind(.compaction);
+        runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
+        const result: anyerror!CompactionWork = blk: {
+            const count = plan.source_len + plan.target_len;
+            var reservation: ?resource_manager_mod.Reservation = null;
+            if (backend.options.resource_manager) |manager|
+                reservation = manager.reserve(.lsm_table_builder_working_set, count * @sizeOf(u64)) catch |err| break :blk err;
+            const ids = backend.allocator.alloc(u64, count) catch |err| {
+                if (reservation) |*lease| lease.release();
+                break :blk err;
+            };
+            var work = CompactionWork{ .score = score, .input_runs = count, .input_bytes = 0, .io_bytes = 0, .run_ids = ids, .key_range = null, .reservation = reservation };
+            var index: usize = 0;
+            while (index < count) {
+                const end = @min(count, index + 2048);
+                const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
+                while (index < end and @import("antfly_platform").time.monotonicNs() < deadline) : (index += 1) {
+                    const offset = if (index < plan.source_len) plan.source_start + index else plan.target_start + index - plan.source_len;
+                    const run = handles[offset].run.*;
+                    ids[index] = run.id;
+                    work.input_bytes +|= run.size_bytes;
+                    includeRunInWorkKeyRange(&work.key_range, plan.output_level, run);
+                }
+                if (backend.manifestCoordinationIo()) |io| {
+                    io.checkCancel() catch |err| {
+                        work.deinit(backend.allocator);
+                        break :blk err;
+                    };
+                    if (index < count) io.sleep(.fromNanoseconds(1), .awake) catch |err| {
+                        work.deinit(backend.allocator);
+                        break :blk err;
+                    };
+                }
+            }
+            work.io_bytes = work.input_bytes +| work.input_bytes;
+            break :blk work;
+        };
+        _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
+        backend.releaseReaderKind(.compaction);
+        return result;
+    };
+    return compactionWorkForPlan(backend.allocator, &backend.runs, plan, score);
+}
+
 fn compactionWorkForPlan(allocator: std.mem.Allocator, runs: anytype, plan: CompactionPlan, score: u64) !CompactionWork {
     const total_runs = plan.source_len + plan.target_len;
     const run_ids = try allocator.alloc(u64, total_runs);
@@ -3673,6 +3771,39 @@ fn planHasCompleteCoverage(runs: anytype, plan: CompactionPlan) bool {
     return true;
 }
 
+test "lsm prepared compaction rejects replaced inputs without tombstones" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |split_gc| {
+        var backend = Backend.init(allocator, .{});
+        defer backend.close();
+        var run = testRun(1, 0, "a", "a", 1);
+        run.state = .{};
+        run.tombstone_count = 0;
+        try backend.runs.append(allocator, run);
+        const locked = runtime_mod.lockBackend(Backend, &backend);
+        defer runtime_mod.unlockBackend(Backend, &backend, locked);
+        const handle = (try backend.planningDirectory()).at(0).retain();
+        defer handle.release(allocator);
+        const plan: CompactionPlan = .{ .source_level = 0, .source_start = 0, .source_len = 1, .target_start = 1, .target_len = 0, .output_level = 1, .input_handles = &.{handle}, .run_indices = &.{0}, .partition_key = wholeKeyspace, .split_gc = split_gc, .complete_coverage = true, .validated_generation = backend.run_directory_generation };
+        var work = try compactionWorkForSelectedPlanLocked(&backend, plan, 1);
+        defer work.deinit(allocator);
+        // Model a publication during off-lock preparation. Moving the input
+        // invalidates its stable address, despite there being no deletes.
+        const source = backend.runs.find(handle.run).?;
+        var replacement = run_store.Store.revision(source, source.*);
+        replacement.level = 1;
+        const directory = try backend.prepareRunDirectoryMove(source, 1);
+        try backend.runs.replace(allocator, source, replacement);
+        backend.invalidateReadVersion();
+        backend.publishRunDirectory(directory);
+        try std.testing.expectEqual(@as(usize, 0), (try backend.planningDirectory()).tombstoneRunCount());
+        try compactPlanAt(Backend, &backend, plan);
+        try std.testing.expectEqual(@as(u64, 0), backend.compaction_stats.compactions);
+        try std.testing.expectEqual(@as(u32, 1), backend.runs.at(0).level);
+    }
+}
+
 fn compactPlanAtWithForegroundPolicy(comptime BackendType: type, backend: *BackendType, initial_plan: CompactionPlan, yield_for_foreground_queries: bool) !void {
     var plan = initial_plan;
     var validated: ?SelectedPlan = null;
@@ -3681,9 +3812,10 @@ fn compactPlanAtWithForegroundPolicy(comptime BackendType: type, backend: *Backe
         if (plan.input_handles != null) {
             if (plan.validated_generation != null and plan.validated_generation.? == backend.run_directory_generation) {
                 std.debug.assert(plan.complete_coverage != null);
-            } else if ((try backend.planningDirectory()).tombstoneRunCount() == 0 or plan.split_gc) {
-                plan.complete_coverage = false;
             } else {
+                // Preparation may yield after selection. Identity/closure
+                // validation is required even without tombstone elision: a
+                // concurrent move can replace an input before planAt uses it.
                 validated = try relocateDirectoryPlan(backend, plan);
                 const selected = validated orelse return;
                 plan.run_indices = selected.plan.run_indices;

@@ -3017,6 +3017,7 @@ pub const Backend = struct {
         const fan_in = self.options.bulk_ingest_tiered_l0_fan_in;
         if (fan_in < 2) return false;
         if (!self.l0SoftPressureLocked()) return false;
+        if (self.pending_bulk_plan) |pending| if (pending.retry_after_ns > self.nowNs()) return false;
         const before_sequence = self.bulk_ingest_window_first_sequence;
         // Explicit bulk sessions own a durable window and fence its runs for
         // one final linear merge. Per-request bulk transactions have no such
@@ -3076,7 +3077,7 @@ pub const Backend = struct {
         if (self.pending_bulk_plan) |pending| {
             if (self.bulk_plan_in_flight) return null;
             if (!self.bulkPlanNeededLocked(pending)) return 0;
-            return if (self.optionalMaintenanceDeferredLocked()) maintenance_admission_retry_ns else 0;
+            return @max(pending.retry_after_ns -| self.nowNs(), if (self.optionalMaintenanceDeferredLocked()) maintenance_admission_retry_ns else 0);
         }
         return null;
     }
@@ -7905,7 +7906,8 @@ pub const Backend = struct {
             delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
         }
         if (compaction_mod.nextTombstoneGcDelay(self)) |candidate| {
-            delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+            const admitted_delay = @max(candidate, if (self.optionalMaintenanceDeferredLocked()) maintenance_admission_retry_ns else 0);
+            delay_ns = if (delay_ns) |current| @min(current, admitted_delay) else admitted_delay;
         }
         if (self.tombstoneReconcileDelayLocked()) |candidate| delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
         if (self.bulkPlanningWakeDelayLocked()) |candidate| delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
@@ -21376,6 +21378,202 @@ test "lsm planning metadata is admitted before allocation" {
         try std.testing.expect(backend.domain_index == null);
         try std.testing.expectEqual(@as(u64, 0), backend.domain_index_builds);
         try std.testing.expectEqual(before, manager.sliceStats(.lsm_in_memory_state).used_bytes);
+    }
+}
+
+test "lsm bulk admission retains prepared work sleeps and certifies concurrent changes" {
+    const alloc = std.testing.allocator;
+    for (0..3) |change| {
+        var storage = storage_io.MemoryStorage.init(alloc);
+        defer storage.deinit();
+        var backend = try Backend.open(alloc, "/bulk-admission-owned", .{ .storage = storage.storage(), .flush_threshold = 1, .direct_bulk_ingest_min_bytes = 1, .bulk_ingest_tiered_l0_fan_in = 4, .compact_threshold_runs = 4, .l0_soft_limit_runs = 4, .l0_hard_limit_runs = 128, .background_io_budget_bytes = 1, .background_io_allow_oversized_single_job = false });
+        defer backend.close();
+        backend.beginBatchMode(.{ .mode = .bulk_ingest });
+        defer backend.finishBatchMode(.{ .mode = .bulk_ingest });
+        for (0..5) |i| {
+            var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+            defer txn.abort();
+            var key: [16]u8 = undefined;
+            try txn.put(.{}, try std.fmt.bufPrint(&key, "doc:{d}", .{i}), "value");
+            try txn.commit();
+        }
+        for (0..64) |_| {
+            _ = try backend.runMaintenanceStep();
+            if (backend.background_io_denied_jobs != 0) break;
+        }
+        const pending = backend.pending_bulk_plan.?;
+        const slices = backend.directory_planning_slices;
+        try std.testing.expectEqual(@as(u64, 1), backend.background_io_denied_jobs);
+        try std.testing.expect(pending.selected != null);
+        const ids = pending.work.run_ids.ptr;
+        for (0..32) |_| try std.testing.expect(!try backend.runMaintenanceStep());
+        try std.testing.expectEqual(slices, backend.directory_planning_slices);
+        try std.testing.expectEqual(@as(u64, 1), backend.background_io_denied_jobs);
+        try std.testing.expect((backend.nextMaintenanceWakeDelayNsBestEffort() orelse 0) > 0);
+        pending.retry_after_ns = 0;
+        try std.testing.expect(!try backend.runMaintenanceStep());
+        try std.testing.expectEqual(slices, backend.directory_planning_slices);
+        try std.testing.expectEqual(@as(u64, 2), backend.background_io_denied_jobs);
+        try std.testing.expect(ids == pending.work.run_ids.ptr);
+        if (change == 1) {
+            var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+            defer txn.abort();
+            try txn.put(.{}, "unrelated", "later");
+            try txn.commit();
+        } else if (change == 2) {
+            const locked = runtime_mod.lockBackend(Backend, &backend);
+            defer runtime_mod.unlockBackend(Backend, &backend, locked);
+            const handle = pending.selected.?.plan.input_handles.?[0];
+            const source = backend.runs.find(handle.run).?;
+            const replacement = RunStore.revision(source, source.*);
+            const directory = try (try backend.planningDirectory()).fork(alloc);
+            try directory.put(&backend, replacement);
+            try backend.runs.replace(alloc, source, replacement);
+            backend.invalidateReadVersion();
+            backend.publishRunDirectory(directory);
+        }
+        pending.retry_after_ns = 0;
+        if (change == 2) {
+            for (0..64) |_| {
+                _ = try backend.runMaintenanceStep();
+                if (backend.pending_bulk_plan == null) break;
+            }
+            try std.testing.expect(backend.pending_bulk_plan == null);
+            try std.testing.expectEqual(@as(u64, 0), backend.compaction_stats.compactions);
+        } else {
+            for (0..64) |_| {
+                _ = try backend.runMaintenanceStep();
+                if (backend.background_io_denied_jobs == 3) break;
+            }
+            try std.testing.expect(backend.pending_bulk_plan.? == pending);
+            try std.testing.expect(ids == pending.work.run_ids.ptr);
+            try std.testing.expectEqual(@as(u64, 3), backend.background_io_denied_jobs);
+            backend.options.background_io_budget_bytes = 1024 * 1024;
+            pending.retry_after_ns = 0;
+            for (0..64) |_| {
+                _ = try backend.runMaintenanceStep();
+                if (backend.compaction_stats.compactions != 0) break;
+            }
+            try std.testing.expectEqual(@as(u64, 1), backend.compaction_stats.compactions);
+            try std.testing.expect(backend.pending_bulk_plan == null);
+            if (change == 1) try std.testing.expectEqualStrings("later", try backend.getMergedWithMutable(&backend.mutable, .{}, "unrelated"));
+        }
+    }
+}
+
+test "lsm foreground deferred GC sleeps without suppressing durability deadlines" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(alloc);
+    var backend = try Backend.open(alloc, "/gc-foreground-admission", .{ .storage = storage.storage(), .resource_manager = &manager });
+    defer backend.close();
+    var state: State = .{};
+    try state.upsert(alloc, .{}, "deleted", "", true);
+    var run = try compaction_mod.makeRunAtLevel(Backend, &backend, state, 1);
+    run.oldest_tombstone_unix_ns = 1;
+    try backend.runs.append(alloc, run);
+    try backend.persistManifest();
+    manager.foreground_query_sessions.store(1, .release);
+    defer manager.foreground_query_sessions.store(0, .release);
+    for (0..128) |_| {
+        try std.testing.expect(!try backend.runMaintenanceStep());
+        try std.testing.expect((backend.nextMaintenanceWakeDelayNsBestEffort() orelse 0) > 0);
+    }
+    backend.wal_checkpoint_pending = true;
+    backend.wal_checkpoint_retry_reason = .checkpoint_failure;
+    backend.wal_checkpoint_retry_deadline_ns = 0;
+    try std.testing.expectEqual(@as(?u64, 0), backend.nextMaintenanceWakeDelayNsBestEffort());
+    backend.wal_checkpoint_pending = false;
+    manager.foreground_query_sessions.store(0, .release);
+    try std.testing.expectEqual(@as(?u64, 0), backend.nextMaintenanceWakeDelayNsBestEffort());
+    for (0..64) |_| {
+        _ = try backend.runMaintenanceStep();
+        if (backend.compaction_stats.compactions != 0) break;
+    }
+    try std.testing.expect(backend.compaction_stats.compactions != 0);
+}
+
+test "lsm bulk admission preserves ownership across scheduler capacity and memory denial" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |memory_denial| {
+        var storage = storage_io.MemoryStorage.init(alloc);
+        defer storage.deinit();
+        var budgets = resource_manager_mod.Options.defaultBudgets();
+        budgets[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)] = .{ .soft_limit_bytes = 1024, .hard_limit_bytes = 1024 };
+        var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+        defer manager.deinit(alloc);
+        var backend = try Backend.open(alloc, "/bulk-admission-scheduler", .{ .storage = storage.storage(), .resource_manager = &manager, .flush_threshold = 1, .direct_bulk_ingest_min_bytes = 1, .bulk_ingest_tiered_l0_fan_in = 4, .compact_threshold_runs = 4, .l0_soft_limit_runs = 4, .l0_hard_limit_runs = 128, .compaction_scheduler = .{ .max_in_flight_input_bytes = if (memory_denial) 1024 * 1024 else 1, .allow_oversized_single_job = false, .resource_reservation_bytes = if (memory_denial) 2048 else 0 } });
+        defer backend.close();
+        backend.beginBatchMode(.{ .mode = .bulk_ingest });
+        defer backend.finishBatchMode(.{ .mode = .bulk_ingest });
+        for (0..5) |i| {
+            var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+            defer txn.abort();
+            var key: [16]u8 = undefined;
+            try txn.put(.{}, try std.fmt.bufPrint(&key, "doc:{d}", .{i}), "value");
+            try txn.commit();
+        }
+        for (0..64) |_| {
+            _ = try backend.runMaintenanceStep();
+            if (backend.pending_bulk_plan) |pending| if (pending.retry_after_ns != 0) break;
+        }
+        const pending = backend.pending_bulk_plan.?;
+        try std.testing.expect(pending.retry_after_ns != 0);
+        const slices = backend.directory_planning_slices;
+        for (0..16) |_| try std.testing.expect(!try backend.runMaintenanceStep());
+        try std.testing.expectEqual(slices, backend.directory_planning_slices);
+        try std.testing.expect((backend.nextMaintenanceWakeDelayNsBestEffort() orelse 0) > 0);
+        if (memory_denial) {
+            try std.testing.expectEqual(@as(u64, 1), backend.compaction_scheduler.denied_resource_pressure);
+        } else try std.testing.expectEqual(@as(u64, 1), backend.compaction_scheduler.denied_capacity);
+        backend.compaction_scheduler.options.max_in_flight_input_bytes = 1024 * 1024;
+        backend.compaction_scheduler.options.resource_reservation_bytes = 0;
+        pending.retry_after_ns = 0;
+        for (0..64) |_| {
+            _ = try backend.runMaintenanceStep();
+            if (backend.compaction_stats.compactions != 0) break;
+        }
+        try std.testing.expectEqual(@as(u64, 1), backend.compaction_stats.compactions);
+    }
+}
+
+test "lsm bulk admission prepared work scaling benchmark" {
+    if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+    const alloc = std.heap.smp_allocator;
+    for ([_]usize{ 1000, 10000, 50000 }) |count| {
+        const keys = try alloc.alloc(u8, count * 8);
+        defer alloc.free(keys);
+        var backend = Backend.init(alloc, .{ .wal_enabled = false, .compact_threshold_runs = 4, .l0_soft_limit_runs = 4, .l0_hard_limit_runs = 100000, .bulk_ingest_tiered_l0_fan_in = 4, .background_io_budget_bytes = 1, .background_io_allow_oversized_single_job = false });
+        defer backend.close();
+        for (0..count) |i| {
+            const key = keys[i * 8 ..][0..8];
+            std.mem.writeInt(u64, key, i, .big);
+            try backend.runs.append(alloc, .{ .id = i + 1, .visibility_id = count + i / (count / 4), .level = 0, .size_bytes = 1024, .path = @constCast("admission-bench.sst"), .smallest_namespace_name = null, .smallest_key = key, .largest_namespace_name = null, .largest_key = key, .entry_count = 1, .tombstone_count = 0, .bloom_filter = null, .owns_metadata = false, .owns_path = false, .state = null });
+        }
+        _ = try backend.planningDirectory();
+        backend.beginBatchMode(.{ .mode = .bulk_ingest });
+        defer backend.finishBatchMode(.{ .mode = .bulk_ingest });
+        var max_ns: u64 = 0;
+        for (0..4096) |turn| {
+            const start = platform_time.monotonicNs();
+            _ = try backend.runMaintenanceStep();
+            const elapsed = platform_time.monotonicNs() - start;
+            max_ns = @max(max_ns, elapsed);
+            if (backend.background_io_denied_jobs != 0) {
+                const slices = backend.directory_planning_slices;
+                const retry_start = platform_time.monotonicNs();
+                for (0..1000) |_| {
+                    backend.pending_bulk_plan.?.retry_after_ns = 0;
+                    _ = try backend.runMaintenanceStep();
+                }
+                try std.testing.expectEqual(slices, backend.directory_planning_slices);
+                std.debug.print("prepared-admission files={d} turns={d} final_ns={d} max_ns={d} retry_ns={d}\n", .{ count, turn + 1, elapsed, max_ns, (platform_time.monotonicNs() - retry_start) / 1000 });
+                break;
+            }
+        }
+        try std.testing.expect(backend.background_io_denied_jobs != 0);
     }
 }
 

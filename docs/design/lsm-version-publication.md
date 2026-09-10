@@ -33,6 +33,23 @@ foreground-deferred jobs advertise a 100 ms retry instead of spinning; wake
 selection preserves earlier WAL and reconciliation deadlines. An in-flight job
 does not request another immediate planning turn.
 
+Bulk continuations also own their prepared scheduler work: input IDs, byte
+totals and key bounds are collected from immutable handles in the existing
+bounded emission phase, with separately admitted storage for IDs. The admission
+check consumes this metadata without another input-count-dependent tree walk.
+A denied grant leaves the selection and its completed dependency certificate
+intact and advertises a 100 ms retry. An unchanged-epoch retry performs no
+discovery or validation scan; intervening
+publications advance the retained delta certificate before another grant.
+Replaced inputs invalidate the job, while unrelated changes preserve it. Policy
+changes, pressure relief, cancellation and shutdown still retire owned state.
+GC wake deadlines apply the same foreground deferral without delaying earlier
+durability deadlines. Domain/GC work preparation reads pinned handles off-lock
+in cooperative 2,048-entry / two-millisecond quanta, not through repeated
+writer-tree lookups under the mutex. Any intervening publication requires
+input identity/closure validation before execution, including tombstone-free
+tables and split-GC plans; absence of deletes is not an identity certificate.
+
 Tombstone metadata distinguishes known zero, known nonzero and unknown. Mainline
 v9/v10 manifests remain readable, but their unknown counts now contribute explicit
 maintenance debt. An augmented directory query finds an unknown input without
@@ -70,6 +87,8 @@ python3 tools/run_bounded_zig_build.py build lsm-backend-test -- --test-filter '
 python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'bulk publication no-op scheduling scaling benchmark'
 python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'bulk publication large generation discovery'
 python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'maintenance score aggregate' --test-filter 'bulk continuation' --test-filter 'unknown tombstone'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'bulk admission' --test-filter 'foreground deferred GC' --test-filter 'async batch reads tree'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -- --test-filter 'prepared compaction rejects'
 ```
 
 Local Apple Silicon / Zig 0.16 ReleaseFast measurements (synthetic hot metadata,
@@ -98,7 +117,30 @@ The pre-fix 50,000-file scoring probe took approximately 1.3 ms per call. This
 establishes removal of the metadata walk, not a sustained-write throughput or
 tail-latency guarantee.
 
+Prepared-admission follow-up, using four logical generations and denying SST
+I/O so the control isolates planning/admission (local arm64 ReleaseFast):
+
+| Selected SSTs | Previous final admission turn | Prepared final turn | Maximum prepared turn | Unchanged-epoch retry |
+| --- | ---: | ---: | ---: | ---: |
+| 1,000 | 112 µs | 6 µs | 253 µs | 39 ns |
+| 10,000 | 1.872 ms | 12 µs | 437 µs | 37 ns |
+| 50,000 | 13.779 ms | 7 µs | 908 µs | 39 ns |
+
+Retries average 1,000 forced-due attempts and assert that planning-slice counts
+do not advance. Production retries sleep between denials. Total initial work
+still scales with selected inputs; the measured win is removing the final
+writer-tree traversal and repeated work during denial, not an end-to-end
+compaction throughput claim. Admitted jobs still incur scheduler ownership and
+conflict checks. Maximum turns remain cooperative rather than hard real-time
+bounds.
+
 ## Read epochs
+
+Async batch reads use the same representation-independent entry accessors as
+scalar reads for live memtables and pinned mutable/immutable snapshots. A rank
+from a tree-backed snapshot must never index its empty flat backing array.
+Regression coverage includes values, tombstones, misses and an old snapshot
+retained across an overwrite.
 
 Read transactions pin mutable state, immutable memtables, and SST membership
 under one backend lock. Ordinary reads no longer project that epoch into a

@@ -112,7 +112,9 @@ fn bulkStateHasDuplicateKeys(allocator: Allocator, state: *const State) !bool {
         index.deinit(allocator);
     }
 
-    for (state.entries.items, 0..) |entry, idx| {
+    var cursor: State.EntryCursor = .{};
+    for (0..state.entryCount()) |idx| {
+        const entry = cursor.at(state, idx);
         const namespace = namespaceOf(entry);
         const hash = hashBulkEntryKey(namespace, entry.key);
         const gop = try index.getOrPut(allocator, hash);
@@ -4354,8 +4356,10 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
 
         fn bulkStateEntriesAreUnique(state: *const State) bool {
             if (state.entryCount() <= 1) return true;
-            var previous = state.entryAt(0);
-            for (state.entries.items[1..]) |entry| {
+            var cursor: State.EntryCursor = .{};
+            var previous = cursor.at(state, 0);
+            for (1..state.entryCount()) |i| {
+                const entry = cursor.at(state, i);
                 if (compareEntryTo(previous, state_mod.namespaceOf(entry), entry.key) == .eq) return false;
                 previous = entry;
             }
@@ -5971,7 +5975,7 @@ fn readManySortedPointFromSnapshotAsync(
     var result: BatchCursorReadResult = .{};
     for (keys, 0..) |key, key_index| {
         if (mutable.findIndex(namespace, key)) |entry_index| {
-            const entry = mutable.entries.items[entry_index];
+            const entry = mutable.entryAt(entry_index);
             resolved[key_index] = true;
             if (entry.tombstone) {
                 result.misses += 1;
@@ -5984,7 +5988,7 @@ fn readManySortedPointFromSnapshotAsync(
         }
         for (immutable_memtables) |state| {
             const entry_index = state.findIndex(namespace, key) orelse continue;
-            const entry = state.entries.items[entry_index];
+            const entry = state.entryAt(entry_index);
             resolved[key_index] = true;
             if (entry.tombstone) {
                 result.misses += 1;
@@ -7632,8 +7636,10 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
 
         fn bulkStateEntriesAreUnique(state: *const State) bool {
             if (state.entryCount() <= 1) return true;
-            var previous = state.entryAt(0);
-            for (state.entries.items[1..]) |entry| {
+            var cursor: State.EntryCursor = .{};
+            var previous = cursor.at(state, 0);
+            for (1..state.entryCount()) |i| {
+                const entry = cursor.at(state, i);
                 if (compareEntryTo(previous, state_mod.namespaceOf(entry), entry.key) == .eq) return false;
                 previous = entry;
             }
@@ -8171,6 +8177,47 @@ test "lsm bounded merge cursor spills inactive persisted block" {
     try std.testing.expectEqual(@as(?usize, null), cursor.source_block_indices[run_source]);
     try std.testing.expectEqualStrings("replay:1", cursor.source_key_copies[run_source].?);
     try std.testing.expectEqual(@as(usize, 0), cursor.source_entries[run_source].?.value.len);
+}
+
+test "lsm async batch reads tree backed mutable and immutable snapshots" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+    var cache = cache_mod.Cache.init(allocator, 1024 * 1024);
+    defer cache.deinit();
+    var backend = try Backend.open(allocator, "/async-tree-snapshot", .{ .storage = storage.storage(), .cache = &cache });
+    defer backend.close();
+    var active: ActiveMemTable = .{};
+    defer active.deinit(allocator);
+    try active.upsert(allocator, .{}, "a", "old", false);
+    try active.upsert(allocator, .{}, "b", "", true);
+    var snapshot = try active.snapshot(allocator);
+    defer snapshot.deinit(allocator);
+    try std.testing.expect(snapshot.ordered_root != null);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.entries.items.len);
+    try active.upsert(allocator, .{}, "a", "new", false);
+    const keys = [_][]const u8{ "a", "b", "missing" };
+    const empty: State = .{};
+    for (0..3) |mode| {
+        var values: [3]?[]const u8 = undefined;
+        var held: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (held.items) |value| allocator.free(value);
+            held.deinit(allocator);
+        }
+        @memset(&values, null);
+        const result = if (mode == 0)
+            try readManySortedPointFromSnapshotAsync(&backend, &active, &.{}, &.{}, &.{}, &.{}, allocator, &held, .{}, &keys, &values, false)
+        else
+            try readManySortedPointFromSnapshotAsync(&backend, if (mode == 1) &snapshot else &empty, if (mode == 1) &.{} else &.{&snapshot}, &.{}, &.{}, &.{}, allocator, &held, .{}, &keys, &values, false);
+        try std.testing.expect(result != null);
+        try std.testing.expectEqual(@as(usize, 1), result.?.hits);
+        try std.testing.expectEqual(@as(usize, 2), result.?.misses);
+        try std.testing.expectEqualStrings(if (mode == 0) "new" else "old", values[0].?);
+        try std.testing.expect(values[1] == null and values[2] == null);
+    }
+    try std.testing.expect(!try bulkStateHasDuplicateKeys(allocator, &snapshot));
 }
 
 test "lsm async point read cleanup preserves independently retained index pin" {
