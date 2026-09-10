@@ -60,7 +60,7 @@ pub fn classifyCreateTableRequestError(err: anyerror) CreateTableRequestErrorDis
 }
 
 pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tables_api.CreateTableRequest {
-    if (body.len == 0) return .{};
+    if (body.len == 0) return .{ .indexes_json = try coverage_policy.withMissingIncarnationsAlloc(alloc, tables_api.default_indexes_json) };
 
     // Validate and normalize indexes from the raw request before invoking the
     // generated parser. The generated OpenAPI parser rejects unknown enum
@@ -122,9 +122,9 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         if (indexes_value != .null)
             req.indexes_json = try normalizeCreateTableIndexesFromValue(alloc, indexes_value)
         else
-            req.indexes_json = try alloc.dupe(u8, tables_api.default_indexes_json);
+            req.indexes_json = try coverage_policy.withMissingIncarnationsAlloc(alloc, tables_api.default_indexes_json);
     } else {
-        req.indexes_json = try alloc.dupe(u8, tables_api.default_indexes_json);
+        req.indexes_json = try coverage_policy.withMissingIncarnationsAlloc(alloc, tables_api.default_indexes_json);
     }
     try validateCreateTableIndexSemantics(alloc, req.indexes_json.?);
 
@@ -1871,4 +1871,23 @@ test "table contract schema update error message explains public sortable replac
         "invalid create table request",
         createTableRequestErrorMessage(error.InvalidCreateTableSchemaRequest, "{\"schema\":{\"dynamic_templates\":[{\"mapping\":{\"type\":\"keyword\",\"sortable\":true}}]}}"),
     );
+}
+
+// The local materializer and metadata must publish the same default identity.
+test "create table default index incarnation survives the system catalog hop" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "", "{}", "{\"indexes\":null}" }) |body| {
+        var request = try parseCreateTableRequest(alloc, body);
+        defer request.deinit(alloc);
+        const encoded = try tables_api.encodeStoredCreateTableRequestAlloc(alloc, request);
+        defer alloc.free(encoded);
+        var stored = try tables_api.parseStoredCreateTableRequest(alloc, encoded);
+        defer stored.deinit(alloc);
+        var before = try std.json.parseFromSlice(std.json.Value, alloc, request.indexes_json.?, .{});
+        defer before.deinit();
+        var after = try std.json.parseFromSlice(std.json.Value, alloc, stored.indexes_json.?, .{});
+        defer after.deinit();
+        const incarnation = coverage_policy.incarnation(before.value.object.get("full_text_index_v0").?) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(incarnation, coverage_policy.incarnation(after.value.object.get("full_text_index_v0").?).?);
+    }
 }

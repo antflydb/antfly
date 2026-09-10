@@ -53,7 +53,16 @@ are protected. Rename requires authority on both the old and new names.
 
 ## Binding and execution
 
-HTTP and A2A retrieval use the same query binding boundary.
+HTTP and A2A retrieval use the same query binding boundary. Background entity
+resolution binds candidate reads, and promotion binds every distinct destination
+in one catalog read before submitting its atomic write batch. Graph hydration
+keeps logical endpoint names for authorization and result provenance, while its
+request-owned resolver pins physical target identities and a catalog revision
+through execution retries. Target row filters run against the resolved table.
+
+Default index incarnations are assigned during public create normalization and
+preserved through the metadata hop and local materialization. Creating another
+index cannot leave the default index waiting for a different incarnation.
 
 Public query admission authorizes logical references and applies their row
 filters before routing. It binds the primary table and every nested native
@@ -135,7 +144,8 @@ wildcard scope remain distinct through storage, lookup, and removal.
 
 Restore jobs persist immutable destination identities. Admission intent is a
 bounded, URL-safe encoding of the structured target, allowing names with
-slashes, spaces, dots, or the full table-name length. The binding is published
+slashes, spaces, dots, or the full table-name length. Replica bootstrap carries that destination namespace so even the first staged
+import uses the new identity. The binding is published
 atomically with restored topology. Repeated idempotent admission retains the
 same destination identity.
 

@@ -11950,7 +11950,17 @@ pub const ApiHttpServer = struct {
         if (row_filter_json) |value| {
             injectRowFilterIntoSearchRequest(alloc, &query_req.req, value) catch return error.InvalidQueryRequest;
         }
-        if (authenticated_identity) |*identity| {
+        var graph_arena = std.heap.ArenaAllocator.init(alloc);
+        defer graph_arena.deinit();
+        var graph_binding = CatalogGraphReadContext{
+            .server = self,
+            .identity = authenticated_identity,
+            .context = .{ .deadline_ns = request_deadline_ns, .cancellation = cancellation orelse .none },
+            .resolver = .{ .arena = graph_arena.allocator() },
+        };
+        if (self.source.vtable.system_catalog != null and query_req.req.graph_queries.len > 0 and distributed_graph.supportsCrossRange(query_req.req)) {
+            query_req.req.graph_table_read_authorizer = .{ .ctx = &graph_binding, .authorize_table = CatalogGraphReadContext.authorize };
+        } else if (authenticated_identity) |*identity| {
             attachGraphTableReadAuthorizer(&query_req.req, identity);
         }
         return (queryWithTransientReadRetry(
@@ -11970,6 +11980,29 @@ pub const ApiHttpServer = struct {
             else => return err,
         }) orelse error.TableNotFound;
     }
+
+    const CatalogGraphReadContext = struct {
+        server: *ApiHttpServer,
+        identity: ?AuthenticatedIdentity,
+        context: api_operation.RequestContext,
+        resolver: CatalogQueryResolver,
+
+        fn authorize(ctx: ?*const anyopaque, alloc: std.mem.Allocator, name: []const u8) anyerror!db_mod.types.GraphTableReadAuthorization {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ctx orelse return .{ .allowed = false })));
+            const target = try system_catalog.Target.literal(name);
+            const key = try target.resourceNameAlloc(self.resolver.arena);
+            if (!try tablePermissionCurrentlyAllowed(self.identity, key, .read)) return .{ .allowed = false };
+            const resolved = try self.server.resolveQueryCatalog(&self.resolver, self.context, &.{target});
+            const table = resolved.tables[0] orelse return .{ .allowed = false };
+            const physical = try alloc.dupe(u8, table.name);
+            errdefer alloc.free(physical);
+            return .{
+                .allowed = true,
+                .physical_table_name = physical,
+                .filter_query_json = try resolveEffectiveRowFilterJson(alloc, self.identity, key),
+            };
+        }
+    };
 
     pub fn attachGraphTableReadAuthorizer(
         req: *db_mod.types.SearchRequest,

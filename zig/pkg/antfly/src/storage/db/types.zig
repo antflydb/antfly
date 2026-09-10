@@ -1774,10 +1774,13 @@ pub fn canonicalGroupedMatchDescendantRequest(
 
 pub const GraphTableReadAuthorization = struct {
     allowed: bool,
+    /// Owned physical routing name; authorization remains against the logical target.
+    physical_table_name: ?[]u8 = null,
     /// Owned by this value when non-null.
     filter_query_json: ?[]u8 = null,
 
     pub fn deinit(self: *GraphTableReadAuthorization, alloc: std.mem.Allocator) void {
+        if (self.physical_table_name) |value| alloc.free(value);
         if (self.filter_query_json) |value| alloc.free(value);
         self.* = undefined;
     }

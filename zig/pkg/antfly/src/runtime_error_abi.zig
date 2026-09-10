@@ -348,7 +348,7 @@ pub const Detail = enum(c_int) {
     generation_rate_limit,
     unsupported_tensor_type,
     generation_capacity_unavailable,
-    // Native catalog errors cross the independently compiled runtime boundary.
+    // System catalog errors cross the independently compiled runtime boundary.
     database_not_found,
     namespace_not_found,
     tablespace_not_found,
@@ -1175,7 +1175,7 @@ test "generation capacity retains retryability across the runtime boundary" {
     try std.testing.expectEqual(error.GenerationCapacityUnavailable, errorFromStatus(result));
 }
 
-test "native catalog errors retain their stable runtime boundary classification" {
+test "system catalog errors retain their stable runtime boundary classification" {
     const errors = [_]anyerror{ error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.CatalogCommandTooLarge, error.InvalidCatalogRecord, error.CatalogIdExhausted };
     for (errors) |err| try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
 }
