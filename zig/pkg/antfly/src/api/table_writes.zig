@@ -32880,21 +32880,16 @@ pub fn applyLocalTableSchemaJson(
     db: *db_mod.DB,
     schema_json: []const u8,
 ) !void {
-    // An empty schema is still an explicit, durable table contract. Persist
-    // the marker so transition and Raft replay can distinguish a provisioned
-    // schema-less DB from an incomplete local generation without consulting
-    // the catalog.
-    if (schema_json.len == 0) {
-        try db.core.store.put(local_schema_json_key, "");
-        return;
-    }
-
+    // The absent/empty catalog contract has the same canonical schema as
+    // table creation. Never overwrite only the public marker: its validator
+    // and the durable runtime layout must be committed in the same epoch.
+    const effective_schema_json = if (schema_json.len == 0) tables_api.default_schema_json else schema_json;
     // Install the public and runtime forms together so storage-boundary writes
     // immediately use the same authoritative validator as API writes.
-    try db.setSchemaJson(alloc, schema_json);
+    try db.setSchemaJson(alloc, effective_schema_json);
     // Propagate schema-derived changes to live algebraic indexes so dynamic
     // template updates take effect without a reopen.
-    try db.reloadAlgebraicSchemaConfigs(schema_json);
+    try db.reloadAlgebraicSchemaConfigs(effective_schema_json);
 }
 
 fn loadTableIndexesJson(
@@ -35750,8 +35745,6 @@ test "provisioned table write source backs up and restores full_text writes from
 
     const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(db_path);
-    var db = try db_mod.DB.open(alloc, db_path, .{});
-    defer db.close();
 
     const FakeCatalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -35912,8 +35905,8 @@ test "provisioned table write source backs up and restores full_text writes from
     try std.testing.expectEqual(@as(u16, 200), public_query.status);
     try std.testing.expect(std.mem.indexOf(u8, public_query.body, "\"doc:a\"") != null);
 
-    db.close();
-    db = try db_mod.DB.open(alloc, db_path, .{});
+    var db = try db_mod.DB.open(alloc, db_path, .{ .open_mode = .query_readonly });
+    defer db.close();
 
     var restored = (try db.lookup(alloc, "doc:a", .{})).?;
     defer restored.deinit(alloc);
@@ -48661,6 +48654,7 @@ test "provisioned table write source restore repair completion retires cached ve
     var stale_status = runtime_status.LocalTableRuntimeStatus{
         .group_id = 7001,
         .stats = .{
+            .doc_count = 99,
             .repair_degraded = true,
             .index_count = 1,
             .indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1),
@@ -50711,6 +50705,7 @@ test "provisioned owner publication clears ambiguous replay-only backfill" {
         .sync_level = .write,
     });
     try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
+    _ = try cached.db.publishVectorBlockBasesAtStableTip();
     try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
 
     {
@@ -50733,6 +50728,7 @@ test "provisioned owner publication clears ambiguous replay-only backfill" {
         .sync_level = .write,
     });
     try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
+    _ = try cached.db.publishVectorBlockBasesAtStableTip();
     try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
 
     var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
@@ -50807,6 +50803,7 @@ test "provisioned owner publication replaces stale cached backfill" {
         .sync_level = .write,
     });
     try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
+    _ = try cached.db.publishVectorBlockBasesAtStableTip();
     try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
 
     {
@@ -50830,6 +50827,7 @@ test "provisioned owner publication replaces stale cached backfill" {
         .sync_level = .write,
     });
     try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
+    _ = try cached.db.publishVectorBlockBasesAtStableTip();
     try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
 
     var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
@@ -57083,8 +57081,6 @@ test "provisioned table write source restore table does not hold local db mutex 
 
     const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
     defer alloc.free(db_path);
-    var db = try db_mod.DB.open(alloc, db_path, .{});
-    defer db.close();
 
     const Catalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -57215,8 +57211,8 @@ test "provisioned table write source restore table does not hold local db mutex 
     if (worker.err) |err| return err;
     try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
 
-    db.close();
-    db = try db_mod.DB.open(alloc, db_path, .{});
+    var db = try db_mod.DB.open(alloc, db_path, .{ .open_mode = .query_readonly });
+    defer db.close();
     var restored = (try db.lookup(alloc, "doc:a", .{})).?;
     defer restored.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"alpha\"") != null);
