@@ -37,6 +37,54 @@ make run
 
 ## 🔄 Development Workflow
 
+### Inference runtime contract smoke test
+
+Operator CI runs the generated model-puller and inference-server arguments
+against the checksum-pinned Antfly v0.2.1 Linux GNU release, using the native CPU
+backend, a small public BGE embedding model, and a tiny GGUF generator
+(`shibatch/tiny1m:gguf:Q4_K_M`). It requires eager and lazy
+readiness plus a finite, nonzero 384-dimensional embedding, verifies eager
+warming before the first request, and checks that removing the model-directory
+flag and config field reproduces an unready server. It needs neither Kubernetes
+nor GPUs.
+
+The same reconciler-generated contract runs against the PR's candidate binary
+in `zig-tests.yml`. Both binaries exercise nested overrides (including empty
+preloads and zero model limits), tagged GGUF preloads with and without a nested
+`api_url`, and omitted `kind`/backend defaults. Generator warming is asserted
+before serving an embedding request. Missing downloads/binaries fail the test.
+The CPU fixture uses policy-neutral `residency_mode: auto` and
+`memory_budget_mb: 0`; non-default GPU/A4B policies retain focused config tests
+and require separate GPU execution validation.
+The contract also checks omitted task hints with lazy discovery and an explicit
+eager preload kind, plus empty/null optional identity fields. Unit tests verify
+that ambiguous eager task hints report a validation failure before workload
+creation, including on an operator upgrade with an unchanged pool generation,
+and that correcting the hint allows reconciliation to recover.
+
+To run locally on Linux or macOS, supply an absolute path to a verified released
+or newly built Antfly binary:
+
+```bash
+ANTFLY_RUNTIME_BIN=/absolute/path/to/antfly GOWORK=off go test \
+  -tags runtimeintegration ./controllers/inference \
+  -run '^TestInferenceRuntimeContract$' -count=1 -v -timeout=20m
+```
+
+This explicit integration target fails if its binary is absent or its model
+cannot be downloaded; ordinary offline unit tests do not run it. Downloads and
+runtime state use isolated temporary directories, and server process groups are
+terminated on completion or timeout. When advancing the supported runtime,
+update both the release version and SHA256 in `antfly-operator-go.yml` and run
+this same target against the candidate binary. This test does not exercise
+container packaging, real Kubernetes scheduling, or GPU execution; retain those
+rollout checks separately.
+
+Runtime PR CI also runs `zig/e2e/inference/test_run_config.py` against the newly
+built binary: config-only flat/nested startup, eager warming and embeddings,
+and CLI precedence in either argument order. This covers the config handoff
+independently of the operator's compatibility flags.
+
 ### Quick Development Cycle
 
 ```bash
