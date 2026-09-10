@@ -121,6 +121,7 @@ jobs:
             scripts/run_db_query_matrix.py \
             scripts/test_run_db_query_matrix.py \
             scripts/test_conformance_fixtures.py \
+            ':(glob)scripts/bench/pdf/**' \
             Makefile \
             .github/workflows/zig-tests.yml \
             .github/workflows/antfly-container.yml
@@ -135,6 +136,11 @@ jobs:
             ':(exclude,glob)zig/pkg/antfly/antfarm/**' \
             ':(glob)scripts/ci/zig-*.sh' \
             scripts/ci/toolchain-policy.json \
+            ':(glob)go/pkg/operator/**' \
+            ':(glob)go/pkg/sdk/admin/**' \
+            go/pkg/sdk/go.mod \
+            go/pkg/sdk/go.sum \
+            ':(glob)specs/openapi/**' \
             .github/actions/load-toolchain-policy/action.yml \
             scripts/test-backup-s3-integration.sh \
             Makefile \
@@ -364,6 +370,7 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
+          python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py'
 
       - name: Check inference kernel generator
         working-directory: zig/pkg/inference
@@ -659,6 +666,7 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
+          python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py'
 
       # Keep normal build-step parallelism while bounding aggregate compiler
       # memory to the pod's cgroup budget.
@@ -931,11 +939,44 @@ jobs:
       - name: Install E2E executable
         run: tar -xzf "${RUNNER_TEMP}/antfly-e2e-base/antfly-e2e-base.tar.gz" -C zig
 
+      - name: Set up Go for operator runtime contract
+        if: matrix.suite == 'inference'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ steps.toolchain.outputs.go_version }}
+          cache: false
+
+      # Execute the SAME reconciler-generated contract as the operator job's
+      # pinned v0.2.1 baseline, now against this PR's newly built runtime.
+      - name: Test generated inference command against candidate runtime
+        if: matrix.suite == 'inference'
+        working-directory: go/pkg/operator
+        env:
+          ANTFLY_RUNTIME_BIN: ${{ github.workspace }}/zig/zig-out/bin/antfly
+          GOWORK: 'off'
+          GOEXPERIMENT: simd
+        run: >-
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} go test
+          -tags runtimeintegration ./controllers/inference
+          -run '^TestInferenceRuntimeContract$' -count=1 -v -timeout=20m
+
       - name: Run base E2E
         env:
           SKIP_BUILD: "1"
           ANTFLY_E2E_SUITE: ${{ matrix.suite }}
         run: taskset -c ${{ steps.e2e_cpus.outputs.list }} scripts/ci/zig-e2e-base-linux.sh
+
+      - name: Run inference config contract with a real CPU model
+        if: matrix.suite == 'inference'
+        working-directory: zig
+        env:
+          ANTFLY_BIN: ./zig-out/bin/antfly
+          ANTFLY_INFERENCE_MODELS_DIR: ${{ runner.temp }}/inference-config-models
+          ANTFLY_INFERENCE_DOWNLOAD: "1"
+          UV_PROJECT_ENVIRONMENT: /tmp/antfly-ci-venv/inference
+        run: >-
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference pytest -q
+          e2e/inference/test_run_config.py
 
       - name: Run low-FD HTTP worker ratchet regression
         if: matrix.suite == 'antfly'

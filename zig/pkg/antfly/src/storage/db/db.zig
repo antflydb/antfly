@@ -455,6 +455,8 @@ pub const OpenOptions = struct {
     start_index_workers: bool = true,
     start_optional_runtimes: bool = true,
     start_optional_runtime_workers: bool = true,
+    /// Managed caches install distributed callbacks before activating replay.
+    start_resolver_workers: bool = true,
     external_derived_checkpoints: bool = true,
     /// Optional durable namespace for replica-local index repair state.
     /// Externally owned roots use this to keep crash-resume intent and replay
@@ -4060,6 +4062,7 @@ pub const DB = struct {
     executor: *derived_executor_mod.Executor,
     start_index_workers: bool,
     optional_runtime_workers_enabled: bool,
+    resolver_workers_enabled: bool,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
     enrichment_append_context: ?*EnrichmentAppendContext,
@@ -4546,6 +4549,7 @@ pub const DB = struct {
                 .executor = executor,
                 .start_index_workers = start_index_workers,
                 .optional_runtime_workers_enabled = false,
+                .resolver_workers_enabled = opts.start_resolver_workers,
                 .secret_store = opts.secret_store,
                 .remote_content = opts.remote_content,
                 .enrichment_append_context = null,
@@ -5482,6 +5486,7 @@ pub const DB = struct {
             self.entity_sink_missing_policy,
         );
         errdefer runtime.deinit();
+        runtime.catalog = self.core.index_manager;
         self.promotion_runtime = runtime;
         self.async_context.promotion_runtime = runtime;
         // Patch the resolution stage's append context so journaling a resolution
@@ -5697,7 +5702,14 @@ pub const DB = struct {
         try self.startResolverReplayRuntimes();
     }
 
+    /// Activate only after the serving owner installs candidate/sink hooks.
+    pub fn activateResolverReplayRuntimes(self: *DB) !void {
+        self.resolver_workers_enabled = true;
+        if (self.optional_runtime_workers_enabled) try self.startResolverReplayRuntimesIfConfigured();
+    }
+
     fn startResolverReplayRuntimes(self: *DB) !void {
+        if (!self.resolver_workers_enabled or !self.optional_runtime_workers_enabled) return;
         if (self.resolution_runtime) |runtime| try runtime.start();
         if (self.promotion_runtime) |runtime| try runtime.start();
     }
@@ -22267,15 +22279,46 @@ pub const DB = struct {
         return try self.core.upsertEnrichment(cfg);
     }
 
+    const ResolverCatalogActivity = struct {
+        resolution: ?*std.atomic.Mutex,
+        promotion: ?*std.atomic.Mutex,
+
+        fn deinit(self: *@This()) void {
+            if (self.promotion) |mutex| mutex.unlock();
+            if (self.resolution) |mutex| mutex.unlock();
+        }
+    };
+
+    fn acquireResolverCatalogActivity(self: *DB, wait: bool) !ResolverCatalogActivity {
+        const resolution = if (self.resolution_runtime) |runtime| &runtime.catch_up_mutex else null;
+        const promotion = if (self.promotion_runtime) |runtime| &runtime.catch_up_mutex else null;
+        while (true) {
+            if (resolution == null or resolution.?.tryLock()) {
+                if (promotion == null or promotion.?.tryLock())
+                    return .{ .resolution = resolution, .promotion = promotion };
+                if (resolution) |mutex| mutex.unlock();
+            }
+            // Managed refresh/apply callers hold a group activity. They must
+            // release it so a worker already inside a Raft callback can finish.
+            if (!wait) return error.WriterLocked;
+            const io = self.backend_runtime.controlIo() orelse self.backend_runtime.io() orelse
+                return error.BackendRuntimeIoUnavailable;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+
     pub fn addResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         {
+            var activity = try self.acquireResolverCatalogActivity(true);
+            defer activity.deinit();
             lockApply(self);
             defer self.core.unlockApply();
             try self.core.addResolver(cfg);
+            if (self.resolution_runtime) |runtime| runtime.notifyBackfill();
         }
         try self.startResolverReplayRuntimes();
         try self.backfillResolverCorpus();
@@ -22283,9 +22326,9 @@ pub const DB = struct {
 
     pub const ResolverUpsertOptions = struct {
         /// When false, persist the catalog mutation and mark the resolver backlog
-        /// dirty, but leave the actual re-resolution drain to the caller. Managed
-        /// table opens use this so DB runtime hooks are installed before
-        /// cross-shard candidate blocking or promotion can run.
+        /// dirty, but leave execution to the resolver worker. Admission is
+        /// nonblocking: a refresh holding a group activity must not wait for
+        /// in-flight resolution or promotion callbacks.
         drain_backfill: bool = true,
     };
 
@@ -22303,17 +22346,21 @@ pub const DB = struct {
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
         const upsert_result = blk: {
+            var activity = try self.acquireResolverCatalogActivity(options.drain_backfill);
+            defer activity.deinit();
             lockApply(self);
             defer self.core.unlockApply();
-            break :blk try self.core.upsertResolver(cfg);
+            const result = try self.core.upsertResolver(cfg);
+            if (result != .updated_no_backfill) {
+                if (self.resolution_runtime) |runtime| runtime.notifyBackfill();
+            }
+            break :blk result;
         };
         switch (upsert_result) {
             .inserted, .updated_backfill_required => {
                 try self.startResolverReplayRuntimes();
                 if (options.drain_backfill) {
                     try self.backfillResolverCorpus();
-                } else if (self.resolution_runtime) |runtime| {
-                    try runtime.requestReresolveBacklog();
                 }
             },
             .updated_no_backfill => {
@@ -22361,37 +22408,60 @@ pub const DB = struct {
 
     pub fn removeResolver(self: *DB, name: []const u8) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.enforceHAWriteGate();
+        while (true) {
+            try self.retireResolverReplayBeforeCatalogRemoval();
+            return self.removeResolverWithoutDrain(name) catch |err| {
+                if (err != error.WriterLocked) return err;
+                if (self.backend_runtime.controlIo() orelse self.backend_runtime.io()) |io|
+                    try io.sleep(.fromMilliseconds(1), .awake);
+                continue;
+            };
+        }
+    }
+
+    pub fn removeResolverWithoutDrain(self: *DB, name: []const u8) !bool {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
-        try self.retireResolverReplayBeforeCatalogRemoval();
-
-        const retirement_sequence = blk: {
+        {
+            var activity = try self.acquireResolverCatalogActivity(false);
+            defer activity.deinit();
+            // No resolver can be removed while an old decision or promotion is
+            // in flight. Wake the existing owner and retry on a later refresh.
+            const promotion = self.promotionStageStats();
+            // Followers cannot promote. Their queued hints reference the live
+            // artifacts deleted below and cannot publish after this callback
+            // fence; they must not prevent local catalog retirement forever.
+            const follower = std.mem.eql(u8, promotion.blocked_reason, "not_source_group_leader");
+            if (self.resolutionStageStats().catch_up_required or
+                (!follower and (promotion.catch_up_required or promotion.blocked)))
+                return error.WriterLocked;
             lockApply(self);
             defer self.core.unlockApply();
-
             const cfg = (try self.resolverConfigByNameAlloc(name)) orelse return false;
             defer {
                 var owned = cfg;
                 owned.deinit(self.alloc);
             }
-
-            break :blk try self.retireResolverArtifactsLocked(cfg);
-        };
-
-        if (retirement_sequence) |sequence| {
-            notifyQueryVisibilityTargetAdvanced(self.async_context, sequence);
-            self.executor.notifySequence(sequence);
-            self.notifyResolverReplayRuntimesForced(sequence);
-            try self.runUntilIdle();
-        }
-
-        {
-            lockApply(self);
-            defer self.core.unlockApply();
+            if (try self.retireResolverArtifactsLocked(cfg)) |sequence| {
+                notifyQueryVisibilityTargetAdvanced(self.async_context, sequence);
+                self.executor.notifySequence(sequence);
+                self.notifyResolverReplayRuntimesForced(sequence);
+                return error.WriterLocked;
+            }
+            // Graph replay still needs the resolver contract to interpret
+            // retirement records, including records whose artifact is absent.
+            // Its persisted/live watermark also makes this safe after reopen.
+            for (self.core.index_manager.graph_indexes.items) |entry| {
+                const applied = try self.managedIndexAppliedSequence(self.alloc, entry.config.name);
+                const target = try self.managedIndexReplayTargetSequence(self.alloc, entry.config.name, .graph, applied);
+                if (applied < target)
+                    return error.WriterLocked;
+            }
             if (!try self.core.removeResolver(name)) return false;
         }
-
         self.stopResolverReplayRuntimesIfUnconfigured();
         return true;
     }
@@ -22438,7 +22508,14 @@ pub const DB = struct {
             const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(self.alloc, parsed.doc_key, cfg.resolution_artifact);
             var resolution_key_owned = true;
             errdefer if (resolution_key_owned) self.alloc.free(resolution_key);
-            if (!containsDeleteKey(deletes.items, resolution_key)) {
+            const exists = if (self.core.store.get(self.alloc, resolution_key)) |raw| exists: {
+                self.alloc.free(raw);
+                break :exists true;
+            } else |err| switch (err) {
+                error.NotFound => false,
+                else => return err,
+            };
+            if (exists and !containsDeleteKey(deletes.items, resolution_key)) {
                 try deletes.append(self.alloc, resolution_key);
                 resolution_key_owned = false;
                 try appendUniqueOwnedKey(self.alloc, &changed, resolution_key);
@@ -22535,7 +22612,14 @@ pub const DB = struct {
         }
         try appendGraphAssetStateSegmentDeleteKeys(self.alloc, self.core.store, state_key, deletes);
 
-        if (!containsDeleteKey(deletes.items, state_key)) {
+        const state_exists = if (self.core.store.get(self.alloc, state_key)) |raw| exists: {
+            self.alloc.free(raw);
+            break :exists true;
+        } else |err| switch (err) {
+            error.NotFound => false,
+            else => return err,
+        };
+        if (state_exists and !containsDeleteKey(deletes.items, state_key)) {
             try deletes.append(self.alloc, state_key);
             state_key_owned = false;
         } else {
@@ -63012,6 +63096,174 @@ test "db re-resolves the corpus when upsertResolver bumps the config generation"
     const raw = try db.core.store.get(alloc, resolution_key);
     defer alloc.free(raw);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":2") != null);
+}
+
+test "db resolver worker resumes durable backfill after deferred activation and reopen" {
+    for ([_]bool{ false, true }) |reopen| {
+        const alloc = std.testing.allocator;
+
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
+        defer cleanupTempDir(path);
+
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_resolver_workers = false });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json =
+            \\{
+            \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+            \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
+            \\}
+            ,
+        });
+
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:a",
+                .value =
+                \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+                ,
+            }},
+            .sync_level = .enrichments,
+        });
+        try db.runUntilIdle();
+
+        const cfg: index_manager_mod.ResolverConfig = .{
+            .name = "kg_background",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "resolution_background_v1",
+            .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+            .config_generation = 1,
+        };
+        _ = try db.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false });
+        try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
+        try std.testing.expect(db.resolutionStageStats().catch_up_required);
+        if (reopen) {
+            db.close();
+            db = try DB.open(alloc, std.mem.span(path), .{ .start_resolver_workers = false });
+            try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
+            try std.testing.expect(db.resolutionStageStats().catch_up_required);
+        }
+        // No synchronous catchUp/runUntilIdle or new write may drive this work.
+        try db.activateResolverReplayRuntimes();
+        const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", cfg.resolution_artifact);
+        defer alloc.free(resolution_key);
+        const io = db.backend_runtime.controlIo() orelse db.backend_runtime.io().?;
+        var completed = false;
+        for (0..1000) |_| {
+            if (db.core.store.get(alloc, resolution_key)) |raw| {
+                defer alloc.free(raw);
+                if (std.mem.indexOf(u8, raw, "person/ada_lovelace") != null and !db.resolutionStageStats().catch_up_required) {
+                    completed = true;
+                    break;
+                }
+            } else |err| if (err != error.NotFound) return err;
+            try io.sleep(.fromMilliseconds(5), .awake);
+        }
+        try std.testing.expect(completed);
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolver_catalog_mod.reresolve_resume_key));
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolver_catalog_mod.reresolve_repair_resume_key));
+    }
+}
+
+test "db managed resolver changes fence in-flight replay and reset durable cursors" {
+    for ([_]bool{ false, true }) |follower| {
+        const alloc = std.testing.allocator;
+
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
+        defer cleanupTempDir(path);
+
+        var sink = FakePromotionSink{ .alloc = alloc };
+        defer sink.deinit();
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_resolver_workers = false, .entity_sink = sink.sink() });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json =
+            \\{
+            \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+            \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
+            \\}
+            ,
+        });
+
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:a",
+                .value =
+                \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+                ,
+            }},
+            .sync_level = .enrichments,
+        });
+        try db.runUntilIdle();
+
+        const cfg: index_manager_mod.ResolverConfig = .{
+            .name = "kg_background",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "resolution_background_v1",
+            .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+            .config_generation = 1,
+        };
+        _ = try db.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false });
+        // Leave generation-one decisions queued for promotion across DDL.
+        try db.resolution_runtime.?.catchUp();
+        try std.testing.expectEqual(@as(usize, 0), sink.count());
+        var replacement = cfg;
+        replacement.config_generation = 2;
+        for ([_]*std.atomic.Mutex{ &db.resolution_runtime.?.catch_up_mutex, &db.promotion_runtime.?.catch_up_mutex }) |mutex| {
+            try std.testing.expect(mutex.tryLock());
+            defer mutex.unlock();
+            try std.testing.expectError(error.WriterLocked, db.upsertResolverWithResultOptions(replacement, .{ .drain_backfill = false }));
+            try std.testing.expectError(error.WriterLocked, db.removeResolverWithoutDrain(cfg.name));
+            var saved = (try db.resolverConfigByNameAlloc(cfg.name)).?;
+            defer saved.deinit(alloc);
+            try std.testing.expectEqual(@as(u64, 1), saved.config_generation);
+        }
+        {
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(resolver_catalog_mod.reresolve_resume_key, "past-doc-a");
+            try txn.put(resolver_catalog_mod.reresolve_repair_resume_key, "past-doc-a");
+            try txn.commit();
+        }
+        _ = try db.upsertResolverWithResultOptions(replacement, .{ .drain_backfill = false });
+        for ([_][]const u8{ resolver_catalog_mod.reresolve_resume_key, resolver_catalog_mod.reresolve_repair_resume_key }) |key| {
+            const cursor = try db.core.store.get(alloc, key);
+            defer alloc.free(cursor);
+            try std.testing.expectEqualStrings("", cursor);
+        }
+        try db.promotion_runtime.?.catchUp();
+        try std.testing.expectEqual(@as(usize, 0), sink.count());
+        try db.runUntilIdle();
+        try std.testing.expectEqual(@as(usize, 1), sink.count());
+        const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", cfg.resolution_artifact);
+        defer alloc.free(resolution_key);
+        const raw = try db.core.store.get(alloc, resolution_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":2") != null);
+        const FollowerOwner = struct {
+            fn isLocal(_: *anyopaque) bool {
+                return false;
+            }
+        };
+        if (follower) db.setPromotionOwner(.{ .ptr = undefined, .vtable = &.{ .is_local_owner = FollowerOwner.isLocal } });
+        // Retirement is durable replay work; keep the catalog until it finishes.
+        try std.testing.expectError(error.WriterLocked, db.removeResolverWithoutDrain(cfg.name));
+        try db.runUntilIdle();
+        try std.testing.expect(try db.removeResolverWithoutDrain(cfg.name));
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+    }
 }
 
 test "db re-resolves existing corpus when upsertResolver inserts a new resolver" {
