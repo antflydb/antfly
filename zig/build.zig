@@ -4486,6 +4486,9 @@ pub fn build(b: *std.Build) void {
     const api_http_runtime_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
         .filters = api_http_runtime_filters,
+        // The linked API/DB harness reached 13.65 GB in native macOS
+        // ReleaseFast codegen. Account for it before overlapping other roots.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,

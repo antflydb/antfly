@@ -9,21 +9,22 @@ Selected preparation retains authenticated semantic digests instead of hashing
 the selected graph again. Each cold sample uses a fresh verifier, not a cold OS
 page cache. Local filesystem timings are not cloud request-latency measurements.
 
-Apple M4 Max / Zig 0.16.0 ReleaseFast, shared host, six samples with the first
-discarded. Each reference prepares the same current-wire artifact and checks
+Apple M4 Max / Zig 0.16.0 ReleaseFast, shared host, after merging main
+`9f192f9be`; six samples with the first discarded. Each reference prepares the same current-wire artifact and checks
 the same selected semantic identity. Preparation excludes the numerical kernel.
 
 | Phase | Reference | Current | Tracked peak / reads |
 | --- | ---: | ---: | --- |
-| Stateful committed insert + delete | 2,150.950 ms | 1,198.386 ms | Endpoint counter reads 262,144 → 2,048 |
-| Serverless narrow, warm identity | 14.384 ms | 0.115 ms | Peak 16,140,777 → 99,141 B; reads 11,780,488 → 115,080 B |
-| Serverless narrow, cold identity | 14.511 ms | 0.115 ms | Same peak and reads as warm |
-| Serverless all types, warm identity | 14.611 ms | 2.884 ms | Peak 16,140,777 → 5,854,947 B; reads 11,780,488 → 3,434,931 B |
-| Serverless all types, cold identity | 14.316 ms | 3.164 ms | Same peak and reads as warm |
+| Stateful committed insert + delete | 1,719.468 ms | 980.983 ms | Endpoint counter reads 262,144 → 2,048 |
+| Serverless narrow, warm identity | 12.781 ms | 0.107 ms | Peak 16,140,777 → 99,141 B; reads 11,780,488 → 115,080 B |
+| Serverless narrow, cold identity | 12.759 ms | 0.105 ms | Same peak and reads as warm |
+| Serverless all types, warm identity | 12.437 ms | 2.710 ms | Peak 16,140,777 → 5,854,947 B; reads 11,780,488 → 3,434,931 B |
+| Serverless all types, cold identity | 12.625 ms | 2.480 ms | Same peak and reads as warm |
 
-A second complete run confirmed the counted bytes and allocation peaks.
-Committed cycles measured 2,158.953 → 1,185.736 ms; cold narrow preparation
-measured 14.483 → 0.133 ms; cold all-types preparation measured 14.423 → 2.911 ms.
+Two pre-merge runs had identical counted bytes and allocation peaks. Committed
+cycles measured 2,150.950 → 1,198.386 ms and 2,158.953 → 1,185.736 ms; cold narrow
+preparation measured 14.511 → 0.115 ms and 14.483 → 0.133 ms. All three complete
+runs checked semantic/encoded parity across all 24 benchmark records.
 
 Compared with the historical v5 run below, warm narrow reads rise from 19,677
 to 115,080 bytes because of block alignment; cold narrow reads fall from
