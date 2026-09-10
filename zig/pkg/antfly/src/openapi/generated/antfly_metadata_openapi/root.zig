@@ -39,6 +39,7 @@ pub const BatchResponse = types.BatchResponse;
 pub const ByteRange = types.ByteRange;
 pub const CalendarInterval = types.CalendarInterval;
 pub const CardinalityMode = types.CardinalityMode;
+pub const CatalogTableTarget = types.CatalogTableTarget;
 pub const CatalogTablespaceBindingRequest = types.CatalogTablespaceBindingRequest;
 pub const CdcConnection = types.CdcConnection;
 pub const ClusterBackupRequest = types.ClusterBackupRequest;

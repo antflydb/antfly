@@ -35,8 +35,8 @@ pub const Route = struct {
     }
 };
 
-/// Caller owns decoded components in its request arena. Catalog names cannot
-/// contain escaped delimiters, so every transport has one authorization target.
+/// Decode each component once. Escaped delimiters in literal table names
+/// remain part of that component and cannot change the selected scope.
 pub fn parseAlloc(alloc: std.mem.Allocator, path: []const u8) !?Route {
     var parts = std.mem.splitScalar(u8, std.mem.trimStart(u8, path, "/"), '/');
     const first = parts.next() orelse return null;
@@ -58,7 +58,7 @@ pub fn parseAlloc(alloc: std.mem.Allocator, path: []const u8) !?Route {
     const third = parts.next() orelse return .{ .kind = .namespace, .name = ns, .database = db, .namespace = ns };
     if (!std.mem.eql(u8, third, "tables")) return .{ .kind = .namespace, .name = ns, .database = db, .namespace = ns, .suffix = ns_suffix };
     const table_raw = parts.next() orelse return .{ .kind = .table, .database = db, .namespace = ns };
-    return .{ .kind = .table, .name = try nameAlloc(alloc, table_raw), .database = db, .namespace = ns, .suffix = parts.rest() };
+    return .{ .kind = .table, .name = try tableNameAlloc(alloc, table_raw), .database = db, .namespace = ns, .suffix = parts.rest() };
 }
 
 fn nameAlloc(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
@@ -68,28 +68,40 @@ fn nameAlloc(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
     return value;
 }
 
+fn tableNameAlloc(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const value = try helpers.decodePercentEncodedPathComponentAlloc(alloc, raw);
+    errdefer alloc.free(value);
+    domain.validateTableName(value) catch return error.InvalidArgument;
+    return value;
+}
+
 pub fn resourceNameAlloc(alloc: std.mem.Allocator, route: Route) ![]u8 {
     const name = route.name orelse "*";
     return switch (route.kind) {
         .database, .tablespace => alloc.dupe(u8, name),
         .namespace => std.fmt.allocPrint(alloc, "{s}.{s}", .{ route.database, name }),
-        .table => std.fmt.allocPrint(alloc, "{s}.{s}.{s}", .{ route.database, route.namespace, name }),
+        .table => (domain.TableScope{ .database = route.database, .namespace = route.namespace, .table = route.name }).keyAlloc(alloc),
     };
 }
 
 pub const tableResourceMatches = domain.tableResourceMatches;
 
-test "native catalog routes decode each scope once and reject escaped delimiters" {
+test "system catalog routes decode each scope once and retain literal delimiters" {
     const alloc = std.testing.allocator;
     const route = (try parseAlloc(alloc, "/databases/namespaces/namespaces/serving/tables/ev%65nts/query")).?;
     defer route.deinit(alloc);
     try std.testing.expectEqualStrings("namespaces", route.database);
     try std.testing.expectEqualStrings("events", route.name.?);
     try std.testing.expectEqualStrings("query", route.suffix);
-    try std.testing.expectError(error.InvalidArgument, parseAlloc(alloc, "/databases/db/namespaces/ns/tables/a%2Fb"));
-    try std.testing.expect(tableResourceMatches("events", "default.public.events"));
-    try std.testing.expect(tableResourceMatches("db.ns.*", "db.ns.events"));
-    try std.testing.expect(!tableResourceMatches("events", "db.ns.events"));
-    try std.testing.expect(!tableResourceMatches("db.ns.*", "db.nsevil.events"));
-    try std.testing.expect(!tableResourceMatches("default.public.*", "table:private"));
+    const literal = (try parseAlloc(alloc, "/databases/db/namespaces/ns/tables/a%2Fb")).?;
+    defer literal.deinit(alloc);
+    try std.testing.expectEqualStrings("a/b", literal.name.?);
+    try std.testing.expectError(error.InvalidArgument, parseAlloc(alloc, "/databases/db%2Fx/namespaces/ns/tables/a"));
+    const key = try (try literal.target()).resourceNameAlloc(alloc);
+    defer alloc.free(key);
+    const scope = try (domain.TableScope{ .database = "db", .namespace = "ns" }).keyAlloc(alloc);
+    defer alloc.free(scope);
+    try std.testing.expect(tableResourceMatches(scope, key));
+    try std.testing.expect(!tableResourceMatches("db.ns.*", key));
+    try std.testing.expect(!tableResourceMatches("a/b", key));
 }

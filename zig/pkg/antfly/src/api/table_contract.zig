@@ -108,7 +108,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     errdefer req.deinit(alloc);
 
     if (parsed.value.tablespace_name) |name| {
-        try @import("../catalog/domain.zig").validateName(name);
+        try @import("../system_catalog/domain.zig").validateName(name);
         req.tablespace_name = try alloc.dupe(u8, name);
     }
     if (parsed.value.num_shards) |num_shards| {

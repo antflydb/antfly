@@ -2272,18 +2272,20 @@ pub fn build(b: *std.Build) void {
         antfly_imports.configure(b, test_mod.*, true, true);
     }
 
-    const native_catalog_tests = b.addTest(.{
+    const system_catalog_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
-        .filters = &.{ "native catalog", "catalog rename", "catalog names" },
+        .filters = &.{ "system catalog", "catalog rename", "catalog names", "metadata raft apply store projects backup restore bootstrap source in placement intents" },
     });
-    const native_catalog_api_tests = b.addTest(.{
+    const system_catalog_api_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
-        .filters = &.{"native catalog"},
+        .filters = &.{"system catalog"},
     });
-    const native_catalog_api_step = b.step("native-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
-    native_catalog_api_step.dependOn(&b.addRunArtifact(native_catalog_api_tests).step);
-    const native_catalog_test_step = b.step("native-catalog-test", "Run native catalog durability, identity, and routing tests");
-    native_catalog_test_step.dependOn(&b.addRunArtifact(native_catalog_tests).step);
+    const system_catalog_api_step = b.step("antfly-system-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
+    system_catalog_api_step.dependOn(&b.addRunArtifact(system_catalog_api_tests).step);
+    const system_catalog_test_step = b.step("antfly-system-catalog-test", "Run system catalog durability, identity, and routing tests");
+    system_catalog_test_step.dependOn(&b.addRunArtifact(system_catalog_tests).step);
+    const system_catalog_transport_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{"system catalog"} });
+    system_catalog_test_step.dependOn(&b.addRunArtifact(system_catalog_transport_tests).step);
 
     const metadata_unit_test_root_paths = [_][]const u8{
         "pkg/antfly/src/metadata_unit_lane_a_test_root.zig",
@@ -4368,7 +4370,7 @@ pub fn build(b: *std.Build) void {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
-        "native catalog",
+        "system catalog",
         "model-directed",
         "tool query builder",
         "agent conversation",
@@ -9530,17 +9532,17 @@ pub fn build(b: *std.Build) void {
     usermgr_storage_standalone_runtime_test_mod.addImport("antfly_root", standalone_runtime_test_mod);
     usermgr_storage_standalone_runtime_test_mod.addImport("antfly_platform", platform_mod);
     standalone_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_standalone_runtime_test_mod);
-    const native_catalog_standalone_tests = b.addTest(.{
+    const system_catalog_standalone_tests = b.addTest(.{
         .root_module = standalone_runtime_test_mod,
-        .filters = &.{"native catalog"},
+        .filters = &.{"system catalog"},
     });
-    const native_catalog_standalone_step = b.step("native-catalog-standalone-test", "Run standalone catalog checkpoint and rollback tests");
-    native_catalog_standalone_step.dependOn(&b.addRunArtifact(native_catalog_standalone_tests).step);
+    const system_catalog_standalone_step = b.step("antfly-system-catalog-standalone-test", "Run standalone catalog checkpoint and rollback tests");
+    system_catalog_standalone_step.dependOn(&b.addRunArtifact(system_catalog_standalone_tests).step);
     const lib_standalone_runtime_tests = b.addTest(.{
         .root_module = standalone_runtime_test_mod,
         .filters = &.{
             "standalone runtime module compiles",
-            "standalone.runtime.test.native catalog",
+            "standalone.runtime.test.system catalog",
             "catalog.domain.",
             "standalone runtime local generator accepts media url data uris",
             "local generate message conversion preserves tool history and admission",

@@ -503,7 +503,8 @@ def test_standalone_auth_api_keys_follow_owner_permissions(auth_api: AuthApi):
     assert write_resp.status_code == 403
 
     tables_resp = auth_api.s.get(f"{auth_api.url}/tables", timeout=30)
-    assert tables_resp.status_code == 403
+    assert tables_resp.status_code == 200
+    assert [table["name"] for table in tables_resp.json()] == ["docs"]
 
     auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
     escalated = auth_api.s.post(
@@ -666,7 +667,8 @@ def test_stateful_auth_enforces_table_permissions(stateful_auth_api: AuthApi):
     assert write_resp.status_code == 403
 
     tables_resp = stateful_auth_api.request_raw("GET", "/tables", timeout=30)
-    assert tables_resp.status_code == 403
+    assert tables_resp.status_code == 200
+    assert [table["name"] for table in tables_resp.json()] == ["docs"]
 
     admin_resp = stateful_auth_api.request_raw("GET", "/auth/v1/users", timeout=30)
     assert admin_resp.status_code == 403
@@ -742,7 +744,7 @@ def test_stateful_auth_enforces_row_filters_on_lookup_and_scan(
 
 
 @pytest.mark.parametrize("fixture_name", ["auth_api", "stateful_auth_api"])
-def test_native_catalog_scoped_permissions_and_row_filters(request, fixture_name):
+def test_system_catalog_scoped_permissions_and_row_filters(request, fixture_name):
     api = request.getfixturevalue(fixture_name)
     api.s.headers["Authorization"] = _basic_auth("admin", "admin")
     api.post("/databases/tenant", {})
@@ -763,7 +765,11 @@ def test_native_catalog_scoped_permissions_and_row_filters(request, fixture_name
             "password": "reader",
             "initial_policies": [
                 {
-                    "resource": "tenant.allowed.events",
+                    "table_target": {
+                        "database": "tenant",
+                        "namespace": "allowed",
+                        "table": "events",
+                    },
                     "resource_type": "table",
                     "type": "read",
                 }
@@ -771,14 +777,11 @@ def test_native_catalog_scoped_permissions_and_row_filters(request, fixture_name
         },
     )
     api.put(
-        "/auth/v1/users/reader/row-filters/tenant.allowed.events",
+        "/auth/v1/users/reader/row-filters/events?database=tenant&namespace=allowed",
         {"term": {"tier": "gold"}},
     )
     api.s.headers["Authorization"] = _basic_auth("reader", "reader")
-    for path in (
-        "/tables/tenant.allowed.events",
-        "/databases/tenant/namespaces/allowed/tables/events",
-    ):
+    for path in ("/databases/tenant/namespaces/allowed/tables/events",):
         assert api.get(path + "/documents/gold") == {"tier": "gold"}
         hidden = api.s.get(api.url + path + "/documents/silver", timeout=30)
         assert hidden.status_code == 404, hidden.text
@@ -789,18 +792,39 @@ def test_native_catalog_scoped_permissions_and_row_filters(request, fixture_name
         assert response["table"] == "tenant.allowed.events"
         assert response["hits"]["total"]["value"] == 1
         assert [hit["_id"] for hit in response["hits"]["hits"]] == ["gold"]
+        joined = api.post(
+            path + "/query",
+            {
+                "full_text_search": {"match_all": {}},
+                "join": {
+                    "right_target": {
+                        "database": "tenant",
+                        "namespace": "allowed",
+                        "table": "events",
+                    },
+                    "on": {"left_field": "tier", "right_field": "tier"},
+                    "right_fields": ["tier"],
+                },
+                "limit": 10,
+            },
+        )["responses"][0]
+        assert len(joined["hits"]["hits"]) == 1, joined
+        assert (
+            joined["hits"]["hits"][0]["_source"]["tenant.allowed.events.tier"] == "gold"
+        )
         forbidden = api.s.post(
             api.url + path + "/batch", json={"inserts": {"bad": {}}}, timeout=30
         )
         assert forbidden.status_code == 403, forbidden.text
-    for path in (
-        "/tables/tenant.secret.events",
-        "/databases/tenant/namespaces/secret/tables/events",
-    ):
+    for path in ("/databases/tenant/namespaces/secret/tables/events",):
         forbidden = api.s.get(api.url + path + "/documents/gold", timeout=30)
         assert forbidden.status_code == 403, forbidden.text
     line = {
-        "table": "tenant.allowed.events",
+        "table_target": {
+            "database": "tenant",
+            "namespace": "allowed",
+            "table": "events",
+        },
         "full_text_search": {"match_all": {}},
         "limit": 10,
     }
@@ -817,24 +841,84 @@ def test_native_catalog_scoped_permissions_and_row_filters(request, fixture_name
         api.url + "/query",
         data=json.dumps(line)
         + "\n"
-        + json.dumps({**line, "table": "tenant.secret.events"})
+        + json.dumps(
+            {
+                **line,
+                "table_target": {
+                    "database": "tenant",
+                    "namespace": "secret",
+                    "table": "events",
+                },
+            }
+        )
         + "\n",
         headers={"Content-Type": "application/x-ndjson"},
         timeout=30,
     )
     assert denied.status_code == 403, denied.text
     api.s.headers["Authorization"] = _basic_auth("admin", "admin")
-    original = api.get("/tables/tenant.allowed.events")["table_id"]
+    original = api.get("/databases/tenant/namespaces/allowed/tables/events")["table_id"]
     api.post("/databases/tenant/namespaces/allowed/rename", {"name": "moved"})
-    assert api.get("/tables/tenant.moved.events")["table_id"] == original
-    missing = api.s.get(api.url + "/tables/tenant.allowed.events", timeout=30)
+    assert (
+        api.get("/databases/tenant/namespaces/moved/tables/events")["table_id"]
+        == original
+    )
+    missing = api.s.get(
+        api.url + "/databases/tenant/namespaces/allowed/tables/events", timeout=30
+    )
     assert missing.status_code == 404, missing.text
     api.s.headers["Authorization"] = _basic_auth("reader", "reader")
     denied = api.s.get(
-        api.url + "/tables/tenant.moved.events/documents/gold", timeout=30
+        api.url + "/databases/tenant/namespaces/moved/tables/events/documents/gold",
+        timeout=30,
     )
     assert denied.status_code == 403, denied.text
     api.s.headers["Authorization"] = _basic_auth("admin", "admin")
-    api.delete("/tables/tenant.moved.events")
-    api.delete("/tables/tenant.secret.events")
+    api.delete("/databases/tenant/namespaces/moved/tables/events")
+    api.delete("/databases/tenant/namespaces/secret/tables/events")
     api.delete("/databases/tenant")
+
+
+def test_system_catalog_exact_star_grant_is_not_global(auth_api):
+    api = auth_api
+    api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    for name in ("%2A", "other"):
+        api.post("/tables/" + name, {"num_shards": 1})
+        api.post(
+            "/tables/" + name + "/batch",
+            {
+                "inserts": {"gold": {"tier": "gold"}, "silver": {"tier": "silver"}},
+                "sync_level": "full_index",
+            },
+        )
+    api.post(
+        "/auth/v1/users/star_reader",
+        {
+            "password": "reader",
+            "initial_policies": [
+                {
+                    "resource_type": "table",
+                    "table_target": {"table": "*"},
+                    "type": "read",
+                }
+            ],
+        },
+    )
+    api.put(
+        "/auth/v1/users/star_reader/row-filters/%2A?database=default&namespace=public",
+        {"term": {"tier": "gold"}},
+    )
+    api.s.headers["Authorization"] = _basic_auth("star_reader", "reader")
+    assert api.get("/tables/%2A/documents/gold") == {"tier": "gold"}
+    assert (
+        api.s.get(api.url + "/tables/%2A/documents/silver", timeout=30).status_code
+        == 404
+    )
+    assert (
+        api.s.get(api.url + "/tables/other/documents/gold", timeout=30).status_code
+        == 403
+    )
+    assert [table["name"] for table in api.get("/tables")] == ["*"]
+    api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    api.delete("/tables/%2A")
+    api.delete("/tables/other")

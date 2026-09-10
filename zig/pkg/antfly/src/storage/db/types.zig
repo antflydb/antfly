@@ -1446,6 +1446,8 @@ pub const GraphQueryTransport = struct {
 };
 
 pub const SearchRequest = struct {
+    /// Borrowed coordinator label; routing and storage continue using immutable identities.
+    response_table_name: ?[]const u8 = null,
     query: Query = .{ .match_all = {} },
     index_name: ?[]const u8 = null,
     primary_text_index_name: ?[]const u8 = null,
@@ -1574,6 +1576,7 @@ const hierarchy_children_validated_fields = [_][]const u8{
 };
 
 const hierarchy_children_supported_internal_fields = [_][]const u8{
+    "response_table_name",
     "filter_query_json",
     "exclusion_query_json",
     "authorization_filter_query_json",

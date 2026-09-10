@@ -934,12 +934,14 @@ def test_concurrent_insert_delete_publications_match_search_results(stateful_api
         table, inserts={key: document() for key in expected}, sync_level="write"
     )
     incarnations = {}
+    last_details = {}
 
     def exact_publication():
         statuses = {}
         for name in (dense, text):
             before = time.monotonic()
             detail = stateful_api.get_index(table, name)
+            last_details[name] = detail
             assert time.monotonic() - before < 5.0, detail
             status = ready_index_status(
                 detail, until="complete", require_query_fresh=True
@@ -955,7 +957,7 @@ def test_concurrent_insert_delete_publications_match_search_results(stateful_api
         return statuses
 
     initial = wait_until(exact_publication, timeout_s=30, interval_s=0.05)
-    assert initial is not None
+    assert initial is not None, {"indexes": last_details, "logs": stateful_api.debug_logs()}
     incarnations = {name: status["incarnation"] for name, status in initial.items()}
     for iteration in range(3):
         deleted = sorted(expected)[:3]

@@ -32,6 +32,7 @@ from conftest import (
     _metadata_command,
     _read_log_tail,
     antfly_public_api_url,
+    annotate_metadata_table_names,
     maybe_preserve_tempdir,
     wait_for_server,
 )
@@ -213,7 +214,11 @@ class SplitStatusCluster:
         )
         response.raise_for_status()
         payload = response.json()
-        return payload if isinstance(payload, dict) else {}
+        return (
+            annotate_metadata_table_names(payload, [self.data_api_url])
+            if isinstance(payload, dict)
+            else {}
+        )
 
     def stop(self) -> None:
         self.port_reservations.close()
@@ -268,11 +273,19 @@ def _runtime_status_reports(
     snapshot: dict[str, Any], table_name: str
 ) -> list[dict[str, Any]]:
     reports: list[dict[str, Any]] = []
+    physical_name = next(
+        (
+            table["name"]
+            for table in snapshot.get("tables", [])
+            if table.get("logical_name", table["name"]) == table_name
+        ),
+        table_name,
+    )
     for store in snapshot.get("stores", []):
         if not isinstance(store, dict):
             continue
         for report in store.get("runtime_statuses", []):
-            if isinstance(report, dict) and report.get("table_name") == table_name:
+            if isinstance(report, dict) and report.get("table_name") == physical_name:
                 reports.append(report)
     return reports
 

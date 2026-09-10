@@ -12,7 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Native catalog contracts. Logical names are mutable; physical table routing
+//! System catalog contracts. Logical names are mutable; physical table routing
 //! names and IDs are immutable. No SQL, HTTP, storage engine, or control loop
 //! dependencies belong here.
 const std = @import("std");
@@ -76,31 +76,94 @@ pub const Resource = struct {
 pub const default_database: Resource = .{ .kind = .database, .id = default_database_id, .name = default_database_name };
 pub const default_namespace: Resource = .{ .kind = .namespace, .id = default_namespace_id, .parent_id = default_database_id, .name = default_namespace_name };
 
+/// Public targets are objects. Internal policy keys are length-framed and
+/// start with NUL, which is forbidden in legacy literal table names. They are
+/// never accepted through a public string field or returned as display names.
+pub const target_key_prefix = "\x00catalog:";
 pub const Target = struct {
     database: []const u8 = default_database_name,
     namespace: []const u8 = default_namespace_name,
     table: []const u8,
 
+    pub fn literal(name: []const u8) !@This() {
+        const target: @This() = .{ .table = name };
+        try target.validate();
+        return target;
+    }
+
+    /// Internal adapters may receive a policy key; every other string is a
+    /// literal name in default.public. Qualification is never guessed.
     pub fn parse(name: []const u8) !@This() {
-        var parts = std.mem.splitScalar(u8, name, '.');
-        const first = parts.next() orelse return error.InvalidCatalogName;
-        const second = parts.next();
-        const third = parts.next();
-        if (parts.next() != null) return error.InvalidCatalogName;
-        const result: @This() = if (third) |table| .{ .database = first, .namespace = second.?, .table = table } else if (second) |table| .{ .namespace = first, .table = table } else .{ .table = first };
-        try result.validate();
-        return result;
+        if (!std.mem.startsWith(u8, name, target_key_prefix)) return literal(name);
+        const scope = try TableScope.fromKey(name);
+        const target: @This() = .{ .database = scope.database, .namespace = scope.namespace, .table = scope.table orelse return error.InvalidCatalogName };
+        try target.validate();
+        return target;
     }
 
     pub fn validate(self: @This()) !void {
         try validateName(self.database);
         try validateName(self.namespace);
-        try validateName(self.table);
+        try validateTableName(self.table);
     }
 
     pub fn resourceNameAlloc(self: @This(), alloc: std.mem.Allocator) ![]u8 {
         try self.validate();
+        return (TableScope{ .database = self.database, .namespace = self.namespace, .table = self.table }).keyAlloc(alloc);
+    }
+
+    pub fn displayNameAlloc(self: @This(), alloc: std.mem.Allocator) ![]u8 {
+        try self.validate();
+        if (self.isDefault()) return alloc.dupe(u8, self.table);
         return std.fmt.allocPrint(alloc, "{s}.{s}.{s}", .{ self.database, self.namespace, self.table });
+    }
+
+    pub fn isDefault(self: @This()) bool {
+        return std.mem.eql(u8, self.database, default_database_name) and std.mem.eql(u8, self.namespace, default_namespace_name);
+    }
+};
+
+/// A missing table selects the namespace; a literal "*" selects a table named
+/// "*". This distinction survives policy persistence and API round trips.
+pub const TableScope = struct {
+    database: []const u8 = default_database_name,
+    namespace: []const u8 = default_namespace_name,
+    table: ?[]const u8 = null,
+
+    pub fn keyAlloc(self: @This(), alloc: std.mem.Allocator) ![]u8 {
+        try validateName(self.database);
+        try validateName(self.namespace);
+        if (self.table) |table| {
+            try validateTableName(table);
+            return std.fmt.allocPrint(alloc, target_key_prefix ++ "{d}:{s}{d}:{s}{d}:{s}", .{ self.database.len, self.database, self.namespace.len, self.namespace, table.len, table });
+        }
+        return std.fmt.allocPrint(alloc, target_key_prefix ++ "{d}:{s}{d}:{s}*", .{ self.database.len, self.database, self.namespace.len, self.namespace });
+    }
+
+    pub fn fromKey(key: []const u8) !@This() {
+        if (!std.mem.startsWith(u8, key, target_key_prefix)) return error.InvalidCatalogName;
+        var rest = key[target_key_prefix.len..];
+        const database = try takeComponent(&rest);
+        const namespace = try takeComponent(&rest);
+        const table: ?[]const u8 = if (std.mem.eql(u8, rest, "*")) blk: {
+            rest = "";
+            break :blk null;
+        } else try takeComponent(&rest);
+        if (rest.len != 0) return error.InvalidCatalogName;
+        try validateName(database);
+        try validateName(namespace);
+        if (table) |name| try validateTableName(name);
+        return .{ .database = database, .namespace = namespace, .table = table };
+    }
+
+    fn takeComponent(rest: *[]const u8) ![]const u8 {
+        const colon = std.mem.indexOfScalar(u8, rest.*, ':') orelse return error.InvalidCatalogName;
+        const length = std.fmt.parseInt(usize, rest.*[0..colon], 10) catch return error.InvalidCatalogName;
+        const start = colon + 1;
+        if (length > rest.len - start) return error.InvalidCatalogName;
+        const value = rest.*[start..][0..length];
+        rest.* = rest.*[start + length ..];
+        return value;
     }
 };
 
@@ -172,10 +235,10 @@ pub const Delta = struct {
 pub const PhysicalTable = struct { id: u64, name: []const u8 };
 
 pub fn plan(alloc: std.mem.Allocator, state: State, request: Mutation, tables: []const PhysicalTable) !Delta {
-    try validateName(request.name);
+    try validateResourceName(request.kind, request.name);
     try validateName(request.database);
     try validateName(request.namespace);
-    if (request.new_name) |name| try validateName(name);
+    if (request.new_name) |name| try validateResourceName(request.kind, name);
     if (request.tablespace) |name| try validateName(name);
     try request.placement_policy.validate();
     if (request.location_json.len > 64 * 1024) return error.InvalidTablespaceLocation;
@@ -322,9 +385,25 @@ pub const Request = struct {
     physical_name: ?[]const u8 = null,
 };
 
+pub const ResolveMany = struct {
+    targets: []const Target,
+    expected_revision: ?u64 = null,
+};
+
+pub const ResolvedMany = struct {
+    revision: u64,
+    tables: []const ?ResolvedTable,
+
+    pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        for (self.tables) |table| if (table) |value| value.deinit(alloc);
+        alloc.free(self.tables);
+    }
+};
+
 pub const Call = union(enum) {
     snapshot: void,
     resolve: Target,
+    resolve_many: ResolveMany,
     mutate: Request,
 };
 
@@ -348,19 +427,61 @@ pub fn validateStorageName(name: []const u8) !void {
     for (name[6..38]) |c| if (!std.ascii.isHex(c)) return error.InvalidCatalogMutation;
     if (name.len == 38) return;
     if (name[38] != ':') return error.InvalidCatalogMutation;
-    _ = try Target.parse(name[39..]);
+    if (!try isRestoreTarget(name)) return error.InvalidCatalogMutation;
 }
 
 /// Restore jobs persist their immutable destination identity. The qualified
 /// suffix carries admission intent until table topology and the binding commit
 /// together; normal reads always use the durable catalog indexes.
-pub fn restoreTarget(physical_name: []const u8) !?Target {
-    if (!std.mem.startsWith(u8, physical_name, "table:")) return null;
-    const suffix = std.mem.indexOfScalarPos(u8, physical_name, 6, ':') orelse return null;
-    return try Target.parse(physical_name[suffix + 1 ..]);
+pub const OwnedRestoreTarget = struct {
+    buffer: []u8,
+    value: Target,
+    pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.buffer);
+    }
+};
+
+pub fn restoreStorageNameAlloc(alloc: std.mem.Allocator, physical: []const u8, target: Target) ![]u8 {
+    const key = try target.resourceNameAlloc(alloc);
+    defer alloc.free(key);
+    const codec = std.base64.url_safe_no_pad.Encoder;
+    const out = try alloc.alloc(u8, physical.len + 1 + codec.calcSize(key.len));
+    @memcpy(out[0..physical.len], physical);
+    out[physical.len] = ':';
+    _ = codec.encode(out[physical.len + 1 ..], key);
+    return out;
 }
 
-test "native catalog legacy identity can bind and rename without moving storage" {
+fn restoreTargetInto(buffer: []u8, physical_name: []const u8) !?Target {
+    if (!std.mem.startsWith(u8, physical_name, "table:") or physical_name.len <= 38) return null;
+    if (physical_name[38] != ':') return error.InvalidCatalogName;
+    for (physical_name[6..38]) |c| if (!std.ascii.isHex(c)) return error.InvalidCatalogName;
+    const encoded = physical_name[39..];
+    const codec = std.base64.url_safe_no_pad.Decoder;
+    const size = codec.calcSizeForSlice(encoded) catch return error.InvalidCatalogName;
+    if (size > buffer.len) return error.InvalidCatalogName;
+    codec.decode(buffer[0..size], encoded) catch return error.InvalidCatalogName;
+    if (!std.mem.startsWith(u8, buffer[0..size], target_key_prefix)) return error.InvalidCatalogName;
+    return try Target.parse(buffer[0..size]);
+}
+
+pub fn isRestoreTarget(physical_name: []const u8) !bool {
+    var buffer: [1024]u8 = undefined;
+    return (try restoreTargetInto(&buffer, physical_name)) != null;
+}
+
+pub fn restoreTarget(alloc: std.mem.Allocator, physical_name: []const u8) !?OwnedRestoreTarget {
+    if (!std.mem.startsWith(u8, physical_name, "table:") or physical_name.len <= 38) return null;
+    const buffer = try alloc.alloc(u8, 1024);
+    errdefer alloc.free(buffer);
+    const value = (try restoreTargetInto(buffer, physical_name)) orelse {
+        alloc.free(buffer);
+        return null;
+    };
+    return .{ .buffer = buffer, .value = value };
+}
+
+test "system catalog legacy identity can bind and rename without moving storage" {
     const alloc = std.testing.allocator;
     const physical = [_]PhysicalTable{.{ .id = 41, .name = "docs" }};
     var renamed = try plan(alloc, .{}, .{ .action = .rename, .kind = .table, .name = "docs", .new_name = "articles" }, &physical);
@@ -371,7 +492,7 @@ test "native catalog legacy identity can bind and rename without moving storage"
     try std.testing.expectError(error.CatalogAlreadyExists, plan(alloc, .{}, .{ .action = .create, .kind = .table, .name = "docs", .table_id = 42, .storage_name = "table:new" }, &physical));
 }
 
-test "native catalog policy precedence and table overrides are explicit" {
+test "system catalog policy precedence and table overrides are explicit" {
     const resources = [_]Resource{
         .{ .kind = .database, .id = 3, .name = "analytics", .tablespace_id = 10 },
         .{ .kind = .namespace, .id = 4, .parent_id = 3, .name = "public", .tablespace_id = 11 },
@@ -387,7 +508,7 @@ test "native catalog policy precedence and table overrides are explicit" {
     try std.testing.expectEqual(@as(u64, 10), (try state.effectiveTablespace(unbound, 0)).?.id);
 }
 
-test "native catalog mutation planning releases allocations on every failure" {
+test "system catalog mutation planning releases allocations on every failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(alloc: std.mem.Allocator) !void {
             var delta = try plan(alloc, .{}, .{ .action = .create, .kind = .database, .name = "analytics" }, &.{});
@@ -423,11 +544,59 @@ pub fn applyDeltaStateAlloc(alloc: std.mem.Allocator, state: State, delta: Delta
 }
 
 pub fn tableResourceMatches(grant: []const u8, target: []const u8) bool {
-    if (std.mem.eql(u8, grant, "*") or std.mem.eql(u8, grant, target)) return true;
+    if (std.mem.eql(u8, grant, "*")) return true;
     const right = Target.parse(target) catch return false;
-    var buf: [512]u8 = undefined;
-    const canonical = std.fmt.bufPrint(&buf, "{s}.{s}.{s}", .{ right.database, right.namespace, right.table }) catch return false;
-    if (std.mem.endsWith(u8, grant, ".*")) return std.mem.startsWith(u8, canonical, grant[0 .. grant.len - 1]);
-    const left = Target.parse(grant) catch return false;
-    return std.mem.eql(u8, left.database, right.database) and std.mem.eql(u8, left.namespace, right.namespace) and std.mem.eql(u8, left.table, right.table);
+    if (std.mem.startsWith(u8, grant, target_key_prefix)) {
+        const scope = TableScope.fromKey(grant) catch return false;
+        return std.mem.eql(u8, scope.database, right.database) and
+            std.mem.eql(u8, scope.namespace, right.namespace) and
+            (scope.table == null or std.mem.eql(u8, scope.table.?, right.table));
+    }
+    return right.isDefault() and std.mem.eql(u8, grant, right.table);
+}
+
+/// Whether every resource in `narrow` is covered by `wide`.
+pub fn tableScopeContains(wide: []const u8, narrow: []const u8) bool {
+    if (std.mem.eql(u8, wide, "*")) return true;
+    if (std.mem.eql(u8, narrow, "*")) return false;
+    if (std.mem.startsWith(u8, narrow, target_key_prefix)) {
+        const scope = TableScope.fromKey(narrow) catch return false;
+        if (scope.table == null) {
+            if (!std.mem.startsWith(u8, wide, target_key_prefix)) return false;
+            const parent = TableScope.fromKey(wide) catch return false;
+            return parent.table == null and std.mem.eql(u8, parent.database, scope.database) and std.mem.eql(u8, parent.namespace, scope.namespace);
+        }
+    }
+    return tableResourceMatches(wide, narrow);
+}
+
+pub fn validateTableName(name: []const u8) !void {
+    if (name.len == 0 or name.len > 255) return error.InvalidCatalogName;
+    for (name) |c| if (c < 0x20 or c == 0x7f) return error.InvalidCatalogName;
+}
+
+pub fn validateResourceName(kind: Kind, name: []const u8) !void {
+    if (kind == .table) return validateTableName(name);
+    return validateName(name);
+}
+
+test "catalog targets preserve literal names and distinguish exact from scoped grants" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "sales.events", "docs table", "path/table", "*", "table:legacy", "1table" }) |name| {
+        const target = try Target.literal(name);
+        const key = try target.resourceNameAlloc(alloc);
+        defer alloc.free(key);
+        try std.testing.expectEqualStrings(name, (try Target.parse(key)).table);
+        try std.testing.expect(tableResourceMatches(name, key));
+    }
+    const scoped = try (Target{ .database = "sales", .table = "events" }).resourceNameAlloc(alloc);
+    defer alloc.free(scoped);
+    try std.testing.expect(!tableResourceMatches("sales.public.events", scoped));
+    const wildcard = try (TableScope{ .database = "sales" }).keyAlloc(alloc);
+    defer alloc.free(wildcard);
+    try std.testing.expect(tableResourceMatches(wildcard, scoped));
+    const literal_star = try (Target{ .database = "sales", .table = "*" }).resourceNameAlloc(alloc);
+    defer alloc.free(literal_star);
+    try std.testing.expect(!tableResourceMatches(literal_star, scoped));
+    try std.testing.expectError(error.InvalidCatalogName, Target.literal(scoped));
 }

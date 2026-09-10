@@ -435,7 +435,7 @@ export class AntflyClient {
     this.client = this.buildClient();
   }
 
-  /** Typed access to every generated endpoint, including native catalog lifecycle routes. */
+  /** Typed access to every generated endpoint, including system catalog lifecycle routes. */
   get api(): Client<paths> {
     return this.client;
   }

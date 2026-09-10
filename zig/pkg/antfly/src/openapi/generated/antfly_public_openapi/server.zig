@@ -32,12 +32,30 @@ pub const GetSubjectRowFilterPathParams = struct {
     table: []const u8,
 };
 
+pub const GetSubjectRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
+};
+
 /// Set row filter for an auth subject on a table
 pub const SetSubjectRowFilterPathParams = struct {
     /// Casbin subject name, such as role:tenant_reader or group:eng.
     subject: []const u8,
     /// Table name (or '*' for all tables).
     table: []const u8,
+};
+
+pub const SetSubjectRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
 };
 
 /// Parse the JSON request body for setSubjectRowFilter.
@@ -51,6 +69,15 @@ pub const RemoveSubjectRowFilterPathParams = struct {
     subject: []const u8,
     /// Table name (or '*' for all tables).
     table: []const u8,
+};
+
+pub const RemoveSubjectRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
 };
 
 /// Get user details
@@ -140,6 +167,9 @@ pub const RemovePermissionFromUserParams = struct {
     resource: []const u8,
     /// The type of the resource for the permission to be removed.
     resource_type: []const u8,
+    database: ?[]const u8 = null,
+    namespace: ?[]const u8 = null,
+    all_tables: ?[]const u8 = null,
 };
 
 /// List user roles
@@ -184,12 +214,30 @@ pub const GetRowFilterPathParams = struct {
     table: []const u8,
 };
 
+pub const GetRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
+};
+
 /// Set row filter for a user on a table
 pub const SetRowFilterPathParams = struct {
     /// The username.
     user_name: []const u8,
     /// Table name (or '*' for all tables).
     table: []const u8,
+};
+
+pub const SetRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
 };
 
 /// Parse the JSON request body for setRowFilter.
@@ -203,6 +251,15 @@ pub const RemoveRowFilterPathParams = struct {
     user_name: []const u8,
     /// Table name (or '*' for all tables).
     table: []const u8,
+};
+
+pub const RemoveRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
 };
 
 /// Parse the JSON request body for backup.
@@ -391,6 +448,8 @@ pub const LookupNamespaceTableDocumentPathParams = struct {
 pub const LookupNamespaceTableDocumentParams = struct {
     /// Comma-separated list of fields to include in the response.
     fields: ?[]const u8 = null,
+    /// Read consistency; defaults to read_index.
+    consistency: ?[]const u8 = null,
 };
 
 /// List indexes for an explicit namespace table
@@ -428,8 +487,8 @@ pub const CreateNamespaceTableIndexPathParams = struct {
 };
 
 /// Parse the JSON request body for createNamespaceTableIndex.
-pub fn parseCreateNamespaceTableIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.IndexConfig) {
-    return std.json.parseFromSlice(antfly_indexes_openapi.IndexConfig, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseCreateNamespaceTableIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.CreateIndexRequest) {
+    return std.json.parseFromSlice(antfly_indexes_openapi.CreateIndexRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Drop an index from an explicit namespace table
@@ -1222,9 +1281,9 @@ pub const routes = [_]Route{
 //   fn getCurrentUser(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listAuthSubjects(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listSubjectRowFilters(self: *Impl, ctx: *httpx.Context, subject: []const u8) !httpx.Response
-//   fn getSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8) !httpx.Response
-//   fn setSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8) !httpx.Response
-//   fn removeSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8) !httpx.Response
+//   fn getSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8, params: GetSubjectRowFilterParams) !httpx.Response
+//   fn setSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8, params: SetSubjectRowFilterParams) !httpx.Response
+//   fn removeSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8, params: RemoveSubjectRowFilterParams) !httpx.Response
 //   fn listUsers(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getUserByName(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
 //   fn createUser(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
@@ -1240,9 +1299,9 @@ pub const routes = [_]Route{
 //   fn addRoleToUser(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
 //   fn removeRoleFromUser(self: *Impl, ctx: *httpx.Context, user_name: []const u8, params: RemoveRoleFromUserParams) !httpx.Response
 //   fn listRowFilters(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
-//   fn getRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8) !httpx.Response
-//   fn setRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8) !httpx.Response
-//   fn removeRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8) !httpx.Response
+//   fn getRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8, params: GetRowFilterParams) !httpx.Response
+//   fn setRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8, params: SetRowFilterParams) !httpx.Response
+//   fn removeRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8, params: RemoveRowFilterParams) !httpx.Response
 //   fn backup(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listBackups(self: *Impl, ctx: *httpx.Context, params: ListBackupsParams) !httpx.Response
 //   fn multiBatchWrite(self: *Impl, ctx: *httpx.Context) !httpx.Response

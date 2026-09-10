@@ -32,16 +32,73 @@ pub fn ApiResponse(comptime T: type) type {
     };
 }
 
+pub const GetSubjectRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
+};
+
+pub const SetSubjectRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
+};
+
+pub const RemoveSubjectRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
+};
+
 pub const RemovePermissionFromUserParams = struct {
     /// The name of the resource for the permission to be removed.
     resource: []const u8,
     /// The type of the resource for the permission to be removed.
     resource_type: []const u8,
+    database: ?[]const u8 = null,
+    namespace: ?[]const u8 = null,
+    all_tables: ?[]const u8 = null,
 };
 
 pub const RemoveRoleFromUserParams = struct {
     /// Role or group subject to remove.
     role: []const u8,
+};
+
+pub const GetRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
+};
+
+pub const SetRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
+};
+
+pub const RemoveRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
 };
 
 pub const ListBackupsParams = struct {
@@ -72,6 +129,8 @@ pub const ListNamespaceTablesParams = struct {
 pub const LookupNamespaceTableDocumentParams = struct {
     /// Comma-separated list of fields to include in the response.
     fields: ?[]const u8 = null,
+    /// Read consistency; defaults to read_index.
+    consistency: ?[]const u8 = null,
 };
 
 pub const ListRestoreJobsParams = struct {
@@ -316,26 +375,90 @@ pub const Client = struct {
 
     /// Get row filter for an auth subject on a table
     /// GET /auth/v1/subjects/{subject}/row-filters/{table}
-    pub fn getSubjectRowFilter(self: *@This(), subject: []const u8, table: []const u8) !ApiResponse(types.RowFilterEntry) {
+    pub fn getSubjectRowFilter(self: *@This(), subject: []const u8, table: []const u8, params: GetSubjectRowFilterParams) !ApiResponse(types.RowFilterEntry) {
         const encoded_subject = try httpx.PercentEncoding.encode(self.allocator, subject);
         defer self.allocator.free(encoded_subject);
         const encoded_table = try httpx.PercentEncoding.encode(self.allocator, table);
         defer self.allocator.free(encoded_table);
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/subjects/{s}/row-filters/{s}", .{ self.base_url, encoded_subject, encoded_table });
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/subjects/{s}/row-filters/{s}", .{ self.base_url, encoded_subject, encoded_table });
         defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.database) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "database=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.namespace) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "namespace=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.all_tables) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "all_tables=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.RowFilterEntry).fromResponse(self.allocator, &resp);
     }
 
     /// Set row filter for an auth subject on a table
     /// PUT /auth/v1/subjects/{subject}/row-filters/{table}
-    pub fn setSubjectRowFilter(self: *@This(), subject: []const u8, table: []const u8, body: std.json.ArrayHashMap(std.json.Value)) !ApiResponse(types.RowFilterEntry) {
+    pub fn setSubjectRowFilter(self: *@This(), subject: []const u8, table: []const u8, body: std.json.ArrayHashMap(std.json.Value), params: SetSubjectRowFilterParams) !ApiResponse(types.RowFilterEntry) {
         const encoded_subject = try httpx.PercentEncoding.encode(self.allocator, subject);
         defer self.allocator.free(encoded_subject);
         const encoded_table = try httpx.PercentEncoding.encode(self.allocator, table);
         defer self.allocator.free(encoded_table);
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/subjects/{s}/row-filters/{s}", .{ self.base_url, encoded_subject, encoded_table });
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/subjects/{s}/row-filters/{s}", .{ self.base_url, encoded_subject, encoded_table });
         defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.database) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "database=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.namespace) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "namespace=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.all_tables) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "all_tables=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.put(url, .{ .json = json_body, .headers = self.authHeaders() });
@@ -344,13 +467,45 @@ pub const Client = struct {
 
     /// Remove row filter for an auth subject on a table
     /// DELETE /auth/v1/subjects/{subject}/row-filters/{table}
-    pub fn removeSubjectRowFilter(self: *@This(), subject: []const u8, table: []const u8) !ApiResponse(std.json.Value) {
+    pub fn removeSubjectRowFilter(self: *@This(), subject: []const u8, table: []const u8, params: RemoveSubjectRowFilterParams) !ApiResponse(std.json.Value) {
         const encoded_subject = try httpx.PercentEncoding.encode(self.allocator, subject);
         defer self.allocator.free(encoded_subject);
         const encoded_table = try httpx.PercentEncoding.encode(self.allocator, table);
         defer self.allocator.free(encoded_table);
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/subjects/{s}/row-filters/{s}", .{ self.base_url, encoded_subject, encoded_table });
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/subjects/{s}/row-filters/{s}", .{ self.base_url, encoded_subject, encoded_table });
         defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.database) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "database=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.namespace) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "namespace=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.all_tables) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "all_tables=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
     }
@@ -495,6 +650,30 @@ pub const Client = struct {
         try query_buf.appendSlice(self.allocator, "resourceType=");
         try query_buf.appendSlice(self.allocator, encoded_query_value_resource_type);
         sep = '&';
+        if (params.database) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "database=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.namespace) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "namespace=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.all_tables) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "all_tables=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
         if (query_buf.items.len > 0) {
             const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
             self.allocator.free(url);
@@ -566,26 +745,90 @@ pub const Client = struct {
 
     /// Get row filter for a user on a table
     /// GET /auth/v1/users/{userName}/row-filters/{table}
-    pub fn getRowFilter(self: *@This(), user_name: []const u8, table: []const u8) !ApiResponse(types.RowFilterEntry) {
+    pub fn getRowFilter(self: *@This(), user_name: []const u8, table: []const u8, params: GetRowFilterParams) !ApiResponse(types.RowFilterEntry) {
         const encoded_user_name = try httpx.PercentEncoding.encode(self.allocator, user_name);
         defer self.allocator.free(encoded_user_name);
         const encoded_table = try httpx.PercentEncoding.encode(self.allocator, table);
         defer self.allocator.free(encoded_table);
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/row-filters/{s}", .{ self.base_url, encoded_user_name, encoded_table });
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/row-filters/{s}", .{ self.base_url, encoded_user_name, encoded_table });
         defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.database) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "database=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.namespace) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "namespace=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.all_tables) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "all_tables=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.RowFilterEntry).fromResponse(self.allocator, &resp);
     }
 
     /// Set row filter for a user on a table
     /// PUT /auth/v1/users/{userName}/row-filters/{table}
-    pub fn setRowFilter(self: *@This(), user_name: []const u8, table: []const u8, body: std.json.ArrayHashMap(std.json.Value)) !ApiResponse(types.RowFilterEntry) {
+    pub fn setRowFilter(self: *@This(), user_name: []const u8, table: []const u8, body: std.json.ArrayHashMap(std.json.Value), params: SetRowFilterParams) !ApiResponse(types.RowFilterEntry) {
         const encoded_user_name = try httpx.PercentEncoding.encode(self.allocator, user_name);
         defer self.allocator.free(encoded_user_name);
         const encoded_table = try httpx.PercentEncoding.encode(self.allocator, table);
         defer self.allocator.free(encoded_table);
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/row-filters/{s}", .{ self.base_url, encoded_user_name, encoded_table });
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/row-filters/{s}", .{ self.base_url, encoded_user_name, encoded_table });
         defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.database) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "database=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.namespace) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "namespace=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.all_tables) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "all_tables=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.put(url, .{ .json = json_body, .headers = self.authHeaders() });
@@ -594,13 +837,45 @@ pub const Client = struct {
 
     /// Remove row filter for a user on a table
     /// DELETE /auth/v1/users/{userName}/row-filters/{table}
-    pub fn removeRowFilter(self: *@This(), user_name: []const u8, table: []const u8) !ApiResponse(std.json.Value) {
+    pub fn removeRowFilter(self: *@This(), user_name: []const u8, table: []const u8, params: RemoveRowFilterParams) !ApiResponse(std.json.Value) {
         const encoded_user_name = try httpx.PercentEncoding.encode(self.allocator, user_name);
         defer self.allocator.free(encoded_user_name);
         const encoded_table = try httpx.PercentEncoding.encode(self.allocator, table);
         defer self.allocator.free(encoded_table);
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/row-filters/{s}", .{ self.base_url, encoded_user_name, encoded_table });
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/row-filters/{s}", .{ self.base_url, encoded_user_name, encoded_table });
         defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.database) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "database=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.namespace) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "namespace=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.all_tables) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "all_tables=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
     }
@@ -989,6 +1264,14 @@ pub const Client = struct {
             try query_buf.appendSlice(self.allocator, encoded_query_value);
             sep = '&';
         }
+        if (params.consistency) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "consistency=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
         if (query_buf.items.len > 0) {
             const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
             self.allocator.free(url);
@@ -1032,7 +1315,7 @@ pub const Client = struct {
 
     /// Add an index to an explicit namespace table
     /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}
-    pub fn createNamespaceTableIndex(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8, body: types.IndexConfig) !ApiResponse(std.json.Value) {
+    pub fn createNamespaceTableIndex(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8, body: types.CreateIndexRequest) !ApiResponse(types.CreatedIndex) {
         const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
         defer self.allocator.free(encoded_database_name);
         const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
@@ -1046,7 +1329,7 @@ pub const Client = struct {
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+        return ApiResponse(types.CreatedIndex).fromResponse(self.allocator, &resp);
     }
 
     /// Drop an index from an explicit namespace table
@@ -1102,7 +1385,7 @@ pub const Client = struct {
 
     /// Restore an explicit namespace table from backup
     /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/restore
-    pub fn restoreNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.RestoreRequest) !ApiResponse(std.json.Value) {
+    pub fn restoreNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.RestoreRequest, idempotency_key: ?[]const u8) !ApiResponse(types.RestoreJob) {
         const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
         defer self.allocator.free(encoded_database_name);
         const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
@@ -1113,8 +1396,12 @@ pub const Client = struct {
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (idempotency_key) |value| try request_headers.append(self.allocator, .{ "Idempotency-Key", value });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.RestoreJob).fromResponse(self.allocator, &resp);
     }
 
     /// Set namespace tablespace

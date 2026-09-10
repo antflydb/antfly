@@ -53,13 +53,13 @@ const query_openapi = @import("antfly_query_openapi");
 const RetrievalAgentResult = metadata_openapi.RetrievalAgentResult;
 const AgentStatus = metadata_openapi.AgentStatus;
 const RetrievalStrategy = metadata_openapi.RetrievalStrategy;
-const native_catalog = @import("../catalog/domain.zig");
+const system_catalog = @import("../system_catalog/domain.zig");
 
-fn resolveTestTable(svc: *metadata_service.MetadataService, name: []const u8) !native_catalog.ResolvedTable {
+fn resolveTestTable(svc: *metadata_service.MetadataService, name: []const u8) !system_catalog.ResolvedTable {
     const alloc = std.testing.allocator;
-    const bytes = try http_server.StatusSource.fromMetadataService(svc).nativeCatalog(alloc, .{}, .{ .resolve = try native_catalog.Target.parse(name) });
+    const bytes = try http_server.StatusSource.fromMetadataService(svc).systemCatalog(alloc, .{}, .{ .resolve = try system_catalog.Target.parse(name) });
     defer alloc.free(bytes);
-    var parsed = try std.json.parseFromSlice(?native_catalog.ResolvedTable, alloc, bytes, .{});
+    var parsed = try std.json.parseFromSlice(?system_catalog.ResolvedTable, alloc, bytes, .{});
     defer parsed.deinit();
     const table = parsed.value orelse return error.TestUnexpectedResult;
     return .{ .table_id = table.table_id, .name = try alloc.dupe(u8, table.name) };
@@ -2897,7 +2897,18 @@ test "public api standalone-like e2e backs up drops and restores a table" {
         "standalone-like-roundtrip-snap",
     );
     try backups_api.validateRestorableManifestLayout(&backup_manifest);
-    try std.testing.expectEqualStrings("docs", backup_manifest.table_name);
+    var catalog_snapshot = try metadata_server.server.svc.adminSnapshot();
+    defer metadata_server.server.svc.freeAdminSnapshot(&catalog_snapshot);
+    var created_status = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.testing.allocator, created.body, .{ .ignore_unknown_fields = true });
+    defer created_status.deinit();
+    const created_id = try std.fmt.parseInt(u64, created_status.value.table_id.?, 10);
+    var found_manifest_identity = false;
+    for (catalog_snapshot.tables) |table| {
+        if (table.table_id != created_id) continue;
+        try std.testing.expectEqualStrings(table.name, backup_manifest.table_name);
+        found_manifest_identity = true;
+    }
+    try std.testing.expect(found_manifest_identity);
 
     const lifecycle_reads_before_drop = data_server.remoteMetadataLifecycleLinearizableReadsForTest();
     _ = try client.dropTable(base_uri, "docs");

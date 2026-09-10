@@ -1614,6 +1614,43 @@ pub const CardinalityMode = enum {
     }
 };
 
+/// An explicit native table target. Components are literal names; dots do not qualify a string table name.
+pub const CatalogTableTarget = struct {
+    database: ?[]const u8 = null,
+    namespace: ?[]const u8 = null,
+    table: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "database", "database", true },
+        .{ "namespace", "namespace", true },
+        .{ "table", "table", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.database) |value| {
+            try jw.objectField("database");
+            try jw.write(value);
+        }
+        if (self.namespace) |value| {
+            try jw.objectField("namespace");
+            try jw.write(value);
+        }
+        try jw.objectField("table");
+        try jw.write(self.table);
+        try jw.endObject();
+    }
+};
+
 pub const CatalogTablespaceBindingRequest = struct {
     /// Existing tablespace name to bind to the catalog object.
     tablespace_name: []const u8,
@@ -4067,7 +4104,8 @@ pub const ForeignSource = struct {
 
 /// A stateful global query. The target table is required on this route.
 pub const GlobalStatefulQueryRequest = struct {
-    /// Name of the table to query. Required for global-query requests.
+    table_target: ?CatalogTableTarget = null,
+    /// Literal table name in default.public. Global queries require exactly one of table or table_target.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
@@ -4138,6 +4176,7 @@ pub const GlobalStatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "table_target", "table_target", true },
         .{ "table", "table", false },
         .{ "query", "query", true },
         .{ "full_text_search", "full_text_search", true },
@@ -4185,6 +4224,10 @@ pub const GlobalStatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.table_target) |value| {
+            try jw.objectField("table_target");
+            try jw.write(value);
+        }
         try jw.objectField("table");
         try jw.write(self.table);
         if (self.query) |value| {
@@ -5203,8 +5246,9 @@ pub const InferenceProviderType = enum {
 
 /// Configuration for joining data from another table. Supports inner, left, and right joins with automatic strategy selection.
 pub const JoinClause = struct {
-    /// Name of the table to join with.
-    right_table: []const u8,
+    right_target: ?CatalogTableTarget = null,
+    /// Literal native table name or declared foreign-source alias. Specify exactly one of right_table or right_target.
+    right_table: ?[]const u8 = null,
     /// Type of join to perform. Defaults to "inner".
     join_type: ?JoinType = null,
     /// Join condition specifying which fields to match.
@@ -5220,7 +5264,8 @@ pub const JoinClause = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "right_table", "right_table", false },
+        .{ "right_target", "right_target", true },
+        .{ "right_table", "right_table", true },
         .{ "join_type", "join_type", true },
         .{ "on", "on", false },
         .{ "right_filters", "right_filters", true },
@@ -5239,8 +5284,14 @@ pub const JoinClause = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        try jw.objectField("right_table");
-        try jw.write(self.right_table);
+        if (self.right_target) |value| {
+            try jw.objectField("right_target");
+            try jw.write(value);
+        }
+        if (self.right_table) |value| {
+            try jw.objectField("right_table");
+            try jw.write(value);
+        }
         if (self.join_type) |value| {
             try jw.objectField("join_type");
             try jw.write(value);
@@ -7243,7 +7294,8 @@ pub const QueryProfile = struct {
 };
 
 pub const QueryRequest = struct {
-    /// Name of the table to query. Required for global-query requests.
+    table_target: ?CatalogTableTarget = null,
+    /// Literal table name in default.public. Global queries require exactly one of table or table_target.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
@@ -7310,6 +7362,7 @@ pub const QueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "table_target", "table_target", true },
         .{ "table", "table", true },
         .{ "query", "query", true },
         .{ "full_text_search", "full_text_search", true },
@@ -7355,6 +7408,10 @@ pub const QueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.table_target) |value| {
+            try jw.objectField("table_target");
+            try jw.write(value);
+        }
         if (self.table) |value| {
             try jw.objectField("table");
             try jw.write(value);
@@ -9185,7 +9242,8 @@ pub const RetrievalAgentUsage = struct {
 
 /// A canonical query in the retrieval pipeline with an optional tree search configuration. Each query specifies its own table. Deprecated stateful graph_searches compatibility is intentionally unavailable here. When both search fields (semantic_search, full_text_search) and tree_search are provided, the search results are used as start nodes for tree navigation.
 pub const RetrievalQueryRequest = struct {
-    /// Name of the table to query. Required for global-query requests.
+    table_target: ?CatalogTableTarget = null,
+    /// Literal table name in default.public. Global queries require exactly one of table or table_target.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
@@ -9254,6 +9312,7 @@ pub const RetrievalQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "table_target", "table_target", true },
         .{ "table", "table", true },
         .{ "query", "query", true },
         .{ "full_text_search", "full_text_search", true },
@@ -9300,6 +9359,10 @@ pub const RetrievalQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.table_target) |value| {
+            try jw.objectField("table_target");
+            try jw.write(value);
+        }
         if (self.table) |value| {
             try jw.objectField("table");
             try jw.write(value);
@@ -10239,7 +10302,8 @@ pub const SortProfile = struct {
 
 /// Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches is retained only at the stateful public transport boundary for the v0.2 transition window.
 pub const StatefulQueryRequest = struct {
-    /// Name of the table to query. Required for global-query requests.
+    table_target: ?CatalogTableTarget = null,
+    /// Literal table name in default.public. Global queries require exactly one of table or table_target.
     table: ?[]const u8 = null,
     /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is non-scoring query input. - `bool.must_not` is non-scoring exclusion query input. Filter branches accept the same query variants as `filter_query` and `exclusion_query`. Structured clauses use the native document-value path; text clauses are resolved through the text index before scoring.
     query: ?std.json.Value = null,
@@ -10310,6 +10374,7 @@ pub const StatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "table_target", "table_target", true },
         .{ "table", "table", true },
         .{ "query", "query", true },
         .{ "full_text_search", "full_text_search", true },
@@ -10357,6 +10422,10 @@ pub const StatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.table_target) |value| {
+            try jw.objectField("table_target");
+            try jw.write(value);
+        }
         if (self.table) |value| {
             try jw.objectField("table");
             try jw.write(value);

@@ -3540,7 +3540,7 @@ pub fn encodeQueryResponses(
                 .profile = profile,
                 .took = meta.took_ms,
                 .status = 200,
-                .table = table_name,
+                .table = req.response_table_name orelse table_name,
             };
             break :blk try std.json.Stringify.valueAlloc(
                 alloc,
@@ -3569,7 +3569,7 @@ pub fn encodeQueryResponses(
                 .profile = profile,
                 .took = meta.took_ms,
                 .status = 200,
-                .table = table_name,
+                .table = req.response_table_name orelse table_name,
             };
             break :blk try std.json.Stringify.valueAlloc(
                 alloc,

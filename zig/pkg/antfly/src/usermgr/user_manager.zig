@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const catalog_names = @import("../catalog/domain.zig");
+const catalog_names = @import("../system_catalog/domain.zig");
 const io_abi = @import("../runtime_io_abi.zig");
 const casbin = @import("antfly_casbin");
 
@@ -1455,6 +1455,10 @@ fn permissionIntersection(left: Permission, right: Permission) ?struct {
         left.resource
     else if (std.mem.eql(u8, left.resource, right.resource))
         left.resource
+    else if (resource_type == .table and catalog_names.tableScopeContains(left.resource, right.resource))
+        right.resource
+    else if (resource_type == .table and catalog_names.tableScopeContains(right.resource, left.resource))
+        left.resource
     else
         return null;
     const permission_type: PermissionType = if (left.type == .admin)
@@ -2102,4 +2106,17 @@ test "usermgr api key permission intersection narrows owner and key wildcards" {
     try std.testing.expectEqual(PermissionType.read, effective[0].type);
     try std.testing.expectEqualStrings("private", effective[1].resource);
     try std.testing.expectEqual(PermissionType.write, effective[1].type);
+}
+
+test "system catalog key intersection narrows namespace grants and rejects dotted lookalikes" {
+    const alloc = std.testing.allocator;
+    const scope = try (catalog_names.TableScope{ .database = "tenant" }).keyAlloc(alloc);
+    defer alloc.free(scope);
+    const exact = try (catalog_names.Target{ .database = "tenant", .table = "events" }).resourceNameAlloc(alloc);
+    defer alloc.free(exact);
+    const left = Permission{ .resource_type = .table, .resource = @constCast(scope), .type = .admin };
+    const right = Permission{ .resource_type = .table, .resource = @constCast(exact), .type = .read };
+    try std.testing.expectEqualStrings(exact, permissionIntersection(left, right).?.resource);
+    try std.testing.expectEqual(PermissionType.read, permissionIntersection(right, left).?.permission_type);
+    try std.testing.expect(permissionIntersection(left, .{ .resource_type = .table, .resource = @constCast("tenant.public.events"), .type = .read }) == null);
 }

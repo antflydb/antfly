@@ -186,7 +186,7 @@ fn rowFilters(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.A
     const table = args.next() orelse cli.fatal("table is required", .{});
     if (std.mem.eql(u8, sub, "get")) {
         cli.rejectRemainingArgs(args, "auth row-filters get");
-        var resp = try client.inner.getRowFilter(username, table);
+        var resp = try client.inner.getRowFilter(username, table, .{});
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
     }
@@ -202,13 +202,13 @@ fn rowFilters(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.A
         const file = file_value orelse cli.fatal("--file is required", .{});
         var parsed = try parseFile(std.json.ArrayHashMap(std.json.Value), allocator, io, file);
         defer parsed.deinit();
-        var resp = try client.inner.setRowFilter(username, table, parsed.value);
+        var resp = try client.inner.setRowFilter(username, table, parsed.value, .{});
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
     }
     if (std.mem.eql(u8, sub, "remove")) {
         cli.rejectRemainingArgs(args, "auth row-filters remove");
-        var resp = try client.inner.removeRowFilter(username, table);
+        var resp = try client.inner.removeRowFilter(username, table, .{});
         defer resp.deinit();
         return printResponse(allocator, io, &resp);
     }
@@ -233,7 +233,7 @@ fn subjects(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
         const table = args.next() orelse cli.fatal("table is required", .{});
         if (std.mem.eql(u8, action, "get")) {
             cli.rejectRemainingArgs(args, "auth subjects row-filters get");
-            var resp = try client.inner.getSubjectRowFilter(subject, table);
+            var resp = try client.inner.getSubjectRowFilter(subject, table, .{});
             defer resp.deinit();
             return printResponse(allocator, io, &resp);
         }
@@ -249,13 +249,13 @@ fn subjects(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
             const file = file_value orelse cli.fatal("--file is required", .{});
             var parsed = try parseFile(std.json.ArrayHashMap(std.json.Value), allocator, io, file);
             defer parsed.deinit();
-            var resp = try client.inner.setSubjectRowFilter(subject, table, parsed.value);
+            var resp = try client.inner.setSubjectRowFilter(subject, table, parsed.value, .{});
             defer resp.deinit();
             return printResponse(allocator, io, &resp);
         }
         if (std.mem.eql(u8, action, "remove")) {
             cli.rejectRemainingArgs(args, "auth subjects row-filters remove");
-            var resp = try client.inner.removeSubjectRowFilter(subject, table);
+            var resp = try client.inner.removeSubjectRowFilter(subject, table, .{});
             defer resp.deinit();
             return printResponse(allocator, io, &resp);
         }

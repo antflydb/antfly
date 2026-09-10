@@ -6,43 +6,29 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..types import UNSET, Unset
-
-T = TypeVar("T", bound="RestoreNamespaceTableResponse202")
+T = TypeVar("T", bound="ScopedRowFilterFilter")
 
 
 @_attrs_define
-class RestoreNamespaceTableResponse202:
-    """
-    Attributes:
-        restore (str | Unset):  Example: triggered.
-    """
+class ScopedRowFilterFilter:
+    """ """
 
-    restore: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        restore = self.restore
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({})
-        if restore is not UNSET:
-            field_dict["restore"] = restore
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        restore = d.pop("restore", UNSET)
+        scoped_row_filter_filter = cls()
 
-        restore_namespace_table_response_202 = cls(
-            restore=restore,
-        )
-
-        restore_namespace_table_response_202.additional_properties = d
-        return restore_namespace_table_response_202
+        scoped_row_filter_filter.additional_properties = d
+        return scoped_row_filter_filter
 
     @property
     def additional_keys(self) -> list[str]:

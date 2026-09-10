@@ -7,9 +7,9 @@ import httpx
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.error import Error
-from ...models.restore_namespace_table_response_202 import RestoreNamespaceTableResponse202
+from ...models.restore_job import RestoreJob
 from ...models.restore_request import RestoreRequest
-from ...types import Response
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
@@ -18,8 +18,11 @@ def _get_kwargs(
     table_name: str,
     *,
     body: RestoreRequest,
+    idempotency_key: str | Unset = UNSET,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
+    if not isinstance(idempotency_key, Unset):
+        headers["Idempotency-Key"] = idempotency_key
 
     _kwargs: dict[str, Any] = {
         "method": "post",
@@ -38,11 +41,9 @@ def _get_kwargs(
     return _kwargs
 
 
-def _parse_response(
-    *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Error | RestoreNamespaceTableResponse202 | None:
+def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Error | RestoreJob | None:
     if response.status_code == 202:
-        response_202 = RestoreNamespaceTableResponse202.from_dict(response.json())
+        response_202 = RestoreJob.from_dict(response.json())
 
         return response_202
 
@@ -62,9 +63,7 @@ def _parse_response(
         return None
 
 
-def _build_response(
-    *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Error | RestoreNamespaceTableResponse202]:
+def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Error | RestoreJob]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -80,13 +79,15 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: RestoreRequest,
-) -> Response[Error | RestoreNamespaceTableResponse202]:
+    idempotency_key: str | Unset = UNSET,
+) -> Response[Error | RestoreJob]:
     """Restore an explicit namespace table from backup
 
     Args:
         database_name (str):
         namespace_name (str):
         table_name (str):
+        idempotency_key (str | Unset):
         body (RestoreRequest):
 
     Raises:
@@ -94,7 +95,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | RestoreNamespaceTableResponse202]
+        Response[Error | RestoreJob]
     """
 
     kwargs = _get_kwargs(
@@ -102,6 +103,7 @@ def sync_detailed(
         namespace_name=namespace_name,
         table_name=table_name,
         body=body,
+        idempotency_key=idempotency_key,
     )
 
     response = client.get_httpx_client().request(
@@ -118,13 +120,15 @@ def sync(
     *,
     client: AuthenticatedClient,
     body: RestoreRequest,
-) -> Error | RestoreNamespaceTableResponse202 | None:
+    idempotency_key: str | Unset = UNSET,
+) -> Error | RestoreJob | None:
     """Restore an explicit namespace table from backup
 
     Args:
         database_name (str):
         namespace_name (str):
         table_name (str):
+        idempotency_key (str | Unset):
         body (RestoreRequest):
 
     Raises:
@@ -132,7 +136,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | RestoreNamespaceTableResponse202
+        Error | RestoreJob
     """
 
     return sync_detailed(
@@ -141,6 +145,7 @@ def sync(
         table_name=table_name,
         client=client,
         body=body,
+        idempotency_key=idempotency_key,
     ).parsed
 
 
@@ -151,13 +156,15 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: RestoreRequest,
-) -> Response[Error | RestoreNamespaceTableResponse202]:
+    idempotency_key: str | Unset = UNSET,
+) -> Response[Error | RestoreJob]:
     """Restore an explicit namespace table from backup
 
     Args:
         database_name (str):
         namespace_name (str):
         table_name (str):
+        idempotency_key (str | Unset):
         body (RestoreRequest):
 
     Raises:
@@ -165,7 +172,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | RestoreNamespaceTableResponse202]
+        Response[Error | RestoreJob]
     """
 
     kwargs = _get_kwargs(
@@ -173,6 +180,7 @@ async def asyncio_detailed(
         namespace_name=namespace_name,
         table_name=table_name,
         body=body,
+        idempotency_key=idempotency_key,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -187,13 +195,15 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: RestoreRequest,
-) -> Error | RestoreNamespaceTableResponse202 | None:
+    idempotency_key: str | Unset = UNSET,
+) -> Error | RestoreJob | None:
     """Restore an explicit namespace table from backup
 
     Args:
         database_name (str):
         namespace_name (str):
         table_name (str):
+        idempotency_key (str | Unset):
         body (RestoreRequest):
 
     Raises:
@@ -201,7 +211,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | RestoreNamespaceTableResponse202
+        Error | RestoreJob
     """
 
     return (
@@ -211,5 +221,6 @@ async def asyncio(
             table_name=table_name,
             client=client,
             body=body,
+            idempotency_key=idempotency_key,
         )
     ).parsed

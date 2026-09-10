@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from ..models.analyses import Analyses
     from ..models.bool_field_query import BoolFieldQuery
     from ..models.boolean_query import BooleanQuery
+    from ..models.catalog_table_target import CatalogTableTarget
     from ..models.conjunction_query import ConjunctionQuery
     from ..models.date_range_string_query import DateRangeStringQuery
     from ..models.disjunction_query import DisjunctionQuery
@@ -56,7 +57,10 @@ T = TypeVar("T", bound="QueryRequest")
 class QueryRequest:
     r"""
     Attributes:
-        table (str | Unset): Name of the table to query. Required for global-query requests. Example: wikipedia.
+        table_target (CatalogTableTarget | Unset): An explicit native table target. Components are literal names; dots
+            do not qualify a string table name.
+        table (str | Unset): Literal table name in default.public. Global queries require exactly one of table or
+            table_target. Example: wikipedia.
         query (QueryRequestQuery | Unset): Canonical public query AST. Prefer this field for new clients.
 
             Boolean clauses are normalized before planning:
@@ -373,6 +377,7 @@ class QueryRequest:
             ```
     """
 
+    table_target: CatalogTableTarget | Unset = UNSET
     table: str | Unset = UNSET
     query: QueryRequestQuery | Unset = UNSET
     full_text_search: (
@@ -518,6 +523,10 @@ class QueryRequest:
         from ..models.term_query import TermQuery
         from ..models.term_range_query import TermRangeQuery
         from ..models.wildcard_query import WildcardQuery
+
+        table_target: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.table_target, Unset):
+            table_target = self.table_target.to_dict()
 
         table = self.table
 
@@ -785,6 +794,8 @@ class QueryRequest:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if table_target is not UNSET:
+            field_dict["table_target"] = table_target
         if table is not UNSET:
             field_dict["table"] = table
         if query is not UNSET:
@@ -859,6 +870,7 @@ class QueryRequest:
         from ..models.analyses import Analyses
         from ..models.bool_field_query import BoolFieldQuery
         from ..models.boolean_query import BooleanQuery
+        from ..models.catalog_table_target import CatalogTableTarget
         from ..models.conjunction_query import ConjunctionQuery
         from ..models.date_range_string_query import DateRangeStringQuery
         from ..models.disjunction_query import DisjunctionQuery
@@ -896,6 +908,13 @@ class QueryRequest:
         from ..models.wildcard_query import WildcardQuery
 
         d = dict(src_dict)
+        _table_target = d.pop("table_target", UNSET)
+        table_target: CatalogTableTarget | Unset
+        if isinstance(_table_target, Unset):
+            table_target = UNSET
+        else:
+            table_target = CatalogTableTarget.from_dict(_table_target)
+
         table = d.pop("table", UNSET)
 
         _query = d.pop("query", UNSET)
@@ -1742,6 +1761,7 @@ class QueryRequest:
             foreign_sources = QueryRequestForeignSources.from_dict(_foreign_sources)
 
         query_request = cls(
+            table_target=table_target,
             table=table,
             query=query,
             full_text_search=full_text_search,

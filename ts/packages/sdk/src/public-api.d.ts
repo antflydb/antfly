@@ -2386,7 +2386,14 @@ export interface paths {
     };
     "/auth/v1/subjects/{subject}/row-filters/{table}": {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Explicit database; defaults to default when namespace is supplied. */
+                database?: string;
+                /** @description Explicit namespace; defaults to public when database is supplied. */
+                namespace?: string;
+                /** @description Select all tables in the explicit namespace instead of the literal path table. */
+                all_tables?: boolean;
+            };
             header?: never;
             path: {
                 /** @description Casbin subject name, such as role:tenant_reader or group:eng. */
@@ -2419,7 +2426,14 @@ export interface paths {
     };
     "/auth/v1/users/{userName}/row-filters/{table}": {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Explicit database; defaults to default when namespace is supplied. */
+                database?: string;
+                /** @description Explicit namespace; defaults to public when database is supplied. */
+                namespace?: string;
+                /** @description Select all tables in the explicit namespace instead of the literal path table. */
+                all_tables?: boolean;
+            };
             header?: never;
             path: {
                 /** @description The username. */
@@ -7584,9 +7598,18 @@ export interface components {
             ancestors?: components["schemas"]["HierarchyAncestors"];
             children?: components["schemas"]["HierarchyChildren"];
         } & (unknown & unknown & unknown);
+        /** @description An explicit native table target. Components are literal names; dots do not qualify a string table name. */
+        CatalogTableTarget: {
+            /** @default default */
+            database?: string;
+            /** @default public */
+            namespace?: string;
+            table: string;
+        };
         QueryRequest: {
+            table_target?: components["schemas"]["CatalogTableTarget"];
             /**
-             * @description Name of the table to query. Required for global-query requests.
+             * @description Literal table name in default.public. Global queries require exactly one of table or table_target.
              * @example wikipedia
              */
             table?: string;
@@ -8193,11 +8216,12 @@ export interface components {
          *     Supports inner, left, and right joins with automatic strategy selection.
          */
         JoinClause: {
+            right_target?: components["schemas"]["CatalogTableTarget"];
             /**
-             * @description Name of the table to join with.
+             * @description Literal native table name or declared foreign-source alias. Specify exactly one of right_table or right_target.
              * @example customers
              */
-            right_table: string;
+            right_table?: string;
             /** @description Type of join to perform. Defaults to "inner". */
             join_type?: components["schemas"]["JoinType"];
             /** @description Join condition specifying which fields to match. */
@@ -9385,12 +9409,28 @@ export interface components {
          * @enum {string}
          */
         PermissionType: "read" | "write" | "admin";
+        /** @description A table or all tables in an explicit namespace. A missing table selects the namespace; a table named '*' remains literal. */
+        CatalogTableScope: {
+            /** @default default */
+            database?: string;
+            /** @default public */
+            namespace?: string;
+            table?: string;
+        };
+        ScopedRowFilter: {
+            table_target: components["schemas"]["CatalogTableScope"];
+            filter: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description Specify exactly one of a legacy literal resource or a structured table_target; table_target requires resource_type table. */
         Permission: {
             /**
              * @description Resource name (e.g., table name, target username, or '*' for all inference operations or a global grant).
              * @example orders_table
              */
-            resource: string;
+            resource?: string;
+            table_target?: components["schemas"]["CatalogTableScope"];
             resource_type: components["schemas"]["ResourceType"];
             type: components["schemas"]["PermissionType"];
         };
@@ -9467,6 +9507,7 @@ export interface components {
             username: string;
             /** @description Optional permission scoping. If empty, inherits owner's full permissions. */
             permissions?: components["schemas"]["Permission"][] | null;
+            scoped_row_filters?: components["schemas"]["ScopedRowFilter"][];
             /** @description Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing. */
             row_filter?: {
                 [key: string]: unknown;
@@ -9502,6 +9543,7 @@ export interface components {
              * @example orders
              */
             table: string;
+            table_target?: components["schemas"]["CatalogTableScope"];
             /**
              * @description Antfly query JSON that documents must match to be visible.
              * @example {
@@ -9528,6 +9570,7 @@ export interface components {
             expires_in?: string;
             /** @description Optional permission scoping. Each permission must be a subset of the creator's permissions. */
             permissions?: components["schemas"]["Permission"][] | null;
+            scoped_row_filters?: components["schemas"]["ScopedRowFilter"][];
             /** @description Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing. */
             row_filter?: {
                 [key: string]: unknown;
@@ -19160,7 +19203,10 @@ export interface operations {
     restoreNamespaceTable: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /** @description Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and table. Requests without this header create a new job. */
+                "Idempotency-Key"?: string;
+            };
             path: {
                 /** @description Database name */
                 databaseName: string;
@@ -19183,10 +19229,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        /** @example triggered */
-                        restore?: string;
-                    };
+                    "application/json": components["schemas"]["RestoreJob"];
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -19198,6 +19241,8 @@ export interface operations {
             query?: {
                 /** @description Comma-separated list of fields to include in the response. */
                 fields?: string;
+                /** @description Read consistency; defaults to read_index. */
+                consistency?: "read_index" | "stale";
             };
             header?: never;
             path: {
@@ -19331,7 +19376,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["IndexConfig"];
+                "application/json": components["schemas"]["CreateIndexRequest"];
             };
         };
         responses: {
@@ -19340,7 +19385,9 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["CreatedIndex"];
+                };
             };
             400: components["responses"]["BadRequest"];
             500: components["responses"]["InternalServerError"];
@@ -20045,6 +20092,9 @@ export interface operations {
                 resource: string;
                 /** @description The type of the resource for the permission to be removed. */
                 resourceType: components["schemas"]["ResourceType"];
+                database?: string;
+                namespace?: string;
+                all_tables?: boolean;
             };
             header?: never;
             path: {
@@ -20342,7 +20392,14 @@ export interface operations {
     };
     getSubjectRowFilter: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Explicit database; defaults to default when namespace is supplied. */
+                database?: string;
+                /** @description Explicit namespace; defaults to public when database is supplied. */
+                namespace?: string;
+                /** @description Select all tables in the explicit namespace instead of the literal path table. */
+                all_tables?: boolean;
+            };
             header?: never;
             path: {
                 /** @description Casbin subject name, such as role:tenant_reader or group:eng. */
@@ -20385,7 +20442,14 @@ export interface operations {
     };
     setSubjectRowFilter: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Explicit database; defaults to default when namespace is supplied. */
+                database?: string;
+                /** @description Explicit namespace; defaults to public when database is supplied. */
+                namespace?: string;
+                /** @description Select all tables in the explicit namespace instead of the literal path table. */
+                all_tables?: boolean;
+            };
             header?: never;
             path: {
                 /** @description Casbin subject name, such as role:tenant_reader or group:eng. */
@@ -20435,7 +20499,14 @@ export interface operations {
     };
     removeSubjectRowFilter: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Explicit database; defaults to default when namespace is supplied. */
+                database?: string;
+                /** @description Explicit namespace; defaults to public when database is supplied. */
+                namespace?: string;
+                /** @description Select all tables in the explicit namespace instead of the literal path table. */
+                all_tables?: boolean;
+            };
             header?: never;
             path: {
                 /** @description Casbin subject name, such as role:tenant_reader or group:eng. */
@@ -20476,7 +20547,14 @@ export interface operations {
     };
     getRowFilter: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Explicit database; defaults to default when namespace is supplied. */
+                database?: string;
+                /** @description Explicit namespace; defaults to public when database is supplied. */
+                namespace?: string;
+                /** @description Select all tables in the explicit namespace instead of the literal path table. */
+                all_tables?: boolean;
+            };
             header?: never;
             path: {
                 /** @description The username. */
@@ -20519,7 +20597,14 @@ export interface operations {
     };
     setRowFilter: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Explicit database; defaults to default when namespace is supplied. */
+                database?: string;
+                /** @description Explicit namespace; defaults to public when database is supplied. */
+                namespace?: string;
+                /** @description Select all tables in the explicit namespace instead of the literal path table. */
+                all_tables?: boolean;
+            };
             header?: never;
             path: {
                 /** @description The username. */
@@ -20578,7 +20663,14 @@ export interface operations {
     };
     removeRowFilter: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Explicit database; defaults to default when namespace is supplied. */
+                database?: string;
+                /** @description Explicit namespace; defaults to public when database is supplied. */
+                namespace?: string;
+                /** @description Select all tables in the explicit namespace instead of the literal path table. */
+                all_tables?: boolean;
+            };
             header?: never;
             path: {
                 /** @description The username. */

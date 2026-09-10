@@ -12,12 +12,13 @@
 # Elastic License 2.0 for the specific language governing permissions and
 # limitations.
 
-"""Native catalog identity, placement, and qualified restore regressions."""
+"""System catalog identity, placement, and qualified restore regressions."""
 
 import json
 import tempfile
 import uuid
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -53,10 +54,11 @@ def test_catalog_rename_restart_and_placement(stateful_api):
     api.post(f"/databases/{database}/namespaces/serving/rename", {"name": "reports"})
     api.post(f"/databases/{database}/rename", {"name": renamed})
     target = f"{renamed}.reports.logs"
-    assert api.get(f"/tables/{target}")["table_id"] == created["table_id"]
-    assert api.get(f"/tables/{target}/documents/doc1") == {"title": "hello"}
+    target_path = f"/databases/{renamed}/namespaces/reports/tables/logs"
+    assert api.get(f"{target_path}")["table_id"] == created["table_id"]
+    assert api.get(f"{target_path}/documents/doc1") == {"title": "hello"}
     result = api.post(
-        f"/tables/{target}/query", {"full_text_search": {"match_all": {}}, "limit": 10}
+        f"{target_path}/query", {"full_text_search": {"match_all": {}}, "limit": 10}
     )
     assert result["responses"][0]["table"] == target
     mcp_url = api.url.removesuffix("/db/v1") + "/mcp/v1"
@@ -73,7 +75,14 @@ def test_catalog_rename_restart_and_placement(stateful_api):
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/call",
-            "params": {"name": "describe_table", "arguments": {"tableName": target}},
+            "params": {
+                "name": "describe_table",
+                "arguments": {
+                    "database": renamed,
+                    "namespace": "reports",
+                    "tableName": "logs",
+                },
+            },
         },
         timeout=10,
     )
@@ -86,9 +95,9 @@ def test_catalog_rename_restart_and_placement(stateful_api):
     assert api._request("DELETE", f"/tablespaces/{tablespace}").status_code == 409
     assert all(item["table_id"] != created["table_id"] for item in api.get("/tables"))
     api.restart_server()
-    assert api.get(f"/tables/{target}")["table_id"] == created["table_id"]
-    assert api.get(f"/tables/{target}/documents/doc1") == {"title": "hello"}
-    api.delete(f"/tables/{target}")
+    assert api.get(f"{target_path}")["table_id"] == created["table_id"]
+    assert api.get(f"{target_path}/documents/doc1") == {"title": "hello"}
+    api.delete(f"{target_path}")
     api.delete(f"/databases/{renamed}")
     api.delete(f"/tablespaces/{tablespace}")
 
@@ -99,7 +108,7 @@ def test_catalog_restore_to_qualified_destination(backup_api, long_names):
     database = "restore_" + uuid.uuid4().hex[:12]
     if long_names:
         database = database.ljust(128, "a")
-    destination = "destination".ljust(128, "a") if long_names else "destination"
+    destination = "destination".ljust(255, "a") if long_names else "destination"
     api.post(f"/databases/{database}", {})
     path = f"/databases/{database}/namespaces/public/tables"
     api.post(path + "/source", {"num_shards": 1})
@@ -247,3 +256,139 @@ def test_catalog_scope_indexes_and_placement_overrides(stateful_api):
     api.delete(root)
     for name in (database + "_db", renamed_policy, database + "_table"):
         api.delete("/tablespaces/" + name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "tenant.public.events",
+        "sales/archive",
+        "sales archive",
+        "*",
+        "table:legacy",
+        "9events",
+        "x" * 255,
+    ],
+)
+def test_catalog_literal_table_names(stateful_api, name):
+    api = stateful_api
+    path = "/tables/" + quote(name, safe="")
+    created = api.post(path, {"num_shards": 1})
+    try:
+        api.post(
+            path + "/batch",
+            {"inserts": {"row": {"name": name}}, "sync_level": "full_index"},
+        )
+        assert api.get(path + "/documents/row") == {"name": name}
+        result = api.post(
+            path + "/query", {"full_text_search": {"match_all": {}}, "limit": 10}
+        )
+        assert result["responses"][0]["table"] == name
+        assert result["responses"][0]["hits"]["hits"][0]["_id"] == "row"
+        assert any(
+            item["name"] == name and item["table_id"] == created["table_id"]
+            for item in api.get("/tables")
+        )
+    finally:
+        api.delete(path)
+
+
+def test_catalog_scoped_join_keeps_literal_lookalikes_separate(stateful_api):
+    api = stateful_api
+    database = "joins_" + uuid.uuid4().hex[:12]
+    root = f"/databases/{database}"
+    api.post(root, {})
+    scoped = root + "/namespaces/public/tables/customers"
+    literal = f"{database}.public.customers"
+    literal_path = "/tables/" + literal
+    docs = root + "/namespaces/public/tables/docs"
+    for path in (scoped, literal_path, docs):
+        api.post(path, {"num_shards": 1})
+    try:
+        for path, name in ((scoped, "scoped"), (literal_path, "literal")):
+            api.post(
+                path + "/batch",
+                {"inserts": {"customer": {"name": name}}, "sync_level": "full_index"},
+            )
+        api.post(
+            docs + "/batch",
+            {
+                "inserts": {"doc": {"customer_id": "customer"}},
+                "sync_level": "full_index",
+            },
+        )
+        for target, expected in (
+            ({"right_table": literal}, "literal"),
+            ({"right_target": {"database": database, "table": "customers"}}, "scoped"),
+        ):
+            body = {
+                "full_text_search": {"match_all": {}},
+                "limit": 10,
+                "join": {
+                    **target,
+                    "on": {"left_field": "customer_id", "right_field": "_id"},
+                    "right_fields": ["name"],
+                },
+            }
+            response = api.post(docs + "/query", body)["responses"][0]
+            assert response["table"] == f"{database}.public.docs"
+            hits = response["hits"]["hits"]
+            assert len(hits) == 1, response
+            assert hits[0]["_source"][literal + ".name"] == expected
+            assert "table:" not in json.dumps(response)
+        both = {
+            "full_text_search": {"match_all": {}},
+            "join": {
+                "right_table": literal,
+                "right_target": {"database": database, "table": "customers"},
+                "on": {"left_field": "customer_id", "right_field": "_id"},
+            },
+        }
+        assert (
+            api.s.post(api.url + docs + "/query", json=both, timeout=30).status_code
+            == 400
+        )
+    finally:
+        for path in (scoped, literal_path, docs):
+            api.delete(path)
+        api.delete(root)
+
+
+def test_catalog_cluster_backup_retains_scope_and_literal_names(backup_api):
+    api = backup_api
+    database = "archive_" + uuid.uuid4().hex[:12]
+    api.post(f"/databases/{database}", {})
+    literal = "sales/archive.v1"
+    paths = [
+        "/tables/" + quote(literal, safe=""),
+        f"/databases/{database}/namespaces/public/tables/" + quote(literal, safe=""),
+    ]
+    for index, path in enumerate(paths):
+        api.post(path, {})
+        api.post(
+            path + "/batch",
+            {"inserts": {"doc": {"scope": index}}, "sync_level": "full_index"},
+        )
+    with tempfile.TemporaryDirectory(prefix="antfly-catalog-cluster-") as directory:
+        location = Path(directory).as_uri()
+        backup = api.cluster_backup(backup_id="catalog-cluster", location=location)
+        assert {table["name"] for table in backup["tables"]} == {
+            literal,
+            f"{database}.public.{literal}",
+        }
+        # The API assertions below exercise the durable manifest after names
+        # have disappeared from the live catalog; they cannot pass through a
+        # cache of existing bindings.
+        for path in paths:
+            api.delete(path)
+        restored = api.cluster_restore(
+            backup_id="catalog-cluster",
+            location=location,
+            restore_mode="fail_if_exists",
+        )
+        assert restored["committed_table_count"] == 2
+        for index, path in enumerate(paths):
+            assert api.get(path + "/documents/doc") == {"scope": index}
+    for path in paths:
+        api.delete(path)
+    api.delete(f"/databases/{database}")

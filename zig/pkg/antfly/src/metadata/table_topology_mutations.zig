@@ -219,8 +219,10 @@ pub fn restore(
             return error.InvalidTableTopologyMutation;
         unique_groups.putAssumeCapacity(range.group_id, {});
     }
-    if (try @import("../catalog/domain.zig").restoreTarget(table.name)) |target| {
-        return @import("../catalog/operations.zig").restore(svc, alloc, request, target, table, ranges);
+    if (try @import("../system_catalog/domain.zig").restoreTarget(alloc, table.name)) |owned_target| {
+        defer owned_target.deinit(alloc);
+        const target = owned_target.value;
+        return @import("../system_catalog/operations.zig").restore(svc, alloc, request, target, table, ranges);
     }
     const protocol_readiness = try svc.ensureTableTopologyProtocolReadyWithContext(
         request,

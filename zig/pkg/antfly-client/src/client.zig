@@ -35,6 +35,8 @@ pub const ApiError = struct {
 pub const AntflyClient = struct {
     inner: openapi.Client,
     allocator: std.mem.Allocator,
+    /// Borrowed explicit scope for table operations; table names stay literal.
+    catalog_scope: ?struct { database: []const u8 = "default", namespace: []const u8 = "public" } = null,
 
     pub fn init(allocator: std.mem.Allocator, http: *httpx.Client, base_url: []const u8) !AntflyClient {
         // Store the server root URL. The generated public client owns the
@@ -87,22 +89,41 @@ pub const AntflyClient = struct {
         self.inner.auth_header = .{ "Authorization", header_val };
     }
 
+    pub fn tablePathAlloc(self: *const AntflyClient, table: []const u8) ![]u8 {
+        const name = try httpx.PercentEncoding.encode(self.allocator, table);
+        defer self.allocator.free(name);
+        if (self.catalog_scope) |scope| {
+            const database = try httpx.PercentEncoding.encode(self.allocator, scope.database);
+            defer self.allocator.free(database);
+            const namespace = try httpx.PercentEncoding.encode(self.allocator, scope.namespace);
+            defer self.allocator.free(namespace);
+            return std.fmt.allocPrint(self.allocator, "/db/v1/databases/{s}/namespaces/{s}/tables/{s}", .{ database, namespace, name });
+        }
+        return std.fmt.allocPrint(self.allocator, "/db/v1/tables/{s}", .{name});
+    }
+
     // --- Table operations ---
 
     pub fn createTable(self: *AntflyClient, table_name: []const u8, body: openapi.types.CreateTableRequest) !void {
+        if (self.catalog_scope) |scope| {
+            var resp = try self.inner.createNamespaceTable(scope.database, scope.namespace, table_name, body);
+            defer resp.deinit();
+            if (resp.status_code >= 300) return self.apiErrorFromResponse(&resp);
+            return;
+        }
         var resp = try self.inner.createTable(table_name, body);
         defer resp.deinit();
         if (resp.status_code >= 300) return self.apiErrorFromResponse(&resp);
     }
 
     pub fn dropTable(self: *AntflyClient, table_name: []const u8) !void {
-        var resp = try self.inner.dropTable(table_name);
+        var resp = try (if (self.catalog_scope) |scope| self.inner.dropNamespaceTable(scope.database, scope.namespace, table_name) else self.inner.dropTable(table_name));
         defer resp.deinit();
         if (resp.status_code >= 300) return self.apiErrorFromResponse(&resp);
     }
 
     pub fn getTable(self: *AntflyClient, table_name: []const u8) !openapi.ApiResponse(openapi.types.TableStatus) {
-        var resp = try self.inner.getTable(table_name);
+        var resp = try (if (self.catalog_scope) |scope| self.inner.getNamespaceTable(scope.database, scope.namespace, table_name) else self.inner.getTable(table_name));
         if (resp.status_code >= 300) {
             defer resp.deinit();
             return self.apiErrorFromResponse(&resp);
@@ -111,7 +132,7 @@ pub const AntflyClient = struct {
     }
 
     pub fn listTables(self: *AntflyClient) !openapi.ApiResponse([]const openapi.types.TableStatus) {
-        var resp = try self.inner.listTables(.{});
+        var resp = try (if (self.catalog_scope) |scope| self.inner.listNamespaceTables(scope.database, scope.namespace, .{}) else self.inner.listTables(.{}));
         if (resp.status_code >= 300) {
             defer resp.deinit();
             return self.apiErrorFromResponse(&resp);
@@ -126,7 +147,7 @@ pub const AntflyClient = struct {
     pub const CreatedIndex = openapi.types.CreatedIndex;
 
     pub fn createIndex(self: *AntflyClient, table_name: []const u8, index_name: []const u8, body: CreateIndexRequest) !openapi.ApiResponse(CreatedIndex) {
-        var resp = try self.inner.createIndex(table_name, index_name, body);
+        var resp = if (self.catalog_scope) |scope| try self.inner.createNamespaceTableIndex(scope.database, scope.namespace, table_name, index_name, body) else try self.inner.createIndex(table_name, index_name, body);
         if (resp.status_code >= 300) {
             defer resp.deinit();
             return self.apiErrorFromResponse(&resp);
@@ -135,7 +156,7 @@ pub const AntflyClient = struct {
     }
 
     pub fn dropIndex(self: *AntflyClient, table_name: []const u8, index_name: []const u8) !void {
-        var resp = try self.inner.dropIndex(table_name, index_name);
+        var resp = try (if (self.catalog_scope) |scope| self.inner.dropNamespaceTableIndex(scope.database, scope.namespace, table_name, index_name) else self.inner.dropIndex(table_name, index_name));
         defer resp.deinit();
         if (resp.status_code >= 300) return self.apiErrorFromResponse(&resp);
     }
@@ -153,7 +174,7 @@ pub const AntflyClient = struct {
     /// `error.ApiError`. Long-running readiness commands use this to classify
     /// retryable status codes without weakening normal one-shot API behavior.
     pub fn getIndexResponse(self: *AntflyClient, table_name: []const u8, index_name: []const u8) !openapi.ApiResponse(openapi.types.IndexStatus) {
-        return self.inner.getIndex(table_name, index_name);
+        return (if (self.catalog_scope) |scope| self.inner.getNamespaceTableIndex(scope.database, scope.namespace, table_name, index_name) else self.inner.getIndex(table_name, index_name));
     }
 
     /// Equivalent to `getIndexResponse`, but bounds the complete HTTP request.
@@ -165,14 +186,14 @@ pub const AntflyClient = struct {
         index_name: []const u8,
         timeout_ms: u64,
     ) !openapi.ApiResponse(openapi.types.IndexStatus) {
-        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
-        defer self.allocator.free(encoded_table_name);
+        const table_path = try self.tablePathAlloc(table_name);
+        defer self.allocator.free(table_path);
         const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
         defer self.allocator.free(encoded_index_name);
         const url = try std.fmt.allocPrint(
             self.allocator,
-            "{s}/db/v1/tables/{s}/indexes/{s}",
-            .{ self.inner.base_url, encoded_table_name, encoded_index_name },
+            "{s}{s}/indexes/{s}",
+            .{ self.inner.base_url, table_path, encoded_index_name },
         );
         defer self.allocator.free(url);
         const headers: ?[]const [2][]const u8 = if (self.inner.auth_header) |*header|
@@ -187,7 +208,7 @@ pub const AntflyClient = struct {
     }
 
     pub fn listIndexes(self: *AntflyClient, table_name: []const u8) !openapi.ApiResponse([]const openapi.types.IndexStatus) {
-        var resp = try self.inner.listIndexes(table_name);
+        var resp = try (if (self.catalog_scope) |scope| self.inner.listNamespaceTableIndexes(scope.database, scope.namespace, table_name) else self.inner.listIndexes(table_name));
         if (resp.status_code >= 300) {
             defer resp.deinit();
             return self.apiErrorFromResponse(&resp);
@@ -203,12 +224,12 @@ pub const AntflyClient = struct {
         table_name: []const u8,
         timeout_ms: u64,
     ) !openapi.ApiResponse([]const openapi.types.IndexStatus) {
-        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
-        defer self.allocator.free(encoded_table_name);
+        const table_path = try self.tablePathAlloc(table_name);
+        defer self.allocator.free(table_path);
         const url = try std.fmt.allocPrint(
             self.allocator,
-            "{s}/db/v1/tables/{s}/indexes",
-            .{ self.inner.base_url, encoded_table_name },
+            "{s}{s}/indexes",
+            .{ self.inner.base_url, table_path },
         );
         defer self.allocator.free(url);
         const headers: ?[]const [2][]const u8 = if (self.inner.auth_header) |*header|
@@ -234,9 +255,9 @@ pub const AntflyClient = struct {
     }
 
     pub fn queryTable(self: *AntflyClient, table_name: []const u8, body: openapi.types.QueryRequest) !openapi.ApiResponse(openapi.types.QueryResponses) {
-        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
-        defer self.allocator.free(encoded_table_name);
-        const path = try std.fmt.allocPrint(self.allocator, "/db/v1/tables/{s}/query", .{encoded_table_name});
+        const table_path = try self.tablePathAlloc(table_name);
+        defer self.allocator.free(table_path);
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/query", .{table_path});
         defer self.allocator.free(path);
         var resp = try self.queryCanonicalPath(path, body);
         if (resp.status_code >= 300) {
@@ -273,7 +294,7 @@ pub const AntflyClient = struct {
         key: []const u8,
         params: openapi.client.LookupKeyParams,
     ) !openapi.ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
-        var resp = try self.inner.lookupKey(table_name, key, params);
+        var resp = try (if (self.catalog_scope) |scope| self.inner.lookupNamespaceTableDocument(scope.database, scope.namespace, table_name, key, .{ .fields = params.fields, .consistency = params.consistency }) else self.inner.lookupKey(table_name, key, params));
         if (resp.status_code >= 300) {
             defer resp.deinit();
             return self.apiErrorFromResponse(&resp);
@@ -383,7 +404,9 @@ pub const AntflyClient = struct {
     // --- Batch operations ---
 
     pub fn batch(self: *AntflyClient, table_name: []const u8, body: openapi.types.BatchRequest) !openapi.ApiResponse(openapi.types.BatchResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/batch", .{ self.inner.base_url, table_name });
+        const table_path = try self.tablePathAlloc(table_name);
+        defer self.allocator.free(table_path);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}{s}/batch", .{ self.inner.base_url, table_path });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, BatchRequestWire{ .inner = body });
         defer self.allocator.free(json_body);
@@ -406,7 +429,7 @@ pub const AntflyClient = struct {
     };
 
     pub fn backupTable(self: *AntflyClient, table_name: []const u8, body: openapi.types.BackupRequest) !void {
-        var resp = try self.inner.backupTable(table_name, body);
+        var resp = try (if (self.catalog_scope) |scope| self.inner.backupNamespaceTable(scope.database, scope.namespace, table_name, body) else self.inner.backupTable(table_name, body));
         defer resp.deinit();
         if (resp.status_code >= 300) return self.apiErrorFromResponse(&resp);
     }
@@ -416,7 +439,7 @@ pub const AntflyClient = struct {
     }
 
     pub fn restoreTableWithOptions(self: *AntflyClient, table_name: []const u8, body: openapi.types.RestoreRequest, options: RestoreOptions) !openapi.ApiResponse(openapi.types.RestoreJob) {
-        var resp = try self.inner.restoreTable(table_name, body, options.idempotency_key);
+        var resp = try (if (self.catalog_scope) |scope| self.inner.restoreNamespaceTable(scope.database, scope.namespace, table_name, body, options.idempotency_key) else self.inner.restoreTable(table_name, body, options.idempotency_key));
         if (resp.status_code >= 300) {
             defer resp.deinit();
             return self.apiErrorFromResponse(&resp);

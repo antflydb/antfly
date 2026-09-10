@@ -5956,7 +5956,7 @@ paths:
         description: Table name
         schema:
           type: string
-          maxLength: 128
+          maxLength: 255
     get:
       summary: Get namespace table details
       description: Gets a table through an explicit database and namespace route.
@@ -6048,7 +6048,7 @@ paths:
         description: Table name
         schema:
           type: string
-          maxLength: 128
+          maxLength: 255
     post:
       summary: Query an explicit namespace table
       description: Queries a table through an explicit database and namespace route. While storage APIs
@@ -6108,7 +6108,7 @@ paths:
         description: Table name
         schema:
           type: string
-          maxLength: 128
+          maxLength: 255
     post:
       summary: Perform batch inserts and deletes on an explicit namespace table
       description: Performs batch writes through an explicit database and namespace route. While storage
@@ -6164,7 +6164,7 @@ paths:
         description: Table name
         schema:
           type: string
-          maxLength: 128
+          maxLength: 255
     post:
       summary: Backup an explicit namespace table
       tags:
@@ -6219,12 +6219,23 @@ paths:
         description: Table name
         schema:
           type: string
-          maxLength: 128
+          maxLength: 255
     post:
       summary: Restore an explicit namespace table from backup
       tags:
         - data_operations
       operationId: restoreNamespaceTable
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+            x-go-type-skip-optional-pointer: false
+          description: Stable key used to safely retry creation of this restore job. Keys are scoped to
+            the authenticated principal and table. Requests without this header create a new job.
       requestBody:
         required: true
         content:
@@ -6237,11 +6248,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  restore:
-                    type: string
-                    example: triggered
+                $ref: '#/components/schemas/RestoreJob'
         '400':
           $ref: '#/components/responses/BadRequest'
         '500':
@@ -6272,7 +6279,7 @@ paths:
         description: Table name
         schema:
           type: string
-          maxLength: 128
+          maxLength: 255
       - name: key
         in: path
         required: true
@@ -6294,6 +6301,15 @@ paths:
           description: Comma-separated list of fields to include in the response.
           schema:
             type: string
+        - name: consistency
+          in: query
+          required: false
+          description: Read consistency; defaults to read_index.
+          schema:
+            type: string
+            enum:
+              - read_index
+              - stale
       responses:
         '200':
           description: Record found
@@ -6341,7 +6357,7 @@ paths:
         description: Table name
         schema:
           type: string
-          maxLength: 128
+          maxLength: 255
     get:
       summary: List indexes for an explicit namespace table
       description: Lists index metadata through an explicit database and namespace route.
@@ -6389,7 +6405,7 @@ paths:
         description: Table name
         schema:
           type: string
-          maxLength: 128
+          maxLength: 255
       - name: indexName
         in: path
         required: true
@@ -6428,10 +6444,14 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/IndexConfig'
+              $ref: '#/components/schemas/CreateIndexRequest'
       responses:
         '201':
           description: Index added successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedIndex'
         '400':
           $ref: '#/components/responses/BadRequest'
         '500':
@@ -7006,6 +7026,18 @@ paths:
           description: The type of the resource for the permission to be removed.
           schema:
             $ref: '#/components/schemas/ResourceType'
+        - name: database
+          in: query
+          schema:
+            type: string
+        - name: namespace
+          in: query
+          schema:
+            type: string
+        - name: all_tables
+          in: query
+          schema:
+            type: boolean
       responses:
         '204':
           description: Permission removed successfully
@@ -7246,6 +7278,21 @@ paths:
         schema:
           type: string
           example: orders
+      - name: database
+        in: query
+        schema:
+          type: string
+        description: Explicit database; defaults to default when namespace is supplied.
+      - name: namespace
+        in: query
+        schema:
+          type: string
+        description: Explicit namespace; defaults to public when database is supplied.
+      - name: all_tables
+        in: query
+        schema:
+          type: boolean
+        description: Select all tables in the explicit namespace instead of the literal path table.
     get:
       tags:
         - RowFilter
@@ -7347,6 +7394,21 @@ paths:
         schema:
           type: string
           example: orders
+      - name: database
+        in: query
+        schema:
+          type: string
+        description: Explicit database; defaults to default when namespace is supplied.
+      - name: namespace
+        in: query
+        schema:
+          type: string
+        description: Explicit namespace; defaults to public when database is supplied.
+      - name: all_tables
+        in: query
+        schema:
+          type: boolean
+        description: Select all tables in the explicit namespace instead of the literal path table.
     get:
       tags:
         - RowFilter
@@ -16154,6 +16216,22 @@ components:
         children:
           $ref: '#/components/schemas/HierarchyChildren'
           x-go-type-skip-optional-pointer: false
+    CatalogTableTarget:
+      type: object
+      description: An explicit native table target. Components are literal names; dots do not qualify
+        a string table name.
+      properties:
+        database:
+          type: string
+          default: default
+        namespace:
+          type: string
+          default: public
+        table:
+          type: string
+      required:
+        - table
+      additionalProperties: false
     QueryRequest:
       type: object
       not:
@@ -16313,9 +16391,12 @@ components:
                   - required:
                       - foreign_sources
       properties:
+        table_target:
+          $ref: '#/components/schemas/CatalogTableTarget'
         table:
           type: string
-          description: Name of the table to query. Required for global-query requests.
+          description: Literal table name in default.public. Global queries require exactly one of table
+            or table_target.
           example: wikipedia
         query:
           x-go-type: json.RawMessage
@@ -17227,12 +17308,14 @@ components:
 
         Supports inner, left, and right joins with automatic strategy selection.
       required:
-        - right_table
         - 'on'
       properties:
+        right_target:
+          $ref: '#/components/schemas/CatalogTableTarget'
         right_table:
           type: string
-          description: Name of the table to join with.
+          description: Literal native table name or declared foreign-source alias. Specify exactly one
+            of right_table or right_target.
           example: customers
         join_type:
           $ref: '#/components/schemas/JoinType'
@@ -19038,20 +19121,48 @@ components:
         - admin
       description: Type of permission.
       example: read
+    CatalogTableScope:
+      type: object
+      description: A table or all tables in an explicit namespace. A missing table selects the namespace;
+        a table named '*' remains literal.
+      properties:
+        database:
+          type: string
+          default: default
+        namespace:
+          type: string
+          default: public
+        table:
+          type: string
+      additionalProperties: false
+    ScopedRowFilter:
+      type: object
+      properties:
+        table_target:
+          $ref: '#/components/schemas/CatalogTableScope'
+        filter:
+          type: object
+          additionalProperties: {}
+      required:
+        - table_target
+        - filter
     Permission:
       type: object
+      description: Specify exactly one of a legacy literal resource or a structured table_target; table_target
+        requires resource_type table.
       properties:
         resource:
           type: string
           description: Resource name (e.g., table name, target username, or '*' for all inference operations
             or a global grant).
           example: orders_table
+        table_target:
+          $ref: '#/components/schemas/CatalogTableScope'
         resource_type:
           $ref: '#/components/schemas/ResourceType'
         type:
           $ref: '#/components/schemas/PermissionType'
       required:
-        - resource
         - resource_type
         - type
     RoleAssignment:
@@ -19146,6 +19257,10 @@ components:
             $ref: '#/components/schemas/Permission'
           nullable: true
           description: Optional permission scoping. If empty, inherits owner's full permissions.
+        scoped_row_filters:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScopedRowFilter'
         row_filter:
           type: object
           additionalProperties: {}
@@ -19193,6 +19308,8 @@ components:
           type: string
           description: Table name (or '*' for all tables).
           example: orders
+        table_target:
+          $ref: '#/components/schemas/CatalogTableScope'
         filter:
           type: object
           additionalProperties: {}
@@ -19222,6 +19339,10 @@ components:
           nullable: true
           description: Optional permission scoping. Each permission must be a subset of the creator's
             permissions.
+        scoped_row_filters:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScopedRowFilter'
         row_filter:
           type: object
           additionalProperties: {}

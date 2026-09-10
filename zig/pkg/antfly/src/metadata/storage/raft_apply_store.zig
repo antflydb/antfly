@@ -13,8 +13,8 @@
 // limitations.
 
 const std = @import("std");
-const native_catalog = @import("../../catalog/domain.zig");
-const native_catalog_storage = @import("../../catalog/storage.zig");
+const system_catalog = @import("../../system_catalog/domain.zig");
+const system_catalog_storage = @import("../../system_catalog/storage.zig");
 const builtin = @import("builtin");
 const raft_engine = @import("raft_engine");
 const fs_paths = @import("../../common/fs_paths.zig");
@@ -175,17 +175,17 @@ pub const TableTopologyMutation = union(enum) {
     },
 };
 
-pub const NativeCatalogCommand = struct {
+pub const SystemCatalogCommand = struct {
     version: u16 = 1,
     expected_revision: u64,
-    mutation: native_catalog.Mutation,
+    mutation: system_catalog.Mutation,
     topology: ?TableTopologyMutation = null,
     placement_update: ?struct { expected: metadata.TableRecord, replacement: metadata.TableRecord } = null,
 };
 
 pub const TransitionCommand = union(enum) {
-    /// Versioned native catalog request, applied atomically with any table topology.
-    apply_native_catalog: []const u8,
+    /// Versioned system catalog request, applied atomically with any table topology.
+    apply_system_catalog: []const u8,
     initialize_metadata_incarnation: metadata_incarnation.MetadataClusterIncarnation,
     upsert_node: metadata.NodeRecord,
     register_node: metadata.NodeRecord,
@@ -308,7 +308,7 @@ pub const TransitionCommand = union(enum) {
 
     pub fn deinit(self: *TransitionCommand, alloc: std.mem.Allocator) void {
         switch (self.*) {
-            .apply_native_catalog => |bytes| alloc.free(bytes),
+            .apply_system_catalog => |bytes| alloc.free(bytes),
             .upsert_node, .register_node => |*record| {
                 metadata_table_manager.freeNode(alloc, record.*);
             },
@@ -2535,11 +2535,16 @@ pub const RaftApplyStore = struct {
     }
 
     fn getTableByNameTxn(self: *RaftApplyStore, alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, name: []const u8) !?metadata.TableRecord {
+        return self.getTableByNameResultTxn(metadata.TableRecord, alloc, txn, group_id, name);
+    }
+
+    fn getTableByNameResultTxn(self: *RaftApplyStore, comptime Result: type, alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, name: []const u8) !?Result {
+        _ = self;
         var name_buf: [640]u8 = undefined;
         const encoded_id = txn.get(try tableNameIndexKey(&name_buf, group_id, name)) catch |err| switch (err) {
             error.NotFound => {
-                const tables = try self.listTablesTxn(alloc, txn, group_id);
-                defer self.freeTables(alloc, tables);
+                const tables = try listPhysicalTableIdentities(alloc, txn, group_id);
+                defer freePhysicalTableIdentities(alloc, tables);
                 for (tables) |table| if (std.mem.eql(u8, table.name, name)) return error.InvalidDerivedCatalogIndex;
                 return null;
             },
@@ -2552,30 +2557,27 @@ pub const RaftApplyStore = struct {
             error.NotFound => return error.InvalidDerivedCatalogIndex,
             else => return err,
         };
-        const table = try decodeTableRecord(alloc, bytes);
-        errdefer metadata_table_manager.freeTable(alloc, table);
+        const table: Result = if (Result == metadata.TableRecord) try decodeTableRecord(alloc, bytes) else try decodeTableIdentity(alloc, bytes);
+        errdefer if (Result == metadata.TableRecord) metadata_table_manager.freeTable(alloc, table) else table.deinit(alloc);
         if (!std.mem.eql(u8, table.name, name)) return error.InvalidDerivedCatalogIndex;
         return table;
     }
 
-    pub fn nativeCatalogSnapshot(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !native_catalog_storage.OwnedState {
+    pub fn systemCatalogSnapshot(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !system_catalog_storage.OwnedState {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
-        return native_catalog_storage.loadState(alloc, &txn, group_id);
+        return system_catalog_storage.loadState(alloc, &txn, group_id);
     }
 
-    pub fn validateNativeCatalog(self: *RaftApplyStore, group_id: u64, command: NativeCatalogCommand) !void {
+    pub fn validateSystemCatalog(self: *RaftApplyStore, group_id: u64, command: SystemCatalogCommand) !void {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
-        var snapshot = try native_catalog_storage.loadState(self.alloc, &txn, group_id);
+        var snapshot = try system_catalog_storage.loadState(self.alloc, &txn, group_id);
         defer snapshot.deinit();
         if (snapshot.meta.revision != command.expected_revision) return error.CatalogGenerationChanged;
-        const tables = try self.listTablesTxn(self.alloc, &txn, group_id);
-        defer self.freeTables(self.alloc, tables);
-        const physical = try self.alloc.alloc(native_catalog.PhysicalTable, tables.len);
-        defer self.alloc.free(physical);
-        for (tables, physical) |table, *item| item.* = .{ .id = table.table_id, .name = table.name };
-        var delta = try native_catalog.plan(self.alloc, snapshot.value, command.mutation, physical);
+        const physical = try listPhysicalTableIdentities(self.alloc, &txn, group_id);
+        defer freePhysicalTableIdentities(self.alloc, physical);
+        var delta = try system_catalog.plan(self.alloc, snapshot.value, command.mutation, physical);
         defer delta.deinit(self.alloc);
         if ((command.mutation.kind == .table and command.mutation.action == .create) != (command.topology != null)) return error.InvalidCatalogMutation;
         if (command.placement_update) |update| {
@@ -2593,25 +2595,49 @@ pub const RaftApplyStore = struct {
 
     /// Qualified point lookup shares one read transaction across name indexes
     /// and the physical table record. Caller owns the returned table record.
-    pub fn resolveNativeCatalogTable(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, target: native_catalog.Target) !?metadata.TableRecord {
-        return self.resolveNativeCatalogResult(metadata.TableRecord, alloc, group_id, target);
+    pub fn resolveSystemCatalogTable(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, target: system_catalog.Target) !?metadata.TableRecord {
+        return self.resolveSystemCatalogResult(metadata.TableRecord, alloc, group_id, target);
     }
 
-    pub fn resolveNativeCatalogIdentity(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, target: native_catalog.Target) !?native_catalog.ResolvedTable {
-        return self.resolveNativeCatalogResult(native_catalog.ResolvedTable, alloc, group_id, target);
+    pub fn resolveSystemCatalogIdentity(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, target: system_catalog.Target) !?system_catalog.ResolvedTable {
+        return self.resolveSystemCatalogResult(system_catalog.ResolvedTable, alloc, group_id, target);
     }
 
-    fn resolveNativeCatalogResult(self: *RaftApplyStore, comptime Result: type, alloc: std.mem.Allocator, group_id: u64, target: native_catalog.Target) !?Result {
+    fn resolveSystemCatalogResult(self: *RaftApplyStore, comptime Result: type, alloc: std.mem.Allocator, group_id: u64, target: system_catalog.Target) !?Result {
         try target.validate();
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
-        var database = try native_catalog_storage.find(alloc, &txn, group_id, .database, 0, target.database);
+        return self.resolveSystemCatalogResultTxn(Result, alloc, &txn, group_id, target);
+    }
+
+    pub fn resolveSystemCatalogIdentities(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.ResolveMany) !system_catalog.ResolvedMany {
+        if (request.targets.len > 256) return error.CatalogCommandTooLarge;
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        const meta = try system_catalog_storage.readMeta(alloc, &txn, group_id);
+        if (request.expected_revision) |expected| if (expected != meta.revision) return error.CatalogGenerationChanged;
+        const tables = try alloc.alloc(?system_catalog.ResolvedTable, request.targets.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (tables[0..initialized]) |table| if (table) |value| value.deinit(alloc);
+            alloc.free(tables);
+        }
+        for (request.targets, tables) |target, *table| {
+            table.* = try self.resolveSystemCatalogResultTxn(system_catalog.ResolvedTable, alloc, &txn, group_id, target);
+            initialized += 1;
+        }
+        return .{ .revision = meta.revision, .tables = tables };
+    }
+
+    fn resolveSystemCatalogResultTxn(self: *RaftApplyStore, comptime Result: type, alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, target: system_catalog.Target) !?Result {
+        try target.validate();
+        var database = try system_catalog_storage.find(alloc, txn, group_id, .database, 0, target.database);
         defer if (database) |*parsed| parsed.deinit();
-        const database_id = if (database) |parsed| parsed.value.id else if (std.mem.eql(u8, target.database, native_catalog.default_database_name)) native_catalog.default_database_id else return null;
-        var namespace = try native_catalog_storage.find(alloc, &txn, group_id, .namespace, database_id, target.namespace);
+        const database_id = if (database) |parsed| parsed.value.id else if (std.mem.eql(u8, target.database, system_catalog.default_database_name)) system_catalog.default_database_id else return null;
+        var namespace = try system_catalog_storage.find(alloc, txn, group_id, .namespace, database_id, target.namespace);
         defer if (namespace) |*parsed| parsed.deinit();
-        const namespace_id = if (namespace) |parsed| parsed.value.id else if (database_id == native_catalog.default_database_id and std.mem.eql(u8, target.namespace, native_catalog.default_namespace_name)) native_catalog.default_namespace_id else return null;
-        if (try native_catalog_storage.find(alloc, &txn, group_id, .table, namespace_id, target.table)) |value| {
+        const namespace_id = if (namespace) |parsed| parsed.value.id else if (database_id == system_catalog.default_database_id and std.mem.eql(u8, target.namespace, system_catalog.default_namespace_name)) system_catalog.default_namespace_id else return null;
+        if (try system_catalog_storage.find(alloc, txn, group_id, .table, namespace_id, target.table)) |value| {
             var binding = value;
             defer binding.deinit();
             var key_buf: [160]u8 = undefined;
@@ -2626,35 +2652,30 @@ pub const RaftApplyStore = struct {
             }
             return table;
         }
-        if (namespace_id != native_catalog.default_namespace_id) return null;
+        if (namespace_id != system_catalog.default_namespace_id) return null;
         // Existing default.public tables retain their original routing name.
-        const table = (try self.getTableByNameTxn(alloc, &txn, group_id, target.table)) orelse return null;
-        if (try native_catalog_storage.getById(alloc, &txn, group_id, .table, table.table_id)) |value| {
+        const table = (try self.getTableByNameResultTxn(Result, alloc, txn, group_id, target.table)) orelse return null;
+        if (try system_catalog_storage.getById(alloc, txn, group_id, .table, table.table_id)) |value| {
             var binding = value;
             binding.deinit();
-            metadata_table_manager.freeTable(alloc, table);
+            if (Result == metadata.TableRecord) metadata_table_manager.freeTable(alloc, table) else table.deinit(alloc);
             return null;
         }
-        if (Result == metadata.TableRecord) return table;
-        defer metadata_table_manager.freeTable(alloc, table);
-        return try native_catalog.ResolvedTable.fromTable(table).clone(alloc);
+        return table;
     }
 
-    fn applyNativeCatalogTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
-        if (bytes.len > native_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
-        var parsed = try std.json.parseFromSlice(NativeCatalogCommand, self.alloc, bytes, .{});
+    fn applySystemCatalogTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
+        if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+        var parsed = try std.json.parseFromSlice(SystemCatalogCommand, self.alloc, bytes, .{});
         defer parsed.deinit();
         const command = parsed.value;
         if (command.version != 1) return error.InvalidCatalogMutation;
-        var snapshot = try native_catalog_storage.loadState(self.alloc, txn, group_id);
+        var snapshot = try system_catalog_storage.loadState(self.alloc, txn, group_id);
         defer snapshot.deinit();
         if (snapshot.meta.revision != command.expected_revision) return;
-        const tables = try self.listTablesTxn(self.alloc, txn, group_id);
-        defer self.freeTables(self.alloc, tables);
-        const physical = try self.alloc.alloc(native_catalog.PhysicalTable, tables.len);
-        defer self.alloc.free(physical);
-        for (tables, physical) |table, *item| item.* = .{ .id = table.table_id, .name = table.name };
-        var delta = native_catalog.plan(self.alloc, snapshot.value, command.mutation, physical) catch |err| switch (err) {
+        const physical = try listPhysicalTableIdentities(self.alloc, txn, group_id);
+        defer freePhysicalTableIdentities(self.alloc, physical);
+        var delta = system_catalog.plan(self.alloc, snapshot.value, command.mutation, physical) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return, // A concurrent catalog/topology operation defeated admission.
         };
@@ -2683,18 +2704,18 @@ pub const RaftApplyStore = struct {
         }
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
-        try native_catalog_storage.applyDelta(self.alloc, txn, group_id, delta, snapshot.meta, hash);
+        try system_catalog_storage.applyDelta(self.alloc, txn, group_id, delta, snapshot.meta, hash);
         // Invalidate metadata readers through the existing catalog event path.
         self.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = group_id });
     }
 
-    fn removeNativeCatalogTableTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !void {
-        if (try native_catalog_storage.getById(self.alloc, txn, group_id, .table, table_id)) |value| {
+    fn removeSystemCatalogTableTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !void {
+        if (try system_catalog_storage.getById(self.alloc, txn, group_id, .table, table_id)) |value| {
             var binding = value;
             defer binding.deinit();
-            const previous = try native_catalog_storage.readMeta(self.alloc, txn, group_id);
-            var removes = [_]native_catalog.Resource{binding.value};
-            try native_catalog_storage.applyDelta(self.alloc, txn, group_id, .{ .upserts = &.{}, .removes = &removes, .next_id = previous.next_id }, previous, @splat(0));
+            const previous = try system_catalog_storage.readMeta(self.alloc, txn, group_id);
+            var removes = [_]system_catalog.Resource{binding.value};
+            try system_catalog_storage.applyDelta(self.alloc, txn, group_id, .{ .upserts = &.{}, .removes = &removes, .next_id = previous.next_id }, previous, @splat(0));
         }
     }
 
@@ -2702,6 +2723,33 @@ pub const RaftApplyStore = struct {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
         return try self.listTablesTxn(alloc, &txn, group_id);
+    }
+
+    /// The cursor lends record bytes; only identities survive each cursor step.
+    /// Catalog DDL must not copy every table's schema into the apply arena.
+    fn listPhysicalTableIdentities(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) ![]system_catalog.PhysicalTable {
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try tablePrefixForGroup(&prefix_buf, group_id);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var records = std.ArrayListUnmanaged(system_catalog.PhysicalTable).empty;
+        errdefer {
+            for (records.items) |record| alloc.free(record.name);
+            records.deinit(alloc);
+        }
+        var entry = try cursor.seekAtOrAfter(prefix);
+        while (entry) |kv| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+            const identity = try decodeTableIdentity(alloc, kv.value);
+            errdefer identity.deinit(alloc);
+            try records.append(alloc, .{ .id = identity.table_id, .name = identity.name });
+        }
+        return records.toOwnedSlice(alloc);
+    }
+
+    fn freePhysicalTableIdentities(alloc: std.mem.Allocator, records: []system_catalog.PhysicalTable) void {
+        for (records) |record| alloc.free(record.name);
+        alloc.free(records);
     }
 
     fn listTablesTxn(
@@ -4035,7 +4083,7 @@ pub const RaftApplyStore = struct {
 
     const MetadataSnapshotKeyFn = *const fn ([]u8, u64) anyerror![]const u8;
     const MetadataSnapshotProjection = enum {
-        native_catalog,
+        system_catalog,
         metadata_incarnation,
         split_transition,
         merge_transition,
@@ -4069,7 +4117,7 @@ pub const RaftApplyStore = struct {
         key: MetadataSnapshotKey,
     };
     const metadata_snapshot_projections = [_]MetadataSnapshotProjectionDescriptor{
-        .{ .projection = .native_catalog, .key = .{ .prefix = native_catalog_storage.prefixForGroup } },
+        .{ .projection = .system_catalog, .key = .{ .prefix = system_catalog_storage.prefixForGroup } },
         .{ .projection = .metadata_incarnation, .key = .{ .point = metadataIncarnationKeyForGroup } },
         .{ .projection = .split_transition, .key = .{ .prefix = splitTransitionPrefixForGroup } },
         .{ .projection = .merge_transition, .key = .{ .prefix = mergeTransitionPrefixForGroup } },
@@ -4104,7 +4152,7 @@ pub const RaftApplyStore = struct {
     /// without classifying its durable output is therefore a compile error.
     fn transitionCommandProjectionMask(tag: std.meta.Tag(TransitionCommand)) u32 {
         return switch (tag) {
-            .apply_native_catalog => metadataSnapshotProjectionBit(.native_catalog) |
+            .apply_system_catalog => metadataSnapshotProjectionBit(.system_catalog) |
                 metadataSnapshotProjectionBit(.table) | metadataSnapshotProjectionBit(.range) |
                 metadataSnapshotProjectionBit(.table_transition_fence) | metadataSnapshotProjectionBit(.catalog_revision),
             .initialize_metadata_incarnation => metadataSnapshotProjectionBit(.metadata_incarnation) |
@@ -4114,9 +4162,9 @@ pub const RaftApplyStore = struct {
             .upsert_store, .register_store, .remove_store => metadataSnapshotProjectionBit(.store),
             .upsert_replica_intent, .remove_replica_intent => metadataSnapshotProjectionBit(.placement) |
                 metadataSnapshotProjectionBit(.placement_version),
-            .upsert_table, .compare_and_replace_table, .remove_table => metadataSnapshotProjectionBit(.native_catalog) | metadataSnapshotProjectionBit(.table) |
+            .upsert_table, .compare_and_replace_table, .remove_table => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) |
                 metadataSnapshotProjectionBit(.catalog_revision),
-            .apply_table_topology => metadataSnapshotProjectionBit(.native_catalog) | metadataSnapshotProjectionBit(.table) |
+            .apply_table_topology => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) |
                 metadataSnapshotProjectionBit(.range) |
                 metadataSnapshotProjectionBit(.catalog_revision),
             .upsert_schema_progress, .remove_schema_progress => metadataSnapshotProjectionBit(.schema_progress),
@@ -4544,7 +4592,7 @@ pub const RaftApplyStore = struct {
     fn applyTransitionCommandTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, command: TransitionCommand) !void {
         try validateTransitionCommandDataGroupIds(command);
         switch (command) {
-            .apply_native_catalog => |bytes| try self.applyNativeCatalogTxn(txn, group_id, bytes),
+            .apply_system_catalog => |bytes| try self.applySystemCatalogTxn(txn, group_id, bytes),
             .initialize_metadata_incarnation => |incarnation| {
                 if (!metadata_incarnation.isValid(incarnation)) return error.InvalidMetadataIncarnation;
                 var key_buf: [160]u8 = undefined;
@@ -4695,7 +4743,7 @@ pub const RaftApplyStore = struct {
                 if (fence.active() or
                     fence.generation != record.expected_transition_generation)
                     return;
-                try self.removeNativeCatalogTableTxn(txn, group_id, record.table_id);
+                try self.removeSystemCatalogTableTxn(txn, group_id, record.table_id);
                 const existing_table_name = try self.lookupTableNameTxn(txn, group_id, record.table_id);
                 defer if (existing_table_name) |name| self.alloc.free(name);
                 var key_buf: [160]u8 = undefined;
@@ -5492,7 +5540,7 @@ pub const RaftApplyStore = struct {
                     try self.deleteTableRangeIndexTxn(txn, group_id, drop.table_id, range_group_id);
                     try self.deleteActiveRestoreRangeIndexTxn(txn, group_id, range_group_id);
                 }
-                try self.removeNativeCatalogTableTxn(txn, group_id, drop.table_id);
+                try self.removeSystemCatalogTableTxn(txn, group_id, drop.table_id);
                 try txn.delete(table_key);
                 try self.deleteTableNameIndexTxn(txn, group_id, existing.name);
                 try self.advanceTableTransitionGenerationWithRangeChangesTxn(
@@ -7040,7 +7088,7 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 }
 
 const TransitionTag = enum(u8) {
-    apply_native_catalog = 52,
+    apply_system_catalog = 52,
     initialize_metadata_incarnation = 45,
     upsert_node = 1,
     remove_node = 2,
@@ -7099,9 +7147,9 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
 
     try out.appendSlice(alloc, transition_magic);
     switch (command) {
-        .apply_native_catalog => |bytes| {
-            if (bytes.len > native_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
-            try out.append(alloc, @intFromEnum(TransitionTag.apply_native_catalog));
+        .apply_system_catalog => |bytes| {
+            if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+            try out.append(alloc, @intFromEnum(TransitionTag.apply_system_catalog));
             try appendRequiredString(alloc, &out, bytes);
         },
         .initialize_metadata_incarnation => |incarnation| {
@@ -7396,9 +7444,9 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
     pos += 1;
 
     return switch (tag) {
-        .apply_native_catalog => blk: {
-            if (encoded.len > native_catalog.max_command_bytes + 16) return error.CatalogCommandTooLarge;
-            break :blk .{ .apply_native_catalog = try readRequiredString(alloc, encoded, &pos) };
+        .apply_system_catalog => blk: {
+            if (encoded.len > system_catalog.max_command_bytes + 16) return error.CatalogCommandTooLarge;
+            break :blk .{ .apply_system_catalog = try readRequiredString(alloc, encoded, &pos) };
         },
         .initialize_metadata_incarnation => blk: {
             if (pos + @sizeOf(metadata_incarnation.MetadataClusterIncarnation) != encoded.len) {
@@ -7853,7 +7901,7 @@ fn decodeMergeTransitionRecord(alloc: std.mem.Allocator, encoded: []const u8) !m
 
 /// Every released table-record encoding shares the identity prefix. Validate
 /// the length-framed tail without allocating or interpreting its definition.
-fn decodeTableIdentity(alloc: std.mem.Allocator, encoded: []const u8) !native_catalog.ResolvedTable {
+fn decodeTableIdentity(alloc: std.mem.Allocator, encoded: []const u8) !system_catalog.ResolvedTable {
     var pos: usize = 0;
     const table_id = try readInt(encoded, &pos, u64);
     _ = try readInt(encoded, &pos, u16); // replicas
@@ -9075,11 +9123,17 @@ fn appendPlacementIntent(
     try appendInt(alloc, out, u64, intent.relocation_target_sequence);
     try appendInt(alloc, out, u64, intent.relocation_applied_sequence);
     if (intent.record.backup_restore_bootstrap) |backup| {
-        if (backup.native_manifest_size_bytes != 0 or backup.native_manifest_sha256.len != 0) {
+        if (backup.native_manifest_size_bytes != 0 or backup.native_manifest_sha256.len != 0 or backup.destination_table_name.len != 0) {
             // Appended after the legacy placement payload so older decoders
             // ignore it rather than misreading it as serving/relocation state.
             try appendInt(alloc, out, u64, backup.native_manifest_size_bytes);
             try appendRequiredString(alloc, out, backup.native_manifest_sha256);
+            if (backup.destination_table_name.len != 0) {
+                try appendRequiredString(alloc, out, backup.destination_table_name);
+                try appendInt(alloc, out, u64, backup.destination_table_id);
+                try appendInt(alloc, out, u64, backup.destination_shard_id);
+                try appendInt(alloc, out, u64, backup.destination_range_id);
+            }
         }
     }
 }
@@ -10131,6 +10185,14 @@ fn readPlacementIntent(
         errdefer alloc.free(native_manifest_sha256);
         backup_restore_bootstrap.?.native_manifest_size_bytes = native_manifest_size_bytes;
         backup_restore_bootstrap.?.native_manifest_sha256 = native_manifest_sha256;
+        if (pos.* < encoded.len) {
+            const destination_name = try readRequiredString(alloc, encoded, pos);
+            errdefer alloc.free(destination_name);
+            backup_restore_bootstrap.?.destination_table_id = try readInt(encoded, pos, u64);
+            backup_restore_bootstrap.?.destination_shard_id = try readInt(encoded, pos, u64);
+            backup_restore_bootstrap.?.destination_range_id = try readInt(encoded, pos, u64);
+            backup_restore_bootstrap.?.destination_table_name = destination_name;
+        }
         backup_restore_bootstrap.?.validate() catch
             return error.InvalidMetadataTransitionEncoding;
     }
@@ -14941,6 +15003,10 @@ test "metadata raft apply store projects backup restore bootstrap source in plac
                     .local_node_id = 7,
                     .bootstrap_mode = .fetch_snapshot,
                     .backup_restore_bootstrap = .{
+                        .destination_table_name = "docs",
+                        .destination_table_id = 51,
+                        .destination_shard_id = 5201,
+                        .destination_range_id = 5201,
                         .backup_id = "snap-5201",
                         .artifact_backup_id = "snap-5201",
                         .location = "file:///tmp/backups",
@@ -14992,6 +15058,10 @@ test "metadata raft apply store projects backup restore bootstrap source in plac
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             intents[0].record.backup_restore_bootstrap.?.artifact_sha256,
         );
+        try std.testing.expectEqualStrings("docs", intents[0].record.backup_restore_bootstrap.?.destination_table_name);
+        try std.testing.expectEqual(@as(u64, 51), intents[0].record.backup_restore_bootstrap.?.destination_table_id);
+        try std.testing.expectEqual(@as(u64, 5201), intents[0].record.backup_restore_bootstrap.?.destination_shard_id);
+        try std.testing.expectEqual(@as(u64, 5201), intents[0].record.backup_restore_bootstrap.?.destination_range_id);
         try std.testing.expectEqual(@as(u64, 2048), intents[0].record.backup_restore_bootstrap.?.native_manifest_size_bytes);
         try std.testing.expectEqualStrings(
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -15738,61 +15808,83 @@ const restore_job_logical_prefix = "\x00\x00__api_restore_jobs__:";
 const max_restore_job_logical_key_bytes: usize = 128;
 const max_restore_job_value_bytes: usize = 64 * 1024;
 
-fn applyNativeCatalogTestCommand(store: *RaftApplyStore, index: u64, command: NativeCatalogCommand) !void {
+fn applySystemCatalogTestCommand(store: *RaftApplyStore, index: u64, command: SystemCatalogCommand) !void {
     const alloc = std.testing.allocator;
     const json = try std.json.Stringify.valueAlloc(alloc, command, .{});
     defer alloc.free(json);
-    const encoded = try encodeTransitionCommand(alloc, .{ .apply_native_catalog = json });
+    const encoded = try encodeTransitionCommand(alloc, .{ .apply_system_catalog = json });
     defer alloc.free(encoded);
     var decoded = (try decodeTransitionCommand(alloc, encoded)).?;
     defer decoded.deinit(alloc);
-    try std.testing.expectEqualStrings(json, decoded.apply_native_catalog);
+    try std.testing.expectEqualStrings(json, decoded.apply_system_catalog);
     const entries = try raft_state_machine.encodeCommittedEntries(alloc, &.{.{ .term = 1, .index = index, .entry_type = .normal, .data = encoded }});
     defer alloc.free(entries);
     try store.snapshotBuilder().applyBatch(.{ .group_id = 21, .commit_index = index, .entries_bytes = entries });
 }
 
-test "native catalog publishes names and table topology atomically and fences stale mutations" {
+test "system catalog publishes names and table topology atomically and fences stale mutations" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/native-catalog", .{tmp.sub_path});
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/antfly-system-catalog", .{tmp.sub_path});
     defer alloc.free(root);
     var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
     defer store.deinit();
-    try applyNativeCatalogTestCommand(&store, 1, .{ .expected_revision = 0, .mutation = .{ .action = .create, .kind = .database, .name = "analytics" } });
+    try applySystemCatalogTestCommand(&store, 1, .{ .expected_revision = 0, .mutation = .{ .action = .create, .kind = .database, .name = "analytics" } });
     const large_description = [_]u8{'x'} ** (256 * 1024);
     const table: metadata.TableRecord = .{ .table_id = 42, .name = "table:42", .description = &large_description, .min_ranges = 1 };
     const ranges = [_]metadata.RangeRecord{.{ .table_id = 42, .group_id = 301, .range_id = 301, .start_key = "" }};
-    try applyNativeCatalogTestCommand(&store, 2, .{ .expected_revision = 1, .mutation = .{ .action = .create, .kind = .table, .name = "events", .database = "analytics", .table_id = 42, .storage_name = "table:42" }, .topology = .{ .create = .{ .expected_transition_generation = 0, .table = table, .ranges = &ranges } } });
+    try applySystemCatalogTestCommand(&store, 2, .{ .expected_revision = 1, .mutation = .{ .action = .create, .kind = .table, .name = "events", .database = "analytics", .table_id = 42, .storage_name = "table:42" }, .topology = .{ .create = .{ .expected_transition_generation = 0, .table = table, .ranges = &ranges } } });
     {
-        const resolved = (try store.resolveNativeCatalogTable(alloc, 21, .{ .database = "analytics", .table = "events" })).?;
+        const resolved = (try store.resolveSystemCatalogTable(alloc, 21, .{ .database = "analytics", .table = "events" })).?;
         defer metadata_table_manager.freeTable(alloc, resolved);
         try std.testing.expectEqual(@as(u64, 42), resolved.table_id);
         try std.testing.expectEqualStrings("table:42", resolved.name);
+    }
+    {
+        const targets = [_]system_catalog.Target{ .{ .database = "analytics", .table = "events" }, .{ .database = "analytics", .table = "missing" } };
+        const resolved = try store.resolveSystemCatalogIdentities(alloc, 21, .{ .targets = &targets, .expected_revision = 2 });
+        defer resolved.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 2), resolved.revision);
+        try std.testing.expectEqual(@as(u64, 42), resolved.tables[0].?.table_id);
+        try std.testing.expect(resolved.tables[1] == null);
+        try std.testing.expectError(error.CatalogGenerationChanged, store.resolveSystemCatalogIdentities(alloc, 21, .{ .targets = &targets, .expected_revision = 1 }));
     }
     // The hot-path response must neither serialize nor allocate the table's
     // potentially large definition. Its allocator budget is independent of it.
     {
         var buffer: [16 * 1024]u8 = undefined;
         var bounded = std.heap.FixedBufferAllocator.init(&buffer);
-        const identity = (try store.resolveNativeCatalogIdentity(bounded.allocator(), 21, .{ .database = "analytics", .table = "events" })).?;
+        const identity = (try store.resolveSystemCatalogIdentity(bounded.allocator(), 21, .{ .database = "analytics", .table = "events" })).?;
         const encoded = try std.json.Stringify.valueAlloc(alloc, identity, .{});
         defer alloc.free(encoded);
         try std.testing.expectEqualStrings("{\"table_id\":42,\"name\":\"table:42\"}", encoded);
     }
-    try applyNativeCatalogTestCommand(&store, 3, .{ .expected_revision = 2, .mutation = .{ .action = .rename, .kind = .database, .name = "analytics", .new_name = "reports" } });
-    try std.testing.expectEqual(@as(?metadata.TableRecord, null), try store.resolveNativeCatalogTable(alloc, 21, .{ .database = "analytics", .table = "events" }));
-    const renamed = (try store.resolveNativeCatalogTable(alloc, 21, .{ .database = "reports", .table = "events" })).?;
+    {
+        // Administrative inventory has the same schema-independent allocation
+        // bound as point resolution, including the cursor's borrowed values.
+        var buffer: [16 * 1024]u8 = undefined;
+        var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+        var txn = try store.store.beginReadTxn();
+        defer txn.abort();
+        const physical = try RaftApplyStore.listPhysicalTableIdentities(bounded.allocator(), &txn, 21);
+        defer RaftApplyStore.freePhysicalTableIdentities(bounded.allocator(), physical);
+        try std.testing.expectEqual(@as(usize, 1), physical.len);
+        try std.testing.expectEqual(@as(u64, 42), physical[0].id);
+        try std.testing.expectEqualStrings("table:42", physical[0].name);
+    }
+    try applySystemCatalogTestCommand(&store, 3, .{ .expected_revision = 2, .mutation = .{ .action = .rename, .kind = .database, .name = "analytics", .new_name = "reports" } });
+    try std.testing.expectEqual(@as(?metadata.TableRecord, null), try store.resolveSystemCatalogTable(alloc, 21, .{ .database = "analytics", .table = "events" }));
+    const renamed = (try store.resolveSystemCatalogTable(alloc, 21, .{ .database = "reports", .table = "events" })).?;
     defer metadata_table_manager.freeTable(alloc, renamed);
     try std.testing.expectEqual(@as(u64, 42), renamed.table_id);
     // The predecessor catalog revision cannot admit a destructive mutation.
-    try applyNativeCatalogTestCommand(&store, 4, .{ .expected_revision = 2, .mutation = .{ .action = .create, .kind = .database, .name = "stale" } });
-    var snapshot = try store.nativeCatalogSnapshot(alloc, 21);
+    try applySystemCatalogTestCommand(&store, 4, .{ .expected_revision = 2, .mutation = .{ .action = .create, .kind = .database, .name = "stale" } });
+    var snapshot = try store.systemCatalogSnapshot(alloc, 21);
     defer snapshot.deinit();
     try std.testing.expectEqual(@as(u64, 3), snapshot.meta.revision);
     try std.testing.expect(snapshot.value.find(.database, 0, "stale") == null);
-    try std.testing.expectError(error.DatabaseNotEmpty, store.validateNativeCatalog(21, .{ .expected_revision = 3, .mutation = .{ .action = .drop, .kind = .database, .name = "reports" } }));
+    try std.testing.expectError(error.DatabaseNotEmpty, store.validateSystemCatalog(21, .{ .expected_revision = 3, .mutation = .{ .action = .drop, .kind = .database, .name = "reports" } }));
     const snapshot_bytes = try store.snapshotBuilder().buildSnapshot(alloc, 21);
     defer alloc.free(snapshot_bytes);
     store.deinit();
@@ -15803,7 +15895,7 @@ test "native catalog publishes names and table topology atomically and fences st
     defer restored.deinit();
     try std.testing.expect(try restored.snapshotBuilder().installSnapshot(alloc, 21, 4, snapshot_bytes));
     for ([_]*RaftApplyStore{ &store, &restored }) |reader| {
-        const found = (try reader.resolveNativeCatalogTable(alloc, 21, .{ .database = "reports", .table = "events" })).?;
+        const found = (try reader.resolveSystemCatalogTable(alloc, 21, .{ .database = "reports", .table = "events" })).?;
         defer metadata_table_manager.freeTable(alloc, found);
         try std.testing.expectEqual(@as(u64, 42), found.table_id);
         try std.testing.expectEqualStrings("table:42", found.name);
@@ -15812,10 +15904,10 @@ test "native catalog publishes names and table topology atomically and fences st
     {
         var txn = try restored.store.beginWriteTxn();
         errdefer txn.abort();
-        const key = try native_catalog_storage.nameKeyAlloc(alloc, 21, .database, 0, "reports");
+        const key = try system_catalog_storage.nameKeyAlloc(alloc, 21, .database, 0, "reports");
         defer alloc.free(key);
         try txn.delete(key);
         try txn.commit();
     }
-    try std.testing.expectError(error.InvalidCatalogRecord, restored.resolveNativeCatalogTable(alloc, 21, .{ .database = "reports", .table = "events" }));
+    try std.testing.expectError(error.InvalidCatalogRecord, restored.resolveSystemCatalogTable(alloc, 21, .{ .database = "reports", .table = "events" }));
 }

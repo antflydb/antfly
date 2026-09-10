@@ -19593,7 +19593,7 @@ const RemoteMetadataSource = struct {
             .ptr = self,
             .routing = self.catalogSource().routingSource() catch unreachable,
             .vtable = &.{
-                .native_catalog = remoteNativeCatalog,
+                .system_catalog = remoteSystemCatalog,
                 .status = remoteStatus,
                 .admin_snapshot = remoteAdminSnapshot,
                 .cached_admin_snapshot = remoteCachedAdminSnapshot,
@@ -20566,9 +20566,50 @@ const RemoteMetadataSource = struct {
         return last_err;
     }
 
-    fn remoteNativeCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.public_api.operation.RequestContext, input: @import("../catalog/domain.zig").Call) ![]u8 {
+    fn readSystemCatalog(self: *RemoteMetadataSource, alloc: std.mem.Allocator, request: antfly.public_api.operation.RequestContext, input: @import("../system_catalog/domain.zig").Call) ![]u8 {
+        try request.ensureActive();
+        const started = self.awakeNs();
+        var budget_ns: u64 = @as(u64, antfly.public_api.raft_mutation_forwarding.max_remaining_ms) * std.time.ns_per_ms;
+        if (request.deadline_ns) |deadline| {
+            const now: u64 = if (request.deadline_io) |borrow| blk: {
+                var receiver = try borrow.receive();
+                break :blk @intCast(@max(0, std.Io.Clock.awake.now(receiver.io()).nanoseconds));
+            } else @import("antfly_platform").time.monotonicNs();
+            budget_ns = @min(budget_ns, deadline -| now);
+        }
+        const deadline = started +| budget_ns;
+        var last_err: anyerror = error.MissingMetadataApi;
+        for (0..self.base_uris.len) |attempt| {
+            try request.ensureActive();
+            const remaining_ns = deadline -| self.awakeNs();
+            if (remaining_ns == 0) return error.DeadlineExceeded;
+            const index = self.metadataApiIndexForAttempt(attempt);
+            var client = self.metadataClient(alloc);
+            var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(request.cancellation);
+            const read = client.readSystemCatalog(self.base_uris[index], input, @intCast(@max(1, remaining_ns / std.time.ns_per_ms)), &cancellation) catch |err| {
+                switch (err) {
+                    error.InvalidCatalogName, error.CatalogNotFound, error.CatalogGenerationChanged, error.CatalogCommandTooLarge, error.OutOfMemory => return err,
+                    else => {
+                        last_err = err;
+                        continue;
+                    },
+                }
+            };
+            self.acceptMetadataIdentity(read.metadata_group_id, read.metadata_incarnation) catch |err| {
+                read.deinit(alloc);
+                last_err = err;
+                continue;
+            };
+            self.noteMetadataAuthoritySuccess(index);
+            return read.body;
+        }
+        return last_err;
+    }
+
+    fn remoteSystemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.public_api.operation.RequestContext, input: @import("../system_catalog/domain.zig").Call) ![]u8 {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         try request.ensureActive();
+        if (input != .mutate) return self.readSystemCatalog(alloc, request, input);
         // Even ambiguous writes may have committed new topology. Invalidate
         // cached snapshots without automatically replaying the mutation.
         defer if (input == .mutate) self.invalidateCache();
@@ -20590,7 +20631,7 @@ const RemoteMetadataSource = struct {
                     if (now >= deadline) return error.DeadlineExceeded;
                     bounded.remaining_ms = @intCast(@min(bounded.remaining_ms, @max(1, (deadline - now) / std.time.ns_per_ms)));
                 }
-                const bytes = try client.forwardNativeCatalog(base_uri, ctx.input, bounded);
+                const bytes = try client.forwardSystemCatalog(base_uri, ctx.input, bounded);
                 defer client.alloc.free(bytes);
                 return ctx.alloc.dupe(u8, bytes) catch |err| {
                     if (ctx.input == .mutate) return error.MetadataMutationOutcomeUnknown;
@@ -35583,6 +35624,36 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         ) !antfly.common.http.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const snapshot = self.snapshot orelse return .{ .status = 503 };
+            // This fixture owns metadata directly. Serve the same compact
+            // read contract as production instead of relying on data caches
+            // to stand in for the catalog authority.
+            if (std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog")) {
+                const catalog = @import("../system_catalog/domain.zig");
+                const parsed = try std.json.parseFromSlice(catalog.Call, response_alloc, request.body, .{});
+                defer parsed.deinit();
+                const body = switch (parsed.value) {
+                    .snapshot => try std.json.Stringify.valueAlloc(response_alloc, catalog.State{ .revision = snapshot.status.metadata_epoch }, .{}),
+                    .resolve => |target| try std.json.Stringify.valueAlloc(response_alloc, resolve(snapshot, target), .{}),
+                    .resolve_many => |input| blk: {
+                        if (input.expected_revision) |revision| if (revision != snapshot.status.metadata_epoch) return .{ .status = 409 };
+                        const tables = try response_alloc.alloc(?catalog.ResolvedTable, input.targets.len);
+                        defer response_alloc.free(tables);
+                        for (input.targets, tables) |target, *table| table.* = resolve(snapshot, target);
+                        break :blk try std.json.Stringify.valueAlloc(response_alloc, catalog.ResolvedMany{ .revision = snapshot.status.metadata_epoch, .tables = tables }, .{});
+                    },
+                    .mutate => return error.UnexpectedCatalogMutation,
+                };
+                errdefer response_alloc.free(body);
+                const headers = try response_alloc.alloc(antfly.common.http.Header, 2);
+                errdefer response_alloc.free(headers);
+                headers[0] = .{ .name = try response_alloc.dupe(u8, "x-antfly-catalog-metadata-group"), .value = &.{} };
+                errdefer headers[0].deinit(response_alloc);
+                headers[0].value = try std.fmt.allocPrint(response_alloc, "{d}", .{snapshot.status.metadata_group_id});
+                headers[1] = .{ .name = try response_alloc.dupe(u8, "x-antfly-catalog-metadata-incarnation"), .value = &.{} };
+                errdefer headers[1].deinit(response_alloc);
+                headers[1].value = try response_alloc.dupe(u8, &snapshot.status.metadata_incarnation.?);
+                return .{ .status = 200, .body = body, .headers = headers };
+            }
             if (std.mem.endsWith(u8, request.uri, antfly.metadata_http_routes.Routes.capabilities)) {
                 return .{
                     .status = 200,
@@ -35632,6 +35703,11 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                 };
             }
             return .{ .status = 404 };
+        }
+        fn resolve(snapshot: *const antfly.metadata_api.AdminSnapshot, target: @import("../system_catalog/domain.zig").Target) ?@import("../system_catalog/domain.zig").ResolvedTable {
+            if (!target.isDefault()) return null;
+            for (snapshot.tables) |table| if (std.mem.eql(u8, table.name, target.table)) return .{ .table_id = table.table_id, .name = table.name };
+            return null;
         }
     };
     var metadata = Metadata{};

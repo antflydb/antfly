@@ -20,12 +20,30 @@ pub const GetSubjectRowFilterPathParams = struct {
     table: []const u8,
 };
 
+pub const GetSubjectRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
+};
+
 /// Set row filter for an auth subject on a table
 pub const SetSubjectRowFilterPathParams = struct {
     /// Casbin subject name, such as role:tenant_reader or group:eng.
     subject: []const u8,
     /// Table name (or '*' for all tables).
     table: []const u8,
+};
+
+pub const SetSubjectRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
 };
 
 /// Parse the JSON request body for setSubjectRowFilter.
@@ -39,6 +57,15 @@ pub const RemoveSubjectRowFilterPathParams = struct {
     subject: []const u8,
     /// Table name (or '*' for all tables).
     table: []const u8,
+};
+
+pub const RemoveSubjectRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
 };
 
 /// Get user details
@@ -128,6 +155,9 @@ pub const RemovePermissionFromUserParams = struct {
     resource: []const u8,
     /// The type of the resource for the permission to be removed.
     resource_type: []const u8,
+    database: ?[]const u8 = null,
+    namespace: ?[]const u8 = null,
+    all_tables: ?[]const u8 = null,
 };
 
 /// List user roles
@@ -172,12 +202,30 @@ pub const GetRowFilterPathParams = struct {
     table: []const u8,
 };
 
+pub const GetRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
+};
+
 /// Set row filter for a user on a table
 pub const SetRowFilterPathParams = struct {
     /// The username.
     user_name: []const u8,
     /// Table name (or '*' for all tables).
     table: []const u8,
+};
+
+pub const SetRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
 };
 
 /// Parse the JSON request body for setRowFilter.
@@ -191,6 +239,15 @@ pub const RemoveRowFilterPathParams = struct {
     user_name: []const u8,
     /// Table name (or '*' for all tables).
     table: []const u8,
+};
+
+pub const RemoveRowFilterParams = struct {
+    /// Explicit database; defaults to default when namespace is supplied.
+    database: ?[]const u8 = null,
+    /// Explicit namespace; defaults to public when database is supplied.
+    namespace: ?[]const u8 = null,
+    /// Select all tables in the explicit namespace instead of the literal path table.
+    all_tables: ?[]const u8 = null,
 };
 
 /// Route metadata for all operations.
@@ -327,7 +384,12 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn getSubjectRowFilter(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const subject = ctx.param("subject") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: subject" });
             const table = ctx.param("table") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table" });
-            return impl.getSubjectRowFilter(ctx, subject, table);
+            const query_params = GetSubjectRowFilterParams{
+                .database = try ctx.queryDecoded("database"),
+                .namespace = try ctx.queryDecoded("namespace"),
+                .all_tables = try ctx.queryDecoded("all_tables"),
+            };
+            return impl.getSubjectRowFilter(ctx, subject, table, query_params);
         }
 
         /// Set row filter for an auth subject on a table
@@ -335,7 +397,12 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn setSubjectRowFilter(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const subject = ctx.param("subject") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: subject" });
             const table = ctx.param("table") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table" });
-            return impl.setSubjectRowFilter(ctx, subject, table);
+            const query_params = SetSubjectRowFilterParams{
+                .database = try ctx.queryDecoded("database"),
+                .namespace = try ctx.queryDecoded("namespace"),
+                .all_tables = try ctx.queryDecoded("all_tables"),
+            };
+            return impl.setSubjectRowFilter(ctx, subject, table, query_params);
         }
 
         /// Remove row filter for an auth subject on a table
@@ -343,7 +410,12 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn removeSubjectRowFilter(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const subject = ctx.param("subject") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: subject" });
             const table = ctx.param("table") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table" });
-            return impl.removeSubjectRowFilter(ctx, subject, table);
+            const query_params = RemoveSubjectRowFilterParams{
+                .database = try ctx.queryDecoded("database"),
+                .namespace = try ctx.queryDecoded("namespace"),
+                .all_tables = try ctx.queryDecoded("all_tables"),
+            };
+            return impl.removeSubjectRowFilter(ctx, subject, table, query_params);
         }
 
         /// List all users
@@ -423,6 +495,9 @@ pub fn ServerRouter(comptime Impl: type) type {
             const query_params = RemovePermissionFromUserParams{
                 .resource = (try ctx.queryDecoded("resource")) orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: resource" }),
                 .resource_type = (try ctx.queryDecoded("resourceType")) orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: resourceType" }),
+                .database = try ctx.queryDecoded("database"),
+                .namespace = try ctx.queryDecoded("namespace"),
+                .all_tables = try ctx.queryDecoded("all_tables"),
             };
             return impl.removePermissionFromUser(ctx, user_name, query_params);
         }
@@ -463,7 +538,12 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn getRowFilter(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const user_name = ctx.param("userName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: userName" });
             const table = ctx.param("table") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table" });
-            return impl.getRowFilter(ctx, user_name, table);
+            const query_params = GetRowFilterParams{
+                .database = try ctx.queryDecoded("database"),
+                .namespace = try ctx.queryDecoded("namespace"),
+                .all_tables = try ctx.queryDecoded("all_tables"),
+            };
+            return impl.getRowFilter(ctx, user_name, table, query_params);
         }
 
         /// Set row filter for a user on a table
@@ -471,7 +551,12 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn setRowFilter(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const user_name = ctx.param("userName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: userName" });
             const table = ctx.param("table") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table" });
-            return impl.setRowFilter(ctx, user_name, table);
+            const query_params = SetRowFilterParams{
+                .database = try ctx.queryDecoded("database"),
+                .namespace = try ctx.queryDecoded("namespace"),
+                .all_tables = try ctx.queryDecoded("all_tables"),
+            };
+            return impl.setRowFilter(ctx, user_name, table, query_params);
         }
 
         /// Remove row filter for a user on a table
@@ -479,7 +564,12 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn removeRowFilter(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const user_name = ctx.param("userName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: userName" });
             const table = ctx.param("table") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: table" });
-            return impl.removeRowFilter(ctx, user_name, table);
+            const query_params = RemoveRowFilterParams{
+                .database = try ctx.queryDecoded("database"),
+                .namespace = try ctx.queryDecoded("namespace"),
+                .all_tables = try ctx.queryDecoded("all_tables"),
+            };
+            return impl.removeRowFilter(ctx, user_name, table, query_params);
         }
     };
 }
@@ -489,9 +579,9 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn getCurrentUser(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listAuthSubjects(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listSubjectRowFilters(self: *Impl, ctx: *httpx.Context, subject: []const u8) !httpx.Response
-//   fn getSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8) !httpx.Response
-//   fn setSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8) !httpx.Response
-//   fn removeSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8) !httpx.Response
+//   fn getSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8, params: GetSubjectRowFilterParams) !httpx.Response
+//   fn setSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8, params: SetSubjectRowFilterParams) !httpx.Response
+//   fn removeSubjectRowFilter(self: *Impl, ctx: *httpx.Context, subject: []const u8, table: []const u8, params: RemoveSubjectRowFilterParams) !httpx.Response
 //   fn listUsers(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getUserByName(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
 //   fn createUser(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
@@ -507,6 +597,6 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn addRoleToUser(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
 //   fn removeRoleFromUser(self: *Impl, ctx: *httpx.Context, user_name: []const u8, params: RemoveRoleFromUserParams) !httpx.Response
 //   fn listRowFilters(self: *Impl, ctx: *httpx.Context, user_name: []const u8) !httpx.Response
-//   fn getRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8) !httpx.Response
-//   fn setRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8) !httpx.Response
-//   fn removeRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8) !httpx.Response
+//   fn getRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8, params: GetRowFilterParams) !httpx.Response
+//   fn setRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8, params: SetRowFilterParams) !httpx.Response
+//   fn removeRowFilter(self: *Impl, ctx: *httpx.Context, user_name: []const u8, table: []const u8, params: RemoveRowFilterParams) !httpx.Response

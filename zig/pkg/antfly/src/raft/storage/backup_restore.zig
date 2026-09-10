@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const native_catalog = @import("../../catalog/domain.zig");
+const system_catalog = @import("../../system_catalog/domain.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
 const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const backups_api = @import("../../api/backups.zig");
@@ -538,7 +538,14 @@ pub fn applyBackupRestoreFromRecordWithOptions(
         .open_options = open_options,
     };
     if (try publishedRestoreAlreadyApplied(alloc, path, group_id, source)) return;
-    try applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, source, .{});
+    try applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, source, .{
+        .expected_table_name = if (restore.destination_table_name.len > 0) restore.destination_table_name else null,
+        .expected_identity_namespace = if (restore.destination_table_id != 0) .{
+            .table_id = restore.destination_table_id,
+            .shard_id = restore.destination_shard_id,
+            .range_id = restore.destination_range_id,
+        } else null,
+    });
 }
 
 fn prepareRestoreSnapshotIfNeeded(
@@ -580,7 +587,7 @@ fn prepareRestoreSnapshotIfNeeded(
     // the isolated, integrity-validated candidate; serving generations and
     // ordinary repair opens retain their exact namespace checks.
     if (options.expected_table_name) |name| {
-        if ((try native_catalog.restoreTarget(name)) != null) {
+        if (try system_catalog.isRestoreTarget(name)) {
             if (options.expected_identity_namespace) |namespace| {
                 try restore.cancellation.check();
                 const open_options = try preparedRestoreOpenOptionsForRepair(&prepared, restore, options);
@@ -619,7 +626,7 @@ fn prepareRestoreSnapshot(
     try backups_api.validateRestoreManifest(alloc, manifest, restore.backup_id);
     if (options.expected_table_name) |table_name| {
         if (!std.mem.eql(u8, manifest.table_name, table_name) and
-            (native_catalog.restoreTarget(table_name) catch null) == null)
+            !(system_catalog.isRestoreTarget(table_name) catch false))
         {
             std.log.err("restore manifest validation failed phase=table_identity class=mismatch", .{});
             return error.InvalidBackupRequest;
@@ -677,6 +684,9 @@ fn prepareRestoreSnapshot(
         path,
         .{
             .identity_namespace = options.expected_identity_namespace,
+            // The isolated candidate is rebound after integrity validation.
+            // Ordinary restore/repair opens keep exact namespace validation.
+            .prefer_existing_identity_namespace = if (options.expected_table_name) |name| try system_catalog.isRestoreTarget(name) else false,
             .backend_runtime = restore.backend_runtime,
         },
     );
@@ -757,6 +767,9 @@ fn applyManifestNativeRestore(
         staged_generation.livePath(),
         .{
             .identity_namespace = options.expected_identity_namespace,
+            // The isolated candidate is rebound after integrity validation.
+            // Ordinary restore/repair opens keep exact namespace validation.
+            .prefer_existing_identity_namespace = if (options.expected_table_name) |name| try system_catalog.isRestoreTarget(name) else false,
             .backend_runtime = restore.backend_runtime,
         },
     );

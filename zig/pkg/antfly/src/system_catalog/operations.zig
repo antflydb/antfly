@@ -12,7 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Transport-independent native catalog admission, capability fencing, and
+//! Transport-independent system catalog admission, capability fencing, and
 //! exact receipt completion. Logical and physical table identities are separate.
 const std = @import("std");
 const domain = @import("domain.zig");
@@ -29,15 +29,15 @@ pub const Request = domain.Request;
 pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: Request) !void {
     try context.ensureActive();
     if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.native_catalog_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.system_catalog_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    var snapshot = try store.nativeCatalogSnapshot(alloc, svc.metadata_group_id);
+    var snapshot = try store.systemCatalogSnapshot(alloc, svc.metadata_group_id);
     defer snapshot.deinit();
-    var command: storage.NativeCatalogCommand = .{ .expected_revision = snapshot.meta.revision, .mutation = request.mutation };
+    var command: storage.SystemCatalogCommand = .{ .expected_revision = snapshot.meta.revision, .mutation = request.mutation };
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -45,7 +45,7 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
         const json = request.create_table_json orelse return error.InvalidCatalogMutation;
         var req = try tables_api.parseStoredCreateTableRequest(a, json);
         const storage_name = request.physical_name orelse try std.fmt.allocPrint(a, "table:{d}", .{snapshot.meta.next_id});
-        if (!std.mem.startsWith(u8, storage_name, "table:") or storage_name.len > 512) return error.InvalidCatalogMutation;
+        if (!std.mem.startsWith(u8, storage_name, "table:") or storage_name.len > 1024) return error.InvalidCatalogMutation;
         req.indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(a, storage_name, req.indexes_json orelse tables_api.default_indexes_json, tables_api.effectiveSchemaJson(req.schema_json));
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(a, req.indexes_json.?);
         try managed_embedder.validateEmbeddingProducerOwnershipJson(a, req.indexes_json.?);
@@ -68,7 +68,7 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
     } else if (request.create_table_json != null) return error.InvalidCatalogMutation;
     if (request.mutation.action == .set_tablespace and request.mutation.kind == .table) {
         const target: domain.Target = .{ .database = request.mutation.database, .namespace = request.mutation.namespace, .table = request.mutation.name };
-        const current = (try store.resolveNativeCatalogTable(a, svc.metadata_group_id, target)) orelse return error.TableNotFound;
+        const current = (try store.resolveSystemCatalogTable(a, svc.metadata_group_id, target)) orelse return error.TableNotFound;
         const namespace = try snapshot.value.namespaceFor(target.database, target.namespace);
         const explicit = if (request.mutation.tablespace) |name| (snapshot.value.find(.tablespace, 0, name) orelse return error.TablespaceNotFound).id else 0;
         const policy = if (try snapshot.value.effectiveTablespace(namespace, explicit)) |tablespace| tablespace.placement_policy else domain.PlacementPolicy{};
@@ -78,13 +78,13 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
         replacement.min_ranges = policy.min_ranges orelse 1;
         command.placement_update = .{ .expected = current, .replacement = replacement };
     }
-    try store.validateNativeCatalog(svc.metadata_group_id, command);
+    try store.validateSystemCatalog(svc.metadata_group_id, command);
     const bytes = try std.json.Stringify.valueAlloc(a, command, .{});
     if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
     try context.ensureActive();
-    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_native_catalog = bytes });
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_system_catalog = bytes });
     svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
-    var observed = store.nativeCatalogSnapshot(alloc, svc.metadata_group_id) catch return error.MetadataMutationOutcomeUnknown;
+    var observed = store.systemCatalogSnapshot(alloc, svc.metadata_group_id) catch return error.MetadataMutationOutcomeUnknown;
     defer observed.deinit();
     var expected_hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &expected_hash, .{});
@@ -95,7 +95,7 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
 pub fn snapshotJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext) ![]u8 {
     try svc.ensureLinearizableReadWithContext(context);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    var snapshot = try store.nativeCatalogSnapshot(alloc, svc.metadata_group_id);
+    var snapshot = try store.systemCatalogSnapshot(alloc, svc.metadata_group_id);
     defer snapshot.deinit();
     return std.json.Stringify.valueAlloc(alloc, snapshot.value, .{});
 }
@@ -103,7 +103,7 @@ pub fn snapshotJson(svc: anytype, alloc: std.mem.Allocator, context: operation.R
 pub fn resolve(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, target: domain.Target) !?table_manager.TableRecord {
     try svc.ensureLinearizableReadWithContext(context);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    return store.resolveNativeCatalogTable(alloc, svc.metadata_group_id, target);
+    return store.resolveSystemCatalogTable(alloc, svc.metadata_group_id, target);
 }
 
 pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: domain.Call) ![]u8 {
@@ -112,9 +112,16 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         .resolve => |target| blk: {
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-            const table = try store.resolveNativeCatalogIdentity(alloc, svc.metadata_group_id, target);
+            const table = try store.resolveSystemCatalogIdentity(alloc, svc.metadata_group_id, target);
             defer if (table) |value| value.deinit(alloc);
             break :blk std.json.Stringify.valueAlloc(alloc, table, .{});
+        },
+        .resolve_many => |request| blk: {
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            const result = try store.resolveSystemCatalogIdentities(alloc, svc.metadata_group_id, request);
+            defer result.deinit(alloc);
+            break :blk std.json.Stringify.valueAlloc(alloc, result, .{});
         },
         .mutate => |request| blk: {
             try mutate(svc, alloc, context, request);
@@ -126,13 +133,13 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
 /// Publish the restored physical incarnation and its logical binding together.
 /// Job retries are accepted only when both projections match exactly.
 pub fn restore(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, target: domain.Target, table: table_manager.TableRecord, source_ranges: []const table_manager.RangeRecord) !void {
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.native_catalog_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.system_catalog_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    var snapshot = try store.nativeCatalogSnapshot(alloc, svc.metadata_group_id);
+    var snapshot = try store.systemCatalogSnapshot(alloc, svc.metadata_group_id);
     defer snapshot.deinit();
     const admission = try svc.captureTableRestoreAdmission(alloc, table);
     const ranges = try @import("../metadata/table_topology_mutations.zig").deriveRestoreDestinationRanges(alloc, table, source_ranges, admission.incarnation_generation);
@@ -141,24 +148,24 @@ pub fn restore(svc: anytype, alloc: std.mem.Allocator, context: operation.Reques
         alloc.free(ranges);
     }
     if (admission.already_applied) {
-        const bound = (try store.resolveNativeCatalogTable(alloc, svc.metadata_group_id, target)) orelse return error.MetadataMutationOutcomeUnknown;
+        const bound = (try store.resolveSystemCatalogTable(alloc, svc.metadata_group_id, target)) orelse return error.MetadataMutationOutcomeUnknown;
         defer table_manager.freeTable(alloc, bound);
         if (bound.table_id != table.table_id) return error.TableAlreadyExists;
         return svc.verifyTableCreateProjection(alloc, table, ranges);
     }
-    const command: storage.NativeCatalogCommand = .{
+    const command: storage.SystemCatalogCommand = .{
         .expected_revision = snapshot.meta.revision,
         .mutation = .{ .action = .create, .kind = .table, .database = target.database, .namespace = target.namespace, .name = target.table, .table_id = table.table_id, .storage_name = table.name },
         .topology = .{ .create = .{ .expected_transition_generation = admission.expected_transition_generation, .table = table, .ranges = ranges } },
     };
-    try store.validateNativeCatalog(svc.metadata_group_id, command);
+    try store.validateSystemCatalog(svc.metadata_group_id, command);
     const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
     defer alloc.free(bytes);
     if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
     try context.ensureActive();
-    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_native_catalog = bytes });
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_system_catalog = bytes });
     svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
-    const bound = (store.resolveNativeCatalogTable(alloc, svc.metadata_group_id, target) catch return error.MetadataMutationOutcomeUnknown) orelse return error.MetadataMutationOutcomeUnknown;
+    const bound = (store.resolveSystemCatalogTable(alloc, svc.metadata_group_id, target) catch return error.MetadataMutationOutcomeUnknown) orelse return error.MetadataMutationOutcomeUnknown;
     defer table_manager.freeTable(alloc, bound);
     if (bound.table_id != table.table_id) return error.MetadataMutationOutcomeUnknown;
     svc.verifyTableCreateProjection(alloc, table, ranges) catch return error.MetadataMutationOutcomeUnknown;

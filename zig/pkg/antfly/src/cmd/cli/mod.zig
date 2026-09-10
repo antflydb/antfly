@@ -158,6 +158,10 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
 pub fn printCommandUsage(command: []const u8) void {
     const usage = commandUsage(command) orelse return;
     std.debug.print("{s}", .{usage});
+    for ([_][]const u8{ "table", "index", "query", "lookup", "load", "insert", "delete", "backup", "restore" }) |name| if (std.mem.eql(u8, command, name)) {
+        std.debug.print("\nTable scope: --database NAME --namespace NAME (defaults: default/public).\nTable names are literal; dots do not select a namespace.\n", .{});
+        break;
+    };
 }
 
 pub fn takeUniqueValue(

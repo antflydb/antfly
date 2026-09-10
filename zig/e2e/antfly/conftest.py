@@ -94,6 +94,33 @@ def finish_create_table(api, table_name: str, response, *, timeout_s: float = 30
     )
 
 
+def annotate_metadata_table_names(
+    snapshot: dict[str, Any], public_api_urls: list[str], *, timeout_s: float = 1.0
+) -> dict[str, Any]:
+    """Join public labels to physical metadata by immutable ID for diagnostics.
+
+    Keep ``name`` untouched: internal mutation routes must use storage names.
+    Polling callers retry if public catalog visibility is temporarily behind.
+    """
+    if not any(
+        str(table.get("name", "")).startswith("table:")
+        for table in snapshot.get("tables", [])
+    ):
+        return snapshot
+    for base in public_api_urls:
+        try:
+            response = requests.get(base.rstrip("/") + "/tables", timeout=timeout_s)
+            response.raise_for_status()
+            names = {int(table["table_id"]): table["name"] for table in response.json()}
+            for table in snapshot.get("tables", []):
+                if int(table.get("table_id", 0)) in names:
+                    table["logical_name"] = names[int(table["table_id"])]
+            return snapshot
+        except (requests.RequestException, ValueError, KeyError, TypeError):
+            continue
+    return snapshot
+
+
 E2E_BACKUP_CONNECTION = "e2e-backups"
 ANTFLY_PUBLIC_API_ROOT = "/db/v1"
 ANTFLY_INTERNAL_API_ROOT = "/internal/v1"
@@ -645,7 +672,11 @@ def ready_serverless_build_status(status: dict[str, Any]) -> dict[str, Any] | No
 
 
 def _wait_for_restore_job(
-    get_job: Callable[[str], Any], accepted: dict[str, Any], *, timeout_s: float = 120.0
+    get_job: Callable[[str], Any],
+    accepted: dict[str, Any],
+    *,
+    timeout_s: float = 120.0,
+    debug_logs: Callable[[], str] | None = None,
 ) -> dict[str, Any]:
     job_id = accepted.get("job_id")
     if not isinstance(job_id, str) or not job_id:
@@ -661,7 +692,8 @@ def _wait_for_restore_job(
             return result if isinstance(result, dict) else job
         if phase in {"failed", "cancelled"}:
             raise AssertionError(
-                f"restore job {job_id} ended in {phase}: {job.get('error')}"
+                f"restore job {job_id} ended in {phase}: {job.get('error')}\n"
+                f"{debug_logs() if debug_logs else ''}"
             )
         if time.monotonic() >= deadline:
             raise AssertionError(
@@ -2899,7 +2931,8 @@ def stateful_api(request: pytest.FixtureRequest):
                 raise AssertionError(
                     "artifact corruption is only available for locally managed stateful servers"
                 )
-            internal_url = f"{server.url}{antfly_internal_api_path(f'/tables/{table_name}/corrupt-embedding-artifact')}"
+            encoded_name = quote(table_name, safe="")
+            internal_url = f"{server.url}{antfly_internal_api_path(f'/tables/{encoded_name}/corrupt-embedding-artifact')}"
             try:
                 with self._request_lock:
                     self._check(
@@ -2907,6 +2940,7 @@ def stateful_api(request: pytest.FixtureRequest):
                             internal_url,
                             headers=internal_service_headers(),
                             json={
+                                "logical_table": True,
                                 "doc_key": doc_key,
                                 "index_name": index_name,
                             },
@@ -3100,7 +3134,9 @@ def stateful_api(request: pytest.FixtureRequest):
                         timeout=120,
                     )
                 accepted = self._check(response)
-                return _wait_for_restore_job(self.get, accepted)
+                return _wait_for_restore_job(
+                    self.get, accepted, debug_logs=self.debug_logs
+                )
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
@@ -3144,7 +3180,9 @@ def stateful_api(request: pytest.FixtureRequest):
                     accepted = self._check(
                         self.s.post(f"{self.url}/restore", json=payload, timeout=120)
                     )
-                return _wait_for_restore_job(self.get, accepted)
+                return _wait_for_restore_job(
+                    self.get, accepted, debug_logs=self.debug_logs
+                )
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
@@ -3361,11 +3399,6 @@ def stateful_api(request: pytest.FixtureRequest):
 
         def delete_index(self, table_name: str, index_name: str) -> dict:
             return self.delete(f"/tables/{table_name}/indexes/{index_name}")
-
-        def debug_logs(self) -> str:
-            if self._server is None:
-                return ""
-            return self._server.debug_logs().strip()
 
     api = PublicApi(session, base, server)
     yield api
@@ -3719,7 +3752,9 @@ def backup_api(request: pytest.FixtureRequest):
                         timeout=120,
                     )
                 accepted = self._check(response)
-                return _wait_for_restore_job(self.get, accepted)
+                return _wait_for_restore_job(
+                    self.get, accepted, debug_logs=self.debug_logs
+                )
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
@@ -3763,7 +3798,9 @@ def backup_api(request: pytest.FixtureRequest):
                     accepted = self._check(
                         self.s.post(f"{self.url}/restore", json=payload, timeout=120)
                     )
-                return _wait_for_restore_job(self.get, accepted)
+                return _wait_for_restore_job(
+                    self.get, accepted, debug_logs=self.debug_logs
+                )
             except requests.RequestException as err:
                 self._raise_request_error(err)
 

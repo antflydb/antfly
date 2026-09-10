@@ -13,12 +13,33 @@ pub const ApiKey = struct {
     username: []const u8,
     /// Optional permission scoping. If empty, inherits owner's full permissions.
     permissions: OpenApiOptionalNullable([]const Permission) = .absent,
+    scoped_row_filters: ?[]const ScopedRowFilter = null,
     /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
     row_filter: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
     /// When the API key was created.
     created_at: []const u8,
     /// When the API key expires. Null means never.
     expires_at: OpenApiOptionalNullable([]const u8) = .absent,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "key_id", "key_id", false },
+        .{ "name", "name", false },
+        .{ "username", "username", false },
+        .{ "permissions", "permissions", false },
+        .{ "scoped_row_filters", "scoped_row_filters", true },
+        .{ "row_filter", "row_filter", false },
+        .{ "created_at", "created_at", false },
+        .{ "expires_at", "expires_at", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -38,6 +59,10 @@ pub const ApiKey = struct {
                 try jw.objectField("permissions");
                 try jw.write(value);
             },
+        }
+        if (self.scoped_row_filters) |value| {
+            try jw.objectField("scoped_row_filters");
+            try jw.write(value);
         }
         switch (self.row_filter) {
             .absent => {},
@@ -77,6 +102,7 @@ pub const ApiKeyWithSecret = struct {
     username: []const u8,
     /// Optional permission scoping. If empty, inherits owner's full permissions.
     permissions: OpenApiOptionalNullable([]const Permission) = .absent,
+    scoped_row_filters: ?[]const ScopedRowFilter = null,
     /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
     row_filter: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
     /// When the API key was created.
@@ -87,6 +113,28 @@ pub const ApiKeyWithSecret = struct {
     key_secret: []const u8,
     /// Pre-encoded credential ready for the Authorization header: base64(key_id:key_secret).
     encoded: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "key_id", "key_id", false },
+        .{ "name", "name", false },
+        .{ "username", "username", false },
+        .{ "permissions", "permissions", false },
+        .{ "scoped_row_filters", "scoped_row_filters", true },
+        .{ "row_filter", "row_filter", false },
+        .{ "created_at", "created_at", false },
+        .{ "expires_at", "expires_at", false },
+        .{ "key_secret", "key_secret", false },
+        .{ "encoded", "encoded", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -106,6 +154,10 @@ pub const ApiKeyWithSecret = struct {
                 try jw.objectField("permissions");
                 try jw.write(value);
             },
+        }
+        if (self.scoped_row_filters) |value| {
+            try jw.objectField("scoped_row_filters");
+            try jw.write(value);
         }
         switch (self.row_filter) {
             .absent => {},
@@ -146,6 +198,45 @@ pub const AuthSubject = struct {
     kind: []const u8,
 };
 
+/// A table or all tables in an explicit namespace. A missing table selects the namespace; a table named '*' remains literal.
+pub const CatalogTableScope = struct {
+    database: ?[]const u8 = null,
+    namespace: ?[]const u8 = null,
+    table: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "database", "database", true },
+        .{ "namespace", "namespace", true },
+        .{ "table", "table", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.database) |value| {
+            try jw.objectField("database");
+            try jw.write(value);
+        }
+        if (self.namespace) |value| {
+            try jw.objectField("namespace");
+            try jw.write(value);
+        }
+        if (self.table) |value| {
+            try jw.objectField("table");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Request to create a new API key.
 pub const CreateApiKeyRequest = struct {
     /// Human-readable name for the API key.
@@ -154,6 +245,7 @@ pub const CreateApiKeyRequest = struct {
     expires_in: ?[]const u8 = null,
     /// Optional permission scoping. Each permission must be a subset of the creator's permissions.
     permissions: OpenApiOptionalNullable([]const Permission) = .absent,
+    scoped_row_filters: ?[]const ScopedRowFilter = null,
     /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
     row_filter: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
 
@@ -162,6 +254,7 @@ pub const CreateApiKeyRequest = struct {
         .{ "name", "name", false },
         .{ "expires_in", "expires_in", true },
         .{ "permissions", "permissions", false },
+        .{ "scoped_row_filters", "scoped_row_filters", true },
         .{ "row_filter", "row_filter", false },
     };
 
@@ -191,6 +284,10 @@ pub const CreateApiKeyRequest = struct {
                 try jw.objectField("permissions");
                 try jw.write(value);
             },
+        }
+        if (self.scoped_row_filters) |value| {
+            try jw.objectField("scoped_row_filters");
+            try jw.write(value);
         }
         switch (self.row_filter) {
             .absent => {},
@@ -319,11 +416,46 @@ pub const Error = struct {
     }
 };
 
+/// Specify exactly one of a legacy literal resource or a structured table_target; table_target requires resource_type table.
 pub const Permission = struct {
     /// Resource name (e.g., table name, target username, or '*' for all inference operations or a global grant).
-    resource: []const u8,
+    resource: ?[]const u8 = null,
+    table_target: ?CatalogTableScope = null,
     resource_type: ResourceType,
     type: PermissionType,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "resource", "resource", true },
+        .{ "table_target", "table_target", true },
+        .{ "resource_type", "resource_type", false },
+        .{ "type", "type", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.resource) |value| {
+            try jw.objectField("resource");
+            try jw.write(value);
+        }
+        if (self.table_target) |value| {
+            try jw.objectField("table_target");
+            try jw.write(value);
+        }
+        try jw.objectField("resource_type");
+        try jw.write(self.resource_type);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Type of permission.
@@ -405,7 +537,41 @@ pub const RoleAssignment = struct {
 pub const RowFilterEntry = struct {
     /// Table name (or '*' for all tables).
     table: []const u8,
+    table_target: ?CatalogTableScope = null,
     /// Antfly query JSON that documents must match to be visible.
+    filter: std.json.ArrayHashMap(std.json.Value),
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "table", "table", false },
+        .{ "table_target", "table_target", true },
+        .{ "filter", "filter", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("table");
+        try jw.write(self.table);
+        if (self.table_target) |value| {
+            try jw.objectField("table_target");
+            try jw.write(value);
+        }
+        try jw.objectField("filter");
+        try jw.write(self.filter);
+        try jw.endObject();
+    }
+};
+
+pub const ScopedRowFilter = struct {
+    table_target: CatalogTableScope,
     filter: std.json.ArrayHashMap(std.json.Value),
 };
 

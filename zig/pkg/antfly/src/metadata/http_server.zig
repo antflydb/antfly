@@ -13,8 +13,8 @@
 // limitations.
 
 const std = @import("std");
-const native_catalog = @import("../catalog/domain.zig");
-const native_catalog_operations = @import("../catalog/operations.zig");
+const system_catalog = @import("../system_catalog/domain.zig");
+const system_catalog_operations = @import("../system_catalog/operations.zig");
 const ant_json = @import("antfly-json");
 const httpx = @import("httpx");
 const group_ids = @import("../common/group_ids.zig");
@@ -87,11 +87,11 @@ pub const ReplaceTableDefinitionRequest = struct {
 
 pub const ReseedExactCutoverResult = table_operations.ReseedExactCutoverResult;
 
-fn nativeCatalogServiceCall(comptime Service: type) *const fn (*anyopaque, std.mem.Allocator, operation.RequestContext, native_catalog.Call) anyerror![]u8 {
+fn systemCatalogServiceCall(comptime Service: type) *const fn (*anyopaque, std.mem.Allocator, operation.RequestContext, system_catalog.Call) anyerror![]u8 {
     return struct {
-        fn call(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, input: native_catalog.Call) ![]u8 {
+        fn call(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, input: system_catalog.Call) ![]u8 {
             const svc: *Service = @ptrCast(@alignCast(ptr));
-            return native_catalog_operations.call(svc, alloc, context, input);
+            return system_catalog_operations.call(svc, alloc, context, input);
         }
     }.call;
 }
@@ -101,7 +101,7 @@ pub const AdminSource = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        native_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, input: native_catalog.Call) anyerror![]u8 = null,
+        system_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, input: system_catalog.Call) anyerror![]u8 = null,
 
         head: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataHead = null,
         linearizable_head: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.MetadataHead = null,
@@ -500,7 +500,7 @@ pub const AdminSource = struct {
         return .{
             .ptr = svc,
             .vtable = &.{
-                .native_catalog = comptime nativeCatalogServiceCall(service.MetadataService),
+                .system_catalog = comptime systemCatalogServiceCall(service.MetadataService),
                 .head = metadataServiceHead,
                 .linearizable_head = metadataServiceLinearizableHead,
                 .linearizable_snapshot = metadataServiceLinearizableSnapshot,
@@ -561,7 +561,7 @@ pub const AdminSource = struct {
         return .{
             .ptr = svc,
             .vtable = &.{
-                .native_catalog = comptime nativeCatalogServiceCall(service.MetadataHttpService),
+                .system_catalog = comptime systemCatalogServiceCall(service.MetadataHttpService),
                 .head = metadataHttpServiceHead,
                 .linearizable_head = metadataHttpServiceLinearizableHead,
                 .linearizable_snapshot = metadataHttpServiceLinearizableSnapshot,
@@ -1660,7 +1660,7 @@ pub const MetadataHttpServer = struct {
         const node_path = routes.Routes.internal_nodes_prefix ++ ":node_id";
         try server.delete(node_path, httpx.Handler.bind(self, metadataFinalizeNodeShutdown));
         try server.post(node_path ++ routes.Routes.internal_node_status_suffix, httpx.Handler.bind(self, metadataReportNodeStatus));
-        try server.post("/internal/v1/catalog/native", httpx.Handler.bind(self, metadataNativeCatalog));
+        try server.post("/internal/v1/system-catalog", httpx.Handler.bind(self, metadataSystemCatalog));
         try server.post(routes.Routes.internal_catalog_publication_check, httpx.Handler.bind(self, metadataCatalogPublicationCheck));
         try server.post(routes.Routes.internal_catalog_table_publication_check, httpx.Handler.bind(self, metadataCatalogTablePublicationCheck));
         try server.post(routes.Routes.internal_catalog_group_retirement_check, httpx.Handler.bind(self, metadataCatalogGroupRetirementCheck));
@@ -1710,11 +1710,11 @@ pub const MetadataHttpServer = struct {
         try server.post(table_path ++ routes.Routes.internal_merge_suffix, httpx.Handler.bind(self, metadataRequestTableMerge));
     }
 
-    fn metadataNativeCatalog(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+    fn metadataSystemCatalog(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_not_proposed);
         const body = (try ctx.body()) orelse return ctx.status(400).text("missing body");
-        if (body.len > native_catalog.max_command_bytes) return ctx.status(413).text("catalog request too large");
-        var parsed = std.json.parseFromSlice(native_catalog.Call, ctx.allocator, body, .{}) catch return ctx.status(400).text("invalid catalog request");
+        if (body.len > system_catalog.max_command_bytes) return ctx.status(413).text("catalog request too large");
+        var parsed = std.json.parseFromSlice(system_catalog.Call, ctx.allocator, body, .{}) catch return ctx.status(400).text("invalid catalog request");
         defer parsed.deinit();
         const forwarding = (raft_mutation_forwarding.parseValues(
             ctx.header(routes.Routes.raft_mutation_remaining_ms_header),
@@ -1724,13 +1724,22 @@ pub const MetadataHttpServer = struct {
         ) catch return ctx.status(400).text("invalid forwarding context")) orelse return ctx.status(400).text("missing forwarding context");
         var context = requestContext(ctx);
         context.deadline_ns = platform_time.monotonicNs() +| @as(u64, forwarding.remaining_ms) * std.time.ns_per_ms;
-        const callback = self.source.vtable.native_catalog orelse return ctx.status(426).text("catalog upgrade required");
+        const callback = self.source.vtable.system_catalog orelse return ctx.status(426).text("catalog upgrade required");
+        const read_identity = if (parsed.value != .mutate) try self.source.vtable.status(self.source.ptr) else null;
         self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
         const response = callback(self.source.ptr, ctx.allocator, context, parsed.value) catch |err| {
             if (err == error.MetadataMutationOutcomeUnknown) try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_unknown);
-            return ctx.status(native_catalog.httpStatus(err)).text(@errorName(err));
+            return ctx.status(system_catalog.httpStatus(err)).text(@errorName(err));
         };
         defer ctx.allocator.free(response);
+        if (read_identity) |before| {
+            const after = try self.source.vtable.status(self.source.ptr);
+            if (before.metadata_group_id != after.metadata_group_id or !std.meta.eql(before.metadata_incarnation, after.metadata_incarnation))
+                return ctx.status(503).text("metadata identity changed during catalog read");
+            const incarnation = after.metadata_incarnation orelse return ctx.status(503).text("metadata incarnation unavailable");
+            try ctx.setHeader("x-antfly-catalog-metadata-group", try std.fmt.allocPrint(ctx.allocator, "{d}", .{after.metadata_group_id}));
+            try ctx.setHeader("x-antfly-catalog-metadata-incarnation", try ctx.allocator.dupe(u8, &incarnation));
+        }
         try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_committed);
         try ctx.setHeader("content-type", "application/json");
         _ = ctx.response.body(response);
@@ -3414,7 +3423,7 @@ fn loadRestoreMetadataSpec(
     if (manifest.artifact_integrity_mode != .declared)
         return error.BackupIntegrityMissing;
     if (!std.mem.eql(u8, manifest.table_name, table_name) and
-        (native_catalog.restoreTarget(table_name) catch null) == null) return error.InvalidBackupRequest;
+        !(system_catalog.isRestoreTarget(table_name) catch false)) return error.InvalidBackupRequest;
     const table = backups_api.deriveRestoreTableRecord(alloc, table_name, location_uri, manifest) catch {
         return error.InvalidBackupRequest;
     };

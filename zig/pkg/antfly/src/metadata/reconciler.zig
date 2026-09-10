@@ -1346,6 +1346,10 @@ fn backupRestoreBootstrapEqual(
         std.mem.eql(u8, a.?.location, b.?.location) and
         std.mem.eql(u8, a.?.snapshot_path, b.?.snapshot_path) and
         std.mem.eql(u8, a.?.connection, b.?.connection) and
+        std.mem.eql(u8, a.?.destination_table_name, b.?.destination_table_name) and
+        a.?.destination_table_id == b.?.destination_table_id and
+        a.?.destination_shard_id == b.?.destination_shard_id and
+        a.?.destination_range_id == b.?.destination_range_id and
         a.?.artifact_size_bytes == b.?.artifact_size_bytes and
         std.mem.eql(u8, a.?.artifact_sha256, b.?.artifact_sha256) and
         a.?.native_manifest_size_bytes == b.?.native_manifest_size_bytes and
@@ -1472,6 +1476,10 @@ fn normalizeRestoreBootstrapIntent(
         effective.record.bootstrap_mode = .fetch_snapshot;
         effective.record.snapshot_bootstrap = null;
         effective.record.backup_restore_bootstrap = .{
+            .destination_table_name = table.name,
+            .destination_table_id = table.table_id,
+            .destination_shard_id = table_manager.rangeDocIdentityShardId(range),
+            .destination_range_id = table_manager.rangeDocIdentityRangeId(range),
             .backup_id = range.restore_backup_id,
             .artifact_backup_id = range.restore_artifact_backup_id,
             .location = range.restore_location,

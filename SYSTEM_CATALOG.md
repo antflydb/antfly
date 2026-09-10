@@ -1,151 +1,199 @@
 # System Catalog Design
 
-Databases and namespaces group the existing document tables. The catalog is
-independent of SQL, relational rows, and lake storage. `default.public` exists
-for existing installations; short table names keep that scope.
+Antfly's system catalog owns databases, namespaces, table identities, and
+logical tablespaces. It is independent of SQL, relational rows, and the storage
+engine. PostgreSQL also calls its persistent database metadata [system
+catalogs](https://www.postgresql.org/docs/current/catalogs.html). SQL and other
+frontends should bind through this catalog rather than maintain separate name
+or placement authorities.
 
 ## Names and identity
 
-Use `/db/v1/databases/{database}/namespaces/{namespace}/tables/{table}` for an
-explicit target. Existing `/db/v1/tables/{table}` operations also accept
-`database.namespace.table` and `namespace.table` (in the default database).
-CLI `--table`, MCP `tableName`, and global query table names use these spellings.
-Names contain ASCII letters, digits, underscores, or hyphens, begin with a
-letter or underscore, and have at most 128 bytes per component.
+A table target is `{database, namespace, table}`. The defaults are `default`
+and `public`. String table names always mean a literal name in that default
+scope: `sales.archive`, `sales/archive`, `sales archive`, and `*` retain their
+meaning as table names. Strings are never split on dots. Table names retain the
+existing 1–255-byte contract excluding control bytes. Database, namespace, and
+tablespace names use 1–128 ASCII letters, digits, underscores, or hyphens,
+starting with a letter or underscore.
 
-Database, namespace, and table renames preserve IDs. A table's physical name,
-shard groups, stored destination grants, and storage remain stable. Public
-`TableStatus.table_id` is a decimal string so JavaScript clients retain all 64
-bits. Physical names are internal and cannot be supplied as public aliases.
-An old logical name stops resolving after rename.
+HTTP exposes explicit scope in
+`/db/v1/databases/{database}/namespaces/{namespace}/tables/{table}`. Each path
+component is percent-encoded independently and decoded exactly once. The legacy
+`/db/v1/tables/{table}` route selects `default.public`.
 
-Creating a database also creates its `public` namespace. Empty databases and
-namespaces can be dropped; a database drop also removes its empty namespaces.
-The compatibility database `default` and its `public` namespace are protected.
-
-## Lifecycle and placement
-
-The generated OpenAPI contract defines database, namespace, and tablespace
-create/list/drop operations, database and tablespace lookups, rename operations, and explicit table query,
-batch, document, index, backup, and restore routes. Rename uses
-`POST .../rename` with `{"name":"new_name"}`.
-
-Create a tablespace with `POST /db/v1/tablespaces/hot`:
+Global queries accept exactly one of `table` and `table_target`. Joins likewise
+accept exactly one of `right_table` and `right_target`:
 
 ```json
 {
-  "location_json": "null",
-  "placement_policy_json": "{\"placement_role\":\"data\",\"desired_replica_count\":3,\"min_ranges\":2}"
+  "table_target": {"database": "analytics", "table": "events"},
+  "full_text_search": {"match_all": {}},
+  "join": {
+    "right_target": {"database": "analytics", "table": "customers"},
+    "on": {"left_field": "customer_id", "right_field": "_id"}
+  }
 }
 ```
 
-Bind a database, namespace, or table with `PUT .../tablespace` and
-`{"tablespace_name":"hot"}`; `DELETE .../tablespace` clears that binding.
-A create-table body can set `tablespace_name` explicitly. Effective precedence
-is table, namespace, database, then the normal native defaults. An explicit
-`num_shards` overrides inherited `min_ranges` when creating a table.
+Database, namespace, and table renames preserve IDs. Native physical routing
+names are immutable and are not public aliases. Legacy tables keep their
+existing physical names; a literal name beginning with `table:` is valid when
+it actually names an independently cataloged table. Public `table_id` values
+are decimal strings so JavaScript clients preserve all 64 bits.
 
-Parent binding changes select defaults for future table creation. Changing an
-existing table's binding atomically updates its native placement policy; the
-normal reconciler performs any resulting placement work. Standalone retains its single local replica; Lite retains its single-range constraint. Clearing its binding
-reapplies inherited policy or native defaults. Placement roles must be nonempty
-name-like strings; replica counts are 1–255 and minimum ranges 1–1024.
-Tablespaces with references cannot be dropped. Renaming a tablespace preserves
-its bindings. `location_json` is opaque compatibility metadata: it does not
-redirect filesystem paths or choose a storage engine.
+Display labels use the literal name in `default.public`, and
+`database.namespace.table` elsewhere. These labels are presentation, not a
+parseable target format; two distinct structured targets can have the same
+label. Clients must retain structured targets when composing subsequent calls.
 
-## Authorization and durability
+Creating a database also creates its `public` namespace. Empty databases and
+namespaces can be dropped. The compatibility database and its public namespace
+are protected. Rename requires authority on both the old and new names.
 
-Permission resource types include `database`, `namespace`, and `tablespace`.
-Table permissions and row filters use `database.namespace.table`; an old short
-name refers to `default.public`. Table grants may use a terminal scoped wildcard
-such as `analytics.public.*`. Catalog mutations require admin authority on the
-resource; rename also requires authority on its destination name. Explicit
-policy selection requires read permission on that tablespace. Resolution occurs
-after authorization, and physical table grants/row filters exist only within
-the authorized request.
+## Binding and execution
+
+HTTP and A2A retrieval use the same query binding boundary.
+
+Public query admission authorizes logical references and applies their row
+filters before routing. It binds the primary table and every nested native
+join target in one linearizable catalog read transaction. Execution and retries
+retain those immutable physical identities. A rename or a drop/recreate cannot
+redirect an in-flight query to a replacement table. Foreign source aliases are
+resolved from the query's foreign-source map and remain separate from native
+catalog targets.
+
+The internal join worker envelope carries physical routing names and separate
+logical result labels. Workers consume the coordinator's binding; they do not
+resolve those names again. Plain query encoders receive the logical table label
+with the search request. Joined responses set it while assembling their existing
+response object. Neither path reparses a completed response just to rename its
+table field.
+
+An NDJSON request shares a resolver and catalog revision. It deduplicates
+repeated targets across lines while retaining per-line authorization. New
+references must resolve at the same revision; a concurrent catalog mutation
+returns a catalog-generation conflict instead of mixing views. This cache is
+request-owned, never a process-wide name cache with a time-based expiry.
+
+## Metadata reads and durability
 
 Catalog records, name indexes, revisions, and table topology commit through
-metadata Raft. Standalone persists the same logical state with table topology in
-its existing atomic catalog checkpoint and rollback boundary. A table create or restore publishes the binding and topology
-atomically. Snapshot installation and reopen retain the catalog. Native catalog
-admission requires topology protocol version 5 throughout the metadata group;
+metadata Raft. Standalone persists the same state in its atomic catalog
+checkpoint and rollback boundary. Create and restore publish table topology
+and the logical binding together. Reopen and snapshot installation retain the
+catalog. System catalog admission requires topology protocol version 5;
 existing atomic table operations retain their version-3 gate.
 
-An ambiguous mutation response carries the existing `unknown` outcome contract;
-observe state before retrying. A committed mutation whose local visibility is
-still converging can return HTTP 202. Qualified restore uses the existing
-restore job durability and cancellation machinery, with an immutable
-physical destination identity persisted in the job.
+Data nodes read the catalog directly from a remembered metadata endpoint,
+without a preceding status RPC. Each successful read returns metadata group and
+incarnation evidence. The reader validates it against its pinned identity and
+uses bounded endpoint failover, a shared deadline, and cancellation. Mutations
+retain the existing at-most-once forwarding and ambiguous-outcome rules.
 
-## Clients
+Indexed reads return only table ID and physical name. Compact binary decoding
+validates record framing without copying or decoding large schema and index
+definitions. Mutation inventories likewise read compact identities from a
+borrowed cursor. Missing name-index entries still check the inventory to
+distinguish absence from corruption; an index-integrity proof would be needed
+before safely eliminating that fallback.
 
-The Go and Python generated clients expose the new operations. The TypeScript
-SDK exposes all generated routes through its typed `client.api` accessor:
+Table listings build an identity map and select scope, prefix, and authorized
+tables before per-table status collection and public schema materialization.
+The administrative snapshot remains the source of topology information.
 
-```ts
-await client.api.POST("/db/v1/databases/{databaseName}", {
-  params: { path: { databaseName: "analytics" } },
-});
+## Grants and row filters
+
+Permissions use either legacy `resource` strings or a structured `table_target`,
+never both. A legacy `resource: "*"` remains a global wildcard. A structured
+scope without `table` means every table in that namespace; a structured scope
+with `table: "*"` means exactly the table named `*`.
+
+```json
+{
+  "resource_type": "table",
+  "table_target": {"database": "analytics", "namespace": "serving"},
+  "type": "read"
+}
 ```
 
-The CLI provides `database`, `namespace`, and `tablespace` commands, including
-rename and tablespace binding commands. Existing table and document commands
-accept qualified names, for example `--table analytics.public.events`.
+Internal policy keys use a reserved NUL prefix and length-framed components,
+which cannot collide with a valid literal table name. Public string inputs
+reject that prefix. API responses project keys back to structured targets.
+API-key permissions intersect the credential's scope with the owner's current
+permissions, including namespace scopes. Request-local physical aliases retain
+their logical authorization target for live revocation checks.
 
-## Regression coverage and lookup cost
+Legacy row-filter maps remain literal. API keys can also supply
+`scoped_row_filters`, each containing `table_target` and `filter`. Row-filter
+management routes accept explicit `database` and `namespace` query parameters;
+`all_tables=true` selects a namespace-wide filter. Exact table filters take
+precedence over namespace filters, then the global filter. Literal `*` and a
+wildcard scope remain distinct through storage, lookup, and removal.
 
-`zig/e2e/antfly/test_native_catalog.py` covers inherited and explicit placement,
-namespace isolation, index lifecycle, logical renames across restart, MCP
-resolution, and qualified restore with idempotency and maximum-length names.
-The catalog cases in `test_auth.py` run against both standalone and separate
-metadata/data processes, checking scoped permissions, row filters, NDJSON
-per-line authorization, and rename/drop behavior. They run in the regular
-Python E2E job.
+## Restore jobs
 
-The focused Zig targets are `native-catalog-test`, `native-catalog-api-test`, and
-`native-catalog-standalone-test`. The metadata, HTTP, and standalone test lanes
-also include their corresponding catalog regressions. Raft-store tests cover
-atomic topology/binding publication, stale revisions, reopen, snapshot install,
-and corruption checks. HTTP tests cover ambiguous outcomes, post-commit
-projection failures, and request-local aliases with live permission revocation.
+Restore jobs persist immutable destination identities. Admission intent is a
+bounded, URL-safe encoding of the structured target, allowing names with
+slashes, spaces, dots, or the full table-name length. The binding is published
+atomically with restored topology. Repeated idempotent admission retains the
+same destination identity.
 
-Positive indexed lookups return only the immutable table ID and physical name.
-The binary table-record reader validates length framing without copying or
-parsing schema/index definitions. A regression resolves a record with a 256 KiB
-definition using a 16 KiB allocation budget. Negative lookups check the catalog
-inventory to distinguish absence from a corrupt name index. Restore-job lists
-share one request-owned catalog snapshot and a physical-to-logical name map
-between authorization and rendering, including bindings for renamed legacy
-tables. A regression checks that 40 jobs use one snapshot and that a subsequent
-request reloads the projection before applying grants.
+Job listing and authorization share one request-owned catalog snapshot and a
+physical-to-logical map. Renamed legacy tables are included in this projection.
+Each new request refreshes the view; authorization uses canonical logical keys,
+and response labels never expose those keys. Existing durable job execution,
+leadership fencing, cancellation, and retention remain authoritative.
 
-The remaining performance opportunities below are code-path observations,
-not measured throughput claims:
+Cluster backup entries retain the immutable source storage name and a separate
+structured destination target. Backup listings render those targets even after
+the source catalog entries are deleted. Restore validates the source manifest,
+recreates the logical binding, and refuses to redirect an overwrite to a later
+reuse of the same name. Scoped destinations require their database and namespace
+to exist; table restore inherits the destination's current placement defaults.
+Native restores reassign identity only within an integrity-validated staged
+generation before publication. Ordinary opens retain exact identity checks.
+Repair and artifact-reprocessing job responses also project logical labels while
+retaining physical identities in their durable state.
 
-- Split-node resolution uses the mutation forwarding driver, which fetches
-  metadata status before the catalog RPC, even for reads. A direct read path
-  should return and validate authority/incarnation evidence and retain bounded
-  rediscovery on leader changes. Skipping identity checks or caching names with
-  a TTL would weaken the current correctness guarantees. Global NDJSON queries
-  currently repeat resolution per line.
-- Query-response name projection parses and serializes the entire response to
-  change its table label. Carrying the logical response name to the final
-  encoder would eliminate that second body traversal and allocation.
-- Namespace table listings collect status and construct responses for all
-  tables before filtering, then repeatedly scan catalog bindings. Select the
-  relevant identities first and join through a map before collecting status.
-- Catalog mutation validation and Raft apply decode all physical table
-  definitions to construct an identity inventory. An identity-only inventory
-  would reduce serialized metadata work for clusters with large schemas.
+## Tablespaces and placement
 
-These optimizations can be scoped independently of the optional M1–M3 refactors.
+Tablespaces are declarative placement policies. Effective precedence is table,
+namespace, database, then native defaults. Create bodies can explicitly select
+`tablespace_name`; explicit `num_shards` overrides inherited `min_ranges`.
 
-The public API smoke E2E currently exposes a correctness gap in joins: primary
-table routes resolve catalog names, but native right-hand join targets still
-reach physical table lookup unchanged. For example, joining `docs` to
-`customers` fails with `TableNotFound` after both tables are created through the
-catalog. Resolve all native join targets before planning and execution, while
-retaining logical names for authorization, row filters, and response labels;
-foreign-source targets must keep their existing semantics. This regression
-must be fixed before merge, independently of the performance work above.
+Parent binding changes affect defaults for future table creation. Explicitly
+changing an existing table's binding atomically changes its native placement
+policy, and the normal reconciler performs the placement work. Clearing a table
+binding reapplies inherited policy or native defaults. Standalone retains one
+local replica; Lite retains its single-range constraint.
+
+Tablespaces with references cannot be dropped. Renaming a tablespace preserves
+bindings. `location_json` remains opaque metadata: it does not migrate files or
+select a storage engine. A future physical-location feature needs its own
+versioned storage and migration contract.
+
+## Clients and validation
+
+Generated Go, Python, TypeScript, and Zig clients expose the scoped routes and
+structured query/grant types. TypeScript callers can use `client.api` directly.
+The CLI accepts `--database` and `--namespace` on table, index, query, lookup,
+load, insert, delete, backup, and restore commands, with `ANTFLY_DATABASE` and
+`ANTFLY_NAMESPACE` defaults. MCP table operations accept separate `database`,
+`namespace`, and literal `tableName` arguments.
+
+`zig/e2e/antfly/test_system_catalog.py` covers literal names, scoped joins,
+namespace isolation, placement, rename/restart, index lifecycle, MCP, and
+idempotent restore with maximum-length targets. Catalog cases in `test_auth.py`
+cover scoped grants and row filters on standalone and split metadata/data
+processes, NDJSON authorization, and literal-star permissions.
+
+Focused Zig targets are `antfly-system-catalog-test`, `antfly-system-catalog-api-test`, and
+`antfly-system-catalog-standalone-test`. Their regressions cover atomic publication,
+stale revisions, reopen and snapshot installation, corruption checks, compact
+allocation budgets, batched join binding, direct-read identity evidence, and
+request-local authorization projections. Client checks use `cmd-test` and
+`antfly-client-test`. The derived visibility deadline-clock regression remains
+in the storage enrichment lane and protects the Lite timeout fix.
+
+These contracts and optimizations do not depend on the optional M1–M3 refactors.

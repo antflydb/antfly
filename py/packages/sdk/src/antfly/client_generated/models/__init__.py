@@ -76,6 +76,8 @@ from .brave_search_config_freshness import BraveSearchConfigFreshness
 from .calendar_interval import CalendarInterval
 from .capability import Capability
 from .cardinality_mode import CardinalityMode
+from .catalog_table_scope import CatalogTableScope
+from .catalog_table_target import CatalogTableTarget
 from .catalog_tablespace_binding_request import CatalogTablespaceBindingRequest
 from .cdc_connection import CdcConnection
 from .chain_condition import ChainCondition
@@ -702,6 +704,7 @@ from .list_restore_jobs_scope import ListRestoreJobsScope
 from .list_users_response_200_item import ListUsersResponse200Item
 from .lookup_key_consistency import LookupKeyConsistency
 from .lookup_key_response_200 import LookupKeyResponse200
+from .lookup_namespace_table_document_consistency import LookupNamespaceTableDocumentConsistency
 from .lookup_namespace_table_document_response_200 import LookupNamespaceTableDocumentResponse200
 from .lsm_storage_status import LsmStorageStatus
 from .match_all_query import MatchAllQuery
@@ -843,7 +846,6 @@ from .restore_job_result_failure_details_item import RestoreJobResultFailureDeta
 from .restore_job_result_restore import RestoreJobResultRestore
 from .restore_job_result_status import RestoreJobResultStatus
 from .restore_job_scope import RestoreJobScope
-from .restore_namespace_table_response_202 import RestoreNamespaceTableResponse202
 from .restore_request import RestoreRequest
 from .retrieval_agent_request import RetrievalAgentRequest
 from .retrieval_agent_result import RetrievalAgentResult
@@ -861,6 +863,8 @@ from .runtime_config_status import RuntimeConfigStatus
 from .runtime_decl import RuntimeDecl
 from .runtime_decl_mode import RuntimeDeclMode
 from .scan_keys_request import ScanKeysRequest
+from .scoped_row_filter import ScopedRowFilter
+from .scoped_row_filter_filter import ScopedRowFilterFilter
 from .secret_entry import SecretEntry
 from .secret_list import SecretList
 from .secret_status import SecretStatus
@@ -1095,7 +1099,9 @@ __all__ = (
     "CalendarInterval",
     "Capability",
     "CardinalityMode",
+    "CatalogTableScope",
     "CatalogTablespaceBindingRequest",
+    "CatalogTableTarget",
     "CdcConnection",
     "ChainCondition",
     "ChainLink",
@@ -1717,6 +1723,7 @@ __all__ = (
     "ListUsersResponse200Item",
     "LookupKeyConsistency",
     "LookupKeyResponse200",
+    "LookupNamespaceTableDocumentConsistency",
     "LookupNamespaceTableDocumentResponse200",
     "LsmStorageStatus",
     "MatchAllQuery",
@@ -1856,7 +1863,6 @@ __all__ = (
     "RestoreJobResultRestore",
     "RestoreJobResultStatus",
     "RestoreJobScope",
-    "RestoreNamespaceTableResponse202",
     "RestoreRequest",
     "RetrievalAgentRequest",
     "RetrievalAgentResult",
@@ -1874,6 +1880,8 @@ __all__ = (
     "RuntimeDecl",
     "RuntimeDeclMode",
     "ScanKeysRequest",
+    "ScopedRowFilter",
+    "ScopedRowFilterFilter",
     "SecretEntry",
     "SecretList",
     "SecretStatus",

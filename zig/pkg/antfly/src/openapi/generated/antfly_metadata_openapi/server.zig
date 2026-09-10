@@ -205,6 +205,8 @@ pub const LookupNamespaceTableDocumentPathParams = struct {
 pub const LookupNamespaceTableDocumentParams = struct {
     /// Comma-separated list of fields to include in the response.
     fields: ?[]const u8 = null,
+    /// Read consistency; defaults to read_index.
+    consistency: ?[]const u8 = null,
 };
 
 /// List indexes for an explicit namespace table
@@ -242,8 +244,8 @@ pub const CreateNamespaceTableIndexPathParams = struct {
 };
 
 /// Parse the JSON request body for createNamespaceTableIndex.
-pub fn parseCreateNamespaceTableIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.IndexConfig) {
-    return std.json.parseFromSlice(antfly_indexes_openapi.IndexConfig, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseCreateNamespaceTableIndexBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.CreateIndexRequest) {
+    return std.json.parseFromSlice(antfly_indexes_openapi.CreateIndexRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Drop an index from an explicit namespace table
@@ -1413,6 +1415,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
             const query_params = LookupNamespaceTableDocumentParams{
                 .fields = try ctx.queryDecoded("fields"),
+                .consistency = try ctx.queryDecoded("consistency"),
             };
             return impl.lookupNamespaceTableDocument(ctx, database_name, namespace_name, table_name, key, query_params);
         }

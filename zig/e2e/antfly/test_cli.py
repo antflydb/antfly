@@ -1190,3 +1190,44 @@ def test_internal_metadata_status(cli):
     result = cli("internal", "metadata", "status")
     status = parse_json(result.stdout)
     assert isinstance(status, dict)
+
+
+def test_catalog_cli_keeps_scope_separate_from_literal_table_name(cli):
+    database = f"cli_catalog_{time.time_ns()}"
+    table = "sales/archive.v1"
+    cli("database", "create", database)
+    scope = ("--database", database, "--namespace", "public")
+    cli("table", "create", "--table", table, "--shards", "1", *scope)
+    cli("table", "create", "--table", table, "--shards", "1")
+    try:
+        scoped = parse_json(cli("table", "get", "--table", table, *scope).stdout)
+        literal = parse_json(cli("table", "get", "--table", table).stdout)
+        assert scoped["table_id"] != literal["table_id"]
+        cli(
+            "insert",
+            "--table",
+            table,
+            "--key",
+            "row",
+            "--document",
+            '{"scope":"selected"}',
+            *scope,
+        )
+        document = wait_until(
+            lambda: parse_json(
+                cli("lookup", "--table", table, "--key", "row", *scope).stdout
+            ),
+            timeout_s=10,
+            interval_s=0.1,
+        )
+        assert document["scope"] == "selected"
+        assert [
+            item["name"]
+            for item in parse_json(
+                cli("table", "list", "--output", "json", *scope).stdout
+            )
+        ] == [table]
+    finally:
+        cli("table", "drop", "--table", table, *scope)
+        cli("table", "drop", "--table", table)
+        cli("database", "drop", database)

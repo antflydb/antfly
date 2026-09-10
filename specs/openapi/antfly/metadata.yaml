@@ -7204,6 +7204,16 @@ components:
         children:
           $ref: "#/components/schemas/HierarchyChildren"
           x-go-type-skip-optional-pointer: false
+    CatalogTableTarget:
+      type: object
+      description: An explicit native table target. Components are literal names; dots do not qualify a string table name.
+      properties:
+        database: {type: string, default: default}
+        namespace: {type: string, default: public}
+        table: {type: string}
+      required: [table]
+      additionalProperties: false
+
     QueryRequest: # Based on remoteindex.Query
       type: object
       not:
@@ -7309,9 +7319,11 @@ components:
                   - required: [join]
                   - required: [foreign_sources]
       properties:
+        table_target:
+          $ref: "#/components/schemas/CatalogTableTarget"
         table:
           type: string
-          description: Name of the table to query. Required for global-query requests.
+          description: Literal table name in default.public. Global queries require exactly one of table or table_target.
           example: "wikipedia"
         query:
           x-go-type: json.RawMessage
@@ -7945,12 +7957,13 @@ components:
         Configuration for joining data from another table.
         Supports inner, left, and right joins with automatic strategy selection.
       required:
-        - right_table
         - "on"
       properties:
+        right_target:
+          $ref: "#/components/schemas/CatalogTableTarget"
         right_table:
           type: string
-          description: Name of the table to join with.
+          description: Literal native table name or declared foreign-source alias. Specify exactly one of right_table or right_target.
           example: "customers"
         join_type:
           $ref: "#/components/schemas/JoinType"
@@ -12757,7 +12770,7 @@ paths:
         description: Table name
         schema:
           type: string
-          maxLength: 128
+          maxLength: 255
     get:
       summary: Get namespace table details
       description: Gets a table through an explicit database and namespace route.
@@ -12836,7 +12849,7 @@ paths:
         description: Table name
         schema:
           type: string
-          maxLength: 128
+          maxLength: 255
     post:
       summary: Query an explicit namespace table
       description: Queries a table through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
@@ -12891,7 +12904,7 @@ paths:
         description: Table name
         schema:
           type: string
-          maxLength: 128
+          maxLength: 255
     post:
       summary: Perform batch inserts and deletes on an explicit namespace table
       description: Performs batch writes through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
@@ -12942,7 +12955,7 @@ paths:
         description: Table name
         schema:
           type: string
-          maxLength: 128
+          maxLength: 255
     post:
       summary: Backup an explicit namespace table
       tags:
@@ -12994,12 +13007,22 @@ paths:
         description: Table name
         schema:
           type: string
-          maxLength: 128
+          maxLength: 255
     post:
       summary: Restore an explicit namespace table from backup
       tags:
         - data_operations
       operationId: restoreNamespaceTable
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+            x-go-type-skip-optional-pointer: false
+          description: Stable key used to safely retry creation of this restore job. Keys are scoped to the authenticated principal and table. Requests without this header create a new job.
       requestBody:
         required: true
         content:
@@ -13012,11 +13035,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  restore:
-                    type: string
-                    example: triggered
+                $ref: "#/components/schemas/RestoreJob"
         "400":
           $ref: "#/components/responses/BadRequest"
         "500":
@@ -13044,7 +13063,7 @@ paths:
         description: Table name
         schema:
           type: string
-          maxLength: 128
+          maxLength: 255
       - name: key
         in: path
         required: true
@@ -13064,6 +13083,13 @@ paths:
           description: Comma-separated list of fields to include in the response.
           schema:
             type: string
+        - name: consistency
+          in: query
+          required: false
+          description: Read consistency; defaults to read_index.
+          schema:
+            type: string
+            enum: [read_index, stale]
       responses:
         "200":
           description: Record found
@@ -13108,7 +13134,7 @@ paths:
         description: Table name
         schema:
           type: string
-          maxLength: 128
+          maxLength: 255
     get:
       summary: List indexes for an explicit namespace table
       description: Lists index metadata through an explicit database and namespace route.
@@ -13153,7 +13179,7 @@ paths:
         description: Table name
         schema:
           type: string
-          maxLength: 128
+          maxLength: 255
       - name: indexName
         in: path
         required: true
@@ -13188,10 +13214,14 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "indexes.yaml#/components/schemas/IndexConfig"
+              $ref: "indexes.yaml#/components/schemas/CreateIndexRequest"
       responses:
         "201":
           description: Index added successfully
+          content:
+            application/json:
+              schema:
+                $ref: "indexes.yaml#/components/schemas/CreatedIndex"
         "400":
           $ref: "#/components/responses/BadRequest"
         "500":

@@ -39,20 +39,20 @@ pub const OwnedState = struct {
 };
 
 pub fn prefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
-    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:native_catalog:{d}:", .{group_id});
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:system_catalog:{d}:", .{group_id});
 }
 
 fn keyAlloc(alloc: std.mem.Allocator, group_id: u64, suffix: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:native_catalog:{d}:{s}", .{ group_id, suffix });
+    return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:system_catalog:{d}:{s}", .{ group_id, suffix });
 }
 
 fn recordKeyAlloc(alloc: std.mem.Allocator, group_id: u64, kind: domain.Kind, id: u64) ![]u8 {
-    return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:native_catalog:{d}:record:{s}:{d}", .{ group_id, @tagName(kind), id });
+    return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:system_catalog:{d}:record:{s}:{d}", .{ group_id, @tagName(kind), id });
 }
 
 pub fn nameKeyAlloc(alloc: std.mem.Allocator, group_id: u64, kind: domain.Kind, parent: u64, name: []const u8) ![]u8 {
-    try domain.validateName(name);
-    return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:native_catalog:{d}:name:{s}:{d}:{s}", .{ group_id, @tagName(kind), parent, name });
+    try domain.validateResourceName(kind, name);
+    return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:system_catalog:{d}:name:{s}:{d}:{s}", .{ group_id, @tagName(kind), parent, name });
 }
 
 pub fn readMeta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) !Meta {
@@ -78,7 +78,7 @@ pub fn loadState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id
     const resources = try a.alloc(domain.Resource, kvs.len);
     for (kvs, resources) |kv, *resource| {
         resource.* = try std.json.parseFromSliceLeaky(domain.Resource, a, kv.value, .{ .allocate = .alloc_always });
-        try domain.validateName(resource.name);
+        try domain.validateResourceName(resource.kind, resource.name);
         if (resource.id == 0) return error.InvalidCatalogRecord;
     }
     return .{ .arena = arena, .meta = meta, .value = .{ .revision = meta.revision, .next_id = meta.next_id, .resources = resources } };

@@ -2940,8 +2940,8 @@ test "table reads translate request deadlines into the routing clock" {
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, catalog.budget(lookupRoutingDeadline(catalog, opts)).checkpoint());
     // Same-domain conversion is identity, including already-expired values.
     try std.testing.expectEqual(@as(?u64, 123), lookupRoutingDeadline(catalog, .{ .execution_deadline_ns = 123, .execution_io = catalog.io }));
-    const native_catalog = table_catalog.CatalogSource{ .ptr = undefined, .vtable = undefined };
-    try std.testing.expectEqual(native_deadline, queryRoutingDeadline(native_catalog, req).?);
+    const system_catalog = table_catalog.CatalogSource{ .ptr = undefined, .vtable = undefined };
+    try std.testing.expectEqual(native_deadline, queryRoutingDeadline(system_catalog, req).?);
 }
 
 fn prepareProvisionedGroupConsistency(

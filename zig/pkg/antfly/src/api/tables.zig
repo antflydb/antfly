@@ -74,14 +74,14 @@ pub fn validateTableMutationName(table_name: []const u8) !void {
 /// publication. Public names keep their existing 255-byte validation contract.
 pub fn validateInternalTableMutationName(table_name: []const u8) !void {
     if (table_name.len <= max_table_name_bytes) return validateTableMutationName(table_name);
-    const catalog = @import("../catalog/domain.zig");
+    const catalog = @import("../system_catalog/domain.zig");
     try catalog.validateStorageName(table_name);
 }
 
-test "native catalog maximum restore identity can be dropped internally" {
-    const catalog = @import("../catalog/domain.zig");
+test "system catalog maximum restore identity can be dropped internally" {
+    const catalog = @import("../system_catalog/domain.zig");
     const component: [catalog.max_name_bytes]u8 = @splat('a');
-    const name = try std.fmt.allocPrint(std.testing.allocator, "table:00000000000000000000000000000000:{s}.{s}.{s}", .{ component, component, component });
+    const name = try catalog.restoreStorageNameAlloc(std.testing.allocator, "table:00000000000000000000000000000000", .{ .database = &component, .namespace = &component, .table = &component });
     defer std.testing.allocator.free(name);
     try validateInternalTableMutationName(name);
     try std.testing.expectError(error.InvalidTableName, validateTableMutationName(name));
@@ -864,7 +864,7 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
     if (root.get("tablespace_name")) |value| {
         if (value != .null) {
             if (value != .string) return error.InvalidCreateTableRequest;
-            try @import("../catalog/domain.zig").validateName(value.string);
+            try @import("../system_catalog/domain.zig").validateName(value.string);
             req.tablespace_name = try alloc.dupe(u8, value.string);
         }
     }

@@ -22,8 +22,8 @@ const std = @import("std");
 /// Version 4 decodes and enforces the distinct extension-lifecycle-v2 command
 /// carrying table compare-and-set preconditions.
 pub const current_version: u16 = 5;
-/// Native catalog records, name indexes, and atomic catalog/table publication.
-pub const native_catalog_version: u16 = 5;
+/// System catalog records, name indexes, and atomic catalog/table publication.
+pub const system_catalog_version: u16 = 5;
 /// Minimum decoder capability required by the atomic create/drop wire format.
 /// Later, unrelated metadata features must not unnecessarily stop table DDL
 /// when a membership change temporarily includes a lower-capability peer.

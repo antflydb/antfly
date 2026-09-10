@@ -12,11 +12,11 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Native catalog response shapes. Authentication and scoped authorization are
+//! System catalog response shapes. Authentication and scoped authorization are
 //! performed by the public handler before these operations are invoked.
 const std = @import("std");
-const domain = @import("../catalog/domain.zig");
-const routes = @import("../catalog/routes.zig");
+const domain = @import("../system_catalog/domain.zig");
+const routes = @import("../system_catalog/routes.zig");
 const operation = @import("operation.zig");
 pub const Response = struct {
     status: u16,
@@ -72,11 +72,11 @@ pub fn execute(source: anytype, alloc: std.mem.Allocator, request: operation.Req
             },
             .drop => {},
         }
-        const result = source.nativeCatalog(alloc, request, .{ .mutate = .{ .mutation = mutation } }) catch |err| return failure(alloc, err);
+        const result = source.systemCatalog(alloc, request, .{ .mutate = .{ .mutation = mutation } }) catch |err| return failure(alloc, err);
         alloc.free(result);
         if (mutation_action == .drop or mutation_action == .rename or route.kind == .table) return .{ .status = 204, .body = &.{} };
     }
-    const bytes = source.nativeCatalog(a, request, .snapshot) catch |err| {
+    const bytes = source.systemCatalog(a, request, .snapshot) catch |err| {
         if (action != null) return visibilityPending(alloc);
         return failure(alloc, err);
     };
@@ -160,10 +160,10 @@ fn tablespaceValue(alloc: std.mem.Allocator, resource: domain.Resource) !Tablesp
     return .{ .tablespace_id = resource.id, .name = resource.name, .location_json = resource.location_json, .placement_policy_json = try std.json.Stringify.valueAlloc(alloc, resource.placement_policy, .{ .emit_null_optional_fields = false }) };
 }
 
-test "native catalog committed mutations retain success when projection fails" {
+test "system catalog committed mutations retain success when projection fails" {
     const Source = struct {
         snapshot: ?[]const u8,
-        fn nativeCatalog(self: @This(), alloc: std.mem.Allocator, _: operation.RequestContext, call: domain.Call) ![]const u8 {
+        fn systemCatalog(self: @This(), alloc: std.mem.Allocator, _: operation.RequestContext, call: domain.Call) ![]const u8 {
             return switch (call) {
                 .mutate => try alloc.dupe(u8, "{}"),
                 .snapshot => try alloc.dupe(u8, self.snapshot orelse return error.Timeout),

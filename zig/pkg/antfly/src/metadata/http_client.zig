@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const native_catalog = @import("../catalog/domain.zig");
+const system_catalog = @import("../system_catalog/domain.zig");
 const ant_json = @import("antfly-json");
 const platform_time = @import("antfly_platform").time;
 const tables_api = @import("../api/tables.zig");
@@ -793,11 +793,61 @@ pub const MetadataHttpClient = struct {
         );
     }
 
-    pub fn forwardNativeCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: native_catalog.Call, forwarding: raft_mutation_forwarding.Context) ![]u8 {
+    pub const CatalogRead = struct {
+        body: []u8,
+        metadata_group_id: u64,
+        metadata_incarnation: metadata_api.MetadataClusterIncarnation,
+
+        pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.body);
+        }
+    };
+
+    /// Read-only retries are safe. The response proves the metadata identity;
+    /// callers need no preceding status/discovery round trip on the happy path.
+    pub fn readSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: system_catalog.Call, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !CatalogRead {
+        if (input == .mutate) return error.InvalidCatalogMutation;
+        if (remaining_ms == 0) return error.Timeout;
+        if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
         defer self.alloc.free(body);
-        if (body.len > native_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
-        const uri = try join(self.alloc, base_uri, "/internal/v1/catalog/native");
+        if (body.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+        const uri = try join(self.alloc, base_uri, "/internal/v1/system-catalog");
+        defer self.alloc.free(uri);
+        var remaining_buf: [10]u8 = undefined;
+        const headers = [_]http_common.RequestHeader{
+            .{ .name = routes.Routes.raft_mutation_remaining_ms_header, .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{remaining_ms}) },
+            .{ .name = routes.Routes.raft_mutation_forwards_remaining_header, .value = "0" },
+            .{ .name = routes.Routes.raft_mutation_campaign_allowed_header, .value = "false" },
+        };
+        var response = try internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, remaining_ms), .cancellation = cancellation }, self.internal_service);
+        defer response.deinit(self.alloc);
+        if (response.status != 200) return switch (response.status) {
+            400 => error.InvalidCatalogName,
+            404 => error.CatalogNotFound,
+            409 => error.CatalogGenerationChanged,
+            413 => error.CatalogCommandTooLarge,
+            426 => error.TableTopologyProtocolUpgradeRequired,
+            503 => error.NotLeader,
+            else => error.RemoteUnavailable,
+        };
+        const group = responseHeader(response, "x-antfly-catalog-metadata-group") orelse return error.MetadataIncarnationUnavailable;
+        const raw_incarnation = responseHeader(response, "x-antfly-catalog-metadata-incarnation") orelse return error.MetadataIncarnationUnavailable;
+        if (raw_incarnation.len != 32) return error.InvalidMetadataIncarnation;
+        const incarnation: metadata_api.MetadataClusterIncarnation = raw_incarnation[0..32].*;
+        if (!@import("incarnation.zig").isValid(incarnation)) return error.InvalidMetadataIncarnation;
+        return .{
+            .metadata_group_id = std.fmt.parseInt(u64, group, 10) catch return error.MetadataGroupMismatch,
+            .metadata_incarnation = incarnation,
+            .body = try self.alloc.dupe(u8, response.body),
+        };
+    }
+
+    pub fn forwardSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: system_catalog.Call, forwarding: raft_mutation_forwarding.Context) ![]u8 {
+        const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
+        defer self.alloc.free(body);
+        if (body.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+        const uri = try join(self.alloc, base_uri, "/internal/v1/system-catalog");
         defer self.alloc.free(uri);
         var remaining_buf: [10]u8 = undefined;
         var forwards_buf: [3]u8 = undefined;
@@ -3670,4 +3720,37 @@ test "metadata http client parses legacy range records without doc identity fiel
     try std.testing.expectEqual(@as(u64, 4200), metadata_table_manager.rangeDocIdentityRangeId(parsed.value[0]));
     try std.testing.expectEqual(@as(u64, 42), metadata_table_manager.rangeDocIdentityShardId(parsed.value[1]));
     try std.testing.expectEqual(@as(u64, 4200), metadata_table_manager.rangeDocIdentityRangeId(parsed.value[1]));
+}
+
+test "system catalog direct read carries identity and deadline without a discovery RPC" {
+    const alloc = std.testing.allocator;
+    const Executor = struct {
+        calls: usize = 0,
+        valid_identity: bool = true,
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
+            try std.testing.expectEqual(@as(?u32, 25), request.timeout_ms);
+            try std.testing.expectEqualStrings("0", request.header(routes.Routes.raft_mutation_forwards_remaining_header).?);
+            try std.testing.expectEqualStrings("false", request.header(routes.Routes.raft_mutation_campaign_allowed_header).?);
+            const headers = try a.alloc(http_common.Header, 2);
+            headers[0] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-group"), .value = try a.dupe(u8, "9") };
+            headers[1] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-incarnation"), .value = try a.dupe(u8, if (self.valid_identity) "11111111111111111111111111111111" else "invalid") };
+            return .{ .status = 200, .headers = headers, .body = try a.dupe(u8, "null") };
+        }
+    };
+    var executor = Executor{};
+    var client = MetadataHttpClient.init(alloc, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    const read = try client.readSystemCatalog("http://metadata.invalid", .{ .resolve = .{ .table = "a.b" } }, 25, null);
+    defer read.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+    try std.testing.expectEqual(@as(u64, 9), read.metadata_group_id);
+    try std.testing.expectEqualStrings("null", read.body);
+    executor.valid_identity = false;
+    try std.testing.expectError(error.InvalidMetadataIncarnation, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
+    try std.testing.expectError(error.Timeout, client.readSystemCatalog("http://metadata.invalid", .snapshot, 0, null));
+    try std.testing.expectError(error.InvalidCatalogMutation, client.readSystemCatalog("http://metadata.invalid", .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "denied" } } }, 25, null));
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
 }

@@ -38,6 +38,21 @@ pub fn runFromIterator(
     var client = try cli.initClient(init.gpa, &http, config);
     defer client.deinit();
 
+    var scoped_arguments: std.ArrayList([*:0]const u8) = .empty;
+    defer scoped_arguments.deinit(init.gpa);
+    const supports_scope = blk: {
+        for ([_][]const u8{ "table", "index", "query", "lookup", "load", "insert", "delete", "backup", "restore" }) |name| if (std.mem.eql(u8, command, name)) break :blk true;
+        break :blk false;
+    };
+    if (supports_scope) {
+        var scope = cli.CatalogFlags.defaultsFromEnv();
+        while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--database")) scope.database = args.next() orelse return error.InvalidArguments else if (std.mem.eql(u8, arg, "--namespace")) scope.namespace = args.next() orelse return error.InvalidArguments else try scoped_arguments.append(init.gpa, arg.ptr);
+        }
+        if (scope.database != null or scope.namespace != null) client.catalog_scope = .{ .database = scope.database orelse "default", .namespace = scope.namespace orelse "public" };
+        args.* = std.process.Args.Iterator.init(.{ .vector = scoped_arguments.items });
+    }
+
     if (std.mem.eql(u8, command, "table")) return cli.table.run(init.gpa, io, &client, args);
     if (std.mem.eql(u8, command, "database")) return cli.database_cmd.run(init.gpa, io, &client, args);
     if (std.mem.eql(u8, command, "namespace")) return cli.namespace_cmd.run(init.gpa, io, &client, args);
