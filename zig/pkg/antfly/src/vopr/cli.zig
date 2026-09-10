@@ -5,7 +5,11 @@ const std = @import("std");
 const antfly = @import("antfly");
 const vopr = @import("vopr");
 
-const max_trace_bytes = 256 * 1024 * 1024;
+const HAScaling = antfly.full_cluster_vopr.HAScalingScenario;
+
+// Production histories retain hundreds of thousands of IO choices and
+// property evaluations. The CLI must be able to reload its own artifacts.
+const max_trace_bytes = 2 * 1024 * 1024 * 1024;
 
 pub fn main(init: std.process.Init) !void {
     const alloc = init.gpa;
@@ -44,18 +48,7 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
         const arg = args[index];
         if (std.mem.eql(u8, arg, "--scenario")) {
             scenario = try nextValue(args, &index);
-            if (!std.mem.eql(u8, scenario, "metadata") and
-                !std.mem.eql(u8, scenario, "transaction") and
-                !std.mem.eql(u8, scenario, "distributed-data") and
-                !std.mem.eql(u8, scenario, "wal") and
-                !std.mem.eql(u8, scenario, "persistent") and
-                !std.mem.eql(u8, scenario, "index-manager") and
-                !std.mem.eql(u8, scenario, "db-split") and
-                !std.mem.eql(u8, scenario, "raft") and
-                !std.mem.eql(u8, scenario, "lmdb") and
-                !std.mem.eql(u8, scenario, "lsm") and
-                !std.mem.eql(u8, scenario, "ha") and
-                antfly.domain_vopr.kindFromCliName(scenario) == null) return error.UnsupportedScenario;
+            _ = try defaultCampaignTransitions(scenario);
         } else if (std.mem.eql(u8, arg, "--seed")) {
             seed = try std.fmt.parseInt(u64, try nextValue(args, &index), 0);
         } else if (std.mem.eql(u8, arg, "--transitions")) {
@@ -87,6 +80,8 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
         13
     else if (std.mem.eql(u8, scenario, "lsm"))
         49
+    else if (std.mem.eql(u8, scenario, "ha-scaling"))
+        600_000
     else if (std.mem.eql(u8, scenario, "ha"))
         33
     else if (antfly.domain_vopr.kindFromCliName(scenario)) |kind|
@@ -134,6 +129,9 @@ fn runCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !v
     } else if (std.mem.eql(u8, scenario, "lsm")) blk: {
         if (transition_budget != 49) return error.LsmScenarioRequiresFortyNineTransitions;
         break :blk try antfly.lsm_vopr.record(alloc, seed);
+    } else if (std.mem.eql(u8, scenario, "ha-scaling")) blk: {
+        try validateCampaignTransitions(scenario, transition_budget);
+        break :blk try antfly.full_cluster_vopr.recordHAScaling(alloc, seed);
     } else if (std.mem.eql(u8, scenario, "ha")) blk: {
         if (transition_budget != 33) return error.HaScenarioRequiresThirtyThreeTransitions;
         break :blk try antfly.ha_vopr.record(alloc, seed);
@@ -647,6 +645,8 @@ fn replayKnownScenario(alloc: std.mem.Allocator, recorded: *const vopr.trace.Tra
         return antfly.lsm_vopr.replay(alloc, recorded);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.ha_vopr.CliScenario.name))
         return antfly.ha_vopr.replay(alloc, recorded);
+    if (std.mem.eql(u8, recorded.header.scenario, HAScaling.name))
+        return vopr.replay.exact(HAScaling, alloc, recorded);
     if (antfly.domain_vopr.kindFromArtifact(recorded) != null)
         return antfly.domain_vopr.replayKnown(alloc, recorded);
     return error.UnsupportedScenario;
@@ -724,6 +724,8 @@ fn runKnownScenarioWithChoicesAndRecorder(
         return runContextFreeWithChoicesAndRecorder(antfly.lsm_vopr.CliScenario, alloc, recorded, source, recorder);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.ha_vopr.CliScenario.name))
         return runContextFreeWithChoicesAndRecorder(antfly.ha_vopr.CliScenario, alloc, recorded, source, recorder);
+    if (std.mem.eql(u8, recorded.header.scenario, HAScaling.name))
+        return runContextFreeWithChoicesAndRecorder(HAScaling, alloc, recorded, source, recorder);
     if (antfly.domain_vopr.kindFromArtifact(recorded) != null) {
         return antfly.domain_vopr.runKnownWithChoicesAndRecorder(alloc, recorded, source, recorder);
     }
@@ -840,6 +842,7 @@ fn declarationsKnown(recorded: *const vopr.trace.Trace) []const vopr.property.De
         return antfly.lsm_vopr.CliScenario.properties;
     if (std.mem.eql(u8, recorded.header.scenario, antfly.ha_vopr.CliScenario.name))
         return antfly.ha_vopr.CliScenario.properties;
+    if (std.mem.eql(u8, recorded.header.scenario, HAScaling.name)) return HAScaling.properties;
     if (antfly.domain_vopr.kindFromArtifact(recorded)) |kind| return switch (kind) {
         .distributed_transaction => antfly.domain_vopr.DistributedTransactionScenario.properties,
         .data_plane => antfly.domain_vopr.DataPlaneScenario.properties,
@@ -865,6 +868,7 @@ fn defaultCampaignTransitions(scenario: []const u8) !usize {
     if (std.mem.eql(u8, scenario, "lmdb")) return 13;
     if (std.mem.eql(u8, scenario, "lsm")) return 49;
     if (std.mem.eql(u8, scenario, "ha")) return 33;
+    if (std.mem.eql(u8, scenario, "ha-scaling")) return 600_000;
     if (antfly.domain_vopr.kindFromCliName(scenario)) |kind| return kind.transitionBudget();
     return error.UnsupportedScenario;
 }
@@ -904,6 +908,7 @@ fn recordCampaignScenario(
     if (std.mem.eql(u8, scenario, "lmdb")) return antfly.lmdb_vopr.record(alloc, seed);
     if (std.mem.eql(u8, scenario, "lsm")) return antfly.lsm_vopr.record(alloc, seed);
     if (std.mem.eql(u8, scenario, "ha")) return antfly.ha_vopr.record(alloc, seed);
+    if (std.mem.eql(u8, scenario, "ha-scaling")) return antfly.full_cluster_vopr.recordHAScaling(alloc, seed);
     if (antfly.domain_vopr.kindFromCliName(scenario) != null) return antfly.domain_vopr.recordNamed(alloc, scenario, seed);
     return error.UnsupportedScenario;
 }
@@ -920,6 +925,7 @@ fn artifactMatchesScenario(artifact: *const vopr.trace.Trace, scenario: []const 
     if (std.mem.eql(u8, scenario, "lmdb")) return std.mem.eql(u8, artifact.header.scenario, antfly.lmdb_vopr.CliScenario.name);
     if (std.mem.eql(u8, scenario, "lsm")) return std.mem.eql(u8, artifact.header.scenario, antfly.lsm_vopr.CliScenario.name);
     if (std.mem.eql(u8, scenario, "ha")) return std.mem.eql(u8, artifact.header.scenario, antfly.ha_vopr.CliScenario.name);
+    if (std.mem.eql(u8, scenario, "ha-scaling")) return std.mem.eql(u8, artifact.header.scenario, HAScaling.name);
     if (antfly.domain_vopr.kindFromCliName(scenario) != null) return antfly.domain_vopr.artifactMatchesCliName(artifact, scenario);
     return false;
 }
@@ -1317,7 +1323,7 @@ fn campaignCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u
     try context.exportQuarantineArtifacts();
     try context.reportSummary();
     if (context.first_error) |err| return err;
-    try checkCampaignFindings(context.failures, fail_on_findings);
+    try checkCampaignFindings(context.failures +| context.seeded_findings, fail_on_findings);
 }
 
 // Write replay artifacts and reports before failing an automated soak. Search
@@ -1487,6 +1493,8 @@ fn reduceCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8)
             reduced.report.target_fingerprint,
         );
     }
+    if (std.mem.eql(u8, recorded.header.scenario, HAScaling.name))
+        return reduceContextFree(HAScaling, alloc, io, output, &recorded, attempts);
     if (std.mem.eql(u8, recorded.header.scenario, antfly.ha_vopr.CliScenario.name)) {
         const target = if (recorded.failures.items.len > 0)
             recorded.failures.items[0].fingerprint
@@ -1651,6 +1659,8 @@ fn fixtureDirForScenario(recorded: *const vopr.trace.Trace) ![]const u8 {
         return "pkg/antfly/src/vopr/fixtures/lsm";
     if (std.mem.eql(u8, recorded.header.scenario, antfly.ha_vopr.CliScenario.name))
         return "pkg/antfly/src/vopr/fixtures/ha";
+    if (std.mem.eql(u8, recorded.header.scenario, HAScaling.name))
+        return "pkg/antfly/src/vopr/fixtures/ha-scaling";
     if (antfly.domain_vopr.kindFromArtifact(recorded)) |kind| return switch (kind) {
         .distributed_transaction => "pkg/antfly/src/vopr/fixtures/distributed-transaction",
         .data_plane => "pkg/antfly/src/vopr/fixtures/data-plane",
@@ -1727,6 +1737,7 @@ const CampaignContext = struct {
     coverage: vopr.coverage.Tracker,
     corpus: vopr.corpus.Corpus,
     seeded_entries: u64 = 0,
+    seeded_findings: u64 = 0,
     retained: u64 = 0,
     failures: u64 = 0,
     clean_histories: u64 = 0,
@@ -1993,7 +2004,7 @@ const CampaignContext = struct {
         var productive: usize = 0;
         for (self.corpus.entries.items) |entry| productive += @intFromBool(entry.productive_children > 0);
         std.debug.print(
-            "VOPR campaign scenario={s} histories={d} transitions={d} clean={d} failed={d} divergent={d} harness_errors={d} exact_replays={d} seeded={d} quarantined={d} retained={d} states={d} transition_kinds={d} faults_reached={d} workloads_reached={d} productive_inputs={d} splice_attempts={d} spliced={d} splice_rejected={d} counterfactual_reports={d} flight_recordings={d} flight_records={d} flight_dropped={d} workers={d} artifacts={s}\n",
+            "VOPR campaign scenario={s} histories={d} transitions={d} clean={d} failed={d} divergent={d} harness_errors={d} exact_replays={d} seeded={d} seed_findings={d} quarantined={d} retained={d} states={d} transition_kinds={d} faults_reached={d} workloads_reached={d} productive_inputs={d} splice_attempts={d} spliced={d} splice_rejected={d} counterfactual_reports={d} flight_recordings={d} flight_records={d} flight_dropped={d} workers={d} artifacts={s}\n",
             .{
                 self.scenario,
                 self.histories,
@@ -2004,6 +2015,7 @@ const CampaignContext = struct {
                 self.harness_errors,
                 self.exact_replays,
                 self.seeded_entries,
+                self.seeded_findings,
                 self.corpus.quarantined.items.len,
                 self.retained,
                 self.semantic_states.count(),
@@ -2132,6 +2144,8 @@ const CampaignContext = struct {
             .harness_errors = self.harness_errors,
             .exact_replays = self.exact_replays,
             .corpus_entries = self.corpus.entries.items.len,
+            .seeded_entries = self.seeded_entries,
+            .seeded_findings = self.seeded_findings,
             .quarantined_entries = self.corpus.quarantined.items.len,
             .retained_entries = self.retained,
             .semantic_states = self.semantic_states.count(),
@@ -2356,14 +2370,27 @@ const CampaignContext = struct {
                 continue;
             }
             // Corpus files must still be executable under the current ABI.
-            var replayed = replayKnownScenario(alloc, &artifact) catch {
-                _ = try self.corpus.quarantineBytes(encoded, .scenario_version_changed);
+            var replayed = replayKnownScenario(alloc, &artifact) catch |err| {
+                switch (err) {
+                    error.IncompatibleScenarioVersion, error.IncompatibleMetadataVoprTrace, error.IncompatibleDistributedDataVoprTrace => {
+                        _ = try self.corpus.quarantineBytes(encoded, .scenario_version_changed);
+                    },
+                    else => {
+                        _ = try self.corpus.quarantineBytes(encoded, .replay_diverged);
+                        self.replay_divergences += 1;
+                        if (self.first_error == null) self.first_error = err;
+                        std.debug.print("VOPR seed replay failed path={s}: {s}\n", .{ name, @errorName(err) });
+                    },
+                }
                 continue;
             };
             replayed.deinit();
             const novelty = try self.coverage.observe(&artifact);
             const added = try self.corpus.add(&artifact, novelty);
-            if (added.inserted) self.seeded_entries += 1;
+            if (added.inserted) {
+                self.seeded_entries += 1;
+                if (artifact.failures.items.len != 0) self.seeded_findings += 1;
+            }
         }
     }
 
@@ -2445,9 +2472,9 @@ fn report(action: []const u8, path: []const u8, artifact: *const vopr.trace.Trac
 fn usage() error{InvalidUsage} {
     std.debug.print(
         \\usage:
-        \\  vopr run --scenario metadata|transaction|distributed-data|distributed-transaction|data-plane|derived-workflow|backup-restore|clock-fault|wal|persistent|index-manager|db-split|raft|lmdb|lsm|ha --seed <u64> [--transitions <n>] [--workload smoke|expanded] --trace-out <path>
+        \\  vopr run --scenario metadata|transaction|distributed-data|distributed-transaction|data-plane|derived-workflow|backup-restore|clock-fault|wal|persistent|index-manager|db-split|raft|lmdb|lsm|ha|ha-scaling --seed <u64> [--transitions <n>] [--workload smoke|expanded] --trace-out <path>
         \\  vopr replay --trace <path>
-        \\  vopr campaign --scenario metadata|transaction|distributed-data|distributed-transaction|data-plane|derived-workflow|backup-restore|clock-fault|wal|persistent|index-manager|db-split|raft|lmdb|lsm|ha --histories <n> [--transitions <n>] --workers <n> --artifact-dir <path> [--fail-on-findings]
+        \\  vopr campaign --scenario metadata|transaction|distributed-data|distributed-transaction|data-plane|derived-workflow|backup-restore|clock-fault|wal|persistent|index-manager|db-split|raft|lmdb|lsm|ha|ha-scaling --histories <n> [--transitions <n>] --workers <n> --artifact-dir <path> [--fail-on-findings]
         \\  vopr reduce --trace <path> --out <path> [--attempts <n>]
         \\  vopr promote --trace <path> --name <fixture-name> [--force]
         \\  vopr tla --trace <path> --domain raft|transaction --out <path.ndjson>
@@ -2630,6 +2657,8 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
     defer context.coverage.deinit();
     try context.primeCorpus(alloc);
     try std.testing.expectEqual(@as(u64, 1), context.seeded_entries);
+    try std.testing.expectEqual(@as(u64, 1), context.seeded_findings);
+    try std.testing.expectError(error.CampaignPropertyFailure, checkCampaignFindings(context.seeded_findings, true));
     try std.testing.expectEqual(@as(usize, 1), context.corpus.entries.items.len);
     if (try context.mutateCorpusEntry(alloc, 0xA17F_FA12)) |mutated_value| {
         var mutated = mutated_value;
@@ -2825,4 +2854,10 @@ test "VOPR scenario registry records and exactly replays every context-free doma
         var replayed = try replayKnownScenario(alloc, &artifact);
         replayed.deinit();
     }
+}
+
+test "VOPR scenario registry accepts production HA scaling in run and campaign" {
+    try std.testing.expectEqual(@as(usize, 600_000), try defaultCampaignTransitions("ha-scaling"));
+    try std.testing.expectError(error.TraceOutputRequired, runCommand(std.testing.allocator, std.testing.io, &.{ "--scenario", "ha-scaling" }));
+    try std.testing.expectError(error.InvalidCampaignBudget, campaignCommand(std.testing.allocator, std.testing.io, &.{ "--scenario", "ha-scaling", "--histories", "0" }));
 }

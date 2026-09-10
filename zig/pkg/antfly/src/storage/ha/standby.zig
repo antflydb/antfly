@@ -156,6 +156,8 @@ pub const Standby = struct {
     progress_wal_path: [:0]u8,
     receive_log: replication_log.ReplicationLog,
     progress_wal: wal_mod.WAL,
+    /// Borrowed durability dependencies must survive conversion to a primary.
+    progress_wal_options: wal_mod.WalOptions,
     progress_state: Progress,
     operation_mutex: std.atomic.Mutex = .unlocked,
     state_mutex: std.atomic.Mutex = .unlocked,
@@ -188,6 +190,7 @@ pub const Standby = struct {
             .progress_wal_path = owned_progress_wal_path,
             .receive_log = receive_log,
             .progress_wal = progress_wal,
+            .progress_wal_options = options.progress_wal_options,
             .progress_state = .{},
         };
         receive_path_owned_locally = false;

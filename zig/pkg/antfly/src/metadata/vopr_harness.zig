@@ -3722,6 +3722,10 @@ pub const MetadataHttpNodeVopr = struct {
 
     fn fetchMedianKey(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) !?[]u8 {
         const cluster: *MetadataHttpClusterVopr = @ptrCast(@alignCast(ptr));
+        if (cluster.data_plane_ownership == .external) {
+            const adapter = cluster.external_shard_db_adapter orelse return error.ExternalShardDbAdapterUnavailable;
+            return try adapter.fetchMedianKey(alloc, group_id);
+        }
         const preferred_index = currentGroupLeaderIndex(cluster, group_id);
         if (preferred_index) |index| {
             if (try fetchMedianKeyFromReplica(cluster, alloc, index, group_id)) |median| return median;
@@ -4557,6 +4561,8 @@ pub const MetadataHttpClusterVopr = struct {
     metadata_proposal_post_apply_failure: ?anyerror = null,
     next_reallocation_request_id: u128 = 1,
     data_plane_ownership: DataPlaneOwnership = .co_located,
+    /// Borrowed production RPC adapter when data groups live in external owners.
+    external_shard_db_adapter: ?metadata_mod.ShardDbAdapter = null,
 
     pub const ProgressPredicate = *const fn (*MetadataHttpClusterVopr, *anyopaque) anyerror!bool;
     const min_pending_reconcile_lease_retry_ms: u64 = 250;

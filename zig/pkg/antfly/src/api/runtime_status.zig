@@ -6398,6 +6398,7 @@ test "table runtime snapshot cache replaces snapshots while preserving one group
         .doc_count = 3,
     };
     const refresh = try std.testing.allocator.alloc(TableRuntimeSnapshot, 2);
+    defer std.testing.allocator.free(refresh);
     refresh[0] = .{
         .table_name = try std.testing.allocator.dupe(u8, "docs"),
         .statuses = .{ .items = refresh_docs_items },
@@ -6407,7 +6408,16 @@ test "table runtime snapshot cache replaces snapshots while preserving one group
         .statuses = .{ .items = refresh_logs_items },
     };
 
-    try publishRefreshForTest(&cache, refresh);
+    // A refresh must capture its observation boundary before the live group
+    // publishes. The newer group authority survives that older refresh.
+    var refresh_token = try cache.captureCatalogToken(std.testing.allocator, &.{ "docs", "logs" }, true);
+    defer refresh_token.deinit();
+    var live = (try cache.snapshotGroupStatus(std.testing.allocator, "docs", 7)).?;
+    defer live.deinit(std.testing.allocator);
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try publishGroupForTest(&cache, "docs", live));
+    var result = try cache.publishRefresh(&refresh_token, refresh);
+    defer result.deinit();
+    try std.testing.expect(!result.hasRejectedTables());
 
     var docs = (try cache.snapshot(std.testing.allocator, "docs")).?;
     defer docs.deinit(std.testing.allocator);
@@ -6647,7 +6657,6 @@ test "table runtime snapshot cache can clone a single group status" {
     defer cache.deinit();
 
     const statuses = try std.testing.allocator.alloc(LocalTableRuntimeStatus, 2);
-    defer std.testing.allocator.free(statuses);
     statuses[0] = .{
         .group_id = 7,
         .stats = .{ .doc_count = 1, .indexes = &.{} },

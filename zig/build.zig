@@ -5100,6 +5100,7 @@ pub fn build(b: *std.Build) void {
         "data runtime records and backs off HA standby replication round failures",
         "data runtime HA replication HTTP budget covers base64 apply envelope",
         "data runtime HA apply window remains bounded for control-plane liveness",
+        "data runtime disk usage scanner reads borrowed filesystem for sharding evidence",
         "data runtime HA apply window does not report caught up with pending or deferred WAL",
         "data server keeps upstream replication availability failures nonfatal",
         "data runtime records HA standby apply failures without stopping run round",
@@ -8458,6 +8459,23 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_vopr_runtime_regressions.addArgs(args);
     b.step("vopr-runtime-regression-test", "Run VOPR runtime ownership, clock, snapshot, and replay regressions").dependOn(&run_vopr_runtime_regressions.step);
 
+    const ha_production_vopr_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"production HA owners stream and promote"},
+        .max_rss = full_cluster_vopr_max_rss,
+    });
+    const run_ha_production_vopr_tests = b.addRunArtifact(ha_production_vopr_tests);
+    b.step("ha-production-vopr-test", "Exercise production HA public writes, standby reads, and promotion on VoprIo").dependOn(&run_ha_production_vopr_tests.step);
+
+    const ha_scaling_vopr_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"production HA scaling VOPR exact replays"},
+        .max_rss = full_cluster_vopr_max_rss,
+    });
+    const run_ha_scaling_vopr_tests = b.addRunArtifact(ha_scaling_vopr_tests);
+    run_ha_scaling_vopr_tests.step.dependOn(&run_ha_production_vopr_tests.step);
+    b.step("ha-scaling-vopr-test", "Replay production standby promotion with automatic split/merge and replica scale-out/drain").dependOn(&run_ha_scaling_vopr_tests.step);
+
     const full_cluster_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{"full cluster VOPR exact replays"},
@@ -9264,6 +9282,8 @@ pub fn build(b: *std.Build) void {
     vopr_runtime_adapter_test_step.dependOn(&run_vopr_runtime_adapter_tests.step);
     derived_workflow_vopr_test_step.dependOn(&run_vopr_runtime_adapter_tests.step);
 
+    b.step("vopr-build", "Install the VOPR campaign and replay executable").dependOn(&b.addInstallArtifact(vopr_cli, .{}).step);
+
     const run_vopr_cli = b.addRunArtifact(vopr_cli);
     run_vopr_cli.addArg("run");
     if (b.args) |args| run_vopr_cli.addArgs(args);
@@ -9361,6 +9381,7 @@ pub fn build(b: *std.Build) void {
     vopr_test_step.dependOn(&run_composed_query_vopr_tests.step);
     vopr_test_step.dependOn(&run_query_embedding_cache_vopr_tests.step);
     vopr_test_step.dependOn(&run_full_cluster_vopr_tests.step);
+    vopr_test_step.dependOn(&run_ha_scaling_vopr_tests.step);
     vopr_test_step.dependOn(production_cluster_vopr_smoke_test_step);
     vopr_test_step.dependOn(&run_generation_reranking_vopr_tests.step);
     vopr_test_step.dependOn(&run_distributed_query_vopr_tests.step);
@@ -9418,20 +9439,22 @@ pub fn build(b: *std.Build) void {
     chaos_progress_tail = chainLabeledRun(b, lib_ha_vopr_tests, "ha-vopr-test", chaos_progress_tail);
     chaos_test_step.dependOn(chaos_progress_tail.?);
 
-    const vopr_soak_test_step = b.step("vopr-soak-test", "Run HA/Raft/data VOPR search campaigns and metadata/Raft native differentials");
+    const vopr_soak_test_step = b.step("vopr-soak-test", "Run HA/scaling/Raft/data VOPR search campaigns and metadata/Raft native differentials");
     const vopr_soak_histories = b.option(u64, "vopr-soak-histories", "Histories per VOPR soak campaign") orelse 100;
+    const vopr_soak_production_histories = b.option(u64, "vopr-soak-production-histories", "Histories in the production HA/scaling soak campaign") orelse 2;
     const vopr_soak_seed = b.option(u64, "vopr-soak-seed", "Base seed for VOPR soak campaigns") orelse 0xa17f_5500;
     const vopr_soak_artifacts = b.option([]const u8, "vopr-soak-artifacts", "Persistent directory for VOPR soak reports and replay corpus") orelse "zig-out/vopr-soak";
     var vopr_soak_progress_tail: ?*std.Build.Step = null;
     // One worker makes corpus-guided selection reproducible as a campaign,
     // in addition to each history's independent exact-replay guarantee.
-    for ([_][]const u8{ "ha", "raft", "distributed-data" }) |scenario| {
+    for ([_][]const u8{ "ha", "raft", "distributed-data", "ha-scaling" }) |scenario| {
+        const histories = if (std.mem.eql(u8, scenario, "ha-scaling")) vopr_soak_production_histories else vopr_soak_histories;
         const campaign = b.addRunArtifact(vopr_cli);
         campaign.addArgs(&.{
-            "campaign",                      "--scenario",                         scenario,
-            "--histories",                   b.fmt("{d}", .{vopr_soak_histories}), "--seed",
-            b.fmt("{d}", .{vopr_soak_seed}), "--workers",                          "1",
-            "--fail-on-findings",            "--artifact-dir",                     b.pathJoin(&.{ vopr_soak_artifacts, scenario }),
+            "campaign",                      "--scenario",               scenario,
+            "--histories",                   b.fmt("{d}", .{histories}), "--seed",
+            b.fmt("{d}", .{vopr_soak_seed}), "--workers",                "1",
+            "--fail-on-findings",            "--artifact-dir",           b.pathJoin(&.{ vopr_soak_artifacts, scenario }),
         });
         if (vopr_soak_progress_tail) |previous| campaign.step.dependOn(previous);
         vopr_soak_progress_tail = &campaign.step;

@@ -63,6 +63,7 @@ fn publishRuntimeStatusRefreshForTest(
 }
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const lsm_backend_mod = @import("../storage/lsm_backend.zig");
+const lsm_storage_io = @import("../storage/lsm_backend/storage_io.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
 const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
 const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
@@ -3620,12 +3621,13 @@ const RuntimeStatusDiskUsageScanner = struct {
         return try self.scan_fn(self.ptr, alloc, path);
     }
 
-    fn directory() @This() {
-        return .{ .scan_fn = scanDirectory };
+    fn directory(io: *std.Io) @This() {
+        return .{ .ptr = io, .scan_fn = scanDirectory };
     }
 
-    fn scanDirectory(_: ?*anyopaque, alloc: std.mem.Allocator, path: []const u8) !u64 {
-        return try directoryUsageBytes(alloc, path);
+    fn scanDirectory(ptr: ?*anyopaque, alloc: std.mem.Allocator, path: []const u8) !u64 {
+        const io: *const std.Io = @ptrCast(@alignCast(ptr.?));
+        return try directoryUsageBytes(alloc, io.*, path);
     }
 };
 
@@ -5723,6 +5725,7 @@ pub const DataServer = struct {
     status_source: antfly.public_api.http_server.StatusSource,
     http_server: ?antfly.public_api.ApiHttpServer = null,
     owned_incoming_graph_route_backend: ?lsm_backend_mod.BackendHandle = null,
+    owned_incoming_graph_route_io: ?lsm_storage_io.IoStorage = null,
     owned_incoming_graph_route_store: ?antfly.storage_backend_erased.Store = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
     h1_disconnect_probe: ?httpx.H1DisconnectProbe = null,
@@ -6175,7 +6178,12 @@ pub const DataServer = struct {
                 .{self.write_source.replica_root_dir},
             );
             defer self.alloc.free(route_root);
-            self.owned_incoming_graph_route_backend = try lsm_backend_mod.BackendHandle.open(self.alloc, route_root, .{});
+            const runtime = try self.ensureBackendRuntime();
+            const filesystem_io = runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+            self.owned_incoming_graph_route_io = lsm_storage_io.IoStorage.init(filesystem_io);
+            self.owned_incoming_graph_route_backend = try lsm_backend_mod.BackendHandle.open(self.alloc, route_root, .{
+                .storage = if (runtime.usesBorrowedIo() or runtime.borrowed_filesystem_io != null) self.owned_incoming_graph_route_io.?.storage() else null,
+            });
             errdefer {
                 self.owned_incoming_graph_route_backend.?.close();
                 self.owned_incoming_graph_route_backend = null;
@@ -6586,9 +6594,9 @@ pub const DataServer = struct {
         const log_path = cfg.standby_log_path orelse return error.HAPromotedPrimaryLogMissing;
         const progress_path = cfg.standby_progress_path orelse return error.HAPromotedPrimarySlotsMissing;
         try self.validateHAStandbyPromotionOwner(standby);
-        var io_impl = std.Io.Threaded.init(self.alloc, .{});
-        defer io_impl.deinit();
-        switch (try standby.pathsMatch(self.alloc, io_impl.io(), log_path, progress_path)) {
+        const runtime = try self.ensureBackendRuntime();
+        const filesystem_io = runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+        switch (try standby.pathsMatch(self.alloc, filesystem_io, log_path, progress_path)) {
             .match => {},
             .receive_log_mismatch => return error.PromotedLogMismatch,
             .progress_wal_mismatch => return error.PromotedProgressMismatch,
@@ -6606,7 +6614,7 @@ pub const DataServer = struct {
             standby,
             slots_path.ptr,
             handoff,
-            .{},
+            .{ .slot_store_options = .{ .wal_options = standby.progress_wal_options } },
         );
         errdefer promoted_primary.close();
 
@@ -15373,7 +15381,9 @@ pub const DataServer = struct {
         db_path: []const u8,
         status: runtime_status.LocalTableRuntimeStatus,
     ) ?RuntimeStatusDiskUsageObservation {
-        return self.runtimeStatusDiskUsageBytesBestEffortWithScanner(group_id, db_path, status, .directory());
+        const runtime = self.ensureBackendRuntime() catch return null;
+        var filesystem_io = runtime.filesystemIo() orelse return null;
+        return self.runtimeStatusDiskUsageBytesBestEffortWithScanner(group_id, db_path, status, .directory(&filesystem_io));
     }
 
     fn runtimeStatusDiskUsageBytesBestEffortWithScanner(
@@ -22372,7 +22382,7 @@ fn collectLocalGroupStatusFromDb(
     return .{
         .group_id = group_id,
         .doc_count = source_doc_count,
-        .disk_bytes = try directoryUsageBytes(alloc, db_path),
+        .disk_bytes = try directoryUsageBytes(alloc, db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable, db_path),
         .disk_bytes_known = true,
         .empty = source_doc_count == 0,
         .created_at_millis = created_at_millis,
@@ -22993,21 +23003,19 @@ fn findMergedSnapshotGroupStatus(
     return null;
 }
 
-fn directoryUsageBytes(alloc: std.mem.Allocator, path: []const u8) !u64 {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    var dir = std.Io.Dir.cwd().openDir(io_impl.io(), path, .{ .iterate = true }) catch |err| switch (err) {
+fn directoryUsageBytes(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !u64 {
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return 0,
         else => return err,
     };
-    defer dir.close(io_impl.io());
+    defer dir.close(io);
 
     var total: u64 = 0;
     var walker = try dir.walk(alloc);
     defer walker.deinit();
-    while (try walker.next(io_impl.io())) |entry| {
+    while (try walker.next(io)) |entry| {
         if (entry.kind != .file) continue;
-        const stat = try dir.statFile(io_impl.io(), entry.path, .{});
+        const stat = try dir.statFile(io, entry.path, .{});
         total += stat.size;
     }
     return total;
@@ -40447,4 +40455,20 @@ test "data runtime background worker capacity is reserved and closes with its ow
     try std.testing.expectEqual(@as(usize, 0), server.backend_runtime.?.laneStats().reserved_workers);
     try std.testing.expect(server.maintenance_worker_lease == null);
     try std.testing.expectError(error.BackgroundOwnerClosing, server.ensureBackgroundWorkerIo(.maintenance));
+}
+
+test "data runtime disk usage scanner reads borrowed filesystem for sharding evidence" {
+    var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{});
+    defer vopr_io.deinit();
+    var io = vopr_io.io();
+    const root = "/vopr-sharding-disk-usage";
+    try std.Io.Dir.cwd().createDirPath(io, root ++ "/nested");
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/one", .data = "abc" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/nested/two", .data = "12345" });
+    const scanner = RuntimeStatusDiskUsageScanner.directory(&io);
+    try std.testing.expectEqual(@as(u64, 8), try scanner.scan(std.testing.allocator, root));
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/nested/two", .data = "1" });
+    try std.testing.expectEqual(@as(u64, 4), try scanner.scan(std.testing.allocator, root));
+    try std.testing.expectEqual(@as(u64, 0), try scanner.scan(std.testing.allocator, root ++ "/absent"));
+    try vopr_io.ensureNoCapabilityViolation();
 }

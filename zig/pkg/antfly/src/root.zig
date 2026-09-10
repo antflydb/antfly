@@ -108,6 +108,7 @@ pub const db_index_races_vopr = @import("vopr/db_index_races.zig");
 pub const provider_boundaries_vopr = @import("vopr/provider_boundaries.zig");
 pub const composed_query_vopr = @import("vopr/composed_query.zig");
 pub const query_embedding_cache_vopr = @import("vopr/query_embedding_cache.zig");
+pub const production_ha_vopr = @import("vopr/production_ha.zig");
 pub const production_cluster_vopr = @import("vopr/production_cluster.zig");
 pub const full_cluster_vopr = @import("vopr/full_cluster.zig");
 pub const generation_reranking_vopr = @import("vopr/generation_reranking.zig");
@@ -388,6 +389,7 @@ test {
     _ = composed_query_vopr;
     _ = query_embedding_cache_vopr;
     _ = full_cluster_vopr;
+    _ = production_ha_vopr;
     _ = generation_reranking_vopr;
     _ = distributed_query_vopr;
     _ = parquet_cache_vopr;
