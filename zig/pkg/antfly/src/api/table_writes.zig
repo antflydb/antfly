@@ -8017,9 +8017,10 @@ pub const ProvisionedTableWriteSource = struct {
     write_coalesce_queues: std.ArrayListUnmanaged(WriteCoalesceQueue) = .empty,
     read_cache: ?*table_reads.ProvisionedTableReadCache = null,
     /// Dropped-table cleanup is post-commit convergence backed by a durable
-    /// repair intent. Bound foreground lease draining so an abandoned reader
-    /// cannot pin the user request; recovery resumes the idempotent cleanup.
-    drop_cleanup_read_drain_timeout_ns: u64 = 5 * std.time.ns_per_s,
+    /// repair intent. Bound foreground read and writer-cache lease draining so
+    /// an abandoned holder cannot pin the user request; recovery resumes the
+    /// idempotent cleanup.
+    drop_cleanup_cache_drain_timeout_ns: u64 = 5 * std.time.ns_per_s,
     write_cache: ?*ProvisionedTableWriteCache = null,
     startup_write_cache: ?*ProvisionedTableWriteCache = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
@@ -10120,6 +10121,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: ?[]const u8,
     ) !void {
         const io = self.tableActivityIo();
+        const drain_started_ns = platform_time.monotonicNs();
         const owned_table_name = if (table_name) |name| try std.heap.page_allocator.dupe(u8, name) else null;
         errdefer if (owned_table_name) |name| std.heap.page_allocator.free(name);
         self.table_activity_mutex.lockUncancelable(io);
@@ -12037,6 +12039,46 @@ pub const ProvisionedTableWriteSource = struct {
                     cache.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name)
                 else
                     cache.drainPendingClosesForGroupTable(group_id, table_name);
+            }
+        }
+    }
+
+    fn drainDroppedTableWriteCachesWithDeadline(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_ids: []const u64,
+        open_fence: ?*std.atomic.Mutex,
+        deadline_ns: u64,
+    ) !void {
+        const io = self.tableActivityIo();
+        for (group_ids) |group_id| {
+            const caches = [_]?*ProvisionedTableWriteCache{
+                self.write_cache,
+                self.startup_write_cache,
+            };
+            for (caches, 0..) |maybe_cache, cache_index| {
+                const cache = maybe_cache orelse continue;
+                if (cache_index == 1 and self.write_cache != null and cache == self.write_cache.?) continue;
+                while (true) {
+                    if (open_fence != null and open_fence.? == &cache.open_mutex)
+                        cache.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name)
+                    else
+                        cache.drainPendingClosesForGroupTable(group_id, table_name);
+
+                    if (!cache.hasRetiredActiveLeaseForGroupTableLocked(group_id, table_name) and
+                        !cache.hasPendingCloseForGroupTableLocked(group_id, table_name)) break;
+
+                    const now_ns = platform_time.monotonicNs();
+                    if (now_ns >= deadline_ns) {
+                        std.log.warn("table writer generation drain timed out table={s} group_id={} wait_ms={}", .{
+                            table_name,
+                            group_id,
+                            @divTrunc(now_ns -| drain_started_ns, std.time.ns_per_ms),
+                        });
+                        return error.TableWriteDrainTimeout;
+                    }
+                    io.sleep(.fromNanoseconds(@min(std.time.ns_per_ms, deadline_ns - now_ns)), .awake) catch {};
+                }
             }
         }
     }
@@ -20560,18 +20602,23 @@ pub const ProvisionedTableWriteSource = struct {
         self.invalidateWriteCache(table_name);
         self.invalidateReadCache(table_name);
         self.invalidateRuntimeStatusCache(table_name);
-        const read_drain_deadline_ns = platform_time.monotonicNs() +|
-            self.drop_cleanup_read_drain_timeout_ns;
+        const cache_drain_deadline_ns = platform_time.monotonicNs() +|
+            self.drop_cleanup_cache_drain_timeout_ns;
         var read_cache_exclusive = self.beginReadCacheExclusiveWithDeadline(
             table_name,
-            read_drain_deadline_ns,
+            cache_drain_deadline_ns,
         ) catch |err| {
             self.local_db_mutex.unlock();
             return err;
         };
         defer if (read_cache_exclusive) |*exclusive| exclusive.deinit();
         self.local_db_mutex.unlock();
-        self.drainWriteCachePendingClosesForGroupsWithOpenFence(table_name, group_ids, open_fence);
+        try self.drainDroppedTableWriteCachesWithDeadline(
+            table_name,
+            group_ids,
+            open_fence,
+            cache_drain_deadline_ns,
+        );
 
         var moved_any_group = false;
         for (group_ids) |group_id| {
@@ -55687,6 +55734,7 @@ test "provisioned table write source drop table closes schema-bearing cached wri
     defer write_cache.deinit();
     var catalog = Catalog{};
     var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
+    defer source.deinit();
     source.write_cache = &write_cache;
 
     var req = tables_api.CreateTableRequest{
@@ -55701,10 +55749,42 @@ test "provisioned table write source drop table closes schema-bearing cached wri
         .writes = &.{.{ .key = "doc:1", .value = "{\"title\":\"alpha\",\"content\":\"body\"}" }},
         .sync_level = .write,
     });
+
+    // Metrics retain cache entries outside table request admission. A dropped
+    // table must keep its files until those leases release and DB.close has
+    // finished its final flush, including status snapshots.
+    const metric_storage = try alloc.alloc(*ProvisionedTableWriteCache.Entry, 1);
+    var metric_pins = pinWriteCacheLsmOwnerEntriesBestEffort(&write_cache, metric_storage) orelse {
+        alloc.free(metric_storage);
+        return error.TestUnexpectedResult;
+    };
+    var metric_pins_active = true;
+    defer if (metric_pins_active) metric_pins.deinit(alloc);
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(path);
+    const contract: metadata_topology_protocol.DropCleanupContract = .{
+        .table_id = 7,
+        .expected_transition_generation = 1,
+        .group_ids = &.{7001},
+    };
     catalog.dropped.store(true, .release);
-    _ = try source.source().dropTable(alloc, "docs", .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{7001} });
+    source.drop_cleanup_cache_drain_timeout_ns = 0;
+    try std.testing.expectError(error.TableWriteDrainTimeout, source.source().dropTable(alloc, "docs", contract));
     try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.retired_entries.items.len);
+    try std.Io.Dir.cwd().access(std.testing.io, path, .{});
+    var retained_doc = (try metric_pins.entries()[0].db.lookup(alloc, "doc:1", .{})) orelse return error.TestUnexpectedResult;
+    defer retained_doc.deinit(alloc);
+
+    metric_pins.deinit(alloc);
+    metric_pins_active = false;
+    // The durable cleanup intent must converge once the last lease releases.
+    try std.testing.expect(!try source.recoverDroppedTableRepairIntents(alloc));
+    try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), write_cache.closing_entries.items.len);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, path, .{}));
+    write_cache.drainPendingCloses();
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, path, .{}));
 }
 
 test "provisioned table write source drop table waits for active read cache lease" {
@@ -55814,7 +55894,7 @@ test "provisioned table write source drop table waits for active read cache leas
 
     var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
     source.read_cache = &read_cache;
-    source.drop_cleanup_read_drain_timeout_ns = 3 * std.time.ns_per_s;
+    source.drop_cleanup_cache_drain_timeout_ns = 3 * std.time.ns_per_s;
 
     var probe = Probe{};
     test_before_drop_table_delete_hook = .{ .ptr = &probe, .run = Probe.run };
