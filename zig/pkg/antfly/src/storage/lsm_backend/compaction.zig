@@ -21,6 +21,7 @@ const compaction_scheduler_mod = @import("compaction_scheduler.zig");
 const Directory = @import("run_directory.zig").Directory;
 const run_store = @import("run_store.zig");
 const ClosureJob = @import("closure_job.zig").Job;
+const DependencyValidation = @import("dependency_validation.zig").Validation;
 const resource_manager_mod = @import("../resource_manager.zig");
 
 const State = state_mod.State;
@@ -152,6 +153,9 @@ const CompactionWork = struct {
 
 pub const CompactionPlan = struct {
     complete_coverage: ?bool = null,
+    // A certificate may bypass repeated identity/coverage work only while
+    // this exact publication generation remains current under the mutex.
+    validated_generation: ?u64 = null,
     source_level: u32,
     source_start: usize,
     source_len: usize,
@@ -272,6 +276,8 @@ pub const PendingDirectoryClosure = struct {
     allow_oversized: bool,
     overlap_threshold: usize,
     reservation: ?resource_manager_mod.Reservation = null,
+    selected: ?SelectedPlan = null,
+    validation: ?DependencyValidation = null,
 
     fn create(backend: anytype, seeds: []const Directory.Handle, max_bytes: u64, allow_oversized: bool, overlap_threshold: usize) !*@This() {
         const allocator = backend.allocator;
@@ -299,6 +305,11 @@ pub const PendingDirectoryClosure = struct {
     }
 
     pub fn cleanupStep(self: *@This(), allocator: std.mem.Allocator, credits: *usize) bool {
+        if (self.validation) |*validation| if (!validation.cleanupStep(allocator, credits)) return false;
+        if (self.selected) |*selected| {
+            if (!selected.deinitStep(allocator, credits)) return false;
+            self.selected = null;
+        }
         if (self.retired_job) |*job| {
             if (!job.deinitStep(allocator, credits)) return false;
             self.retired_job = null;
@@ -328,6 +339,7 @@ pub const PendingDirectoryClosure = struct {
         const allocator = backend.allocator;
         var credits: usize = std.math.maxInt(usize);
         std.debug.assert(self.cleanupStep(allocator, &credits));
+        if (self.validation) |*validation| validation.deinit(backend);
         backend.retireCheckpointDirectory(self.directory);
         allocator.free(self.seeds);
         if (self.reservation) |*lease| lease.release();
@@ -343,6 +355,7 @@ fn resumeDirectoryClosure(backend: anytype) !?SelectedPlan {
     backend.retainReaderKind(.compaction);
     defer backend.releaseReaderKind(.compaction);
     const BackendType = @TypeOf(backend.*);
+    if (pending.selected != null) return resumeClosureValidation(backend, pending);
     if (backend.manifestCoordinationIo()) |io| try io.checkCancel();
     runtime_mod.unlockBackend(BackendType, backend, true);
     const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
@@ -372,8 +385,10 @@ fn resumeDirectoryClosure(backend: anytype) !?SelectedPlan {
         pending.retired_job = replacement;
         return null;
     }
-    destroy = true;
-    if (pending.job.source_len < pending.overlap_threshold) return null;
+    if (pending.job.source_len < pending.overlap_threshold) {
+        destroy = true;
+        return null;
+    }
     const handles = pending.job.handles.?;
     var selected = SelectedPlan{ .plan = .{
         .source_level = pending.job.source_level,
@@ -388,17 +403,45 @@ fn resumeDirectoryClosure(backend: anytype) !?SelectedPlan {
     } };
     pending.job.handles = null;
     pending.job.indices = null;
-    errdefer selected.release(backend);
-    if ((try backend.planningDirectory()).tree.root != pending.directory.tree.root) {
-        const relocated = try relocateDirectoryPlan(backend, selected.plan) orelse {
-            selected.release(backend);
-            return null;
-        };
-        backend.allocator.free(selected.plan.run_indices.?);
-        selected.plan.run_indices = relocated.plan.run_indices;
-    }
     selected.reservation = pending.reservation;
     pending.reservation = null;
+    pending.selected = selected;
+    return resumeClosureValidation(backend, pending);
+}
+
+fn resumeClosureValidation(backend: anytype, pending: *PendingDirectoryClosure) !?SelectedPlan {
+    var retire = false;
+    defer if (retire) {
+        backend.pending_directory_closure = null;
+        backend.retireClosurePlanning(pending);
+    };
+    errdefer retire = true;
+    if (pending.validation == null) {
+        const current = try backend.planningDirectory();
+        if (current.tree.root == pending.directory.tree.root and current.tombstoneRunCount() == 0) {
+            // Discovery already certified these identities and dependencies.
+            // Without deletes there is no coverage work to repeat.
+            retire = true;
+            var selected = pending.selected.?;
+            pending.selected = null;
+            selected.plan.complete_coverage = false;
+            selected.plan.validated_generation = backend.run_directory_generation;
+            return selected;
+        }
+        pending.validation = try DependencyValidation.init(backend, pending.selected.?.plan);
+    }
+    const result = try pending.validation.?.advanceLocked(backend);
+    backend.directory_planning_slices +|= 1;
+    if (result == .pending) return null;
+    retire = true;
+    if (result == .invalid) return null;
+    var selected = pending.selected.?;
+    pending.selected = null;
+    backend.allocator.free(selected.plan.run_indices.?);
+    selected.plan.run_indices = pending.validation.?.job.indices;
+    pending.validation.?.job.indices = null;
+    selected.plan.complete_coverage = pending.validation.?.job.covered;
+    selected.plan.validated_generation = backend.run_directory_generation;
     return selected;
 }
 
@@ -685,6 +728,7 @@ pub const PendingGc = struct {
     retired_next: ?*PendingGc = null,
     selected: ?SelectedPlan = null,
     intent: ?Intent = null,
+    validation: ?DependencyValidation = null,
 
     const Intent = struct {
         base: *Directory,
@@ -701,6 +745,7 @@ pub const PendingGc = struct {
             directory: *Directory,
             store: *run_store.Store,
             changes: Directory.ChangeCursor,
+            pending_change: ?Directory.ChangeCursor.Change = null,
         };
 
         fn beginRebase(self: *Intent, backend: anytype) !void {
@@ -727,8 +772,17 @@ pub const PendingGc = struct {
             const objectives = selected.gc_objective_handles orelse selected.plan.input_handles.?;
             const first = objectives[0].run;
             const first_visibility = if (first.visibility_id == 0) first.id else first.visibility_id;
-            while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
-                const change = rebase.changes.next(&credits) orelse return rebase.changes.done();
+            while (credits != 0) {
+                const change = rebase.pending_change orelse rebase.changes.next(&credits) orelse return rebase.changes.done();
+                if (@import("antfly_platform").time.monotonicNs() >= deadline) {
+                    rebase.pending_change = change;
+                    return false;
+                }
+                // Recognize cursor exhaustion even when the last allocating
+                // edit consumed the time quantum. Otherwise a one-edit delta
+                // requires a second turn just to finish its cursor, and one
+                // new write per turn can keep intent forever one epoch behind.
+                rebase.pending_change = null;
                 const run = change.run;
                 if (Directory.containsReadOrdered(objectives, run)) return error.CompactionPlanningStale;
                 const visibility = if (run.visibility_id == 0) run.id else run.visibility_id;
@@ -833,6 +887,7 @@ pub const PendingGc = struct {
     };
 
     pub fn cleanupStep(self: *@This(), allocator: std.mem.Allocator, credits: *usize) bool {
+        if (self.validation) |*validation| if (!validation.cleanupStep(allocator, credits)) return false;
         if (self.selected) |*selected| {
             if (!selected.deinitStep(allocator, credits)) return false;
             self.selected = null;
@@ -853,6 +908,7 @@ pub const PendingGc = struct {
 
     pub fn destroy(self: *@This(), backend: anytype) void {
         self.discardIntent(backend);
+        if (self.validation) |*validation| validation.deinit(backend);
         if (self.selected) |selected| selected.deinit(backend.allocator);
         self.job.deinit(backend.allocator);
         backend.retireCheckpointDirectory(self.directory);
@@ -948,6 +1004,10 @@ test "GC intent rebases writes between slices without restarting or dropping new
             }
         }
     }
+    if (backend.pending_gc) |pending| {
+        if (pending.intent) |intent| std.debug.print("GC intent stalled: added={d} prepared={d} refreshed={d} rebasing={}\n", .{ added, intent.index, intent.refreshed, intent.rebase != null });
+        if (pending.validation) |validation| std.debug.print("GC validation stalled: phase={s} inputs={d} slices={d} rebases={d}\n", .{ @tagName(validation.phase), validation.job.index, validation.slices, validation.rebases });
+    }
     return error.GcIntentDidNotConverge;
 }
 
@@ -964,10 +1024,13 @@ fn resumeGcIntent(backend: anytype, pending: *PendingGc) !?SelectedPlan {
     backend.retainReaderKind(.compaction);
     defer backend.releaseReaderKind(.compaction);
     const intent = &pending.intent.?;
-    const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
+    var deadline: u64 = 0;
     var turns: usize = 0;
     while (true) {
         runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
+        // Reclamation has its own bounded quantum. Starting this deadline
+        // before unlock can starve intent work under continuous publication.
+        if (deadline == 0) deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
         const result = if (intent.rebase != null)
             intent.stepRebase(backend, &pending.job.component.?, &pending.selected.?, 512, deadline)
         else
@@ -1047,6 +1110,11 @@ test "GC intent rejects changes to selected newer levels above its tombstone anc
     try latest.put(&backend, revised);
     backend.publishRunDirectory(latest);
     try intent.beginRebase(&backend);
+    for (0..64) |_| {
+        if (intent.rebase.?.pending_change != null) break;
+        try std.testing.expect(!try intent.stepRebase(&backend, &component, &selected, 1, 0));
+    }
+    try std.testing.expect(intent.rebase.?.pending_change != null);
     try std.testing.expectError(error.CompactionPlanningStale, intent.stepRebase(&backend, &component, &selected, 2048, std.math.maxInt(u64)));
     try std.testing.expect(!intent.directory.?.byId(handles[0].run.id).?.gc_requested);
 }
@@ -1059,6 +1127,7 @@ fn selectDirectoryGc(backend: anytype, max_bytes: u64) !?SelectedPlan {
     backend.directory_planning_in_flight = true;
     defer backend.directory_planning_in_flight = false;
     if (backend.pending_gc) |pending| if (pending.intent != null) return resumeGcIntent(backend, pending);
+    if (backend.pending_gc) |pending| if (pending.selected != null) return resumeGcValidation(backend, pending);
     const allocator = backend.allocator;
     const configured = backend.options.tombstone_gc_max_input_bytes;
     const limit = if (max_bytes == 0) configured else if (configured == 0) max_bytes else @min(max_bytes, configured);
@@ -1099,19 +1168,41 @@ fn selectDirectoryGc(backend: anytype, max_bytes: u64) !?SelectedPlan {
     pending.cache.valid_until = pending.job.valid_until;
     if (pending.cache.generation == backend.run_directory_generation) backend.gc_debt_cache = pending.cache;
     pending.selected = try pending.take(allocator) orelse return null;
-    const selected = &pending.selected.?;
-    const objectives = selected.gc_objective_handles orelse selected.plan.input_handles.?;
-    // Revalidate the whole collection objective before persisting its intent.
-    var objective_plan = selected.plan;
-    objective_plan.input_handles = objectives;
-    objective_plan.source_level = objectives[0].run.level;
-    objective_plan.split_gc = false;
-    objective_plan.tombstone_gc = true;
-    const objective = try relocateDirectoryPlan(backend, objective_plan) orelse return null;
-    defer objective.deinit(allocator);
-    pending.intent = try PendingGc.Intent.create(backend, pending);
     retire = false;
-    return resumeGcIntent(backend, pending);
+    return null;
+}
+
+fn resumeGcValidation(backend: anytype, pending: *PendingGc) !?SelectedPlan {
+    var retire = false;
+    defer if (retire) {
+        backend.pending_gc = null;
+        backend.retireGcPlanning(pending);
+    };
+    errdefer retire = true;
+    if (pending.validation == null) {
+        const selected = &pending.selected.?;
+        const objectives = selected.gc_objective_handles orelse selected.plan.input_handles.?;
+        var objective = selected.plan;
+        objective.input_handles = objectives;
+        objective.source_level = objectives[0].run.level;
+        objective.split_gc = false;
+        objective.tombstone_gc = true;
+        pending.validation = try DependencyValidation.init(backend, objective);
+    }
+    const result = try pending.validation.?.advanceLocked(backend);
+    backend.directory_planning_slices +|= 1;
+    if (result == .pending) return null;
+    if (result == .invalid) {
+        retire = true;
+        return null;
+    }
+    // The complete objective is certified against the live root. Capture the
+    // intent roots before unlocking; intent's own continuation rebases later
+    // publications without retaining validation scratch.
+    pending.intent = try PendingGc.Intent.create(backend, pending);
+    pending.validation.?.deinit(backend);
+    pending.validation = null;
+    return null;
 }
 
 fn selectTombstoneGc(backend: anytype, max_bytes: u64) !?SelectedPlan {
@@ -1189,6 +1280,10 @@ pub fn compactTombstonesScheduled(comptime BackendType: type, backend: *BackendT
         backend.tombstone_gc_retry_after_ns = 0;
     }
     const selected = try selectTombstoneGc(backend, backend.options.max_compaction_input_bytes) orelse {
+        // A continuation yielding its quantum is progress, not an admission
+        // denial. In particular, aged GC must not sleep 250 ms after every
+        // identity, cleanup, or intent slice.
+        if (comptime @hasField(BackendType, "pending_gc")) if (backend.pending_gc != null) return false;
         if ((nextTombstoneGcDelay(backend) orelse 1) == 0) deferTombstoneGc(backend);
         return false;
     };
@@ -1518,7 +1613,11 @@ fn selectDirectoryPlanBudgeted(backend: anytype, l0_limit: usize, l0_only: bool,
         };
         selected.plan.partition_key = backend.options.run_partition_key;
         if (hotspot and selected.plan.source_len < overlap_threshold) {
-            selected.release(backend);
+            // This is bounded fast-path scratch, not end-of-operation cleanup.
+            // Keep the writer fence: release() may unlock and reclaim the
+            // borrowed directory that the next iteration still uses. Every
+            // payload also remains owned by the live directory here.
+            selected.deinit(backend.allocator);
             continue;
         }
         selected.reservation = reservation;
@@ -1534,6 +1633,51 @@ pub fn directorySelectionInputCountForTest(backend: anytype) !usize {
     const selected = try selectDomainPlanSynchronous(backend, backend.options.compact_threshold_runs, false, backend.options.max_compaction_input_bytes, false, &stats) orelse return 0;
     defer selected.release(backend);
     return selected.plan.source_len + selected.plan.target_len;
+}
+
+test "hotspot rejection preserves the borrowed directory writer fence" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        directory: *Directory,
+        options: @import("../lsm_backend.zig").Options = .{ .compact_threshold_runs = 100, .level_target_bytes_base = 0 },
+        planner_seed: usize = 0,
+        mu: @TypeOf(@as(Backend, undefined).mu) = .unlocked,
+        storage: ?void = null,
+        root_dir: ?[]u8 = null,
+        unlocks: usize = 0,
+        pub fn planningDirectory(self: *@This()) !*const Directory {
+            return self.directory;
+        }
+        pub fn retainRunSnapshotRef(_: *@This(), _: *Run) !void {}
+        pub fn releaseRunSnapshotRef(_: *@This(), _: *Run) void {}
+        pub fn retainReader(_: *@This()) void {}
+        pub fn releaseReader(_: *@This()) void {}
+        pub fn retainReaderKind(_: *@This(), _: anytype) void {}
+        pub fn releaseReaderKind(_: *@This(), _: anytype) void {}
+        pub fn manifestCoordinationIo(_: *@This()) ?std.Io {
+            return null;
+        }
+        pub fn unlockWithReclamation(self: *@This()) void {
+            self.unlocks += 1;
+            self.mu.unlock();
+        }
+    };
+    const allocator = std.testing.allocator;
+    const directory = try Directory.create(allocator);
+    defer directory.destroy(allocator);
+    var fixture = Fixture{ .allocator = allocator, .directory = directory };
+    for (0..12) |i| {
+        var key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key, i, .big);
+        try directory.put(&fixture, .{ .id = i + 1, .level = 0, .size_bytes = 1, .path = null, .smallest_namespace_name = null, .smallest_key = &key, .largest_namespace_name = null, .largest_key = &key, .entry_count = 1, .bloom_filter = null, .state = .{} });
+    }
+    const locked = runtime_mod.lockBackend(Fixture, &fixture);
+    defer runtime_mod.unlockBackend(Fixture, &fixture, locked);
+    var stats: CompactionSelectionStats = .{};
+    try std.testing.expect(try selectDirectoryPlan(&fixture, 100, false, 0, false, &stats) == null);
+    try std.testing.expectEqual(@as(usize, 8), fixture.planner_seed);
+    try std.testing.expectEqual(@as(usize, 0), fixture.unlocks);
 }
 
 fn selectDomainPlanSynchronous(backend: anytype, l0_limit: usize, l0_only: bool, max_bytes: u64, allow_oversized: bool, stats: *CompactionSelectionStats) !?SelectedPlan {
@@ -1596,72 +1740,41 @@ fn relocateDomainPlan(allocator: std.mem.Allocator, runs: []const Run, plan: Com
 
 fn relocateDirectoryPlan(backend: anytype, plan: CompactionPlan) !?SelectedPlan {
     const allocator = backend.allocator;
-    var directory = try (try backend.planningDirectory()).fork(allocator);
-    defer backend.retireCheckpointDirectory(directory);
-    var reservation: ?resource_manager_mod.Reservation = null;
-    defer if (reservation) |*lease| lease.release();
-    if (backend.options.resource_manager) |manager| reservation = try manager.reserve(.lsm_table_builder_working_set, 8192 + plan.input_handles.?.len * 128);
-    backend.retainReaderKind(.compaction);
-    defer backend.releaseReaderKind(.compaction);
-    const io = backend.manifestCoordinationIo();
-    var job = @import("dependency_job.zig").Job.init(directory, plan);
-    defer if (job.indices) |indices| allocator.free(indices);
-    runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
-    const checked = advanceDependencyJob(allocator, &job, io);
-    _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
-    try checked;
-    if (!job.valid) return null;
-    // Extend the completed certificate through deltas, not through another
-    // O(K) identity scan. Stable input handles survive unrelated rank changes.
-    while ((try backend.planningDirectory()).tree.root != directory.tree.root) {
-        const latest = try (try backend.planningDirectory()).fork(allocator);
-        var changes = Directory.ChangeCursor.init(directory, latest);
-        runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
-        const accepted = advanceDependencyChanges(&job, &changes, io);
-        _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
-        backend.retireCheckpointDirectory(directory);
-        directory = latest;
-        try accepted;
-        if (!job.valid) return null;
-    }
-    var relocated = plan;
-    relocated.run_indices = job.indices;
-    job.indices = null;
-    return .{ .plan = relocated, .borrowed_inputs = true, .complete_coverage = job.covered };
-}
-
-fn advanceDependencyJob(allocator: std.mem.Allocator, job: *@import("dependency_job.zig").Job, io: ?std.Io) !void {
-    // Reclaim the temporary membership tree before the final certificate CAS.
-    // Delta validation uses the already-sorted stable handles afterwards.
+    var validation = try DependencyValidation.init(backend, plan);
     defer {
-        const indices = job.indices;
-        job.indices = null;
-        while (true) {
-            var credits: usize = 2048;
-            if (job.deinitStep(allocator, &credits)) break;
-            if (io) |runtime| runtime.sleep(.fromNanoseconds(1), .awake) catch {};
+        // Synchronous build/publication owns its inputs on the stack. Drain
+        // cancellation/error cleanup off-lock too; maintenance-owned jobs
+        // instead retain this continuation on their retirement queues.
+        if (validation.phase != .certificate) {
+            backend.retainReaderKind(.compaction);
+            runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
+            while (true) {
+                var credits: usize = 2048;
+                if (validation.cleanupStep(allocator, &credits)) break;
+                if (backend.manifestCoordinationIo()) |io| io.sleep(.fromNanoseconds(1), .awake) catch {};
+            }
+            _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
+            backend.releaseReaderKind(.compaction);
         }
-        job.indices = indices;
+        validation.deinit(backend);
     }
     while (true) {
-        if (io) |runtime| try runtime.checkCancel();
-        if (try job.step(allocator, 2048, @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms)) return;
-        if (io) |runtime| try runtime.sleep(.fromNanoseconds(1), .awake);
-    }
-}
-
-fn advanceDependencyChanges(job: *@import("dependency_job.zig").Job, changes: *Directory.ChangeCursor, io: ?std.Io) !void {
-    while (!changes.done()) {
-        if (io) |runtime| try runtime.checkCancel();
-        var credits: usize = 2048;
-        const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
-        while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
-            if (changes.next(&credits)) |change| {
-                if (!job.acceptChange(change)) return;
-            } else break;
+        // A synchronous installation must not chase a moving epoch forever.
+        // Return a stale result after bounded rebase attempts; its caller
+        // safely discards unpublished output and schedules a fresh plan.
+        if (validation.rebases >= 4 and validation.changes == null) return null;
+        switch (try validation.advanceLocked(backend)) {
+            .pending => continue,
+            .invalid => return null,
+            .valid => break,
         }
-        if (!changes.done()) if (io) |runtime| try runtime.sleep(.fromNanoseconds(1), .awake);
     }
+    var relocated = plan;
+    relocated.run_indices = validation.job.indices;
+    validation.job.indices = null;
+    relocated.complete_coverage = validation.job.covered;
+    relocated.validated_generation = backend.run_directory_generation;
+    return .{ .plan = relocated, .borrowed_inputs = true, .complete_coverage = validation.job.covered };
 }
 
 pub const RememberedCompaction = struct {
@@ -2244,7 +2357,9 @@ fn compactPlanAt(comptime BackendType: type, backend: *BackendType, initial_plan
     defer if (validated) |selected| selected.release(backend);
     if (comptime @hasDecl(BackendType, "planningDirectory")) {
         if (plan.input_handles != null) {
-            if ((try backend.planningDirectory()).tombstoneRunCount() == 0 or plan.split_gc) {
+            if (plan.validated_generation != null and plan.validated_generation.? == backend.run_directory_generation) {
+                std.debug.assert(plan.complete_coverage != null);
+            } else if ((try backend.planningDirectory()).tombstoneRunCount() == 0 or plan.split_gc) {
                 plan.complete_coverage = false;
             } else {
                 validated = try relocateDirectoryPlan(backend, plan);

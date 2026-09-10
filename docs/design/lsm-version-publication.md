@@ -162,13 +162,29 @@ remain explicit diagnostic/oracle or synchronous administrative projections.
 
 Ordinary discovery, GC component discovery, density/age evaluation, bounded
 progress selection, GC-intent preparation, and result emission use resumable
-jobs. Dependency certification runs off-lock in cooperative 2 ms / 2,048-credit
-slices. A persistent-root diff extends a completed certificate through concurrent
+jobs. Dependency certification owns both epochs and retains its identity,
+scratch-cleanup, and delta cursors across maintenance calls. Each call advances
+one off-lock 2 ms / 2,048-credit slice. A persistent-root diff extends a completed certificate through concurrent
 edits; genuinely newer L0 writes and disjoint changes do not restart its full
 input scan. Changed selected inputs or new mandatory dependencies invalidate
 it. Stable handles, not old ranks, address writer inputs at installation.
 GC-intent candidates similarly rebase concurrent deltas and publish their
 prepared writer/reader roots atomically.
+
+Synchronous build/install callers drain the same validator but give up after
+four rebase attempts, safely discarding unpublished output when they cannot
+catch the live epoch. They do not wait for global write quiescence indefinitely.
+An accepted maintenance certificate carries its publication generation, so an
+unchanged generation avoids a second full identity/coverage pass before build.
+Small rejected hotspot candidates release their bounded scratch without dropping
+the writer fence that protects the borrowed directory. L0 overlap scoring reads
+the maintained level aggregate; its cold fallback probes at most the scoring
+limit plus one run instead of walking an overloaded L0.
+
+Planner deadlines start after unlock-time reclamation has received its separate
+quantum. This prevents a backlog of retired versions from repeatedly consuming
+the entire planning budget before the first operation. Shutdown cancels jobs
+before draining writer roots, including unpublished GC-intent candidates.
 
 Metadata trees, planner arenas, and retired selection handles reclaim in bounded
 slices. Obsolete-file probes and deletion visit at most 128 due candidates per
@@ -334,6 +350,26 @@ contention; they establish algorithmic scaling, not throughput guarantees.
 An earlier repeat measured 5.39 µs for the 100,000-run replacement and 0.87 µs
 for its one-write certificate delta, illustrating ordinary local timing variation.
 
+The owned-validation follow-up (local macOS arm64, ReleaseFast) measured:
+
+| L0 runs / selected inputs | Previous scoring count walk | Aggregate scoring | Complete validation + scratch GC | Turns | Maximum validation turn |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 9.81 µs | <0.01 µs | 0.181 ms | 2 | 0.174 ms |
+| 10,000 | 187.65 µs | <0.01 µs | 2.384 ms | 15 | 0.338 ms |
+| 100,000 | 3.10 ms | <0.01 µs | 40.404 ms | 147 | 0.680 ms |
+
+The scoring control executes the previous repeated rank-lookup loop 31 times;
+the aggregate path executes 10,000 times against stable metadata. Its few-ns
+measurements are below useful application-level precision, not a claimed
+end-to-end speedup ratio. Validation includes the backend unlock/relock driver
+and incremental membership-tree cleanup, unlike the earlier scan-only numbers.
+The turn deadline is cooperative: allocator calls, mutex reacquisition and
+separately budgeted reclamation can extend wall time under contention. These
+measurements are not hard-real-time guarantees or sustained-write throughput
+results. Deterministic regressions separately publish newer runs between
+one-credit validation turns, check unchanged identity progress, reject replaced
+inputs, and verify cleanup at allocation failures and shutdown.
+
 The repeated physical-churn controls wrote 16,957,275 versus 16,036 SST bytes
 for two-sided metadata updates with domain-aware compaction disabled/enabled.
 The payload-family control wrote 6,357,075 versus 7,669 SST bytes, retaining
@@ -343,9 +379,10 @@ metadata-around-payload fixtures, not general workload amplification ratios.
 Reproduce from `zig/` with:
 
 ```sh
-python3 tools/run_bounded_zig_build.py build lib-storage-test -Doptimize=ReleaseFast -- --test-filter 'writer owner narrow publication scaling benchmark' --test-filter 'dependency certificate delta scaling benchmark'
-python3 tools/run_bounded_zig_build.py build lib-storage-test -Doptimize=ReleaseFast -- --test-filter 'lsm incremental manifest publication benchmark' --test-filter 'lsm persistent directory and lazy cursor scaling benchmark'
-python3 tools/run_bounded_zig_build.py build lib-storage-test -Doptimize=ReleaseFast -- --test-filter 'obsolete ledger' --test-filter 'native durability lane contention benchmark'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'writer owner narrow publication scaling benchmark' --test-filter 'dependency certificate delta scaling benchmark'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'lsm incremental manifest publication benchmark' --test-filter 'lsm persistent directory and lazy cursor scaling benchmark'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'obsolete ledger' --test-filter 'native durability lane contention benchmark'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'lsm overlap scoring aggregate scaling benchmark' --test-filter 'lsm dependency continuation slice scaling benchmark'
 python3 tools/run_bounded_zig_build.py build unit-storage-test-audit
 python3 tools/run_bounded_zig_build.py build lib-lsm-backend-sim-test -Doptimize=ReleaseSafe
 ```

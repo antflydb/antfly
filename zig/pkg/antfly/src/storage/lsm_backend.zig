@@ -2417,15 +2417,16 @@ pub const Backend = struct {
     fn largestL0OverlapRunCountLocked(self: *Backend) usize {
         const threshold = self.options.l0_overlap_compact_threshold_runs;
         if (threshold == 0) return 0;
-        var l0_count: usize = 0;
-        while (l0_count < self.runs.count() and self.runs.at(l0_count).*.level == 0) : (l0_count += 1) {}
         // Above the soft limit, normal L0 pressure already schedules
         // compaction. Exact overlap scoring is O(n^2) and runs under `mu`, so
         // performing it during overload can block point and batch reads for
         // seconds. Zero here means "not independently scored"; L0 run/byte
         // pressure remains fully represented by the surrounding metrics.
         const soft_limit = self.effectiveL0SoftLimitRuns();
-        if (soft_limit == 0 or l0_count > @min(soft_limit, compaction_mod.max_exact_l0_overlap_runs)) return 0;
+        if (soft_limit == 0) return 0;
+        const limit = @min(soft_limit, compaction_mod.max_exact_l0_overlap_runs);
+        const l0_count = self.overlapScoringL0Count(limit);
+        if (l0_count > limit) return 0;
         var scratch: [compaction_mod.max_exact_l0_overlap_runs]Run = undefined;
         const l0_runs = scratch[0..l0_count];
         for (l0_runs, 0..) |*run, rank| run.* = self.runs.at(rank).*;
@@ -2433,6 +2434,16 @@ pub const Backend = struct {
         const result = compaction_mod.largestL0OverlapRunCount(l0_runs, threshold);
         self.l0_overlap_cache.store(l0_runs, threshold, result);
         return result;
+    }
+
+    // Do not walk an overloaded L0 merely to decide not to score it. Ordinary
+    // publications maintain the aggregate; cold/test roots need at most
+    // limit + 1 probes, independent of the size of the backlog.
+    fn overlapScoringL0Count(self: *const Backend, limit: usize) usize {
+        if (!self.run_directory_dirty) if (self.run_directory) |directory| return directory.levelStats(0).count;
+        var count: usize = 0;
+        while (count < self.runs.count() and count <= limit and self.runs.at(count).level == 0) : (count += 1) {}
+        return count;
     }
 
     fn maintenanceScoreLocked(self: *Backend) u64 {
@@ -5233,17 +5244,6 @@ pub const Backend = struct {
     }
 
     pub fn destroyRunMetadata(self: *Backend) void {
-        if (self.store_reclaimer) |*job| {
-            var credits: usize = std.math.maxInt(usize);
-            std.debug.assert(job.step(self.allocator, &credits));
-            job.finish(self.allocator);
-            self.store_reclaimer = null;
-        }
-        while (self.retired_run_stores) |store| {
-            self.retired_run_stores = store.retired_next;
-            store.deinit(self.allocator);
-            self.allocator.destroy(store);
-        }
         if (self.pending_gc) |pending| pending.destroy(self);
         self.pending_gc = null;
         while (self.retired_gc) |pending| {
@@ -5261,6 +5261,20 @@ pub const Backend = struct {
         while (self.retired_closures) |pending| {
             self.retired_closures = pending.retired_next;
             pending.destroy(self);
+        }
+        // Cancelling an unfinished GC intent retires prepared writer roots.
+        // Drain stores AFTER job destruction, otherwise close leaks every
+        // payload still owned by those newly retired candidate versions.
+        if (self.store_reclaimer) |*job| {
+            var credits: usize = std.math.maxInt(usize);
+            std.debug.assert(job.step(self.allocator, &credits));
+            job.finish(self.allocator);
+            self.store_reclaimer = null;
+        }
+        while (self.retired_run_stores) |store| {
+            self.retired_run_stores = store.retired_next;
+            store.deinit(self.allocator);
+            self.allocator.destroy(store);
         }
         self.manifest_journal.deinit(self.allocator);
         if (self.manifest_directory) |directory| directory.destroy(self.allocator);
@@ -7997,6 +8011,191 @@ test "lsm backend default base level target absorbs L0 pressure output" {
     try std.testing.expectEqual(@as(u64, 28), stats.lower_level_runs);
 }
 
+test "lsm overlap scoring bounds cold fallback and uses published aggregates" {
+    var backend = Backend.init(std.testing.allocator, .{ .l0_hard_limit_runs = 16 });
+    defer backend.close();
+    try appendSyntheticLevelRunsForTest(&backend, 0, 1024, 1);
+    var runs = backend.runs.cursor();
+    while (runs.next()) |run| run.state = .{};
+    try std.testing.expectEqual(@as(usize, 9), backend.overlapScoringL0Count(8));
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    defer runtime_mod.unlockBackend(Backend, &backend, locked);
+    _ = try backend.planningDirectory();
+    try std.testing.expectEqual(@as(usize, 1024), backend.overlapScoringL0Count(8));
+    try std.testing.expectEqual(@as(usize, 0), backend.largestL0OverlapRunCountLocked());
+    try std.testing.expect(!backend.l0_overlap_cache.valid);
+}
+
+test "lsm overlap scoring aggregate scaling benchmark" {
+    if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+    const time = @import("antfly_platform").time;
+    for ([_]usize{ 1000, 10000, 100000 }) |count| {
+        var backend = Backend.init(std.heap.smp_allocator, .{ .l0_hard_limit_runs = 16 });
+        defer backend.close();
+        try appendSyntheticLevelRunsForTest(&backend, 0, count, 1);
+        var runs = backend.runs.cursor();
+        while (runs.next()) |run| run.state = .{};
+        const locked = runtime_mod.lockBackend(Backend, &backend);
+        defer runtime_mod.unlockBackend(Backend, &backend, locked);
+        _ = try backend.planningDirectory();
+        var previous_ns: u64 = 0;
+        for (0..31) |_| {
+            const started = time.monotonicNs();
+            var l0_count: usize = 0;
+            while (l0_count < backend.runs.count() and backend.runs.at(l0_count).level == 0) : (l0_count += 1) {}
+            std.mem.doNotOptimizeAway(l0_count);
+            previous_ns += time.monotonicNs() - started;
+        }
+        const started = time.monotonicNs();
+        for (0..10000) |_| {
+            const result = backend.largestL0OverlapRunCountLocked();
+            std.mem.doNotOptimizeAway(result);
+        }
+        const aggregate_ns = time.monotonicNs() - started;
+        std.debug.print("l0-score runs={d} previous_mean_ns={d} aggregate_mean_ns={d}\n", .{ count, previous_ns / 31, aggregate_ns / 10000 });
+    }
+}
+
+test "lsm dependency continuation retains epochs and budgets concurrent rebases" {
+    const Validation = @import("lsm_backend/dependency_validation.zig").Validation;
+    const allocator = std.testing.allocator;
+    var backend = Backend.init(allocator, .{});
+    defer backend.close();
+    try appendSyntheticLevelRunsForTest(&backend, 0, 32, 1);
+    var runs = backend.runs.cursor();
+    while (runs.next()) |run| run.state = .{};
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    defer runtime_mod.unlockBackend(Backend, &backend, locked);
+    const directory = try backend.planningDirectory();
+    var handles: [32]RunDirectory.Handle = undefined;
+    for (&handles, 0..) |*handle, i| handle.* = directory.at(i).retain();
+    defer for (handles) |handle| handle.release(allocator);
+    const plan = compaction_mod.CompactionPlan{ .source_level = 0, .source_start = 0, .source_len = handles.len, .target_start = handles.len, .target_len = 0, .output_level = 1, .input_handles = &handles, .tombstone_gc = true };
+    var validation = try Validation.init(&backend, plan);
+    defer validation.deinit(&backend);
+    try std.testing.expectEqual(Validation.Result.pending, try validation.advanceBudgetedLocked(&backend, 1, 0));
+    try std.testing.expectEqual(@as(usize, 0), validation.job.index);
+    while (validation.phase != .certificate) {
+        const before = validation.job.index;
+        _ = try validation.advanceBudgetedLocked(&backend, 1, std.math.maxInt(u64));
+        try std.testing.expect(validation.job.index - before <= 1);
+    }
+    for (0..16) |i| {
+        const current = try backend.planningDirectory();
+        const changed = try current.fork(allocator);
+        errdefer changed.destroy(allocator);
+        var added = handles[0].run.*;
+        added.id = 1000 + i;
+        added.visibility_id = added.id;
+        added.owns_metadata = false;
+        try backend.runs.append(allocator, added);
+        try changed.put(&backend, added);
+        backend.publishRunDirectory(changed);
+        const before = validation.slices;
+        _ = try validation.advanceBudgetedLocked(&backend, 1, std.math.maxInt(u64));
+        try std.testing.expectEqual(before + 1, validation.slices);
+        try std.testing.expectEqual(handles.len, validation.job.index);
+    }
+    var result: Validation.Result = .pending;
+    for (0..10000) |_| {
+        result = try validation.advanceBudgetedLocked(&backend, 1, std.math.maxInt(u64));
+        if (result != .pending) break;
+    }
+    try std.testing.expectEqual(Validation.Result.valid, result);
+    try std.testing.expect(validation.rebases > 1);
+    const changed = try (try backend.planningDirectory()).fork(allocator);
+    try changed.put(&backend, handles[0].run.*);
+    backend.publishRunDirectory(changed);
+    for (0..10000) |_| {
+        result = try validation.advanceBudgetedLocked(&backend, 1, std.math.maxInt(u64));
+        if (result != .pending) break;
+    }
+    try std.testing.expectEqual(Validation.Result.invalid, result);
+}
+
+test "lsm dependency continuation allocation failures and partial cleanup" {
+    const Fixture = struct {
+        fn check(allocator: Allocator) !void {
+            const Validation = @import("lsm_backend/dependency_validation.zig").Validation;
+            var backend = Backend.init(allocator, .{});
+            defer backend.close();
+            try appendSyntheticLevelRunsForTest(&backend, 0, 3, 1);
+            var runs = backend.runs.cursor();
+            while (runs.next()) |run| run.state = .{};
+            const locked = runtime_mod.lockBackend(Backend, &backend);
+            defer runtime_mod.unlockBackend(Backend, &backend, locked);
+            const directory = try backend.planningDirectory();
+            const handles = [_]RunDirectory.Handle{ directory.at(0), directory.at(1), directory.at(2) };
+            const plan = compaction_mod.CompactionPlan{ .source_level = 0, .source_start = 0, .source_len = handles.len, .target_start = handles.len, .target_len = 0, .output_level = 1, .input_handles = &handles };
+            for (0..3) |phase| {
+                var validation = try Validation.init(&backend, plan);
+                defer validation.deinit(&backend);
+                for (0..if (phase == 0) @as(usize, 1) else 100) |_| {
+                    const result = try validation.advanceBudgetedLocked(&backend, 1, std.math.maxInt(u64));
+                    if (phase == 1 and validation.phase == .cleanup) break;
+                    if (result != .pending) break;
+                }
+                // Cancellation/retirement can occur in any phase. It must
+                // release scratch incrementally before the owning epoch.
+                while (true) {
+                    var credits: usize = 1;
+                    if (validation.cleanupStep(allocator, &credits)) break;
+                }
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{});
+}
+
+test "lsm close cancels an unpublished GC intent and drains its writer roots" {
+    var backend = Backend.init(std.testing.allocator, .{ .tombstone_gc_min_percent = 1 });
+    defer backend.close();
+    try appendStateLevelRunsForTest(&backend, 0, 32);
+    var runs = backend.runs.cursor();
+    while (runs.next()) |run| run.tombstone_count = 1;
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    defer runtime_mod.unlockBackend(Backend, &backend, locked);
+    for (0..1000) |_| {
+        try std.testing.expect(!try compaction_mod.compactTombstonesScheduled(Backend, &backend, 0));
+        if (backend.pending_gc) |pending| if (pending.intent != null) return;
+    }
+    return error.MissingPendingGcIntent;
+}
+
+test "lsm dependency continuation slice scaling benchmark" {
+    if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+    const Validation = @import("lsm_backend/dependency_validation.zig").Validation;
+    const time = @import("antfly_platform").time;
+    const allocator = std.heap.smp_allocator;
+    for ([_]usize{ 1000, 10000, 100000 }) |count| {
+        var backend = Backend.init(allocator, .{});
+        defer backend.close();
+        try appendSyntheticLevelRunsForTest(&backend, 0, count, 1);
+        var runs = backend.runs.cursor();
+        while (runs.next()) |run| run.state = .{};
+        const locked = runtime_mod.lockBackend(Backend, &backend);
+        defer runtime_mod.unlockBackend(Backend, &backend, locked);
+        const directory = try backend.planningDirectory();
+        const handles = try allocator.alloc(RunDirectory.Handle, count);
+        defer allocator.free(handles);
+        var cursor = directory.readCursor();
+        for (handles) |*handle| handle.* = cursor.next().?;
+        const plan = compaction_mod.CompactionPlan{ .source_level = 0, .source_start = 0, .source_len = handles.len, .target_start = handles.len, .target_len = 0, .output_level = 1, .input_handles = handles, .tombstone_gc = true };
+        var validation = try Validation.init(&backend, plan);
+        defer validation.deinit(&backend);
+        const started = time.monotonicNs();
+        var max_slice_ns: u64 = 0;
+        while (true) {
+            const before = time.monotonicNs();
+            const result = try validation.advanceLocked(&backend);
+            max_slice_ns = @max(max_slice_ns, time.monotonicNs() - before);
+            if (result == .invalid) return error.InvalidBenchmarkCertificate;
+            if (result == .valid) break;
+        }
+        std.debug.print("dependency-continuation inputs={d} total_ns={d} slices={d} max_slice_ns={d}\n", .{ count, time.monotonicNs() - started, validation.slices, max_slice_ns });
+    }
+}
+
 test "lsm backend caches exact L0 overlap score until immutable run IDs change" {
     var backend = Backend.init(std.testing.allocator, .{
         .l0_overlap_compact_threshold_runs = 2,
@@ -8691,7 +8890,11 @@ test "lsm GC splits wide sources without making older L0 deletes newer" {
     defer pinned.abort();
     try std.testing.expectEqualStrings("fresh", try pinned.get(.{}, "a"));
     try std.testing.expectError(error.NotFound, pinned.get(.{}, "z"));
-    try std.testing.expect(try backend.runMaintenanceStep());
+    const before_split = backend.compaction_stats.compactions;
+    for (0..64) |_| {
+        try std.testing.expect(try backend.runMaintenanceStep());
+        if (backend.compaction_stats.compactions != before_split) break;
+    }
     var split_outputs: usize = 0;
     for ((try backend.runs.testItems(backend.allocator))) |run| if (run.visibility_id == 3) {
         split_outputs += 1;
@@ -8705,7 +8908,7 @@ test "lsm GC splits wide sources without making older L0 deletes newer" {
         try std.testing.expectEqualStrings("fresh", try reopened.getMergedWithMutable(&reopened.mutable, .{}, "a"));
         try std.testing.expectError(error.NotFound, reopened.getMergedWithMutable(&reopened.mutable, .{}, "z"));
     }
-    for (0..16) |_| {
+    for (0..128) |_| {
         const before = backend.compaction_stats.input_bytes;
         if (!try backend.runMaintenanceStep()) break;
         try std.testing.expect(backend.compaction_stats.input_bytes - before <= 24 * 1024);
@@ -8735,8 +8938,14 @@ test "lsm aged GC below irreducible input budget schedules a retry instead of sp
     run.oldest_tombstone_unix_ns = 1;
     try backend.runs.append(alloc, run);
     try backend.persistManifest();
-    // The first pass durably records the pending collection objective.
-    try std.testing.expect(try backend.runMaintenanceStep());
+    // Discovery, certification and durable intent are distinct bounded turns.
+    // Only a completed, inadmissible objective should schedule a retry.
+    for (0..64) |_| {
+        _ = try backend.runMaintenanceStep();
+        if (backend.tombstone_gc_retry_after_ns != 0) break;
+        try std.testing.expect(backend.pending_gc != null);
+    }
+    try std.testing.expect(backend.tombstone_gc_retry_after_ns != 0);
     try std.testing.expect(!try backend.runMaintenanceStep());
     try std.testing.expect((backend.nextMaintenanceWakeDelayNsBestEffort() orelse 0) > 0);
     const deadline = backend.tombstone_gc_retry_after_ns;
@@ -8789,9 +8998,10 @@ test "lsm GC checkpoints bounded level progress while preserving old readers" {
         try backend.persistManifest();
     }
     var steps: usize = 0;
-    while (backend.runs.count() != 0 and steps < 16) : (steps += 1) {
+    while (backend.runs.count() != 0 and steps < 128) : (steps += 1) {
         const before = backend.compaction_stats.input_bytes;
         _ = try backend.runMaintenanceStep();
+        if (backend.pending_gc != null) try std.testing.expectEqual(@as(u64, 0), backend.tombstone_gc_retry_after_ns);
         try std.testing.expect(backend.compaction_stats.input_bytes - before <= options.tombstone_gc_max_input_bytes);
         try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{}, "key"));
         for ((try backend.runs.testItems(backend.allocator))) |run| if ((run.tombstone_count orelse 0) != 0) {
