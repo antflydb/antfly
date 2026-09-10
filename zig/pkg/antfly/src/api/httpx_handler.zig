@@ -1870,6 +1870,10 @@ pub const AntflyApiHandler = struct {
                 .status = 409,
                 .message = "IndexGenerationMismatch",
             },
+            error.GenerationTransitionActive => .{
+                .status = 503,
+                .message = "GenerationTransitionActive",
+            },
             error.DocIdentityNamespaceMismatch => .{
                 .status = 409,
                 .message = "doc identity namespace mismatch",
@@ -7200,6 +7204,9 @@ const SchemaReconcileWriteSource = struct {
 };
 
 test "typed internal HTTP errors preserve conflict semantics" {
+    const transition = AntflyApiHandler.sharedInternalHttpErrorSpec(error.GenerationTransitionActive).?;
+    try std.testing.expectEqual(@as(u16, 503), transition.status);
+    try std.testing.expectEqualStrings("GenerationTransitionActive", transition.message);
     const stale_index = AntflyApiHandler.sharedInternalHttpErrorSpec(error.IndexGenerationMismatch).?;
     try std.testing.expectEqual(@as(u16, 409), stale_index.status);
     try std.testing.expectEqualStrings("IndexGenerationMismatch", stale_index.message);

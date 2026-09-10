@@ -32,6 +32,7 @@ pub const Topology = struct {
     source_node_count: usize,
     source_edge_count: usize,
     retained_bytes: usize,
+    type_checksums: []const [32]u8 = &.{},
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.node_ids);
@@ -39,6 +40,7 @@ pub const Topology = struct {
         alloc.free(self.string_bytes);
         alloc.free(self.edge_type_offsets);
         alloc.free(self.edges);
+        alloc.free(self.type_checksums);
         self.* = undefined;
     }
 };
@@ -50,6 +52,15 @@ const Reader = struct {
     cancellation: CancellationToken,
     remaining: *u64,
 
+    fn raw(self: @This(), offset: u64, len: usize) ![]u8 {
+        if (len > self.remaining.*) return error.GraphMetricBuildBudgetExceeded;
+        self.remaining.* -= len;
+        const bytes = try self.store.getRangeAllocWithCancellationUsingAllocator(self.alloc, self.source.artifact_id, offset, len, self.cancellation);
+        errdefer self.alloc.free(bytes);
+        if (bytes.len != len) return error.ArtifactIntegrityMismatch;
+        return bytes;
+    }
+
     fn read(self: @This(), offset: u64, len: u64) ![]u8 {
         try self.cancellation.check();
         if (offset > self.source.byte_len or len > self.source.byte_len - offset) return error.InvalidGraphSegment;
@@ -57,6 +68,68 @@ const Reader = struct {
             error.ArtifactReadBudgetExceeded => error.GraphMetricBuildBudgetExceeded,
             else => err,
         };
+    }
+};
+
+/// One immutable source control shared by bounded preparation groups. A
+/// manifest-bound footer authenticates the directory; the directory binds all
+/// data blocks and semantic type identities. No data-range response is trusted.
+pub const Context = struct {
+    reader: Reader,
+    trailer: wire.TopologyTrailer,
+    bytes: []u8,
+    directory: ?wire.TopologyDirectory,
+
+    pub fn init(alloc: Allocator, store: *artifacts.ArtifactStore, source: refs.ArtifactRef, cancellation: CancellationToken, remaining: *u64) !Context {
+        if (source.byte_len < wire.topology_trailer_len) return error.InvalidGraphSegment;
+        try artifacts.validateSha256ArtifactIdentity(source.artifact_id, source.checksum);
+        const reader = Reader{ .alloc = alloc, .store = store, .source = source, .cancellation = cancellation, .remaining = remaining };
+        const bound = !std.mem.eql(u8, &source.graph_topology_control_checksum, &@as([32]u8, @splat(0)));
+        const footer = if (bound) try reader.raw(source.byte_len - wire.topology_trailer_len, wire.topology_trailer_len) else try reader.read(source.byte_len - wire.topology_trailer_len, wire.topology_trailer_len);
+        defer alloc.free(footer);
+        if (bound) try verify(footer, source.graph_topology_control_checksum);
+        const trailer = try wire.decodeTopologyTrailer(footer, source.byte_len);
+        const raw = try reader.raw(trailer.body_len + trailer.topology_len, trailer.directory_len);
+        errdefer alloc.free(raw);
+        const directory = try wire.TopologyDirectory.init(raw, trailer.checksum);
+        if (directory) |dir| {
+            const covered = trailer.body_len + trailer.topology_len;
+            const blocks = covered / wire.authentication_block_bytes + @intFromBool(covered % wire.authentication_block_bytes != 0);
+            if (dir.block_checksums.len / 32 != blocks) return error.InvalidGraphSegment;
+        }
+        return .{ .reader = reader, .trailer = trailer, .bytes = raw, .directory = directory };
+    }
+
+    pub fn deinit(self: *Context) void {
+        self.reader.alloc.free(self.bytes);
+        self.* = undefined;
+    }
+
+    fn verify(bytes: []const u8, checksum: [32]u8) !void {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        if (!std.mem.eql(u8, &digest, &checksum)) return error.ArtifactIntegrityMismatch;
+    }
+
+    fn read(self: Context, offset: u64, len: u64) ![]u8 {
+        try self.reader.cancellation.check();
+        const covered = self.trailer.body_len + self.trailer.topology_len;
+        if (offset > covered or len > covered - offset) return error.InvalidGraphSegment;
+        if (len == 0) return self.reader.alloc.alloc(u8, 0);
+        const block_bytes = wire.authentication_block_bytes;
+        const begin = offset / block_bytes * block_bytes;
+        const end = @min(covered, (offset + len + block_bytes - 1) / block_bytes * block_bytes);
+        const bytes = try self.reader.raw(begin, @intCast(end - begin));
+        errdefer self.reader.alloc.free(bytes);
+        var pos: usize = 0;
+        while (pos < bytes.len) : (pos += block_bytes) {
+            try self.reader.cancellation.check();
+            const block: usize = @intCast(begin / block_bytes + pos / block_bytes);
+            try verify(bytes[pos..@min(bytes.len, pos + block_bytes)], self.directory.?.block_checksums[block * 32 ..][0..32].*);
+        }
+        const start: usize = @intCast(offset - begin);
+        std.mem.copyForwards(u8, bytes[0..@intCast(len)], bytes[start..][0..@intCast(len)]);
+        return self.reader.alloc.realloc(bytes, @intCast(len));
     }
 };
 
@@ -69,18 +142,20 @@ fn selected(kind: []const u8, configs: anytype) bool {
 }
 
 /// Caller supplies a peak-limited allocator and a shared, byte-accounted read
-/// allowance. Cold authentication of the full source is charged by the store;
-/// warm exact-identity reads charge only the requested ranges.
+/// allowance. Manifest-bound sources authenticate only the touched blocks;
+/// unbound current-wire sources additionally charge full-source verification.
 pub fn readAlloc(alloc: Allocator, store: *artifacts.ArtifactStore, source: refs.ArtifactRef, configs: anytype, limits: anytype, cancellation: CancellationToken, remaining: *u64) !?Topology {
-    if (source.byte_len < wire.topology_trailer_len) return error.InvalidGraphSegment;
-    const reader = Reader{ .alloc = alloc, .store = store, .source = source, .cancellation = cancellation, .remaining = remaining };
-    const footer = try reader.read(source.byte_len - wire.topology_trailer_len, wire.topology_trailer_len);
-    defer alloc.free(footer);
-    const trailer = try wire.decodeTopologyTrailer(footer, source.byte_len);
+    var context = try Context.init(alloc, store, source, cancellation, remaining);
+    defer context.deinit();
+    return readPreparedAlloc(alloc, &context, configs, limits, cancellation);
+}
+
+pub fn readPreparedAlloc(alloc: Allocator, context: *const Context, configs: anytype, limits: anytype, cancellation: CancellationToken) !?Topology {
+    var reader = context.*;
+    reader.reader.alloc = alloc;
+    const trailer = reader.trailer;
     if (trailer.source_nodes > limits.max_nodes or trailer.source_edges > limits.max_edges) return error.GraphMetricBuildBudgetExceeded;
-    const raw = try reader.read(trailer.body_len + trailer.topology_len, trailer.directory_len);
-    defer alloc.free(raw);
-    const directory = (try wire.TopologyDirectory.init(raw, trailer.checksum)) orelse return null;
+    const directory = reader.directory orelse return null;
     if (trailer.source_nodes > directory.nodes) return error.InvalidGraphSegment;
     for (0..directory.page_offsets.len / 8) |i| {
         const offset = std.mem.readInt(u64, directory.page_offsets[i * 8 ..][0..8], .little);
@@ -110,6 +185,8 @@ pub fn readAlloc(alloc: Allocator, store: *artifacts.ArtifactStore, source: refs
     errdefer alloc.free(type_offsets);
     const kinds = try alloc.alloc([]const u8, selected_types);
     errdefer alloc.free(kinds);
+    const checksums = try alloc.alloc([32]u8, selected_types);
+    errdefer alloc.free(checksums);
     var strings = std.ArrayListUnmanaged(u8).empty;
     defer strings.deinit(alloc);
     iterator = directory.iterator();
@@ -118,6 +195,7 @@ pub fn readAlloc(alloc: Allocator, store: *artifacts.ArtifactStore, source: refs
     while (try iterator.next()) |entry| {
         if (!selected(entry.kind, configs)) continue;
         kinds[type_index] = entry.kind;
+        checksums[type_index] = entry.digest;
         type_offsets[type_index] = @intCast(edge_index);
         type_index += 1;
         var read_edges: u64 = 0;
@@ -229,7 +307,7 @@ pub fn readAlloc(alloc: Allocator, store: *artifacts.ArtifactStore, source: refs
         edge.source = if (dense) mapping[edge.source] else ordinalIndex(ordinals, edge.source);
         edge.target = if (dense) mapping[edge.target] else ordinalIndex(ordinals, edge.target);
     }
-    return .{ .node_ids = nodes, .edge_types = kinds, .string_bytes = string_bytes, .edge_type_offsets = type_offsets, .edges = edges, .source_node_count = trailer.source_nodes, .source_edge_count = @intCast(trailer.source_edges), .retained_bytes = (nodes.len + kinds.len) * @sizeOf([]const u8) + string_bytes.len + type_offsets.len * 4 + edges.len * @sizeOf(Edge) };
+    return .{ .node_ids = nodes, .edge_types = kinds, .string_bytes = string_bytes, .edge_type_offsets = type_offsets, .edges = edges, .type_checksums = checksums, .source_node_count = trailer.source_nodes, .source_edge_count = @intCast(trailer.source_edges), .retained_bytes = (nodes.len + kinds.len) * @sizeOf([]const u8) + string_bytes.len + type_offsets.len * 4 + edges.len * @sizeOf(Edge) + checksums.len * 32 };
 }
 
 fn ordinalIndex(ordinals: []const u32, ordinal: u32) u32 {

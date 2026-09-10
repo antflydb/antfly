@@ -12125,6 +12125,7 @@ pub const ApiHttpServer = struct {
                 error.EndOfStream,
                 error.FileNotFound,
                 error.TableReadChurn,
+                error.GenerationTransitionActive,
                 error.IdentityReadGenerationChanged,
                 error.TopologyChanged,
                 => {
@@ -12132,7 +12133,7 @@ pub const ApiHttpServer = struct {
                     std.log.warn("public table query read failed table={s} err={} attempt={d}", .{ table_name, err, attempts + 1 });
                     const now_ns = retryMonotonicNs(retry_io);
                     if (retryDeadlineExpired(retry_deadline_ns, now_ns)) return error.Timeout;
-                    const sleep_ns = boundedRetrySleepNs(retry_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return err;
+                    const sleep_ns = boundedRetrySleepNs(retry_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return if (err == error.GenerationTransitionActive) error.StorageReadTemporarilyUnavailable else err;
                     if (sleep_ns == 0) return error.Timeout;
                     try sleepNsCancellable(retry_io, sleep_ns, req.cancellation);
                     continue;
@@ -23580,6 +23581,11 @@ test "api http retries identity generation and topology churn from a fresh query
     defer topology_response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 2), reads.attempts);
     try std.testing.expectEqualStrings("{\"responses\":[]}", topology_response.json);
+    reads.attempts = 0;
+    reads.transient = error.GenerationTransitionActive;
+    var transition_response = (try ApiHttpServer.queryWithTransientReadRetry(std.testing.allocator, null, reads.source(), "docs", .{}, .read_index, .none)).?;
+    defer transition_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 2), reads.attempts);
 }
 
 test "api http index generation retry refreshes once and preserves readiness cancellation and deadlines" {
@@ -23608,23 +23614,23 @@ test "api http index generation retry refreshes once and preserves readiness can
     };
     const alloc = std.testing.allocator;
     var reads = FakeReads{};
-    var response = (try ApiHttpServer.queryWithTransientReadRetry(alloc, reads.source(), "docs", .{}, .read_index, .none)).?;
+    var response = (try ApiHttpServer.queryWithTransientReadRetry(alloc, null, reads.source(), "docs", .{}, .read_index, .none)).?;
     defer response.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), reads.attempts);
 
     reads = .{ .fail_count = 100 };
-    try std.testing.expectError(error.IndexRebuilding, ApiHttpServer.queryWithTransientReadRetry(alloc, reads.source(), "docs", .{}, .read_index, .none));
+    try std.testing.expectError(error.IndexRebuilding, ApiHttpServer.queryWithTransientReadRetry(alloc, null, reads.source(), "docs", .{}, .read_index, .none));
     try std.testing.expectEqual(@as(usize, 2), reads.attempts);
 
     for ([_]usize{ 1, 2 }) |cancel_at| {
         var canceled = std.atomic.Value(bool).init(false);
         reads = .{ .fail_count = 100, .cancel = &canceled, .cancel_at = cancel_at };
-        try std.testing.expectError(error.Cancelled, ApiHttpServer.queryWithTransientReadRetry(alloc, reads.source(), "docs", .{ .cancellation = CancellationToken.fromAtomic(&canceled) }, .read_index, .none));
+        try std.testing.expectError(error.Cancelled, ApiHttpServer.queryWithTransientReadRetry(alloc, null, reads.source(), "docs", .{ .cancellation = CancellationToken.fromAtomic(&canceled) }, .read_index, .none));
         try std.testing.expectEqual(cancel_at, reads.attempts);
     }
 
     reads = .{};
-    try std.testing.expectError(error.Timeout, ApiHttpServer.queryWithTransientReadRetry(alloc, reads.source(), "docs", .{ .execution_deadline_ns = 0 }, .read_index, .none));
+    try std.testing.expectError(error.Timeout, ApiHttpServer.queryWithTransientReadRetry(alloc, null, reads.source(), "docs", .{ .execution_deadline_ns = 0 }, .read_index, .none));
     try std.testing.expectEqual(@as(usize, 0), reads.attempts);
 }
 

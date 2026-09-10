@@ -27,6 +27,7 @@ pub const Error = operation.ApiError || error{
     TopologyChanged,
     IdentityReadGenerationChanged,
     IndexGenerationMismatch,
+    GenerationTransitionActive,
     HierarchyCursorStale,
     DocIdentityNamespaceMismatch,
     StorageReadTemporarilyUnavailable,
@@ -146,6 +147,7 @@ pub const Operations = struct {
             error.TopologyChanged => error.TopologyChanged,
             error.IdentityReadGenerationChanged => error.IdentityReadGenerationChanged,
             error.IndexGenerationMismatch => error.IndexGenerationMismatch,
+            error.GenerationTransitionActive => error.GenerationTransitionActive,
             error.DocIdentityNamespaceMismatch => error.DocIdentityNamespaceMismatch,
             error.StorageReadTemporarilyUnavailable => error.StorageReadTemporarilyUnavailable,
             error.CatalogRoutingUnavailable,
@@ -1673,6 +1675,7 @@ test "typed internal query workers preserve identity generation validation" {
 
 test "typed internal group reads preserve retryable resident storage failures" {
     const alloc = std.testing.allocator;
+    try std.testing.expectEqual(error.GenerationTransitionActive, Operations.mapCommonReadError(error.GenerationTransitionActive).?);
     try std.testing.expectEqual(error.IndexGenerationMismatch, Operations.mapCommonReadError(error.IndexGenerationMismatch).?);
     try std.testing.expectEqual(
         error.DeadlineExceeded,

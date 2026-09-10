@@ -4463,6 +4463,8 @@ pub fn build(b: *std.Build) void {
         "query embedding cache translates native query deadlines",
         "typed internal HTTP errors preserve conflict semantics",
         "api http index generation retry refreshes once and preserves readiness cancellation and deadlines",
+        "api http retries identity generation and topology churn from a fresh query snapshot",
+        "derived enrichment visibility guard observes cancellation and deadline",
         "db reverse graph probe rejects a deleted or replaced index incarnation",
         "api http client preserves group doc identity conflicts",
         "typed internal group reads preserve retryable resident storage failures",
@@ -10208,6 +10210,7 @@ pub fn build(b: *std.Build) void {
         "ordinal blocks",
         "graph degree planned build honors edge filter during scan page execution",
         "graph metric filtered",
+        "graph metric coalesced global counters",
         "graph metric partition spans remain balanced at production cardinality",
         "graph metric partition census",
         "partition census owns bounded checkpoints",
@@ -10232,6 +10235,8 @@ pub fn build(b: *std.Build) void {
         "graph hits coordinator publish failure preserves prior published pair after reopen",
     };
     const graph_metric_unit_tests = b.addTest(.{
+        // The merged storage root measured 7.61 GB on macOS ReleaseFast.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 8 else 7) * 1024 * 1024 * 1024,
         .root_module = db_test_mod,
         .filters = compileFiltersWithAnchors(
             b,

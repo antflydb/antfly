@@ -224,15 +224,30 @@ pub const FilesystemClient = struct {
         if (opts.cancellation) |token| try token.check();
         if (opts.version_id != null) return error.VersioningUnsupported;
         if (opts.range != null and opts.part_number != null) return error.AmbiguousRange;
-        var meta = try self.statObject(alloc, bucket, key);
+        const object_path = try objectPathAlloc(alloc, self.root_dir, bucket, key);
+        defer alloc.free(object_path);
+        const file = try openFilePath(self.io, object_path);
+        defer file.close(self.io);
+        return self.getOpenObject(alloc, bucket, key, file, opts);
+    }
+
+    // Conditional writes replace the path atomically. Pin one opened object
+    // for metadata, range resolution and body reads so unconditional GET never
+    // becomes a spurious failed precondition when that path is replaced.
+    fn getOpenObject(self: *FilesystemClient, alloc: Allocator, bucket: []const u8, key: []const u8, file: std.Io.File, opts: types.GetOptions) !types.GetResult {
+        if (opts.cancellation) |token| try token.check();
+        if (opts.version_id != null) return error.VersioningUnsupported;
+        if (opts.range != null and opts.part_number != null) return error.AmbiguousRange;
+        const file_stat = try file.stat(self.io);
+        var header = try readObjectHeader(alloc, self.io, file, file_stat.size);
+        defer header.deinit(alloc);
+        var meta = try metadataFromHeader(alloc, bucket, key, header, file_stat.mtime.toMilliseconds());
         errdefer meta.deinit(alloc);
 
         if (opts.if_match_etag) |expected| {
             if (meta.etag == null or !std.mem.eql(u8, meta.etag.?, expected)) return error.PreconditionFailed;
         }
 
-        const object_path = try objectPathAlloc(alloc, self.root_dir, bucket, key);
-        defer alloc.free(object_path);
         const total_len = std.math.cast(usize, meta.content_length) orelse return error.ObjectTooLarge;
         const part_range = if (opts.part_number) |part_number|
             try computePartRange(total_len, part_number)
@@ -251,10 +266,10 @@ pub const FilesystemClient = struct {
         const body = try readObjectRangeAlloc(
             self.io,
             alloc,
-            object_path,
+            file,
+            header,
             requested.start,
             requested.end,
-            meta.etag.?,
             opts.cancellation,
         );
 
@@ -300,18 +315,29 @@ pub const FilesystemClient = struct {
         const file_stat = try file.stat(self.io);
         var header = try readObjectHeader(alloc, self.io, file, file_stat.size);
         defer header.deinit(alloc);
+        return metadataFromHeader(alloc, bucket, key, header, file_stat.mtime.toMilliseconds());
+    }
 
+    fn metadataFromHeader(alloc: Allocator, bucket: []const u8, key: []const u8, header: ObjectHeader, modified_ms: i64) !types.ObjectMetadata {
+        const owned_bucket = try alloc.dupe(u8, bucket);
+        errdefer alloc.free(owned_bucket);
+        const owned_key = try alloc.dupe(u8, key);
+        errdefer alloc.free(owned_key);
+        const etag = try alloc.dupe(u8, &header.etag);
+        errdefer alloc.free(etag);
+        const checksum = try alloc.dupe(u8, &header.etag);
+        errdefer alloc.free(checksum);
         return .{
-            .bucket = try alloc.dupe(u8, bucket),
-            .key = try alloc.dupe(u8, key),
-            .etag = try alloc.dupe(u8, &header.etag),
+            .bucket = owned_bucket,
+            .key = owned_key,
+            .etag = etag,
             .checksum = .{
                 .algorithm = .sha256_hex,
-                .value = try alloc.dupe(u8, &header.etag),
+                .value = checksum,
             },
             .content_length = header.content_length,
             .content_type = if (header.content_type.len == 0) null else try alloc.dupe(u8, header.content_type),
-            .last_modified_unix_ms = file_stat.mtime.toMilliseconds(),
+            .last_modified_unix_ms = modified_ms,
         };
     }
 
@@ -859,20 +885,14 @@ fn resolveRange(total_len: u64, offset: u64, maybe_len: ?u64) !ObjectRange {
 fn readObjectRangeAlloc(
     io: std.Io,
     alloc: Allocator,
-    path: []const u8,
+    file: std.Io.File,
+    header: ObjectHeader,
     start: usize,
     end: usize,
-    expected_etag: []const u8,
     cancellation: ?types.CancellationToken,
 ) ![]u8 {
     if (cancellation) |token| try token.check();
     if (end < start) return error.InvalidRange;
-    const file = try openFilePath(io, path);
-    defer file.close(io);
-    const stat = try file.stat(io);
-    var header = try readObjectHeader(alloc, io, file, stat.size);
-    defer header.deinit(alloc);
-    if (!std.mem.eql(u8, &header.etag, expected_etag)) return error.PreconditionFailed;
     if (end > header.content_length) return error.InvalidRange;
 
     const body = try alloc.alloc(u8, end - start);
@@ -1114,6 +1134,37 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "filesystem get pins metadata and body across atomic path replacement" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "get-snapshot");
+    defer cleanupTmp(path);
+    var fs = try FilesystemClient.init(alloc, std.mem.span(path));
+    var client = fs.client();
+    defer client.deinit();
+    var first = try client.putObject("docs", "HEAD", "first", .{ .content_type = "old/type" });
+    defer first.deinit(alloc);
+    const object_path = try objectPathAlloc(alloc, std.mem.span(path), "docs", "HEAD");
+    defer alloc.free(object_path);
+    const pinned = try openFilePath(fs.io, object_path);
+    defer pinned.close(fs.io);
+    var second = try client.putObject("docs", "HEAD", "longer replacement", .{ .content_type = "new/type" });
+    defer second.deinit(alloc);
+    var old = try fs.getOpenObject(alloc, "docs", "HEAD", pinned, .{});
+    defer old.deinit(alloc);
+    try std.testing.expectEqualStrings("first", old.body);
+    try std.testing.expectEqualStrings("old/type", old.metadata.content_type.?);
+    try std.testing.expectEqualStrings(first.etag.?, old.metadata.etag.?);
+    var range = try fs.getOpenObject(alloc, "docs", "HEAD", pinned, .{ .range = .{ .offset = 1, .length = 3 }, .if_match_etag = first.etag });
+    defer range.deinit(alloc);
+    try std.testing.expectEqualStrings("irs", range.body);
+    try std.testing.expectError(error.PreconditionFailed, fs.getOpenObject(alloc, "docs", "HEAD", pinned, .{ .if_match_etag = second.etag }));
+    var current = try client.getObject("docs", "HEAD", .{ .if_match_etag = second.etag });
+    defer current.deinit(alloc);
+    try std.testing.expectEqualStrings("longer replacement", current.body);
+    try std.testing.expectEqualStrings("new/type", current.metadata.content_type.?);
 }
 
 test "filesystem client supports bucket/object lifecycle and file helpers" {

@@ -81,6 +81,19 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
 
 ## Non-serverless
 
+- Generation-transition contention retains a stable retryable error across
+  runtime archives and internal HTTP. Public queries retry a fresh snapshot
+  within the existing cancellation/deadline budget; persistent contention is
+  reported as temporary read unavailability instead of an opaque internal failure.
+- Derived visibility waits carry their cancellation, absolute deadline and clock
+  together through manual and Io-backed executors. A borrowed backend clock's
+  timestamp is never reinterpreted in the native process clock domain.
+- Global incidence counts use the same original/final mutation set as topology
+  invalidation. Duplicate operations and delete/reinsert replacements do not
+  perform intermediate counter writes. Endpoint deltas borrow input IDs, encode
+  each distinct changed node once, and bulk-read sorted counts in 256-key pages.
+  Both ends of a self-loop contribute; all borrowed values are decoded before
+  batch mutation. This also applies to graphs without configured metrics.
 - Connectivity epochs advance only when a batch changes the final edge identity
   set. Identical upserts, attribute-only updates, missing deletes, and delete/
   reinsert replacements do not restart unweighted metric jobs. Each selected
@@ -218,7 +231,28 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
   and isolated local nodes are preserved.
   Both JSON adapters propagate allocator exhaustion and unwind partial edge
   ownership; allocation failure cannot silently produce an empty graph.
-- Verified packed graph ordinals are prepared once per immutable source.
+- Graph wire v6 and manifest v21 bind an 80-byte topology trailer to the
+  manifest. Its SHA-256-authenticated directory contains canonical per-type
+  semantic digests, dictionary page offsets and SHA-256 checksums for 64 KiB
+  data blocks. Cold readers fetch only the trailer, directory and blocks covering
+  selected ranges. They verify every fetched block before decoding; actual
+  aligned/overfetched bytes count against the shared read allowance. Directory
+  size remains capped at 1 MiB. An explicitly unavailable directory retains the
+  current-wire full-preparation path, not a legacy decoder. Low-level callers
+  without a manifest control binding must authenticate the complete artifact
+  before trusting its directory.
+- Filesystem object GET pins one file handle for metadata and body reads.
+  Concurrent atomic HEAD replacement cannot turn an unconditional read into a
+  failed precondition; explicit ETag conditions still bind that pinned object.
+- One bounded source-control object is retained while all pending filters on
+  that source drain, independent of request/alias ordering. Filters prepare
+  separately, smallest selected edge count first; one oversized filter cannot
+  make a small filter retain its topology. Equivalent filters still share
+  preparation, and compatible metric requirements share their projection.
+  An unavailable directory falls back to one shared full-source preparation.
+  Returned topology carries verified type digests, avoiding a second graph-wide
+  hashing pass and per-node digest array. Fallback preparation computes the same
+  digests under the separate identity-work allowance.
   Compatible projection requirements share preparation when the combined work
   and memory fit. Otherwise, cheaper exact requirements are admitted first.
   Admission bounds active nodes by `min(source_nodes, 2 * selected_edges)` and
@@ -228,7 +262,7 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
   allocation; exact construction admission and the live-allocation limiter
   remain authoritative. Serverless additionally reserves local-ID adapters,
   selection permutations and replacement-node buffers before allocation.
-  Materializer epoch 19 also binds the semantic-identity admission policy.
+  Materializer epoch 22 binds grouped and block-authenticated preparation admission.
 - Preparation has two admission phases. The projection census is charged before
   allocations or edge scans; exact projection construction is charged after the
   census and before CSR allocation. Reserved census work remains charged when
@@ -264,8 +298,10 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
   Readers validate both semantic binding and current source integrity. Original
   source strings in the immutable payload need not equal the new publication's
   strings; authenticated control lengths come from the artifact manifest.
-  Changed graph artifacts are still fully authenticated and prepared before
-  their identities are computed; this is not a source-I/O bypass.
+  Changed indexed graphs authenticate their directory and only the selected
+  topology blocks. Reuse can read semantic digests directly from that verified
+  directory; full-content authentication is unnecessary when the manifest
+  already binds the control root.
   Optional hashing has a separate 1 GiB byte-work allowance and live-allocation
   admission including any retained projection. Per-type digest scratch is freed
   before numerical work. If admission is exhausted, a zero identity disables

@@ -189,7 +189,7 @@ test "serverless graph segment codec rejects non-canonical edge ordering" {
     try std.testing.expectError(error.InvalidGraphSegment, decodeAlloc(alloc, encoded));
 }
 
-test "serverless graph segment codec encodes local artifacts as packed v5" {
+test "serverless graph segment codec encodes local artifacts as packed v6" {
     const alloc = std.testing.allocator;
     var segment = graph_types.Segment{
         .adjacencies = try alloc.alloc(graph_types.Adjacency, 1),

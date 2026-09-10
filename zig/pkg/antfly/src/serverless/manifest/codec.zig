@@ -140,7 +140,7 @@ fn decodePolicy(data: []const u8, pos_ptr: *usize) !catalog_types.NamespacePolic
 
 fn artifactEncodedSize(artifact: manifest_types.ArtifactRef) usize {
     const provenance_bytes = 2 + 8 + 8 + 8 + 8;
-    const integrity_bytes: usize = if (artifact.kind == .graph_metric_segment) 4 + 4 + 32 + 32 + 32 + 8 + 32 + 32 + 1 + 1 else 0;
+    const integrity_bytes: usize = if (artifact.kind == .graph_segment) 32 else if (artifact.kind == .graph_metric_segment) 4 + 4 + 32 + 32 + 32 + 8 + 32 + 32 + 1 + 1 else 0;
     return 1 + 4 + 4 + 8 + 4 + provenance_bytes + integrity_bytes + artifact.name.len + artifact.artifact_id.len + artifact.checksum.len;
 }
 
@@ -362,6 +362,10 @@ pub fn encodeForVersionAlloc(alloc: Allocator, manifest: manifest_types.Manifest
         pos += 8;
         std.mem.writeInt(u64, buf[pos..][0..8], artifact.materializer_fingerprint, .little);
         pos += 8;
+        if (artifact.kind == .graph_segment) {
+            @memcpy(buf[pos..][0..32], &artifact.graph_topology_control_checksum);
+            pos += 32;
+        }
         if (artifact.kind == .graph_metric_segment) {
             std.mem.writeInt(u32, buf[pos..][0..4], artifact.graph_metric_control_len, .little);
             pos += 4;
@@ -722,6 +726,12 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
             pos += 8;
             break :blk value;
         };
+        var graph_topology_control_checksum: [32]u8 = @splat(0);
+        if (kind == .graph_segment) {
+            if (data.len - pos < 32) return error.InvalidManifest;
+            graph_topology_control_checksum = data[pos..][0..32].*;
+            pos += 32;
+        }
         var graph_metric_control_len: u32 = 0;
         var graph_metric_routing_footer_len: u32 = 0;
         var graph_metric_control_checksum: [32]u8 = @splat(0);
@@ -787,6 +797,7 @@ pub fn decodeAlloc(alloc: Allocator, data: []const u8) !manifest_types.Manifest 
             .computed_at_ms = computed_at_ms,
             .materializer_fingerprint = materializer_fingerprint,
             .graph_metric_control_len = graph_metric_control_len,
+            .graph_topology_control_checksum = graph_topology_control_checksum,
             .graph_metric_routing_footer_len = graph_metric_routing_footer_len,
             .graph_metric_control_checksum = graph_metric_control_checksum,
             .graph_metric_routing_checksum = graph_metric_routing_checksum,
@@ -1024,6 +1035,7 @@ test "serverless manifest codec round-trips deterministically" {
         .artifact_id = try alloc.dupe(u8, "graph-0001"),
         .byte_len = 512,
         .checksum = try alloc.dupe(u8, "sha256:graph"),
+        .graph_topology_control_checksum = @splat(0x77),
     };
     manifest.artifacts[4] = .{
         .kind = .graph_metric_segment,
@@ -1075,6 +1087,7 @@ test "serverless manifest codec round-trips deterministically" {
     try std.testing.expectEqual(manifest_types.ArtifactKind.graph_segment, decoded.artifacts[3].kind);
     try std.testing.expectEqual(manifest_types.ArtifactKind.graph_metric_segment, decoded.artifacts[4].kind);
     try std.testing.expectEqual(artifact_ref.graph_metric_segment_wire_version, decoded.artifacts[4].metadata_version);
+    try std.testing.expectEqualSlices(u8, &manifest.artifacts[3].graph_topology_control_checksum, &decoded.artifacts[3].graph_topology_control_checksum);
     try std.testing.expectEqual(@as(u64, 40), decoded.artifacts[4].published_generation);
     try std.testing.expectEqual(@as(u64, 39), decoded.artifacts[4].edge_generation);
     try std.testing.expectEqual(@as(u64, 123), decoded.artifacts[4].computed_at_ms);
@@ -1093,7 +1106,7 @@ test "serverless manifest codec round-trips deterministically" {
     var current_artifact_bytes: usize = 0;
     for (manifest.artifacts) |artifact| current_artifact_bytes += artifactEncodedSize(artifact);
     const prefix_len = encoded_a.len - current_artifact_bytes;
-    const encoded_v14 = try alloc.alloc(u8, encoded_a.len - materializer_bytes * manifest.artifacts.len - graph_metric_integrity_bytes);
+    const encoded_v14 = try alloc.alloc(u8, encoded_a.len - materializer_bytes * manifest.artifacts.len - graph_metric_integrity_bytes - 32);
     defer alloc.free(encoded_v14);
     @memcpy(encoded_v14[0..prefix_len], encoded_a[0..prefix_len]);
     var src_pos = prefix_len;
@@ -1104,6 +1117,7 @@ test "serverless manifest codec round-trips deterministically" {
         @memcpy(encoded_v14[dst_pos..][0..retained_header_bytes], encoded_a[src_pos..][0..retained_header_bytes]);
         src_pos += retained_header_bytes + materializer_bytes;
         if (artifact.kind == .graph_metric_segment) src_pos += graph_metric_integrity_bytes;
+        if (artifact.kind == .graph_segment) src_pos += 32;
         dst_pos += retained_header_bytes;
         const payload_len = artifact.name.len + artifact.artifact_id.len + artifact.checksum.len;
         @memcpy(encoded_v14[dst_pos..][0..payload_len], encoded_a[src_pos..][0..payload_len]);

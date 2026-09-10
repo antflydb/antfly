@@ -19,7 +19,7 @@
 /// The only manifest wire that may publish graph-metric artifacts. Serverless
 /// has not shipped, so partial pre-release graph-metric layouts are rejected
 /// instead of becoming a permanent compatibility surface.
-pub const graph_metric_manifest_wire_version: u16 = 20;
+pub const graph_metric_manifest_wire_version: u16 = 21;
 pub const graph_metric_segment_wire_version: u16 = 10;
 
 pub const GraphMetricMaterializationState = enum(u8) {
@@ -64,6 +64,9 @@ pub const ArtifactRef = struct {
     /// catalog scheduling can detect stale materializations without fetching
     /// the object payload. Zero denotes a pre-v15 manifest.
     materializer_fingerprint: u64 = 0,
+    /// Manifest-authenticated graph trailer; authenticates the directory and
+    /// its fixed-size data-block checksums without whole-object cold reads.
+    graph_topology_control_checksum: [32]u8 = @splat(0),
     /// Authenticated range metadata for the current graph-metric wire. Fixed-size
     /// digests avoid per-reference allocations and let point/status reads stay
     /// bounded without trusting object-store range responses.

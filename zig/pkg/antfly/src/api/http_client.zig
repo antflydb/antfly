@@ -3768,6 +3768,7 @@ test "api http client preserves public batch retry safety classifications" {
 }
 
 fn remoteStorageReadUnavailableError(body: []const u8) anyerror {
+    if (std.mem.eql(u8, body, "GenerationTransitionActive")) return error.GenerationTransitionActive;
     if (std.mem.eql(u8, body, "storage read temporarily unavailable")) {
         return error.StorageReadTemporarilyUnavailable;
     }
@@ -4352,6 +4353,9 @@ test "api http client preserves group doc identity conflicts" {
     try std.testing.expectError(error.IndexGenerationMismatch, client.fetchGroupQuery(base_uri, 7, "docs", "{}"));
 
     conflict_executor.status = 503;
+    conflict_executor.body = "GenerationTransitionActive";
+    try std.testing.expectError(error.GenerationTransitionActive, client.fetchGroupQuery(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.GenerationTransitionActive, client.fetchGroupGraphHydrate(base_uri, 7, "docs", "{}"));
     conflict_executor.body = "write unavailable";
     try std.testing.expectError(error.LeaderUnavailable, client.fetchGroupBatch(base_uri, 7, "docs", "{}"));
 

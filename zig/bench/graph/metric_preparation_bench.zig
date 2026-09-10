@@ -207,6 +207,7 @@ pub fn main(init: std.process.Init) !void {
     if (indexing_only) {
         try benchmarkGraphIndexConstruction(&output);
         try benchmarkTypedEdgeScans(init.io, &output);
+        try benchmarkCommittedCounters(init.io, &output);
         try benchmarkSelectedTopologyReads(init.io, &output);
         return benchmarkSemanticMetricReuse(init.io, &output);
     }
@@ -455,6 +456,54 @@ fn benchmarkGraphIndexConstruction(out: anytype) !void {
     }
 }
 
+fn benchmarkCommittedCounters(io: std.Io, out: anytype) !void {
+    const alloc = std.heap.smp_allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const fixture = arena.allocator();
+    const ids = try fixture.alloc([]const u8, 1024);
+    for (ids, 0..) |*id, i| id.* = try std.fmt.allocPrint(fixture, "node-{d:0>8}", .{i});
+    const writes = try fixture.alloc(antfly.graph.BatchWrite, ids.len * 64);
+    const deletes = try fixture.alloc(antfly.graph.BatchDelete, writes.len);
+    for (writes, deletes, 0..) |*write, *delete, i| {
+        write.* = .{ .source = ids[i / 64], .target = ids[(i / 64 + i % 64 + 1) % ids.len], .edge_type = "link" };
+        delete.* = .{ .source = write.source, .target = write.target, .edge_type = write.edge_type };
+    }
+    for ([_]bool{ true, false }) |reference| {
+        const root = try std.fmt.allocPrint(fixture, "/tmp/antfly-global-counter-bench-{d}", .{antfly.platform_time.monotonicNs()});
+        try std.Io.Dir.cwd().createDirPath(io, root);
+        defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        const store_path = try std.fmt.allocPrint(fixture, "{s}/store\x00", .{root});
+        const reverse_path = try std.fmt.allocPrint(fixture, "{s}/reverse\x00", .{root});
+        var store = try antfly.docstore.DocStore.open(alloc, @ptrCast(store_path.ptr), .{});
+        defer store.close();
+        var index = try antfly.graph.GraphIndex.open(alloc, &store, @ptrCast(reverse_path.ptr), "links", .{});
+        defer index.close();
+        var samples: [5]u64 = undefined;
+        for (0..6) |sample| {
+            const started = antfly.platform_time.monotonicNs();
+            try index.benchmarkBatchApply(writes, &.{}, reference);
+            if (index.edge_count != writes.len or index.node_count != ids.len) return error.InvalidBenchmarkResult;
+            try index.benchmarkBatchApply(&.{}, deletes, reference);
+            const elapsed = antfly.platform_time.monotonicNs() - started;
+            if (index.edge_count != 0 or index.node_count != 0) return error.InvalidBenchmarkResult;
+            if (sample != 0) samples[sample - 1] = elapsed;
+        }
+        std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+        const json = try std.json.Stringify.valueAlloc(fixture, .{
+            .mode = if (reference) "stateful_global_counters_per_edge_committed" else "stateful_global_counters_coalesced_committed",
+            .edges = writes.len,
+            .nodes = ids.len,
+            .median_ns = samples[2],
+            .endpoint_counter_reads = if (reference) writes.len * 4 else ids.len * 2,
+            .note = "default durable LSM; six insert+delete cycles, first discarded; identical original/final topology; includes both directional commits and WAL, excludes fixture; no forced compaction or reopen",
+        }, .{});
+        try out.interface.writeAll(json);
+        try out.interface.writeByte('\n');
+        try out.flush();
+    }
+}
+
 fn benchmarkTypedEdgeScans(io: std.Io, out: anytype) !void {
     const alloc = std.heap.smp_allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -599,7 +648,8 @@ fn benchmarkSelectedTopologyReads(io: std.Io, out: anytype) !void {
     defer alloc.free(payload);
     var metadata = try artifacts.put(payload);
     defer metadata.deinit(alloc);
-    const source = antfly.serverless.manifest.ArtifactRef{ .kind = .graph_segment, .name = "graph", .artifact_id = metadata.artifact_id, .checksum = metadata.checksum, .byte_len = metadata.byte_len };
+    var source = antfly.serverless.manifest.ArtifactRef{ .kind = .graph_segment, .name = "graph", .artifact_id = metadata.artifact_id, .checksum = metadata.checksum, .byte_len = metadata.byte_len };
+    try graph.codec.compact.bindTopologyControl(&source, payload);
     try artifacts.verifyContentWithCancellationUsingAllocator(alloc, source.artifact_id, source.byte_len, source.checksum, .none);
     for ([_]bool{ true, false }) |sparse| {
         const config = antfly.graph.GraphMetricConfig{ .name = "degree", .kind = .degree, .edge_filter = if (sparse) .{ .mode = .types, .types = &.{"selected"} } else .{} };
@@ -671,6 +721,7 @@ fn benchmarkSemanticMetricReuse(io: std.Io, out: anytype) !void {
         var metadata = try artifacts.put(payload);
         defer metadata.deinit(alloc);
         source.* = .{ .kind = .graph_segment, .name = "graph", .artifact_id = try fixture.dupe(u8, metadata.artifact_id), .checksum = try fixture.dupe(u8, metadata.checksum), .byte_len = metadata.byte_len };
+        try graph.codec.compact.bindTopologyControl(source, payload);
     }
     const config = antfly.graph.GraphMetricConfig{ .name = "rank", .kind = .pagerank, .max_iterations = 30, .tolerance = 1e-15 };
     const first_request = metric.PublicationRequest{ .graph_index_name = "graph", .source_graph = sources[0], .config = config, .provenance = .{ .published_generation = 1, .edge_generation = 1, .computed_at_ms = 1 } };

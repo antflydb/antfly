@@ -6395,6 +6395,17 @@ pub const GraphIndex = struct {
     }
 
     pub fn batchApply(self: *GraphIndex, writes: []const BatchWrite, deletes: []const BatchDelete) !void {
+        return self.batchApplyWithAccounting(writes, deletes, true);
+    }
+
+    /// Benchmark oracle keeps identical durable writes and topology accounting;
+    /// only global incidence maintenance differs. Both paths commit normally.
+    pub fn benchmarkBatchApply(self: *GraphIndex, writes: []const BatchWrite, deletes: []const BatchDelete, reference: bool) !void {
+        if (reference) return self.batchApplyWithAccounting(writes, deletes, false);
+        return self.batchApplyWithAccounting(writes, deletes, true);
+    }
+
+    fn batchApplyWithAccounting(self: *GraphIndex, writes: []const BatchWrite, deletes: []const BatchDelete, comptime coalesced: bool) !void {
         if (writes.len == 0 and deletes.len == 0) return;
 
         // Validate the complete batch before opening either physical write
@@ -6453,7 +6464,7 @@ pub const GraphIndex = struct {
 
             const rev_key = try reverseEdgeKeyAlloc(self.alloc, delete.target, self.index_name, delete.edge_type, delete.source);
             defer self.alloc.free(rev_key);
-            try self.accountReverseDelete(&reverse_batch, delete.source, delete.target, rev_key);
+            if (!coalesced) try self.accountReverseDelete(&reverse_batch, delete.source, delete.target, rev_key);
             reverse_batch.delete(rev_key) catch |err| switch (err) {
                 error.NotFound => {},
                 else => return err,
@@ -6476,10 +6487,11 @@ pub const GraphIndex = struct {
 
             const rev_key = try reverseEdgeKeyAlloc(self.alloc, write.target, self.index_name, write.edge_type, write.source);
             defer self.alloc.free(rev_key);
-            try self.accountReverseInsert(&reverse_batch, write.source, write.target, rev_key);
+            if (!coalesced) try self.accountReverseInsert(&reverse_batch, write.source, write.target, rev_key);
             try reverse_batch.put(rev_key, edge_val);
         }
 
+        if (coalesced) try self.accountTopologyMutations(&reverse_batch, &topology_changes);
         var typed_updates = typed_edges.Updates.init(self.alloc);
         defer typed_updates.deinit();
         changes = topology_changes.iterator();
@@ -6513,6 +6525,67 @@ pub const GraphIndex = struct {
     }
 
     const TopologyMutation = struct { before: bool, after: bool, kind: []const u8, source: []const u8, target: []const u8 };
+
+    /// Count original-to-final connectivity once, independent of duplicate
+    /// writes, attribute replacement and intermediate delete/reinsert pairs.
+    /// Only distinct changed endpoints incur a counter read and mutation.
+    fn accountTopologyMutations(self: *GraphIndex, batch: anytype, mutations: *const std.StringHashMapUnmanaged(TopologyMutation)) !void {
+        var deltas = std.StringHashMapUnmanaged(i64).empty;
+        defer deltas.deinit(self.alloc);
+        var edge_delta: i128 = 0;
+        var it = mutations.valueIterator();
+        while (it.next()) |mutation| {
+            if (mutation.before == mutation.after) continue;
+            const delta: i64 = if (mutation.after) 1 else -1;
+            edge_delta += delta;
+            for ([_][]const u8{ mutation.source, mutation.target }) |node| {
+                const entry = try deltas.getOrPut(self.alloc, node);
+                if (!entry.found_existing) entry.value_ptr.* = 0;
+                entry.value_ptr.* = try std.math.add(i64, entry.value_ptr.*, delta);
+            }
+        }
+        self.edge_count = std.math.cast(u64, @as(i128, self.edge_count) + edge_delta) orelse return error.InvalidGraphMetricBuildManifest;
+        const Update = struct { key: []u8, delta: i64 };
+        const updates = try self.alloc.alloc(Update, deltas.count());
+        defer self.alloc.free(updates);
+        var count: usize = 0;
+        defer for (updates[0..count]) |update| self.alloc.free(update.key);
+        var entries = deltas.iterator();
+        while (entries.next()) |entry| {
+            if (entry.value_ptr.* == 0) continue;
+            updates[count] = .{ .key = try graphNodeRefKeyAlloc(self.alloc, entry.key_ptr.*), .delta = entry.value_ptr.* };
+            count += 1;
+        }
+        std.mem.sort(Update, updates[0..count], {}, struct {
+            fn less(_: void, a: Update, b: Update) bool {
+                return std.mem.order(u8, a.key, b.key) == .lt;
+            }
+        }.less);
+        var values: [256]?[]const u8 = undefined;
+        var keys: [256][]const u8 = undefined;
+        var next_counts: [256]u64 = undefined;
+        var offset: usize = 0;
+        while (offset < count) {
+            const page = updates[offset..@min(count, offset + values.len)];
+            for (page, keys[0..page.len]) |update, *key| key.* = update.key;
+            try batch.getManySorted(keys[0..page.len], values[0..page.len]);
+            // Decode borrowed batch values before the first mutation.
+            for (page, values[0..page.len], 0..) |update, value, i| {
+                const current = if (value) |raw| blk: {
+                    if (raw.len != 8) return error.InvalidGraphMetricBuildManifest;
+                    break :blk std.mem.readInt(u64, raw[0..8], .little);
+                } else 0;
+                const next = std.math.cast(u64, @as(i128, current) + update.delta) orelse return error.InvalidGraphMetricBuildManifest;
+                next_counts[i] = next;
+                if (current == 0 and next != 0) self.node_count += 1;
+                if (current != 0 and next == 0) self.node_count = std.math.sub(u64, self.node_count, 1) catch return error.InvalidGraphMetricBuildManifest;
+            }
+            for (page, next_counts[0..page.len]) |update, next| {
+                if (next == 0) try batch.delete(update.key) else try putU64(batch, update.key, next);
+            }
+            offset += page.len;
+        }
+    }
 
     fn rememberTopologyMutation(self: *GraphIndex, txn: anytype, mutations: *std.StringHashMapUnmanaged(TopologyMutation), source: []const u8, target: []const u8, kind: []const u8, after: bool) !void {
         const key = try reverseEdgeKeyAlloc(self.alloc, target, self.index_name, kind, source);
@@ -19393,6 +19466,49 @@ test "graph metric membership deltas match immediate updates for duplicates self
             try std.testing.expectEqual(expected, try GraphIndex.readU64OrZero(&batch, key));
         }
     }
+}
+
+test "graph metric coalesced global counters preserve duplicate self-loop and replacement semantics" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-global-deltas");
+    defer cleanupTmp(store_path);
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-global-deltas");
+    defer cleanupTmp(rev_path);
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{});
+    defer graph.close();
+    const writes = [_]BatchWrite{
+        .{ .source = "a", .target = "a", .edge_type = "link" },
+        .{ .source = "a", .target = "b", .edge_type = "link" },
+        .{ .source = "a", .target = "b", .edge_type = "link", .weight = 2 },
+    };
+    try graph.batchApply(&writes, &.{});
+    const generation = graph.edge_generation;
+    const deletes = [_]BatchDelete{
+        .{ .source = "a", .target = "a", .edge_type = "link" },
+        .{ .source = "a", .target = "b", .edge_type = "link" },
+        .{ .source = "a", .target = "b", .edge_type = "link" },
+    };
+    try graph.batchApply(&writes, &deletes);
+    try std.testing.expectEqual(generation, graph.edge_generation);
+    try std.testing.expectEqual(@as(u64, 2), graph.edge_count);
+    try std.testing.expectEqual(@as(u64, 2), graph.node_count);
+    {
+        var txn = try graph.beginReadReverseTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(@as(u64, 3), try GraphIndex.readU64OrZero(&txn, "meta:node_ref:a"));
+        try std.testing.expectEqual(@as(u64, 1), try GraphIndex.readU64OrZero(&txn, "meta:node_ref:b"));
+    }
+    try graph.batchApply(&.{}, &deletes);
+    try std.testing.expectEqual(@as(u64, 0), graph.edge_count);
+    try std.testing.expectEqual(@as(u64, 0), graph.node_count);
+    var txn = try graph.beginReadReverseTxn();
+    defer txn.abort();
+    try std.testing.expectError(error.NotFound, txn.get("meta:node_ref:a"));
+    try std.testing.expectError(error.NotFound, txn.get("meta:node_ref:b"));
 }
 
 test "graph metric filtered postings activate lazily and retain mutation coverage across reopen" {

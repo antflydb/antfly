@@ -1,10 +1,59 @@
 # Graph metric execution and query benchmarks
 
-## Addressed plans and topology preparation (2026-09-09)
+## Block-authenticated preparation and committed counters (2026-09-09)
+
+Run `zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --indexing-only`.
+Current graph wire is v6, manifest wire v21. Both ingestion paths emit the same
+authenticated block table, and the published manifest binds its control root.
+Selected preparation retains authenticated semantic digests instead of hashing
+the selected graph again. Each cold sample uses a fresh verifier, not a cold OS
+page cache. Local filesystem timings are not cloud request-latency measurements.
+
+Apple M4 Max / Zig 0.16.0 ReleaseFast, shared host, six samples with the first
+discarded. Each reference prepares the same current-wire artifact and checks
+the same selected semantic identity. Preparation excludes the numerical kernel.
+
+| Phase | Reference | Current | Tracked peak / reads |
+| --- | ---: | ---: | --- |
+| Stateful committed insert + delete | 2,150.950 ms | 1,198.386 ms | Endpoint counter reads 262,144 → 2,048 |
+| Serverless narrow, warm identity | 14.384 ms | 0.115 ms | Peak 16,140,777 → 99,141 B; reads 11,780,488 → 115,080 B |
+| Serverless narrow, cold identity | 14.511 ms | 0.115 ms | Same peak and reads as warm |
+| Serverless all types, warm identity | 14.611 ms | 2.884 ms | Peak 16,140,777 → 5,854,947 B; reads 11,780,488 → 3,434,931 B |
+| Serverless all types, cold identity | 14.316 ms | 3.164 ms | Same peak and reads as warm |
+
+A second complete run confirmed the counted bytes and allocation peaks.
+Committed cycles measured 2,158.953 → 1,185.736 ms; cold narrow preparation
+measured 14.483 → 0.133 ms; cold all-types preparation measured 14.423 → 2.911 ms.
+
+Compared with the historical v5 run below, warm narrow reads rise from 19,677
+to 115,080 bytes because of block alignment; cold narrow reads fall from
+11,794,405 to 115,080 bytes. The source grows by 5,760 bytes for its block table.
+Cross-run timing comparisons are approximate on this shared host; within-run
+reference parity and counted bytes are the stronger evidence.
+
+The committed-counter fixture uses 65,536 edges and 1,024 nodes on the default
+durable LSM. Both paths execute six complete insert/delete cycles, discarding the
+first, and check edge/node counts after both commits. Only global incidence
+maintenance differs; topology invalidation, directional writes and WAL/commit
+remain in the timer. Coalescing reduces endpoint counter reads per cycle from
+262,144 to 2,048. This does not imply fewer WAL records: repeated mutable-key
+updates were already coalesced by the LSM. Forced compaction, reopening and
+fixture construction are excluded.
+
+The block table costs 32 bytes per 64 KiB covered, at most 128 KiB for a 256 MiB
+artifact, plus 32 bytes in each graph manifest reference. The existing eight-byte
+ordinal edge index and dictionary/type directory are still present. Directory
+control remains capped at 1 MiB, with an explicit full-preparation fallback.
+Aligned reads can overfetch compared with v5's warm range path, but no longer
+require cold full-object authentication. Actual overfetched bytes count against
+publication's shared read allowance; separate filter groups share one control
+object and retain only their own selected topology.
+
+## Earlier v5 addressed plans and topology preparation (2026-09-09)
 
 Run `zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --indexing-only`.
 Apple M4 Max / Zig 0.16.0, shared host; six samples, first discarded. This run
-includes the merge of main `aa44bddd1`. Current wire is v5. The following are
+includes the merge of main `aa44bddd1`. That run used wire v5. The following are
 local phase measurements, not cloud/HTTP latency.
 
 | Phase | Reference | Addressed | Tracked peak / reads |

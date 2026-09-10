@@ -350,6 +350,7 @@ pub const Detail = enum(c_int) {
     index_generation_mismatch,
     unsupported_tensor_type,
     generation_capacity_unavailable,
+    generation_transition_active,
 };
 
 pub const Status = extern struct {
@@ -440,6 +441,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.DocIdentityNamespaceMismatch => status(.conflict, .doc_identity_namespace_mismatch),
         error.TableGenerationChanged => status(.conflict, .table_generation_changed),
         error.GenerationDurabilityUncertain => status(.retryable, .generation_durability_uncertain),
+        error.GenerationTransitionActive => status(.retryable, .generation_transition_active),
         error.IndexRebuilding => status(.retryable, .index_rebuilding),
         error.TableVisibilityTimeout => status(.timeout, .table_visibility_timeout),
         error.WriterLocked => status(.retryable, .writer_locked),
@@ -778,6 +780,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .doc_identity_namespace_mismatch => "DocIdentityNamespaceMismatch",
         .table_generation_changed => "TableGenerationChanged",
         .generation_durability_uncertain => "GenerationDurabilityUncertain",
+        .generation_transition_active => "GenerationTransitionActive",
         .index_rebuilding => "IndexRebuilding",
         .table_visibility_timeout => "TableVisibilityTimeout",
         .writer_locked => "WriterLocked",
@@ -1024,6 +1027,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
 }
 
 test "stable status preserves public boundary semantics" {
+    try std.testing.expectEqual(error.GenerationTransitionActive, errorFromStatus(statusFromError(error.GenerationTransitionActive)));
+    try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.GenerationTransitionActive).code);
     try std.testing.expectEqual(error.IndexGenerationMismatch, errorFromStatus(statusFromError(error.IndexGenerationMismatch)));
     try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.IndexGenerationMismatch).code);
     try std.testing.expect(Status.ok.isOk());

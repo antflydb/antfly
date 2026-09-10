@@ -3,6 +3,7 @@
 import importlib.util
 import io
 import os
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -19,6 +20,21 @@ SPEC.loader.exec_module(launcher)
 
 
 class BoundedZigBuildTest(unittest.TestCase):
+    def test_ci_scheduler_caps_admit_the_storage_compile_claim(self):
+        build = (SCRIPT.parents[1] / "build.zig").read_text(encoding="utf-8")
+        workflow = (SCRIPT.parents[2] / ".github/workflows/zig-tests.yml").read_text(
+            encoding="utf-8"
+        )
+        claim = re.search(r"\.distributed => (\d+) \* 1024 \* 1024 \* 1024", build)
+        self.assertIsNotNone(
+            claim, "update this contract when storage claims change shape"
+        )
+        required = int(claim.group(1)) * 1024**3
+        caps = re.findall(r"--max-rss-cap (\d+)", workflow)
+        self.assertTrue(caps)
+        for cap in caps:
+            self.assertGreaterEqual(int(cap), required)
+
     def test_environment_override_is_used_as_exact_budget(self):
         with mock.patch.dict(os.environ, {launcher.MAX_RSS_ENV: "123456"}):
             self.assertEqual(123456, launcher.detect_max_rss())
@@ -55,6 +71,18 @@ class BoundedZigBuildTest(unittest.TestCase):
                 launcher, "detect_memory_limit", return_value=40_000
             ):
                 self.assertEqual(32_000, launcher.detect_max_rss())
+
+    def test_ci_cap_admits_storage_kernel_without_overriding_small_cgroup(self):
+        cap = 22 * 1024 * 1024 * 1024
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(
+                launcher, "detect_memory_limit", return_value=64 * 1024**3
+            ):
+                self.assertEqual(cap, launcher.detect_max_rss(cap))
+            with mock.patch.object(
+                launcher, "detect_memory_limit", return_value=16 * 1024**3
+            ):
+                self.assertEqual(int(16 * 1024**3 * 0.8), launcher.detect_max_rss(cap))
 
     def test_command_adds_missing_scheduler_options(self):
         command = launcher.build_command(

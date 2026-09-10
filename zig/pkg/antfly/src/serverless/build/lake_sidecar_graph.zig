@@ -117,6 +117,7 @@ fn buildGraphSidecarBoundedAlloc(
 
     var declaration = try declaredArtifactAlloc(alloc, binding, options, payload.len);
     errdefer freeOwnedDeclaration(alloc, declaration);
+    try graph_segment.codec.compact.bindTopologyControl(&declaration.artifact, payload);
     try declaration.validate();
 
     return .{

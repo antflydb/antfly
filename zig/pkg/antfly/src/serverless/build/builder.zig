@@ -2962,6 +2962,7 @@ pub fn cloneArtifactRefAlloc(alloc: Allocator, artifact: manifest_mod.ArtifactRe
         .graph_metric_control_len = artifact.graph_metric_control_len,
         .graph_metric_routing_footer_len = artifact.graph_metric_routing_footer_len,
         .graph_metric_control_checksum = artifact.graph_metric_control_checksum,
+        .graph_topology_control_checksum = artifact.graph_topology_control_checksum,
         .graph_metric_routing_checksum = artifact.graph_metric_routing_checksum,
         .graph_metric_point_index_checksum = artifact.graph_metric_point_index_checksum,
         .graph_metric_config_fingerprint = artifact.graph_metric_config_fingerprint,
@@ -3868,6 +3869,8 @@ pub fn buildGraphArtifactRefsForMaterializedDocsAllocUntil(
             const refs = try alloc.alloc(manifest_mod.ArtifactRef, 1);
             errdefer alloc.free(refs);
             refs[0] = try artifactRefFromMetadataAlloc(alloc, .graph_segment, artifact);
+            errdefer freeArtifactRef(alloc, refs[0]);
+            try graph_segment_mod.codec.compact.bindTopologyControl(&refs[0], payload);
             return refs;
         }
         return try alloc.alloc(manifest_mod.ArtifactRef, 0);
@@ -3900,6 +3903,7 @@ pub fn buildGraphArtifactRefsForMaterializedDocsAllocUntil(
         for (graph_index_names, 0..) |index_name, idx| {
             refs[idx] = try artifactRefFromMetadataNamedAlloc(alloc, .graph_segment, index_name, artifact);
             initialized += 1;
+            try graph_segment_mod.codec.compact.bindTopologyControl(&refs[idx], payload);
         }
         return refs;
     }
@@ -3936,6 +3940,8 @@ fn buildGraphArtifactRefsForRepublishAlloc(
             const refs = try alloc.alloc(manifest_mod.ArtifactRef, 1);
             errdefer alloc.free(refs);
             refs[0] = try artifactRefFromMetadataAlloc(alloc, .graph_segment, artifact);
+            errdefer freeArtifactRef(alloc, refs[0]);
+            try graph_segment_mod.codec.compact.bindTopologyControl(&refs[0], payload);
             return refs;
         }
         return try alloc.alloc(manifest_mod.ArtifactRef, 0);
@@ -3966,6 +3972,7 @@ fn buildGraphArtifactRefsForRepublishAlloc(
         for (graph_index_names, 0..) |index_name, idx| {
             refs[idx] = try artifactRefFromMetadataNamedAlloc(alloc, .graph_segment, index_name, artifact);
             initialized += 1;
+            try graph_segment_mod.codec.compact.bindTopologyControl(&refs[idx], payload);
         }
         return refs;
     }
@@ -6224,6 +6231,7 @@ test "serverless builder publishes and lifecycle-binds configured graph metrics"
     const degree_metric_name = try graph_metric_segment_mod.artifactNameAlloc(alloc, "graph_idx", "degree");
     defer alloc.free(degree_metric_name);
     const first_graph = first.artifacts[findNamedArtifactIndex(first, .graph_segment, "graph_idx").?];
+    try std.testing.expect(!std.mem.eql(u8, &first_graph.graph_topology_control_checksum, &@as([32]u8, @splat(0))));
     const first_metric = first.artifacts[findNamedArtifactIndex(first, .graph_metric_segment, metric_name).?];
     try std.testing.expectEqual(@as(u64, 1), first_graph.edge_generation);
     try std.testing.expectEqual(graph_metric_segment_mod.wire_version, first_metric.metadata_version);
@@ -6245,6 +6253,7 @@ test "serverless builder publishes and lifecycle-binds configured graph metrics"
     var second = try manifest_store.getAlloc("docs", 2);
     defer second.deinit(alloc);
     const second_graph = second.artifacts[findNamedArtifactIndex(second, .graph_segment, "graph_idx").?];
+    try std.testing.expectEqualSlices(u8, &first_graph.graph_topology_control_checksum, &second_graph.graph_topology_control_checksum);
     const second_metric = second.artifacts[findNamedArtifactIndex(second, .graph_metric_segment, metric_name).?];
     try std.testing.expectEqualStrings(first_graph.artifact_id, second_graph.artifact_id);
     try std.testing.expectEqual(first_graph.edge_generation, second_graph.edge_generation);
@@ -6275,6 +6284,7 @@ test "serverless builder publishes and lifecycle-binds configured graph metrics"
     var third = try manifest_store.getAlloc("docs", 3);
     defer third.deinit(alloc);
     const third_graph = third.artifacts[findNamedArtifactIndex(third, .graph_segment, "graph_idx").?];
+    try std.testing.expect(!std.mem.eql(u8, &third_graph.graph_topology_control_checksum, &@as([32]u8, @splat(0))));
     const third_metric = third.artifacts[findNamedArtifactIndex(third, .graph_metric_segment, metric_name).?];
     const third_degree_metric = third.artifacts[findNamedArtifactIndex(third, .graph_metric_segment, degree_metric_name).?];
     try std.testing.expect(!std.mem.eql(u8, second_graph.artifact_id, third_graph.artifact_id));
