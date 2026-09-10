@@ -6146,6 +6146,7 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
 pub const PendingTombstoneReconcile = struct {
     handle: Directory.Handle,
     account: *@import("memory_account.zig").Account,
+    footer: ?lsm_table_file.Footer = null,
     cursor: ?PersistedRunCursor = null,
     state_cursor: State.EntryCursor = .{},
     rows: usize = 0,
@@ -6153,6 +6154,16 @@ pub const PendingTombstoneReconcile = struct {
     complete: bool = false,
     budget: ?resource_manager_mod.BudgetedAllocator = null,
     reservation: ?resource_manager_mod.Reservation = null,
+
+    // Each slice admits exactly its next physical read before dropping the
+    // backend lock. Buffered rows need no further I/O credit. Footer, index
+    // and each compressed block are independent, resumable admission units.
+    fn nextIoBytes(self: *const @This()) u64 {
+        if (self.complete or self.handle.run.path == null) return 0;
+        const footer = self.footer orelse return lsm_table_file.footer_len;
+        const cursor = if (self.cursor) |*cursor| cursor else return footer.metadata_len;
+        return cursor.nextReadBytes();
+    }
 
     fn create(backend: anytype, handle: Directory.Handle) !*@This() {
         var credit: ?resource_manager_mod.Reservation = null;
@@ -6170,14 +6181,27 @@ pub const PendingTombstoneReconcile = struct {
         const allocator = if (self.budget) |*budget| budget.allocator() else backend.allocator;
         if (credits == 0 or @import("antfly_platform").time.monotonicNs() >= deadline) return false;
         if (run.path) |path| {
+            if (self.footer == null) {
+                self.footer = try repository_mod.loadRunFooterWithStorage(backend.storage.?, allocator, path);
+                if (self.footer.?.entry_count != run.entry_count) return error.InvalidTableFile;
+                return false;
+            }
             if (self.cursor == null) {
-                self.cursor = try PersistedRunCursor.init(allocator, backend.storage.?, path);
+                const footer = self.footer.?;
+                const metadata = try backend.storage.?.readFileRangeAlloc(allocator, path, footer.metadata_offset, footer.metadata_len);
+                defer allocator.free(metadata);
+                self.cursor = try PersistedRunCursor.initWithIndex(allocator, backend.storage.?, path, try lsm_table_file.decodeSequentialIndexFromFooterAlloc(allocator, footer, metadata));
                 if (self.cursor.?.index.entry_count != run.entry_count) return error.InvalidTableFile;
                 return false; // Index admission/I/O owns a separate quantum.
             }
         }
+        var may_read_window = if (self.cursor) |*cursor| cursor.nextReadBytes() != 0 else false;
         while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
             const deleted = if (self.cursor) |*cursor| blk: {
+                if (cursor.nextReadBytes() != 0) {
+                    if (!may_read_window) return false;
+                    may_read_window = false;
+                }
                 const entry = (try cursor.currentEntry()) orelse {
                     if (self.rows != run.entry_count) return error.InvalidTableFile;
                     return self.finishScan();
@@ -6225,6 +6249,10 @@ pub const PendingTombstoneReconcile = struct {
 
 pub fn reconcileTombstonesStep(backend: anytype) anyerror!bool {
     if (backend.tombstone_reconcile_in_flight) return false;
+    if (backend.optionalMaintenanceDeferredLocked()) {
+        backend.tombstone_reconcile_retry_ns = backend.nowNs() +| 100 * std.time.ns_per_ms;
+        return false;
+    }
     backend.tombstone_reconcile_in_flight = true;
     defer backend.tombstone_reconcile_in_flight = false;
     var release = false;
@@ -6260,6 +6288,13 @@ pub fn reconcileTombstonesStep(backend: anytype) anyerror!bool {
         return true;
     }
     if (backend.manifestCoordinationIo()) |io| try io.checkCancel();
+    if (!backend.tryReserveMaintenanceIoBudget(pending.nextIoBytes())) {
+        // Admission denial is not corruption and must neither discard the
+        // verified prefix nor schedule a zero-delay retry loop.
+        backend.tombstone_reconcile_retry_ns = backend.nowNs() +| 100 * std.time.ns_per_ms;
+        return false;
+    }
+    backend.tombstone_reconcile_retry_ns = 0;
     const before = pending.rows;
     backend.retainReaderKind(.compaction);
     runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
@@ -6331,7 +6366,12 @@ const PersistedRunCursor = struct {
         storage: @import("storage_io.zig").Storage,
         path: []const u8,
     ) !PersistedRunCursor {
-        var index = try repository_mod.loadRunSequentialTableIndexAllocWithStorage(storage, allocator, path);
+        return initWithIndex(allocator, storage, path, try repository_mod.loadRunSequentialTableIndexAllocWithStorage(storage, allocator, path));
+    }
+
+    /// Consumes the index on both success and failure.
+    fn initWithIndex(allocator: std.mem.Allocator, storage: @import("storage_io.zig").Storage, path: []const u8, owned_index: lsm_table_file.SequentialTableIndex) !PersistedRunCursor {
+        var index = owned_index;
         errdefer index.deinit(allocator);
         // Run snapshots pin immutable paths through output publication. Keep
         // input descriptors window-scoped: per-compaction capacity estimates
@@ -6394,16 +6434,7 @@ const PersistedRunCursor = struct {
     fn ensureCurrentWindow(self: *PersistedRunCursor) !void {
         if (self.block_index >= self.index.blocks.len) return error.InvalidTableFile;
         const window = self.index.blocks[self.block_index].window;
-        if (self.loaded_window) |loaded| {
-            if (loaded.relative_offset == window.relative_offset and
-                loaded.len == window.len and
-                loaded.physical_relative_offset == window.physical_relative_offset and
-                loaded.physical_len == window.physical_len and
-                loaded.compression == window.compression)
-            {
-                return;
-            }
-        }
+        if (self.windowLoaded(window)) return;
 
         if (self.loaded_bytes) |bytes| {
             self.allocator.free(bytes);
@@ -6423,6 +6454,27 @@ const PersistedRunCursor = struct {
             window.checksum,
         );
         self.loaded_window = window;
+    }
+
+    fn nextReadBytes(self: *const PersistedRunCursor) u64 {
+        if (self.position == null or self.block_index >= self.index.blocks.len) return 0;
+        const window = self.index.blocks[self.block_index].window;
+        return if (self.windowLoaded(window)) 0 else window.physicalLen();
+    }
+
+    fn windowLoaded(self: *const PersistedRunCursor, window: lsm_table_file.EntryDataWindow) bool {
+        if (self.loaded_window) |loaded| {
+            if (loaded.relative_offset == window.relative_offset and
+                loaded.len == window.len and
+                loaded.physical_relative_offset == window.physical_relative_offset and
+                loaded.physical_len == window.physical_len and
+                loaded.compression == window.compression)
+            {
+                return self.loaded_bytes != null;
+            }
+        }
+
+        return false;
     }
 };
 

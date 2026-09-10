@@ -25,14 +25,29 @@ Foreground hard-pressure and explicit-window callers drain their own jobs with
 policy changes, stale inputs and close reclaim partial ownership; background
 cleanup itself resumes in bounded off-lock quanta.
 
+Continuation ownership is independent of pressure admission. Every maintenance
+turn retires a background bulk plan whose pressure or captured policy no longer
+applies, before foreground-traffic deferral. Retired jobs retain an immediate
+cleanup wake until bounded reclamation releases their pins. Still-needed but
+foreground-deferred jobs advertise a 100 ms retry instead of spinning; wake
+selection preserves earlier WAL and reconciliation deadlines. An in-flight job
+does not request another immediate planning turn.
+
 Tombstone metadata distinguishes known zero, known nonzero and unknown. Mainline
 v9/v10 manifests remain readable, but their unknown counts now contribute explicit
 maintenance debt. An augmented directory query finds an unknown input without
 scanning unrelated files. A separate fair lane pins that input and streams its
 sequential index and checksum-verified blocks with an allocation-charged scratch
-budget. Index loading has its own quantum, followed by at most 2,048 entries or
-two milliseconds per turn. These are cooperative bounds: one storage operation
-or block decode may exceed the time target.
+budget. The optional-work foreground policy and per-turn background I/O budget
+apply before scanning. Footer, sequential metadata and each compressed data block
+are separately admitted physical read units. A turn reads at most one block and
+processes at most 2,048 entries or two milliseconds; buffered entries need no new
+I/O credit. Denied admission retains the verified footer/index/scan position and
+advertises a 100 ms retry, without counting a corruption failure. The existing
+oversized-single-job option permits one physical unit to exceed an otherwise
+unused turn budget. These are cooperative bounds: one metadata decode, storage
+operation or block decode may exceed the time target. Durable manifest publication
+remains a separate durability lane, not part of the SST read budget.
 
 After verifying entry counts, reconciliation releases its I/O scratch and
 publishes only updated immutable metadata through the normal manifest protocol.
@@ -54,6 +69,7 @@ close, corrupt blocks and publication-headroom retries. Reproduce from `zig/`:
 python3 tools/run_bounded_zig_build.py build lsm-backend-test -- --test-filter 'bulk publication' --test-filter 'unknown tombstone' --test-filter 'tiers committed runs' --test-filter 'snapshot clone has'
 python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'bulk publication no-op scheduling scaling benchmark'
 python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'bulk publication large generation discovery'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'maintenance score aggregate' --test-filter 'bulk continuation' --test-filter 'unknown tombstone'
 ```
 
 Local Apple Silicon / Zig 0.16 ReleaseFast measurements (synthetic hot metadata,
@@ -72,6 +88,15 @@ generations, selection performed 39,995 visits over 20 slices, taking 2.10 ms
 total with a 121 µs maximum measured slice. These results establish file-count
 independence and bounded scheduling turns, not a worst-case linear discovery
 guarantee or a wall-clock deadline for storage I/O.
+
+The scheduler-helper microbenchmark above did not cover pressure checks in the
+actual backend scoring path. Those checks now use the writer owner's maintained
+L0 file/byte totals too. A follow-up measuring `Backend.maintenanceScore()` over
+10,000 calls (including its mutex probe) took 13.4 / 14.6 / 14.6 ns at 1,000 /
+10,000 / 50,000 files in one generation; a repeat took 15.0 / 15.8 / 15.9 ns.
+The pre-fix 50,000-file scoring probe took approximately 1.3 ms per call. This
+establishes removal of the metadata walk, not a sustained-write throughput or
+tail-latency guarantee.
 
 ## Read epochs
 

@@ -2842,7 +2842,7 @@ pub const Backend = struct {
         self.background_io_oversized_jobs +|= 1;
     }
 
-    fn tryReserveMaintenanceIoBudget(self: *Backend, io_bytes: u64) bool {
+    pub fn tryReserveMaintenanceIoBudget(self: *Backend, io_bytes: u64) bool {
         if (!self.canReserveMaintenanceIoBudget(io_bytes)) return false;
         self.reserveMaintenanceIoBudgetAssumeAdmitted(io_bytes);
         return true;
@@ -2874,12 +2874,21 @@ pub const Backend = struct {
         const reclaim_visits_before = self.obsolete_reclaim_visits;
         const planning_slices_before = self.directory_planning_slices;
         if (self.options.backend.read_only) return false;
+        // Admission pressure governs new work, not the lifetime of an owned
+        // continuation. Retire obsolete jobs even while foreground work owns
+        // the I/O lane; unlock reclamation drains their pins in bounded slices.
+        const bulk_retired = self.retireUnneededBulkPlanLocked();
         if (!self.manifest_checkpoint_build_in_flight and self.manifest_journal.sequence != null and self.manifest_journal.checkpointDue()) {
             return try self.manifest_journal.runCheckpoint(self);
         }
         if (self.wal_checkpoint_pending and self.walCheckpointRetryDueLocked()) {
             if (try self.runWalPressureMaintenanceStepLocked()) return true;
         }
+        self.maintenance_io_budget_remaining = if (self.options.background_io_budget_bytes > 0)
+            self.options.background_io_budget_bytes
+        else
+            null;
+        defer self.maintenance_io_budget_remaining = null;
         // Reconciliation has its own fair lane. An unknown SST never means
         // "zero deletes", and a large old run cannot monopolize maintenance.
         self.tombstone_reconcile_turn +%= 1;
@@ -2893,12 +2902,8 @@ pub const Backend = struct {
         // This prevents the import from reaching hard L0 pressure and then
         // repeatedly rewriting its entire overlapping lower-level base.
         if (self.bulkIngestActive()) {
-            if (!self.bulkTieredL0MaintenanceDueLocked()) return (self.tombstoneReconcileDelayLocked() orelse 1) == 0;
-            self.maintenance_io_budget_remaining = if (self.options.background_io_budget_bytes > 0)
-                self.options.background_io_budget_bytes
-            else
-                null;
-            defer self.maintenance_io_budget_remaining = null;
+            if (!self.bulkTieredL0MaintenanceDueLocked() or self.optionalMaintenanceDeferredLocked())
+                return bulk_retired or (self.tombstoneReconcileDelayLocked() orelse 1) == 0;
             const compacted = try compaction_mod.compactBulkL0TierScheduledBeforeSequence(
                 Backend,
                 self,
@@ -2914,11 +2919,6 @@ pub const Backend = struct {
             _ = self.refreshCachedMaintenanceHintLocked();
             return compacted;
         }
-        self.maintenance_io_budget_remaining = if (self.options.background_io_budget_bytes > 0)
-            self.options.background_io_budget_bytes
-        else
-            null;
-        defer self.maintenance_io_budget_remaining = null;
         const before_compactions = self.compaction_stats.compactions;
         const before_manifest_writes = self.write_stats.manifest_writes;
         const before_obsolete_paths = self.obsolete_paths.count();
@@ -2961,11 +2961,7 @@ pub const Backend = struct {
             // pressure selection, so a 3.2x L0 backlog rewrote an 8.5x-overfull
             // L1 before L1 could be promoted. Use the soft L0 bound as the
             // pressure denominator while retaining overlap-triggered L0 work.
-            const defer_soft_compaction = if (self.options.resource_manager) |manager|
-                manager.shouldDeferSoftCompactionForDerivedReplay() or
-                    manager.shouldDeferOptionalMaintenanceForForegroundTraffic()
-            else
-                false;
+            const defer_soft_compaction = self.optionalMaintenanceDeferredLocked();
             if (!defer_soft_compaction) {
                 self.gc_maintenance_turn +%= 1;
                 var compacted = self.pending_directory_closure == null and self.pending_l0_directory_closure == null and self.gc_maintenance_turn % 8 == 0 and (compaction_mod.nextTombstoneGcDelay(self) orelse 1) == 0 and
@@ -3009,7 +3005,7 @@ pub const Backend = struct {
 
         _ = self.refreshCachedMaintenanceHintLocked();
 
-        return self.compaction_stats.compactions != before_compactions or
+        return bulk_retired or self.compaction_stats.compactions != before_compactions or
             (self.tombstoneReconcileDelayLocked() orelse 1) == 0 or
             self.directory_planning_slices != planning_slices_before or
             self.write_stats.manifest_writes != before_manifest_writes or
@@ -3038,31 +3034,51 @@ pub const Backend = struct {
     }
 
     fn l0RunSoftPressureLocked(self: *const Backend) bool {
-        var l0_runs: usize = 0;
-        while (l0_runs < self.runs.count() and self.runs.at(l0_runs).level == 0) : (l0_runs += 1) {}
         return self.effectiveL0SoftLimitRuns() > 0 and
-            l0_runs > self.effectiveL0SoftLimitRuns();
+            self.runs.l0Files() > self.effectiveL0SoftLimitRuns();
     }
 
     fn l0ByteSoftPressureLocked(self: *const Backend) bool {
         if (self.options.l0_soft_limit_bytes == 0) return false;
-        var l0_bytes: u64 = 0;
-        var cursor = self.runs.cursor();
-        while (cursor.next()) |run| {
-            if (run.level != 0) break;
-            l0_bytes +|= run.size_bytes;
-        }
-        return l0_bytes > self.options.l0_soft_limit_bytes;
+        return self.runs.l0Bytes() > self.options.l0_soft_limit_bytes;
     }
 
     fn l0HardPressureLocked(self: *const Backend) bool {
-        var l0_runs: usize = 0;
-        var l0_bytes: u64 = 0;
-        while (l0_runs < self.runs.count() and self.runs.at(l0_runs).level == 0) : (l0_runs += 1) {
-            l0_bytes +|= self.runs.at(l0_runs).size_bytes;
+        return (self.effectiveL0HardLimitRuns() > 0 and self.runs.l0Files() > self.effectiveL0HardLimitRuns()) or
+            (self.options.l0_hard_limit_bytes > 0 and self.runs.l0Bytes() > self.options.l0_hard_limit_bytes);
+    }
+
+    const maintenance_admission_retry_ns: u64 = 100 * std.time.ns_per_ms;
+
+    pub fn optionalMaintenanceDeferredLocked(self: *const Backend) bool {
+        return if (self.options.resource_manager) |manager|
+            manager.shouldDeferSoftCompactionForDerivedReplay() or manager.shouldDeferOptionalMaintenanceForForegroundTraffic()
+        else
+            false;
+    }
+
+    fn bulkPlanNeededLocked(self: *const Backend, pending: *const compaction_mod.PendingBulkPlan) bool {
+        return self.options.bulk_ingest_tiered_l0_fan_in >= 2 and self.l0SoftPressureLocked() and
+            pending.selection.policy.eql(.{ .fan_in = self.options.bulk_ingest_tiered_l0_fan_in, .max_bytes = self.options.max_compaction_input_bytes, .sequence = if (self.bulkIngestActive()) self.bulk_ingest_window_first_sequence else 0 });
+    }
+
+    fn retireUnneededBulkPlanLocked(self: *Backend) bool {
+        if (self.bulk_plan_in_flight) return false;
+        const pending = self.pending_bulk_plan orelse return false;
+        if (self.bulkPlanNeededLocked(pending)) return false;
+        self.pending_bulk_plan = null;
+        self.retireBulkPlanning(pending);
+        return true;
+    }
+
+    fn bulkPlanningWakeDelayLocked(self: *Backend) ?u64 {
+        if (self.retired_bulk_plans != null) return 0;
+        if (self.pending_bulk_plan) |pending| {
+            if (self.bulk_plan_in_flight) return null;
+            if (!self.bulkPlanNeededLocked(pending)) return 0;
+            return if (self.optionalMaintenanceDeferredLocked()) maintenance_admission_retry_ns else 0;
         }
-        return (self.effectiveL0HardLimitRuns() > 0 and l0_runs > self.effectiveL0HardLimitRuns()) or
-            (self.options.l0_hard_limit_bytes > 0 and l0_bytes > self.options.l0_hard_limit_bytes);
+        return null;
     }
 
     fn runWalPressureMaintenanceStepLocked(self: *Backend) !bool {
@@ -4498,7 +4514,7 @@ pub const Backend = struct {
     fn scheduleMaintenanceJobIfNeededLocked(self: *Backend) void {
         if (self.closing.load(.acquire)) return;
         if (self.options.backend.read_only) return;
-        if (self.bulkIngestActive() and !self.wal_checkpoint_pending and !self.bulkTieredL0MaintenanceDueLocked() and !(self.manifest_journal.sequence != null and self.manifest_journal.checkpointDue())) return;
+        if (self.bulkIngestActive() and self.pending_bulk_plan == null and self.retired_bulk_plans == null and self.tombstoneReconcileDelayLocked() == null and !self.wal_checkpoint_pending and !self.bulkTieredL0MaintenanceDueLocked() and !(self.manifest_journal.sequence != null and self.manifest_journal.checkpointDue())) return;
         if (self.options.maintenance_waker != null) {
             if (self.maintenanceScoreLocked() != 0) self.wakeMaintenanceWorker();
             return;
@@ -7866,10 +7882,16 @@ pub const Backend = struct {
         // In particular, a due routine task must not keep an external worker
         // spinning while bulk mode intentionally suppresses that task.
         if (self.bulkIngestActive()) {
-            if (self.pending_bulk_plan != null or self.bulkTieredL0MaintenanceDueLocked()) return 0;
-            const reconcile = self.tombstoneReconcileDelayLocked();
-            const wal_delay = self.nextWalCheckpointRetryDelayNsLocked();
-            return if (reconcile) |value| if (wal_delay) |wal_value| @min(value, wal_value) else value else wal_delay;
+            var delay = self.bulkPlanningWakeDelayLocked();
+            if (!self.bulk_plan_in_flight and self.bulkTieredL0MaintenanceDueLocked()) {
+                const candidate: u64 = if (self.optionalMaintenanceDeferredLocked()) maintenance_admission_retry_ns else 0;
+                delay = if (delay) |current| @min(current, candidate) else candidate;
+            }
+            if (self.tombstoneReconcileDelayLocked()) |candidate|
+                delay = if (delay) |current| @min(current, candidate) else candidate;
+            if (self.nextWalCheckpointRetryDelayNsLocked()) |candidate|
+                delay = if (delay) |current| @min(current, candidate) else candidate;
+            return delay;
         }
 
         var delay_ns = self.nextObsoleteReclaimDelayNsLocked();
@@ -7886,7 +7908,7 @@ pub const Backend = struct {
             delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
         }
         if (self.tombstoneReconcileDelayLocked()) |candidate| delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
-        if (self.pending_bulk_plan != null or self.retired_bulk_plans != null) return 0;
+        if (self.bulkPlanningWakeDelayLocked()) |candidate| delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
         return delay_ns;
     }
 
@@ -7894,7 +7916,7 @@ pub const Backend = struct {
         if (self.options.backend.read_only or self.tombstone_reconcile_in_flight) return null;
         if (self.pending_tombstone_reconcile != null or
             (!self.run_directory_dirty and self.run_directory != null and self.run_directory.?.unknownTombstoneRunCount() != 0))
-            return self.tombstone_reconcile_retry_ns -| self.nowNs();
+            return @max(self.tombstone_reconcile_retry_ns -| self.nowNs(), if (self.optionalMaintenanceDeferredLocked()) maintenance_admission_retry_ns else 0);
         return null;
     }
 
@@ -21354,6 +21376,153 @@ test "lsm planning metadata is admitted before allocation" {
         try std.testing.expect(backend.domain_index == null);
         try std.testing.expectEqual(@as(u64, 0), backend.domain_index_builds);
         try std.testing.expectEqual(before, manager.sliceStats(.lsm_in_memory_state).used_bytes);
+    }
+}
+
+test "lsm bulk continuation retires after pressure relief or policy change despite foreground traffic" {
+    const alloc = std.testing.allocator;
+    for ([_]usize{ 1, 2, 3 }) |turns| for ([_]bool{ false, true }) |change_policy| {
+        var storage = storage_io.MemoryStorage.init(alloc);
+        defer storage.deinit();
+        var manager = resource_manager_mod.ResourceManager.init(.{});
+        defer manager.deinit(alloc);
+        var backend = try Backend.open(alloc, "/bulk-continuation-retirement", .{ .storage = storage.storage(), .resource_manager = &manager, .flush_threshold = 1, .direct_bulk_ingest_min_bytes = 1, .bulk_ingest_tiered_l0_fan_in = 4, .compact_threshold_runs = 4, .l0_soft_limit_runs = 4, .l0_hard_limit_runs = 128, .obsolete_retention_ns = 0 });
+        defer backend.close();
+        backend.beginBatchMode(.{ .mode = .bulk_ingest });
+        var bulk_active = true;
+        defer if (bulk_active) backend.finishBatchMode(.{ .mode = .bulk_ingest });
+        for (0..5) |i| {
+            var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+            defer txn.abort();
+            var key: [16]u8 = undefined;
+            try txn.put(.{}, try std.fmt.bufPrint(&key, "doc:{d}", .{i}), "value");
+            try txn.commit();
+        }
+        for (0..turns) |_| try std.testing.expect(try backend.runMaintenanceStep());
+        try std.testing.expect(backend.pending_bulk_plan != null);
+        manager.foreground_query_sessions.store(1, .release);
+        defer manager.foreground_query_sessions.store(0, .release);
+        // A needed but deferred job sleeps instead of spinning.
+        try std.testing.expect((backend.nextMaintenanceWakeDelayNsBestEffort() orelse 0) > 0);
+        if (change_policy) {
+            backend.options.bulk_ingest_tiered_l0_fan_in = 0;
+        } else {
+            const locked = runtime_mod.lockBackend(Backend, &backend);
+            defer runtime_mod.unlockBackend(Backend, &backend, locked);
+            try std.testing.expect(try compaction_mod.compactBulkL0Tier(Backend, &backend, 4));
+            try backend.persistManifestLocked();
+            try std.testing.expectEqual(@as(usize, 2), backend.runs.l0Files());
+        }
+        try std.testing.expectEqual(@as(?u64, 0), backend.nextMaintenanceWakeDelayNsBestEffort());
+        for (0..64) |_| _ = try backend.runMaintenanceStep();
+        try std.testing.expect(backend.pending_bulk_plan == null);
+        try std.testing.expect(backend.retired_bulk_plans == null);
+        try std.testing.expect(backend.active_bulk_plans == null);
+        backend.finishBatchMode(.{ .mode = .bulk_ingest });
+        bulk_active = false;
+        manager.foreground_query_sessions.store(0, .release);
+        for (0..64) |_| _ = try backend.runMaintenanceStep();
+        try std.testing.expect(backend.pending_bulk_plan == null);
+        if (!change_policy) try std.testing.expectEqual(@as(usize, 0), backend.obsolete_paths.count());
+    };
+}
+
+test "lsm unknown tombstone admission bounds physical reads and preserves resume state" {
+    const alloc = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(alloc);
+    defer storage.deinit();
+    const root = "/reconcile-admission";
+    try writeUnknownTombstoneFixture(alloc, storage.storage(), root, 10, 5000);
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(alloc);
+    var backend = try Backend.open(alloc, root, .{ .storage = storage.storage(), .resource_manager = &manager, .wal_enabled = false, .background_io_budget_bytes = 1, .background_io_allow_oversized_single_job = false });
+    defer backend.close();
+    manager.foreground_query_sessions.store(1, .release);
+    defer manager.foreground_query_sessions.store(0, .release);
+    for (0..8) |_| _ = try backend.runMaintenanceStep();
+    try std.testing.expect(backend.pending_tombstone_reconcile == null);
+    try std.testing.expectEqual(@as(u64, 0), backend.tombstone_reconcile_rows);
+    try std.testing.expect((backend.nextMaintenanceWakeDelayNsBestEffort() orelse 0) > 0);
+    manager.foreground_query_sessions.store(0, .release);
+    for (0..8) |_| {
+        backend.tombstone_reconcile_turn = 0;
+        backend.tombstone_reconcile_retry_ns = 0;
+        _ = try backend.runMaintenanceStep();
+    }
+    try std.testing.expect(backend.pending_tombstone_reconcile != null);
+    try std.testing.expect(backend.pending_tombstone_reconcile.?.footer == null);
+    try std.testing.expectEqual(@as(u64, 0), backend.background_io_reserved_bytes);
+    try std.testing.expect(backend.background_io_denied_jobs > 0);
+    try std.testing.expect((backend.nextMaintenanceWakeDelayNsBestEffort() orelse 0) > 0);
+    // Admit just the fixed footer. The next denial preserves it for retry.
+    backend.options.background_io_budget_bytes = @import("lsm/table_file.zig").footer_len;
+    for (0..8) |_| {
+        backend.tombstone_reconcile_retry_ns = 0;
+        _ = try backend.runMaintenanceStep();
+    }
+    const pending = backend.pending_tombstone_reconcile.?;
+    try std.testing.expect(pending.footer != null);
+    try std.testing.expect(pending.cursor == null);
+    try std.testing.expectEqual(@as(u64, @import("lsm/table_file.zig").footer_len), backend.background_io_reserved_bytes);
+    // A quantum may admit one oversized physical unit, never the whole SST.
+    backend.options.background_io_allow_oversized_single_job = true;
+    backend.tombstone_reconcile_turn = 0;
+    backend.tombstone_reconcile_retry_ns = 0;
+    _ = try backend.runMaintenanceStep();
+    try std.testing.expect(pending.cursor != null);
+    var expected_io: u64 = @import("lsm/table_file.zig").footer_len + pending.footer.?.metadata_len;
+    var largest_block: u64 = 0;
+    var previous_offset: ?u32 = null;
+    for (pending.cursor.?.index.blocks) |block| {
+        const offset = block.window.physicalRelativeOffset();
+        if (previous_offset == null or previous_offset.? != offset) expected_io += block.window.physicalLen();
+        previous_offset = offset;
+        largest_block = @max(largest_block, block.window.physicalLen());
+    }
+    // Foreground admission also pauses an already-owned cursor without
+    // discarding its verified index or rereading it when traffic subsides.
+    manager.foreground_query_sessions.store(1, .release);
+    const reserved_before_pause = backend.background_io_reserved_bytes;
+    for (0..8) |_| _ = try backend.runMaintenanceStep();
+    try std.testing.expectEqual(reserved_before_pause, backend.background_io_reserved_bytes);
+    try std.testing.expectEqual(@as(u64, 0), backend.tombstone_reconcile_rows);
+    try std.testing.expect(backend.pending_tombstone_reconcile.? == pending);
+    manager.foreground_query_sessions.store(0, .release);
+    for (0..256) |_| {
+        if (backend.tombstone_reconcile_completed != 0) break;
+        const before = backend.tombstone_reconcile_rows;
+        const io_before = backend.background_io_reserved_bytes;
+        backend.tombstone_reconcile_retry_ns = 0;
+        _ = try backend.runMaintenanceStep();
+        try std.testing.expect(backend.tombstone_reconcile_rows - before <= 2048);
+        try std.testing.expect(backend.background_io_reserved_bytes - io_before <= largest_block);
+    }
+    try std.testing.expectEqual(@as(u64, 5000), backend.tombstone_reconcile_rows);
+    try std.testing.expectEqual(@as(u64, 1), backend.tombstone_reconcile_completed);
+    try std.testing.expect(backend.background_io_oversized_jobs > 1);
+    try std.testing.expect(backend.background_io_reserved_bytes > 5000);
+    try std.testing.expectEqual(expected_io, backend.background_io_reserved_bytes);
+    try std.testing.expectEqual(@as(?u32, 5000), backend.runs.at(0).tombstone_count);
+}
+
+test "lsm maintenance score aggregate scaling benchmark" {
+    if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+    const alloc = std.heap.smp_allocator;
+    for ([_]usize{ 1000, 10000, 50000 }) |count| {
+        const keys = try alloc.alloc(u8, count * 8);
+        defer alloc.free(keys);
+        var backend = Backend.init(alloc, .{ .wal_enabled = false, .compact_threshold_runs = 100000, .l0_soft_limit_runs = 100000, .l0_hard_limit_runs = 200000 });
+        defer backend.close();
+        for (0..count) |i| {
+            const key = keys[i * 8 ..][0..8];
+            std.mem.writeInt(u64, key, i, .big);
+            try backend.runs.append(alloc, .{ .id = i + 1, .visibility_id = count, .level = 0, .size_bytes = 1024, .path = @constCast("score-benchmark.sst"), .smallest_namespace_name = null, .smallest_key = key, .largest_namespace_name = null, .largest_key = key, .entry_count = 1, .tombstone_count = 0, .bloom_filter = null, .owns_metadata = false, .owns_path = false, .state = null });
+        }
+        _ = try backend.planningDirectory();
+        const started = platform_time.monotonicNs();
+        for (0..10000) |_| std.mem.doNotOptimizeAway(backend.maintenanceScore());
+        const ns = @as(f64, @floatFromInt(platform_time.monotonicNs() - started)) / 10000;
+        std.debug.print("maintenance-score files={d} ns={d:.1}\n", .{ count, ns });
     }
 }
 

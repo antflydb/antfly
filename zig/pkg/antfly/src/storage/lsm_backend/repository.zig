@@ -1559,7 +1559,7 @@ pub fn loadRunSequentialTableIndexAllocWithStorage(
     return try lsm_table_file.decodeSequentialIndexFromFooterAlloc(allocator, footer, metadata_bytes);
 }
 
-fn loadRunFooterWithStorage(
+pub fn loadRunFooterWithStorage(
     storage: storage_io.Storage,
     allocator: Allocator,
     path: []const u8,
