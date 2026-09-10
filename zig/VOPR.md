@@ -3080,6 +3080,11 @@ cancels immediately after promotion to verify task and network cleanup;
 `ha-scaling-vopr-test` also checks the composed history and exact replay.
 The maintenance coordinator closes admission and exits when its borrowed lane
 is canceled, allowing the remaining registration owners to unwind.
+The composed split-to-merge history also covers unbounded range adjacency and
+source finalization on every document replica. Finalization atomically persists
+the narrowed range and Raft entry receipt through a metadata-only path. A later
+merge therefore validates the same base in the Raft projection and document DB;
+replaying an older split entry cannot narrow that merged range again.
 
 This is a bounded composition, not exhaustive fault coverage. The existing
 fixture retains a native temporary namespace for ancillary stores such as the

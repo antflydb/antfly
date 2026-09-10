@@ -2012,11 +2012,9 @@ const RaftTableApplyStateMachine = struct {
                 // no document mutation, and their null batch payload is
                 // intentionally poison to binaries that predate the barrier.
                 if (decoded.protocol_barrier_version == null and
-                    // Split lifecycle commands belong exclusively to the durable
-                    // Raft apply store. Sending an otherwise empty command through
-                    // the document DB can fail on unrelated index/runtime state
-                    // after the lifecycle mutation is already durable, leaving
-                    // Raft replaying a partially applied command.
+                    // Source finalization also publishes the physical DB range
+                    // through a metadata-only, entry-idempotent apply path.
+                    // Other source lifecycle commands need no document DB work.
                     batchRequiresDocumentDbApply(decoded.batch.req))
                 {
                     self.applyDocumentBatchForEntry(
@@ -2087,7 +2085,7 @@ const RaftTableApplyStateMachine = struct {
 };
 
 fn batchRequiresDocumentDbApply(req: antfly.db.types.BatchRequest) bool {
-    if (req.split_transition != null) return false;
+    if (req.split_transition) |transition| return transition.kind == .finalize;
     if (req.merge_source_transition != null) return false;
     if (req.split_checkpoint) |checkpoint| {
         if (checkpoint.kind == .source_ack and
@@ -12999,9 +12997,9 @@ pub const DataServer = struct {
             };
         } else if (split_terminal != null) blk: {
             // A completed transition makes the replicated range authoritative.
-            // Source lifecycle entries deliberately bypass the document DB,
-            // whose physical range may therefore still be the pre-cutover
-            // interval. Never widen a finalized source (or undo a rollback)
+            // The document delegate can still be applying finalization, so
+            // its physical range may be the pre-cutover interval. Never widen
+            // a finalized source (or undo a rollback)
             // while reconciling its documents after restart.
             const current = try source_store.currentRange(work_alloc, source_group_id);
             projected_range = current;
@@ -25446,7 +25444,7 @@ test "data raft merge observation derives from replicated source and receiver ma
     try std.testing.expectError(error.ConflictingMergeTransition, DataServer.deriveReplicatedMergeObservation(alloc, &store, record));
 }
 
-test "data raft source lifecycle commands bypass document db apply while receiver checkpoints apply" {
+test "data raft source finalization and receiver checkpoints apply document range metadata" {
     try std.testing.expectEqual(
         data_raft_batch.merge_artifacts_protocol_version,
         DataServer.requiredRaftBatchProtocolVersion(.{ .merge_artifacts = &.{.{ .key = "artifact", .value = "payload" }} }),
@@ -25469,6 +25467,15 @@ test "data raft source lifecycle commands bypass document db apply while receive
             .kind = .finalize,
             .transition_id = 7001,
             .receiver_group_id = 7002,
+        },
+    }));
+    try std.testing.expect(batchRequiresDocumentDbApply(.{
+        .split_transition = .{
+            .kind = .finalize,
+            .transition_id = 7001,
+            .attempt_epoch = 1,
+            .destination_group_id = 7002,
+            .split_key = "doc:m",
         },
     }));
     try std.testing.expect(batchRequiresDocumentDbApply(.{
@@ -25924,6 +25931,63 @@ test "data raft retry checkpoints survive changed ready windows and publication 
         error.UnknownGroup,
         apply_sm.waitReadBarrier(retired_barrier, platform_time.monotonicNs() + std.time.ns_per_s),
     );
+}
+
+test "data raft split finalization persists the receiver base before merge and survives restart replay" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/split-then-merge", .{tmp.sub_path});
+    defer alloc.free(path);
+    const finalize: antfly.db.types.BatchRequest = .{ .split_transition = .{
+        .kind = .finalize,
+        .transition_id = 41,
+        .attempt_epoch = 1,
+        .destination_group_id = 2,
+        .split_key = "doc:k",
+    } };
+    const split_entry: antfly.db.RaftAppliedEntryIdentity = .{ .term = 1, .index = 10 };
+    const merge_entry: antfly.db.RaftAppliedEntryIdentity = .{ .term = 1, .index = 11 };
+    {
+        var db = try antfly.db.DB.open(alloc, path, .{ .start_index_workers = false });
+        defer db.close();
+        try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"acknowledged\"}" }} });
+        try db.batchRaftReplicatedApply(finalize, split_entry);
+        try std.testing.expectEqualStrings("doc:k", db.getRange().end);
+        try std.testing.expectEqual(split_entry, (try db.raftAppliedEntry()).?);
+    }
+    {
+        var db = try antfly.db.DB.open(alloc, path, .{ .start_index_workers = false });
+        defer db.close();
+        try std.testing.expectEqualStrings("doc:k", db.getRange().end);
+        var invalid = finalize;
+        invalid.split_transition.?.split_key = "doc:z";
+        try std.testing.expectError(error.InvalidSplitRange, db.batchRaftReplicatedApply(invalid, merge_entry));
+        try std.testing.expectEqual(split_entry, (try db.raftAppliedEntry()).?);
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = .{
+            .kind = .accept,
+            .transition_id = 42,
+            .donor_group_id = 2,
+            .receiver_group_id = 1,
+            .receiver_base_start = "",
+            .receiver_base_end = "doc:k",
+            .merged_start = "",
+            .merged_end = "",
+        } }, merge_entry);
+        try std.testing.expectEqualStrings("", db.getRange().end);
+        try db.batchRaftReplicatedApply(finalize, split_entry);
+        try std.testing.expectEqualStrings("", db.getRange().end);
+    }
+    {
+        var db = try antfly.db.DB.open(alloc, path, .{ .start_index_workers = false });
+        defer db.close();
+        try db.batchRaftReplicatedApply(finalize, split_entry);
+        try std.testing.expectEqualStrings("", db.getRange().end);
+        try std.testing.expectEqual(merge_entry, (try db.raftAppliedEntry()).?);
+        const value = (try db.get(alloc, "doc:a")) orelse return error.TestExpectedDocument;
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("{\"title\":\"acknowledged\"}", value);
+    }
 }
 
 test "data raft document apply identity prevents non-idempotent restart replay" {

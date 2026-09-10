@@ -7156,6 +7156,10 @@ pub const DB = struct {
         // batchInternal repeats this check under the mutation lock, which is
         // the correctness fence if another caller advances the marker here.
         if (try self.raftEntryAlreadyApplied(identity)) return;
+        if (req.split_transition) |transition| {
+            if (transition.kind != .finalize) return error.InvalidBatchRequest;
+            return self.applyRaftSplitFinalization(transition, identity);
+        }
         var apply_req = req;
         apply_req.sync_level = .write;
         try self.batchInternal(apply_req, null, .{
@@ -7164,6 +7168,45 @@ pub const DB = struct {
             .bypass_ha_write_gate = true,
             .raft_applied_entry_marker = identity,
         });
+    }
+
+    /// The durable Raft projection validates the split lifecycle before the
+    /// document delegate runs. Mirror its finalized range on every replica,
+    /// without sending an empty source command through document/index work.
+    /// The range and entry receipt share a batch so restart replay cannot
+    /// narrow a range again after a later merge has expanded it.
+    fn applyRaftSplitFinalization(
+        self: *DB,
+        transition: types.SplitTransitionMutation,
+        identity: RaftAppliedEntryIdentity,
+    ) !void {
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
+        lockApply(self);
+        defer self.core.unlockApply();
+        switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), identity)) {
+            .already_applied => return,
+            .apply => {},
+        }
+        const current = self.core.byteRange();
+        if (transition.transition_id == 0 or transition.attempt_epoch == 0 or
+            transition.destination_group_id == 0 or transition.split_key.len == 0 or
+            !std.mem.lessThan(u8, current.start, transition.split_key) or
+            (current.end.len != 0 and std.mem.lessThan(u8, current.end, transition.split_key)))
+            return error.InvalidSplitRange;
+        const start = try self.alloc.dupe(u8, current.start);
+        errdefer self.alloc.free(start);
+        const end = try self.alloc.dupe(u8, transition.split_key);
+        errdefer self.alloc.free(end);
+        const range: types.ByteRange = .{ .start = start, .end = end };
+        const range_value = try range_state_mod.encodeRangeAlloc(self.alloc, range);
+        defer self.alloc.free(range_value);
+        var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
+        try rebaseRangeCoverageMetadata(self.alloc, self.core.store, self.core.index_manager, range, &.{
+            .{ .key = range_state_mod.range_key, .value = range_value },
+            raftAppliedEntryWrite(identity, &marker_buf),
+        });
+        self.core.adoptRangeInMemoryOwned(start, end);
     }
 
     pub fn raftAppliedEntry(self: *DB) !?RaftAppliedEntryIdentity {
