@@ -162,8 +162,10 @@ The review-driven worker ownership and per-group apply changes are tracked in
   follower removal. The final focused data-Raft/VOPR suite also passed 110 tests.
 - Managed writer-cache/restore lifecycle suite: 218 tests passed.
 - Python launcher/resolution checks: 15 passed.
-- Final Linux ReleaseFast soak is running: 38/60 completed successfully at
-  publication, with three workers, eight CPUs (`0-6,8`), and 256 descriptors.
+- Final Linux ReleaseFast soak: **60/60 passed**, with three workers,
+  eight CPUs (`0-6,8`), and 256 descriptors.
+- The same final Linux build passed both default regression-loop cases:
+  full-text schema migration and automatic shard splitting.
   Executable SHA-256: `a3c6e7987c0eadc0f633b58373d18ec0e13e0e6529fded12eaf37d966fe317f1`.
 
 Run the durable backfill and catalog lifecycle checks from `zig/`:
