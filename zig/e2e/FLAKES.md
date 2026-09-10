@@ -37,6 +37,13 @@ baseline and PR #694 with main merged as the fixed source. The repository's
 workers and ten repetitions per worker, pinned to eight CPUs on a disposable
 runner with a fresh filesystem. The baseline reproduces both CI signatures.
 
+The baseline finished **47/60 passed**: CLI **29/30**, with one matching
+readiness regression; backup **18/30**, with ten seed-write 409s, one completed
+restore-progress retirement timeout, and one 30-second HTTP read timeout.
+The latter two failures are separate observations, not evidence for the
+forwarding executor cause. The original binary lacks the added underlying
+transport-error diagnostics. Raw worker logs were retained for comparison.
+
 ### Three-by-three backup seed batch: unknown outcome (#694)
 
 The run reported 394 passed, five skipped, and one failure. Table creation and

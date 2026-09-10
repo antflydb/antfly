@@ -28,11 +28,14 @@ revision in the current table epoch. Each accepted group publication records
 its cache epoch; a retained snapshot from before a catalog fence cannot
 acknowledge a notification in the new epoch. Newer source revisions,
 unsequenced structural invalidations, and owner retirement still fence
-completion. A separate regression checks the same revision across a catalog
-fence. No readiness assertions or production deadlines were relaxed.
+completion. Cached and synthetic publications cannot establish this proof.
+A separate regression checks the same revision across a catalog fence,
+including republishing retained facts in the new epoch. No readiness
+assertions or production deadlines were relaxed.
 
 The ordering regression fails before the fix. With the fix, all 173
 `antfly-api-derived-coverage-test` tests pass on macOS ARM64 without leaks.
+Nine focused publication-fence and owner-lifecycle tests also passed.
 Linux reproduction and soak results are recorded in the
 [E2E history](e2e/FLAKES.md#completed-cli-readiness-regresses-after-publication-696).
 

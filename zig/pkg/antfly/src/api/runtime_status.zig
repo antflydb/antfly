@@ -2771,10 +2771,12 @@ pub const TableRuntimeSnapshotCache = struct {
             // callback reaches this cache. That durable target is already
             // observed even if no notification watermark was recorded yet.
             // Do not mint a new causal fence for the delayed duplicate.
-            // Pending/ownerless observations cannot supply this proof, and
+            // Pending, cached, or synthetic observations cannot supply this proof, and
             // null-sequence structural invalidations must always fence.
             if (state.groups.get(group_id)) |observed| {
                 if (observed.metadata.target_observation_complete and
+                    observed.metadata.source != .cached_snapshot and
+                    observed.metadata.source != .synthetic_config and
                     observed.cache_publication_epoch != null and
                     std.meta.eql(observed.cache_publication_epoch.?, state.epoch) and
                     sequence <= observed.metadata.target_observation_revision)
@@ -9367,19 +9369,30 @@ test "late source target notification cannot revoke an already observed target" 
 
 test "late source notification cannot reuse an observation from before a catalog fence" {
     const alloc = std.testing.allocator;
-    var cache = TableRuntimeSnapshotCache.init(alloc);
-    defer cache.deinit();
-    const initial = try cache.capturePublicationToken("docs");
-    _ = try cache.publishGroup(initial, "docs", .{
-        .group_id = 7,
-        .stats = .{},
-        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .target_observation_revision = 6 },
-    });
-    cache.fenceTablePublications("docs");
-    cache.markGroupTargetObservationPending("docs", 7, 6);
-    var pending = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
-    defer pending.deinit(alloc);
-    try std.testing.expect(!pending.metadata.target_observation_complete);
+    for ([_]?RuntimeStatusSource{ null, .cached_snapshot, .synthetic_config }) |retained_source| {
+        var cache = TableRuntimeSnapshotCache.init(alloc);
+        defer cache.deinit();
+        const initial = try cache.capturePublicationToken("docs");
+        _ = try cache.publishGroup(initial, "docs", .{
+            .group_id = 7,
+            .stats = .{},
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .target_observation_revision = 6 },
+        });
+        cache.fenceTablePublications("docs");
+        // Relabeling retained facts in a new epoch does not sample the owner.
+        if (retained_source) |source| {
+            const current = try cache.capturePublicationToken("docs");
+            _ = try cache.publishGroup(current, "docs", .{
+                .group_id = 7,
+                .stats = .{},
+                .metadata = .{ .source = source, .freshness = .fresh, .target_observation_revision = 6 },
+            });
+        }
+        cache.markGroupTargetObservationPending("docs", 7, 6);
+        var pending = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+        defer pending.deinit(alloc);
+        try std.testing.expect(!pending.metadata.target_observation_complete);
+    }
 }
 
 test "runtime owner retirement preserves serving snapshot and fences convergence" {
