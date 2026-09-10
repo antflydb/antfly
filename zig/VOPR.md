@@ -3115,6 +3115,12 @@ The workflow restores the last compatible scenario corpus, copies it into a
 fresh run directory, and uploads reports, traces, logs, and diagnostics even
 when the campaign fails. A separate job replays and merges the uploaded shard
 corpora, deduplicates them, and saves a bounded working corpus for the next run.
+The merge chooses its compatibility authority by exact replay with the current
+runner, preferring fresh histories. Duplicate-only campaigns can use a replayed
+seed; divergent candidates remain inputs for quarantine instead of aborting
+the merge before valid histories are retained. If no candidate replays, the job
+fails with an authority-selection log and leaves the uploaded shard traces
+available for diagnosis without publishing a working corpus.
 The working corpus keeps up to 128 clean traces for HA/Raft, eight for
 distributed data, and two for production HA/scaling, plus the smallest retained
 representative of every distinct failure fingerprint. `retention.json` records

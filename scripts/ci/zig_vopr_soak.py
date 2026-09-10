@@ -5,11 +5,11 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 
 def traces(directory):
@@ -122,29 +122,48 @@ def merge_corpus(binary, inputs, output, retained=None):
     candidates = traces(inputs)
     if not candidates:
         raise ValueError("no retained traces were uploaded")
-    # Prefer a freshly recorded trace as the compatibility authority. Old seed
-    # traces may belong to a previous scenario version and must be quarantined.
-    fresh = [path for path in candidates if path.name.startswith("history-")]
-    if not fresh:
-        raise ValueError("no fresh history is available as the corpus authority")
-    base = fresh[0]
-    command = [
-        str(binary),
-        "corpus-merge",
-        "--base",
-        str(base),
-        "--out-dir",
-        str(output),
-    ]
-    seen = {trace_digest(base)}
+    unique = {}
     for path in candidates:
         digest = trace_digest(path)
-        if digest in seen:
-            continue
-        seen.add(digest)
-        command.extend(["--trace", str(path)])
+        unique.setdefault(digest, path)
+    # New histories can themselves diverge. A successful campaign can also
+    # produce only duplicates, which are present solely as seed files. Choose
+    # authority by exact replay with this binary, preferring fresh histories;
+    # a filename alone proves neither compatibility nor successful replay.
+    ordered = sorted(
+        unique.values(), key=lambda path: (not path.name.startswith("history-"), path)
+    )
     output.mkdir(parents=True, exist_ok=True)
     with (output / "merge.log").open("w") as log:
+        base = None
+        for path in ordered:
+            log.write(f"Checking corpus authority: {path}\n")
+            log.flush()
+            replay = subprocess.run(
+                [str(binary), "replay", "--trace", str(path)],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+            if replay.returncode == 0:
+                base = path
+                break
+        if base is None:
+            log.write("No corpus candidate exactly replays with the current binary.\n")
+            return 1
+        command = [
+            str(binary),
+            "corpus-merge",
+            "--base",
+            str(base),
+            "--out-dir",
+            str(output),
+        ]
+        for path in ordered:
+            if path != base:
+                command.extend(["--trace", str(path)])
+        # Keep rejected authority candidates in the merge: it classifies and
+        # retains their quarantine evidence alongside the valid corpus.
         result = subprocess.run(
             command, stdout=log, stderr=subprocess.STDOUT, check=False
         )

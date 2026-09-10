@@ -1,8 +1,8 @@
 import json
-from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import zig_vopr_soak as soak
@@ -61,6 +61,9 @@ class SoakTests(unittest.TestCase):
                 (inputs / shard / "history-0.voprtrace").write_bytes(b"current history")
 
             def merge(command, **kwargs):
+                if command[1] == "replay":
+                    self.assertTrue(Path(command[-1]).name.startswith("history-"))
+                    return subprocess.CompletedProcess(command, 0)
                 self.assertTrue(
                     Path(command[command.index("--base") + 1]).name.startswith(
                         "history-"
@@ -83,6 +86,8 @@ class SoakTests(unittest.TestCase):
             (inputs / "history-0.voprtrace").write_bytes(b"current history")
 
             def merge(command, **kwargs):
+                if command[1] == "replay":
+                    return subprocess.CompletedProcess(command, 0)
                 (output / "index.json").write_text(
                     '{"artifacts": [], "quarantine": [{"reason": "replay_diverged"}]}'
                 )
@@ -91,6 +96,123 @@ class SoakTests(unittest.TestCase):
             with patch.object(soak.subprocess, "run", side_effect=merge):
                 self.assertEqual(soak.merge_corpus(Path("vopr"), inputs, output), 1)
             self.assertTrue((output / "index.json").exists())
+
+    def test_divergent_first_history_is_quarantined_with_valid_history_retained(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            inputs, output, retained = (
+                root / "shards",
+                root / "merged",
+                root / "retained",
+            )
+            inputs.mkdir()
+            bad = inputs / "history-0.voprtrace"
+            good = inputs / "history-1.voprtrace"
+            bad.write_bytes(b"divergent")
+            good.write_bytes(b"current history")
+            replayed = []
+
+            def merge(command, **kwargs):
+                if command[1] == "replay":
+                    path = Path(command[-1])
+                    replayed.append(path)
+                    return subprocess.CompletedProcess(command, int(path == bad))
+                self.assertEqual(command[command.index("--base") + 1], str(good))
+                self.assertEqual(command[command.index("--trace") + 1], str(bad))
+                (output / "trace-good.voprtrace").write_bytes(good.read_bytes())
+                (output / "quarantine").mkdir()
+                (output / "quarantine" / "bad.voprquarantine").write_bytes(
+                    bad.read_bytes()
+                )
+                (output / "index.json").write_text(
+                    json.dumps(
+                        {
+                            "scenario": "raft-group",
+                            "artifacts": [{"path": "trace-good.voprtrace"}],
+                            "quarantine": [{"reason": "replay_diverged"}],
+                        }
+                    )
+                )
+                return subprocess.CompletedProcess(command, 0)
+
+            with patch.object(soak.subprocess, "run", side_effect=merge):
+                self.assertEqual(
+                    soak.merge_corpus(Path("vopr"), inputs, output, retained), 1
+                )
+            self.assertEqual(replayed, [bad, good])
+            self.assertEqual(
+                (retained / "trace-good.voprtrace").read_bytes(), good.read_bytes()
+            )
+            self.assertEqual(
+                (output / "quarantine" / "bad.voprquarantine").read_bytes(),
+                bad.read_bytes(),
+            )
+
+    def test_duplicate_only_campaign_uses_current_replayable_seed_authority(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            corpus, run, output = root / "corpus", root / "run", root / "merged"
+            corpus.mkdir()
+            (corpus / "current.voprtrace").write_bytes(b"current history")
+            (corpus / "old.voprtrace").write_bytes(b"old version")
+
+            def campaign(command, **kwargs):
+                (run / "results.json").write_text('{"failed": 0}')
+                return subprocess.CompletedProcess(command, 0)
+
+            with patch.object(soak.subprocess, "run", side_effect=campaign):
+                self.assertEqual(
+                    soak.run_shard(Path("vopr"), "raft", 42, 1, corpus, run), 0
+                )
+            self.assertEqual(list(run.glob("history-*.voprtrace")), [])
+
+            def merge(command, **kwargs):
+                if command[1] == "replay":
+                    compatible = Path(command[-1]).read_bytes() == b"current history"
+                    return subprocess.CompletedProcess(command, 0 if compatible else 1)
+                self.assertEqual(
+                    Path(command[command.index("--base") + 1]).read_bytes(),
+                    b"current history",
+                )
+                self.assertEqual(
+                    Path(command[command.index("--trace") + 1]).read_bytes(),
+                    b"old version",
+                )
+                (output / "index.json").write_text(
+                    '{"artifacts": [], "quarantine": [{"reason": "scenario_version_changed"}]}'
+                )
+                return subprocess.CompletedProcess(command, 0)
+
+            with patch.object(soak.subprocess, "run", side_effect=merge):
+                self.assertEqual(soak.merge_corpus(Path("vopr"), run, output), 0)
+
+    def test_no_replayable_authority_fails_without_publishing_a_corpus(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            inputs, output, retained = (
+                root / "shards",
+                root / "merged",
+                root / "retained",
+            )
+            inputs.mkdir()
+            bad = inputs / "history-0.voprtrace"
+            bad.write_bytes(b"divergent")
+
+            def replay(command, **kwargs):
+                self.assertEqual(command[1], "replay")
+                return subprocess.CompletedProcess(command, 1)
+
+            with patch.object(soak.subprocess, "run", side_effect=replay):
+                self.assertEqual(
+                    soak.merge_corpus(Path("vopr"), inputs, output, retained), 1
+                )
+            self.assertIn(
+                "No corpus candidate exactly replays",
+                (output / "merge.log").read_text(),
+            )
+            self.assertFalse((output / "index.json").exists())
+            self.assertFalse(retained.exists())
+            self.assertEqual(bad.read_bytes(), b"divergent")
 
     def test_working_corpus_bounds_clean_traces_and_preserves_unique_findings(self):
         with tempfile.TemporaryDirectory() as root:
