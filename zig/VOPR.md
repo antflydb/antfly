@@ -648,8 +648,9 @@ The lane suffix still describes fidelity:
   `lib-metadata-vopr-placement-chaos-test` select the broader fault suites;
   `lib-metadata-vopr-chaos-soak-test` combines those three selections.
 
-The aggregate `vopr-test`, `antfly-integration-test`, `antfly-chaos-test`, and
-`chaos-soak-test` retain their existing selections.
+The aggregate `vopr-test`, `antfly-integration-test`, and `antfly-chaos-test`
+retain their existing selections. `vopr-soak-test` includes the broader fault
+selections alongside retained-corpus search campaigns.
 
 Metadata planning fixes (2026-09-07): rename validation exposed four failures
 that also reproduced at merged, pre-rename commit `6d21a583f`. The shared
@@ -2991,7 +2992,7 @@ lsm                   ha
 ### `vopr-soak-test`
 
 - Larger history counts, broader fault budgets, and retained native
-  differentials. `chaos-soak-test` is a compatibility alias for this same DAG.
+  differentials.
 - Runs the campaign CLI for HA, Raft, distributed data, and production
   HA/scaling with `--fail-on-findings` and one worker. Defaults are 100 histories
   for the smaller scenarios and two for production HA/scaling.
@@ -3189,9 +3190,6 @@ Legacy storage commands are:
 - DB split: `db-split-workload-test` and `db-split-replay-fixtures`.
 - Aggregate legacy workloads: `storage-workload-test` and
   `storage-workload-soak`.
-
-The old `*-sim-test` and `storage-sim-soak` spellings are compatibility aliases,
-not canonical suite names.
 
 Reduced legacy artifacts are written under `/tmp` with an
 `antfly-{lmdb,wal,persistent,index-manager,db-split}-replay-` prefix. Promote a

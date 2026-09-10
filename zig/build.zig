@@ -4769,8 +4769,6 @@ pub fn build(b: *std.Build) void {
     const run_lib_raft_harness_tests = addFilteredTestRunArtifact(b, lib_raft_harness_tests);
     const lib_raft_harness_test_step = b.step("lib-raft-harness-test", "Run the legacy Raft deterministic harness tests");
     lib_raft_harness_test_step.dependOn(&run_lib_raft_harness_tests.step);
-    const lib_raft_sim_test_compat_step = b.step("lib-raft-sim-test", "Compatibility alias for lib-raft-harness-test");
-    lib_raft_sim_test_compat_step.dependOn(lib_raft_harness_test_step);
 
     const lib_raft_chaos_default_filters = [_][]const u8{
         "managed host simulation restores through both raft state backends",
@@ -4826,8 +4824,6 @@ pub fn build(b: *std.Build) void {
     const run_lib_lsm_backend_workload_tests = addFilteredTestRunArtifact(b, lib_lsm_backend_workload_tests);
     const lib_lsm_backend_workload_test_step = b.step("lib-lsm-backend-workload-test", "Run legacy LSM backend storage workload tests");
     lib_lsm_backend_workload_test_step.dependOn(&run_lib_lsm_backend_workload_tests.step);
-    const lib_lsm_backend_sim_test_compat_step = b.step("lib-lsm-backend-sim-test", "Compatibility alias for lib-lsm-backend-workload-test");
-    lib_lsm_backend_sim_test_compat_step.dependOn(lib_lsm_backend_workload_test_step);
 
     const lib_lsm_backend_chaos_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -9508,7 +9504,6 @@ pub fn build(b: *std.Build) void {
     vopr_soak_progress_tail = chainLabeledFilteredTests(b, antfly_test_mod, "lib-metadata-vopr-placement-chaos-test", lib_metadata_vopr_placement_chaos_filters, vopr_soak_progress_tail);
     vopr_soak_progress_tail = chainLabeledRun(b, lib_raft_chaos_tests, "lib-raft-chaos-test", vopr_soak_progress_tail);
     vopr_soak_test_step.dependOn(vopr_soak_progress_tail.?);
-    b.step("chaos-soak-test", "Compatibility alias for vopr-soak-test").dependOn(vopr_soak_test_step);
     soak_test_step.dependOn(vopr_soak_test_step);
 
     const template_test_mod = b.createModule(.{
@@ -9857,8 +9852,6 @@ pub fn build(b: *std.Build) void {
     const run_storage_lmdb_soak_tests = addFilteredTestRunArtifact(b, storage_lmdb_soak_tests);
     const storage_lmdb_soak_step = b.step("lmdb-workload-soak", "Run only the legacy LMDB randomized workload soak");
     storage_lmdb_soak_step.dependOn(&run_storage_lmdb_soak_tests.step);
-    const lmdb_sim_soak_compat_step = b.step("lmdb-sim-soak", "Compatibility alias for lmdb-workload-soak");
-    lmdb_sim_soak_compat_step.dependOn(storage_lmdb_soak_step);
 
     const docstore_test_mod = makeLmdbModule(b, "pkg/antfly/src/docstore_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     docstore_test_mod.addImport("bloom", bloom_mod);
@@ -9932,8 +9925,6 @@ pub fn build(b: *std.Build) void {
     const run_wal_workload_tests = addFilteredTestRunArtifact(b, wal_workload_tests);
     const wal_workload_test_step = b.step("wal-workload-test", "Run only the legacy WAL randomized workload tests");
     wal_workload_test_step.dependOn(&run_wal_workload_tests.step);
-    const wal_sim_test_compat_step = b.step("wal-sim-test", "Compatibility alias for wal-workload-test");
-    wal_sim_test_compat_step.dependOn(wal_workload_test_step);
 
     const wal_vopr_tests = b.addTest(.{
         .root_module = wal_test_mod,
@@ -9978,14 +9969,10 @@ pub fn build(b: *std.Build) void {
     const run_wal_soak_tests = addFilteredTestRunArtifact(b, wal_soak_tests);
     const wal_soak_step = b.step("wal-workload-soak", "Run only the legacy WAL randomized workload soak");
     wal_soak_step.dependOn(&run_wal_soak_tests.step);
-    const wal_sim_soak_compat_step = b.step("wal-sim-soak", "Compatibility alias for wal-workload-soak");
-    wal_sim_soak_compat_step.dependOn(wal_soak_step);
 
     const storage_workload_soak_step = b.step("storage-workload-soak", "Run the legacy LMDB and WAL randomized workload soaks");
     storage_workload_soak_step.dependOn(&run_storage_lmdb_soak_tests.step);
     storage_workload_soak_step.dependOn(&run_wal_soak_tests.step);
-    const storage_sim_soak_compat_step = b.step("storage-sim-soak", "Compatibility alias for storage-workload-soak");
-    storage_sim_soak_compat_step.dependOn(storage_workload_soak_step);
     soak_test_step.dependOn(storage_workload_soak_step);
 
     const persistent_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
@@ -10028,8 +10015,6 @@ pub fn build(b: *std.Build) void {
     const run_persistent_workload_tests = addFilteredTestRunArtifact(b, persistent_workload_tests);
     const persistent_workload_step = b.step("persistent-workload-test", "Run only the legacy persistent randomized workload tests");
     persistent_workload_step.dependOn(&run_persistent_workload_tests.step);
-    const persistent_sim_test_compat_step = b.step("persistent-sim-test", "Compatibility alias for persistent-workload-test");
-    persistent_sim_test_compat_step.dependOn(persistent_workload_step);
 
     const persistent_replay_tests = b.addTest(.{
         .root_module = persistent_test_mod,
@@ -10068,8 +10053,6 @@ pub fn build(b: *std.Build) void {
     const run_persistent_soak_tests = addFilteredTestRunArtifact(b, persistent_soak_tests);
     const persistent_soak_step = b.step("persistent-workload-soak", "Run only the legacy persistent randomized workload soak");
     persistent_soak_step.dependOn(&run_persistent_soak_tests.step);
-    const persistent_sim_soak_compat_step = b.step("persistent-sim-soak", "Compatibility alias for persistent-workload-soak");
-    persistent_sim_soak_compat_step.dependOn(persistent_soak_step);
 
     storage_workload_soak_step.dependOn(&run_persistent_soak_tests.step);
 
@@ -10117,8 +10100,6 @@ pub fn build(b: *std.Build) void {
     const run_index_manager_workload_tests = addFilteredTestRunArtifact(b, index_manager_workload_tests);
     const index_manager_workload_step = b.step("index-manager-workload-test", "Run only the legacy index-manager randomized workload tests");
     index_manager_workload_step.dependOn(&run_index_manager_workload_tests.step);
-    const index_manager_sim_test_compat_step = b.step("index-manager-sim-test", "Compatibility alias for index-manager-workload-test");
-    index_manager_sim_test_compat_step.dependOn(index_manager_workload_step);
 
     const index_manager_replay_tests = b.addTest(.{
         .root_module = index_manager_test_mod,
@@ -10183,8 +10164,6 @@ pub fn build(b: *std.Build) void {
     const run_db_split_workload_tests = addFilteredTestRunArtifact(b, db_split_workload_tests);
     const db_split_workload_step = b.step("db-split-workload-test", "Run only the legacy DB split randomized workload tests");
     db_split_workload_step.dependOn(&run_db_split_workload_tests.step);
-    const db_split_sim_test_compat_step = b.step("db-split-sim-test", "Compatibility alias for db-split-workload-test");
-    db_split_sim_test_compat_step.dependOn(db_split_workload_step);
 
     const db_split_vopr_tests = b.addTest(.{
         .root_module = db_test_mod,
@@ -10202,8 +10181,6 @@ pub fn build(b: *std.Build) void {
     storage_workload_test_step.dependOn(&run_wal_workload_tests.step);
     storage_workload_test_step.dependOn(&run_persistent_workload_tests.step);
     storage_workload_test_step.dependOn(&run_index_manager_workload_tests.step);
-    const storage_sim_test_compat_step = b.step("storage-sim-test", "Compatibility alias for storage-workload-test");
-    storage_sim_test_compat_step.dependOn(storage_workload_test_step);
 
     const storage_vopr_step = b.step("storage-vopr-test", "Run deterministic storage modeled-time/model-I/O VOPR checks");
     storage_vopr_step.dependOn(&run_storage_vopr_runtime_tests.step);
