@@ -56,6 +56,18 @@ retirement and rejects stale incarnation reports at apply time; see the
 Final acceptance requires **100/100 for each affected test**, using the branch
 with the native-storage main merge and all fixes, without failure retries.
 
+The CLI quickstart now separates retry exhaustion into
+`test_cli_index_wait_survives_retry_exhaustion_and_restart`. The quickstart
+retains the 10.5-second maintenance observation, completed list/detail
+readiness, restart, image query, and RAG assertions. The dedicated test owns
+its initial healthy corpus, exhausts the unchanged provider retry policy,
+then checks isolated failure, later progress, and partial-generation restart.
+Both tests restore their mock provider state during cleanup. A Linux run of
+both tests passed: quickstart **13.37 s**, retry exhaustion **65.73 s**, including
+**62.31 s / 36 provider requests** before exhaustion. The earlier integrated
+quickstart averaged 77.2 s. Focused readiness soaks use the quickstart node ID;
+the retry-policy test remains in the ordinary E2E suite.
+
 ### Three-by-three backup seed batch: unknown outcome (#694)
 
 The run reported 394 passed, five skipped, and one failure. Table creation and

@@ -48,6 +48,10 @@ They still record the source and reducing watermarks, preserving deletion
 authority for future merges; a newer target still fences completion.
 All 174 derived-coverage tests passed before merging the native storage
 implementation, including callback permutations and deletion/replacement cases.
+Retry exhaustion now has its own independently seeded CLI E2E test, retaining
+the production backoff and degraded/restart assertions. The quickstart keeps
+its readiness, maintenance-cycle, query, and restart checks and takes about
+13 seconds instead of 77 seconds in the first Linux split validation.
 Linux reproduction and soak results are recorded in the
 [E2E history](e2e/FLAKES.md#completed-cli-readiness-regresses-after-publication-696).
 
