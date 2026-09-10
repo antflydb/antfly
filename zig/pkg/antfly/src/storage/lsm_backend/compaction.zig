@@ -982,6 +982,7 @@ test "GC intent rebases writes between slices without restarting or dropping new
     const locked = runtime_mod.lockBackend(Backend, &backend);
     defer runtime_mod.unlockBackend(Backend, &backend, locked);
     var added: usize = 0;
+    var rebasing_writes: usize = 0;
     var original: ?*PendingGc = null;
     for (0..10000) |_| {
         if (try selectDirectoryGc(&backend, 0)) |selected| {
@@ -998,7 +999,12 @@ test "GC intent rebases writes between slices without restarting or dropping new
         }
         if (backend.pending_gc) |pending| {
             if (original) |expected| try std.testing.expectEqual(expected, pending) else original = pending;
-            if (pending.intent != null) {
+            // Exercise writes throughout preparation and a sustained rebase
+            // burst, then permit catch-up. An infinite arrival stream can
+            // exceed a 2 ms service quantum on a contended Debug allocator;
+            // convergence must not depend on the test host's minimum speed.
+            if (pending.intent != null and rebasing_writes < 64) {
+                if (pending.intent.?.rebase != null) rebasing_writes += 1;
                 added += 1;
                 try Fixture.append(&backend, inputs + added);
             }
@@ -1741,6 +1747,7 @@ fn relocateDomainPlan(allocator: std.mem.Allocator, runs: []const Run, plan: Com
 fn relocateDirectoryPlan(backend: anytype, plan: CompactionPlan) !?SelectedPlan {
     const allocator = backend.allocator;
     var validation = try DependencyValidation.init(backend, plan);
+    validation.yield_between_slices = true;
     defer {
         // Synchronous build/publication owns its inputs on the stack. Drain
         // cancellation/error cleanup off-lock too; maintenance-owned jobs

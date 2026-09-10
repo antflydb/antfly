@@ -31,6 +31,7 @@ pub const Validation = struct {
     reservation: ?Reservation = null,
     slices: usize = 0,
     rebases: usize = 0,
+    yield_between_slices: bool = false,
     pub const Result = enum { pending, valid, invalid };
 
     pub fn init(backend: anytype, plan: anytype) !Validation {
@@ -62,9 +63,17 @@ pub const Validation = struct {
         // own quantum afterwards; continuous retirement must not consume
         // every validation turn before the first identity can be visited.
         const advanced = self.step(backend.allocator, credits, @min(deadline, time.monotonicNs() +| 2 * std.time.ns_per_ms));
+        // Maintenance hands control back to its scheduler after this call.
+        // A synchronous drain must explicitly yield through std.Io instead
+        // of monopolizing a cooperative executor across successive slices.
+        const yielded = if (self.yield_between_slices)
+            if (backend.manifestCoordinationIo()) |io| io.sleep(.fromNanoseconds(1), .awake) else @as(anyerror!void, {})
+        else
+            @as(anyerror!void, {});
         _ = runtime.lockBackend(@TypeOf(backend.*), backend);
         self.slices += 1;
         try advanced;
+        try yielded;
         if (!self.job.valid) return .invalid;
         if (self.changes) |*changes| if (changes.done()) {
             backend.retireCheckpointDirectory(self.directory);
