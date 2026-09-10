@@ -379,6 +379,92 @@ class RuntimeCacheTest(unittest.TestCase):
                         self.build(target, settings=settings, succeeds=False),
                     )
 
+    def test_runtime_owner_dependencies(self):
+        self.build("cache-probe")
+        self.assert_archives(self.build("cache-probe"))
+        for relative, consumers in (
+            ("zig/lib/mcp/src/root.zig", ("api_kernel",)),
+            ("zig/lib/a2a/src/root.zig", ("api_kernel",)),
+            ("zig/lib/raft/src/root.zig", ("distributed", "api_kernel")),
+        ):
+            with self.subTest(source=relative):
+                source = self.own(relative)
+                contents = source.read_bytes() + b"\n// owner dependency edit\n"
+                source.write_bytes(contents)
+                self.assert_archives(self.build("cache-probe"), rebuilt=consumers)
+                self.assert_archives(self.build("cache-probe"))
+                source.unlink()
+                # Unrelated owners keep compiling without the dependency. Its
+                # real consumers must fail instead of silently dropping it.
+                unrelated = [unit for unit in UNITS if unit not in consumers]
+                output = self.build(*(f"runtime-unit-{unit}" for unit in unrelated))
+                for unit in unrelated:
+                    self.assert_compile(output, unit, "cached")
+                for unit in consumers:
+                    self.assertIn(
+                        "FileNotFound",
+                        self.build(f"runtime-unit-{unit}", succeeds=False),
+                    )
+                source.write_bytes(contents)
+                self.assert_archives(self.build("cache-probe"))
+
+    def test_explicit_observability_dependencies(self):
+        audio = self.own("zig/lib/audio/src/mod.zig")
+        audio.write_bytes(
+            audio.read_bytes()
+            + b'\npub const cache_test_profile = @import("builtin").mode;\n'
+        )
+        for standalone in (False, True):
+            with self.subTest(standalone=standalone):
+                if standalone:
+                    self.use_standalone()
+                target = "cache-inference" if standalone else "runtime-unit-inference"
+                artifact = (
+                    "exe antfly-inference"
+                    if standalone
+                    else "lib antfly-runtime-inference"
+                )
+                self.build(target)
+                self.assertRegex(
+                    self.build(target), rf"compile {artifact} Debug \S+ cached"
+                )
+
+                # Compatibility sources are available for an explicit caller to
+                # choose, but must never influence the production entrypoints.
+                for name in ("prometheus", "structlog"):
+                    compat = self.own(f"zig/pkg/inference/src/compat/{name}.zig")
+                    compat.write_bytes(
+                        compat.read_bytes() + b"\n// unused compatibility edit\n"
+                    )
+                self.assertRegex(
+                    self.build(target), rf"compile {artifact} Debug \S+ cached"
+                )
+
+                for name in ("prometheus", "structlog"):
+                    with self.subTest(module=name):
+                        source = self.own(f"zig/lib/{name}/src/root.zig")
+                        contents = (
+                            source.read_bytes()
+                            + b"\n// actual observability dependency\n"
+                        )
+                        source.write_bytes(contents)
+                        self.assertRegex(
+                            self.build(target), rf"compile {artifact} Debug \S+ success"
+                        )
+                        source.unlink()
+                        self.build("--help")
+                        self.assertIn(
+                            "BENCH_PROFILE Debug Debug",
+                            self.build("cache-antfly-inference-audio-bench"),
+                        )
+                        failure = self.build(target, succeeds=False)
+                        self.assertIn("FileNotFound", failure)
+                        self.assertNotIn("panic:", failure)
+                        source.write_bytes(contents)
+                        self.assertRegex(
+                            self.build(target), rf"compile {artifact} Debug \S+ cached"
+                        )
+
     def test_optional_onnx_dependencies(self):
         source = self.own("zig/lib/audio/src/mod.zig")
         source.write_bytes(

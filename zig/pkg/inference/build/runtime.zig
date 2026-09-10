@@ -58,8 +58,10 @@ pub const SharedModules = struct {
     jsonschema: ?*std.Build.Module = null,
     image: ?*std.Build.Module = null,
     hash: ?*std.Build.Module = null,
-    prometheus: ?*std.Build.Module = null,
-    structlog: ?*std.Build.Module = null,
+    // Entrypoints choose these implementations explicitly; missing source
+    // must fail its consumer rather than select a compatibility fallback.
+    prometheus: *std.Build.Module,
+    structlog: *std.Build.Module,
     jinja: ?*std.Build.Module = null,
     protobuf: *std.Build.Module,
     sentencepiece_proto: *std.Build.Module,
@@ -200,8 +202,8 @@ pub fn create(config: Config) Graph {
     const hash_mod = shared.hash orelse createSharedModule(config, "lib/hash/src/mod.zig");
     const image_mod = shared.image orelse createSharedModule(config, "lib/image/src/mod.zig");
     if (shared.image == null) image_mod.addImport("antfly_hash", hash_mod);
-    const prometheus_mod = shared.prometheus orelse createOptionalSharedModule(config, "lib/prometheus/src/root.zig", "src/compat/prometheus.zig");
-    const structlog_mod = shared.structlog orelse createOptionalSharedModule(config, "lib/structlog/src/root.zig", "src/compat/structlog.zig");
+    const prometheus_mod = shared.prometheus;
+    const structlog_mod = shared.structlog;
     const jinja_mod = shared.jinja orelse b.dependency("jinja", .{
         .target = target,
         .optimize = optimize,
@@ -685,22 +687,6 @@ fn addOrCreateModule(b: *std.Build, register_public_modules: bool, name: []const
     return b.createModule(options);
 }
 
-fn createOptionalSharedModule(config: Config, relative_path: []const u8, fallback_path: []const u8) *std.Build.Module {
-    const shared_path = pathJoin(config.b, config.paths.shared_lib_root, relative_path);
-    if (pathExists(config.b, shared_path)) {
-        return config.b.createModule(.{
-            .root_source_file = config.b.path(shared_path),
-            .target = config.target,
-            .optimize = config.optimize,
-        });
-    }
-    return config.b.createModule(.{
-        .root_source_file = config.b.path(pathJoin(config.b, config.paths.inference_root, fallback_path)),
-        .target = config.target,
-        .optimize = config.optimize,
-    });
-}
-
 fn configureRuntimeLinks(
     b: *std.Build,
     module: *std.Build.Module,
@@ -769,12 +755,6 @@ pub fn configureMetal(
     module.linkFramework("Metal", .{});
     module.linkFramework("MetalPerformanceShaders", .{});
     module.addCSourceFile(.{ .file = b.path(pathJoin(b, paths.inference_root, "src/backends/metal_kernels.m")), .flags = &.{"-fobjc-arc"} });
-}
-
-fn pathExists(b: *std.Build, path: []const u8) bool {
-    const io = b.graph.io;
-    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
-    return true;
 }
 
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {

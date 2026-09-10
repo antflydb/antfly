@@ -79,6 +79,14 @@ edges; the inference probe also loads the real inference module. The checks cove
 - Disabled PJRT has no production import edge in either entrypoint. PJRT edits
   and removal leave CPU products cached. Enabled products and explicit
   qualification tests still rebuild on source edits and fail for missing source.
+- Storage, API, and serverless archives declare their own imports. MCP/A2A edits
+  rebuild only the API archive; Raft edits leave serverless cached. Required
+  dependencies still invalidate their consumers and fail when removed. Tests
+  and the full public package retain their broader interfaces.
+- Both entrypoints explicitly supply inference's metrics and logging modules.
+  Editing those modules rebuilds inference; removing them fails its compilation
+  while help and unrelated audio targets still work. Compatibility source edits
+  do not affect production or silently change the selected implementation.
 - Release versions live in a small `lib/build_info` object. Archives see only a
   stable accessor module; final links attach the object only for version consumers.
   Tests use stable test metadata. Version-only changes leave the five runtime

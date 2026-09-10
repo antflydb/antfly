@@ -155,17 +155,13 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             .sanitize_thread = sanitize_thread,
             .pic = if (unit == .distributed) true else null,
         });
-        if (unit == .cli) {
-            production_antfly_imports.configureCli(role_mod, link_libc);
-        } else if (unit == .inference) {
-            production_antfly_imports.configureInference(b, role_mod, link_libc);
-        } else {
-            production_antfly_imports.configureRuntime(b, role_mod, link_libc, false);
+        switch (unit) {
+            .cli => production_antfly_imports.configureCli(role_mod, link_libc),
+            .inference => production_antfly_imports.configureInference(b, role_mod, link_libc),
+            .distributed => production_antfly_imports.configureStorage(b, role_mod, link_libc),
+            .api_kernel => production_antfly_imports.configureApi(role_mod, link_libc),
+            .serverless => production_antfly_imports.configureServerless(b, role_mod, link_libc),
         }
-        // Only the API kernel serves schemas. The other units use its ABI;
-        // giving them these file imports would invalidate their caches too.
-        if (unit == .api_kernel)
-            role_mod.addImport("antfly_openapi_specs", production_antfly_imports.embedded_openapi);
         addMacosSdkPaths(b, role_mod, target);
         if (unit == .cli or unit == .distributed) role_mod.addImport("antfly-client", antfly_client_pkg_mod);
         if (unit == .distributed) role_mod.addImport("antfly_storage_root", role_mod);

@@ -204,6 +204,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = link_libc,
     }).module("antfly_platform");
+    const configured_prometheus_mod = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ shared_lib_root, "lib/prometheus/src/root.zig" })),
+        .target = target,
+        .optimize = optimize,
+    });
+    const configured_structlog_mod = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ shared_lib_root, "lib/structlog/src/root.zig" })),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const tokenizer_build = b.lazyImport(@This(), "tokenizer_build") orelse return;
     const build_info_build = b.lazyImport(@This(), "build_info") orelse return;
@@ -237,6 +247,8 @@ pub fn build(b: *std.Build) void {
             .protobuf = tokenizer_protobuf.module("protobuf"),
             .sentencepiece_proto = tokenizer_proto,
             .platform = configured_platform_mod,
+            .prometheus = configured_prometheus_mod,
+            .structlog = configured_structlog_mod,
         },
         .b = b,
         .target = target,

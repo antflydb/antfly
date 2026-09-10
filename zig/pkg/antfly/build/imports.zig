@@ -160,7 +160,11 @@ pub const AntflyRootImports = struct {
     };
 
     pub fn configure(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
-        self.configureRuntime(b, mod, link_libc, true);
+        // The public/test facade exposes the whole implementation. Production
+        // archives use the owner constructors below to keep caches independent.
+        self.configureBase(mod, link_libc);
+        inline for (import_table) |entry| mod.addImport(entry.name, @field(self, entry.field));
+        addSnowballModule(b, mod);
         mod.addImport("build_info", self.build_info.module);
     }
 
@@ -207,24 +211,64 @@ pub const AntflyRootImports = struct {
         @compileError("unknown Antfly dependency: " ++ field);
     }
 
-    /// Install the production runtime imports while keeping the heavyweight
-    /// inference server graph out of compilation units that only exchange its
-    /// language-neutral bridge types. Supporting inference API, chunking,
-    /// extraction, and audio modules remain available because distributed
-    /// server roles genuinely use them.
-    pub fn configureRuntime(
-        self: @This(),
-        b: *std.Build,
-        mod: *std.Build.Module,
-        link_libc: bool,
-        include_inference_server: bool,
-    ) void {
+    // Only dependencies consumed by all three database owners belong here.
+    // Imports affect Zig's cache even when their declarations are never used;
+    // keep owner-specific dependencies in their constructors below.
+    fn configureDatabase(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
+        self.configureBase(mod, link_libc);
+        inline for (.{
+            "bloom",           "chunking",           "common_openapi",    "credentials",
+            "embeddings",      "embeddings_openapi", "extracting",        "generating",
+            "google",          "handlebars",         "hash",              "httpx",
+            "image",           "indexes_openapi",    "inference_chunker", "json",
+            "logging_openapi", "metadata_openapi",   "objectstore",       "openai_api",
+            "pdf",             "query_openapi",      "reader_config",     "readers",
+            "regex",           "reranking",          "scraping",          "synthesizing",
+            "transcribing",    "vector",             "vellum",
+        }) |field| self.addImport(mod, field);
+    }
+
+    const storage_imports = .{
+        "admin_openapi",            "casbin",           "extraction_openapi", "inference_api",
+        "inference_config_openapi", "internal_openapi", "matcher",            "middleware_openapi",
+        "raft_engine",              "resolver",         "s3_openapi",         "scraping_openapi",
+        "vectorindex",
+    };
+    const api_imports = .{
+        "a2a", "casbin",      "eval_openapi",   "generating_api_openapi", "generating_openapi",
+        "mcp", "raft_engine", "schema_openapi", "usermgr_openapi",
+    };
+
+    pub fn configureStorage(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
+        self.configureDatabase(mod, link_libc);
+        inline for (storage_imports) |field| self.addImport(mod, field);
+        addSnowballModule(b, mod);
+    }
+
+    pub fn configureApi(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
+        self.configureDatabase(mod, link_libc);
+        inline for (api_imports) |field| self.addImport(mod, field);
+        mod.addImport("antfly_openapi_specs", self.embedded_openapi);
+    }
+
+    pub fn configureServerless(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
+        self.configureDatabase(mod, link_libc);
+        inline for (.{
+            "inference_api", "inference_config_openapi", "middleware_openapi",
+            "s3_openapi",    "scraping_openapi",         "vectorindex",
+        }) |field| self.addImport(mod, field);
+        addSnowballModule(b, mod);
+    }
+
+    /// This driver exercises storage and HTTP API implementations in one root.
+    pub fn configureStorageBenchmark(self: @This(), b: *std.Build, mod: *std.Build.Module) void {
+        self.configureStorage(b, mod, true);
+        inline for (api_imports) |field| self.addImport(mod, field);
+        mod.addImport("antfly_openapi_specs", self.embedded_openapi);
+    }
+
+    fn configureBase(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
         mod.addOptions("build_options", self.build_options);
-        inline for (import_table) |entry| {
-            if (include_inference_server or !std.mem.eql(u8, entry.name, "inference_server")) {
-                mod.addImport(entry.name, @field(self, entry.field));
-            }
-        }
         mod.addImport("antfly_platform", self.platform);
         if (link_libc and !self.platform_link_libc) {
             platform_build.addFilesystemCapacitySource(
@@ -234,6 +278,5 @@ pub const AntflyRootImports = struct {
             );
         }
         mod.link_libc = link_libc;
-        addSnowballModule(b, mod);
     }
 };
