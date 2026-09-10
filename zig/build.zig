@@ -1206,6 +1206,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     dependOnAll(lib_test_step, &.{
         &run_lib_json_tests.step,
         &run_lib_onnx_tests.step,
+        &run_objectstore_tests.step,
         &run_httpx_json_tests.step,
         &run_httpx_tests.step,
     });

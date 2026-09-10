@@ -224,15 +224,22 @@ pub const FilesystemClient = struct {
         if (opts.cancellation) |token| try token.check();
         if (opts.version_id != null) return error.VersioningUnsupported;
         if (opts.range != null and opts.part_number != null) return error.AmbiguousRange;
-        var meta = try self.statObject(alloc, bucket, key);
+        const object_path = try objectPathAlloc(alloc, self.root_dir, bucket, key);
+        defer alloc.free(object_path);
+        // Publication atomically replaces the path. Keep this descriptor for
+        // both metadata and payload so a GET observes one object generation.
+        const file = try openFilePath(self.io, object_path);
+        defer file.close(self.io);
+        const file_stat = try file.stat(self.io);
+        var header = try readObjectHeader(alloc, self.io, file, file_stat.size);
+        defer header.deinit(alloc);
+        var meta = try objectMetadataAlloc(alloc, bucket, key, header, file_stat.mtime.toMilliseconds());
         errdefer meta.deinit(alloc);
 
         if (opts.if_match_etag) |expected| {
             if (meta.etag == null or !std.mem.eql(u8, meta.etag.?, expected)) return error.PreconditionFailed;
         }
 
-        const object_path = try objectPathAlloc(alloc, self.root_dir, bucket, key);
-        defer alloc.free(object_path);
         const total_len = std.math.cast(usize, meta.content_length) orelse return error.ObjectTooLarge;
         const part_range = if (opts.part_number) |part_number|
             try computePartRange(total_len, part_number)
@@ -251,10 +258,10 @@ pub const FilesystemClient = struct {
         const body = try readObjectRangeAlloc(
             self.io,
             alloc,
-            object_path,
+            file,
+            header,
             requested.start,
             requested.end,
-            meta.etag.?,
             opts.cancellation,
         );
 
@@ -301,18 +308,7 @@ pub const FilesystemClient = struct {
         var header = try readObjectHeader(alloc, self.io, file, file_stat.size);
         defer header.deinit(alloc);
 
-        return .{
-            .bucket = try alloc.dupe(u8, bucket),
-            .key = try alloc.dupe(u8, key),
-            .etag = try alloc.dupe(u8, &header.etag),
-            .checksum = .{
-                .algorithm = .sha256_hex,
-                .value = try alloc.dupe(u8, &header.etag),
-            },
-            .content_length = header.content_length,
-            .content_type = if (header.content_type.len == 0) null else try alloc.dupe(u8, header.content_type),
-            .last_modified_unix_ms = file_stat.mtime.toMilliseconds(),
-        };
+        return objectMetadataAlloc(alloc, bucket, key, header, file_stat.mtime.toMilliseconds());
     }
 
     fn deleteObject(self: *FilesystemClient, bucket: []const u8, key: []const u8, opts: types.DeleteOptions) !void {
@@ -855,23 +851,37 @@ fn resolveRange(total_len: u64, offset: u64, maybe_len: ?u64) !ObjectRange {
     return .{ .start = @intCast(offset), .end = @intCast(end_u64) };
 }
 
+fn objectMetadataAlloc(alloc: Allocator, bucket: []const u8, key: []const u8, header: ObjectHeader, last_modified_unix_ms: i64) !types.ObjectMetadata {
+    const owned_bucket = try alloc.dupe(u8, bucket);
+    errdefer alloc.free(owned_bucket);
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    const etag = try alloc.dupe(u8, &header.etag);
+    errdefer alloc.free(etag);
+    const checksum = try alloc.dupe(u8, &header.etag);
+    errdefer alloc.free(checksum);
+    return .{
+        .bucket = owned_bucket,
+        .key = owned_key,
+        .etag = etag,
+        .checksum = .{ .algorithm = .sha256_hex, .value = checksum },
+        .content_length = header.content_length,
+        .content_type = if (header.content_type.len == 0) null else try alloc.dupe(u8, header.content_type),
+        .last_modified_unix_ms = last_modified_unix_ms,
+    };
+}
+
 fn readObjectRangeAlloc(
     io: std.Io,
     alloc: Allocator,
-    path: []const u8,
+    file: std.Io.File,
+    header: ObjectHeader,
     start: usize,
     end: usize,
-    expected_etag: []const u8,
     cancellation: ?types.CancellationToken,
 ) ![]u8 {
     if (cancellation) |token| try token.check();
     if (end < start) return error.InvalidRange;
-    const file = try openFilePath(io, path);
-    defer file.close(io);
-    const stat = try file.stat(io);
-    var header = try readObjectHeader(alloc, io, file, stat.size);
-    defer header.deinit(alloc);
-    if (!std.mem.eql(u8, &header.etag, expected_etag)) return error.PreconditionFailed;
     if (end > header.content_length) return error.InvalidRange;
 
     const body = try alloc.alloc(u8, end - start);
@@ -1157,6 +1167,80 @@ test "filesystem client supports bucket/object lifecycle and file helpers" {
     const downloaded = try readFileAlloc(alloc, dst_path);
     defer alloc.free(downloaded);
     try std.testing.expectEqualStrings("beta", downloaded);
+}
+
+test "filesystem GET keeps one generation when publication replaces or deletes the object" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf, "get-generation");
+    defer cleanupTmp(path);
+    var fs = try FilesystemClient.init(alloc, std.mem.span(path));
+    defer fs.deinit();
+
+    const Mutation = struct {
+        fs: *FilesystemClient,
+        replacement: ?[]const u8,
+        checks: usize = 0,
+        failure: ?anyerror = null,
+
+        fn check(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            // The second backend cancellation checkpoint is after metadata
+            // selection and before payload reading. Publish at that boundary
+            // without canceling the GET or adding production test hooks.
+            if (self.checks == 2) self.mutate() catch |err| {
+                self.failure = err;
+            };
+            return false;
+        }
+
+        fn mutate(self: *@This()) !void {
+            if (self.replacement) |body| {
+                var result = try self.fs.putObject(std.testing.allocator, "bucket", "HEAD", body, .{ .content_type = "application/new" });
+                result.deinit(std.testing.allocator);
+            } else {
+                try self.fs.deleteObject("bucket", "HEAD", .{});
+            }
+        }
+    };
+
+    const original = "original publication";
+    const replacements = [_]?[]const u8{ "x", "a much longer replacement publication", null };
+    for (replacements) |replacement| {
+        for (0..4) |mode| {
+            var put = try fs.putObject(alloc, "bucket", "HEAD", original, .{ .content_type = "application/old" });
+            defer put.deinit(alloc);
+            var mutation = Mutation{ .fs = &fs, .replacement = replacement };
+            var options = types.GetOptions{
+                .cancellation = types.CancellationToken.fromCallback(&mutation, Mutation.check),
+            };
+            switch (mode) {
+                0 => {},
+                1 => options.range = .{ .offset = 2, .length = 5 },
+                2 => options.part_number = 1,
+                3 => options.if_match_etag = put.etag.?,
+                else => unreachable,
+            }
+            var got = try fs.getObject(alloc, "bucket", "HEAD", options);
+            defer got.deinit(alloc);
+            if (mutation.failure) |err| return err;
+            try std.testing.expect(mutation.checks >= 2);
+            try std.testing.expectEqualStrings(if (mode == 1) original[2..7] else original, got.body);
+            try std.testing.expectEqual(@as(u64, got.body.len), got.metadata.content_length);
+            try std.testing.expectEqualStrings(put.etag.?, got.metadata.etag.?);
+            try std.testing.expectEqualStrings(put.etag.?, got.metadata.checksum.?.value);
+            try std.testing.expectEqualStrings("application/old", got.metadata.content_type.?);
+            if (replacement) |body| {
+                var current = try fs.getObject(alloc, "bucket", "HEAD", .{});
+                defer current.deinit(alloc);
+                try std.testing.expectEqualStrings(body, current.body);
+                try std.testing.expectError(error.PreconditionFailed, fs.getObject(alloc, "bucket", "HEAD", .{ .if_match_etag = put.etag.? }));
+            } else {
+                try std.testing.expectError(error.FileNotFound, fs.getObject(alloc, "bucket", "HEAD", .{}));
+            }
+        }
+    }
 }
 
 test "filesystem whole-file download honors cancellation before publication" {
