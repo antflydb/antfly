@@ -12,6 +12,16 @@ Existing planes remain readable without an eager rewrite. This does not change
 the table-level source-ownership setting or exact-score requirements. Frozen
 comparison catalogs and archive locations are in `benchmark-baselines/README.md`.
 
+## Micro-profile of store costs (2026-09-10)
+
+[VECTOR_STORE_PERF_PROFILE.md](VECTOR_STORE_PERF_PROFILE.md) attributes the
+store's write, read, disk, and memory costs with the isolated
+`vector_payload_bench` harness (`zig build vector-payload-bench`). It records
+the SHA-256 digest as the dominant read-path CPU cost, synchronous WAL and
+delta-chain checkpoints as the largest writer stalls, bootstrap write
+amplification of about 3.6x, and the cold-reopen inventory scan, which now
+reads only identity metadata instead of every payload byte.
+
 ## Sparse fallback and bounded planning follow-up
 
 Sparse batching now applies only when no denser reclaimable segment was selected.

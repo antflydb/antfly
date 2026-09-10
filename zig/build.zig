@@ -9842,6 +9842,18 @@ pub fn build(b: *std.Build) void {
     vector_payload_test_step.dependOn(&run_vector_payload_tests.step);
     unit_test_step.dependOn(&run_vector_payload_tests.step);
 
+    const vector_payload_bench_mod = makeLmdbModule(b, "pkg/antfly/src/vector_payload_bench_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    vector_payload_bench_mod.addImport("bloom", bloom_mod);
+    vector_payload_bench_mod.addImport("antfly_vectorindex", vectorindex_mod);
+    vector_payload_bench_mod.addImport("antfly-json", json_mod);
+    vector_payload_bench_mod.addImport("structlog", structlog_mod);
+    const vector_payload_bench = b.addExecutable(.{
+        .name = "vector_payload_bench",
+        .root_module = vector_payload_bench_mod,
+    });
+    const vector_payload_bench_step = b.step("vector-payload-bench", "Build and install the source vector payload store micro-benchmark");
+    vector_payload_bench_step.dependOn(&b.addInstallArtifact(vector_payload_bench, .{}).step);
+
     const native_vector_store_test_mod = makeLmdbModule(b, "pkg/antfly/src/native_vector_store_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     native_vector_store_test_mod.addImport("bloom", bloom_mod);
     native_vector_store_test_mod.addImport("antfly_vectorindex", vectorindex_mod);

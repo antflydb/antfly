@@ -244,9 +244,9 @@ pub const Store = struct {
                 for (previous.?.readers) |reader| {
                     if (next_segments.contains(id(reader))) continue;
                     for (0..reader.count) |i| {
-                        const row = try reader.entryAt(i);
+                        const row = reader.sourceIdentityAt(i);
                         rows.* += 1;
-                        if (row.value != .vector or row.key.len != 32) return error.InvalidVectorReference;
+                        if (!row.vector or row.key.len != 32) return error.InvalidVectorReference;
                         try self.remove(row.key[0..32].*);
                     }
                 }
@@ -254,10 +254,10 @@ pub const Store = struct {
             for (next.readers) |reader| {
                 if (self.segments.contains(id(reader))) continue;
                 for (0..reader.count) |i| {
-                    const row = try reader.entryAt(i);
+                    const row = reader.sourceIdentityAt(i);
                     rows.* += 1;
-                    if (row.value != .vector or row.key.len != 32) return error.InvalidVectorReference;
-                    try self.add(alloc, row.key[0..32].*, row.value.vector.dims);
+                    if (!row.vector or row.key.len != 32) return error.InvalidVectorReference;
+                    try self.add(alloc, row.key[0..32].*, row.dims);
                 }
             }
             if (!use_delta) {
@@ -623,7 +623,7 @@ pub const Store = struct {
                 while (marking.ann_row < reader.count) : (marking.ann_row += 1) {
                     if (markBudgetExpired(started, budget_ns, limit, progress)) return;
                     progress.rows += 1;
-                    const row = try reader.entryAt(marking.ann_row);
+                    const row = reader.sourceIdentityAt(marking.ann_row);
                     try markAnnKey(marking, row.key, progress);
                 }
                 marking.ann_row = 0;
@@ -1041,10 +1041,14 @@ pub const Store = struct {
         if (@TypeOf(unique) == *LiveSet) {
             if (self.bitmap_marking) try unique.enableBitmapsMode(opened, self.bitmap_locator);
         }
+        // Inventory counts identities. Reader admission has already validated
+        // the immutable index and every key; payload checksums are verified
+        // at the read, verification, and copy boundaries that touch payload
+        // bytes, so this scan must not fault in or hash the vector planes.
         for (opened.readers) |reader| for (0..reader.count) |i| {
-            const entry = try reader.entryAt(i);
+            const entry = reader.sourceIdentityAt(i);
             self.stats.inventory_rows_scanned += 1;
-            if (entry.value == .vector) try FullInventory.put(unique, entry.key, entry.value.vector.dims);
+            if (entry.vector) try FullInventory.put(unique, entry.key, entry.dims);
         };
         for (opened.wal.records.items) |record| {
             if (record.kind == .upsert) try FullInventory.put(unique, record.key, record.dims);
@@ -1797,9 +1801,9 @@ pub const Store = struct {
         live_rows: u64 = 0,
 
         fn add(self: *@This(), reader: anytype, index: usize, live: *const LiveSet) !void {
-            const row = try reader.entryAt(index);
-            if (row.value != .vector or row.key.len != 32) return;
-            const bytes = @as(u64, row.value.vector.dims) * 4;
+            const row = reader.sourceIdentityAt(index);
+            if (!row.vector or row.key.len != 32) return;
+            const bytes = @as(u64, row.dims) * 4;
             self.total += bytes;
             if (!live.contains(row.key[0..32].*)) self.dead += bytes else self.live_rows += 1;
         }
@@ -1976,7 +1980,7 @@ pub const Store = struct {
             for (selected_indices.items) |index| {
                 const reader = self.opened.readers[index];
                 for (0..reader.count) |i| {
-                    const row = try reader.entryAt(i);
+                    const row = reader.sourceIdentityAt(i);
                     if (row.key.len != 32) continue;
                     if (live.get(row.key[0..32].*)) |dims| try copy_live.put(row.key[0..32].*, dims);
                 }

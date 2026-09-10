@@ -50,8 +50,8 @@ pub const Directory = struct {
         for (opened.readers) |reader| {
             if (reader.generation <= self.generation) continue;
             for (0..reader.count) |i| {
-                const row = try reader.entryAt(i);
-                if (row.key.len != 32 or row.value != .vector) continue;
+                const row = reader.sourceIdentityAt(i);
+                if (row.key.len != 32 or !row.vector) continue;
                 try self.entries.put(row.key[0..32].*, .{ .generation = reader.generation, .shard = reader.shard_id });
                 self.dirty_entries += 1;
             }
@@ -73,7 +73,7 @@ pub const Directory = struct {
             }
             if (retained) continue;
             for (0..reader.count) |i| {
-                const row = try reader.entryAt(i);
+                const row = reader.sourceIdentityAt(i);
                 if (row.key.len != 32) continue;
                 const location = self.entries.get(row.key[0..32].*) orelse continue;
                 if (location.generation == reader.generation and location.shard == reader.shard_id) {
