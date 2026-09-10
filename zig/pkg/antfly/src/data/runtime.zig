@@ -63,6 +63,7 @@ fn publishRuntimeStatusRefreshForTest(
 }
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const lsm_backend_mod = @import("../storage/lsm_backend.zig");
+const lsm_storage_io = @import("../storage/lsm_backend/storage_io.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
 const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
 const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
@@ -2020,11 +2021,9 @@ const RaftTableApplyStateMachine = struct {
                 // no document mutation, and their null batch payload is
                 // intentionally poison to binaries that predate the barrier.
                 if (decoded.protocol_barrier_version == null and
-                    // Split lifecycle commands belong exclusively to the durable
-                    // Raft apply store. Sending an otherwise empty command through
-                    // the document DB can fail on unrelated index/runtime state
-                    // after the lifecycle mutation is already durable, leaving
-                    // Raft replaying a partially applied command.
+                    // Source finalization also publishes the physical DB range
+                    // through a metadata-only, entry-idempotent apply path.
+                    // Other source lifecycle commands need no document DB work.
                     batchRequiresDocumentDbApply(decoded.batch.req))
                 {
                     self.applyDocumentBatchForEntry(
@@ -2095,7 +2094,7 @@ const RaftTableApplyStateMachine = struct {
 };
 
 fn batchRequiresDocumentDbApply(req: antfly.db.types.BatchRequest) bool {
-    if (req.split_transition != null) return false;
+    if (req.split_transition) |transition| return transition.kind == .finalize;
     if (req.merge_source_transition != null) return false;
     if (req.split_checkpoint) |checkpoint| {
         if (checkpoint.kind == .source_ack and
@@ -3657,12 +3656,13 @@ const RuntimeStatusDiskUsageScanner = struct {
         return try self.scan_fn(self.ptr, alloc, path);
     }
 
-    fn directory() @This() {
-        return .{ .scan_fn = scanDirectory };
+    fn directory(io: *std.Io) @This() {
+        return .{ .ptr = io, .scan_fn = scanDirectory };
     }
 
-    fn scanDirectory(_: ?*anyopaque, alloc: std.mem.Allocator, path: []const u8) !u64 {
-        return try directoryUsageBytes(alloc, path);
+    fn scanDirectory(ptr: ?*anyopaque, alloc: std.mem.Allocator, path: []const u8) !u64 {
+        const io: *const std.Io = @ptrCast(@alignCast(ptr.?));
+        return try directoryUsageBytes(alloc, io.*, path);
     }
 };
 
@@ -4925,6 +4925,45 @@ test "runtime status disk usage cache is scoped to one root generation and group
     try std.testing.expectEqual(@as(u64, 800), server.runtime_status_disk_usage_cache.get(8).?.disk_bytes);
 }
 
+test "runtime status disk scan uses primary cardinality while derived indexes catch up" {
+    const alloc = std.testing.allocator;
+    var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+    const catalog = antfly.public_api.table_catalog.CatalogSource{ .ptr = undefined, .vtable = undefined };
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(".", catalog, antfly.raft.read_gate.alreadyReadSafeBarrier()),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(".", catalog),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(1),
+        .backend_runtime = runtime.ptr(),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+    const Scanner = struct {
+        calls: usize = 0,
+        fn scan(ptr: ?*anyopaque, _: std.mem.Allocator, _: []const u8) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.calls += 1;
+            return 4096;
+        }
+    };
+    var scanner: Scanner = .{};
+    // An earlier empty observation cannot hide the new primary documents,
+    // even while derived replay is active and its visible count remains zero.
+    try server.runtime_status_disk_usage_cache.put(alloc, 7, .{ .valid = true, .disk_bytes = 0, .lsm_root_generation = 3 });
+    const observation = server.runtimeStatusDiskUsageBytesBestEffortWithScanner(7, "unused", .{
+        .group_id = 7,
+        .metadata = .{ .lsm_root_generation = 3 },
+        .stats = .{ .source_doc_count = 1, .doc_count = 0, .async_indexing = .{ .dense_catch_up = .{ .active = true } } },
+    }, .{ .ptr = &scanner, .scan_fn = Scanner.scan });
+    try std.testing.expect(observation != null);
+    try std.testing.expectEqual(@as(u64, 4096), observation.?.disk_bytes);
+    try std.testing.expectEqual(@as(usize, 1), scanner.calls);
+}
+
 test "runtime status disk scan retries across a reallocation fence and group invalidation remains scoped" {
     const ControlledScanner = struct {
         entered: std.atomic.Value(bool) = .init(false),
@@ -5789,6 +5828,7 @@ pub const DataServer = struct {
     status_source: antfly.public_api.http_server.StatusSource,
     http_server: ?antfly.public_api.ApiHttpServer = null,
     owned_incoming_graph_route_backend: ?lsm_backend_mod.BackendHandle = null,
+    owned_incoming_graph_route_io: ?lsm_storage_io.IoStorage = null,
     owned_incoming_graph_route_store: ?antfly.storage_backend_erased.Store = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
     h1_disconnect_probe: ?httpx.H1DisconnectProbe = null,
@@ -6245,7 +6285,12 @@ pub const DataServer = struct {
                 .{self.write_source.replica_root_dir},
             );
             defer self.alloc.free(route_root);
-            self.owned_incoming_graph_route_backend = try lsm_backend_mod.BackendHandle.open(self.alloc, route_root, .{});
+            const runtime = try self.ensureBackendRuntime();
+            const filesystem_io = runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+            self.owned_incoming_graph_route_io = lsm_storage_io.IoStorage.init(filesystem_io);
+            self.owned_incoming_graph_route_backend = try lsm_backend_mod.BackendHandle.open(self.alloc, route_root, .{
+                .storage = if (runtime.usesBorrowedIo() or runtime.borrowed_filesystem_io != null) self.owned_incoming_graph_route_io.?.storage() else null,
+            });
             errdefer {
                 self.owned_incoming_graph_route_backend.?.close();
                 self.owned_incoming_graph_route_backend = null;
@@ -6546,8 +6591,7 @@ pub const DataServer = struct {
             return error.HAStandbyStateChanged;
         }
 
-        const apply_deadline_ns = platform_time.monotonicNs() +|
-            ha_replication_default_apply_window_ns;
+        const apply_deadline_ns = standby.applyDeadlineAfter(ha_replication_default_apply_window_ns);
         const applied = client.applyFetchedWithOptions(
             &batch,
             standby,
@@ -6657,9 +6701,9 @@ pub const DataServer = struct {
         const log_path = cfg.standby_log_path orelse return error.HAPromotedPrimaryLogMissing;
         const progress_path = cfg.standby_progress_path orelse return error.HAPromotedPrimarySlotsMissing;
         try self.validateHAStandbyPromotionOwner(standby);
-        var io_impl = std.Io.Threaded.init(self.alloc, .{});
-        defer io_impl.deinit();
-        switch (try standby.pathsMatch(self.alloc, io_impl.io(), log_path, progress_path)) {
+        const runtime = try self.ensureBackendRuntime();
+        const filesystem_io = runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+        switch (try standby.pathsMatch(self.alloc, filesystem_io, log_path, progress_path)) {
             .match => {},
             .receive_log_mismatch => return error.PromotedLogMismatch,
             .progress_wal_mismatch => return error.PromotedProgressMismatch,
@@ -6677,7 +6721,7 @@ pub const DataServer = struct {
             standby,
             slots_path.ptr,
             handoff,
-            .{},
+            .{ .slot_store_options = .{ .wal_options = standby.progress_wal_options } },
         );
         errdefer promoted_primary.close();
 
@@ -12963,9 +13007,9 @@ pub const DataServer = struct {
             };
         } else if (split_terminal != null) blk: {
             // A completed transition makes the replicated range authoritative.
-            // Source lifecycle entries deliberately bypass the document DB,
-            // whose physical range may therefore still be the pre-cutover
-            // interval. Never widen a finalized source (or undo a rollback)
+            // The document delegate can still be applying finalization, so
+            // its physical range may be the pre-cutover interval. Never widen
+            // a finalized source (or undo a rollback)
             // while reconciling its documents after restart.
             const current = try source_store.currentRange(work_alloc, source_group_id);
             projected_range = current;
@@ -13026,10 +13070,11 @@ pub const DataServer = struct {
         donor: antfly.db.types.ByteRange,
         receiver: antfly.db.types.ByteRange,
     ) !antfly.db.types.ByteRange {
-        if (std.mem.eql(u8, donor.end, receiver.start)) {
+        // Empty starts and ends denote opposite infinities, not adjacency.
+        if (donor.end.len != 0 and std.mem.eql(u8, donor.end, receiver.start)) {
             return .{ .start = donor.start, .end = receiver.end };
         }
-        if (std.mem.eql(u8, receiver.end, donor.start)) {
+        if (receiver.end.len != 0 and std.mem.eql(u8, receiver.end, donor.start)) {
             return .{ .start = receiver.start, .end = donor.end };
         }
         return error.NonAdjacentMergeRanges;
@@ -15570,7 +15615,9 @@ pub const DataServer = struct {
         db_path: []const u8,
         status: runtime_status.LocalTableRuntimeStatus,
     ) ?RuntimeStatusDiskUsageObservation {
-        return self.runtimeStatusDiskUsageBytesBestEffortWithScanner(group_id, db_path, status, .directory());
+        const runtime = self.ensureBackendRuntime() catch return null;
+        var filesystem_io = runtime.filesystemIo() orelse return null;
+        return self.runtimeStatusDiskUsageBytesBestEffortWithScanner(group_id, db_path, status, .directory(&filesystem_io));
     }
 
     fn runtimeStatusDiskUsageBytesBestEffortWithScanner(
@@ -15581,6 +15628,10 @@ pub const DataServer = struct {
         scanner: RuntimeStatusDiskUsageScanner,
     ) ?RuntimeStatusDiskUsageObservation {
         const active = runtimeStatusHasActiveBackgroundWork(status);
+        // Derived indexes can still report zero while durable primary
+        // documents already exist (notably after split snapshot import).
+        // Use the same authoritative count as the control-plane report.
+        const doc_count = controlPlaneDocumentCount(status.stats);
         const lsm_root_generation = if (status.metadata.lsm_root_generation != 0)
             status.metadata.lsm_root_generation
         else
@@ -15600,7 +15651,7 @@ pub const DataServer = struct {
                 lsm_root_generation,
                 now_ns,
                 active,
-                status.stats.doc_count,
+                doc_count,
                 status.stats.storage_change_token,
             )) {
                 const observation = RuntimeStatusDiskUsageObservation{
@@ -15612,7 +15663,7 @@ pub const DataServer = struct {
             }
             self.runtime_status_disk_usage_cache_mutex.unlock();
 
-            if (active and status.stats.doc_count == 0) return null;
+            if (active and doc_count == 0) return null;
             // Take the generation before scanning. A request that arrives
             // during the scan fences this generation and invalidates the
             // cache entry, so the retry below is the first observation that
@@ -22598,7 +22649,7 @@ fn collectLocalGroupStatusFromDb(
     return .{
         .group_id = group_id,
         .doc_count = source_doc_count,
-        .disk_bytes = try directoryUsageBytes(alloc, db_path),
+        .disk_bytes = try directoryUsageBytes(alloc, db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable, db_path),
         .disk_bytes_known = true,
         .empty = source_doc_count == 0,
         .created_at_millis = created_at_millis,
@@ -23219,21 +23270,19 @@ fn findMergedSnapshotGroupStatus(
     return null;
 }
 
-fn directoryUsageBytes(alloc: std.mem.Allocator, path: []const u8) !u64 {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    var dir = std.Io.Dir.cwd().openDir(io_impl.io(), path, .{ .iterate = true }) catch |err| switch (err) {
+fn directoryUsageBytes(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !u64 {
+    var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return 0,
         else => return err,
     };
-    defer dir.close(io_impl.io());
+    defer dir.close(io);
 
     var total: u64 = 0;
     var walker = try dir.walk(alloc);
     defer walker.deinit();
-    while (try walker.next(io_impl.io())) |entry| {
+    while (try walker.next(io)) |entry| {
         if (entry.kind != .file) continue;
-        const stat = try dir.statFile(io_impl.io(), entry.path, .{});
+        const stat = try dir.statFile(io, entry.path, .{});
         total += stat.size;
     }
     return total;
@@ -25223,6 +25272,39 @@ test "data runtime live writer source follows raft apply ownership" {
     );
 }
 
+test "data raft merge ranges preserve unbounded endpoints in either donor orientation" {
+    const Range = antfly.db.types.ByteRange;
+    const cases = [_]struct { left: Range, right: Range }{
+        .{ .left = .{ .start = "", .end = "doc:k" }, .right = .{ .start = "doc:k", .end = "" } },
+        .{ .left = .{ .start = "doc:a", .end = "doc:k" }, .right = .{ .start = "doc:k", .end = "doc:z" } },
+    };
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |reverse| {
+            const donor = if (reverse) case.right else case.left;
+            const receiver = if (reverse) case.left else case.right;
+            const ranges = try DataServer.mergeReceiverAcceptRanges(donor, receiver, null, 42);
+            try std.testing.expectEqualStrings(case.left.start, ranges.merged.start);
+            try std.testing.expectEqualStrings(case.right.end, ranges.merged.end);
+            // Exercise the same validator that consumes the replicated checkpoint.
+            const plan = try antfly.db.merge_state.planCheckpointApply(std.testing.allocator, null, receiver, .{
+                .transition_id = 42,
+                .donor_group_id = 1,
+                .receiver_group_id = 2,
+                .receiver_base_start = ranges.base.start,
+                .receiver_base_end = ranges.base.end,
+                .merged_start = ranges.merged.start,
+                .merged_end = ranges.merged.end,
+                .kind = .accept,
+            });
+            plan.deinit(std.testing.allocator);
+        }
+    }
+    try std.testing.expectError(error.NonAdjacentMergeRanges, DataServer.mergeTransitionRange(
+        .{ .start = "doc:z", .end = "" },
+        .{ .start = "", .end = "doc:a" },
+    ));
+}
+
 test "data raft merge observation derives from replicated source and receiver markers" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -25372,7 +25454,7 @@ test "data raft merge observation derives from replicated source and receiver ma
     try std.testing.expectError(error.ConflictingMergeTransition, DataServer.deriveReplicatedMergeObservation(alloc, &store, record));
 }
 
-test "data raft source lifecycle commands bypass document db apply while receiver checkpoints apply" {
+test "data raft source finalization and receiver checkpoints apply document range metadata" {
     try std.testing.expectEqual(
         data_raft_batch.merge_artifacts_protocol_version,
         DataServer.requiredRaftBatchProtocolVersion(.{ .merge_artifacts = &.{.{ .key = "artifact", .value = "payload" }} }),
@@ -25395,6 +25477,15 @@ test "data raft source lifecycle commands bypass document db apply while receive
             .kind = .finalize,
             .transition_id = 7001,
             .receiver_group_id = 7002,
+        },
+    }));
+    try std.testing.expect(batchRequiresDocumentDbApply(.{
+        .split_transition = .{
+            .kind = .finalize,
+            .transition_id = 7001,
+            .attempt_epoch = 1,
+            .destination_group_id = 7002,
+            .split_key = "doc:m",
         },
     }));
     try std.testing.expect(batchRequiresDocumentDbApply(.{
@@ -25850,6 +25941,63 @@ test "data raft retry checkpoints survive changed ready windows and publication 
         error.UnknownGroup,
         apply_sm.waitReadBarrier(retired_barrier, platform_time.monotonicNs() + std.time.ns_per_s),
     );
+}
+
+test "data raft split finalization persists the receiver base before merge and survives restart replay" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/split-then-merge", .{tmp.sub_path});
+    defer alloc.free(path);
+    const finalize: antfly.db.types.BatchRequest = .{ .split_transition = .{
+        .kind = .finalize,
+        .transition_id = 41,
+        .attempt_epoch = 1,
+        .destination_group_id = 2,
+        .split_key = "doc:k",
+    } };
+    const split_entry: antfly.db.RaftAppliedEntryIdentity = .{ .term = 1, .index = 10 };
+    const merge_entry: antfly.db.RaftAppliedEntryIdentity = .{ .term = 1, .index = 11 };
+    {
+        var db = try antfly.db.DB.open(alloc, path, .{ .start_index_workers = false });
+        defer db.close();
+        try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"acknowledged\"}" }} });
+        try db.batchRaftReplicatedApply(finalize, split_entry);
+        try std.testing.expectEqualStrings("doc:k", db.getRange().end);
+        try std.testing.expectEqual(split_entry, (try db.raftAppliedEntry()).?);
+    }
+    {
+        var db = try antfly.db.DB.open(alloc, path, .{ .start_index_workers = false });
+        defer db.close();
+        try std.testing.expectEqualStrings("doc:k", db.getRange().end);
+        var invalid = finalize;
+        invalid.split_transition.?.split_key = "doc:z";
+        try std.testing.expectError(error.InvalidSplitRange, db.batchRaftReplicatedApply(invalid, merge_entry));
+        try std.testing.expectEqual(split_entry, (try db.raftAppliedEntry()).?);
+        try db.batchRaftReplicatedApply(.{ .merge_checkpoint = .{
+            .kind = .accept,
+            .transition_id = 42,
+            .donor_group_id = 2,
+            .receiver_group_id = 1,
+            .receiver_base_start = "",
+            .receiver_base_end = "doc:k",
+            .merged_start = "",
+            .merged_end = "",
+        } }, merge_entry);
+        try std.testing.expectEqualStrings("", db.getRange().end);
+        try db.batchRaftReplicatedApply(finalize, split_entry);
+        try std.testing.expectEqualStrings("", db.getRange().end);
+    }
+    {
+        var db = try antfly.db.DB.open(alloc, path, .{ .start_index_workers = false });
+        defer db.close();
+        try db.batchRaftReplicatedApply(finalize, split_entry);
+        try std.testing.expectEqualStrings("", db.getRange().end);
+        try std.testing.expectEqual(merge_entry, (try db.raftAppliedEntry()).?);
+        const value = (try db.get(alloc, "doc:a")) orelse return error.TestExpectedDocument;
+        defer alloc.free(value);
+        try std.testing.expectEqualStrings("{\"title\":\"acknowledged\"}", value);
+    }
 }
 
 test "data raft document apply identity prevents non-idempotent restart replay" {
@@ -32317,6 +32465,35 @@ test "data runtime startup catch-up prefers cached admin snapshot" {
     try std.testing.expectEqual(@as(usize, 0), snapshot_source.admin_calls);
 }
 
+// These tests isolate provision admission and retry policy from periodic
+// maintenance. A real LSM worker marks runtime/store status dirty even when
+// there are no DBs; racing that worker can send the control round down the
+// unrelated status-report retry path before it reaches the provision tick.
+fn prepareProvisioningControlRoundForTest(server: *DataServer) void {
+    const now_ms = server.backgroundMonotonicMs();
+    server.lsm_maintenance_next_eligible_ns.store(std.math.maxInt(u64), .monotonic);
+    server.auto_bulk_finish_last_run_at_ms.store(now_ms, .monotonic);
+    server.provisioned_index_repair_last_run_at_ms.store(now_ms, .monotonic);
+}
+
+const ProvisioningControlMetadataForTest = struct {
+    requests: usize = 0,
+
+    fn executor(self: *@This()) antfly.common.http.RequestExecutor {
+        return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+    }
+
+    fn execute(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        _: antfly.common.http.HttpRequest,
+    ) !antfly.common.http.HttpResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.requests += 1;
+        return error.UnexpectedProvisioningMetadataRequest;
+    }
+};
+
 test "data runtime runRound does not refresh provisioned replica root inline while worker is active" {
     const alloc = std.testing.allocator;
 
@@ -32326,11 +32503,25 @@ test "data runtime runRound does not refresh provisioned replica root inline whi
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provision-active", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
 
-    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{
+        .required = .of(&.{ .clock_read, .synchronization }),
+        .monotonic_ns = std.time.ns_per_s,
+    });
+    defer vopr_io.deinit();
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = vopr_io.io() },
+    });
     defer backend_runtime.deinit();
     const remote_metadata = try alloc.create(RemoteMetadataSource);
     const metadata_api_urls = [_][]const u8{"http://metadata.test"};
-    remote_metadata.* = try RemoteMetadataSource.init(alloc, &metadata_api_urls, backend_runtime.ptr().apiIoImpl().?);
+    var metadata_transport = ProvisioningControlMetadataForTest{};
+    remote_metadata.* = try RemoteMetadataSource.initWithRequestExecutors(
+        alloc,
+        &metadata_api_urls,
+        &.{metadata_transport.executor()},
+        vopr_io.io(),
+    );
 
     var server: DataServer = .{
         .alloc = alloc,
@@ -32351,17 +32542,18 @@ test "data runtime runRound does not refresh provisioned replica root inline whi
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
-        .status_source = undefined,
+        .status_source = remote_metadata.statusSource(),
         .api_server_cfg = undefined,
         .query_async_limit = .limited(8),
         .backend_runtime = backend_runtime.ptr(),
         .listener_cfg = undefined,
     };
     defer server.deinit();
+    prepareProvisioningControlRoundForTest(&server);
 
     server.store_registration_confirmed = true;
     server.store_status_dirty.store(false, .release);
-    server.last_store_status_report_at_ms = 1;
+    server.last_store_status_report_at_ms = server.backgroundMonotonicMs();
     server.runtime_status_dirty.store(false, .release);
     server.provisioned_startup_catch_up_dirty.store(false, .release);
     server.provisioned_root_refresh_dirty.store(true, .release);
@@ -32369,7 +32561,9 @@ test "data runtime runRound does not refresh provisioned replica root inline whi
     server.provision_ticks = 3;
 
     try server.runRound();
+    try std.testing.expectEqual(@as(usize, 0), metadata_transport.requests);
 
+    try std.testing.expectEqual(@as(u32, 0), server.metadataBootstrapRetryAttemptsForTest());
     try std.testing.expectEqual(@as(usize, 0), server.provision_ticks);
     try std.testing.expect(server.provisioned_root_refresh_dirty.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_root_refresh_started.load(.monotonic));
@@ -32385,11 +32579,25 @@ test "data runtime runRound backs off retryable provision metadata failures" {
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provision-metadata-backoff", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
 
-    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{
+        .required = .of(&.{ .clock_read, .synchronization }),
+        .monotonic_ns = std.time.ns_per_s,
+    });
+    defer vopr_io.deinit();
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = vopr_io.io() },
+    });
     defer backend_runtime.deinit();
     const remote_metadata = try alloc.create(RemoteMetadataSource);
     const metadata_api_urls = [_][]const u8{"http://metadata.test"};
-    remote_metadata.* = try RemoteMetadataSource.init(alloc, &metadata_api_urls, backend_runtime.ptr().apiIoImpl().?);
+    var metadata_transport = ProvisioningControlMetadataForTest{};
+    remote_metadata.* = try RemoteMetadataSource.initWithRequestExecutors(
+        alloc,
+        &metadata_api_urls,
+        &.{metadata_transport.executor()},
+        vopr_io.io(),
+    );
     remote_metadata.test_faults.fetch_head_error = error.NotLeader;
 
     var server: DataServer = .{
@@ -32411,9 +32619,6 @@ test "data runtime runRound backs off retryable provision metadata failures" {
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
-        // runRound may schedule a runtime-status refresh after the injected
-        // metadata failure. Match production construction so that path has a
-        // valid interface instead of invoking undefined test memory.
         .status_source = remote_metadata.statusSource(),
         .api_server_cfg = undefined,
         .query_async_limit = .limited(8),
@@ -32421,16 +32626,18 @@ test "data runtime runRound backs off retryable provision metadata failures" {
         .listener_cfg = undefined,
     };
     defer server.deinit();
+    prepareProvisioningControlRoundForTest(&server);
 
     server.store_registration_confirmed = true;
     server.store_status_dirty.store(false, .release);
-    server.last_store_status_report_at_ms = 1;
+    server.last_store_status_report_at_ms = server.backgroundMonotonicMs();
     server.runtime_status_dirty.store(false, .release);
     server.provisioned_startup_catch_up_dirty.store(false, .release);
     server.provisioned_root_refresh_dirty.store(false, .release);
     server.provision_ticks = 3;
 
     try server.runRound();
+    try std.testing.expectEqual(@as(usize, 0), metadata_transport.requests);
 
     try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
     try std.testing.expect(server.nextMetadataBootstrapRetryAtMsForTest() != 0);
@@ -32443,11 +32650,17 @@ test "data runtime runRound backs off retryable provision metadata failures" {
     server.provision_ticks = 3;
 
     try server.runRound();
+    try std.testing.expectEqual(@as(usize, 0), metadata_transport.requests);
 
     try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
     try std.testing.expectEqual(next_retry_at_ms, server.nextMetadataBootstrapRetryAtMsForTest());
     try std.testing.expectEqual(last_head_check_at_ms, server.last_provision_head_check_at_ms);
     try std.testing.expectEqual(@as(usize, 3), server.provision_ticks);
+    vopr_io.monotonic_ns = @as(i96, next_retry_at_ms - 1) * std.time.ns_per_ms;
+    try std.testing.expect(!server.metadataBootstrapRetryDue(server.backgroundMonotonicMs()));
+    vopr_io.monotonic_ns += std.time.ns_per_ms;
+    try std.testing.expect(server.metadataBootstrapRetryDue(server.backgroundMonotonicMs()));
+    try vopr_io.ensureNoCapabilityViolation();
 }
 
 test "data runtime provisioned root refresh worker backs off retryable metadata failures" {
@@ -32459,11 +32672,25 @@ test "data runtime provisioned root refresh worker backs off retryable metadata 
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provision-worker-backoff", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
 
-    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{
+        .required = .of(&.{ .clock_read, .synchronization }),
+        .monotonic_ns = std.time.ns_per_s,
+    });
+    defer vopr_io.deinit();
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = vopr_io.io() },
+    });
     defer backend_runtime.deinit();
     const remote_metadata = try alloc.create(RemoteMetadataSource);
     const metadata_api_urls = [_][]const u8{"http://metadata.test"};
-    remote_metadata.* = try RemoteMetadataSource.init(alloc, &metadata_api_urls, backend_runtime.ptr().apiIoImpl().?);
+    var metadata_transport = ProvisioningControlMetadataForTest{};
+    remote_metadata.* = try RemoteMetadataSource.initWithRequestExecutors(
+        alloc,
+        &metadata_api_urls,
+        &.{metadata_transport.executor()},
+        vopr_io.io(),
+    );
     remote_metadata.test_faults.fetch_head_error = error.NotLeader;
 
     var server: DataServer = .{
@@ -32485,13 +32712,14 @@ test "data runtime provisioned root refresh worker backs off retryable metadata 
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
-        .status_source = undefined,
+        .status_source = remote_metadata.statusSource(),
         .api_server_cfg = undefined,
         .query_async_limit = .limited(8),
         .backend_runtime = backend_runtime.ptr(),
         .listener_cfg = undefined,
     };
     defer server.deinit();
+    prepareProvisioningControlRoundForTest(&server);
 
     server.provisioned_root_refresh_dirty.store(true, .release);
 
@@ -32510,10 +32738,16 @@ test "data runtime provisioned root refresh worker backs off retryable metadata 
     server.provision_ticks = 3;
 
     try server.runRound();
+    try std.testing.expectEqual(@as(usize, 0), metadata_transport.requests);
 
     try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
     try std.testing.expectEqual(next_retry_at_ms, server.nextMetadataBootstrapRetryAtMsForTest());
     try std.testing.expectEqual(@as(usize, 3), server.provision_ticks);
+    vopr_io.monotonic_ns = @as(i96, next_retry_at_ms - 1) * std.time.ns_per_ms;
+    try std.testing.expect(!server.metadataBootstrapRetryDue(server.backgroundMonotonicMs()));
+    vopr_io.monotonic_ns += std.time.ns_per_ms;
+    try std.testing.expect(server.metadataBootstrapRetryDue(server.backgroundMonotonicMs()));
+    try vopr_io.ensureNoCapabilityViolation();
 }
 
 test "data runtime provisioned root refresh spawn failure preserves retry bookkeeping" {
@@ -41051,4 +41285,20 @@ test "data runtime background worker capacity is reserved and closes with its ow
     try std.testing.expectEqual(@as(usize, 0), server.backend_runtime.?.laneStats().reserved_workers);
     try std.testing.expect(server.maintenance_worker_lease == null);
     try std.testing.expectError(error.BackgroundOwnerClosing, server.ensureBackgroundWorkerIo(.maintenance));
+}
+
+test "data runtime disk usage scanner reads borrowed filesystem for sharding evidence" {
+    var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{});
+    defer vopr_io.deinit();
+    var io = vopr_io.io();
+    const root = "/vopr-sharding-disk-usage";
+    try std.Io.Dir.cwd().createDirPath(io, root ++ "/nested");
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/one", .data = "abc" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/nested/two", .data = "12345" });
+    const scanner = RuntimeStatusDiskUsageScanner.directory(&io);
+    try std.testing.expectEqual(@as(u64, 8), try scanner.scan(std.testing.allocator, root));
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/nested/two", .data = "1" });
+    try std.testing.expectEqual(@as(u64, 4), try scanner.scan(std.testing.allocator, root));
+    try std.testing.expectEqual(@as(u64, 0), try scanner.scan(std.testing.allocator, root ++ "/absent"));
+    try vopr_io.ensureNoCapabilityViolation();
 }

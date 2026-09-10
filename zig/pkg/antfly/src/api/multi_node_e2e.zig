@@ -29,7 +29,7 @@ const metadata_table_workflow = @import("../metadata/table_workflow.zig");
 const raft_catalog = @import("../raft/catalog.zig");
 const raft_host = @import("../raft/host.zig");
 const read_gate = @import("../raft/read_gate.zig");
-const raft_sim = @import("../raft/sim_harness.zig");
+const raft_vopr = @import("../raft/vopr_harness.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const std_http_executor = @import("../raft/transport/std_http_executor.zig");
 const std_http_listener = @import("../raft/transport/std_http_listener.zig");
@@ -386,7 +386,7 @@ fn makeHostSimConfig(
     metadata_group_id: u64,
     replica_root_dir: []const u8,
     replica_catalog_path: []const u8,
-) raft_sim.ManagedHttpHostSimulationConfig {
+) raft_vopr.ManagedHttpHostSimulationConfig {
     return .{
         .host = .{
             .http = .{
@@ -404,7 +404,7 @@ fn makeHostSimConfig(
     };
 }
 
-fn makeHostSimDeps(factory: *Factory) raft_sim.ManagedHttpHostSimulationDeps {
+fn makeHostSimDeps(factory: *Factory) raft_vopr.ManagedHttpHostSimulationDeps {
     return .{
         .host = .{
             .http = .{
@@ -1474,13 +1474,13 @@ test "public api multi-node e2e routes CRUD from a non-host node" {
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-multi-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostSimConfig(1, 6110, root_a, cat_a),
         makeHostSimConfig(2, 6110, root_b, cat_b),
         makeHostSimConfig(3, 6110, root_c, cat_c),
         makeHostSimConfig(4, 6110, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
@@ -1728,13 +1728,13 @@ test "public api multi-node e2e routes transaction commit from a non-host node" 
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-multi-txn-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostSimConfig(1, 6145, root_a, cat_a),
         makeHostSimConfig(2, 6145, root_b, cat_b),
         makeHostSimConfig(3, 6145, root_c, cat_c),
         makeHostSimConfig(4, 6145, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
@@ -1929,13 +1929,13 @@ test "public api multi-node e2e commits cross-table transactions atomically" {
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-multi-cross-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostSimConfig(1, 6144, root_a, cat_a),
         makeHostSimConfig(2, 6144, root_b, cat_b),
         makeHostSimConfig(3, 6144, root_c, cat_c),
         makeHostSimConfig(4, 6144, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
@@ -2184,13 +2184,13 @@ test "public api multi-node e2e supports long-lived transaction sessions from a 
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-multi-session-txn-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostSimConfig(1, 6149, root_a, cat_a),
         makeHostSimConfig(2, 6149, root_b, cat_b),
         makeHostSimConfig(3, 6149, root_c, cat_c),
         makeHostSimConfig(4, 6149, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
@@ -2518,13 +2518,13 @@ test "public api multi-node e2e supports cross-table transaction sessions" {
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-multi-cross-session-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostSimConfig(1, 6154, root_a, cat_a),
         makeHostSimConfig(2, 6154, root_b, cat_b),
         makeHostSimConfig(3, 6154, root_c, cat_c),
         makeHostSimConfig(4, 6154, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
@@ -2754,13 +2754,13 @@ test "public api multi-node e2e reloads durable cross-table transaction sessions
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-multi-cross-session-restart-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostSimConfig(1, 6155, root_a, cat_a),
         makeHostSimConfig(2, 6155, root_b, cat_b),
         makeHostSimConfig(3, 6155, root_c, cat_c),
         makeHostSimConfig(4, 6155, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
@@ -3023,13 +3023,13 @@ test "public api multi-node e2e adopts durable cross-table transaction sessions 
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-multi-cross-session-adopt-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostSimConfig(1, 6156, root_a, cat_a),
         makeHostSimConfig(2, 6156, root_b, cat_b),
         makeHostSimConfig(3, 6156, root_c, cat_c),
         makeHostSimConfig(4, 6156, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
@@ -3293,13 +3293,13 @@ test "public api multi-node e2e reloads durable transaction sessions after coord
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-multi-session-restart-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostSimConfig(1, 6151, root_a, cat_a),
         makeHostSimConfig(2, 6151, root_b, cat_b),
         makeHostSimConfig(3, 6151, root_c, cat_c),
         makeHostSimConfig(4, 6151, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
@@ -3520,13 +3520,13 @@ test "public api multi-node e2e adopts durable transaction sessions after coordi
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-multi-session-adopt-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostSimConfig(1, 6151, root_a, cat_a),
         makeHostSimConfig(2, 6151, root_b, cat_b),
         makeHostSimConfig(3, 6151, root_c, cat_c),
         makeHostSimConfig(4, 6151, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
@@ -3722,13 +3722,13 @@ test "public api multi-node e2e retries transaction commit once after topology c
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-multi-txn-retry-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostSimConfig(1, 6146, root_a, cat_a),
         makeHostSimConfig(2, 6146, root_b, cat_b),
         makeHostSimConfig(3, 6146, root_c, cat_c),
         makeHostSimConfig(4, 6146, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
@@ -3967,13 +3967,13 @@ test "public api multi-node e2e fails transaction commit after repeated topology
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-multi-txn-retry-fail-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostSimConfig(1, 6147, root_a, cat_a),
         makeHostSimConfig(2, 6147, root_b, cat_b),
         makeHostSimConfig(3, 6147, root_c, cat_c),
         makeHostSimConfig(4, 6147, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
@@ -4203,13 +4203,13 @@ test "public api multi-node e2e retries transaction session commit once after to
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-multi-session-retry-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostSimConfig(1, 6150, root_a, cat_a),
         makeHostSimConfig(2, 6150, root_b, cat_b),
         makeHostSimConfig(3, 6150, root_c, cat_c),
         makeHostSimConfig(4, 6150, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
@@ -4489,13 +4489,13 @@ test "public api multi-node e2e retries cross-table transaction session commit o
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-multi-cross-session-retry-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostSimConfig(1, 6157, root_a, cat_a),
         makeHostSimConfig(2, 6157, root_b, cat_b),
         makeHostSimConfig(3, 6157, root_c, cat_c),
         makeHostSimConfig(4, 6157, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
@@ -4824,13 +4824,13 @@ test "public api multi-node e2e fails transaction session commit after repeated 
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-multi-session-retry-fail-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostSimConfig(1, 6151, root_a, cat_a),
         makeHostSimConfig(2, 6151, root_b, cat_b),
         makeHostSimConfig(3, 6151, root_c, cat_c),
         makeHostSimConfig(4, 6151, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
@@ -5114,13 +5114,13 @@ test "public api multi-node e2e recovers unresolved distributed transaction afte
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-multi-txn-restart-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostSimConfig(1, 6148, root_a, cat_a),
         makeHostSimConfig(2, 6148, root_b, cat_b),
         makeHostSimConfig(3, 6148, root_c, cat_c),
         makeHostSimConfig(4, 6148, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
@@ -5373,13 +5373,13 @@ test "public api multi-node e2e routes semantic and sparse queries from a non-ho
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-multi-semantic-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostSimConfig(1, 6140, root_a, cat_a),
         makeHostSimConfig(2, 6140, root_b, cat_b),
         makeHostSimConfig(3, 6140, root_c, cat_c),
         makeHostSimConfig(4, 6140, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
@@ -5732,13 +5732,13 @@ test "public api multi-node e2e routes graph queries from a non-host node" {
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-multi-graph-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostSimConfig(1, 6170, root_a, cat_a),
         makeHostSimConfig(2, 6170, root_b, cat_b),
         makeHostSimConfig(3, 6170, root_c, cat_c),
         makeHostSimConfig(4, 6170, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
@@ -5927,13 +5927,13 @@ test "public api multi-node e2e routes split flow from a non-host node" {
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-multi-split-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostSimConfig(1, 6120, root_a, cat_a),
         makeHostSimConfig(2, 6120, root_b, cat_b),
         makeHostSimConfig(3, 6120, root_c, cat_c),
         makeHostSimConfig(4, 6120, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
@@ -6366,13 +6366,13 @@ test "public api multi-node e2e routes merge flow from a non-host node" {
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-multi-merge-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostSimConfig(1, 6130, root_a, cat_a),
         makeHostSimConfig(2, 6130, root_b, cat_b),
         makeHostSimConfig(3, 6130, root_c, cat_c),
         makeHostSimConfig(4, 6130, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
@@ -6679,13 +6679,13 @@ test "public api multi-node e2e retries distributed graph after merge churn" {
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-graph-retry-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostSimConfig(1, 6190, root_a, cat_a),
         makeHostSimConfig(2, 6190, root_b, cat_b),
         makeHostSimConfig(3, 6190, root_c, cat_c),
         makeHostSimConfig(4, 6190, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
@@ -6955,13 +6955,13 @@ test "public api multi-node e2e fails distributed graph after repeated churn bey
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-graph-retry-fail-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostSimConfig(1, 6191, root_a, cat_a),
         makeHostSimConfig(2, 6191, root_b, cat_b),
         makeHostSimConfig(3, 6191, root_c, cat_c),
         makeHostSimConfig(4, 6191, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
@@ -7220,13 +7220,13 @@ test "public api multi-node e2e routes semantic and sparse queries across split 
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-multi-semantic-split-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostSimConfig(1, 6150, root_a, cat_a),
         makeHostSimConfig(2, 6150, root_b, cat_b),
         makeHostSimConfig(3, 6150, root_c, cat_c),
         makeHostSimConfig(4, 6150, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
@@ -7559,13 +7559,13 @@ test "public api multi-node e2e routes semantic and sparse queries after merge f
     const cat_d = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-multi-semantic-merge-d.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(cat_d);
 
-    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+    const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{
         makeHostSimConfig(1, 6160, root_a, cat_a),
         makeHostSimConfig(2, 6160, root_b, cat_b),
         makeHostSimConfig(3, 6160, root_c, cat_c),
         makeHostSimConfig(4, 6160, root_d, cat_d),
     };
-    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+    const deps = [_]raft_vopr.ManagedHttpHostSimulationDeps{
         makeHostSimDeps(&factory_a),
         makeHostSimDeps(&factory_b),
         makeHostSimDeps(&factory_c),
