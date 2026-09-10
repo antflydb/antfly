@@ -1240,7 +1240,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         &run_httpx_json_tests.step,
         &run_httpx_tests.step,
     });
-    soak_test_step.dependOn(owner_tests.chaos_soak_test_step);
+    soak_test_step.dependOn(owner_tests.vopr_soak_test_step);
     soak_test_step.dependOn(owner_tests.storage_workload_soak_step);
     const lib_transcribing_tests = b.addTest(.{
         .root_module = transcribing_mod,

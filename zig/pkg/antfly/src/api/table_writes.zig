@@ -10121,7 +10121,6 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: ?[]const u8,
     ) !void {
         const io = self.tableActivityIo();
-        const drain_started_ns = platform_time.monotonicNs();
         const owned_table_name = if (table_name) |name| try std.heap.page_allocator.dupe(u8, name) else null;
         errdefer if (owned_table_name) |name| std.heap.page_allocator.free(name);
         self.table_activity_mutex.lockUncancelable(io);
@@ -12051,6 +12050,7 @@ pub const ProvisionedTableWriteSource = struct {
         deadline_ns: u64,
     ) !void {
         const io = self.tableActivityIo();
+        const drain_started_ns = platform_time.monotonicNs();
         for (group_ids) |group_id| {
             const caches = [_]?*ProvisionedTableWriteCache{
                 self.write_cache,

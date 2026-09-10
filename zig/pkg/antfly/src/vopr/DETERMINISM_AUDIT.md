@@ -1,7 +1,7 @@
 # Metadata VOPR Determinism Audit
 
 This is the preserved Phase 0 baseline inventory for the first metadata world:
-`metadata/vopr_harness.zig`, including its `raft/sim_harness.zig` transport.
+`metadata/vopr_harness.zig`, including its `raft/vopr_harness.zig` transport.
 The table records the risks as originally audited; the resolution summary below
 states the current adapter status.
 
@@ -38,3 +38,14 @@ differential boundaries are line-local allowances with mandatory rationale;
 they are not permitted to contribute choices, observations, events, or stable
 IDs. Runtime evidence independently catalogs immediate structured choices and
 borrowed-`std.Io` entropy calls.
+
+The production HA/scaling composition also audits `production_ha.zig`. Its
+primary, standby receive/progress, replication slots, and fencing stores borrow
+the shared VOPR filesystem and clock; promoted slot ownership preserves those
+same dependencies. Automatic sharding borrows the owner's wall and monotonic
+clocks, including cooldown expiry independently of realtime corrections, reads disk
+size through its filesystem, and obtains median keys through the production
+shard RPC adapter. Compact observations include HA durable/apply frontiers and production
+Raft progress rather than native paths or addresses. The production fixture's
+ancillary restore-job LMDB remains inside its established unique native temp
+namespace and is not exercised as a modeled crash store by this history.
