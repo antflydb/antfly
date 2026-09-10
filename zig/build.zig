@@ -5024,6 +5024,7 @@ pub fn build(b: *std.Build) void {
         "remote metadata source pins one cluster incarnation across cache invalidation",
         "remote metadata mutation failover preserves ambiguous and deterministic outcomes",
         "remote metadata mutation discovery preserves forwarding budget for the configured leader",
+        "remote metadata mutation discovery preserves endpoint coverage and delivery time",
         "remote metadata source retains mutation authority across cache invalidation",
         "remote metadata source installs fenced snapshot without comparing epoch domains",
         "remote metadata source rejects fenced snapshot across mutation invalidation",
@@ -7761,6 +7762,7 @@ pub fn build(b: *std.Build) void {
             "lifecycle listener detach drains callbacks and preserves unrelated listeners",
             "metadata.table mutation routing forwards only to a routable remote leader",
             "metadata http client forwards table create and drop to the internal route",
+            "metadata http client status role survives response and parser release",
             "metadata http client rejects invalid forwarded table names before I/O",
             "metadata http client surfaces typed rejection for forwarded table mutations only with non-admission proof",
             "metadata http client preserves transport ambiguity for forwarded table mutations",
@@ -10124,6 +10126,14 @@ pub fn build(b: *std.Build) void {
     // inventory as well as its own unique cases. Run that union once.
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db tests");
     db_test_step.dependOn(&run_db_unit_tests.step);
+
+    const resolver_backfill_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "upsertResolver", "managed resolver", "resolver worker resumes durable backfill" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const resolver_backfill_step = b.step("antfly-resolver-backfill-test", "Run resolver catalog and durable backfill regressions");
+    resolver_backfill_step.dependOn(&addFilteredTestRunArtifact(b, resolver_backfill_tests).step);
 
     // Keep the small, deterministic release-blocker primitives in the PR/base
     // unit gate. The corpus-scale fixtures below protect thresholds that only

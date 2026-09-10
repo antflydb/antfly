@@ -1301,9 +1301,15 @@ pub const MetadataHttpClient = struct {
         }, budget);
         defer resp.deinit(self.alloc);
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
-        const value = try std.json.parseFromSliceLeaky(T, self.alloc, resp.body, .{ .ignore_unknown_fields = true });
+        const parsed = try std.json.parseFromSlice(T, self.alloc, resp.body, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
         try ensureRequestBudget(budget);
-        return value;
+        // Value-returning endpoints must not borrow response or parser memory.
+        // Status has one string field; canonicalize it before either owner is
+        // released, including parser-owned storage for escaped JSON strings.
+        if (T == metadata_api.MetadataStatus)
+            return metadata_api.stabilizeMetadataStatus(parsed.value);
+        return parsed.value;
     }
 
     fn requestWithBody(
@@ -2938,6 +2944,46 @@ test "metadata http client retries transient connection close on fetch status" {
     const status = try client.fetchStatus("http://127.0.0.1:9000");
     try std.testing.expectEqual(@as(u64, 77), status.metadata_group_id);
     try std.testing.expectEqual(@as(usize, 2), flaky.attempts);
+}
+
+test "metadata http client status role survives response and parser release" {
+    const Response = struct {
+        storage: [512]u8 = undefined,
+        owner: std.heap.FixedBufferAllocator = undefined,
+        role_json: []const u8,
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.owner = std.heap.FixedBufferAllocator.init(&self.storage);
+            return .{
+                .status = 200,
+                .owner_allocator = self.owner.allocator(),
+                .body = try std.fmt.allocPrint(
+                    self.owner.allocator(),
+                    "{{\"metadata_group_id\":77,\"metadata_raft_role\":{s},\"metrics\":{{}}}}",
+                    .{self.role_json},
+                ),
+            };
+        }
+    };
+    const cases = [_]struct { json: []const u8, expected: []const u8 }{
+        .{ .json = "\"leader\"", .expected = "leader" },
+        .{ .json = "\"follower\"", .expected = "follower" },
+        .{ .json = "\"le\\u0061der\"", .expected = "leader" },
+        .{ .json = "\"future_role\"", .expected = "unknown" },
+    };
+    for (cases) |case| {
+        var response = Response{ .role_json = case.json };
+        var client = MetadataHttpClient.init(std.testing.allocator, .{
+            .ptr = &response,
+            .vtable = &.{ .execute = Response.execute },
+        });
+        const status = try client.fetchStatus("http://metadata.test");
+        try std.testing.expectEqual(@as(usize, 0), response.owner.end_index);
+        @memset(&response.storage, '#');
+        try std.testing.expectEqualStrings(case.expected, status.metadata_raft_role);
+        try std.testing.expectEqual(@as(u64, 77), status.metadata_group_id);
+    }
 }
 
 test "metadata http client retries bounded timeout on fetch status" {

@@ -22369,6 +22369,10 @@ pub const DB = struct {
                     const runtime = self.resolution_runtime.?;
                     if (try runtime.hasReresolveBacklog()) {
                         try self.backfillResolverCorpus();
+                    } else {
+                        // The worker may have cleared the enqueue cursor while
+                        // the resulting replay and downstream work is pending.
+                        try self.runUntilIdle();
                     }
                 }
             },
@@ -22403,6 +22407,11 @@ pub const DB = struct {
                 if (queued > 0) try self.runUntilIdle();
                 if (complete) break;
             }
+            // A background window may have enqueued the final records, so this
+            // caller's last window can report complete with zero queued work.
+            // Synchronous backfill promises applied output, not just an empty
+            // corpus cursor; drain the shared replay target before returning.
+            try self.runUntilIdle();
         }
     }
 
@@ -63334,68 +63343,82 @@ test "db re-resolves existing corpus when upsertResolver inserts a new resolver"
 }
 
 test "db drains pending resolver backfill when retrying a no-op upsertResolver" {
-    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |already_enqueued| {
+        const alloc = std.testing.allocator;
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-    defer cleanupTempDir(path);
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
+        defer cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_resolver_workers = !already_enqueued });
+        defer db.close();
 
-    try db.addIndex(.{
-        .name = "relations_graph",
-        .kind = .graph,
-        .config_json =
-        \\{
-        \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
-        \\}
-        ,
-    });
-
-    try db.batch(.{
-        .writes = &.{.{
-            .key = "doc:a",
-            .value =
-            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+        try db.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json =
+            \\{
+            \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+            \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
+            \\}
             ,
-        }},
-        .sync_level = .enrichments,
-    });
-    try db.runUntilIdle();
+        });
 
-    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_retry_v1");
-    defer alloc.free(resolution_key);
-    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:a",
+                .value =
+                \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+                ,
+            }},
+            .sync_level = .enrichments,
+        });
+        try db.runUntilIdle();
 
-    const cfg: index_manager_mod.ResolverConfig = .{
-        .name = "kg_retry",
-        .table = "entities",
-        .source_artifact = "relations_v1",
-        .resolution_artifact = "resolution_retry_v1",
-        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
-        .config_generation = 1,
-    };
+        const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_retry_v1");
+        defer alloc.free(resolution_key);
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
 
-    {
-        lockApply(&db);
-        defer db.core.unlockApply();
-        try std.testing.expectEqual(index_manager_mod.IndexManager.ResolverUpsertResult.inserted, try db.core.upsertResolver(cfg));
+        const cfg: index_manager_mod.ResolverConfig = .{
+            .name = "kg_retry",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "resolution_retry_v1",
+            .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+            .config_generation = 1,
+        };
+
+        {
+            lockApply(&db);
+            defer db.core.unlockApply();
+            try std.testing.expectEqual(index_manager_mod.IndexManager.ResolverUpsertResult.inserted, try db.core.upsertResolver(cfg));
+        }
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+        try std.testing.expect(try db.resolution_runtime.?.hasReresolveBacklog());
+
+        if (already_enqueued) {
+            // Model the worker clearing the dirty cursor after enqueueing the
+            // replay record, before resolution has materialized its output.
+            while (try db.resolution_runtime.?.hasReresolveBacklog()) {
+                var tick = try db.resolution_runtime.?.runReresolveBacklogWindow();
+                tick.deinit(db.runtime_alloc);
+            }
+            try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+            try std.testing.expect(db.resolution_runtime.?.target_sequence.load(.acquire) >
+                db.resolution_runtime.?.applied_sequence.load(.acquire));
+        }
+
+        // Retrying the same catalog config is a material no-op, but the durable
+        // dirty cursor from the first attempt must still be drained.
+        try db.upsertResolver(cfg);
+
+        const raw = try db.core.store.get(alloc, resolution_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
+        try std.testing.expect(!try db.resolution_runtime.?.hasReresolveBacklog());
     }
-    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
-    try std.testing.expect(try db.resolution_runtime.?.hasReresolveBacklog());
-
-    // Retrying the same catalog config is a material no-op, but the durable
-    // dirty cursor from the first attempt must still be drained.
-    try db.upsertResolver(cfg);
-
-    const raw = try db.core.store.get(alloc, resolution_key);
-    defer alloc.free(raw);
-    try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
-    try std.testing.expect(!try db.resolution_runtime.?.hasReresolveBacklog());
 }
 
 test "db refuses resolver removal while resolution or promotion replay is pending" {

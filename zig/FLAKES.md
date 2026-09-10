@@ -39,6 +39,70 @@ Nine focused publication-fence and owner-lifecycle tests also passed.
 Linux reproduction and soak results are recorded in the
 [E2E history](e2e/FLAKES.md#completed-cli-readiness-regresses-after-publication-696).
 
+## Metadata mutation discovery exhausts admission time (#694)
+
+The first forwarding-fix soak passed 59/60 backup runs. The remaining run never
+reached a write: five explicit pre-admission `503 metadata_leader_unavailable`
+responses exhausted the existing 30-second create budget.
+
+Two concrete discovery defects were reproduced:
+
+- A status GET used the entire five-second mutation budget. A stalled first
+  endpoint prevented discovery from reaching a healthy configured leader, and
+  each public retry started over at that same endpoint. Discovery now divides
+  remaining time among the remaining probes and reserves a share for mutation
+  delivery. The initial endpoint preference is captured once, so concurrent
+  affinity updates cannot skip endpoints. Discovery still consumes no forwarding
+  hops; delivered mutations retain the original hop, campaign, deadline, and
+  ambiguity rules.
+- `MetadataHttpClient.fetchStatus` returned a role string borrowed from an HTTP
+  body it had already freed. Leader discovery could read corrupted bytes and
+  classify the leader as a follower. Role stabilization now occurs inside the
+  HTTP client before releasing either response or parser memory. Recognized
+  roles use static strings, unknown roles become `unknown`, and temporary parser
+  allocations (including escaped JSON strings) are released.
+
+The virtual-clock regression fails before the probe-budget change and passes
+with it. It covers a slow first endpoint, all endpoints timing out, an
+overshooting executor, changing affinity, and preserved delivery authority.
+The response-lifetime regression explicitly overwrites released response
+storage: it reads `######` instead of `leader` before the fix and succeeds
+afterward, including escaped strings without leaks. All 100 metadata service
+checks and four focused data discovery/status checks passed.
+
+A live HTTP proxy also reproduced the original create-admission signature
+before the fix and completed the full backup/restore test afterward. The
+retained regression keeps a stalled alternate status route first and all three
+direct metadata addresses available, so leadership changes cannot accidentally
+hide the only leader route. Fault activation follows cluster bootstrap.
+See the [E2E history](e2e/FLAKES.md#table-create-admission-timeout-during-694-validation)
+for the final merged-runtime soak and the limits of the exploratory evidence.
+
+## Synchronous resolver retry returns before queued backfill applies (#694)
+
+[PR #694, run 34432995411, job 102732550441](https://github.com/antflydb/antfly/actions/runs/34432995411/job/102732550441)
+failed `db drains pending resolver backfill when retrying a no-op upsertResolver`
+with `NotFound` when reading the expected resolution artifact.
+
+The resolver worker can enqueue the final corpus window and clear its durable
+cursor before replay materializes the output. A synchronous no-op upsert checked
+only that cursor, so it could return with replay still pending. A synchronous
+backfill driver could likewise see a completed window with zero records queued
+by that driver and skip its final replay drain.
+
+Synchronous upserts now drain replay even when the corpus cursor is already
+empty, and synchronous backfill always completes a final replay drain. Managed
+`drain_backfill=false` callers retain asynchronous execution and nonblocking
+catalog admission. No production timeout or test assertion is relaxed.
+
+The regression preserves the original worker-enabled case and adds a controlled
+interleaving: disable resolver workers, enqueue all corpus windows, verify the
+cursor is gone but target sequence exceeds applied sequence and the output is
+absent, then retry the same catalog config. It fails with the exact CI
+`NotFound` before the fix and passes afterward. All five focused catalog,
+generation-change, deferred-reopen, and backfill checks passed without leaks in
+`zig build antfly-resolver-backfill-test -j4`.
+
 ## Standalone routing watch deadline (#689, #694)
 
 [PR #689, run 34418061842, job 102687782332](https://github.com/antflydb/antfly/actions/runs/34418061842/job/102687782332)

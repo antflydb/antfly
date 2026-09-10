@@ -10,7 +10,7 @@ entries so later failures can be compared with the original signature.
 | Test | CI evidence | Fix commit | Status |
 | --- | --- | --- | --- |
 | Same CLI pipeline, completion regresses between `index get` and `index list` | [PR #696, run 34428885099, job 102726530711](https://github.com/antflydb/antfly/actions/runs/34428885099/job/102726530711?pr=696) | PR #694 | Reproduced with the original Linux CI executable; delayed source callbacks now recognize completed observations within the same catalog epoch. See below. |
-| Same three-by-three backup test, seed batch `409 write outcome unknown` | [PR #694, run 34423487352, job 102714559943](https://github.com/antflydb/antfly/actions/runs/34423487352/job/102714559943) | This change | Reproduced control-executor exhaustion; forwarding moved to outbound Raft executor. Fixed-runtime soak: 59/60 passed, no seed 409; one earlier table-create timeout remains open below. |
+| Same three-by-three backup test, seed batch `409 write outcome unknown` | [PR #694, run 34423487352, job 102714559943](https://github.com/antflydb/antfly/actions/runs/34423487352/job/102714559943) | This change | Reproduced control-executor exhaustion; forwarding moved to outbound Raft executor. The initial 59/60 soak exposed table-create discovery defects, addressed below. Final merged-runtime soak: 90/90 passed (60 ordinary, 30 stalled-route). |
 | `test_index_lifecycle.py::test_serverless_named_embedding_indexes_report_publication_actions` | [PR #692, run 34420585088, job 102704104941](https://github.com/antflydb/antfly/actions/runs/34420585088/job/102704104941?pr=692) | This change | Filesystem GET keeps metadata and payload on one open descriptor across atomic publication; see [deterministic reproduction and validation](../FLAKES.md#serverless-build-status-preconditionfailed-during-publication-692). |
 | `test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities` | [PR #690, run 34395199129, job 102623777993](https://github.com/antflydb/antfly/actions/runs/34395199129/job/102623777993?pr=690) | This change | Resolver work moved out of refresh; per-group Raft apply deferral preserves healthy progress; see [runtime investigation and validation](../FLAKES.md#autograph-second-document-write-timeout-690). |
 | `test_retrieval.py::test_retrieval_agent_streaming_fallback_progress` | [PR #657, run 34176604388, job 101914807099](https://github.com/antflydb/antfly/actions/runs/34176604388/job/101914807099?pr=657), head [`bc8f8a20d`](https://github.com/antflydb/antfly/commit/bc8f8a20d34534969decc90813fbcb8f390164f1) | [`47106c1fd`](https://github.com/antflydb/antfly/commit/47106c1fd09e9be5f1e3333363fd77d007813632) | Teardown recovery fixed; original reset cause unknown; 30/30 soak runs passed. |
@@ -97,17 +97,64 @@ cause of the matching failure signature. Baseline soak logs are retained in
 `/private/tmp/pr694-backup-fixed-soak.log` (the earlier scheduler/diagnostics-only
 change) and `/private/tmp/pr694-backup-transport-soak.log` (underlying error added).
 
-#### Table-create admission timeout during #694 validation (open)
+#### Table-create admission timeout during #694 validation
 
-Worker 1, iteration 11 of the fixed-runtime soak exhausted the existing
+Worker 1, iteration 11 of the first forwarding-fix soak exhausted the existing
 30-second create-admission budget after five HTTP 503 responses with
 `metadata_leader_unavailable`, `X-Antfly-Metadata-Mutation-Not-Admitted: true`,
 and `X-Antfly-Metadata-Not-Leader: true`. It had not reached seed writes or the
-changed batch forwarder. This is a recurrence of the earlier table-create
-failure stage; the current evidence does not establish its internal cause.
-It remains an open flake, not a reason to replay ambiguous writes or extend
-production deadlines. The full response and six process logs are in the final
-soak log above; the harness preserved the failed cluster directory as well.
+changed batch forwarder. The original six logs did not identify the internal
+cause, so they cannot prove which discovery defect occurred in that run.
+
+The [runtime investigation](../FLAKES.md#metadata-mutation-discovery-exhausts-admission-time-694)
+reproduced both a first-endpoint status probe consuming the entire mutation
+budget and a returned Raft role referencing a freed response buffer. Bounded
+endpoint probes, stable endpoint coverage, and role stabilization before
+response release fix those defects. Public retry policy, production deadlines,
+and the prohibition on replaying ambiguous writes remain unchanged.
+
+The live stalled-status reproduction failed before the fix with the same five
+pre-admission 503 responses, then passed the full backup/restore case afterward.
+The retained proxy test keeps every direct metadata node address available
+beside its stalled alternate route and activates the fault after bootstrap.
+This preserves a discoverable leader across elections. An earlier proxy version
+replaced one node address; elections could make that hidden node the only
+leader, violating the test's healthy-leader assumption.
+
+Exploratory validation is retained separately from the final soak:
+
+- A diagnostic baseline had one `AddressInUse` startup collision in 60 runs,
+  before the first public request; this was not the table-create failure.
+- Overlapping three-worker ordinary and three-worker proxy soaks with other
+  local builds raised host load above 100. The ordinary run passed 56/60:
+  three restore-progress retirement timeouts and one seed 409 after Raft apply
+  timeouts and thousands of transport send failures. The proxy run was stopped
+  to correct its endpoint assumption and reduce concurrent load. These results
+  do not establish that the discovery changes fix the separate stress failures.
+- Logs: `/private/tmp/pr694-create-full-diagnostic-soak.log`,
+  `/private/tmp/pr694-create-proxy-before.log`,
+  `/private/tmp/pr694-create-proxy-after.log`,
+  `/private/tmp/pr694-create-fixed-soak.log`, and
+  `/private/tmp/pr694-stalled-overlap-workers/`.
+
+Final validation on macOS ARM64, native Debug, with remote PR commits through
+`d0aa27d49` merged and the discovery/ownership and resolver-drain fixes applied:
+
+- **90/90 full backup/restore runs passed**: 60 ordinary and 30 with a stalled
+  alternate metadata status route. Three workers total; each ran ten rounds of
+  two ordinary tests followed by one faulted test. No table-create, seed-write,
+  backup, restore, or retirement failure occurred.
+- 100 metadata service, four data discovery/status, five resolver-backfill,
+  and 173 derived-coverage checks passed without leaks. All 134 Python
+  harness/scheduler checks passed, as did pinned Ruff, Zig format, and diff checks.
+- Log: `/private/tmp/pr694-final-merged-backup-soak.log`.
+- Executable SHA-256:
+  `bae3921f715c8e2f0e3a0d0aeb40088391d4600d611b473a79c3c618d87f28df`.
+
+The matching local reproductions establish concrete discovery defects; the
+original failed run's logs do not prove which one it encountered. The clean
+final soak is evidence of the merged behavior, not proof that unrelated
+higher-load or port-handoff failures are eliminated.
 
 ### Quickstart restart fixture and HA replication startup (#657)
 

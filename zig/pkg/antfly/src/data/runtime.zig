@@ -19689,16 +19689,27 @@ const RemoteMetadataSource = struct {
     ) !T {
         const deadline_ns = self.awakeNs() +|
             @as(u64, antfly.public_api.raft_mutation_forwarding.max_remaining_ms) * std.time.ns_per_ms;
-        const discovery_budget = antfly.metadata_http_client.RequestBudget{ .deadline_ns = deadline_ns, .io = self.io };
         var mutation_driver = antfly.public_api.raft_mutation_forwarding.AbsoluteDriver.init(deadline_ns);
         var last_pre_admission_err: anyerror = error.MissingMetadataApi;
         const fallback_indices = try std.heap.page_allocator.alloc(usize, self.base_uris.len);
         defer std.heap.page_allocator.free(fallback_indices);
         var endpoint_discovery = MetadataMutationEndpointDiscovery.init(fallback_indices);
+        // Snapshot the starting preference once. Other metadata requests can
+        // update affinity while this discovery is in flight; they must not
+        // make it skip an endpoint or probe the same endpoint twice.
+        const start_index = self.metadataApiIndexForAttempt(0);
         for (0..self.base_uris.len) |attempt| {
-            if (self.awakeNs() >= deadline_ns)
+            const now_ns = self.awakeNs();
+            if (now_ns >= deadline_ns)
                 return error.NotLeader;
-            const index = self.metadataApiIndexForAttempt(attempt);
+            const index = (start_index + attempt) % self.base_uris.len;
+            // A slow or unavailable status endpoint cannot consume the whole
+            // mutation budget. Give every remaining endpoint a turn and
+            // reserve one share for delivery to the discovered authority.
+            const discovery_budget = antfly.metadata_http_client.RequestBudget{
+                .deadline_ns = catalogRoutingAttemptDeadline(now_ns, deadline_ns, self.base_uris.len - attempt + 1),
+                .io = self.io,
+            };
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
@@ -19706,7 +19717,7 @@ const RemoteMetadataSource = struct {
             const status = metadata_client.fetchStatusWithBudget(self.base_uris[index], discovery_budget) catch |err| {
                 if (self.awakeNs() >= deadline_ns)
                     return error.NotLeader;
-                last_pre_admission_err = err;
+                last_pre_admission_err = if (err == error.Timeout) error.NotLeader else err;
                 continue;
             };
             self.acceptMetadataIdentity(status.metadata_group_id, status.metadata_incarnation) catch |err| {
@@ -19986,7 +19997,7 @@ const RemoteMetadataSource = struct {
                 continue;
             };
             self.noteMetadataReadSuccess(index);
-            return stabilizeMetadataStatus(status);
+            return status;
         }
         return last_err;
     }
@@ -21426,29 +21437,6 @@ fn cloneMetadataStatusOwned(
     var owned = status;
     owned.metadata_raft_role = try alloc.dupe(u8, status.metadata_raft_role);
     return owned;
-}
-
-fn stabilizeMetadataStatus(
-    status: antfly.metadata_api.MetadataStatus,
-) antfly.metadata_api.MetadataStatus {
-    var stable = status;
-    const stable_roles = [_][]const u8{
-        "absent",
-        "unknown",
-        "disabled",
-        "follower",
-        "pre_candidate",
-        "candidate",
-        "leader",
-    };
-    for (stable_roles) |role| {
-        if (std.mem.eql(u8, role, status.metadata_raft_role)) {
-            stable.metadata_raft_role = role;
-            return stable;
-        }
-    }
-    stable.metadata_raft_role = "unknown";
-    return stable;
 }
 
 fn retainCurrentReallocationRequestObservations(
@@ -33232,7 +33220,7 @@ test "data runtime remote metadata status stabilizes parser-backed role" {
     const alloc = std.testing.allocator;
     const source_role = try alloc.dupe(u8, "leader");
     defer alloc.free(source_role);
-    const status = stabilizeMetadataStatus(.{
+    const status = antfly.metadata_api.stabilizeMetadataStatus(.{
         .metadata_group_id = 1,
         .metadata_raft_role = source_role,
         .metrics = .{},
@@ -33241,7 +33229,7 @@ test "data runtime remote metadata status stabilizes parser-backed role" {
     try std.testing.expect(status.metadata_raft_role.ptr != source_role.ptr);
     @memset(source_role, 'x');
     try std.testing.expectEqualStrings("leader", status.metadata_raft_role);
-    const future = stabilizeMetadataStatus(.{
+    const future = antfly.metadata_api.stabilizeMetadataStatus(.{
         .metadata_group_id = 1,
         .metadata_raft_role = "future_role",
         .metrics = .{},
@@ -39845,6 +39833,83 @@ test "remote metadata mutation discovery preserves forwarding budget for the con
     var leaderless_discovery = RemoteMetadataSource.MetadataMutationEndpointDiscovery.init(&leaderless_storage);
     try std.testing.expect(leaderless_discovery.observe(9, leaderless) == null);
     try std.testing.expectEqualSlices(usize, &[_]usize{9}, leaderless_discovery.fallbacks());
+}
+
+test "remote metadata mutation discovery preserves endpoint coverage and delivery time" {
+    const alloc = std.testing.allocator;
+    const VoprIo = @import("vopr").vopr_io.VoprIo;
+    var virtual_io = try VoprIo.init(.{});
+    defer virtual_io.deinit();
+    const Probe = struct {
+        const Mode = enum { slow_first, slow_all, overshoot, affinity_changed };
+        clock: *VoprIo,
+        source: ?*RemoteMetadataSource = null,
+        mode: Mode,
+        probes: usize = 0,
+        mutations: usize = 0,
+
+        fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.probes += 1;
+            try std.testing.expectEqual(.GET, request.method);
+            const first = std.mem.startsWith(u8, request.uri, "http://stalled.test/");
+            if (self.mode == .slow_all or (first and self.mode != .affinity_changed)) {
+                self.clock.monotonic_ns += @as(u64, request.timeout_ms.?) * std.time.ns_per_ms;
+                if (self.mode == .overshoot) self.clock.monotonic_ns += 5 * std.time.ns_per_s;
+                return error.Timeout;
+            }
+            if (first) self.source.?.noteMetadataAuthoritySuccess(1);
+            return .{
+                .status = 200,
+                .body = try std.json.Stringify.valueAlloc(allocator, antfly.metadata_api.MetadataStatus{
+                    .metadata_group_id = 9,
+                    .metadata_incarnation = .{'1'} ** 32,
+                    .metadata_raft_local_node_id = if (first) 1 else 2,
+                    .metadata_raft_leader_id = 2,
+                    .metadata_raft_role = if (first) "follower" else "leader",
+                    .metrics = .{},
+                }, .{}),
+            };
+        }
+
+        fn deliver(
+            _: *RemoteMetadataSource,
+            _: *antfly.metadata_http_client.MetadataHttpClient,
+            base_uri: []const u8,
+            forwarding: antfly.public_api.raft_mutation_forwarding.Context,
+            self: *@This(),
+        ) !void {
+            try std.testing.expectEqualStrings("http://leader.test", base_uri);
+            try std.testing.expect(forwarding.remaining_ms > 0);
+            try std.testing.expectEqual(@as(u8, 1), forwarding.forwards_remaining);
+            try std.testing.expect(forwarding.campaign_allowed);
+            self.mutations += 1;
+        }
+    };
+    for ([_]Probe.Mode{ .slow_first, .slow_all, .overshoot, .affinity_changed }) |mode| {
+        virtual_io.monotonic_ns = 0;
+        var probe = Probe{ .clock = &virtual_io, .mode = mode };
+        var source = try RemoteMetadataSource.initWithRequestExecutors(
+            alloc,
+            &.{ "http://stalled.test", "http://leader.test" },
+            &.{.{ .ptr = &probe, .vtable = &.{ .execute = Probe.execute } }},
+            virtual_io.io(),
+        );
+        defer source.deinit();
+        probe.source = &source;
+        switch (mode) {
+            .slow_first, .affinity_changed => {
+                try source.withMetadataMutationApiClient(void, Probe.deliver, &probe);
+                try std.testing.expectEqual(@as(usize, 1), probe.mutations);
+            },
+            .slow_all, .overshoot => {
+                try std.testing.expectError(error.NotLeader, source.withMetadataMutationApiClient(void, Probe.deliver, &probe));
+                try std.testing.expectEqual(@as(usize, 0), probe.mutations);
+            },
+        }
+        try std.testing.expectEqual(@as(usize, if (mode == .overshoot) 1 else 2), probe.probes);
+        if (mode != .overshoot) try std.testing.expect(virtual_io.monotonic_ns < 5 * std.time.ns_per_s);
+    }
 }
 
 test "remote metadata source retains mutation authority across cache invalidation" {

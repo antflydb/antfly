@@ -968,6 +968,12 @@ class ThreeByThreeBackupCluster:
             )
 
     def debug_logs(self) -> str:
+        try:
+            statuses = _metadata_status_observations(
+                self.metadata_statuses(request_timeout_s=1.0)
+            )
+        except RuntimeError as exc:
+            statuses = f"status probe unavailable: {exc}"
         for handle in self.metadata_log_files:
             handle.flush()
         for handle in self.data_log_files:
@@ -976,6 +982,7 @@ class ThreeByThreeBackupCluster:
             f"[metadata-{i + 1}]\n{_read_log_tail(path)}"
             for i, path in enumerate(self.metadata_log_paths)
         ]
+        parts.append(f"[live-metadata-statuses]\n{statuses!r}")
         parts.extend(
             f"[data-{i + 4}]\n{_read_log_tail(path)}"
             for i, path in enumerate(self.data_log_paths)
