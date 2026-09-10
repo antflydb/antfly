@@ -120,3 +120,8 @@ Requests and derived-readiness polling are bounded; failures abort the scenario
 instead of becoming successful latency samples. These workloads measure the
 catalog integration and resolver/graph path, not vector-search quality, inference
 throughput, large-document indexing, or multi-machine network capacity.
+
+Management reads and DDL are measured through the public API. Catalog and
+resolution setup observes visibility-pending create acknowledgements with GET
+and then waits for published shard leaders. It never replays a create to obtain
+its response, and it does not retry measured requests or ambiguous writes.

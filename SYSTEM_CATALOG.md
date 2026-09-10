@@ -181,7 +181,9 @@ physical-name index with its table manager. Indexes are rebuilt before checkpoin
 publication and restored with rollback state; their keys borrow the owned records.
 Resolution and mutation planning use the owned indexes under the existing
 metadata lock. Physical collision checks use the table manager’s name/ID indexes;
-planning enumerates only affected children. Publication still clones, indexes,
+planning enumerates only affected children. Legacy adoption retains physical names
+in the mutation arena so replacing a table-manager record cannot invalidate a
+pending binding. Publication still clones, indexes,
 and checkpoints the complete standalone state, so total standalone mutation
 cost remains proportional to catalog size.
 

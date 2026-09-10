@@ -1064,6 +1064,8 @@ pub const RequestLifecycleHook = struct {
 /// ingress lifecycle because DataServer uses it to expose completed query
 /// work only after storage/read leases have been released. Implementations may
 /// suspend, so callers must reach it only while owning the response bytes.
+/// String fields are borrowed for the hook invocation. Observers retaining an
+/// event beyond that invocation must copy them into their own storage.
 pub const QueryResultLifecycleEvent = struct {
     operation_id: []const u8,
     table_name: []const u8,
@@ -23244,7 +23246,8 @@ fn parseTestStringValuesAlloc(alloc: std.mem.Allocator, json: []const u8) !Owned
 
 fn testQueryHitSourcePathValue(hit: anytype, path: []const u8) ?std.json.Value {
     const source = hit._source orelse return null;
-    return json_helpers.extractJsonPathValue(source, path);
+    const value: std.json.Value = if (@TypeOf(source) == std.json.Value) source else .{ .object = source.map };
+    return json_helpers.extractJsonPathValue(value, path);
 }
 
 fn testOwnedHitSourcePathValue(hit: std.json.Value, path: []const u8) ?std.json.Value {
@@ -35180,8 +35183,13 @@ test "api http server exposes operation-specific query result assembly" {
         }
     };
     const Observer = struct {
+        alloc: std.mem.Allocator,
         events: [2]QueryResultLifecycleEvent = undefined,
         count: usize = 0,
+
+        fn deinit(self: *@This()) void {
+            for (self.events[0..self.count]) |event| self.alloc.free(event.table_name);
+        }
 
         fn hook(self: *@This()) QueryResultLifecycleHook {
             return .{ .ptr = self, .reach_fn = reach };
@@ -35190,12 +35198,14 @@ test "api http server exposes operation-specific query result assembly" {
         fn reach(ptr: *anyopaque, event: QueryResultLifecycleEvent) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.events[self.count] = event;
+            self.events[self.count].table_name = try self.alloc.dupe(u8, event.table_name);
             self.count += 1;
         }
     };
 
     var reads = FakeReads{};
-    var observer = Observer{};
+    var observer = Observer{ .alloc = alloc };
+    defer observer.deinit();
     var server = ApiHttpServer.init(alloc, .{
         .query_result_lifecycle_hook = observer.hook(),
     }, FakeSource.iface(), reads.source(), null);
@@ -47860,7 +47870,7 @@ test "api http server executes direct foreign table query through registry" {
     try std.testing.expect(DummyForeign.last_dsn == null);
 
     var cancellation = std.atomic.Value(bool).init(false);
-    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null, null, &cancellation, null, null)).?;
+    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null, null, CancellationToken.fromAtomic(&cancellation), null, null)).?;
     defer alloc.free(json);
 
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, json, .{});
@@ -47888,7 +47898,7 @@ test "api http server executes direct foreign table query through registry" {
             null,
             null,
             null,
-            &cancellation,
+            CancellationToken.fromAtomic(&cancellation),
             null,
             null,
         ),
@@ -47980,7 +47990,7 @@ test "api http server executes direct foreign table aggregations through registr
     ;
 
     var cancellation = std.atomic.Value(bool).init(false);
-    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null, null, &cancellation, null, null)).?;
+    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null, null, CancellationToken.fromAtomic(&cancellation), null, null)).?;
     defer alloc.free(json);
 
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, json, .{});

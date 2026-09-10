@@ -1145,6 +1145,7 @@ const LocalStandaloneMetadata = struct {
 
     const CatalogReader = struct {
         owner: *LocalStandaloneMetadata,
+        alloc: std.mem.Allocator,
         index: *const system_catalog.StateIndex,
         pub fn lookup(self: @This(), kind: system_catalog.Kind, parent: u64, name: []const u8) !?system_catalog.Resource {
             return self.index.find(kind, parent, name);
@@ -1167,16 +1168,18 @@ const LocalStandaloneMetadata = struct {
         }
         pub fn physicalByName(self: @This(), name: []const u8) !?system_catalog.PhysicalTable {
             const table = self.owner.manager.findTableByName(name) orelse return null;
-            return .{ .id = table.table_id, .name = table.name };
+            // Legacy adoption can replace the physical table before the delta
+            // is published. Retain its name in the mutation arena.
+            return .{ .id = table.table_id, .name = try self.alloc.dupe(u8, table.name) };
         }
         pub fn physicalById(self: @This(), id: u64) !?system_catalog.PhysicalTable {
             const table = self.owner.manager.tables.get(id) orelse return null;
-            return .{ .id = table.table_id, .name = table.name };
+            return .{ .id = table.table_id, .name = try self.alloc.dupe(u8, table.name) };
         }
     };
     fn planCatalogLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, command: system_catalog.Mutation) !system_catalog.Delta {
         const empty: system_catalog.StateIndex = .{};
-        const reader: CatalogReader = .{ .owner = self, .index = if (self.system_catalog_state) |*state| &state.index else &empty };
+        const reader: CatalogReader = .{ .owner = self, .alloc = alloc, .index = if (self.system_catalog_state) |*state| &state.index else &empty };
         return system_catalog.planWithReader(alloc, reader, self.systemCatalogState().next_id, command);
     }
 
@@ -9970,6 +9973,14 @@ test "system catalog standalone checkpoint preserves bindings and rolls back und
     var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
     defer metadata.deinit();
     const source = metadata.statusSource();
+    // An unbound legacy table gets a catalog binding when its placement is
+    // updated. Replacing the manager record must not invalidate delta strings.
+    try metadata.manager.upsertTable(.{ .table_id = 77, .name = "legacy" });
+    const adopt = try source.systemCatalog(alloc, .{}, .{ .mutate = .{ .mutation = .{ .action = .set_tablespace, .kind = .table, .name = "legacy" } } });
+    alloc.free(adopt);
+    const legacy = (try metadata.resolveSystemCatalogLocked(.{ .table = "legacy" })).?;
+    try std.testing.expectEqualStrings("legacy", legacy.name);
+    try std.testing.expectEqual(@as(u64, 77), legacy.table_id);
     const create_db = try source.systemCatalog(alloc, .{}, .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "analytics" } } });
     alloc.free(create_db);
     const create_table = try source.systemCatalog(alloc, .{}, .{ .mutate = .{

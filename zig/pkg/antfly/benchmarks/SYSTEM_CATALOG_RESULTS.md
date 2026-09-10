@@ -168,14 +168,12 @@ results are retained in the machine-readable artifact.
 | 10 | Join | 57.7 / 78.5 ms | 80.3 / 112.2 ms |
 | 10 | NDJSON ×20 | 542.1 / 556.8 ms | 672.1 / 833.3 ms |
 
-The distributed join and NDJSON medians regressed in these runs; host contention
-prevents attributing that difference to this change. One remaining source of
-metadata traffic is internal shard routing: the wire request does not carry the
-coordinator's prepared primary text-index selection, so the receiver still reads
-a query definition. Removing that read safely requires a versioned internal
-execution envelope that carries the selected indexes and catalog identity, with
-receiver validation and a compatibility fallback. It cannot be replaced by
-blindly skipping routing or reusing an unvalidated process-wide definition.
+The distributed join and NDJSON medians regressed in those runs; host contention
+prevents attributing that difference to the change. That revision still performed
+an internal shard definition read because its wire request lacked prepared index
+selection. The indexed-management and prepared-routing follow-up below implements
+a versioned internal envelope with matching identity/fence validation and a legacy
+fallback, then measures the distributed workload again.
 
 One updated redirect run and one baseline rerun timed out while a document shard
 held the source document but its graph remained empty. Those failures are not
@@ -191,6 +189,101 @@ Independent regression checks verify one prefix scan for 100 repeated mentions,
 one bulk read for their shared missing redirect, identity retention across retries
 and joins, one reused NDJSON definition with administrative snapshots disabled,
 and legacy/missing lookups within a 4 KiB allocator with 1,000 unrelated databases.
+
+## Indexed management, prepared routing, and owning-shard reads
+
+Production baseline `c4971e9d5`; updated production sources `ddfb52448`. Both
+include `origin/main` at `8211fc92c`. These are sequential Debug-build runs on
+one shared macOS ARM64 host, with no own build or test workloads running during
+measurement. They are not isolated capacity measurements. Complete settings,
+binary hashes, all catalog sizes, steady graph reads, intermediate results, and
+failed-run diagnostics are in [the machine-readable results](system_catalog_indexed_workloads_2026_09_10.json).
+A subsequent ownership fix retains legacy standalone table names through mutation
+publication; it does not change the measured distributed paths.
+
+The implementation uses transaction-backed point reads and covering parent
+indexes for management, reverse references for DDL dependencies, a versioned
+prepared-query header checked against the catalog fence, and bounded candidate
+batches partitioned by owning shard. Derived rows are written atomically and
+rebuilt from primary records after reopen/snapshot installation.
+
+### Multi-tenant management
+
+Three metadata and three data nodes; 10, 100, and 1,000 tenant databases, each
+with its default namespace. Ten samples after two warmups per sequential
+operation. Four concurrent clients perform 20 reads and 20 namespace create/drop
+cycles in total. Create/drop and rename timings are complete round trips; rename
+includes a GET that verifies identity. Database provisioning is reported separately.
+
+| Operation at 1,000 tenants | Before p50 / p95 (ms) | After p50 / p95 (ms) |
+| --- | --- | --- |
+| Named GET | 47.5 / 57.0 | 24.8 / 26.9 |
+| List all databases | 52.4 / 56.9 | 28.2 / 44.3 |
+| Namespace create/drop | 264.7 / 294.3 | 131.1 / 183.9 |
+| Rename round trip | 264.3 / 311.9 | 129.4 / 167.3 |
+| Concurrent named GET | 62.7 / 150.8 | 26.3 / 58.2 |
+| Concurrent namespace create/drop | 421.9 / 630.5 | 184.2 / 258.9 |
+
+An intermediate implementation fetched each listed record through a separate
+primary seek: its 1,000-tenant list median regressed to 146.1 ms. The final
+covering parent index reduced that to 28.2 ms. The intermediate run is retained
+in the artifact, not used as the baseline. Small-catalog medians were mixed:
+for example, 10-tenant named GET rose from 13.9 to 26.8 ms. The results support
+better scale behavior, not a universal improvement at every size.
+
+### Distributed application operations
+
+Ten scoped tables; 20 samples after two warmups. NDJSON contains 20 queries;
+concurrent lookup uses four clients with 20 requests each. All before/after
+operations completed. The earlier 100-table failure above was not rerun in this
+comparison, so these results do not establish reliability at that scale.
+
+| Operation | Before p50 / p95 (ms) | After p50 / p95 (ms) |
+| --- | --- | --- |
+| Qualified lookup | 26.7 / 48.0 | 25.3 / 33.5 |
+| Qualified query | 51.8 / 75.1 | 26.2 / 45.9 |
+| Qualified join | 82.8 / 103.3 | 65.2 / 79.1 |
+| NDJSON ×20 | 787.1 / 945.4 | 540.8 / 559.0 |
+| Scoped table listing | 26.3 / 72.0 | 25.2 / 32.9 |
+| Concurrent lookup | 26.6 / 31.8 | 38.7 / 54.8 |
+| Table rename | 38.9 / 58.9 | 30.0 / 50.2 |
+
+### Entity resolution across eight shards
+
+Three document shards and eight entity shards. Redirect workloads seed a unique
+alias and curated survivor for every mention. Each size uses two warmup documents
+and five measured documents, followed by ten steady graph reads per mode. The
+interval runs from source write to graph hydration and includes polling. Clustered
+keys share an owner; spread keys use hexadecimal prefixes across the initial
+ranges. Benchmark redirects keep each survivor near its alias. A separate E2E
+regression covers redirects crossing owners and 100 repeated mentions.
+
+| Key layout | Mentions | Before p50 / p95 (ms) | After p50 / p95 (ms) |
+| --- | --- | --- | --- |
+| Clustered | 10 | 1115.2 / 1325.5 | 955.4 / 1006.2 |
+| Clustered | 100 | 1595.2 / 1621.6 | 1232.4 / 1400.7 |
+| Spread | 10 | 1527.0 / 1667.9 | 1413.3 / 1486.2 |
+| Spread | 100 | 2403.8 / 2966.1 | 1289.1 / 1626.0 |
+
+Two baseline attempts stopped during setup because the create acknowledgement
+had no table projection yet. The harness now observes visibility with GET before
+waiting for shard readiness, without replaying the create. A subsequent spread
+baseline failed an entity seed write with HTTP 503 `write unavailable`; a fresh
+cluster run completed. Those failures are recorded separately and are not latency
+samples. No measured requests or ambiguous writes were retried. Both updated
+layouts completed. This is not evidence that the previously observed intermittent
+empty-graph or storage-read failures are resolved.
+
+### Isolated algorithm scale
+
+ReleaseFast microbenchmarks compare related-label lookup by repeated scans versus
+an indexed projection, and rebuilding a planner index for each rename versus a
+retained reader. At 1,000/10,000 tenants, listing projection took 0.992/145.478 ms
+with scans and 0.009/0.082 ms with indexes. Rename planning with a rebuilt index
+took 2.346/34.137 ms, versus 3.881/7.559 microseconds with the retained reader.
+These are algorithm comparisons within the new harness, not measured DDL timings
+from the previous server binary. Distributed DDL still includes Raft; standalone
+publication still clones and checkpoints the complete catalog.
 
 ## Reproduction
 

@@ -176,15 +176,29 @@ def server(binary: Path, deployment: str):
             instance.stop()
 
 
-def wait_for_catalog_shards(api: Api, instance, created: dict, args) -> float:
+def wait_for_catalog_shards(
+    api: Api, instance, created: dict, args, path: str
+) -> float:
     """Keep asynchronous shard bootstrap outside steady-state measurements."""
     if not isinstance(instance, MultiNodeScalingCluster):
         return 0.0
-    groups = {int(group) for group in created["shards"]}
-    if not groups:
-        raise RuntimeError("created table has no shards")
     start = time.perf_counter()
     deadline = start + args.readiness_timeout
+    # A committed create may return a visibility-pending acknowledgement.
+    # Observe the table with GET; never replay the mutation to obtain its body.
+    observed = created
+    while not observed.get("shards"):
+        if time.perf_counter() >= deadline:
+            raise RuntimeError(
+                f"created table visibility timed out: {path}, {observed}"
+            )
+        try:
+            observed = api.request("GET", path)
+        except (requests.RequestException, RuntimeError) as error:
+            observed = {"observation_error": str(error)}
+        if not observed.get("shards"):
+            time.sleep(min(args.poll_ms / 1000, max(0, deadline - time.perf_counter())))
+    groups = {int(group) for group in observed["shards"]}
     pending = list(instance.metadata_urls)
     while pending:
         for url in pending.copy():
@@ -274,7 +288,9 @@ def catalog_scenario(args, binary: Path) -> dict:
                         )
                 creates.append((time.perf_counter_ns() - start) / 1e6)
                 shard_readiness.append(
-                    wait_for_catalog_shards(api, instance, created, args)
+                    wait_for_catalog_shards(
+                        api, instance, created, args, f"{scope}/tables/events_{i}"
+                    )
                 )
             previous = count
             table = f"events_{count - 1}"
@@ -503,7 +519,7 @@ def resolution_scenario(args, binary: Path) -> dict:
         entities = api.request(
             "POST", "/tables/entities", {"num_shards": args.entity_shards}
         )
-        wait_for_catalog_shards(api, instance, entities, args)
+        wait_for_catalog_shards(api, instance, entities, args, "/tables/entities")
         indexes = json.loads(json.dumps(DOCUMENTS_INDEXES))
         indexes["relations_graph"]["resolvers"][0]["candidate_search"] = (
             "prefix" if args.resolution_workload == "prefix" else "exact_key"
@@ -521,7 +537,7 @@ def resolution_scenario(args, binary: Path) -> dict:
         documents = api.request(
             "POST", "/tables/documents", {"num_shards": 3, "indexes": indexes}
         )
-        wait_for_catalog_shards(api, instance, documents, args)
+        wait_for_catalog_shards(api, instance, documents, args, "/tables/documents")
         checkpoints = []
         for mentions in sorted(set(args.mentions)):
             print(
