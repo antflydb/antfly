@@ -4388,6 +4388,7 @@ pub fn build(b: *std.Build) void {
         "created graph index response projects closed nested schemas",
         "index encoders expose graph sources once in normalized config",
         "api http client round-trips public status and internal capability routes",
+        "api http client requires explicit not-proposed marker and tracks delivery phase",
         "index activation client preserves progress and transport classifications",
         "api http retryable embedding failures provide retry guidance",
         "api http server obtains query embedding policy from resource manager",
