@@ -121,6 +121,7 @@ jobs:
             scripts/run_db_query_matrix.py \
             scripts/test_run_db_query_matrix.py \
             scripts/test_conformance_fixtures.py \
+            ':(glob)scripts/bench/pdf/**' \
             Makefile \
             .github/workflows/zig-tests.yml \
             .github/workflows/antfly-container.yml
@@ -364,6 +365,7 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
+          python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py'
 
       - name: Check inference kernel generator
         working-directory: zig/pkg/inference
@@ -659,6 +661,7 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
+          python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py'
 
       # Keep normal build-step parallelism while bounding aggregate compiler
       # memory to the pod's cgroup budget.

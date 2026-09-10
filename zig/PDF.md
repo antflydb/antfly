@@ -4489,6 +4489,34 @@ provenance.
 
 ### Real-model qualification
 
+The follow-up qualification workflow extends existing family gates; it does not
+replace their fixtures, precision/backend requirements or numerical tolerances.
+See [`scripts/bench/pdf/QUALIFICATION.md`](../scripts/bench/pdf/QUALIFICATION.md).
+
+- Model layer: native versioned family reports remain authoritative. Qwen3's
+  Metal/CUDA gates additionally overlap independently prompted query/document
+  requests at mixed dimensions using existing parity/MRL validators. Gemma's
+  batching summary is versioned without changing its scheduler/performance gates.
+- Execution layer: a checked-in contract plan reuses capability, cancellation,
+  admission, per-item identity, linked/worker transport and distributed proxy
+  tests. Fake providers qualify these contracts, not real-model native fusion.
+- Document layer: a profiled two-consumer gate reuses the real PDF benchmark and
+  output signatures, requires both precommit/replay at two memory caps, and checks
+  physical render multiplicity and tracked window bounds. Unprofiled paired
+  completed-indexing performance remains a separate experiment.
+
+The thin runner retains exact gate scopes, native verdicts, command logs, versioned
+report hashes, source and local artifact fingerprints. Missing/skipped evidence,
+schema mismatch, failed processes and source/artifact drift cannot produce a
+passing full-plan result. Local hashes do not attest a remote deployment, and
+represented layers do not imply matching model/deployment coverage.
+
+These scripts and their hermetic tests are not evidence that the exact artifacts
+passed on hardware. The current document benchmark still pins Florence/BGE on
+Metal; generator, multimodal embedder, extractor, reranker and chunker document
+hardware lanes, semantic PDF oracles and accelerator/RSS measurements require
+separate qualification. GLiNER training parity does not qualify serving fusion.
+
 The non-hermetic release gate renders the same two-page fixture and sends its
 pages through actual remote Antfly reader, generator, and embedder contracts:
 
