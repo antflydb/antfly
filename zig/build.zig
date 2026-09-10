@@ -3617,6 +3617,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "preload model spec parser categorizes registry variants and backends",
             "inference runtime preload parser preserves registry variants and explicit backends",
+            "inference run config",
             "inference list accepts models directory before or after flags",
         },
         .test_runner = .{

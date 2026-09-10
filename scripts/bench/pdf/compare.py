@@ -132,7 +132,12 @@ def comparable_pair(before, after, trials):
 
 
 def summarize(pairs, trials):
-    report = {"pairs": [], "timing_comparable": True, "timings": None}
+    report = {
+        "schema": "antfly.pdf.comparison.v1",
+        "pairs": [],
+        "timing_comparable": True,
+        "timings": None,
+    }
     for pair in pairs:
         errors = comparable_pair(pair["main"], pair["pr"], trials)
         for subject in ("main", "pr"):
@@ -270,6 +275,11 @@ def run_subject(args, out, index, subject):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-dir", type=Path, required=True)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Fresh evidence directory; defaults to WORK_DIR/NAME",
+    )
     parser.add_argument("--circus-dir", type=Path, required=True)
     for subject in ("main", "pr"):
         parser.add_argument(f"--{subject}-binary", type=Path, required=True)
@@ -306,7 +316,7 @@ def main():
         getattr(args, f"{subject}_binary").resolve(strict=True)
     args.work_dir = args.work_dir.resolve(strict=True)
     args.circus_dir = args.circus_dir.resolve(strict=True)
-    out = args.work_dir / args.name
+    out = args.output if args.output is not None else args.work_dir / args.name
     out.mkdir()  # Never overwrite an existing experiment.
     save(
         out / "experiment.json",
