@@ -138,12 +138,12 @@ test "writer run store stages ownership atomically through allocation failures" 
 const Entry = struct {
     run: *Run,
     payload: ?*Payload = null,
-    pub const Summary = struct { run_bytes: u64 = 0, manifest_bytes: u64 = 0 };
+    pub const Summary = struct { run_bytes: u64 = 0, manifest_bytes: u64 = 0, l0_files: usize = 0, l0_bytes: u64 = 0 };
     pub fn summarize(entry: Entry, left: Summary, right: Summary) Summary {
         const run = entry.run;
         const wire: u64 = if (run.path) |path| 112 + path.len + run.smallest_key.len + run.largest_key.len +
             (if (run.smallest_namespace_name) |name| name.len else 0) + (if (run.largest_namespace_name) |name| name.len else 0) else 0;
-        return .{ .run_bytes = left.run_bytes +| right.run_bytes +| run.size_bytes, .manifest_bytes = left.manifest_bytes +| right.manifest_bytes +| wire };
+        return .{ .run_bytes = left.run_bytes +| right.run_bytes +| run.size_bytes, .manifest_bytes = left.manifest_bytes +| right.manifest_bytes +| wire, .l0_files = left.l0_files + right.l0_files + @intFromBool(run.level == 0), .l0_bytes = left.l0_bytes +| right.l0_bytes +| if (run.level == 0) run.size_bytes else 0 };
     }
     pub fn retainShared(self: Entry) Entry {
         _ = self.payload.?.owner.retain();
@@ -223,6 +223,12 @@ pub const Store = struct {
     }
     pub fn totalBytes(self: *const Store) u64 {
         return if (self.tree.root) |root| root.summary.run_bytes else 0;
+    }
+    pub fn l0Files(self: *const Store) usize {
+        return if (self.tree.root) |root| root.summary.l0_files else 0;
+    }
+    pub fn l0Bytes(self: *const Store) u64 {
+        return if (self.tree.root) |root| root.summary.l0_bytes else 0;
     }
     pub fn manifestBytes(self: *const Store) u64 {
         return if (self.tree.root) |root| root.summary.manifest_bytes else 0;

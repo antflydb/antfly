@@ -36818,9 +36818,16 @@ test "auto bulk max-window request waits for idle finish" {
     try std.testing.expect(try write_cache.finishExpiredAutoBulkIngestLocked(idle_finish_ns));
     const primary_after_idle = write_cache.entries.items[0].*.db.snapshotPrimaryLsmWriteStatsForTest().?;
     try std.testing.expectEqual(primary_before_idle.immutable_flushes, primary_after_idle.immutable_flushes);
-    try std.testing.expectEqual(primary_before_idle.manifest_writes, primary_after_idle.manifest_writes);
+    // Idle completion may settle pending manifest/obsolete-file metadata.
+    // Its contract is no forced SST publication, not zero metadata writes.
+    try std.testing.expectEqual(primary_before_idle.flushes, primary_after_idle.flushes);
+    try std.testing.expectEqual(primary_before_idle.table_file_writes, primary_after_idle.table_file_writes);
+    try std.testing.expectEqual(primary_before_idle.compactions, primary_after_idle.compactions);
     try std.testing.expect(!write_cache.entries.items[0].*.auto_bulk_ingest_session_open);
     try std.testing.expectEqual(@as(usize, 0), write_cache.active_bulk_ingest_sessions.items.len);
+    try std.testing.expect(!try write_cache.finishExpiredAutoBulkIngestLocked(idle_finish_ns + 1));
+    const primary_after_recheck = write_cache.entries.items[0].*.db.snapshotPrimaryLsmWriteStatsForTest().?;
+    try std.testing.expectEqual(primary_after_idle.manifest_writes, primary_after_recheck.manifest_writes);
 }
 
 test "maintenance lease batch releases all pins on every allocation failure" {

@@ -22,6 +22,8 @@ const Directory = @import("run_directory.zig").Directory;
 const run_store = @import("run_store.zig");
 const ClosureJob = @import("closure_job.zig").Job;
 const DependencyValidation = @import("dependency_validation.zig").Validation;
+pub const BulkPolicy = @import("bulk_selection.zig").Policy;
+const BulkSelection = @import("bulk_selection.zig").Job;
 const resource_manager_mod = @import("../resource_manager.zig");
 
 const State = state_mod.State;
@@ -2715,6 +2717,8 @@ pub fn compactBulkL0Tier(
     backend: *BackendType,
     fan_in: usize,
 ) !bool {
+    if (comptime @hasField(BackendType, "pending_bulk_plan"))
+        return compactBulkDirectory(backend, .{ .fan_in = fan_in, .max_bytes = backend.options.max_compaction_input_bytes }, false, 0);
     const plan = selectBulkL0Tier(
         &backend.runs,
         fan_in,
@@ -2735,6 +2739,8 @@ pub fn compactBulkL0DeltaSeal(
     backend: *BackendType,
     min_growth_factor: usize,
 ) !bool {
+    if (comptime @hasField(BackendType, "pending_bulk_plan"))
+        return compactBulkDirectory(backend, .{ .mode = .delta, .fan_in = min_growth_factor, .max_bytes = backend.options.max_compaction_input_bytes }, false, 0);
     if (min_growth_factor < 2) return false;
     const l0_count = countLeadingL0Runs(&backend.runs);
     if (l0_count < 2) return false;
@@ -2797,6 +2803,8 @@ pub fn compactBulkL0TierScheduledBeforeSequence(
     score: u64,
     before_sequence: u64,
 ) !bool {
+    if (comptime @hasField(BackendType, "pending_bulk_plan"))
+        return compactBulkDirectory(backend, .{ .fan_in = fan_in, .max_bytes = backend.options.max_compaction_input_bytes, .sequence = before_sequence }, true, score);
     const plan = selectBulkL0Tier(
         &backend.runs,
         fan_in,
@@ -2809,6 +2817,394 @@ pub fn compactBulkL0TierScheduledBeforeSequence(
     defer grant.complete();
     try compactPlanAtOptionalMaintenance(BackendType, backend, plan);
     return true;
+}
+
+/// The scheduler asks whether discovery is due, never performs discovery.
+/// A negative result is cached for the exact epoch and policy. Actual jobs
+/// survive unrelated publications and validate identities before execution.
+pub fn bulkDirectoryPlanningDue(backend: anytype, policy: BulkPolicy) bool {
+    if (backend.pending_bulk_plan != null) return true;
+    if (backend.bulk_plan_negative_generation == backend.run_directory_generation and
+        backend.bulk_plan_negative_policy.eql(policy)) return false;
+    if (!backend.run_directory_dirty) if (backend.run_directory) |directory|
+        return directory.generationCount() >= @max(@as(usize, 2), policy.fan_in);
+    return backend.runs.l0Files() >= @max(@as(usize, 2), policy.fan_in);
+}
+
+pub const PendingBulkPlan = struct {
+    directory: *Directory,
+    generation: u64,
+    selection: BulkSelection,
+    phase: enum { select, emit, validate, done } = .select,
+    cursor: ?Directory.Cursor = null,
+    handles: ?[]Directory.Handle = null,
+    indices: ?[]usize = null,
+    emitted: usize = 0,
+    released: usize = 0,
+    selected: ?SelectedPlan = null,
+    validation: ?DependencyValidation = null,
+    reservation: ?resource_manager_mod.Reservation = null,
+    output_reservation: ?resource_manager_mod.Reservation = null,
+    retired_next: ?*@This() = null,
+    active_next: ?*@This() = null,
+
+    pub fn accountedMemoryBytes(self: *const @This(), pass: u64) u64 {
+        var bytes = self.directory.accountedMemoryBytes(pass);
+        if (self.validation) |validation| {
+            bytes +|= validation.directory.accountedMemoryBytes(pass);
+            if (validation.latest) |latest| bytes +|= latest.accountedMemoryBytes(pass);
+        }
+        return bytes;
+    }
+
+    fn create(backend: anytype, policy: BulkPolicy) !*@This() {
+        var credit: ?resource_manager_mod.Reservation = null;
+        errdefer if (credit) |*lease| lease.release();
+        if (backend.options.resource_manager) |manager|
+            credit = try manager.reserve(.lsm_table_builder_working_set, @sizeOf(@This()) + @sizeOf(Directory));
+        const directory = try (try backend.planningDirectory()).fork(backend.allocator);
+        errdefer directory.destroy(backend.allocator);
+        const self = try backend.allocator.create(@This());
+        self.* = .{ .directory = directory, .generation = backend.run_directory_generation, .selection = .init(directory, policy), .reservation = credit };
+        self.active_next = backend.active_bulk_plans;
+        backend.active_bulk_plans = self;
+        return self;
+    }
+    fn advanceLocked(self: *@This(), backend: anytype) !bool {
+        if (backend.manifestCoordinationIo()) |io| try io.checkCancel();
+        if (self.phase == .done) return true;
+        backend.directory_planning_slices +|= 1;
+        if (self.phase == .validate) {
+            if (self.validation == null) {
+                self.validation = try DependencyValidation.init(backend, self.selected.?.plan);
+                self.validation.?.job.indices = @constCast(self.selected.?.plan.run_indices.?);
+                self.selected.?.plan.run_indices = null;
+            }
+            const result = try self.validation.?.advanceLocked(backend);
+            if (result == .pending and self.validation.?.rebases < 4) return false;
+            self.phase = .done;
+            if (result == .valid) {
+                self.selected.?.plan.run_indices = self.validation.?.takeIndices();
+                self.selected.?.plan.complete_coverage = self.validation.?.job.covered;
+                self.selected.?.plan.validated_generation = backend.run_directory_generation;
+            }
+            return true;
+        }
+        backend.retainReaderKind(.compaction);
+        runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
+        const result = self.step(backend, 2048, @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms);
+        _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
+        backend.releaseReaderKind(.compaction);
+        try result;
+        return self.phase == .done;
+    }
+    fn step(self: *@This(), backend: anytype, credits_arg: usize, deadline: u64) !void {
+        var credits = credits_arg;
+        const allocator = backend.allocator;
+        if (self.phase == .select) {
+            if (self.selection.step(credits, deadline)) self.phase = if (self.selection.result != null) .emit else .done;
+            return;
+        }
+        const range = self.selection.result.?;
+        if (self.handles == null) {
+            if (backend.options.resource_manager) |manager|
+                self.output_reservation = try manager.reserve(.lsm_table_builder_working_set, range.len * (@sizeOf(Directory.Handle) + @sizeOf(usize)));
+            const handles = try allocator.alloc(Directory.Handle, range.len);
+            errdefer allocator.free(handles);
+            self.indices = try allocator.alloc(usize, range.len);
+            self.handles = handles;
+            self.cursor = self.directory.readCursor();
+            self.cursor.?.rank = range.start;
+        }
+        while (self.emitted < range.len and credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+            self.handles.?[self.emitted] = self.cursor.?.next().?.retain();
+            self.indices.?[self.emitted] = range.start + self.emitted;
+            self.emitted += 1;
+            credits -= 1;
+        }
+        if (self.emitted == range.len) {
+            self.selected = .{ .plan = .{ .source_level = 0, .source_start = 0, .source_len = range.len, .target_start = range.len, .target_len = 0, .output_level = 0, .run_indices = self.indices, .input_handles = self.handles }, .reservation = self.output_reservation };
+            self.output_reservation = null;
+            self.handles = null;
+            self.indices = null;
+            self.emitted = 0;
+            self.phase = .validate;
+        }
+    }
+    fn take(self: *@This()) ?SelectedPlan {
+        if (self.selected) |selected| if (selected.plan.validated_generation != null) {
+            self.selected = null;
+            return selected;
+        };
+        return null;
+    }
+    pub fn cleanupStep(self: *@This(), allocator: std.mem.Allocator, credits: *usize) bool {
+        if (self.validation) |*validation| if (!validation.cleanupStep(allocator, credits)) return false;
+        if (self.selected) |*selected| {
+            if (!selected.deinitStep(allocator, credits)) return false;
+            self.selected = null;
+        }
+        if (self.handles) |handles| {
+            while (self.released < self.emitted and credits.* != 0) {
+                handles[self.released].release(allocator);
+                self.released += 1;
+                credits.* -= 1;
+            }
+            if (self.released != self.emitted) return false;
+            allocator.free(handles);
+            self.handles = null;
+        }
+        if (self.indices) |indices| allocator.free(indices);
+        self.indices = null;
+        return true;
+    }
+    pub fn finish(self: *@This(), backend: anytype) void {
+        backend.unregisterBulkPlanning(self);
+        if (self.validation) |*validation| validation.deinit(backend);
+        backend.retireCheckpointDirectory(self.directory);
+        if (self.output_reservation) |*lease| lease.release();
+        if (self.reservation) |*lease| lease.release();
+        backend.allocator.destroy(self);
+    }
+    pub fn destroy(self: *@This(), backend: anytype) void {
+        var credits: usize = std.math.maxInt(usize);
+        std.debug.assert(self.cleanupStep(backend.allocator, &credits));
+        self.finish(backend);
+    }
+};
+
+fn compactBulkDirectory(backend: anytype, policy: BulkPolicy, scheduled: bool, score: u64) !bool {
+    if (scheduled and backend.bulk_plan_in_flight) return false;
+    if (scheduled and !bulkDirectoryPlanningDue(backend, policy)) return false;
+    if (scheduled) if (backend.pending_bulk_plan) |pending| if (!pending.selection.policy.eql(policy)) {
+        backend.retireBulkPlanning(pending);
+        backend.pending_bulk_plan = null;
+    };
+    const pending = if (scheduled and backend.pending_bulk_plan != null) backend.pending_bulk_plan.? else try PendingBulkPlan.create(backend, policy);
+    if (scheduled) backend.pending_bulk_plan = pending;
+    if (scheduled) backend.bulk_plan_in_flight = true;
+    defer if (scheduled) {
+        backend.bulk_plan_in_flight = false;
+    };
+    var retire = !scheduled;
+    defer if (retire) {
+        if (scheduled) backend.pending_bulk_plan = null;
+        backend.retireBulkPlanning(pending);
+    };
+    errdefer retire = true;
+    while (!try pending.advanceLocked(backend)) {
+        if (scheduled) return true; // A discovery quantum is scheduling progress.
+        if (backend.manifestCoordinationIo()) |io| {
+            backend.retainReaderKind(.compaction);
+            runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
+            const yielded = io.sleep(.fromNanoseconds(1), .awake);
+            _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
+            backend.releaseReaderKind(.compaction);
+            try yielded;
+        }
+    }
+    retire = true;
+    var selected = pending.take() orelse {
+        if (scheduled and pending.selection.result == null and pending.generation == backend.run_directory_generation) {
+            backend.bulk_plan_negative_generation = pending.generation;
+            backend.bulk_plan_negative_policy = policy;
+        }
+        return false;
+    };
+    defer selected.release(backend);
+    if (scheduled or policy.mode == .window) {
+        var work = try compactionWorkForPlan(backend.allocator, &backend.runs, selected.plan, score);
+        defer work.deinit(backend.allocator);
+        var grant = backend.acquireCompactionGrant(work) orelse return false;
+        defer grant.complete();
+        try compactPlanAtOptionalMaintenance(@TypeOf(backend.*), backend, selected.plan);
+    } else try compactPlanAt(@TypeOf(backend.*), backend, selected.plan);
+    return true;
+}
+
+test "bulk publication summaries match the flat oracle across budgets fences and epoch changes" {
+    const allocator = std.testing.allocator;
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        pub fn retainRunSnapshotRef(_: *@This(), _: *Run) !void {}
+        pub fn releaseRunSnapshotRef(_: *@This(), _: *Run) void {}
+    };
+    var fixture = Fixture{ .allocator = allocator };
+    for (0..24) |variant| {
+        const directory = try Directory.create(allocator);
+        defer directory.destroy(allocator);
+        var runs: std.ArrayListUnmanaged(Run) = .empty;
+        defer runs.deinit(allocator);
+        for (0..12) |group| for (0..1 + (group + variant) % 5) |file| {
+            const keys = [_][]const u8{ "a", "b", "c", "d", "e" };
+            var run = testRun(group * 8 + file + 1, 0, keys[file], keys[file], if (variant == 0) 0 else (1 + (group * 13 + variant * 7) % 19) * 100);
+            run.visibility_id = (group + 1) * 8;
+            run.tombstone_count = 0;
+            run.path = @constCast("bulk-fixture.sst");
+            try directory.put(&fixture, run);
+            try runs.append(allocator, run);
+        };
+        sortRuns(runs.items);
+        try std.testing.expectEqual(@as(usize, 12), directory.generationCount());
+        try std.testing.expectEqual(runs.items.len, directory.generationPrefix(12).files);
+        for ([_]usize{ 2, 4, 8 }) |fan_in| for ([_]u64{ 0, 2000, 10000 }) |limit| for ([_]u64{ 0, 48, 49 }) |ceiling| {
+            const expected = selectBulkL0Tier(runs.items, fan_in, limit, ceiling);
+            var job = BulkSelection.init(directory, .{ .fan_in = fan_in, .max_bytes = limit, .sequence = ceiling });
+            try std.testing.expect(!job.step(0, std.math.maxInt(u64)));
+            try std.testing.expect(!job.step(1, 0));
+            while (true) {
+                const before = job.visits;
+                const done = job.step(1, std.math.maxInt(u64));
+                try std.testing.expect(job.visits - before <= 1);
+                if (done) break;
+            }
+            try std.testing.expectEqual(expected == null, job.result == null);
+            if (expected) |plan| {
+                try std.testing.expectEqual(plan.source_start, job.result.?.start);
+                try std.testing.expectEqual(plan.source_len, job.result.?.len);
+            }
+        };
+        const pinned = try directory.fork(allocator);
+        defer pinned.destroy(allocator);
+        const removed = directory.at(0).run.*;
+        try directory.remove(allocator, &removed);
+        try std.testing.expectEqual(runs.items.len, pinned.generationPrefix(12).files);
+        try std.testing.expectEqual(runs.items.len - 1, directory.generationPrefix(12).files);
+        var moved = removed;
+        moved.level = 1;
+        try directory.put(&fixture, moved);
+        try std.testing.expectEqual(runs.items.len - 1, directory.generationPrefix(12).files);
+    }
+}
+
+test "bulk publication no-op scheduling scaling benchmark" {
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    const allocator = std.heap.smp_allocator;
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        pub fn retainRunSnapshotRef(_: *@This(), _: *Run) !void {}
+        pub fn releaseRunSnapshotRef(_: *@This(), _: *Run) void {}
+    };
+    var fixture = Fixture{ .allocator = allocator };
+    const clock = @import("antfly_platform").time;
+    for ([_]usize{ 1000, 10000, 50000 }) |count| {
+        const directory = try Directory.create(allocator);
+        defer directory.destroy(allocator);
+        var owner: run_store.Store = .{};
+        defer owner.deinit(allocator);
+        for (0..count) |i| {
+            var key: [8]u8 = undefined;
+            std.mem.writeInt(u64, &key, i, .big);
+            var run = testRun(i + 1, 0, &key, &key, 1024);
+            run.visibility_id = count;
+            run.tombstone_count = 0;
+            run.path = @constCast("bulk-benchmark.sst");
+            try directory.put(&fixture, run);
+            // The oracle only inspects level/sequence/bytes, not key bytes.
+            run.smallest_key = &.{};
+            run.largest_key = &.{};
+            run.owns_metadata = false;
+            try owner.append(allocator, run);
+        }
+        var started = clock.monotonicNs();
+        for (0..20) |_| try std.testing.expect(!hasBulkL0Tier(&owner, 4));
+        const old_ns = (clock.monotonicNs() - started) / 20;
+        var scheduler = .{ .pending_bulk_plan = @as(?*PendingBulkPlan, null), .bulk_plan_negative_generation = @as(?u64, null), .bulk_plan_negative_policy = BulkPolicy{}, .run_directory_generation = @as(u64, 1), .run_directory_dirty = false, .run_directory = @as(?*Directory, directory), .runs = &owner };
+        started = clock.monotonicNs();
+        for (0..1000000) |_| {
+            std.mem.doNotOptimizeAway(&scheduler);
+            try std.testing.expect(!bulkDirectoryPlanningDue(&scheduler, .{}));
+        }
+        const new_ns = @as(f64, @floatFromInt(clock.monotonicNs() - started)) / 1000000;
+        var job = BulkSelection.init(directory, .{});
+        try std.testing.expect(job.step(1, std.math.maxInt(u64)));
+        try std.testing.expect(job.result == null);
+        std.debug.print("bulk-summary files={d} old_check_ns={d} scheduler_check_ns={d:.3} generations={d} discovery_visits={d} summary_bytes={d}\n", .{ count, old_ns, new_ns, directory.generationCount(), job.visits, directory.generations.memoryBytes() });
+    }
+}
+
+test "bulk publication large generation discovery is time sliced" {
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    const allocator = std.heap.smp_allocator;
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        pub fn retainRunSnapshotRef(_: *@This(), _: *Run) !void {}
+        pub fn releaseRunSnapshotRef(_: *@This(), _: *Run) void {}
+    };
+    var fixture = Fixture{ .allocator = allocator };
+    const directory = try Directory.create(allocator);
+    defer directory.destroy(allocator);
+    for (0..10000) |i| {
+        var run = testRun(i + 1, 0, "a", "z", 1024);
+        run.path = @constCast("bulk-generations.sst");
+        run.tombstone_count = 0;
+        try directory.put(&fixture, run);
+    }
+    const clock = @import("antfly_platform").time;
+    var job = BulkSelection.init(directory, .{});
+    var slices: usize = 0;
+    var max_ns: u64 = 0;
+    const started = clock.monotonicNs();
+    while (true) {
+        const before = clock.monotonicNs();
+        const visits = job.visits;
+        const done = job.step(2048, before +| 2 * std.time.ns_per_ms);
+        try std.testing.expect(job.visits - visits <= 2048);
+        max_ns = @max(max_ns, clock.monotonicNs() - before);
+        slices += 1;
+        if (done) break;
+    }
+    try std.testing.expect(slices > 1);
+    try std.testing.expectEqual(@as(usize, 9996), job.result.?.start);
+    try std.testing.expectEqual(@as(usize, 4), job.result.?.len);
+    std.debug.print("bulk-discovery generations=10000 visits={d} slices={d} max_slice_ns={d} total_ns={d}\n", .{ job.visits, slices, max_ns, clock.monotonicNs() - started });
+}
+
+test "bulk publication admission and partial cleanup tolerate every allocation failure" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const allocator = std.testing.allocator;
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        pub fn retainRunSnapshotRef(_: *@This(), _: *Run) !void {}
+        pub fn releaseRunSnapshotRef(_: *@This(), _: *Run) void {}
+        fn check(alloc: std.mem.Allocator, source: *const Directory) !void {
+            var backend = Backend.init(alloc, .{});
+            defer backend.close();
+            backend.run_directory = try source.fork(alloc);
+            backend.run_directory_dirty = false;
+            var cursor = source.readCursor();
+            while (cursor.next()) |handle| {
+                var borrowed = handle.run.*;
+                borrowed.owns_metadata = false;
+                borrowed.owns_path = false;
+                try backend.runs.append(alloc, borrowed);
+            }
+            const locked = runtime_mod.lockBackend(Backend, &backend);
+            defer runtime_mod.unlockBackend(Backend, &backend, locked);
+            const pending = try PendingBulkPlan.create(&backend, .{ .fan_in = 2 });
+            defer pending.destroy(&backend);
+            var turns: usize = 0;
+            while (!try pending.advanceLocked(&backend)) {
+                turns += 1;
+                if (turns > 100) return error.TestUnexpectedResult;
+            }
+            try std.testing.expect(pending.selected != null);
+            while (true) {
+                var credits: usize = 1;
+                if (pending.cleanupStep(alloc, &credits)) break;
+            }
+        }
+    };
+    var fixture = Fixture{ .allocator = allocator };
+    const directory = try Directory.create(allocator);
+    defer directory.destroy(allocator);
+    for (0..4) |i| {
+        var run = testRun(i + 1, 0, "a", "z", 100);
+        run.path = @constCast("bulk-allocation.sst");
+        run.tombstone_count = 0;
+        try directory.put(&fixture, run);
+    }
+    try std.testing.checkAllAllocationFailures(allocator, Fixture.check, .{directory});
 }
 
 pub fn hasBulkL0Tier(runs: anytype, fan_in: usize) bool {
@@ -2886,6 +3282,10 @@ pub fn compactBulkL0WindowScheduled(
     first_sequence: u64,
     score: u64,
 ) !bool {
+    // Closing a durable window drains its own continuation; it must neither
+    // steal the background slot nor report success before that window settles.
+    if (comptime @hasField(BackendType, "pending_bulk_plan"))
+        return compactBulkDirectory(backend, .{ .mode = .window, .sequence = first_sequence, .max_bytes = backend.options.max_compaction_input_bytes }, false, score);
     if (first_sequence == 0) return false;
     const l0_count = countLeadingL0Runs(&backend.runs);
     var source_len: usize = 0;
@@ -4145,6 +4545,7 @@ fn selectL0OverlapCompactionCandidateWithStats(
 }
 
 fn countLeadingL0Runs(runs: anytype) usize {
+    if (comptime @TypeOf(runs) == *run_store.Store or @TypeOf(runs) == *const run_store.Store) return runs.l0Files();
     var l0_count: usize = 0;
     while (l0_count < run_store.len(runs) and run_store.get(runs, l0_count).level == 0) : (l0_count += 1) {}
     return l0_count;
@@ -5738,6 +6139,175 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
             };
         }
     };
+}
+
+/// One admitted, immutable input. Unknown counts are reconciled without
+/// changing read visibility, rewriting SSTs, or scanning unrelated runs.
+pub const PendingTombstoneReconcile = struct {
+    handle: Directory.Handle,
+    account: *@import("memory_account.zig").Account,
+    cursor: ?PersistedRunCursor = null,
+    state_cursor: State.EntryCursor = .{},
+    rows: usize = 0,
+    tombstones: u32 = 0,
+    complete: bool = false,
+    budget: ?resource_manager_mod.BudgetedAllocator = null,
+    reservation: ?resource_manager_mod.Reservation = null,
+
+    fn create(backend: anytype, handle: Directory.Handle) !*@This() {
+        var credit: ?resource_manager_mod.Reservation = null;
+        errdefer if (credit) |*lease| lease.release();
+        if (backend.options.resource_manager) |manager|
+            credit = try manager.reserve(.lsm_table_builder_working_set, @sizeOf(@This()));
+        const self = try backend.allocator.create(@This());
+        self.* = .{ .handle = handle.retain(), .account = handle.retainAccounting(), .reservation = credit, .budget = if (backend.options.resource_manager) |manager| .init(manager, .lsm_table_builder_working_set, backend.allocator, 1) else null };
+        return self;
+    }
+    fn step(self: *@This(), backend: anytype, credits_arg: usize, deadline: u64) anyerror!bool {
+        if (self.complete) return true;
+        var credits = credits_arg;
+        const run = self.handle.run;
+        const allocator = if (self.budget) |*budget| budget.allocator() else backend.allocator;
+        if (credits == 0 or @import("antfly_platform").time.monotonicNs() >= deadline) return false;
+        if (run.path) |path| {
+            if (self.cursor == null) {
+                self.cursor = try PersistedRunCursor.init(allocator, backend.storage.?, path);
+                if (self.cursor.?.index.entry_count != run.entry_count) return error.InvalidTableFile;
+                return false; // Index admission/I/O owns a separate quantum.
+            }
+        }
+        while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+            const deleted = if (self.cursor) |*cursor| blk: {
+                const entry = (try cursor.currentEntry()) orelse {
+                    if (self.rows != run.entry_count) return error.InvalidTableFile;
+                    return self.finishScan();
+                };
+                break :blk entry.tombstone;
+            } else blk: {
+                const source = if (run.state) |*source| source else return error.RunStateUnavailable;
+                if (self.rows == source.entryCount()) {
+                    if (self.rows != run.entry_count) return error.InvalidTableFile;
+                    return self.finishScan();
+                }
+                break :blk self.state_cursor.at(source, self.rows).tombstone;
+            };
+            self.rows += 1;
+            if (self.rows > run.entry_count) return error.InvalidTableFile;
+            self.tombstones += @intFromBool(deleted);
+            if (self.cursor) |*cursor| try cursor.advance();
+            credits -= 1;
+        }
+        return false;
+    }
+    fn finishScan(self: *@This()) bool {
+        if (self.cursor) |*cursor| cursor.deinit();
+        self.cursor = null;
+        if (self.budget) |*budget| budget.deinit();
+        self.budget = null;
+        self.complete = true;
+        return true;
+    }
+    fn releaseContents(self: *@This(), backend: anytype) void {
+        if (self.cursor) |*cursor| cursor.deinit();
+        if (self.budget) |*budget| budget.deinit();
+        self.handle.release(backend.allocator);
+    }
+    fn finish(self: *@This(), backend: anytype) void {
+        self.account.release();
+        if (self.reservation) |*lease| lease.release();
+        backend.allocator.destroy(self);
+    }
+    pub fn destroy(self: *@This(), backend: anytype) void {
+        self.releaseContents(backend);
+        self.finish(backend);
+    }
+};
+
+pub fn reconcileTombstonesStep(backend: anytype) anyerror!bool {
+    if (backend.tombstone_reconcile_in_flight) return false;
+    backend.tombstone_reconcile_in_flight = true;
+    defer backend.tombstone_reconcile_in_flight = false;
+    var release = false;
+    defer if (release) if (backend.pending_tombstone_reconcile) |pending| {
+        // Keep the admitted owner visible to accounting through reclamation.
+        backend.retainReaderKind(.other);
+        runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
+        pending.releaseContents(backend);
+        _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
+        backend.pending_tombstone_reconcile = null;
+        pending.finish(backend);
+        backend.releaseReaderKind(.other);
+    };
+    errdefer |err| {
+        // Publication admission can recover without rereading an already
+        // verified SST. Completed jobs retain only their small metadata pin.
+        release = !(err == error.ResourceBudgetExceeded and backend.pending_tombstone_reconcile != null and backend.pending_tombstone_reconcile.?.complete);
+        backend.tombstone_reconcile_failures +|= 1;
+        backend.tombstone_reconcile_failure_streak +|= 1;
+        const shift: u6 = @intCast(@min(backend.tombstone_reconcile_failure_streak - 1, 7));
+        backend.tombstone_reconcile_retry_ns = backend.nowNs() +| @min(@as(u64, 250 * std.time.ns_per_ms) << shift, 30 * std.time.ns_per_s);
+    }
+    const directory = try backend.planningDirectory();
+    if (backend.pending_tombstone_reconcile == null) {
+        const handle = directory.nextUnknownTombstone(backend.tombstone_reconcile_after_rank) orelse
+            directory.nextUnknownTombstone(0) orelse return false;
+        backend.tombstone_reconcile_after_rank = directory.rankOf(handle.run).? + 1;
+        backend.pending_tombstone_reconcile = try PendingTombstoneReconcile.create(backend, handle);
+    }
+    const pending = backend.pending_tombstone_reconcile.?;
+    if (directory.resolve(pending.handle) == null) {
+        release = true;
+        return true;
+    }
+    if (backend.manifestCoordinationIo()) |io| try io.checkCancel();
+    const before = pending.rows;
+    backend.retainReaderKind(.compaction);
+    runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
+    const result: anyerror!bool = pending.step(backend, 2048, @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms);
+    _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
+    backend.releaseReaderKind(.compaction);
+    backend.tombstone_reconcile_rows +|= pending.rows - before;
+    backend.directory_planning_slices +|= 1;
+    const done = result catch |err| {
+        if (pending.budget) |*budget| if (budget.denied()) return error.ResourceBudgetExceeded;
+        return @as(anyerror!bool, err);
+    };
+    if (!done) return true;
+    release = true;
+    const current = try backend.planningDirectory();
+    if (current.resolve(pending.handle) == null) return true;
+    const source = backend.runs.find(pending.handle.run).?;
+    var metadata = run_store.Store.revision(source, source.*);
+    metadata.tombstone_count = pending.tombstones;
+    // The original delete timestamp is unknowable. Zero is explicitly due,
+    // never a new grace period that repeated restarts can extend indefinitely.
+    metadata.oldest_tombstone_unix_ns = 0;
+    const plan = CompactionPlan{ .source_level = source.level, .source_start = 0, .source_len = 1, .target_start = 1, .target_len = 0, .output_level = source.level, .input_handles = &.{pending.handle} };
+    var credit = try backend.admitCompactionMetadata(plan, &.{metadata});
+    defer credit.release();
+    var publication_owned = true;
+    const retired = try backend.allocator.create(run_store.Store);
+    errdefer if (publication_owned) backend.allocator.destroy(retired);
+    var candidate = try backend.runs.prepareReplace(backend.allocator, source, metadata);
+    errdefer if (publication_owned) candidate.deinit(backend.allocator);
+    const updated = try current.fork(backend.allocator);
+    errdefer if (publication_owned) updated.destroy(backend.allocator);
+    try updated.put(backend, metadata);
+    backend.invalidateReadVersion();
+    retired.* = backend.runs;
+    backend.runs = candidate;
+    backend.retireRunStore(retired);
+    backend.publishRunDirectory(updated);
+    // Durable publication can fail after the live metadata has taken
+    // ownership. Leave that state dirty and retryable, never free it here.
+    publication_owned = false;
+    credit.commit();
+    backend.markManifestDirty();
+    backend.tombstone_reconcile_completed +|= 1;
+    backend.tombstone_reconcile_retry_ns = 0;
+    backend.tombstone_reconcile_failure_streak = 0;
+    if (backend.root_dir != null) try backend.persistManifestLocked();
+    return true;
 }
 
 const PersistedRunCursor = struct {

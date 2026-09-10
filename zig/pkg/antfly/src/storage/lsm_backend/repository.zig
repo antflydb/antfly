@@ -192,21 +192,24 @@ pub const Run = struct {
 };
 
 pub fn cloneRunSnapshot(allocator: Allocator, source: Run) !Run {
+    var metadata_owned = true;
     const smallest_namespace_name = if (source.smallest_namespace_name) |name| try allocator.dupe(u8, name) else null;
-    errdefer if (smallest_namespace_name) |name| allocator.free(name);
+    errdefer if (metadata_owned) if (smallest_namespace_name) |name| allocator.free(name);
     const smallest_key = try allocator.dupe(u8, source.smallest_key);
-    errdefer allocator.free(smallest_key);
+    errdefer if (metadata_owned) allocator.free(smallest_key);
     const largest_namespace_name = if (source.largest_namespace_name) |name| try allocator.dupe(u8, name) else null;
-    errdefer if (largest_namespace_name) |name| allocator.free(name);
+    errdefer if (metadata_owned) if (largest_namespace_name) |name| allocator.free(name);
     const largest_key = try allocator.dupe(u8, source.largest_key);
-    errdefer allocator.free(largest_key);
+    errdefer if (metadata_owned) allocator.free(largest_key);
+    const path = if (source.path) |path| try allocator.dupe(u8, path) else null;
+    errdefer if (metadata_owned) if (path) |owned| allocator.free(owned);
 
     var out = Run{
         .id = source.id,
         .level = source.level,
         .size_bytes = source.size_bytes,
         .compression_stats = source.compression_stats,
-        .path = if (source.path) |path| try allocator.dupe(u8, path) else null,
+        .path = path,
         .smallest_namespace_name = smallest_namespace_name,
         .smallest_key = smallest_key,
         .largest_namespace_name = largest_namespace_name,
@@ -223,6 +226,7 @@ pub fn cloneRunSnapshot(allocator: Allocator, source: Run) !Run {
         .table_index = null,
         .state = null,
     };
+    metadata_owned = false;
     errdefer out.deinit(allocator);
 
     if (source.path == null) {
@@ -233,14 +237,15 @@ pub fn cloneRunSnapshot(allocator: Allocator, source: Run) !Run {
 }
 
 pub fn cloneRunCompactionSnapshot(allocator: Allocator, source: Run) !Run {
+    var metadata_owned = true;
     const smallest_namespace_name = if (source.smallest_namespace_name) |name| try allocator.dupe(u8, name) else null;
-    errdefer if (smallest_namespace_name) |name| allocator.free(name);
+    errdefer if (metadata_owned) if (smallest_namespace_name) |name| allocator.free(name);
     const smallest_key = try allocator.dupe(u8, source.smallest_key);
-    errdefer allocator.free(smallest_key);
+    errdefer if (metadata_owned) allocator.free(smallest_key);
     const largest_namespace_name = if (source.largest_namespace_name) |name| try allocator.dupe(u8, name) else null;
-    errdefer if (largest_namespace_name) |name| allocator.free(name);
+    errdefer if (metadata_owned) if (largest_namespace_name) |name| allocator.free(name);
     const largest_key = try allocator.dupe(u8, source.largest_key);
-    errdefer allocator.free(largest_key);
+    errdefer if (metadata_owned) allocator.free(largest_key);
 
     var out = Run{
         .id = source.id,
@@ -265,6 +270,7 @@ pub fn cloneRunCompactionSnapshot(allocator: Allocator, source: Run) !Run {
         .table_index = null,
         .state = null,
     };
+    metadata_owned = false;
     errdefer out.deinit(allocator);
 
     if (source.path == null) {
@@ -278,6 +284,22 @@ pub fn ensureOpenDirs(root_dir: []const u8) !void {
     var native = try storage_io.NativeStorage.init(std.heap.page_allocator, .threaded);
     defer native.deinit();
     try ensureOpenDirsWithStorage(native.storage(), root_dir);
+}
+
+test "lsm snapshot clone has one metadata owner on state failure" {
+    const allocator = std.testing.allocator;
+    const source = Run{ .id = 1, .level = 0, .size_bytes = 1, .path = null, .smallest_namespace_name = @constCast("docs"), .smallest_key = @constCast("a"), .largest_namespace_name = @constCast("docs"), .largest_key = @constCast("z"), .entry_count = 1, .state = null, .bloom_filter = null, .owns_metadata = false };
+    try std.testing.expectError(error.RunStateUnavailable, cloneRunSnapshot(allocator, source));
+    try std.testing.expectError(error.RunStateUnavailable, cloneRunCompactionSnapshot(allocator, source));
+    const Fixture = struct {
+        fn check(alloc: Allocator, input: Run, compaction: bool) !void {
+            var snapshot = if (compaction) try cloneRunCompactionSnapshot(alloc, input) else try cloneRunSnapshot(alloc, input);
+            snapshot.deinit(alloc);
+        }
+    };
+    var valid = source;
+    valid.state = .{};
+    for ([_]bool{ false, true }) |compaction| try std.testing.checkAllAllocationFailures(allocator, Fixture.check, .{ valid, compaction });
 }
 
 pub fn ensureOpenDirsWithStorage(storage: storage_io.Storage, root_dir: []const u8) !void {

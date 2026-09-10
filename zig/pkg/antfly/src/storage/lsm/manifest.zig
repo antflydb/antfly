@@ -185,6 +185,13 @@ fn encodeAllocVersion(allocator: std.mem.Allocator, manifest: Manifest, encoded_
     return try bytes.toOwnedSlice(allocator);
 }
 
+/// Fixture encoder for databases written by main, not a runtime downgrade API.
+pub fn encodeMainlineFixture(allocator: std.mem.Allocator, manifest: Manifest, encoded_version: u32) ![]u8 {
+    if (!@import("builtin").is_test) @compileError("mainline fixture encoder is test-only");
+    std.debug.assert(encoded_version == 9 or encoded_version == 10);
+    return encodeAllocVersion(allocator, manifest, encoded_version);
+}
+
 fn putInt(comptime T: type, bytes: []u8, offset: *usize, value: T) void {
     std.mem.writeInt(T, bytes[offset.*..][0..@sizeOf(T)], value, .little);
     offset.* += @sizeOf(T);

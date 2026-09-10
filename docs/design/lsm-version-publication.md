@@ -1,5 +1,78 @@
 # LSM version publication
 
+## Logical-generation scheduling and unknown metadata
+
+The directory maintains a persistent L0 generation index alongside its file
+indexes. Each entry contains the publication sequence, physical file count and
+bytes; subtree summaries expose total files/bytes and the largest generation.
+Adding, replacing, moving or removing an SST stages these updates with the same
+directory publication. Pinned readers and planners retain the old summaries.
+The writer owner also maintains L0 count/byte totals, so foreground pressure
+checks and lower-level byte comparisons do not walk SST metadata.
+
+Scheduler probes use generation counts and an epoch/policy-specific negative
+cache. They never run the tier selector. Background selection owns one pinned
+directory and resumes in 2,048-operation / two-millisecond quanta off the backend
+mutex. It preserves the flat oracle's oldest compatible window policy, iterating
+logical generations rather than physical files. Selection may revisit generation
+windows; it does not claim a linear bound in the number of generations. Its work
+and memory are independent of the number of files per generation until a selected
+range is emitted. Delta-seal and explicit-window boundaries use logarithmic
+aggregate queries. Selected handles are emitted in bounded quanta, admitted by
+actual selection size, and pass the existing dependency certificate before use.
+Foreground hard-pressure and explicit-window callers drain their own jobs with
+`std.Io` yields instead of consuming the background continuation. Cancellation,
+policy changes, stale inputs and close reclaim partial ownership; background
+cleanup itself resumes in bounded off-lock quanta.
+
+Tombstone metadata distinguishes known zero, known nonzero and unknown. Mainline
+v9/v10 manifests remain readable, but their unknown counts now contribute explicit
+maintenance debt. An augmented directory query finds an unknown input without
+scanning unrelated files. A separate fair lane pins that input and streams its
+sequential index and checksum-verified blocks with an allocation-charged scratch
+budget. Index loading has its own quantum, followed by at most 2,048 entries or
+two milliseconds per turn. These are cooperative bounds: one storage operation
+or block decode may exceed the time target.
+
+After verifying entry counts, reconciliation releases its I/O scratch and
+publishes only updated immutable metadata through the normal manifest protocol.
+It does not rewrite the SST. Unknown delete ages remain zero (already eligible),
+not a fresh grace period. Concurrent input replacement invalidates the result;
+unrelated publications do not. Publication admission retains a completed count
+for retry without rereading the file. Read/corruption failures leave counts
+unknown, back off and rotate discovery so another input can make progress.
+Reopen uses the persisted count instead of repeating the scan. Maintenance
+diagnostics expose unknown runs, rows examined, reconciliations completed,
+failures and active bulk planning jobs.
+
+Regression coverage includes flat-oracle differential selection with byte caps
+and sequence fences, immutable generation replacement/removal/level moves,
+allocation failures, concurrent publication, old mainline manifests, partial
+close, corrupt blocks and publication-headroom retries. Reproduce from `zig/`:
+
+```sh
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -- --test-filter 'bulk publication' --test-filter 'unknown tombstone' --test-filter 'tiers committed runs' --test-filter 'snapshot clone has'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'bulk publication no-op scheduling scaling benchmark'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'bulk publication large generation discovery'
+```
+
+Local Apple Silicon / Zig 0.16 ReleaseFast measurements (synthetic hot metadata,
+not end-to-end write latency):
+
+| Physical SSTs in one generation | Previous tree-walking no-op check | New scheduler probe |
+| --- | ---: | ---: |
+| 1,000 | 30.4 µs | ~0.5 ns |
+| 10,000 | 802.1 µs | ~0.5 ns |
+| 50,000 | 4.68 ms | ~0.5 ns |
+
+All three inputs require one discovery operation and 1,072 bytes for the
+generation tree. The sub-nanosecond figure measures the hot constant-time branch
+in a tight loop; it is not a request-latency prediction. With 10,000 distinct
+generations, selection performed 39,995 visits over 20 slices, taking 2.10 ms
+total with a 121 µs maximum measured slice. These results establish file-count
+independence and bounded scheduling turns, not a worst-case linear discovery
+guarantee or a wall-clock deadline for storage I/O.
+
 ## Read epochs
 
 Read transactions pin mutable state, immutable memtables, and SST membership

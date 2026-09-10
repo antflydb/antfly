@@ -20,6 +20,7 @@ const repository = @import("repository.zig");
 const state = @import("state.zig");
 const Account = @import("memory_account.zig").Account;
 const Run = repository.Run;
+const generation_index = @import("generation_index.zig");
 
 const Payload = struct {
     refs: std.atomic.Value(usize) = .init(1),
@@ -37,6 +38,7 @@ const Entry = struct {
 
     pub const Summary = struct {
         tombstone_runs: usize = 0,
+        unknown_tombstone_runs: usize = 0,
         gc_requested: bool = false,
         oldest_tombstone: u64 = std.math.maxInt(u64),
         newest_tombstone: u64 = 0,
@@ -45,6 +47,7 @@ const Entry = struct {
         const deletes = (entry.run.tombstone_count orelse 0) != 0;
         return .{
             .tombstone_runs = left.tombstone_runs + right.tombstone_runs + @intFromBool(deletes),
+            .unknown_tombstone_runs = left.unknown_tombstone_runs + right.unknown_tombstone_runs + @intFromBool(entry.run.tombstone_count == null),
             .gc_requested = left.gc_requested or right.gc_requested or (deletes and entry.run.gc_requested),
             .oldest_tombstone = @min(left.oldest_tombstone, right.oldest_tombstone, if (deletes) entry.run.oldest_tombstone_unix_ns else std.math.maxInt(u64)),
             .newest_tombstone = @max(left.newest_tombstone, right.newest_tombstone, if (deletes) entry.run.oldest_tombstone_unix_ns else 0),
@@ -164,6 +167,7 @@ pub const Directory = struct {
     bounds: BoundsTree = .{},
     ends: EndsTree = .{},
     levels: LevelTree = .{},
+    generations: generation_index.Tree = .{},
     total_run_bytes: u64 = 0,
     memory_run_count: usize = 0,
     retired_next: ?*Directory = null,
@@ -180,6 +184,7 @@ pub const Directory = struct {
         out.bounds = self.bounds.fork();
         out.ends = self.ends.fork();
         out.levels = self.levels.fork();
+        out.generations = self.generations.fork();
         out.total_run_bytes = self.total_run_bytes;
         out.memory_run_count = self.memory_run_count;
         return out;
@@ -196,13 +201,14 @@ pub const Directory = struct {
         bounds: BoundsTree.Reclaimer,
         ends: EndsTree.Reclaimer,
         levels: LevelTree.Reclaimer,
+        generations: generation_index.Tree.Reclaimer,
 
         pub fn init(directory: *Directory) @This() {
             directory.retainAccounting();
-            return .{ .directory = directory, .tree = .init(directory.tree), .ids = .init(directory.ids), .bounds = .init(directory.bounds), .ends = .init(directory.ends), .levels = .init(directory.levels) };
+            return .{ .directory = directory, .tree = .init(directory.tree), .ids = .init(directory.ids), .bounds = .init(directory.bounds), .ends = .init(directory.ends), .levels = .init(directory.levels), .generations = .init(directory.generations) };
         }
         pub fn step(self: *@This(), allocator: std.mem.Allocator, credits: *usize) bool {
-            return self.tree.step(allocator, credits) and self.ids.step(allocator, credits) and self.bounds.step(allocator, credits) and self.ends.step(allocator, credits) and self.levels.step(allocator, credits);
+            return self.tree.step(allocator, credits) and self.ids.step(allocator, credits) and self.bounds.step(allocator, credits) and self.ends.step(allocator, credits) and self.levels.step(allocator, credits) and self.generations.step(allocator, credits);
         }
         /// Only after step reports completion, back under the accounting lock.
         pub fn finish(self: *@This(), allocator: std.mem.Allocator) void {
@@ -223,6 +229,8 @@ pub const Directory = struct {
         ends.deinit(allocator);
         var levels = self.levels;
         levels.deinit(allocator);
+        var generations = self.generations;
+        generations.deinit(allocator);
     }
 
     pub fn retainAccounting(self: *const Directory) void {
@@ -231,6 +239,7 @@ pub const Directory = struct {
         if (self.bounds.account) |account| _ = account.retain();
         if (self.ends.account) |account| _ = account.retain();
         if (self.levels.account) |account| _ = account.retain();
+        if (self.generations.account) |account| _ = account.retain();
     }
 
     pub fn releaseAccounting(self: *const Directory) void {
@@ -239,6 +248,7 @@ pub const Directory = struct {
         if (self.bounds.account) |account| account.release();
         if (self.ends.account) |account| account.release();
         if (self.levels.account) |account| account.release();
+        if (self.generations.account) |account| account.release();
     }
     pub fn put(self: *Directory, backend: anytype, run: Run) !void {
         const allocator = backend.allocator;
@@ -248,6 +258,7 @@ pub const Directory = struct {
         try self.bounds.prepare(allocator);
         try self.ends.prepareEdits(allocator, if (previous) |node| if (compareEnds(node.entry, .{ .run = &run }) != .eq) 2 else 1 else 1);
         try self.levels.prepare(allocator);
+        if (run.level == 0) try self.generations.prepare(allocator);
         const payload = try allocator.create(Payload);
         errdefer allocator.destroy(payload);
         var owned = try repository.cloneRunCompactionSnapshot(allocator, run);
@@ -292,6 +303,13 @@ pub const Directory = struct {
         // changing the read-order key. Remove its old secondary key first.
         if (previous) |node| if (compareEnds(node.entry, entry) != .eq) self.ends.removePrepared(allocator, node.entry);
         self.levels.putPrepared(allocator, level);
+        if (run.level == 0) {
+            const key = generation_index.Generation{ .sequence = generation_index.sequence(run) };
+            var generation = if (generation_index.Tree.find(self.generations.root, key)) |node| node.entry else key;
+            generation.files += @intFromBool(previous == null);
+            generation.bytes = generation.bytes - old_bytes + run.size_bytes;
+            self.generations.putPrepared(allocator, generation);
+        }
         self.tree.putPrepared(allocator, entry);
         self.ids.putPrepared(allocator, entry);
         self.bounds.putPrepared(allocator, entry);
@@ -303,6 +321,7 @@ pub const Directory = struct {
         try self.bounds.prepare(allocator);
         try self.ends.prepare(allocator);
         try self.levels.prepare(allocator);
+        if (run.level == 0) try self.generations.prepare(allocator);
         const existing = find(self.tree.root, .{ .run = run }) orelse return;
         // All run indexes own this payload until their prepared edits finish.
         const entry = existing.entry.retainShared();
@@ -314,6 +333,12 @@ pub const Directory = struct {
         level.tombstone_runs -= @intFromBool((entry.run.tombstone_count orelse 0) != 0);
         self.total_run_bytes -= entry.run.size_bytes;
         if (level.count == 0) self.levels.removePrepared(allocator, level) else self.levels.putPrepared(allocator, level);
+        if (entry.run.level == 0) {
+            var generation = generation_index.Tree.find(self.generations.root, .{ .sequence = generation_index.sequence(entry.run.*) }).?.entry;
+            generation.files -= 1;
+            generation.bytes -= entry.run.size_bytes;
+            if (generation.files == 0) self.generations.removePrepared(allocator, generation) else self.generations.putPrepared(allocator, generation);
+        }
         self.tree.removePrepared(allocator, entry);
         self.ids.removePrepared(allocator, entry);
         self.bounds.removePrepared(allocator, entry);
@@ -341,6 +366,14 @@ pub const Directory = struct {
             const account = payload.account;
             (Entry{ .run = self.run, .payload = payload }).deinit(allocator);
             account.release();
+        }
+        pub fn accountedMemoryBytes(self: @This(), pass: u64) u64 {
+            const payload: *const Payload = @ptrCast(@alignCast(self.revision));
+            return payload.account.chargeOnce(pass);
+        }
+        pub fn retainAccounting(self: @This()) *Account {
+            const payload: *const Payload = @ptrCast(@alignCast(self.revision));
+            return payload.account.retain();
         }
     };
 
@@ -660,7 +693,8 @@ pub const Directory = struct {
         return runs;
     }
     pub fn accountedMemoryBytes(self: *const Directory, pass: u64) u64 {
-        return @sizeOf(Directory) + (self.tree.spare.capacity + self.ids.spare.capacity + self.bounds.spare.capacity + self.ends.spare.capacity + self.levels.spare.capacity) * @sizeOf(*Tree.Node) +
+        return @sizeOf(Directory) + (self.tree.spare.capacity + self.ids.spare.capacity + self.bounds.spare.capacity + self.ends.spare.capacity + self.levels.spare.capacity + self.generations.spare.capacity) * @sizeOf(*Tree.Node) +
+            (if (self.generations.account) |account| account.chargeOnce(pass) else 0) +
             (if (self.tree.account) |account| account.chargeOnce(pass) else 0) +
             (if (self.ids.account) |account| account.chargeOnce(pass) else 0) +
             (if (self.bounds.account) |account| account.chargeOnce(pass) else 0) +
@@ -696,6 +730,28 @@ pub const Directory = struct {
 
     pub fn tombstoneRunCount(self: *const Directory) usize {
         return if (self.tree.root) |root| root.summary.tombstone_runs else 0;
+    }
+
+    pub fn unknownTombstoneRunCount(self: *const Directory) usize {
+        return if (self.tree.root) |root| root.summary.unknown_tombstone_runs else 0;
+    }
+    pub fn nextUnknownTombstone(self: *const Directory, after: usize) ?Handle {
+        const found = nextUnknown(self.tree.root, after, 0) orelse return null;
+        return .{ .run = found.entry.run, .revision = found.entry.payload.? };
+    }
+    fn nextUnknown(root: ?*const Tree.Node, after: usize, base: usize) ?*const Tree.Node {
+        const node = root orelse return null;
+        if (node.summary.unknown_tombstone_runs == 0 or base + node.count <= after) return null;
+        const rank = base + (if (node.left) |left| left.count else 0);
+        if (nextUnknown(node.left, after, base)) |found| return found;
+        if (rank >= after and node.entry.run.tombstone_count == null) return node;
+        return nextUnknown(node.right, after, rank + 1);
+    }
+    pub fn generationCount(self: *const Directory) usize {
+        return if (self.generations.root) |root| root.count else 0;
+    }
+    pub fn generationPrefix(self: *const Directory, count_arg: usize) generation_index.Generation.Summary {
+        return generation_index.prefix(self.generations.root, count_arg);
     }
 
     pub const TombstoneCursor = struct {

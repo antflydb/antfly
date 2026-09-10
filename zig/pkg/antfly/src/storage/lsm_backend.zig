@@ -846,6 +846,11 @@ pub const Backend = struct {
         read_version_builds: u64 = 0,
         domain_index_builds: u64 = 0,
         tombstone_entries: u64 = 0,
+        unknown_tombstone_runs: u64 = 0,
+        tombstone_reconcile_rows: u64 = 0,
+        tombstone_reconcile_completed: u64 = 0,
+        tombstone_reconcile_failures: u64 = 0,
+        bulk_planning_jobs: u64 = 0,
         read_version_pins: u64 = 0,
         mutable_entries: u64 = 0,
         mutable_bytes: u64 = 0,
@@ -955,6 +960,11 @@ pub const Backend = struct {
         dst.read_version_builds +|= src.read_version_builds;
         dst.domain_index_builds +|= src.domain_index_builds;
         dst.tombstone_entries +|= src.tombstone_entries;
+        dst.unknown_tombstone_runs +|= src.unknown_tombstone_runs;
+        dst.tombstone_reconcile_rows +|= src.tombstone_reconcile_rows;
+        dst.tombstone_reconcile_completed +|= src.tombstone_reconcile_completed;
+        dst.tombstone_reconcile_failures +|= src.tombstone_reconcile_failures;
+        dst.bulk_planning_jobs +|= src.bulk_planning_jobs;
         dst.read_version_pins +|= src.read_version_pins;
         dst.mutable_entries +|= src.mutable_entries;
         dst.mutable_bytes +|= src.mutable_bytes;
@@ -1593,6 +1603,22 @@ pub const Backend = struct {
     planner_seed: usize = 0,
     directory_planning_in_flight: bool = false,
     pending_directory_closure: ?*compaction_mod.PendingDirectoryClosure = null,
+    pending_bulk_plan: ?*compaction_mod.PendingBulkPlan = null,
+    active_bulk_plans: ?*compaction_mod.PendingBulkPlan = null,
+    retired_bulk_plans: ?*compaction_mod.PendingBulkPlan = null,
+    bulk_plan_in_flight: bool = false,
+    bulk_plan_reclaim_in_flight: bool = false,
+    bulk_plan_negative_generation: ?u64 = null,
+    bulk_plan_negative_policy: compaction_mod.BulkPolicy = .{},
+    pending_tombstone_reconcile: ?*compaction_mod.PendingTombstoneReconcile = null,
+    tombstone_reconcile_in_flight: bool = false,
+    tombstone_reconcile_after_rank: usize = 0,
+    tombstone_reconcile_retry_ns: u64 = 0,
+    tombstone_reconcile_turn: u64 = 0,
+    tombstone_reconcile_rows: u64 = 0,
+    tombstone_reconcile_completed: u64 = 0,
+    tombstone_reconcile_failures: u64 = 0,
+    tombstone_reconcile_failure_streak: u64 = 0,
     pending_l0_directory_closure: ?*compaction_mod.PendingDirectoryClosure = null,
     closure_service_l0_next: bool = false,
     pending_gc: ?*compaction_mod.PendingGc = null,
@@ -2219,6 +2245,10 @@ pub const Backend = struct {
             .obsolete_delete_retries = self.obsolete_delete_retries,
         };
         const obsolete_now_ns = self.nowNs();
+        stats.tombstone_reconcile_rows = self.tombstone_reconcile_rows;
+        stats.tombstone_reconcile_completed = self.tombstone_reconcile_completed;
+        stats.tombstone_reconcile_failures = self.tombstone_reconcile_failures;
+        stats.bulk_planning_jobs = @intFromBool(self.pending_bulk_plan != null);
         var obsolete_cursor = self.obsolete_paths.iterator();
         while (obsolete_cursor.next()) |obsolete| {
             // An open manifest independently pins the file even when its run
@@ -2260,6 +2290,7 @@ pub const Backend = struct {
                 const run = self.runs.at(i).*;
                 level_bytes += run.size_bytes;
                 stats.tombstone_entries +|= run.tombstone_count orelse 0;
+                stats.unknown_tombstone_runs +|= @intFromBool(run.tombstone_count == null);
                 stats.total_run_logical_entry_bytes +|= run.compression_stats.logical_entry_bytes;
                 stats.total_run_physical_entry_bytes +|= run.compression_stats.physical_entry_bytes;
                 stats.total_run_compressed_blocks +|= run.compression_stats.compressed_blocks;
@@ -2546,6 +2577,10 @@ pub const Backend = struct {
 
     fn maintenanceScoreLocked(self: *Backend) u64 {
         var score: u64 = 0;
+        if (self.pending_bulk_plan != null or self.retired_bulk_plans != null) score +|= 1;
+        if (self.tombstoneReconcileDelayLocked()) |delay| if (delay == 0) {
+            score +|= 1;
+        };
         if (self.pending_directory_closure != null or self.pending_l0_directory_closure != null or self.retired_closures != null) score += 1;
         if (self.pending_gc != null or self.retired_gc != null or self.directory_reclaimer != null or self.retired_run_directories != null) score +|= 1;
         if (self.retired_run_stores != null or self.store_reclaimer != null) score +|= 1;
@@ -2557,7 +2592,7 @@ pub const Backend = struct {
         const hard_limit_l0_runs = self.effectiveL0HardLimitRuns();
         const tiered_l0 = self.options.run_partition_key == null and self.options.bulk_ingest_tiered_l0_fan_in >= 2;
         const has_l0_tier = tiered_l0 and
-            compaction_mod.hasBulkL0Tier(&self.runs, self.options.bulk_ingest_tiered_l0_fan_in);
+            compaction_mod.bulkDirectoryPlanningDue(self, .{ .fan_in = self.options.bulk_ingest_tiered_l0_fan_in, .max_bytes = self.options.max_compaction_input_bytes });
         if (hard_limit_l0_runs > 0) {
             const l0_runs = if (directory) |root| root.levelStats(0).count else countLevelRuns(&self.runs, 0);
             if (l0_runs > hard_limit_l0_runs) {
@@ -2696,6 +2731,11 @@ pub const Backend = struct {
         if (self.manifest_checkpoint_directory) |directory| bytes +|= directory.accountedMemoryBytes(pass);
         if (self.pending_directory_closure) |pending| bytes +|= pending.directory.accountedMemoryBytes(pass);
         if (self.pending_l0_directory_closure) |pending| bytes +|= pending.directory.accountedMemoryBytes(pass);
+        var active_bulk = self.active_bulk_plans;
+        while (active_bulk) |pending| : (active_bulk = pending.active_next) bytes +|= pending.accountedMemoryBytes(pass);
+        if (self.pending_tombstone_reconcile) |pending| bytes +|= pending.account.chargeOnce(pass);
+        var retired_bulk = self.retired_bulk_plans;
+        while (retired_bulk) |pending| : (retired_bulk = pending.retired_next) bytes +|= pending.accountedMemoryBytes(pass);
         var retired_closure = self.retired_closures;
         while (retired_closure) |pending| : (retired_closure = pending.retired_next) bytes +|= pending.directory.accountedMemoryBytes(pass);
         if (self.pending_gc) |pending| bytes +|= pending.accountedMemoryBytes(pass);
@@ -2840,12 +2880,20 @@ pub const Backend = struct {
         if (self.wal_checkpoint_pending and self.walCheckpointRetryDueLocked()) {
             if (try self.runWalPressureMaintenanceStepLocked()) return true;
         }
+        // Reconciliation has its own fair lane. An unknown SST never means
+        // "zero deletes", and a large old run cannot monopolize maintenance.
+        self.tombstone_reconcile_turn +%= 1;
+        if (self.tombstone_reconcile_turn % 2 == 1 and !self.tombstone_reconcile_in_flight and
+            (self.tombstoneReconcileDelayLocked() orelse 1) == 0)
+        {
+            return try compaction_mod.reconcileTombstonesStep(self);
+        }
         // Ordinary leveled compaction remains deferred during bulk ingest, but
         // a pressured sorted-publication lane may stream one size-tier merge.
         // This prevents the import from reaching hard L0 pressure and then
         // repeatedly rewriting its entire overlapping lower-level base.
         if (self.bulkIngestActive()) {
-            if (!self.bulkTieredL0MaintenanceDueLocked()) return false;
+            if (!self.bulkTieredL0MaintenanceDueLocked()) return (self.tombstoneReconcileDelayLocked() orelse 1) == 0;
             self.maintenance_io_budget_remaining = if (self.options.background_io_budget_bytes > 0)
                 self.options.background_io_budget_bytes
             else
@@ -2962,6 +3010,7 @@ pub const Backend = struct {
         _ = self.refreshCachedMaintenanceHintLocked();
 
         return self.compaction_stats.compactions != before_compactions or
+            (self.tombstoneReconcileDelayLocked() orelse 1) == 0 or
             self.directory_planning_slices != planning_slices_before or
             self.write_stats.manifest_writes != before_manifest_writes or
             self.obsolete_paths.count() != before_obsolete_paths or
@@ -2981,7 +3030,7 @@ pub const Backend = struct {
         // continuous public upload and left hard-pressure compaction as the
         // only progress path.
         if (self.options.run_partition_key != null) return true;
-        return compaction_mod.hasBulkL0TierBeforeSequence(&self.runs, fan_in, before_sequence);
+        return compaction_mod.bulkDirectoryPlanningDue(self, .{ .fan_in = fan_in, .sequence = before_sequence, .max_bytes = self.options.max_compaction_input_bytes });
     }
 
     fn l0SoftPressureLocked(self: *const Backend) bool {
@@ -3377,6 +3426,7 @@ pub const Backend = struct {
         // to the explicit sync/publication operation that unlocked us.
         self.reclaimClosurePlanningSliceLocked();
         self.reclaimGcPlanningSliceLocked();
+        self.reclaimBulkPlanningSliceLocked();
         self.reclaimStoreSliceLocked();
         self.reclaimDirectorySliceLocked();
         var turns: usize = 0;
@@ -3513,6 +3563,49 @@ pub const Backend = struct {
     pub fn retireClosurePlanning(self: *Backend, pending: *compaction_mod.PendingDirectoryClosure) void {
         pending.retired_next = self.retired_closures;
         self.retired_closures = pending;
+    }
+
+    pub fn retireBulkPlanning(self: *Backend, pending: *compaction_mod.PendingBulkPlan) void {
+        self.unregisterBulkPlanning(pending);
+        pending.retired_next = self.retired_bulk_plans;
+        self.retired_bulk_plans = pending;
+    }
+    pub fn unregisterBulkPlanning(self: *Backend, pending: *compaction_mod.PendingBulkPlan) void {
+        var link = &self.active_bulk_plans;
+        while (link.*) |active| {
+            if (active == pending) {
+                link.* = active.active_next;
+                active.active_next = null;
+                return;
+            }
+            link = &active.active_next;
+        }
+    }
+    fn reclaimBulkPlanningSliceLocked(self: *Backend) void {
+        if (self.bulk_plan_reclaim_in_flight) return;
+        const pending = self.retired_bulk_plans orelse return;
+        self.bulk_plan_reclaim_in_flight = true;
+        defer self.bulk_plan_reclaim_in_flight = false;
+        self.retainReaderKind(.other);
+        self.mu.unlock();
+        var credits: usize = 2048;
+        var done = false;
+        const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+            var quantum: usize = @min(credits, 64);
+            const before = quantum;
+            done = pending.cleanupStep(self.allocator, &quantum);
+            credits -= before - quantum;
+            if (done) break;
+        }
+        _ = runtime_mod.lockBackend(Backend, self);
+        if (done) {
+            var link = &self.retired_bulk_plans;
+            while (link.*.? != pending) link = &link.*.?.retired_next;
+            link.* = pending.retired_next;
+            pending.finish(self);
+        }
+        self.releaseReaderKind(.other);
     }
 
     fn reclaimClosurePlanningSliceLocked(self: *Backend) void {
@@ -5696,6 +5789,14 @@ pub const Backend = struct {
     }
 
     pub fn destroyRunMetadata(self: *Backend) void {
+        if (self.pending_tombstone_reconcile) |pending| pending.destroy(self);
+        self.pending_tombstone_reconcile = null;
+        if (self.pending_bulk_plan) |pending| pending.destroy(self);
+        self.pending_bulk_plan = null;
+        while (self.retired_bulk_plans) |pending| {
+            self.retired_bulk_plans = pending.retired_next;
+            pending.destroy(self);
+        }
         if (self.pending_gc) |pending| pending.destroy(self);
         self.pending_gc = null;
         while (self.retired_gc) |pending| {
@@ -7115,22 +7216,14 @@ pub const Backend = struct {
     }
 
     fn snapshotL0PressureLocked(self: *const Backend) L0Pressure {
-        var pressure = L0Pressure{};
-        while (pressure.runs < self.runs.count() and self.runs.at(pressure.runs).*.level == 0) : (pressure.runs += 1) {
-            pressure.bytes += self.runs.at(pressure.runs).*.size_bytes;
-        }
-        return pressure;
+        return .{ .runs = self.runs.l0Files(), .bytes = self.runs.l0Bytes() };
     }
 
     fn bulkL0DeltaSealDueLocked(self: *const Backend, l0_bytes: u64) bool {
         const denominator = self.options.bulk_ingest_l0_delta_seal_ratio_denominator;
         if (denominator == 0 or l0_bytes == 0) return false;
 
-        var lower_bytes: u64 = 0;
-        var i = self.snapshotL0PressureLocked().runs;
-        while (i < self.runs.count()) : (i += 1) {
-            lower_bytes +|= self.runs.at(i).size_bytes;
-        }
+        const lower_bytes = self.runs.totalBytes() -| self.runs.l0Bytes();
         if (lower_bytes == 0) return false;
         const threshold = lower_bytes / denominator + @intFromBool(lower_bytes % denominator != 0);
         return l0_bytes >= threshold;
@@ -7772,7 +7865,12 @@ pub const Backend = struct {
         // an open bulk session exposes only resource/durability checkpoints.
         // In particular, a due routine task must not keep an external worker
         // spinning while bulk mode intentionally suppresses that task.
-        if (self.bulkIngestActive()) return self.nextWalCheckpointRetryDelayNsLocked();
+        if (self.bulkIngestActive()) {
+            if (self.pending_bulk_plan != null or self.bulkTieredL0MaintenanceDueLocked()) return 0;
+            const reconcile = self.tombstoneReconcileDelayLocked();
+            const wal_delay = self.nextWalCheckpointRetryDelayNsLocked();
+            return if (reconcile) |value| if (wal_delay) |wal_value| @min(value, wal_value) else value else wal_delay;
+        }
 
         var delay_ns = self.nextObsoleteReclaimDelayNsLocked();
         if (self.nextMutableIdleFlushDelayNsLocked()) |candidate| {
@@ -7787,7 +7885,17 @@ pub const Backend = struct {
         if (compaction_mod.nextTombstoneGcDelay(self)) |candidate| {
             delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
         }
+        if (self.tombstoneReconcileDelayLocked()) |candidate| delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+        if (self.pending_bulk_plan != null or self.retired_bulk_plans != null) return 0;
         return delay_ns;
+    }
+
+    fn tombstoneReconcileDelayLocked(self: *Backend) ?u64 {
+        if (self.options.backend.read_only or self.tombstone_reconcile_in_flight) return null;
+        if (self.pending_tombstone_reconcile != null or
+            (!self.run_directory_dirty and self.run_directory != null and self.run_directory.?.unknownTombstoneRunCount() != 0))
+            return self.tombstone_reconcile_retry_ns -| self.nowNs();
+        return null;
     }
 
     fn nextMutableIdleFlushDelayNsLocked(self: *Backend) ?u64 {
@@ -12687,8 +12795,22 @@ test "lsm backend tiers committed runs while overlapping request bulk mode remai
     try std.testing.expectEqual(@as(u64, 0), backend.bulk_ingest_window_first_sequence);
 
     try std.testing.expect(try backend.runMaintenanceStep());
+    // Selection, emission and dependency validation are distinct quanta.
+    try std.testing.expect(backend.pending_bulk_plan != null);
+    // A newer request may publish while the background plan owns its epoch.
+    // It must neither restart discovery nor change the selected chronology.
+    {
+        var txn = try backend.beginBatchWithOptions(request_options);
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:5", "newest");
+        try txn.commit();
+    }
+    for (0..32) |_| {
+        if (backend.compaction_stats.compactions != 0) break;
+        try std.testing.expect(try backend.runMaintenanceStep());
+    }
     try std.testing.expectEqual(@as(u64, 1), backend.compaction_stats.compactions);
-    try std.testing.expectEqual(@as(usize, 2), countLevelRuns(&backend.runs, 0));
+    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(&backend.runs, 0));
 
     backend.finishBatchMode(request_options);
     request_active = false;
@@ -21233,6 +21355,201 @@ test "lsm planning metadata is admitted before allocation" {
         try std.testing.expectEqual(@as(u64, 0), backend.domain_index_builds);
         try std.testing.expectEqual(before, manager.sliceStats(.lsm_in_memory_state).used_bytes);
     }
+}
+
+fn writeUnknownTombstoneFixture(allocator: Allocator, storage: Storage, root: []const u8, format: u32, rows: usize) !void {
+    var backend = try Backend.open(allocator, root, .{ .storage = storage, .wal_enabled = false, .flush_threshold = 1, .compact_threshold_runs = 100000, .l0_soft_limit_runs = 100000, .l0_hard_limit_runs = 100000 });
+    var open = true;
+    defer if (open) backend.close();
+    var txn = try backend.beginWrite();
+    defer txn.abort();
+    for (0..rows) |i| {
+        var key: [16]u8 = undefined;
+        try txn.delete(.{}, try std.fmt.bufPrint(&key, "key:{d:0>8}", .{i}));
+    }
+    try txn.commit();
+    try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
+    const meta = repository_mod.runMeta(backend.runs.at(0).*);
+    const manifest = try lsm_manifest.encodeMainlineFixture(allocator, .{ .next_run_id = backend.next_run_id, .runs = &.{meta} }, format);
+    defer allocator.free(manifest);
+    backend.close();
+    open = false;
+    const path = try std.fmt.allocPrint(allocator, "{s}/manifest.bin", .{root});
+    defer allocator.free(path);
+    try storage.writeFileAbsolute(path, manifest);
+}
+
+test "lsm unknown tombstone mainline reconciliation is sliced durable and collects idle garbage" {
+    const allocator = std.testing.allocator;
+    for ([_]u32{ 9, 10 }) |format| {
+        var storage = storage_io.MemoryStorage.init(allocator);
+        defer storage.deinit();
+        const root = "/unknown-tombstone-mainline";
+        try writeUnknownTombstoneFixture(allocator, storage.storage(), root, format, 3001);
+        const options = Options{ .storage = storage.storage(), .wal_enabled = false, .compact_threshold_runs = 100000, .l0_soft_limit_runs = 100000, .l0_hard_limit_runs = 100000, .tombstone_gc_max_age_ns = 1, .obsolete_retention_ns = 0, .obsolete_delete_retry_ns = 0 };
+        var backend = try Backend.open(allocator, root, options);
+        var open = true;
+        defer if (open) backend.close();
+        try std.testing.expectEqual(@as(usize, 1), (try backend.planningDirectory()).unknownTombstoneRunCount());
+        try std.testing.expect(backend.maintenanceScore() > 0);
+        var slices: usize = 0;
+        while (backend.tombstone_reconcile_completed == 0 and slices < 100) : (slices += 1) {
+            const before = backend.tombstone_reconcile_rows;
+            const locked = runtime_mod.lockBackend(Backend, &backend);
+            defer runtime_mod.unlockBackend(Backend, &backend, locked);
+            try std.testing.expect(try compaction_mod.reconcileTombstonesStep(&backend));
+            try std.testing.expect(backend.tombstone_reconcile_rows - before <= 2048);
+        }
+        try std.testing.expect(slices >= 3);
+        try std.testing.expectEqual(@as(u64, 3001), backend.tombstone_reconcile_rows);
+        try std.testing.expectEqual(@as(u64, 1), backend.tombstone_reconcile_completed);
+        try std.testing.expectEqual(@as(?u32, 3001), backend.runs.at(0).tombstone_count);
+        try std.testing.expectEqual(@as(u64, 0), backend.compaction_stats.compactions);
+        backend.close();
+        open = false;
+        backend = try Backend.open(allocator, root, options);
+        open = true;
+        try std.testing.expectEqual(@as(usize, 0), (try backend.planningDirectory()).unknownTombstoneRunCount());
+        try std.testing.expectEqual(@as(?u32, 3001), backend.runs.at(0).tombstone_count);
+        for (0..64) |_| _ = try backend.runMaintenanceStep();
+        try std.testing.expectEqual(@as(usize, 0), backend.runs.count());
+        try std.testing.expectEqual(@as(u64, 0), backend.tombstone_reconcile_rows);
+    }
+}
+
+test "lsm unknown tombstone reconciliation discards stale input and closes partial work" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+    const root = "/unknown-tombstone-stale";
+    try writeUnknownTombstoneFixture(allocator, storage.storage(), root, 10, 20);
+    var backend = try Backend.open(allocator, root, .{ .storage = storage.storage(), .wal_enabled = false });
+    defer backend.close();
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    defer runtime_mod.unlockBackend(Backend, &backend, locked);
+    try std.testing.expect(try compaction_mod.reconcileTombstonesStep(&backend));
+    try std.testing.expect(backend.pending_tombstone_reconcile != null);
+    const source = backend.runs.at(0);
+    var replacement = RunStore.revision(source, source.*);
+    replacement.gc_requested = true;
+    const directory = try (try backend.planningDirectory()).fork(allocator);
+    var directory_owned = true;
+    defer if (directory_owned) directory.destroy(allocator);
+    try directory.put(&backend, replacement);
+    try backend.runs.replace(allocator, source, replacement);
+    backend.invalidateReadVersion();
+    backend.publishRunDirectory(directory);
+    directory_owned = false;
+    try std.testing.expect(try compaction_mod.reconcileTombstonesStep(&backend));
+    try std.testing.expect(backend.pending_tombstone_reconcile == null);
+    try std.testing.expectEqual(@as(u64, 0), backend.tombstone_reconcile_completed);
+    try std.testing.expectEqual(@as(?u32, null), backend.runs.at(0).tombstone_count);
+    try std.testing.expect(try compaction_mod.reconcileTombstonesStep(&backend));
+    try std.testing.expect(backend.pending_tombstone_reconcile != null);
+    // Close owns the pinned path, sequential index and admitted scratch.
+}
+
+test "lsm unknown tombstone reconciliation keeps corrupt input unknown and backs off" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+    const root = "/unknown-tombstone-corrupt";
+    try writeUnknownTombstoneFixture(allocator, storage.storage(), root, 10, 3);
+    var backend = try Backend.open(allocator, root, .{ .storage = storage.storage(), .wal_enabled = false });
+    defer backend.close();
+    const bytes = storage.files.get(backend.runs.at(0).path.?).?;
+    var index = try repository_mod.loadRunSequentialTableIndexAllocWithStorage(storage.storage(), allocator, backend.runs.at(0).path.?);
+    defer index.deinit(allocator);
+    const offset = index.entry_data_start + index.blocks[0].window.physicalRelativeOffset();
+    const old = bytes[offset];
+    bytes[offset] ^= 0xff;
+    defer bytes[offset] = old;
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    defer runtime_mod.unlockBackend(Backend, &backend, locked);
+    var failed = false;
+    for (0..16) |_| {
+        _ = compaction_mod.reconcileTombstonesStep(&backend) catch {
+            failed = true;
+            break;
+        };
+    }
+    try std.testing.expect(failed);
+    try std.testing.expect(backend.pending_tombstone_reconcile == null);
+    try std.testing.expectEqual(@as(?u32, null), backend.runs.at(0).tombstone_count);
+    try std.testing.expectEqual(@as(u64, 1), backend.tombstone_reconcile_failures);
+    try std.testing.expect(backend.tombstone_reconcile_retry_ns > backend.nowNs());
+}
+
+test "lsm unknown tombstone manifest failure preserves published owners for retry" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const root = "/unknown-tombstone-manifest-failure";
+    try writeUnknownTombstoneFixture(allocator, storage.storage(), root, 10, 3);
+    var backend = try Backend.open(allocator, root, .{ .storage = storage.storage(), .wal_enabled = false, .read_runtime = storage_io.ReadRuntime.init(io_impl.io()) });
+    defer backend.close();
+    const Hook = struct {
+        fn fail(_: *anyopaque) !void {
+            return error.InjectedPublicationFailure;
+        }
+    };
+    repository_mod.publication_test_hook = .{ .context = &backend, .run = Hook.fail };
+    defer repository_mod.publication_test_hook = null;
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    defer runtime_mod.unlockBackend(Backend, &backend, locked);
+    var failed = false;
+    for (0..16) |_| {
+        _ = compaction_mod.reconcileTombstonesStep(&backend) catch |err| {
+            try std.testing.expectEqual(error.InjectedPublicationFailure, err);
+            failed = true;
+            break;
+        };
+    }
+    try std.testing.expect(failed);
+    try std.testing.expect(backend.pending_tombstone_reconcile == null);
+    try std.testing.expectEqual(@as(?u32, 3), backend.runs.at(0).tombstone_count);
+    try std.testing.expectEqual(@as(usize, 0), (try backend.planningDirectory()).unknownTombstoneRunCount());
+    try std.testing.expect(backend.manifest_dirty);
+    repository_mod.publication_test_hook = null;
+    try backend.persistManifestLocked();
+    try std.testing.expect(!backend.manifest_dirty);
+}
+
+test "lsm unknown tombstone publication admission retains verified counts without rereading" {
+    const allocator = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(allocator);
+    defer storage.deinit();
+    const root = "/unknown-tombstone-admission";
+    try writeUnknownTombstoneFixture(allocator, storage.storage(), root, 10, 3);
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer std.debug.assert(manager.sliceStats(.lsm_table_builder_working_set).used_bytes == 0);
+    var backend = try Backend.open(allocator, root, .{ .storage = storage.storage(), .wal_enabled = false, .resource_manager = &manager });
+    defer backend.close();
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    defer runtime_mod.unlockBackend(Backend, &backend, locked);
+    backend.manifest_admitted_wire_bytes = repository_mod.maxManifestReadBytes();
+    defer backend.manifest_admitted_wire_bytes = 0;
+    var denied = false;
+    for (0..16) |_| {
+        _ = compaction_mod.reconcileTombstonesStep(&backend) catch |err| {
+            try std.testing.expectEqual(error.ResourceBudgetExceeded, err);
+            denied = true;
+            break;
+        };
+    }
+    try std.testing.expect(denied);
+    try std.testing.expect(backend.pending_tombstone_reconcile.?.complete);
+    try std.testing.expect(backend.pending_tombstone_reconcile.?.cursor == null);
+    try std.testing.expect(backend.pending_tombstone_reconcile.?.budget == null);
+    try std.testing.expectEqual(@as(u64, 3), backend.tombstone_reconcile_rows);
+    try std.testing.expectEqual(@as(?u32, null), backend.runs.at(0).tombstone_count);
+    backend.manifest_admitted_wire_bytes = 0;
+    try std.testing.expect(try compaction_mod.reconcileTombstonesStep(&backend));
+    try std.testing.expect(backend.pending_tombstone_reconcile == null);
+    try std.testing.expectEqual(@as(u64, 3), backend.tombstone_reconcile_rows);
+    try std.testing.expectEqual(@as(?u32, 3), backend.runs.at(0).tombstone_count);
 }
 
 test "lsm tombstone GC bounds unique key churn and preserves old readers across reopen" {
