@@ -253,6 +253,10 @@ pub const ProbeTxn = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// One get_many_sorted call observes a single committed view. Separate
+        /// calls need not share a snapshot; generic per-key fallbacks cannot
+        /// claim this capability.
+        get_many_sorted_is_atomic: bool = false,
         abort: *const fn (Allocator, *anyopaque) void,
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
@@ -1110,6 +1114,7 @@ pub fn probeTxnFrom(allocator: Allocator, handle: anytype) !ProbeTxn {
         .allocator = wrapper_box_allocator,
         .ptr = box_ptr,
         .vtable = &.{
+            .get_many_sorted_is_atomic = @hasDecl(Handle, "get_many_sorted_is_atomic") and Handle.get_many_sorted_is_atomic,
             .abort = vt.abort,
             .get = vt.get,
             .get_many_sorted = vt.getManySorted,

@@ -71,20 +71,43 @@ later counters, manufacturing a partial tuple that fails the worker. Outcome
 transitions and source deletion can similarly mix incompatible cardinalities.
 
 Target validation, repair certification, query admission, and status tuple
-reads now hold one MVCC read transaction. Certification reads the range-local
-source count and any legacy artifact-counter fallback through that same
-transaction. The normal path remains a fixed number of point lookups, with no
-write lock, retry loop, or corpus scan added. Legacy missing range counters
-retain their existing scan fallback, now within the same snapshot. Persisted
-partial tuples and counter overflow remain errors.
+reads now capture a consistent batch of five keys: all three outcomes, the
+range-local source count, and the legacy artifact counter. The LSM backend
+captures mutable hits and pins the immutable source layout under its short
+backend lock, then performs any disk reads outside it. An explicit capability
+keeps backends with only per-key probe reads on their ordinary snapshot path.
+General MVCC snapshots can clone the mutable table; they are not used on the
+normal LSM counter path. Single-counter reads retain their existing point
+probes. Legacy missing range counters retain their scan fallback, re-reading
+the whole proof in one snapshot. Persisted partial tuples and counter overflow
+remain errors, and current-generation outcomes still supersede an invalid
+legacy artifact counter when that fallback is not needed.
 
-The deterministic regression commits the complete outcome tuple and source
-count after the first counter is read. That call observes the old empty state;
+The regression fails with `InvalidDerivedCoverageCounter` when the old read
+behavior is restored in an isolated worktree. The fixed reader captures the
+whole batch before a forced commit: that call observes the old empty state and
 the next sees the complete new state. Removing a persisted counter still
-returns `InvalidDerivedCoverageCounter`. The focused dense lifecycle suite
-passes 77 checks without skips or leaks. The posting/vector lag is an observed
+errors. A storage regression retains captured values across overwrites,
+deletions, and insertion of a previously missing key and verifies zero mutable
+snapshot clones. The focused dense lifecycle suite passes 77 checks without
+skips or leaks; the storage suite passes 737 checks with one intentionally
+inactive cross-process child helper skipped and no failures or leaks. Its
+standalone build target also declares the PDF dependency already required by
+the shared background runtime. The posting/vector lag is an observed
 consequence, not independent proof that every native publication stall has
 this cause; Linux acceptance remains required.
+
+## Online vector-publication test counts unrelated posting progress (#694)
+
+The dense lifecycle suite intermittently expected zero progress from a second
+online vector-publication call but received one. A previously queued posting
+checkpoint completed between calls; the API's aggregate count includes that
+valid handoff. The test now compares the exact-vector manifest generation and
+its storage sync count, retaining the primary-scan hook assertion. Foreground
+and posting-mutation admission must still remain open inside vector staging.
+This tests the no-rebuild contract directly without assuming checkpoint timing.
+The corrected combined run passed all 77 dense lifecycle checks and 737 storage
+checks (one inactive child helper skipped), with no failures or leaks.
 
 ## Partial-source replay and stale follower restore-job observations (#694)
 

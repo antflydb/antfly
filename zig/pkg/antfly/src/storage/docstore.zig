@@ -1070,6 +1070,24 @@ pub const DocStore = struct {
         };
     }
 
+    /// Read a sorted set of keys from one committed view without cloning the
+    /// full mutable LSM state. The returned lease owns `values`; abort it after
+    /// consuming them. Only this batch is snapshot-consistent: subsequent get
+    /// calls on a live probe may see later commits. Backends without an atomic
+    /// point-batch capability use their ordinary read snapshot instead.
+    pub fn readManyConsistent(self: *DocStore, keys: []const []const u8, values: []?[]const u8) !Txn {
+        var txn = try self.beginProbeTxn();
+        if (txn.probe) |probe| {
+            if (!probe.vtable.get_many_sorted_is_atomic) {
+                txn.abort();
+                txn = try self.beginReadTxn();
+            }
+        }
+        errdefer txn.abort();
+        try txn.getManySorted(keys, values);
+        return txn;
+    }
+
     /// Open a current-tip probe transaction for hot single-writer point reads.
     ///
     /// Runtime backends use a dedicated point-read transaction here so callers
@@ -3303,6 +3321,31 @@ test "docstore runtime point get does not clone mutable snapshot" {
     const value = try store.get(alloc, "doc:a");
     defer alloc.free(value);
     try std.testing.expectEqualStrings("alpha", value);
+    const after = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(before.mutable_snapshot_clone_calls, after.mutable_snapshot_clone_calls);
+}
+
+test "docstore consistent point batch owns values without cloning mutable state" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1024 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    try store.putBatch(&.{
+        .{ .key = "counter:a", .value = "old-a" },
+        .{ .key = "counter:b", .value = "old-b" },
+    }, &.{});
+    const before = backend.snapshotMaintenanceStats();
+    var values: [3]?[]const u8 = undefined;
+    var lease = try store.readManyConsistent(&.{ "counter:a", "counter:b", "counter:missing" }, &values);
+    defer lease.abort();
+    try store.putBatch(&.{
+        .{ .key = "counter:a", .value = "new-a" },
+        .{ .key = "counter:missing", .value = "new-c" },
+    }, &.{"counter:b"});
+    try std.testing.expectEqualStrings("old-a", values[0].?);
+    try std.testing.expectEqualStrings("old-b", values[1].?);
+    try std.testing.expect(values[2] == null);
     const after = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(before.mutable_snapshot_clone_calls, after.mutable_snapshot_clone_calls);
 }

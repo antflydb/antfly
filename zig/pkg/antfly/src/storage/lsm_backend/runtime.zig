@@ -2947,6 +2947,9 @@ fn snapshotReadMutable(comptime BackendType: type, backend: *BackendType, reason
 
 pub fn BoundProbeTxn(comptime BackendType: type) type {
     return struct {
+        // Mutable hits and the immutable/run layout are captured under one
+        // backend lock. Disk reads use that pinned layout after releasing it.
+        pub const get_many_sorted_is_atomic = true;
         allocator: Allocator,
         metadata_allocator: Allocator,
         backend: *BackendType,

@@ -9832,6 +9832,7 @@ pub fn build(b: *std.Build) void {
 
     const docstore_test_mod = makeLmdbModule(b, "pkg/antfly/src/docstore_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     docstore_test_mod.addImport("bloom", bloom_mod);
+    docstore_test_mod.addImport("antfly_pdf", pdf_mod);
     const docstore_unit_tests = b.addTest(.{
         .root_module = docstore_test_mod,
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },

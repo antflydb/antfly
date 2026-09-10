@@ -15,10 +15,13 @@ pub fn decode(raw: []const u8) !u64 {
     return std.mem.readInt(u64, raw[0..8], .little);
 }
 
-pub fn load(_: Allocator, store: *docstore_mod.DocStore) !?u64 {
-    var txn = try store.beginReadTxn();
-    defer txn.abort();
-    return try loadFromTxn(&txn);
+pub fn load(alloc: Allocator, store: *docstore_mod.DocStore) !?u64 {
+    const raw = store.get(alloc, &internal_keys.range_document_count_key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    return try decode(raw);
 }
 
 pub fn loadFromTxn(txn: *docstore_mod.DocStore.Txn) !?u64 {

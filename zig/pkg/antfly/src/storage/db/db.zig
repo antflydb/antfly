@@ -13203,33 +13203,14 @@ pub const DB = struct {
             .managed => |value| value,
         };
         const generation = self.core.index_manager.coverageGenerationForIndex(index_name) orelse return false;
-        var coverage_txn = try self.core.store.beginReadTxn();
-        defer coverage_txn.abort();
-        const produced = (try loadDerivedCoverageOutcomeCounterFromTxn(
-            alloc,
-            &coverage_txn,
-            index_name,
-            generation,
-            "produced",
-        )) orelse return false;
-        const skipped = (try loadDerivedCoverageOutcomeCounterFromTxn(
-            alloc,
-            &coverage_txn,
-            index_name,
-            generation,
-            "skipped",
-        )) orelse return false;
-        const terminal_failed = (try loadDerivedCoverageOutcomeCounterFromTxn(
-            alloc,
-            &coverage_txn,
-            index_name,
-            generation,
-            "terminal_failed",
-        )) orelse return false;
+        const coverage_counts = try loadDerivedCoverageCounters(alloc, self.core.store, index_name, generation, null, null);
+        const produced = coverage_counts.produced orelse return false;
+        const skipped = coverage_counts.skipped orelse return false;
+        const terminal_failed = coverage_counts.terminal_failed orelse return false;
         // Do not fall back to a primary-store scan on query admission. Modern
         // managed writes maintain this counter atomically; a missing legacy
         // counter simply leaves the durable repair owner in charge.
-        const source_total = (try range_cardinality.loadFromTxn(&coverage_txn)) orelse return false;
+        const source_total = coverage_counts.source_total orelse return false;
         const assessment = types.evaluateDerivedCoverageAssessment(
             policy,
             source_total,
@@ -13249,7 +13230,7 @@ pub const DB = struct {
                 // counter—not `produced`—is the active HBC cardinality
                 // authority.
                 const expected_active_count = if (densePublicationTargetUsesArtifactCounter(dense))
-                    (try loadDenseArtifactTargetCounterFromTxn(alloc, &coverage_txn, index_name)) orelse break :blk false
+                    (try coverage_counts.artifactCount()) orelse break :blk false
                 else
                     produced;
                 // Posting cache freshness is intentionally absent here.
@@ -18604,13 +18585,12 @@ pub const DB = struct {
             .managed => |value| value,
         };
         const generation = self.core.index_manager.coverageGenerationForIndex(index_name) orelse return .indeterminate;
-        var coverage_txn = try self.core.store.beginReadTxn();
-        defer coverage_txn.abort();
-        const produced = try loadDerivedCoverageOutcomeCounterFromTxn(alloc, &coverage_txn, index_name, generation, "produced");
-        const skipped = try loadDerivedCoverageOutcomeCounterFromTxn(alloc, &coverage_txn, index_name, generation, "skipped");
-        const terminal_failed = try loadDerivedCoverageOutcomeCounterFromTxn(alloc, &coverage_txn, index_name, generation, "terminal_failed");
+        const coverage_counts = try loadDerivedCoverageCounters(alloc, self.core.store, index_name, generation, self.core.index_manager.byte_range, null);
+        const produced = coverage_counts.produced;
+        const skipped = coverage_counts.skipped;
+        const terminal_failed = coverage_counts.terminal_failed;
 
-        const source_total = try range_cardinality.loadOrCountFromTxn(alloc, self.core.store, &coverage_txn, self.core.index_manager.byte_range);
+        const source_total = coverage_counts.source_total.?;
         const applied_sequence = try self.managedIndexAppliedSequence(alloc, index_name);
         const target_sequence = try self.projectionStatsTargetSequence(alloc, cfg.*, applied_sequence);
         const replay_current = applied_sequence >= target_sequence;
@@ -25752,18 +25732,13 @@ pub const DB = struct {
     }
 
     fn loadDenseArtifactTargetCounter(alloc: Allocator, store: *docstore_mod.DocStore, index_name: []const u8) !?u64 {
-        var txn = try store.beginReadTxn();
-        defer txn.abort();
-        return try loadDenseArtifactTargetCounterFromTxn(alloc, &txn, index_name);
-    }
-
-    fn loadDenseArtifactTargetCounterFromTxn(alloc: Allocator, txn: *docstore_mod.DocStore.Txn, index_name: []const u8) !?u64 {
         const key = try denseArtifactTargetCounterKeyAlloc(alloc, index_name);
         defer alloc.free(key);
-        const raw = txn.get(key) catch |err| switch (err) {
+        const raw = store.get(alloc, key) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,
         };
+        defer alloc.free(raw);
         if (raw.len != 8) return error.InvalidDenseArtifactTargetCounter;
         return std.mem.readInt(u64, raw[0..8], .little);
     }
@@ -30083,11 +30058,10 @@ pub const DB = struct {
 
     fn populateDerivedCoverageCounts(self: *DB, index_name: []const u8, generation: u64, config_hash: u64, item: *types.DBIndexStats) !void {
         item.coverage_config_hash = config_hash;
-        var coverage_txn = try self.core.store.beginReadTxn();
-        defer coverage_txn.abort();
-        const produced = try loadDerivedCoverageOutcomeCounterFromTxn(self.core.alloc, &coverage_txn, index_name, generation, "produced");
-        const skipped = try loadDerivedCoverageOutcomeCounterFromTxn(self.core.alloc, &coverage_txn, index_name, generation, "skipped");
-        const terminal_failed = try loadDerivedCoverageOutcomeCounterFromTxn(self.core.alloc, &coverage_txn, index_name, generation, "terminal_failed");
+        const coverage_counts = try loadDerivedCoverageCounters(self.core.alloc, self.core.store, index_name, generation, null, null);
+        const produced = coverage_counts.produced;
+        const skipped = coverage_counts.skipped;
+        const terminal_failed = coverage_counts.terminal_failed;
 
         const present_count: u2 = @as(u2, @intFromBool(produced != null)) +
             @as(u2, @intFromBool(skipped != null)) +
@@ -47001,25 +46975,104 @@ fn loadDerivedCoverageOutcomeCounterFromStore(
     generation: u64,
     outcome: []const u8,
 ) !?u64 {
-    var txn = try store.beginReadTxn();
-    defer txn.abort();
-    return try loadDerivedCoverageOutcomeCounterFromTxn(alloc, &txn, index_name, generation, outcome);
-}
-
-fn loadDerivedCoverageOutcomeCounterFromTxn(
-    alloc: Allocator,
-    txn: *docstore_mod.DocStore.Txn,
-    index_name: []const u8,
-    generation: u64,
-    outcome: []const u8,
-) !?u64 {
     const counter_key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, index_name, generation, outcome);
     defer alloc.free(counter_key);
-    const raw = txn.get(counter_key) catch |err| switch (err) {
+    const raw = store.get(alloc, counter_key) catch |err| switch (err) {
         error.NotFound => return null,
         else => return err,
     };
+    defer alloc.free(raw);
     return try internal_keys.decodeDerivedCoverageOutcomeCount(raw);
+}
+
+const DerivedCoverageCounters = struct {
+    produced: ?u64,
+    skipped: ?u64,
+    terminal_failed: ?u64,
+    source_total: ?u64,
+    artifact_count: ?u64,
+    artifact_invalid: bool,
+
+    fn artifactCount(self: @This()) !?u64 {
+        if (self.artifact_invalid) return error.InvalidDenseArtifactTargetCounter;
+        return self.artifact_count;
+    }
+};
+
+fn loadDerivedCoverageCounters(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_name: []const u8,
+    generation: u64,
+    legacy_range: ?types.ByteRange,
+    test_ctx: ?*AsyncContext,
+) !DerivedCoverageCounters {
+    const tags = [_][]const u8{ "produced", "skipped", "terminal_failed" };
+    var owned_keys: [4][]u8 = undefined;
+    var initialized: usize = 0;
+    defer for (owned_keys[0..initialized]) |key| alloc.free(key);
+    for (tags, 0..) |tag, i| {
+        owned_keys[i] = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, index_name, generation, tag);
+        initialized += 1;
+    }
+    owned_keys[3] = try DB.denseArtifactTargetCounterKeyAlloc(alloc, index_name);
+    initialized += 1;
+    const unsorted = [_][]const u8{ owned_keys[0], owned_keys[1], owned_keys[2], &internal_keys.range_document_count_key, owned_keys[3] };
+    var order = [_]usize{ 0, 1, 2, 3, 4 };
+    std.mem.sort(usize, &order, unsorted, struct {
+        fn less(keys: [5][]const u8, lhs: usize, rhs: usize) bool {
+            return std.mem.order(u8, keys[lhs], keys[rhs]) == .lt;
+        }
+    }.less);
+    var keys: [5][]const u8 = undefined;
+    for (order, 0..) |index, i| keys[i] = unsorted[index];
+    var values: [5]?[]const u8 = undefined;
+    var lease = try store.readManyConsistent(&keys, &values);
+    var lease_open = true;
+    defer if (lease_open) lease.abort();
+    var source_position: usize = undefined;
+    for (order, 0..) |index, i| if (index == 3) {
+        source_position = i;
+    };
+    // Legacy ranges without a maintained source counter need their historical
+    // scan fallback. Re-read the entire proof in that snapshot; never combine
+    // the earlier point batch with a newer corpus count.
+    if (legacy_range != null and values[source_position] == null) {
+        lease.abort();
+        lease_open = false;
+        lease = try store.beginReadTxn();
+        lease_open = true;
+        try lease.getManySorted(&keys, &values);
+    }
+    if (builtin.is_test) {
+        if (test_ctx) |ctx| if (test_dense_target_after_coverage_capture) |hook| try hook(ctx);
+    }
+    var artifact_invalid = false;
+    var decoded = [_]?u64{null} ** 5;
+    for (order, values) |index, raw| {
+        if (raw) |value| decoded[index] = switch (index) {
+            3 => try range_cardinality.decode(value),
+            4 => blk: {
+                if (value.len != 8) {
+                    artifact_invalid = true;
+                    break :blk null;
+                }
+                break :blk std.mem.readInt(u64, value[0..8], .little);
+            },
+            else => try internal_keys.decodeDerivedCoverageOutcomeCount(value),
+        };
+    }
+    if (legacy_range) |byte_range| {
+        if (decoded[3] == null) decoded[3] = try range_cardinality.loadOrCountFromTxn(alloc, store, &lease, byte_range);
+    }
+    return .{
+        .produced = decoded[0],
+        .skipped = decoded[1],
+        .terminal_failed = decoded[2],
+        .source_total = decoded[3],
+        .artifact_count = decoded[4],
+        .artifact_invalid = artifact_invalid,
+    };
 }
 
 fn scanDerivedCoverageOutcomeFromStore(
@@ -55492,7 +55545,7 @@ fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !
 
 const DenseTargetCoverage = enum { all_sources, materialized };
 
-var test_dense_target_after_produced_read: ?*const fn (*AsyncContext) anyerror!void = null;
+var test_dense_target_after_coverage_capture: ?*const fn (*AsyncContext) anyerror!void = null;
 
 fn denseTargetCountForIndexContextWithCoverage(
     ctx: *AsyncContext,
@@ -55508,18 +55561,10 @@ fn denseTargetCountForIndexContextWithCoverage(
         }
     }
     const generation = ctx.index_manager.coverageGenerationForIndex(index_name) orelse return null;
-    var coverage_txn = try ctx.store.beginReadTxn();
-    defer coverage_txn.abort();
-    // The producer atomically writes all outcomes and primary cardinality.
-    // Separate latest-value reads can straddle that commit, manufacture a
-    // partial tuple, and permanently fail the replay worker. One MVCC lease
-    // also keeps source deletions/outcome transitions in the same proof.
-    const produced = try loadDerivedCoverageOutcomeCounterFromTxn(ctx.alloc, &coverage_txn, index_name, generation, "produced");
-    if (builtin.is_test) {
-        if (test_dense_target_after_produced_read) |hook| try hook(ctx);
-    }
-    const skipped = try loadDerivedCoverageOutcomeCounterFromTxn(ctx.alloc, &coverage_txn, index_name, generation, "skipped");
-    const terminal_failed = try loadDerivedCoverageOutcomeCounterFromTxn(ctx.alloc, &coverage_txn, index_name, generation, "terminal_failed");
+    const coverage_counts = try loadDerivedCoverageCounters(ctx.alloc, ctx.store, index_name, generation, ctx.index_manager.byte_range, ctx);
+    const produced = coverage_counts.produced;
+    const skipped = coverage_counts.skipped;
+    const terminal_failed = coverage_counts.terminal_failed;
     const present_count: u2 = @as(u2, @intFromBool(produced != null)) +
         @as(u2, @intFromBool(skipped != null)) +
         @as(u2, @intFromBool(terminal_failed != null));
@@ -55535,17 +55580,12 @@ fn denseTargetCountForIndexContextWithCoverage(
         else
             false;
         if (requires_artifact_coverage) {
-            return try DB.loadDenseArtifactTargetCounterFromTxn(ctx.alloc, &coverage_txn, index_name);
+            return try coverage_counts.artifactCount();
         }
         // A fresh generation on an empty table has no outcome rows to create
         // the counter tuple. The range-local primary cardinality distinguishes
         // that valid zero target from missing accounting on a non-empty range.
-        const source_count = try range_cardinality.loadOrCountFromTxn(
-            ctx.alloc,
-            ctx.store,
-            &coverage_txn,
-            ctx.index_manager.byte_range,
-        );
+        const source_count = coverage_counts.source_total.?;
         return if (source_count == 0) 0 else null;
     }
     if (present_count != 3) return error.InvalidDerivedCoverageCounter;
@@ -55561,12 +55601,7 @@ fn denseTargetCountForIndexContextWithCoverage(
         return error.InvalidDerivedCoverageCounter;
     const accounted = std.math.add(u64, accounted_without_failures, terminal_failed.?) catch
         return error.InvalidDerivedCoverageCounter;
-    const source_count = try range_cardinality.loadOrCountFromTxn(
-        ctx.alloc,
-        ctx.store,
-        &coverage_txn,
-        ctx.index_manager.byte_range,
-    );
+    const source_count = coverage_counts.source_total.?;
     if (accounted > source_count) return null;
     if (coverage == .all_sources and accounted != source_count) return null;
     // Replay consumes available artifacts, independently of provider work
@@ -96771,9 +96806,10 @@ test "db dense target reads atomic outcome and source coverage snapshot" {
         .coverage_generation = 42,
     };
     try db.addIndex(config);
+    try db.core.store.put(&internal_keys.range_document_count_key, &([_]u8{0} ** 8));
     const Commit = struct {
         fn afterProduced(ctx: *AsyncContext) !void {
-            test_dense_target_after_produced_read = null;
+            test_dense_target_after_coverage_capture = null;
             const tags = [_][]const u8{ "produced", "skipped", "terminal_failed" };
             var keys: [3][]u8 = undefined;
             var initialized: usize = 0;
@@ -96791,13 +96827,13 @@ test "db dense target reads atomic outcome and source coverage snapshot" {
             try ctx.store.putBatch(&writes, &.{});
         }
     };
-    // Publish a complete first tuple between its first and second reads.
+    // Publish a complete first tuple after the counter batch is captured.
     // This call must observe the pre-commit empty table; the next sees all
     // four committed counters. No scheduling/sleep is needed to force the race.
-    test_dense_target_after_produced_read = Commit.afterProduced;
-    defer test_dense_target_after_produced_read = null;
+    test_dense_target_after_coverage_capture = Commit.afterProduced;
+    defer test_dense_target_after_coverage_capture = null;
     try std.testing.expectEqual(@as(?u64, 0), try denseTargetCountForIndexContext(db.async_context, config.name));
-    try std.testing.expect(test_dense_target_after_produced_read == null);
+    try std.testing.expect(test_dense_target_after_coverage_capture == null);
     try std.testing.expectEqual(@as(?u64, 1), try denseTargetCountForIndexContext(db.async_context, config.name));
 
     // Actual persisted corruption remains an error, rather than a retryable
@@ -97116,8 +97152,16 @@ test "db online vector publication leaves foreground and posting mutation admiss
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expectEqualDeep(before, try dense.index.postingBacklogStats());
     try std.testing.expect(!db.nativeVectorProjectionMaintenanceNeeded());
-    // Steady-state maintenance must not scan or rewrite the same generation.
-    try std.testing.expectEqual(@as(usize, 0), try db.publishVectorBlockBasesOnline(.{}));
+    // A posting checkpoint queued before this pass may finish asynchronously.
+    // The aggregate progress count includes that legitimate handoff; it cannot
+    // prove whether the exact-vector plane was rebuilt. Compare its durable
+    // generation and storage sync count, retaining the no-primary-scan check.
+    // This fixture disables background vector-publication owners.
+    const vector_generation = manager.vector_block_generation.?.opened.store.manifest.?.latest_generation;
+    const vector_syncs = vector_storage.sync_contents_calls;
+    _ = try db.publishVectorBlockBasesOnline(.{});
+    try std.testing.expectEqual(vector_generation, manager.vector_block_generation.?.opened.store.manifest.?.latest_generation);
+    try std.testing.expectEqual(vector_syncs, vector_storage.sync_contents_calls);
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
 
     manager.clearVectorBlockGenerationForTest();
