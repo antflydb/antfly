@@ -104426,14 +104426,18 @@ test "db failed activated dense generation rolls back to retained predecessor" {
         // Activate one healthy shadow first so the fault below proves that a
         // later failed generation can roll back to a non-canonical predecessor
         // pointer, not only to the original canonical root.
-        var first_generation = try db.repairArtifactIssuesWithRequest(alloc, .{
+        // Use the functional test budget for every activation so scheduling
+        // delays do not prevent the intended crash checkpoint from being hit.
+        var first_generation = try db.repairArtifactIssuesWithRequestOptions(alloc, .{
             .target = .index,
             .artifact_kind = .embedding,
             .index_name = "dense_idx",
             .limit = 1,
             .force = true,
-        });
-        first_generation.deinit(alloc);
+        }, repair_completion_test_options);
+        defer first_generation.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 1), first_generation.indexes_rebuilt);
+        try std.testing.expect(!first_generation.debt_remaining);
         const first_generation_pointer = (try db.core.index_manager.captureActiveIndexRootPointer("dense_idx")) orelse
             return error.TestUnexpectedResult;
         defer alloc.free(first_generation_pointer);
@@ -104450,13 +104454,13 @@ test "db failed activated dense generation rolls back to retained predecessor" {
             .after_snapshot_build = CrashHook.afterSnapshot,
             .after_pointer_activation = CrashHook.afterActivation,
         };
-        try std.testing.expectError(error.TestCrashBeforeReplacementValidation, db.repairArtifactIssuesWithRequest(alloc, .{
+        try std.testing.expectError(error.TestCrashBeforeReplacementValidation, db.repairArtifactIssuesWithRequestOptions(alloc, .{
             .target = .index,
             .artifact_kind = .embedding,
             .index_name = "dense_idx",
             .limit = 1,
             .force = true,
-        }));
+        }, repair_completion_test_options));
         db.shadow_index_repair_hook = null;
         repair_id = (try db.indexRepairIdForIndex(alloc, "dense_idx")) orelse return error.TestUnexpectedResult;
         var interrupted = try db.loadIndexRepairEntryById(alloc, repair_id);
@@ -104586,7 +104590,7 @@ test "db failed activated dense generation rolls back to retained predecessor" {
     try std.testing.expectEqual(@as(u32, 1), previous.total_hits);
     try std.testing.expectEqualStrings("doc:a", previous.hits[0].id);
 
-    const rebuilt = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
+    const rebuilt = try reopened.advanceIndexRepairIntent(alloc, repair_id, repair_completion_test_options);
     try std.testing.expect(rebuilt.attempted);
     try std.testing.expect(rebuilt.repaired);
     try std.testing.expect(!try reopened.hasPendingIndexRepairIntents(alloc));
