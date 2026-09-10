@@ -139,6 +139,8 @@ pub const BulkIngestFinishOptions = struct {
     /// the target is left for scheduled maintenance.
     max_deferred_l0_runs: ?usize = null,
     max_foreground_compaction_steps: usize = 0,
+    /// Per-job input cap; null uses the backend policy, zero admits no work.
+    /// An explicit cap never permits the oversized-single-job exception.
     max_foreground_compaction_input_bytes: ?u64 = null,
     max_foreground_compaction_ns: ?u64 = null,
     max_deferred_hbc_leaf_splits_per_publish: ?usize = null,

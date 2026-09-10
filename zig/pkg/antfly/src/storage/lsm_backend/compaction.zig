@@ -156,6 +156,8 @@ pub const CompactionPlan = struct {
     // A certificate may bypass repeated identity/coverage work only while
     // this exact publication generation remains current under the mutex.
     validated_generation: ?u64 = null,
+    // Set only by discovery of a minimum indivisible oversized closure.
+    oversized_indivisible: bool = false,
     source_level: u32,
     source_start: usize,
     source_len: usize,
@@ -262,10 +264,141 @@ const SelectedPlan = struct {
     }
 };
 
+/// A continuation belongs to a request policy, not just a directory epoch.
+/// Exact matching within a lane avoids reusing discovery after a caller
+/// changes its pressure target or admission contract.
+const PlanningPolicy = struct {
+    l0_limit: usize,
+    l0_only: bool,
+    max_bytes: u64,
+    allow_oversized: bool,
+
+    fn matches(self: @This(), other: @This()) bool {
+        return std.meta.eql(self, other);
+    }
+
+    fn admits(self: @This(), plan: CompactionPlan, input_bytes: u64) bool {
+        if (self.l0_only and plan.source_level != 0) return false;
+        return self.max_bytes == 0 or input_bytes <= self.max_bytes or
+            (self.allow_oversized and plan.oversized_indivisible);
+    }
+};
+
+test "compaction policy admission requires the requested level and explicit oversized proof" {
+    const policy = PlanningPolicy{ .l0_limit = 1, .l0_only = true, .max_bytes = 100, .allow_oversized = false };
+    var plan = CompactionPlan{ .source_level = 0, .source_start = 0, .source_len = 1, .target_start = 1, .target_len = 0, .output_level = 1 };
+    try std.testing.expect(policy.admits(plan, 100));
+    try std.testing.expect(!policy.admits(plan, 101));
+    var oversized = policy;
+    oversized.allow_oversized = true;
+    try std.testing.expect(!oversized.admits(plan, 101));
+    plan.oversized_indivisible = true;
+    try std.testing.expect(oversized.admits(plan, 101));
+    try std.testing.expect(!policy.admits(plan, 101));
+    plan.source_level = 1;
+    try std.testing.expect(!oversized.admits(plan, 1));
+    try std.testing.expect(!policy.matches(oversized));
+    var changed = policy;
+    changed.l0_limit += 1;
+    try std.testing.expect(!policy.matches(changed));
+}
+
+test "compaction policy lanes isolate budgets retain progress and drain abandoned requests" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const allocator = std.testing.allocator;
+    var backend = Backend.init(allocator, .{ .compact_threshold_runs = 0, .level_target_runs_base = 100000, .level_target_bytes_base = 0 });
+    defer backend.close();
+    for (0..5001) |i| {
+        var state: State = .{};
+        errdefer state.deinit(allocator);
+        var key: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&key, "doc:{d:0>4}", .{if (i == 5000) 0 else i});
+        try state.appendUpsert(allocator, .{ .name = "docs" }, name, "value", false);
+        if (i == 5000) try state.appendUpsert(allocator, .{ .name = "docs" }, "doc:9999", "value", false);
+        var run = try makeRunAtLevel(Backend, &backend, state, if (i == 5000) 0 else 1);
+        state = .{};
+        errdefer run.deinit(allocator);
+        try backend.runs.append(allocator, run);
+    }
+    try backend.runs.reindexForTest(allocator);
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    defer runtime_mod.unlockBackend(Backend, &backend, locked);
+    var stats: CompactionSelectionStats = .{};
+    try std.testing.expect(try selectDomainPlan(&backend, 0, false, 0, false, &stats) == null);
+    const background = backend.pending_directory_closure.?;
+    const visits = background.job.visits;
+    const started = @import("antfly_platform").time.monotonicNs();
+    for (0..64) |_| {
+        try std.testing.expect(!try compactL0ToLimitScheduledWithinBudget(Backend, &backend, 0, 1, 1));
+        try std.testing.expectEqual(background, backend.pending_directory_closure.?);
+        try std.testing.expectEqual(visits, background.job.visits);
+    }
+    if (@import("builtin").mode == .ReleaseFast) std.debug.print("\nLSM policy isolation runs=5001 rejected_foreground_ns={d}\n", .{(@import("antfly_platform").time.monotonicNs() - started) / 64});
+    try std.testing.expect(!try compactL0ToLimitScheduledWithinBudget(Backend, &backend, 0, 1, 0));
+    try std.testing.expectEqual(@as(usize, 0), backend.compaction_stats.compactions);
+
+    try std.testing.expect(try selectDomainPlan(&backend, 0, true, 0, false, &stats) == null);
+    const foreground = backend.pending_l0_directory_closure.?;
+    try std.testing.expect(foreground != background);
+    // No lane may replace an owner while it is operating outside the mutex.
+    backend.directory_planning_in_flight = true;
+    try std.testing.expect(try selectDomainPlan(&backend, 0, true, 1, false, &stats) == null);
+    try std.testing.expectEqual(foreground, backend.pending_l0_directory_closure.?);
+    backend.directory_planning_in_flight = false;
+    for (0..2) |_| try std.testing.expect(try selectDomainPlan(&backend, 0, false, 0, false, &stats) == null);
+    try std.testing.expect(background.job.visits > visits);
+    try std.testing.expect(foreground.job.visits > 0);
+    // Changing a foreground policy retires only its own lane, off-lock.
+    try std.testing.expect(try selectDomainPlan(&backend, 0, true, 1, false, &stats) == null);
+    try std.testing.expect(backend.pending_l0_directory_closure == null);
+    try std.testing.expectEqual(background, backend.pending_directory_closure.?);
+    var selected = (try selectDomainPlanSynchronous(&backend, 0, false, 0, false, &stats)).?;
+    try std.testing.expectEqual(@as(usize, 5001), selected.plan.source_len + selected.plan.target_len);
+    selected.release(&backend);
+    try std.testing.expect(backend.pending_directory_closure == null);
+
+    // A request may disappear after its first slice. Ordinary background
+    // maintenance must finish and release its continuation without that caller.
+    try std.testing.expect(try selectDomainPlan(&backend, 0, true, 0, false, &stats) == null);
+    var drained = false;
+    for (0..1000) |_| {
+        if (try selectDomainPlan(&backend, 0, false, 0, false, &stats)) |result| {
+            result.release(&backend);
+            drained = true;
+            break;
+        }
+    }
+    try std.testing.expect(drained);
+    try std.testing.expect(backend.pending_l0_directory_closure == null);
+    try std.testing.expect(backend.pending_directory_closure == null);
+    // Background draining must still enforce ITS current admission budget,
+    // even when the foreground job was discovered with an unlimited budget.
+    try std.testing.expect(try selectDomainPlan(&backend, 0, true, 0, false, &stats) == null);
+    for (0..1000) |_| {
+        try std.testing.expect(!try compactDomainPlan(Backend, &backend, 0, false, true, 1, 1, false));
+        if (backend.pending_l0_directory_closure == null) break;
+    }
+    try std.testing.expect(backend.pending_l0_directory_closure == null);
+    try std.testing.expectEqual(@as(usize, 0), backend.compaction_stats.compactions);
+    // Synchronous callers also drain the other lane across all of its slices.
+    try std.testing.expect(try selectDomainPlan(&backend, 0, true, 0, false, &stats) == null);
+    selected = (try selectDomainPlanSynchronous(&backend, 0, false, 0, false, &stats)).?;
+    selected.release(&backend);
+    try std.testing.expect(backend.pending_l0_directory_closure == null);
+    // Leave both lanes queued: close must reclaim both, including reservations.
+    try std.testing.expect(try selectDomainPlan(&backend, 0, false, 0, false, &stats) == null);
+    try std.testing.expect(try selectDomainPlan(&backend, 0, true, 0, false, &stats) == null);
+}
+
+fn closureSlot(backend: anytype, l0_only: bool) *?*PendingDirectoryClosure {
+    return if (l0_only) &backend.pending_l0_directory_closure else &backend.pending_directory_closure;
+}
+
 /// An exceptional broad ordinary closure belongs to maintenance, not to the
 /// stack of whichever request first noticed pressure. Keep its epoch and
 /// scratch reservation until the cursor completes or is discarded.
 pub const PendingDirectoryClosure = struct {
+    policy: PlanningPolicy,
     directory: *Directory,
     job: ClosureJob,
     retired_job: ?ClosureJob = null,
@@ -279,7 +412,7 @@ pub const PendingDirectoryClosure = struct {
     selected: ?SelectedPlan = null,
     validation: ?DependencyValidation = null,
 
-    fn create(backend: anytype, seeds: []const Directory.Handle, max_bytes: u64, allow_oversized: bool, overlap_threshold: usize) !*@This() {
+    fn create(backend: anytype, seeds: []const Directory.Handle, max_bytes: u64, allow_oversized: bool, overlap_threshold: usize, policy: PlanningPolicy) !*@This() {
         const allocator = backend.allocator;
         var reservation: ?resource_manager_mod.Reservation = null;
         errdefer if (reservation) |*lease| lease.release();
@@ -292,6 +425,7 @@ pub const PendingDirectoryClosure = struct {
         const self = try allocator.create(@This());
         errdefer allocator.destroy(self);
         self.* = .{
+            .policy = policy,
             .directory = directory,
             .job = try ClosureJob.init(allocator, directory, owned, max_bytes, false),
             .seeds = owned,
@@ -347,15 +481,15 @@ pub const PendingDirectoryClosure = struct {
     }
 };
 
-fn resumeDirectoryClosure(backend: anytype) !?SelectedPlan {
-    const pending = backend.pending_directory_closure.?;
+fn resumeDirectoryClosure(backend: anytype, slot: *?*PendingDirectoryClosure) !?SelectedPlan {
+    const pending = slot.*.?;
     if (backend.directory_planning_in_flight) return null;
     backend.directory_planning_in_flight = true;
     defer backend.directory_planning_in_flight = false;
     backend.retainReaderKind(.compaction);
     defer backend.releaseReaderKind(.compaction);
     const BackendType = @TypeOf(backend.*);
-    if (pending.selected != null) return resumeClosureValidation(backend, pending);
+    if (pending.selected != null) return resumeClosureValidation(backend, pending, slot);
     if (backend.manifestCoordinationIo()) |io| try io.checkCancel();
     runtime_mod.unlockBackend(BackendType, backend, true);
     const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
@@ -364,7 +498,7 @@ fn resumeDirectoryClosure(backend: anytype) !?SelectedPlan {
     backend.directory_planning_slices +|= 1;
     var destroy = false;
     defer if (destroy) {
-        backend.pending_directory_closure = null;
+        slot.* = null;
         backend.retireClosurePlanning(pending);
     };
     const done = advanced catch |err| {
@@ -400,19 +534,20 @@ fn resumeDirectoryClosure(backend: anytype) !?SelectedPlan {
         .run_indices = pending.job.indices,
         .input_handles = handles,
         .partition_key = backend.options.run_partition_key,
+        .oversized_indivisible = pending.policy.max_bytes != 0 and pending.job.max_bytes == 0,
     } };
     pending.job.handles = null;
     pending.job.indices = null;
     selected.reservation = pending.reservation;
     pending.reservation = null;
     pending.selected = selected;
-    return resumeClosureValidation(backend, pending);
+    return resumeClosureValidation(backend, pending, slot);
 }
 
-fn resumeClosureValidation(backend: anytype, pending: *PendingDirectoryClosure) !?SelectedPlan {
+fn resumeClosureValidation(backend: anytype, pending: *PendingDirectoryClosure, slot: *?*PendingDirectoryClosure) !?SelectedPlan {
     var retire = false;
     defer if (retire) {
-        backend.pending_directory_closure = null;
+        slot.* = null;
         backend.retireClosurePlanning(pending);
     };
     errdefer retire = true;
@@ -1318,7 +1453,24 @@ fn deferTombstoneGc(backend: anytype) void {
 /// unrelated interleaved runs are never added merely to make a global slice.
 fn selectDomainPlan(backend: anytype, l0_limit: usize, l0_only: bool, max_bytes: u64, allow_oversized: bool, stats: *CompactionSelectionStats) !?SelectedPlan {
     if (comptime @hasField(@TypeOf(backend.*), "pending_directory_closure")) {
-        if (backend.pending_directory_closure != null) return resumeDirectoryClosure(backend);
+        // A slice temporarily drops the writer mutex. Never replace a slot
+        // whose owner is using it off-lock, including the other policy lane.
+        if (backend.directory_planning_in_flight) return null;
+        const policy = PlanningPolicy{ .l0_limit = l0_limit, .l0_only = l0_only, .max_bytes = max_bytes, .allow_oversized = allow_oversized };
+        const slot = closureSlot(backend, l0_only);
+        if (slot.*) |pending| if (!pending.policy.matches(policy)) {
+            slot.* = null;
+            backend.retireClosurePlanning(pending);
+        };
+        // Background service alternates queued lanes. An abandoned foreground
+        // request must not retain a pinned epoch forever, and foreground calls
+        // must neither consume nor restart a background closure.
+        if (!l0_only and backend.pending_l0_directory_closure != null) {
+            const serve_l0 = slot.* == null or backend.closure_service_l0_next;
+            backend.closure_service_l0_next = !serve_l0;
+            if (serve_l0) return resumeDirectoryClosure(backend, &backend.pending_l0_directory_closure);
+        }
+        if (slot.* != null) return resumeDirectoryClosure(backend, slot);
     }
     if (comptime @hasDecl(@TypeOf(backend.*), "planningDirectory")) {
         return selectDirectoryPlan(backend, l0_limit, l0_only, max_bytes, allow_oversized, stats) catch |err| {
@@ -1527,6 +1679,7 @@ fn selectDirectoryPlanOffLock(backend: anytype, l0_limit: usize, l0_only: bool, 
 }
 
 fn selectDirectoryPlanBudgeted(backend: anytype, l0_limit: usize, l0_only: bool, max_bytes: u64, allow_oversized: bool, stats: *CompactionSelectionStats, initial_budget: DirectoryPlanningBudget) !?SelectedPlan {
+    const policy = PlanningPolicy{ .l0_limit = l0_limit, .l0_only = l0_only, .max_bytes = max_bytes, .allow_oversized = allow_oversized };
     const directory = try backend.planningDirectory();
     var selected_level: ?u32 = null;
     var best_pressure: u64 = 0;
@@ -1585,7 +1738,7 @@ fn selectDirectoryPlanBudgeted(backend: anytype, l0_limit: usize, l0_only: bool,
                     if (err == error.CompactionPlanningBudgetExceeded) {
                         if (reservation) |*lease| lease.release();
                         reservation = null;
-                        backend.pending_directory_closure = try PendingDirectoryClosure.create(backend, seeds[0..seed_len], max_bytes, allow_oversized, if (hotspot) overlap_threshold else 0);
+                        closureSlot(backend, l0_only).* = try PendingDirectoryClosure.create(backend, seeds[0..seed_len], max_bytes, allow_oversized, if (hotspot) overlap_threshold else 0, policy);
                         backend.directory_planning_slices +|= 1;
                         return null;
                     }
@@ -1602,13 +1755,14 @@ fn selectDirectoryPlanBudgeted(backend: anytype, l0_limit: usize, l0_only: bool,
                         if (err == error.CompactionPlanningBudgetExceeded) {
                             if (reservation) |*lease| lease.release();
                             reservation = null;
-                            backend.pending_directory_closure = try PendingDirectoryClosure.create(backend, seeds[0..1], 0, false, if (hotspot) overlap_threshold else 0);
+                            closureSlot(backend, l0_only).* = try PendingDirectoryClosure.create(backend, seeds[0..1], 0, false, if (hotspot) overlap_threshold else 0, policy);
                             backend.directory_planning_slices +|= 1;
                             return null;
                         }
                     }
                     return err;
                 };
+                if (candidate) |*selected| selected.plan.oversized_indivisible = allow_oversized;
                 break;
             }
             seed_len = @max(@as(usize, 1), seed_len / 2);
@@ -1636,7 +1790,7 @@ fn selectDirectoryPlanBudgeted(backend: anytype, l0_limit: usize, l0_only: bool,
 pub fn directorySelectionInputCountForTest(backend: anytype) !usize {
     std.debug.assert(@import("builtin").is_test);
     var stats: CompactionSelectionStats = .{};
-    const selected = try selectDomainPlanSynchronous(backend, backend.options.compact_threshold_runs, false, backend.options.max_compaction_input_bytes, false, &stats) orelse return 0;
+    const selected = try selectDomainPlanSynchronous(backend, backend.options.compact_threshold_runs, false, backend.options.max_compaction_input_bytes, allowOversizedSingleCompactionInput(backend), &stats) orelse return 0;
     defer selected.release(backend);
     return selected.plan.source_len + selected.plan.target_len;
 }
@@ -1690,14 +1844,16 @@ fn selectDomainPlanSynchronous(backend: anytype, l0_limit: usize, l0_only: bool,
     while (true) {
         if (try selectDomainPlan(backend, l0_limit, l0_only, max_bytes, allow_oversized, stats)) |selected| return selected;
         if (comptime @hasField(@TypeOf(backend.*), "pending_directory_closure")) {
-            if (backend.pending_directory_closure != null and !backend.directory_planning_in_flight) continue;
+            const pending = closureSlot(backend, l0_only).* != null or (!l0_only and backend.pending_l0_directory_closure != null);
+            if (pending and !backend.directory_planning_in_flight) continue;
         }
         return null;
     }
 }
 
 fn compactDomainPlan(comptime BackendType: type, backend: *BackendType, l0_limit: usize, l0_only: bool, comptime scheduled: bool, score: u64, max_bytes: u64, allow_oversized: bool) !bool {
-    if (scheduled and !l0_only) if (try compactRememberedPlanIfValid(BackendType, backend)) return true;
+    const policy = PlanningPolicy{ .l0_limit = l0_limit, .l0_only = l0_only, .max_bytes = max_bytes, .allow_oversized = allow_oversized };
+    if (scheduled and !l0_only) if (try compactRememberedPlanIfValid(BackendType, backend, policy)) return true;
     var stats: CompactionSelectionStats = .{};
     defer noteCompactionSelectionStats(BackendType, backend, stats);
     const selected = (if (scheduled)
@@ -1708,13 +1864,17 @@ fn compactDomainPlan(comptime BackendType: type, backend: *BackendType, l0_limit
     if (scheduled) {
         var work = try compactionWorkForPlan(backend.allocator, &backend.runs, selected.plan, score);
         defer work.deinit(backend.allocator);
+        if (!policy.admits(selected.plan, work.input_bytes)) return false;
         var grant = backend.acquireCompactionGrant(work) orelse {
             rememberDeniedCompaction(BackendType, backend, selected.plan, score);
             return false;
         };
         defer grant.complete();
         try compactPlanAt(BackendType, backend, selected.plan);
-    } else try compactPlanAt(BackendType, backend, selected.plan);
+    } else {
+        if (!policy.admits(selected.plan, compactionInputBytes(&backend.runs, selected.plan))) return false;
+        try compactPlanAt(BackendType, backend, selected.plan);
+    }
     return true;
 }
 
@@ -1918,7 +2078,7 @@ pub fn maybeCompactRunsScheduledWithL0Limit(
     score: u64,
 ) !bool {
     if (domainPlanningEnabled(backend)) return compactDomainPlan(BackendType, backend, l0_limit, false, true, score, backend.options.max_compaction_input_bytes, allowOversizedSingleCompactionInput(backend));
-    if (try compactRememberedPlanIfValid(BackendType, backend)) return true;
+    if (try compactRememberedPlanIfValid(BackendType, backend, .{ .l0_limit = l0_limit, .l0_only = false, .max_bytes = backend.options.max_compaction_input_bytes, .allow_oversized = allowOversizedSingleCompactionInput(backend) })) return true;
 
     var selection_stats: CompactionSelectionStats = .{};
     const plan = selectCompactionPlanWithStats(
@@ -1969,7 +2129,7 @@ pub fn compactL0ToLimit(comptime BackendType: type, backend: *BackendType, l0_li
 
 pub fn compactL0ToLimitScheduled(comptime BackendType: type, backend: *BackendType, l0_limit: usize, score: u64) !bool {
     if (domainPlanningEnabled(backend)) return compactDomainPlan(BackendType, backend, l0_limit, true, true, score, backend.options.max_compaction_input_bytes, allowOversizedSingleCompactionInput(backend));
-    if (try compactRememberedPlanIfValid(BackendType, backend)) return true;
+    if (try compactRememberedPlanIfValid(BackendType, backend, .{ .l0_limit = l0_limit, .l0_only = true, .max_bytes = backend.options.max_compaction_input_bytes, .allow_oversized = allowOversizedSingleCompactionInput(backend) })) return true;
 
     var selection_stats: CompactionSelectionStats = .{};
     const plan = selectL0CompactionWithStats(
@@ -2001,6 +2161,9 @@ pub fn compactL0ToLimitScheduledWithinBudget(
     score: u64,
     max_input_bytes: ?u64,
 ) !bool {
+    // Zero in the public optional budget means no foreground input, whereas
+    // zero in the internal planner's non-optional limit means unlimited.
+    if (max_input_bytes == 0) return false;
     const option_limit = backend.options.max_compaction_input_bytes;
     const effective_limit = if (max_input_bytes) |explicit_limit|
         if (option_limit > 0) @min(option_limit, explicit_limit) else explicit_limit
@@ -2169,7 +2332,7 @@ fn noteCompactionSelectionStats(comptime BackendType: type, backend: *BackendTyp
     if (stats.oversized_skips > 0) backend.compaction_scheduler.noteOversizedSkips(stats.oversized_skips);
 }
 
-fn compactRememberedPlanIfValid(comptime BackendType: type, backend: *BackendType) !bool {
+fn compactRememberedPlanIfValid(comptime BackendType: type, backend: *BackendType, policy: PlanningPolicy) !bool {
     if (!@hasField(BackendType, "remembered_compaction")) return false;
     const remembered = backend.remembered_compaction orelse return false;
     backend.compaction_scheduler.noteRememberedRetry();
@@ -2182,7 +2345,7 @@ fn compactRememberedPlanIfValid(comptime BackendType: type, backend: *BackendTyp
 
     var work = try compactionWorkForPlan(backend.allocator, &backend.runs, plan, remembered.score);
     defer work.deinit(backend.allocator);
-    if (backend.options.max_compaction_input_bytes > 0 and work.input_bytes > backend.options.max_compaction_input_bytes) {
+    if (!policy.admits(plan, work.input_bytes)) {
         backend.remembered_compaction = null;
         backend.compaction_scheduler.noteRememberedStale();
         return false;

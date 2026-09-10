@@ -63,6 +63,41 @@ Planning builds are single-flight and memory-admitted. Plans are revalidated
 against live inputs before installation. GC intent is merged from those live
 inputs, including requests made while ordinary compaction was building.
 
+### Policy-bound continuation admission
+
+Discovery identity includes the L0 target, source-level restriction, input-byte
+limit, and oversized-job policy. There are at most two active closure slots:
+ordinary background work and L0-only work. A foreground request never consumes
+or replaces the background slot. Changing policy retires only that lane's old
+job through the sliced cleanup queue; no slot is replaced while planning is
+off-lock. Both slots participate in memory accounting and shutdown cleanup.
+
+Background maintenance alternates between queued slots, including L0 jobs whose
+request has returned. Synchronous compaction drains those same continuations.
+This preserves background progress without indefinitely pinning an abandoned
+foreground epoch. Both lanes retain the existing per-slice work/time bounds;
+they do not introduce parallel builders or an unbounded per-request job queue.
+
+Before acquiring an execution grant, admission checks the current caller's
+source-level and byte restrictions using the input-byte total already computed
+for scheduling. Retry-cache hits use the same check. Exceeding a byte target
+requires both caller permission and a minimum-indivisible-closure certificate
+from discovery; a queued plan is not itself permission to exceed a budget.
+An explicit zero-byte foreground budget admits no work (the internal planner's
+zero sentinel still means unlimited). Regression tests cover alternating lanes,
+policy changes, in-flight ownership, final admission, synchronous/background
+draining, and close with both slots occupied.
+
+The ReleaseFast policy-isolation regression measured about 10.1 microseconds
+per rejected foreground call (64 calls, a queued 5,001-run background closure).
+It asserts zero background discovery progress and zero executed compactions
+during those requests. This measures metadata admission, not SST I/O or an
+end-to-end ingestion speedup. Reproduce from `zig/` with:
+
+```sh
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'compaction policy'
+```
+
 ## Manifest journal
 
 `manifest.bin` is now a 36-byte checksummed `ALSMSET1` descriptor containing the

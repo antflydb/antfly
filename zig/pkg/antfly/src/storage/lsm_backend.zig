@@ -1552,6 +1552,8 @@ pub const Backend = struct {
     planner_seed: usize = 0,
     directory_planning_in_flight: bool = false,
     pending_directory_closure: ?*compaction_mod.PendingDirectoryClosure = null,
+    pending_l0_directory_closure: ?*compaction_mod.PendingDirectoryClosure = null,
+    closure_service_l0_next: bool = false,
     pending_gc: ?*compaction_mod.PendingGc = null,
     retired_gc: ?*compaction_mod.PendingGc = null,
     gc_reclaim_in_flight: bool = false,
@@ -2448,7 +2450,7 @@ pub const Backend = struct {
 
     fn maintenanceScoreLocked(self: *Backend) u64 {
         var score: u64 = 0;
-        if (self.pending_directory_closure != null or self.retired_closures != null) score += 1;
+        if (self.pending_directory_closure != null or self.pending_l0_directory_closure != null or self.retired_closures != null) score += 1;
         if (self.pending_gc != null or self.retired_gc != null or self.directory_reclaimer != null or self.retired_run_directories != null) score +|= 1;
         if (self.retired_run_stores != null or self.store_reclaimer != null) score +|= 1;
         if (self.obsolete_run_count != 0 and (self.obsolete_run_drain_remaining != 0 or self.obsolete_run_pin_epoch != file_pin_release_epoch.load(.acquire))) score +|= 1;
@@ -2588,6 +2590,7 @@ pub const Backend = struct {
         if (self.manifest_directory) |directory| bytes +|= directory.accountedMemoryBytes(pass);
         if (self.manifest_checkpoint_directory) |directory| bytes +|= directory.accountedMemoryBytes(pass);
         if (self.pending_directory_closure) |pending| bytes +|= pending.directory.accountedMemoryBytes(pass);
+        if (self.pending_l0_directory_closure) |pending| bytes +|= pending.directory.accountedMemoryBytes(pass);
         var retired_closure = self.retired_closures;
         while (retired_closure) |pending| : (retired_closure = pending.retired_next) bytes +|= pending.directory.accountedMemoryBytes(pass);
         if (self.pending_gc) |pending| bytes +|= pending.accountedMemoryBytes(pass);
@@ -2775,7 +2778,7 @@ pub const Backend = struct {
                 false;
             if (!defer_soft_compaction) {
                 self.gc_maintenance_turn +%= 1;
-                const aged_gc = self.pending_directory_closure == null and self.gc_maintenance_turn % 8 == 0 and (compaction_mod.nextTombstoneGcDelay(self) orelse 1) == 0 and
+                const aged_gc = self.pending_directory_closure == null and self.pending_l0_directory_closure == null and self.gc_maintenance_turn % 8 == 0 and (compaction_mod.nextTombstoneGcDelay(self) orelse 1) == 0 and
                     try compaction_mod.compactTombstonesScheduled(Backend, self, score);
                 const compacted = aged_gc or try compaction_mod.maybeCompactRunsScheduledWithL0Limit(
                     Backend,
@@ -2783,7 +2786,7 @@ pub const Backend = struct {
                     if (soft_l0_runs > 0) soft_l0_runs else self.options.compact_threshold_runs,
                     score,
                 );
-                if (!compacted and self.pending_directory_closure == null) _ = try compaction_mod.compactTombstonesScheduled(Backend, self, score);
+                if (!compacted and self.pending_directory_closure == null and self.pending_l0_directory_closure == null) _ = try compaction_mod.compactTombstonesScheduled(Backend, self, score);
             }
         }
         // Hard L0/WAL bounds remain authoritative even while latency-sensitive
@@ -5258,6 +5261,8 @@ pub const Backend = struct {
         }
         if (self.pending_directory_closure) |pending| pending.destroy(self);
         self.pending_directory_closure = null;
+        if (self.pending_l0_directory_closure) |pending| pending.destroy(self);
+        self.pending_l0_directory_closure = null;
         while (self.retired_closures) |pending| {
             self.retired_closures = pending.retired_next;
             pending.destroy(self);
