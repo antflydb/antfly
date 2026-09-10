@@ -5081,6 +5081,7 @@ pub fn build(b: *std.Build) void {
         "three production DataServers compose replicated merge and split across public writes failover and restart on VoprIo",
         "inline replicated split action failure releases its transition lane exactly once",
         "data raft forwarding distinguishes safe retries from ambiguous outcomes",
+        "data raft forwarding progresses while the control executor is saturated",
         "expired data raft deadline snapshots never wait and release before returning",
         "transaction pre-decision Raft wait consumes admission delay and preserves response time",
         "data raft batch forwarding bounds routing campaigns deadlines and deterministic fallback",

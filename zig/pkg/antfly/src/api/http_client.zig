@@ -2175,6 +2175,12 @@ pub const ApiHttpClient = struct {
                 // peer explicitly reported an ambiguous proposal or whether
                 // the client lost the response after crossing its send
                 // boundary.
+                std.log.warn("internal group batch transport failed group_id={} delivery={s} timeout_ms={?} err={s}", .{
+                    group_id,
+                    @tagName(delivery),
+                    timeout_ms,
+                    @errorName(err),
+                });
                 return error.RaftBatchWriteTransportOutcomeUnknown;
             }
             return err;
@@ -4641,13 +4647,13 @@ test "api http client requires explicit not-proposed marker and tracks delivery 
     try std.testing.expectError(error.OutOfMemory, OutcomeExecutor.fetch(&client));
 
     executor.mode = .failure_after_send;
-    try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, OutcomeExecutor.fetch(&client));
+    try std.testing.expectError(error.RaftBatchWriteTransportOutcomeUnknown, OutcomeExecutor.fetch(&client));
 
     executor.mode = .refused_after_send;
-    try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, OutcomeExecutor.fetch(&client));
+    try std.testing.expectError(error.RaftBatchWriteTransportOutcomeUnknown, OutcomeExecutor.fetch(&client));
 
     executor.mode = .failure_unknown;
-    try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, OutcomeExecutor.fetch(&client));
+    try std.testing.expectError(error.RaftBatchWriteTransportOutcomeUnknown, OutcomeExecutor.fetch(&client));
 }
 
 test "fenced backup forwarding treats post-send transport failure as ambiguous" {

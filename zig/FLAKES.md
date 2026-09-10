@@ -4,6 +4,89 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## Standalone routing watch deadline (#689, #694)
+
+[PR #689, run 34418061842, job 102687782332](https://github.com/antflydb/antfly/actions/runs/34418061842/job/102687782332)
+failed `standalone routing watch does not report absence after one probe` with
+`expected .authoritative_absence, found .retry`. The real-clock test used a 60 ms
+deadline; scheduling delay can exhaust the confirmation budget, so the
+deadline-aware mutex correctly returns a retry instead of certifying absence.
+
+[PR #694](https://github.com/antflydb/antfly/pull/694) accepts that retry only after
+deadline expiry and retains the minimum-wait and unexpected-change assertions.
+The watch and mutex deadline checks share an injectable monotonic clock. Manual
+time requires successful confirmation before expiry and checks an overshooting
+sleep, an already-expired caller budget, and mutex contention. Production keeps
+the same monotonic time, sleep, and yield operations.
+
+Validation on macOS ARM64: all 108 standalone runtime tests passed without
+leaks. Setting the confirmation budget to zero temporarily made the new test
+fail with the original expected/actual mismatch; the mutation was reverted.
+Both routing-watch tests passed in #694's subsequent Linux x86_64 CI run
+34423487352. That run failed in the unrelated dense rollback test below.
+
+## Dense generation rollback activation budget (#694, #695)
+
+[PR #694, run 34423487352, job 102704099568](https://github.com/antflydb/antfly/actions/runs/34423487352/job/102704099568)
+failed `db failed activated dense generation rolls back to retained predecessor`.
+The second repair returned `failed=1`, `unresolved=1`, and remaining debt instead
+of reaching the injected `TestCrashBeforeReplacementValidation` error.
+
+The functional rollback test used the 250 ms production activation budget.
+A temporary 350 ms pause after persisting the activating phase reproduced the
+CI signature on macOS ARM64. [PR #695](https://github.com/antflydb/antfly/pull/695),
+commit `d36b3492d`, uses the existing five-second functional-test options for the
+predecessor build, crash-injected replacement, and final recovery rebuild. It
+also asserts that the predecessor completed successfully before testing
+rollback. The production limit and crash, rollback, and search assertions stay
+in place. The fix is also included in #694.
+
+The injected-pause case passed after the fix. After removing the temporary hook,
+all 68 tests in `zig build dense-index-lifecycle-regression-test -j4` passed
+without leaks. Formatting and diff checks passed. The Linux x86_64 unit job on
+#695 also passed ([run 34427566807, job 102716322007](https://github.com/antflydb/antfly/actions/runs/34427566807/job/102716322007)).
+The same 68 tests passed again after inclusion in #694 with current main.
+
+## Backup seed forwarding exhausts the control executor (#694)
+
+[PR #694, run 34423487352, job 102714559943](https://github.com/antflydb/antfly/actions/runs/34423487352/job/102714559943)
+failed the three-by-three backup E2E case while seeding its three documents:
+HTTP 409 `write outcome unknown`. The artifact contained only the executable,
+so the original CI log does not identify the underlying transport error.
+
+On macOS ARM64, a native Debug build based on main `9f192f9be` reproduced the
+same seed failure in **1/30 concurrent runs**. Adding error-path diagnostics
+then reproduced it in **7/60 runs**, all with `ConcurrencyUnavailable` inside
+the forwarded group batch HTTP client. The client conservatively translates
+transport errors after its send boundary into an ambiguous write outcome;
+the test correctly fails instead of blindly replaying the batch.
+
+Both known-leader and placement-fallback forwarding used `dataRaftIo()`, which
+selects the runtime's eight-worker control executor. HTTP forwarding submits
+nested request, deadline, and connection tasks. Concurrent transaction
+participants compete with control work for those eight slots, and admission
+failure can occur after a request starts. Forwarding now uses the existing
+bounded outbound Raft network executor. Control waits retain their executor,
+and borrowed runtimes retain their caller-supplied transport authority. Neither
+the aggregate worker budget nor the write deadline is increased.
+
+The deterministic regression occupies every control slot, verifies that one
+more task is rejected, then sends a real forwarded batch to a loopback peer.
+With the old executor it fails with `RaftBatchWriteTransportOutcomeUnknown`
+and underlying `ConcurrencyUnavailable`; with the fix it receives HTTP 201 and
+verifies exactly one request. The borrowed-VoprIo and forwarding-error
+classification regressions also pass. Diagnostics now retain the underlying
+HTTP error, delivery phase, and timeout without logging request bodies.
+The broader HTTP client regression had three stale expectations for transport
+failures after #692 introduced the distinct internal error; they now require
+`RaftBatchWriteTransportOutcomeUnknown`. Peer-reported ambiguity still requires
+`RaftBatchWriteOutcomeUnknown`, and definite pre-send failure remains distinct.
+
+The E2E fixture also declares its process resource explicitly: before the fix,
+pytest collection classified this six-process cluster as `light`; afterward it
+uses `antfly-process`. See the [E2E entry](e2e/FLAKES.md#three-by-three-backup-seed-batch-unknown-outcome-694)
+for final soak results and remaining CI validation.
+
 ## Autograph second-document write timeout (#690)
 
 [CI run 34395199129, job 102623777993](https://github.com/antflydb/antfly/actions/runs/34395199129/job/102623777993?pr=690)

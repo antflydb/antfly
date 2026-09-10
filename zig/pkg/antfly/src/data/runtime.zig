@@ -9476,6 +9476,15 @@ pub const DataServer = struct {
         return null;
     }
 
+    fn dataRaftForwardIo(self: *DataServer) ?std.Io {
+        // Forwarded HTTP requests need concurrent request, deadline, and
+        // connect tasks. Keep that fanout off the small control executor used
+        // by read barriers and reconciliation. The runtime supplies either
+        // its bounded outbound network lane or the caller's borrowed I/O.
+        const runtime = self.backend_runtime orelse return null;
+        return runtime.raftOutboundIo();
+    }
+
     fn dataRaftMonotonicNs(self: *DataServer) u64 {
         if (self.dataRaftIo()) |io|
             return @intCast(@max(0, std.Io.Clock.now(.awake, io).nanoseconds));
@@ -10135,7 +10144,7 @@ pub const DataServer = struct {
                                 // the Raft process that selected the route.
                                 var executor = antfly.common.http.IoHttpExecutor.init(
                                     alloc,
-                                    self.dataRaftIo() orelse return error.BackendRuntimeUnavailable,
+                                    self.dataRaftForwardIo() orelse return error.BackendRuntimeUnavailable,
                                     .{},
                                 );
                                 defer executor.deinit();
@@ -10358,7 +10367,7 @@ pub const DataServer = struct {
 
         var executor = antfly.common.http.IoHttpExecutor.init(
             alloc,
-            self.dataRaftIo() orelse return error.BackendRuntimeUnavailable,
+            self.dataRaftForwardIo() orelse return error.BackendRuntimeUnavailable,
             .{},
         );
         defer executor.deinit();
@@ -35153,6 +35162,8 @@ test "data raft retry clock and sleep borrow VoprIo" {
     defer runtime.deinit();
     var server: DataServer = undefined;
     server.backend_runtime = runtime.ptr();
+    try std.testing.expectEqual(io.userdata, server.dataRaftForwardIo().?.userdata);
+    try std.testing.expectEqual(io.vtable, server.dataRaftForwardIo().?.vtable);
     try std.testing.expectEqual(@as(u64, 0), server.dataRaftMonotonicNs());
     const metadata_budget = antfly.metadata_http_client.RequestBudget{
         .deadline_ns = 2 * data_raft_batch_leader_retry_sleep_ns,
@@ -40652,6 +40663,78 @@ test "remote catalog watches reserve the outer deadline for replica failover" {
             25 * std.time.ns_per_ms,
         ),
     );
+}
+
+test "data raft forwarding progresses while the control executor is saturated" {
+    if (@import("builtin").single_threaded or @import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var server: DataServer = .{
+        .alloc = alloc,
+        .backend_runtime = backend_runtime.ptr(),
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            "/tmp/unused-data-forward-capacity",
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            "/tmp/unused-data-forward-capacity",
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+        ),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .nothing,
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    const control_io = server.dataRaftIo().?;
+    var release: std.Io.Event = .unset;
+    const Worker = struct {
+        fn run(io: std.Io, event: *std.Io.Event) void {
+            event.waitUncancelable(io);
+        }
+    };
+    var tasks: [@import("../common/threaded_io_limits.zig").backend_runtime_control]std.Io.Future(void) = undefined;
+    var started: usize = 0;
+    defer {
+        release.set(control_io);
+        for (tasks[0..started]) |*task| task.await(control_io);
+    }
+    for (&tasks) |*task| {
+        task.* = try control_io.concurrent(Worker.run, .{ control_io, &release });
+        started += 1;
+    }
+    try std.testing.expectError(error.ConcurrencyUnavailable, control_io.concurrent(Worker.run, .{ control_io, &release }));
+
+    var peer = try httpx.TestServer.start(alloc, std.testing.io, &.{.{
+        .method = .POST,
+        .path = "/internal/v1/groups/7/tables/docs/batch-routed-v1",
+        .respond = .{ .status = 201, .body = "{\"inserted\":1}" },
+        .max_uses = 1,
+    }});
+    defer peer.deinit();
+    var serving = try std.testing.io.concurrent(httpx.TestServer.handleOne, .{&peer});
+    defer serving.cancel(std.testing.io) catch {};
+    var executor = antfly.common.http.IoHttpExecutor.init(alloc, server.dataRaftForwardIo().?, .{});
+    defer executor.deinit();
+    var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
+    var response = try client.fetchGroupBatchWithForwarding(
+        peer.baseUrl(),
+        7,
+        "docs",
+        "{\"inserts\":{\"doc:a\":{\"title\":\"a\"}}}",
+        5_000,
+        .{ .remaining_ms = 5_000, .forwards_remaining = 0, .campaign_allowed = false },
+        null,
+        null,
+    );
+    defer response.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"inserted\":1}", response.body);
+    try serving.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 1), peer.route_hits[0]);
 }
 
 test "data runtime background worker capacity is reserved and closes with its owner" {

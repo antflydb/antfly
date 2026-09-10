@@ -9,6 +9,7 @@ entries so later failures can be compared with the original signature.
 
 | Test | CI evidence | Fix commit | Status |
 | --- | --- | --- | --- |
+| Same three-by-three backup test, seed batch `409 write outcome unknown` | [PR #694, run 34423487352, job 102714559943](https://github.com/antflydb/antfly/actions/runs/34423487352/job/102714559943) | This change | Reproduced control-executor exhaustion; forwarding moved to outbound Raft executor. Fixed-runtime soak: 59/60 passed, no seed 409; one earlier table-create timeout remains open below. |
 | `test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities` | [PR #690, run 34395199129, job 102623777993](https://github.com/antflydb/antfly/actions/runs/34395199129/job/102623777993?pr=690) | This change | Resolver work moved out of refresh; per-group Raft apply deferral preserves healthy progress; see [runtime investigation and validation](../FLAKES.md#autograph-second-document-write-timeout-690). |
 | `test_retrieval.py::test_retrieval_agent_streaming_fallback_progress` | [PR #657, run 34176604388, job 101914807099](https://github.com/antflydb/antfly/actions/runs/34176604388/job/101914807099?pr=657), head [`bc8f8a20d`](https://github.com/antflydb/antfly/commit/bc8f8a20d34534969decc90813fbcb8f390164f1) | [`47106c1fd`](https://github.com/antflydb/antfly/commit/47106c1fd09e9be5f1e3333363fd77d007813632) | Teardown recovery fixed; original reset cause unknown; 30/30 soak runs passed. |
 | `test_backup_restore.py::test_three_by_three_cluster_backup_restore_through_metadata_public_api` | [PR #658, run 34177703845, job 101916669107](https://github.com/antflydb/antfly/actions/runs/34177703845/job/101916669107?pr=658), head [`96bee1e80`](https://github.com/antflydb/antfly/commit/96bee1e80cf115c2dc636ed065a0378d8cfb27f3) | [`1bf7230cc`](https://github.com/antflydb/antfly/commit/1bf7230cc74c37ba4263964719542c210ff9473d) | Write-admission handling fixed; 30/30 soak runs passed. |
@@ -17,6 +18,71 @@ entries so later failures can be compared with the original signature.
 | Same three-by-three backup test, initial table create | [PR #664, run 34263167199, job 102199089027](https://github.com/antflydb/antfly/actions/runs/34263167199/job/102199089027?pr=664), merge `d6108b73b85a8e77dfcb740d5518279b2a51d826` | This change | Read waiter clock and pre-admission handling fixed; 100/100 Debug soak runs passed. |
 | `test_quickstart.py::test_public_quickstart_query_string_boolean_controls` | [PR #657, run 34296218257, job 102299245250](https://github.com/antflydb/antfly/actions/runs/34296218257/job/102299245250?pr=657), head `292e5ec9c` | This change | Deterministic fixture mismatch reproduced 9/9; fresh stateful restart fixture passed 30/30 final soak runs. |
 | `test_standby.py::test_standby_streams_public_writes_restarts_and_rejects_writes` | Same #657 job | This change | Live replication startup wait passed 30/30 ordinary and 30/30 delayed-fetch runs. Delayed first fetch reproduces the pending-durability 503 without the wait; original CI delay was not observed locally. |
+
+### Three-by-three backup seed batch: unknown outcome (#694)
+
+The run reported 394 passed, five skipped, and one failure. Table creation and
+three-shard, three-voter replication checks succeeded, but the initial batch
+seeding three fixed document keys returned HTTP 409 `write outcome unknown`.
+The test failed before starting backup. Both routing-watch unit tests and the
+inference E2E suite passed in the same run. The failed aggregate checks merely
+report their child-job failures; they are not additional flakes.
+
+This is distinct from the earlier 503 `write unavailable` admission rejection.
+The seeding helper correctly refuses to replay an ambiguous generic batch.
+Its immediate error path now includes the six server log tails, status, response
+body, and chained exception, just like the deadline-exhaustion path. Fast tests
+cover this exact 409, transport failures, and other non-admission errors, require
+diagnostics, and verify that each fails after one POST.
+
+The failure reproduced on current main with #692 included: 1/30 initial runs,
+then 7/60 instrumented runs, using three concurrent soak workers. Every
+instrumented failure reported `ConcurrencyUnavailable` in the group batch
+forwarder. The [runtime investigation](../FLAKES.md#backup-seed-forwarding-exhausts-the-control-executor-694)
+records the executor fix and deterministic before/after regression.
+
+The fixture was also missing from the scheduler's legacy process-fixture list,
+which still named its predecessor `multi_metadata_backup_cluster`. It now
+declares `@e2e_resource("antfly_process")` directly, so future fixture renames
+retain the declaration. Actual pytest collection changes from `light--test--`
+to `antfly-process--test--`; the six-process cluster now consumes a process
+resource slot. The concurrent soak uses independent pytest workers and still
+stresses multiple clusters simultaneously.
+
+Validation on 2026-09-09 (America/Los_Angeles), macOS ARM64, native Debug:
+
+- 128 harness and scheduler tests passed.
+- The saturated-control forwarding regression failed before the executor fix
+  and passed afterward; borrowed I/O and error-classification checks passed.
+- All 114 focused forwarding, HTTP-client, and Raft checks passed after updating
+  three stale expectations for the distinct internal transport-ambiguity error.
+- Fixed-runtime soak: **59/60 passed**, three workers × twenty repetitions.
+  No seed-write 409 occurred; one run failed before seeding at table-create
+  admission, detailed below. This is not a clean full-test soak.
+- Pinned Ruff lint/format checks, Zig formatting, and diff checks passed.
+- Linux CI remains cross-platform validation.
+
+The fixed Debug executable SHA-256 was
+`ad61b7bdfd43fd6e425e44caab2e8c8a9d2252f7b366356fe7b12b6eb96454a8`.
+The final soak log is `/private/tmp/pr694-backup-outbound-fixed-soak.log`.
+
+Original CI diagnostics were insufficient to prove that CI hit the same internal
+error; the local reproduction and deterministic regression establish a concrete
+cause of the matching failure signature. Baseline soak logs are retained in
+`/private/tmp/pr694-backup-fixed-soak.log` (the earlier scheduler/diagnostics-only
+change) and `/private/tmp/pr694-backup-transport-soak.log` (underlying error added).
+
+#### Table-create admission timeout during #694 validation (open)
+
+Worker 1, iteration 11 of the fixed-runtime soak exhausted the existing
+30-second create-admission budget after five HTTP 503 responses with
+`metadata_leader_unavailable`, `X-Antfly-Metadata-Mutation-Not-Admitted: true`,
+and `X-Antfly-Metadata-Not-Leader: true`. It had not reached seed writes or the
+changed batch forwarder. This is a recurrence of the earlier table-create
+failure stage; the current evidence does not establish its internal cause.
+It remains an open flake, not a reason to replay ambiguous writes or extend
+production deadlines. The full response and six process logs are in the final
+soak log above; the harness preserved the failed cluster directory as well.
 
 ### Quickstart restart fixture and HA replication startup (#657)
 

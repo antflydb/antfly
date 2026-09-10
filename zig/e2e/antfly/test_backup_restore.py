@@ -38,6 +38,7 @@ from conftest import (
     resolve_binary_path,
     wait_for_server,
 )
+from e2e_scheduler import e2e_resource
 from helpers import assert_created_index, wait_until
 from port_reservations import LoopbackPortReservations
 
@@ -372,13 +373,17 @@ def _seed_cluster_docs_when_writable(
             return None
         return _check_response(last_response)
 
-    batch = wait_until(attempt, timeout_s=timeout_s, interval_s=0.1)
-    assert batch is not None, (
-        f"table {table_name} did not become writable; "
-        f"last_response={last_response.text if last_response is not None else None}\n"
-        f"{cluster.debug_logs()}"
-    )
-    return batch
+    try:
+        batch = wait_until(attempt, timeout_s=timeout_s, interval_s=0.1)
+        assert batch is not None, f"table {table_name} did not become writable"
+        return batch
+    except (AssertionError, requests.RequestException) as exc:
+        raise AssertionError(
+            f"backup table {table_name} seed failed: {exc}; "
+            f"last_status={last_response.status_code if last_response is not None else None}; "
+            f"last_response={last_response.text if last_response is not None else None}\n"
+            f"{cluster.debug_logs()}"
+        ) from exc
 
 
 def _is_metadata_not_leader_response(response: requests.Response) -> bool:
@@ -1100,6 +1105,7 @@ class ThreeByThreeBackupCluster:
 
 
 @pytest.fixture
+@e2e_resource("antfly_process")
 def three_by_three_backup_cluster(
     request: pytest.FixtureRequest,
 ) -> ThreeByThreeBackupCluster:
