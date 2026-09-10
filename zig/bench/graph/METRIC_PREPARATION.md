@@ -1,5 +1,48 @@
 # Graph metric execution and query benchmarks
 
+## Retained native cursors and durable lifecycle ownership (2026-09-10)
+
+In-process adjacency streams retain their native read snapshots and physical
+cursor across bounded batches. Logical resume cursors remain the RPC paging
+contract. Both paths share allocation-free encoded-key inspection and admit the
+complete decoded edge size before allocating identifiers or metadata. Native
+scans close their resources on exhaustion, errors, or explicit early stopping;
+they do not advance into the unrequested tail just to manufacture a resume key.
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseSafe -j1 -- --native-scans-only
+```
+
+Apple M4 Max / Zig 0.16.0; warm default durable LSM, 65,536 outgoing hub edges
+inserted in sixteen 4,096-edge batches. Five samples after one warmup per mode,
+with each comparison repeated. Both paths decode identical results in batches
+of 64 using the current admission implementation; setup is excluded, scan and
+result cleanup included.
+
+| Workload | Logical pages | Retained cursor |
+| --- | ---: | ---: |
+| Full scan median, repeated runs | 23.19–24.28 ms | 18.70–18.81 ms |
+| Full scan query allocation count | 209,918 | 203,778 |
+| Full scan peak query-owned bytes | 10,848 | 10,786 |
+| First-edge median, repeated runs | 4.38–4.75 µs | 4.38–4.42 µs |
+
+Retaining the cursor reduced full-scan time by approximately 19–23% without
+increasing the batch size. First-edge timings are too small/noisy to establish
+a latency improvement. Query allocation statistics exclude storage-owned
+snapshots/cursors; this is a local scan benchmark, not an end-to-end cloud or
+ingestion throughput claim.
+
+Repair now treats metric score epochs, cleanup cursors, and operator intent as
+durable lifecycle state rather than rebuildable counters. Starting a repair
+atomically fences numerical leases and advances the topology epoch, retaining
+interrupted jobs for normal bounded retirement before lease takeover replaces
+them. A full retirement queue therefore cannot prevent repair/reopen. Bounded
+reconstruction preserves the lifecycle namespaces and topology task incarnation
+sequence. Regression coverage includes unpublished score isolation,
+restart between counter-rebuild pages, snapshot stability across intervening
+LSM writes, escaped identities, all directions, duplicate types, oversized
+payload admission, and allocation-failure cleanup.
+
 ## Demand-driven queries and recoverable pruning (2026-09-10)
 
 The `--paged-only` harness now also runs complete dedicated limit-1 neighbor

@@ -105,23 +105,5 @@ test "graph maintenance edge streams preserve source admission diagnostics" {
 }
 
 pub fn openGraph(alloc: A, index: *graph.GraphIndex, key: []const u8, kinds: []const []const u8, direction: graph.EdgeDirection) !Stream {
-    return Stream.init(alloc, struct {
-        index: *graph.GraphIndex,
-        key: []const u8,
-        kinds: []const []const u8,
-        direction: graph.EdgeDirection,
-        cursor: ?graph.EdgeScanCursor = null,
-        done: bool = false,
-        fn nextPage(self: *@This(), a: A, count: usize, bytes: usize) !?[]graph.Edge {
-            if (self.done) return null;
-            const page = try self.index.getEdgesByTypesPage(a, self.key, self.kinds, self.direction, self.cursor, .{ .max_edges = count, .max_owned_bytes = bytes });
-            if (self.cursor) |*cursor| cursor.deinit(a);
-            self.cursor = page.next_cursor;
-            self.done = page.next_cursor == null;
-            return page.edges;
-        }
-        fn deinit(self: *@This(), a: A) void {
-            if (self.cursor) |*cursor| cursor.deinit(a);
-        }
-    }{ .index = index, .key = key, .kinds = kinds, .direction = direction });
+    return Stream.init(alloc, index.nativeEdgeScan(key, kinds, direction));
 }

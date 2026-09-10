@@ -200,6 +200,7 @@ pub fn main(init: std.process.Init) !void {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--paged-only")) return @import("paged_read_bench.zig").run(init.io, &output);
         if (std.mem.eql(u8, arg, "--prune-only")) return benchmarkRangePrune(init.io, &output);
+        if (std.mem.eql(u8, arg, "--native-scans-only")) return benchmarkNativeScans(init.io, &output);
         if (std.mem.eql(u8, arg, "--presence-only")) return benchmarkPresence(&output);
         if (std.mem.eql(u8, arg, "--tree-only")) return benchmarkTreeValidation(init.io, &output);
         if (std.mem.eql(u8, arg, "--indexing-only")) {
@@ -486,6 +487,68 @@ fn benchmarkTreeValidation(io: std.Io, out: anytype) !void {
             }
             std.mem.sort(u64, &times, {}, std.sort.asc(u64));
             const json = try std.json.Stringify.valueAlloc(fixture, .{ .mode = if (reference) "tree_prior_write_walk" else "tree_grouped_validation", .writes = count, .median_ns = times[2], .note = "read-only production validation against an empty native graph; identical valid distinct-source writes; excludes commit and fixture setup" }, .{});
+            try out.interface.writeAll(json);
+            try out.interface.writeByte('\n');
+            try out.flush();
+        }
+    }
+}
+
+fn benchmarkNativeScans(io: std.Io, out: anytype) !void {
+    const alloc = std.heap.smp_allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.fmt.allocPrint(a, "/tmp/antfly-native-scan-bench-{d}", .{antfly.platform_time.monotonicNs()});
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const forward = try std.fmt.allocPrintSentinel(a, "{s}/forward", .{root}, 0);
+    const reverse = try std.fmt.allocPrintSentinel(a, "{s}/reverse", .{root}, 0);
+    var index = try antfly.graph.GraphIndex.openWithPrivateStores(alloc, forward, reverse, "g", .{});
+    defer index.close();
+    const count = 65536;
+    const writes = try a.alloc(antfly.graph.BatchWrite, count);
+    for (writes, 0..) |*write, i| write.* = .{ .source = "hub", .target = try std.fmt.allocPrint(a, "node-{d:0>8}", .{i}), .edge_type = "link" };
+    for (0..count / 4096) |i| try index.batchApply(writes[i * 4096 ..][0..4096], &.{});
+    // Both paths use the same decoder, batch size and durable LSM fixture.
+    // Also check that retaining the cursor doesn't sacrifice prefix stopping.
+    for ([_]usize{ count, 1 }) |demand| {
+        for ([_]bool{ false, true, false, true }) |retained| {
+            var samples: [5]u64 = undefined;
+            var last = PhaseAllocStats{};
+            for (0..6) |sample| {
+                var stats = PhaseAllocStats{};
+                var tracking = PhaseTrackingAllocator{ .backing = alloc, .stats = &stats };
+                const query_alloc = tracking.allocator();
+                const start = std.Io.Clock.awake.now(io);
+                var seen: usize = 0;
+                if (retained) {
+                    var scan = index.nativeEdgeScan("hub", &.{"link"}, .out);
+                    defer scan.deinit(query_alloc);
+                    while (seen < demand) {
+                        const edges = (try scan.nextPage(query_alloc, @min(64, demand - seen), 256 * 1024)) orelse break;
+                        seen += edges.len;
+                        antfly.graph.GraphIndex.freeEdges(query_alloc, edges);
+                    }
+                } else {
+                    var cursor: ?antfly.graph.EdgeScanCursor = null;
+                    defer if (cursor) |*value| value.deinit(query_alloc);
+                    while (seen < demand) {
+                        var page = try index.getEdgesByTypesPage(query_alloc, "hub", &.{"link"}, .out, cursor, .{ .max_edges = @min(64, demand - seen), .max_owned_bytes = 256 * 1024 });
+                        if (cursor) |*value| value.deinit(query_alloc);
+                        cursor = page.next_cursor;
+                        page.next_cursor = null;
+                        seen += page.edges.len;
+                        page.deinit(query_alloc);
+                        if (cursor == null) break;
+                    }
+                }
+                if (seen != demand or stats.current_bytes != 0) return error.InvalidBenchmarkResult;
+                if (sample != 0) samples[sample - 1] = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds());
+                last = stats;
+            }
+            std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+            const json = try std.json.Stringify.valueAlloc(a, .{ .mode = if (retained) "native_retained_cursor" else "native_logical_pages", .edges = count, .demand = demand, .batch_records = 64, .median_ns = samples[2], .query_peak_bytes = last.peak_bytes, .query_alloc_count = last.alloc_count, .note = "warm default durable LSM, includes scan/result cleanup; excludes setup; query allocation stats exclude storage-owned snapshot/cursor allocations" }, .{});
             try out.interface.writeAll(json);
             try out.interface.writeByte('\n');
             try out.flush();
