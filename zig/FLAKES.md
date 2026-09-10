@@ -4,6 +4,35 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## Follower catalog observations can retire live data-Raft history (#694)
+
+The failed `00dd1e4aef` restore case (`sjng4qip`) recorded repeated admission of
+both original and restored groups before `ConflictingDataApplyBatch`. Its
+preserved restored Raft stores contained fresh bootstrap checkpoints while the
+data apply journal retained committed identities. Data-Raft reconciliation was
+allowed to retire local groups from ordinary cached/follower snapshots, and
+`metadata_epoch` is only a process-local lifecycle counter. A stale peer can
+therefore omit a live group while presenting a numerically larger epoch.
+
+The real data-runtime regression admits group 77, then supplies an older empty
+catalog with a larger lifecycle counter. Before the fix it fails with expected
+`active`, observed `absent` (`/private/tmp/ci694-retirement-before.log`). Remote
+reconciliation now requires a coherent linearizable snapshot before changing
+local replica placement, membership, or generation. The authority read and
+publication share the reconciliation mutex; the Raft progress owner remains
+independent. Unsupported or unavailable authority cannot authorize retirement.
+The status reporter also uses the refreshed snapshot after reconciliation.
+
+Unchanged placement reuses its prior admitted plan without a quorum read.
+Exact value comparison covers replica/bootstrap identity, voter/learner arrays,
+and scalar relocation fields. A fresh authoritative snapshot bypasses the
+process-local epoch shortcut so a real deletion still applies when two peers'
+counters happen to match. The regression covers stale removal, stale generation
+replacement, unchanged cached progress, and authoritative deletion with an
+equal counter. All 175 data-runtime checks pass without skips or leaks
+(`/private/tmp/ci694-retirement-runtime-final.log`). Linux acceptance remains
+pending; the strict apply-history conflict check is unchanged.
+
 ## Metadata request waiters advance election time outside the cadence driver (#694)
 
 The 60-case diagnostic backup run on `00dd1e4aef` recorded 6,665 metadata

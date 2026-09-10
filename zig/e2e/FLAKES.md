@@ -1,5 +1,22 @@
 # Zig E2E flakes
 
+## 2026-09-10: data-Raft placement requires authority before retirement (#694)
+
+The preserved `sjng4qip` backup failure contained repeated restored-group
+admissions followed by `ConflictingDataApplyBatch`. A deterministic data-runtime
+regression reproduced destructive retirement from an older empty catalog whose
+process-local metadata epoch was larger: group 77 changed from active to absent.
+The fix requires a coherent linearizable snapshot for changed local placement,
+serializes its acquisition with reconciliation, and leaves unchanged placement
+on the cached path. Equal epoch counters from different metadata processes do
+not suppress a genuinely authoritative deletion. See `../FLAKES.md` for the
+production contract and before/after artifacts.
+
+The prior 294/300 mixed run and 57/60 old-runtime backup diagnostic remain failed
+historical runs. Fresh 100-per-scenario acceptance must use the completed
+placement-authority fix together with the resident-owner, CDC, backup-ABI, and
+Raft-cadence fixes; no old passing subset counts toward that acceptance.
+
 ## 2026-09-10: bounded coverage follow-up acceptance (#694)
 
 The `00dd1e4aef` Linux ReleaseFast executable

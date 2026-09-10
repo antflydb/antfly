@@ -14547,7 +14547,7 @@ pub const DataServer = struct {
             self.store_registration_confirmed = false;
             try self.registerNodeIfConfigured();
         }
-        try self.syncDataRaftFromSnapshot(&snapshot);
+        try self.syncDataRaftFromObservedSnapshot(&snapshot);
         const report_generation = self.local_group_status_generation.load(.acquire);
 
         var local_group_ids = try collectLocalGroupIds(self.alloc, snapshot.placement_intents, registration.node_id);
@@ -14755,7 +14755,7 @@ pub const DataServer = struct {
         const remote_metadata = self.remote_metadata orelse return;
         var snapshot = try remote_metadata.fetchSnapshot();
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
-        try self.syncDataRaftFromSnapshot(&snapshot);
+        try self.syncDataRaftFromObservedSnapshot(&snapshot);
     }
 
     fn requestDataRaftMetadataSync(self: *DataServer) void {
@@ -14870,18 +14870,42 @@ pub const DataServer = struct {
         self.last_data_raft_local_intents = replacement;
     }
 
-    fn syncDataRaftFromSnapshot(self: *DataServer, snapshot: *const antfly.metadata_api.AdminSnapshot) !void {
+    const PlacementAuthority = enum { observation, linearizable };
+
+    /// A cached/follower view may drive unchanged local placement. Any change
+    /// needs a coherent quorum-fenced snapshot before filesystem or Raft state
+    /// is mutated. Serialize the read with publication so two reconcilers
+    /// cannot apply their authoritative snapshots in reverse order.
+    fn syncDataRaftFromObservedSnapshot(self: *DataServer, snapshot: *antfly.metadata_api.AdminSnapshot) !void {
+        lockAtomic(&self.data_raft_reconcile_mutex);
+        defer self.data_raft_reconcile_mutex.unlock();
+        self.syncDataRaftFromSnapshotLocked(snapshot, .observation) catch |err| {
+            if (err != error.MetadataReconciliationRequiresAuthority) return err;
+            const remote = self.remote_metadata orelse return err;
+            const authoritative = (try RemoteMetadataSource.remoteLinearizableSnapshot(remote, .{})) orelse return err;
+            freeAdminSnapshotOwned(self.alloc, snapshot);
+            snapshot.* = authoritative;
+            try self.syncDataRaftFromSnapshotLocked(snapshot, .linearizable);
+        };
+    }
+
+    fn syncDataRaftFromSnapshot(self: *DataServer, snapshot: *const antfly.metadata_api.AdminSnapshot, authority: PlacementAuthority) !void {
+        lockAtomic(&self.data_raft_reconcile_mutex);
+        defer self.data_raft_reconcile_mutex.unlock();
+        return self.syncDataRaftFromSnapshotLocked(snapshot, authority);
+    }
+
+    fn syncDataRaftFromSnapshotLocked(self: *DataServer, snapshot: *const antfly.metadata_api.AdminSnapshot, authority: PlacementAuthority) !void {
         self.observeReallocationRequest(snapshot.reallocation_request);
         const raft = self.data_raft orelse return;
         const factory = self.data_raft_factory orelse return;
         const registration = self.store_registration orelse return;
-
-        lockAtomic(&self.data_raft_reconcile_mutex);
-        defer self.data_raft_reconcile_mutex.unlock();
-
         const metadata_epoch = snapshot.status.metadata_epoch;
 
-        const stable_cached_epoch = metadata_epoch != 0 and
+        // Lifecycle epochs are local to each metadata process. A fresh quorum
+        // read must inspect its actual plan even if another peer reused the
+        // same counter; only ordinary observations may reuse the local plan.
+        const stable_cached_epoch = authority == .observation and metadata_epoch != 0 and
             self.last_data_raft_reconciled_metadata_epoch == metadata_epoch;
         stable_round: {
             if (!stable_cached_epoch) break :stable_round;
@@ -14960,6 +14984,10 @@ pub const DataServer = struct {
         var next_cached_local_intents = try local_intents.toOwnedSlice(self.alloc);
         var cache_transferred = false;
         defer if (!cache_transferred) self.freeDataRaftLocalIntents(next_cached_local_intents);
+        if (authority == .observation and
+            (self.last_data_raft_reconciled_metadata_epoch == null or
+                !dataRaftPlacementAuthorityMatches(self.last_data_raft_local_intents, next_cached_local_intents)))
+            return error.MetadataReconciliationRequiresAuthority;
         var next_group_table_names = try self.buildLocalDataRaftGroupTableNames(snapshot, next_cached_local_intents);
         defer {
             var it = next_group_table_names.valueIterator();
@@ -23092,6 +23120,24 @@ fn localNodePreferredServingPeer(
     return min_node_id != null and min_node_id.? == local_node_id;
 }
 
+/// Reuse authority only for the exact previously published local plan. This
+/// compares owned data by value, including bootstrap identity and all scalar
+/// relocation fields; replica array reordering merely requests a fresh fence.
+fn dataRaftPlacementAuthorityMatches(previous: []const antfly.raft.PlacementIntent, next: []const antfly.raft.PlacementIntent) bool {
+    if (previous.len != next.len) return false;
+    for (previous, next) |left, right| {
+        if (!antfly.raft.catalog.eqlReplicaRecord(left.record, right.record) or
+            !std.mem.eql(u64, left.peer_node_ids, right.peer_node_ids) or
+            !std.mem.eql(u64, left.learner_node_ids, right.learner_node_ids)) return false;
+        var scalar_fields = left;
+        scalar_fields.record = right.record;
+        scalar_fields.peer_node_ids = right.peer_node_ids;
+        scalar_fields.learner_node_ids = right.learner_node_ids;
+        if (!std.meta.eql(scalar_fields, right)) return false;
+    }
+    return true;
+}
+
 /// Storage/runtime evidence is owned by the local replica generation, not by
 /// transient routing or Raft-membership state. Keeping this identity narrower
 /// than the complete placement intent prevents a relocation's
@@ -26361,10 +26407,31 @@ test "data raft ticker advances consensus independently of control rounds" {
         .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
         .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
     };
-    try server.syncDataRaftFromSnapshot(&snapshot);
+    try server.syncDataRaftFromSnapshot(&snapshot, .linearizable);
     try std.testing.expectEqual(@as(?u64, 17), server.last_data_raft_reconciled_metadata_epoch);
     try std.testing.expectEqual(@as(usize, 1), server.last_data_raft_local_intents.len);
     const cached_intents_ptr = server.last_data_raft_local_intents.ptr;
+
+    // A follower may report an older empty catalog with a larger local
+    // lifecycle counter. It must not erase a replica's durable Raft history.
+    var stale = snapshot;
+    stale.status.metadata_epoch = 1000;
+    stale.tables = &.{};
+    stale.ranges = &.{};
+    stale.placement_intents = &.{};
+    try std.testing.expectError(error.MetadataReconciliationRequiresAuthority, server.syncDataRaftFromSnapshot(&stale, .observation));
+    try std.testing.expectEqual(antfly.raft.host.HostedReplicaStatus.active, data_raft.host.status(77));
+    try std.testing.expectEqual(cached_intents_ptr, server.last_data_raft_local_intents.ptr);
+
+    var replacement = snapshot;
+    replacement.status.metadata_epoch = 1001;
+    var replacement_intents = [_]antfly.raft.PlacementIntent{snapshot.placement_intents[0]};
+    replacement_intents[0].record.metadata_version += 1;
+    replacement.placement_intents = &replacement_intents;
+    try std.testing.expectError(error.MetadataReconciliationRequiresAuthority, server.syncDataRaftFromSnapshot(&replacement, .observation));
+    // Unchanged placement remains entirely local and borrows the prior plan.
+    try server.syncDataRaftFromSnapshot(&snapshot, .observation);
+    try std.testing.expectEqual(cached_intents_ptr, server.last_data_raft_local_intents.ptr);
 
     {
         lockAtomic(&server.data_raft_mutex);
@@ -26409,7 +26476,7 @@ test "data raft ticker advances consensus independently of control rounds" {
         group.raw_node.raft.soft_state = .{ .leader_id = null, .role = .follower };
     }
     try std.testing.expect(!server.localDataRaftLeaderReady(77));
-    try server.syncDataRaftFromSnapshot(&snapshot);
+    try server.syncDataRaftFromSnapshot(&snapshot, .observation);
     try std.testing.expect(server.localDataRaftLeaderReady(77));
     try std.testing.expectEqual(cached_intents_ptr, server.last_data_raft_local_intents.ptr);
 
@@ -26425,29 +26492,36 @@ test "data raft ticker advances consensus independently of control rounds" {
         antfly.raft.host.HostedReplicaStatus.absent,
         data_raft.host.status(77),
     );
-    try server.syncDataRaftFromSnapshot(&snapshot);
+    try server.syncDataRaftFromSnapshot(&snapshot, .linearizable);
     try std.testing.expectEqual(
         antfly.raft.host.HostedReplicaStatus.active,
         data_raft.host.status(77),
     );
     try std.testing.expectEqual(@as(?u64, 17), server.last_data_raft_reconciled_metadata_epoch);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    var progress = antfly.raft.ManagedProgressDriver.init(
-        io_impl.io(),
-        server.raftProgressSource(),
-        std.time.ns_per_ms,
-    );
-    defer progress.deinit();
-    try progress.start();
+    {
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        var progress = antfly.raft.ManagedProgressDriver.init(
+            io_impl.io(),
+            server.raftProgressSource(),
+            std.time.ns_per_ms,
+        );
+        defer progress.deinit();
+        try progress.start();
 
-    const deadline_ns = platform_time.monotonicNs() + 2 * std.time.ns_per_s;
-    while (!server.localDataRaftLeaderReady(77)) {
-        try progress.check();
-        if (platform_time.monotonicNs() >= deadline_ns) return error.TestExpectedEqual;
-        try io_impl.io().sleep(.fromMilliseconds(1), .awake);
+        const deadline_ns = platform_time.monotonicNs() + 2 * std.time.ns_per_s;
+        while (!server.localDataRaftLeaderReady(77)) {
+            try progress.check();
+            if (platform_time.monotonicNs() >= deadline_ns) return error.TestExpectedEqual;
+            try io_impl.io().sleep(.fromMilliseconds(1), .awake);
+        }
     }
+    // A genuinely authoritative removal must still apply when the leader's
+    // process-local epoch happens to equal the previous follower's epoch.
+    stale.status.metadata_epoch = snapshot.status.metadata_epoch;
+    try server.syncDataRaftFromSnapshot(&stale, .linearizable);
+    try std.testing.expectEqual(antfly.raft.host.HostedReplicaStatus.absent, data_raft.host.status(77));
 }
 
 test "data runtime cli accepts config path" {
@@ -35618,7 +35692,7 @@ test "production DataServer replicated merge actions run on VoprIo" {
         }} });
     }
 
-    try server.syncDataRaftFromSnapshot(&snapshot);
+    try server.syncDataRaftFromSnapshot(&snapshot, .linearizable);
 
     const Shared = struct {
         server: *DataServer,
@@ -36296,7 +36370,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         }} });
         receiver.close();
     }
-    for (&servers) |*server| try server.syncDataRaftFromSnapshot(&snapshot);
+    for (&servers) |*server| try server.syncDataRaftFromSnapshot(&snapshot, .linearizable);
     if (vopr_io.firstCapabilityViolation()) |violation| {
         std.log.err("multi-owner DataServer VOPR pre-schedule capability violation operation={s}", .{
             @tagName(violation.operation),
@@ -37034,7 +37108,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             for (self.servers, 0..) |*server, i| {
                 if (!self.initialized[i]) continue;
                 try SnapshotPublisher.publish(server, self.snapshot.*);
-                try server.syncDataRaftFromSnapshot(self.snapshot);
+                try server.syncDataRaftFromSnapshot(self.snapshot, .linearizable);
             }
         }
 
