@@ -149,7 +149,7 @@ pub const TableDropProjection = struct {
     }
 };
 
-const derived_catalog_index_version = "2";
+const derived_catalog_index_version = "3";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -2094,6 +2094,8 @@ pub const RaftApplyStore = struct {
     next_lifecycle_listener_registration_id: u64 = 1,
     apply_mutex: std.Io.Mutex = .init,
     active_outcome: ?*CommittedApplyOutcome = null,
+    verified_catalog_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    read_only: bool = false,
 
     const OwnedBatch = struct {
         commit_index: u64,
@@ -2134,6 +2136,7 @@ pub const RaftApplyStore = struct {
             .alloc = alloc,
             .io_impl = io_impl,
             .root_dir = root_dir,
+            .read_only = cfg.read_only,
             .path = path,
             .backend = backend,
             .store = try docstore.DocStore.openRuntime(alloc, runtime_store),
@@ -2144,6 +2147,7 @@ pub const RaftApplyStore = struct {
         var it = self.batches.valueIterator();
         while (it.next()) |batch| self.alloc.free(batch.entries_bytes);
         self.batches.deinit(self.alloc);
+        self.verified_catalog_groups.deinit(self.alloc);
         for (self.projected_placement_intents.items) |*entry| freePlacementIntent(self.alloc, entry.intent);
         self.projected_placement_intents.deinit(self.alloc);
         self.loaded_placement_groups.deinit(self.alloc);
@@ -2588,14 +2592,10 @@ pub const RaftApplyStore = struct {
 
     fn getTableByNameResultTxn(self: *RaftApplyStore, comptime Result: type, alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, name: []const u8) !?Result {
         _ = self;
+        try requireDerivedCatalogIndexesTxn(txn, group_id);
         var name_buf: [640]u8 = undefined;
         const encoded_id = txn.get(try tableNameIndexKey(&name_buf, group_id, name)) catch |err| switch (err) {
-            error.NotFound => {
-                const tables = try listPhysicalTableIdentities(alloc, txn, group_id);
-                defer freePhysicalTableIdentities(alloc, tables);
-                for (tables) |table| if (std.mem.eql(u8, table.name, name)) return error.InvalidDerivedCatalogIndex;
-                return null;
-            },
+            error.NotFound => return null,
             else => return err,
         };
         if (encoded_id.len != 8) return error.InvalidDerivedCatalogIndex;
@@ -2607,7 +2607,7 @@ pub const RaftApplyStore = struct {
         };
         const table: Result = if (Result == metadata.TableRecord) try decodeTableRecord(alloc, bytes) else try decodeTableIdentity(alloc, bytes);
         errdefer if (Result == metadata.TableRecord) metadata_table_manager.freeTable(alloc, table) else table.deinit(alloc);
-        if (!std.mem.eql(u8, table.name, name)) return error.InvalidDerivedCatalogIndex;
+        if (table.table_id != id or !std.mem.eql(u8, table.name, name)) return error.InvalidDerivedCatalogIndex;
         return table;
     }
 
@@ -2618,7 +2618,7 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn validateSystemCatalog(self: *RaftApplyStore, group_id: u64, command: SystemCatalogCommand) !void {
-        var txn = try self.store.beginReadTxn();
+        var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
         var snapshot = try system_catalog_storage.loadState(self.alloc, &txn, group_id);
         defer snapshot.deinit();
@@ -2653,14 +2653,14 @@ pub const RaftApplyStore = struct {
 
     fn resolveSystemCatalogResult(self: *RaftApplyStore, comptime Result: type, alloc: std.mem.Allocator, group_id: u64, target: system_catalog.Target) !?Result {
         try target.validate();
-        var txn = try self.store.beginReadTxn();
+        var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
         return self.resolveSystemCatalogResultTxn(Result, alloc, &txn, group_id, target);
     }
 
     pub fn resolveSystemCatalogIdentities(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.ResolveMany) !system_catalog.ResolvedMany {
         if (request.targets.len > 256) return error.CatalogCommandTooLarge;
-        var txn = try self.store.beginReadTxn();
+        var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
         const meta = try system_catalog_storage.readMeta(alloc, &txn, group_id);
         if (request.expected_revision) |expected| if (expected != meta.revision) return error.CatalogGenerationChanged;
@@ -2673,8 +2673,27 @@ pub const RaftApplyStore = struct {
         for (request.targets, tables) |target, *table| {
             table.* = try self.resolveSystemCatalogResultTxn(system_catalog.ResolvedTable, alloc, &txn, group_id, target);
             initialized += 1;
+            if (request.include_query_definitions) if (table.*) |*identity| {
+                identity.query_definition = try self.queryTableDefinitionTxn(alloc, &txn, group_id, identity.name);
+            };
         }
         return .{ .revision = meta.revision, .tables = tables };
+    }
+
+    pub fn queryTableDefinition(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, name: []const u8) !?system_catalog.QueryDefinition {
+        var txn = try self.beginQueryCatalogReadTxn(group_id);
+        defer txn.abort();
+        return self.queryTableDefinitionTxn(alloc, &txn, group_id, name);
+    }
+
+    fn queryTableDefinitionTxn(self: *RaftApplyStore, alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, name: []const u8) !?system_catalog.QueryDefinition {
+        const identity = (try self.getTableByNameResultTxn(system_catalog.ResolvedTable, alloc, txn, group_id, name)) orelse return null;
+        defer identity.deinit(alloc);
+        var key_buf: [160]u8 = undefined;
+        const bytes = try txn.get(try tableKeyForGroup(&key_buf, group_id, identity.table_id));
+        const projection = try decodeTableQueryProjection(alloc, bytes, true);
+        defer alloc.free(projection.name);
+        return projection.query_definition;
     }
 
     fn resolveSystemCatalogResultTxn(self: *RaftApplyStore, comptime Result: type, alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, target: system_catalog.Target) !?Result {
@@ -2790,6 +2809,8 @@ pub const RaftApplyStore = struct {
             if (!std.mem.startsWith(u8, kv.key, prefix)) break;
             const identity = try decodeTableIdentity(alloc, kv.value);
             errdefer identity.deinit(alloc);
+            var key_buf: [160]u8 = undefined;
+            if (!std.mem.eql(u8, kv.key, try tableKeyForGroup(&key_buf, group_id, identity.table_id))) return error.InvalidMetadataRecord;
             try records.append(alloc, .{ .id = identity.table_id, .name = identity.name });
         }
         return records.toOwnedSlice(alloc);
@@ -3630,6 +3651,62 @@ pub const RaftApplyStore = struct {
     /// rows are intentionally excluded from Raft snapshots: snapshot install
     /// removes them and the next apply (or indexed read) reconstructs them
     /// atomically from primary range and extension-member rows.
+    fn requireDerivedCatalogIndexesTxn(txn: *docstore.DocStore.Txn, group_id: u64) !void {
+        var buf: [160]u8 = undefined;
+        const marker = txn.get(try derivedCatalogIndexVersionKey(&buf, group_id)) catch |err| switch (err) {
+            error.NotFound => return error.InvalidDerivedCatalogIndex,
+            else => return err,
+        };
+        if (!std.mem.eql(u8, marker, derived_catalog_index_version)) return error.InvalidDerivedCatalogIndex;
+    }
+
+    fn beginQueryCatalogReadTxn(self: *RaftApplyStore, group_id: u64) !docstore.DocStore.Txn {
+        const io = self.io_impl.io();
+        self.apply_mutex.lockUncancelable(io);
+        defer self.apply_mutex.unlock(io);
+        try self.ensureQueryCatalogIndexesLocked(group_id);
+        // Capture the read snapshot before allowing snapshot install to
+        // invalidate the projection. Readers retain this transaction afterward.
+        var txn = try self.store.beginReadTxn();
+        errdefer txn.abort();
+        try requireDerivedCatalogIndexesTxn(&txn, group_id);
+        return txn;
+    }
+
+    fn ensureQueryCatalogIndexes(self: *RaftApplyStore, group_id: u64) !void {
+        var txn = try self.beginQueryCatalogReadTxn(group_id);
+        txn.abort();
+    }
+
+    fn ensureQueryCatalogIndexesLocked(self: *RaftApplyStore, group_id: u64) !void {
+        if (self.verified_catalog_groups.contains(group_id)) return;
+        try self.verified_catalog_groups.ensureUnusedCapacity(self.alloc, 1);
+        var txn = if (self.read_only) try self.store.beginReadTxn() else try self.store.beginWriteTxn();
+        var finished = false;
+        defer if (!finished) txn.abort();
+        if (self.read_only) {
+            try requireDerivedCatalogIndexesTxn(&txn, group_id);
+            try system_catalog_storage.validateNameIndex(self.alloc, &txn, group_id);
+            const tables = try listPhysicalTableIdentities(self.alloc, &txn, group_id);
+            defer freePhysicalTableIdentities(self.alloc, tables);
+            for (tables) |table| {
+                const found = (try self.getTableByNameResultTxn(system_catalog.ResolvedTable, self.alloc, &txn, group_id, table.name)) orelse return error.InvalidDerivedCatalogIndex;
+                defer found.deinit(self.alloc);
+                if (found.table_id != table.id) return error.InvalidDerivedCatalogIndex;
+            }
+        } else {
+            var buf: [160]u8 = undefined;
+            txn.delete(try derivedCatalogIndexVersionKey(&buf, group_id)) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+            _ = try self.ensureDerivedCatalogIndexesTxn(&txn, group_id);
+            try txn.commit();
+            finished = true;
+        }
+        self.verified_catalog_groups.putAssumeCapacity(group_id, {});
+    }
+
     pub fn ensureDerivedCatalogIndexes(self: *RaftApplyStore, group_id: u64) !void {
         const io = self.io_impl.io();
         self.apply_mutex.lockUncancelable(io);
@@ -3933,6 +4010,8 @@ pub const RaftApplyStore = struct {
             if (std.mem.eql(u8, value, derived_catalog_index_version)) return false;
         }
 
+        try system_catalog_storage.rebuildNameIndex(self.alloc, txn, group_id);
+
         var range_index_prefix_buf: [128]u8 = undefined;
         try self.deleteDerivedPrefixTxn(
             txn,
@@ -3954,21 +4033,18 @@ pub const RaftApplyStore = struct {
             try activeRestoreRangeIndexPrefixForGroup(&active_restore_prefix_buf, group_id),
         );
 
-        var table_prefix_buf: [128]u8 = undefined;
-        const table_rows = try docstore.DocStore.scanPrefixTxn(
-            self.alloc,
-            txn,
-            try tablePrefixForGroup(&table_prefix_buf, group_id),
-        );
-        defer freeMetadataSnapshotRows(self.alloc, table_rows);
-        for (table_rows) |row| {
-            const table = try decodeTableRecord(self.alloc, row.value);
-            defer metadata_table_manager.freeTable(self.alloc, table);
-            try self.putTableNameIndexTxn(txn, group_id, table.name, table.table_id);
-            var fence = try self.loadTableTransitionFenceTxn(txn, group_id, table.table_id);
+        const tables = try listPhysicalTableIdentities(self.alloc, txn, group_id);
+        defer freePhysicalTableIdentities(self.alloc, tables);
+        for (tables) |table| {
+            var name_buf: [640]u8 = undefined;
+            if (txn.get(try tableNameIndexKey(&name_buf, group_id, table.name))) |_| {
+                return error.InvalidDerivedCatalogIndex;
+            } else |err| if (err != error.NotFound) return err;
+            try self.putTableNameIndexTxn(txn, group_id, table.name, table.id);
+            var fence = try self.loadTableTransitionFenceTxn(txn, group_id, table.id);
             fence.range_membership = .{};
             var fence_key_buf: [192]u8 = undefined;
-            const fence_key = try tableTransitionFenceKeyForGroup(&fence_key_buf, group_id, table.table_id);
+            const fence_key = try tableTransitionFenceKeyForGroup(&fence_key_buf, group_id, table.id);
             var encoded_fence: [table_transition_fence_encoded_len]u8 = undefined;
             encodeTableTransitionFence(&encoded_fence, fence);
             try txn.put(fence_key, &encoded_fence);
@@ -4360,6 +4436,7 @@ pub const RaftApplyStore = struct {
         for (existing, 0..) |row, i| deletes[i] = row.key;
         for (derived_existing, existing.len..) |row, i| deletes[i] = row.key;
         try self.store.putBatch(writes, deletes);
+        _ = self.verified_catalog_groups.remove(group_id);
 
         if (self.batches.getPtr(group_id)) |batch| {
             self.alloc.free(batch.entries_bytes);
@@ -4428,6 +4505,9 @@ pub const RaftApplyStore = struct {
             }
             rows.deinit(alloc);
         }
+        const catalog_names = try system_catalog_storage.namePrefixAlloc(alloc, group_id);
+        defer alloc.free(catalog_names);
+        try appendMetadataPrefixRowsTxn(alloc, txn, &rows, catalog_names);
         var prefix_buf: [160]u8 = undefined;
         try appendMetadataPrefixRowsTxn(
             alloc,
@@ -8077,21 +8157,33 @@ fn decodeMergeTransitionRecord(alloc: std.mem.Allocator, encoded: []const u8) !m
 /// Every released table-record encoding shares the identity prefix. Validate
 /// the length-framed tail without allocating or interpreting its definition.
 fn decodeTableIdentity(alloc: std.mem.Allocator, encoded: []const u8) !system_catalog.ResolvedTable {
+    return decodeTableQueryProjection(alloc, encoded, false);
+}
+
+fn decodeTableQueryProjection(alloc: std.mem.Allocator, encoded: []const u8, include_definition: bool) !system_catalog.ResolvedTable {
     var pos: usize = 0;
     const table_id = try readInt(encoded, &pos, u64);
     _ = try readInt(encoded, &pos, u16); // replicas
     _ = try readInt(encoded, &pos, u32); // minimum ranges
     const name = try readRequiredString(alloc, encoded, &pos);
     errdefer alloc.free(name);
-    var fields: usize = 0;
-    while (pos < encoded.len) : (fields += 1) {
+    var fields: [8][]const u8 = undefined;
+    var count: usize = 0;
+    while (pos < encoded.len) : (count += 1) {
+        if (count == fields.len) return error.InvalidMetadataTransitionEncoding;
         const length = try readInt(encoded, &pos, u32);
         if (length > encoded.len - pos) return error.InvalidMetadataTransitionEncoding;
+        fields[count] = encoded[pos..][0..length];
         pos += length;
     }
-    // Legacy, read-schema, and restore-intent records respectively.
-    if (fields != 5 and fields != 6 and fields != 8) return error.InvalidMetadataTransitionEncoding;
-    return .{ .table_id = table_id, .name = name };
+    // Legacy, read-schema, and restore-intent records respectively. Borrow all
+    // framed fields to validate the encoding, but copy only query-owned data.
+    if (count != 5 and count != 6 and count != 8) return error.InvalidMetadataTransitionEncoding;
+    return .{ .table_id = table_id, .name = name, .query_definition = if (include_definition) try (system_catalog.QueryDefinition{
+        .schema_json = fields[1],
+        .read_schema_json = if (count == 5) "" else fields[2],
+        .indexes_json = fields[if (count == 5) 2 else 3],
+    }).clone(alloc) else null };
 }
 
 fn decodeTableRecord(alloc: std.mem.Allocator, encoded: []const u8) !metadata.TableRecord {
@@ -16232,6 +16324,14 @@ test "system catalog publishes names and table topology atomically and fences st
         try std.testing.expectEqualStrings("{\"table_id\":42,\"name\":\"table:42\"}", encoded);
     }
     {
+        var buffer: [16 * 1024]u8 = undefined;
+        var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+        const definition = (try store.queryTableDefinition(bounded.allocator(), 21, "table:42")).?;
+        defer definition.deinit(bounded.allocator());
+        try std.testing.expectEqualStrings(table.schema_json, definition.schema_json);
+        try std.testing.expectEqualStrings(table.indexes_json, definition.indexes_json);
+    }
+    {
         // Administrative inventory has the same schema-independent allocation
         // bound as point resolution, including the cursor's borrowed values.
         var buffer: [16 * 1024]u8 = undefined;
@@ -16280,5 +16380,48 @@ test "system catalog publishes names and table topology atomically and fences st
         try txn.delete(key);
         try txn.commit();
     }
-    try std.testing.expectError(error.InvalidCatalogRecord, restored.resolveSystemCatalogTable(alloc, 21, .{ .database = "reports", .table = "events" }));
+    // Reopen is a projection trust boundary: reconstruct missing derived rows
+    // from authoritative records before allowing constant-time negative reads.
+    restored.deinit();
+    restored = try RaftApplyStore.init(alloc, .{ .root_dir = target_root });
+    const repaired = (try restored.resolveSystemCatalogTable(alloc, 21, .{ .database = "reports", .table = "events" })).?;
+    defer metadata_table_manager.freeTable(alloc, repaired);
+    try std.testing.expectEqualStrings("table:42", repaired.name);
+}
+
+test "system catalog legacy and missing point reads have catalog-independent allocation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog-point-reads", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        for (0..1000) |i| {
+            const name = try std.fmt.allocPrint(alloc, "database_{d}", .{i});
+            defer alloc.free(name);
+            try system_catalog_storage.writeResource(alloc, &txn, 21, .{ .kind = .database, .id = 100 + i, .name = name });
+        }
+        const encoded = try encodeTableRecord(alloc, .{ .table_id = 7, .name = "legacy" });
+        defer alloc.free(encoded);
+        var buf: [160]u8 = undefined;
+        try txn.put(try tableKeyForGroup(&buf, 21, 7), encoded);
+        try txn.commit();
+    }
+    try store.ensureQueryCatalogIndexes(21);
+    for ([_]system_catalog.Target{ .{ .table = "legacy" }, .{ .table = "missing" }, .{ .database = "missing", .table = "legacy" } }, 0..) |target, i| {
+        var buffer: [4096]u8 = undefined;
+        var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+        const result = try store.resolveSystemCatalogIdentity(bounded.allocator(), 21, target);
+        defer if (result) |value| value.deinit(bounded.allocator());
+        if (i == 0) try std.testing.expectEqualStrings("legacy", result.?.name) else try std.testing.expect(result == null);
+    }
+    store.deinit();
+    store = try RaftApplyStore.init(alloc, .{ .root_dir = root, .read_only = true });
+    const result = (try store.resolveSystemCatalogIdentity(alloc, 21, .{ .table = "legacy" })).?;
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 7), result.table_id);
 }

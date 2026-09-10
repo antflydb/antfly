@@ -60,7 +60,7 @@ METADATA_MUTATION_NOT_ADMITTED_RESPONSE_HEADERS = {
 }
 
 
-def _new_e2e_deadline() -> "_Deadline":
+def _new_e2e_deadline() -> _Deadline:
     return _Deadline(AUTOGRAPH_E2E_TIMEOUT_S)
 
 
@@ -177,7 +177,7 @@ class _Api:
         *,
         num_shards: int = 1,
         indexes: dict | None = None,
-        deadline: "_Deadline | None" = None,
+        deadline: _Deadline | None = None,
     ) -> dict:
         payload: dict = {"num_shards": num_shards}
         if indexes is not None:
@@ -239,7 +239,7 @@ class _Api:
         body: dict,
         *,
         sync_level: str = "write",
-        deadline: "_Deadline | None" = None,
+        deadline: _Deadline | None = None,
     ) -> dict:
         payload = {"inserts": {doc_id: body}, "sync_level": sync_level}
         max_timeout = 120.0 if sync_level in {"enrichments", "full_index"} else 30.0
@@ -320,7 +320,7 @@ class _Api:
         doc_id: str,
         body: dict,
         *,
-        deadline: "_Deadline",
+        deadline: _Deadline,
     ) -> bool:
         reconcile_expires_at = min(
             deadline.expires_at,
@@ -832,13 +832,17 @@ def _exercise_autograph(resolution_cluster, candidate_search):
             deadline=_new_e2e_deadline(),
         )
 
-    # A second document links to the existing entity's canonical destination.
+    # Repeated mentions share candidate reads and retain the canonical redirect
+    # destination for every mention in both exact and prefix workloads.
     api.insert(
         "documents",
         "doc:b",
         {
             "relations": {
-                "entities": [{"id": "e0", "label": "person", "text": "Ada Lovelace"}]
+                "entities": [
+                    {"id": f"e{i}", "label": "person", "text": "Ada Lovelace"}
+                    for i in range(100)
+                ]
             }
         },
         deadline=_new_e2e_deadline(),

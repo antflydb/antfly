@@ -64,6 +64,33 @@ graph on three metadata and three data nodes:
   outside this interval. Output includes readiness poll counts.
 - Measure steady graph traversal with and without document hydration separately.
 
+Additional production-shaped cases:
+
+```sh
+# Wide schemas: avoid repeatedly copying unrelated table definitions.
+uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
+  --scenario catalog --schema-fields 200 --table-counts 10 100 \
+  --output /tmp/catalog-wide.json
+# Repeated names share label-prefix candidates within each document.
+uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
+  --scenario resolution --resolution-workload prefix \
+  --output /tmp/catalog-prefix.json
+# Every alias resolves through a curated survivor document.
+uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
+  --scenario resolution --resolution-workload redirects \
+  --output /tmp/catalog-redirects.json
+```
+
+The prefix workload repeats a pool of ten names (or fewer for small mention
+counts), including across documents; warmup populates that pool before measured
+writes. The redirects workload seeds distinct aliases and survivors for every
+document. Both validate the complete set of hydrated destination keys. Reports
+record mention count, unique entity count, and seeded entity-document count.
+The storage regression suite separately verifies that legacy and missing lookups
+fit a 4 KiB caller allocator with 1,000 unrelated databases, and that reopening
+repairs derived name indexes. These are allocation/correctness checks rather
+than elapsed-time thresholds.
+
 Useful controls include `--table-counts`, `--mentions`, `--documents`, `--samples`,
 `--warmup`, `--concurrency`, and `--ndjson-lines`. A quick harness check can use
 `--table-counts 3 10 --mentions 4 10 --documents 2 --samples 3 --warmup 1`.

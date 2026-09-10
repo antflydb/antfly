@@ -213,6 +213,21 @@ def catalog_scenario(args, binary: Path) -> dict:
             {"placement_policy_json": json.dumps({"desired_replica_count": 1})},
         )
         api.request("PUT", scope + "/tablespace", {"tablespace_name": "benchmark"})
+        table_config = {"num_shards": 1}
+        if args.schema_fields:
+            table_config["schema"] = {
+                "document_schemas": {
+                    "default": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                f"field_{field}": {"type": "string"}
+                                for field in range(args.schema_fields)
+                            },
+                        }
+                    }
+                }
+            }
         previous = 0
         checkpoints = []
         for count in sorted(set(args.table_counts)):
@@ -225,8 +240,18 @@ def catalog_scenario(args, binary: Path) -> dict:
             for i in range(previous, count):
                 start = time.perf_counter_ns()
                 created = api.request(
-                    "POST", f"{scope}/tables/events_{i}", {"num_shards": 1}
+                    "POST",
+                    f"{scope}/tables/events_{i}",
+                    table_config,
                 )
+                if args.schema_fields:
+                    properties = created["schema"]["document_schemas"]["default"][
+                        "schema"
+                    ]["properties"]
+                    if len(properties) != args.schema_fields:
+                        raise RuntimeError(
+                            "table did not retain benchmark schema fields"
+                        )
                 creates.append((time.perf_counter_ns() - start) / 1e6)
                 shard_readiness.append(
                     wait_for_catalog_shards(api, instance, created, args)
@@ -357,7 +382,9 @@ def resolution_scenario(args, binary: Path) -> dict:
     with server(binary, "cluster") as (api, startup, _instance):
         api.request("POST", "/tables/entities", {"num_shards": 1})
         indexes = json.loads(json.dumps(DOCUMENTS_INDEXES))
-        indexes["relations_graph"]["resolvers"][0]["candidate_search"] = "exact_key"
+        indexes["relations_graph"]["resolvers"][0]["candidate_search"] = (
+            "prefix" if args.resolution_workload == "prefix" else "exact_key"
+        )
         api.request("POST", "/tables/documents", {"num_shards": 3, "indexes": indexes})
         checkpoints = []
         for mentions in sorted(set(args.mentions)):
@@ -369,27 +396,47 @@ def resolution_scenario(args, binary: Path) -> dict:
             polls = []
             for document in range(args.documents + args.warmup):
                 key = f"{('1', '7', 'e')[document % 3]}:{mentions}:{document}"
-                names = [f"Entity {mentions} {document} {i}" for i in range(mentions)]
+                names = (
+                    [
+                        f"Repeated Person {i % min(mentions, 10)}"
+                        for i in range(mentions)
+                    ]
+                    if args.resolution_workload == "prefix"
+                    else [f"Entity {mentions} {document} {i}" for i in range(mentions)]
+                )
                 expected = {
                     "person/" + name.lower().replace(" ", "_") for name in names
                 }
-                # Half the mentions resolve existing entities; the rest mint new
-                # ones. New keys per document make hydration prove promotion.
-                if mentions // 2:
+                seed = {
+                    "person/" + name.lower().replace(" ", "_"): {
+                        "entity_type": "person",
+                        "canonical_name": name,
+                        "aliases": [name],
+                    }
+                    for name in names[: mentions // 2]
+                }
+                if args.resolution_workload == "redirects":
+                    seed = {}
+                    expected = set()
+                    for name in names:
+                        original = "person/" + name.lower().replace(" ", "_")
+                        survivor = original + "_curated"
+                        seed[original] = {
+                            "entity_type": "person",
+                            "canonical_name": name,
+                            "merged_into": survivor,
+                        }
+                        seed[survivor] = {
+                            "entity_type": "person",
+                            "canonical_name": name,
+                            "aliases": [name],
+                        }
+                        expected.add(survivor)
+                if seed:
                     api.request(
                         "POST",
                         "/tables/entities/batch",
-                        {
-                            "inserts": {
-                                "person/" + name.lower().replace(" ", "_"): {
-                                    "entity_type": "person",
-                                    "canonical_name": name,
-                                    "aliases": [name],
-                                }
-                                for name in names[: mentions // 2]
-                            },
-                            "sync_level": "full_index",
-                        },
+                        {"inserts": seed, "sync_level": "full_index"},
                     )
                 query = {
                     "query": {"match_all": {}},
@@ -453,7 +500,9 @@ def resolution_scenario(args, binary: Path) -> dict:
             checkpoints.append(
                 {
                     "mentions_per_document": mentions,
-                    "existing_entities_per_document": mentions // 2,
+                    "unique_entities": len(expected),
+                    "workload": args.resolution_workload,
+                    "seeded_entity_documents": len(seed),
                     "write_to_hydrated_graph": summary(latencies),
                     "readiness_poll_counts": polls,
                     "graph_topology_only": api.measure(
@@ -492,6 +541,17 @@ def main():
         help="Catalog scenario deployment",
     )
     parser.add_argument("--table-counts", nargs="+", type=positive, default=[10, 100])
+    parser.add_argument(
+        "--resolution-workload",
+        choices=["exact", "prefix", "redirects"],
+        default="exact",
+    )
+    parser.add_argument(
+        "--schema-fields",
+        type=int,
+        default=0,
+        help="Extra string fields per catalog table",
+    )
     parser.add_argument("--mentions", nargs="+", type=positive, default=[10, 100])
     parser.add_argument("--documents", type=positive, default=5)
     parser.add_argument("--concurrency", type=positive, default=8)
@@ -502,6 +562,8 @@ def main():
     parser.add_argument("--readiness-timeout", type=positive, default=115)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.schema_fields < 0:
+        parser.error("--schema-fields must be nonnegative")
     binary = args.binary.resolve(strict=True)
     with binary.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()

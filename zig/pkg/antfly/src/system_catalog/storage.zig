@@ -13,9 +13,8 @@
 // limitations.
 
 //! Transactional catalog persistence. Records and name indexes are separate so
-//! routing resolves a qualified name with point reads, independent of catalog
-//! size for indexed hits. Administrative mutations and negative-lookup
-//! corruption checks inspect the complete inventory.
+//! routing resolves a qualified name with point reads. Derived indexes are rebuilt
+//! from authoritative records at projection initialization and snapshot install.
 const std = @import("std");
 const docstore = @import("../storage/docstore.zig");
 const domain = @import("domain.zig");
@@ -52,7 +51,7 @@ fn recordKeyAlloc(alloc: std.mem.Allocator, group_id: u64, kind: domain.Kind, id
 
 pub fn nameKeyAlloc(alloc: std.mem.Allocator, group_id: u64, kind: domain.Kind, parent: u64, name: []const u8) ![]u8 {
     try domain.validateResourceName(kind, name);
-    return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:system_catalog:{d}:name:{s}:{d}:{s}", .{ group_id, @tagName(kind), parent, name });
+    return std.fmt.allocPrint(alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:{s}:{d}:{s}", .{ group_id, @tagName(kind), parent, name });
 }
 
 pub fn readMeta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) !Meta {
@@ -80,6 +79,8 @@ pub fn loadState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id
         resource.* = try std.json.parseFromSliceLeaky(domain.Resource, a, kv.value, .{ .allocate = .alloc_always });
         try domain.validateResourceName(resource.kind, resource.name);
         if (resource.id == 0) return error.InvalidCatalogRecord;
+        const expected_key = try recordKeyAlloc(a, group_id, resource.kind, resource.id);
+        if (!std.mem.eql(u8, expected_key, kv.key)) return error.InvalidCatalogRecord;
     }
     return .{ .arena = arena, .meta = meta, .value = .{ .revision = meta.revision, .next_id = meta.next_id, .resources = resources } };
 }
@@ -101,15 +102,7 @@ pub fn find(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64
     const key = try nameKeyAlloc(alloc, group_id, kind, parent, name);
     defer alloc.free(key);
     const bytes = txn.get(key) catch |err| switch (err) {
-        error.NotFound => {
-            // A missing index must not turn an existing resource into a 404.
-            // Confirm negative lookups against authoritative records; indexed
-            // positive lookups remain constant-time and snapshot-consistent.
-            var state = try loadState(alloc, txn, group_id);
-            defer state.deinit();
-            for (state.value.resources) |resource| if (resource.kind == kind and resource.parent_id == parent and std.mem.eql(u8, resource.name, name)) return error.InvalidCatalogRecord;
-            return null;
-        },
+        error.NotFound => return null,
         else => return err,
     };
     if (bytes.len != 8) return error.InvalidCatalogRecord;
@@ -118,6 +111,52 @@ pub fn find(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64
     errdefer resource.deinit();
     if (resource.value.parent_id != parent or !std.mem.eql(u8, resource.value.name, name)) return error.InvalidCatalogRecord;
     return resource;
+}
+
+pub fn namePrefixAlloc(alloc: std.mem.Allocator, group_id: u64) ![]u8 {
+    return std.fmt.allocPrint(alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:", .{group_id});
+}
+
+/// Rebuild only derived rows. Duplicate authoritative names/IDs fail closed.
+pub fn rebuildNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) !void {
+    var state = try loadState(alloc, txn, group_id);
+    defer state.deinit();
+    var index = try domain.StateIndex.init(alloc, state.value);
+    defer index.deinit(alloc);
+    const prefix = try namePrefixAlloc(alloc, group_id);
+    defer alloc.free(prefix);
+    const legacy_prefix = try keyAlloc(alloc, group_id, "name:");
+    defer alloc.free(legacy_prefix);
+    for ([_][]const u8{ prefix, legacy_prefix }) |p| {
+        const rows = try docstore.DocStore.scanPrefixTxn(alloc, txn, p);
+        defer {
+            for (rows) |row| {
+                alloc.free(row.key);
+                alloc.free(row.value);
+            }
+            alloc.free(rows);
+        }
+        for (rows) |row| try txn.delete(row.key);
+    }
+    for (state.value.resources) |resource| {
+        const key = try nameKeyAlloc(alloc, group_id, resource.kind, resource.parent_id, resource.name);
+        defer alloc.free(key);
+        var id: [8]u8 = undefined;
+        std.mem.writeInt(u64, &id, resource.id, .little);
+        try txn.put(key, &id);
+    }
+}
+
+pub fn validateNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) !void {
+    var state = try loadState(alloc, txn, group_id);
+    defer state.deinit();
+    var index = try domain.StateIndex.init(alloc, state.value);
+    defer index.deinit(alloc);
+    for (state.value.resources) |resource| {
+        var found = (try find(alloc, txn, group_id, resource.kind, resource.parent_id, resource.name)) orelse return error.InvalidCatalogRecord;
+        defer found.deinit();
+        if (found.value.id != resource.id) return error.InvalidCatalogRecord;
+    }
 }
 
 pub fn writeResource(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, resource: domain.Resource) !void {

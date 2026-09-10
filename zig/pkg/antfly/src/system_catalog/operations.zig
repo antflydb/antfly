@@ -108,6 +108,13 @@ pub fn resolve(svc: anytype, alloc: std.mem.Allocator, context: operation.Reques
 
 pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: domain.Call) ![]u8 {
     return switch (input) {
+        .query_definition => |name| blk: {
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            const definition = try store.queryTableDefinition(alloc, svc.metadata_group_id, name);
+            defer if (definition) |value| value.deinit(alloc);
+            break :blk std.json.Stringify.valueAlloc(alloc, definition, .{});
+        },
         .snapshot => snapshotJson(svc, alloc, context),
         .resolve => |target| blk: {
             try svc.ensureLinearizableReadWithContext(context);

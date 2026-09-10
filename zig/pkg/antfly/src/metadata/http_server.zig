@@ -1737,8 +1737,11 @@ pub const MetadataHttpServer = struct {
             if (before.metadata_group_id != after.metadata_group_id or !std.meta.eql(before.metadata_incarnation, after.metadata_incarnation))
                 return ctx.status(503).text("metadata identity changed during catalog read");
             const incarnation = after.metadata_incarnation orelse return ctx.status(503).text("metadata incarnation unavailable");
-            try ctx.setHeader("x-antfly-catalog-metadata-group", try std.fmt.allocPrint(ctx.allocator, "{d}", .{after.metadata_group_id}));
-            try ctx.setHeader("x-antfly-catalog-metadata-incarnation", try ctx.allocator.dupe(u8, &incarnation));
+            // Header insertion owns its copy; avoid leaking temporary values
+            // when the HTTP context uses a general-purpose allocator.
+            var group_buf: [20]u8 = undefined;
+            try ctx.setHeader("x-antfly-catalog-metadata-group", try std.fmt.bufPrint(&group_buf, "{d}", .{after.metadata_group_id}));
+            try ctx.setHeader("x-antfly-catalog-metadata-incarnation", &incarnation);
         }
         try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_committed);
         try ctx.setHeader("content-type", "application/json");

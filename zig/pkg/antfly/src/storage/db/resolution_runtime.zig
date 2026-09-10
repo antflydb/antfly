@@ -811,9 +811,34 @@ const SourceCandidateProvider = struct {
     }
     const vtable = resolver_lib.CandidateProvider.VTable{ .candidates_for = candidatesFor, .candidates_for_batch = candidatesForBatch };
 
+    const BatchDocuments = struct {
+        alloc: std.mem.Allocator,
+        docs: std.StringHashMapUnmanaged([]const u8) = .empty,
+        keys: std.ArrayListUnmanaged([]const u8) = .empty,
+        limit: usize = 0,
+
+        fn consume(ctx: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.limit > 0 and self.keys.items.len >= self.limit) return error.CandidateLimitReached;
+            const owned_key = try self.alloc.dupe(u8, key);
+            try self.docs.put(self.alloc, owned_key, try self.alloc.dupe(u8, value));
+            try self.keys.append(self.alloc, owned_key);
+        }
+    };
+
+    fn collectKeys(self: *SourceCandidateProvider, collected: *BatchDocuments, keys: []const []const u8) !void {
+        if (keys.len == 0) return;
+        if (self.source.vtable.get_many) |get_many| {
+            try get_many(self.source.ptr, collected.alloc, self.table, keys, collected, BatchDocuments.consume);
+        } else {
+            for (keys) |key| if (try self.source.get(collected.alloc, self.table, key)) |raw|
+                try BatchDocuments.consume(collected, key, raw);
+        }
+    }
+
     fn candidatesForBatch(ptr: *anyopaque, alloc: std.mem.Allocator, entities: []const resolver_lib.ExtractedEntity, lists: [][]const resolver_lib.Candidate) anyerror!void {
         const self: *SourceCandidateProvider = @ptrCast(@alignCast(ptr));
-        if (self.mode != .exact_key or self.source.vtable.get_many == null) {
+        if (self.mode == .ann) {
             for (entities, lists) |entity, *list| {
                 var candidates = std.ArrayListUnmanaged(resolver_lib.Candidate).empty;
                 try candidatesFor(ptr, alloc, entity, &candidates);
@@ -825,31 +850,57 @@ const SourceCandidateProvider = struct {
         defer scratch.deinit();
         const a = scratch.allocator();
         const keys = try a.alloc([]const u8, entities.len);
-        for (entities, keys) |entity, *key| key.* = try self.resolver.renderKeyAlloc(a, entity);
-        const Collected = struct {
-            alloc: std.mem.Allocator,
-            docs: std.StringHashMapUnmanaged([]const u8) = .empty,
-            fn consume(ctx: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
-                const collection: *@This() = @ptrCast(@alignCast(ctx));
-                try collection.docs.put(collection.alloc, try collection.alloc.dupe(u8, key), try collection.alloc.dupe(u8, value));
-            }
-        };
-        var collected = Collected{ .alloc = a };
-        try self.source.vtable.get_many.?(self.source.ptr, a, self.table, keys, &collected, Collected.consume);
-        for (keys, lists) |key, *list| {
-            var candidates = std.ArrayListUnmanaged(resolver_lib.Candidate).empty;
-            if (collected.docs.get(key)) |raw| {
-                const resolved_key = try jsonStringFieldAlloc(a, raw, "merged_into");
-                // Curated merge chains retain the existing one-hop semantics.
-                const resolved_raw = if (resolved_key) |rk| collected.docs.get(rk) orelse blk: {
-                    const raw_target = (try self.source.get(a, self.table, rk)) orelse break :blk null;
-                    try collected.docs.put(a, rk, raw_target);
-                    break :blk raw_target;
-                } else null;
-                try appendEntityCandidateWithResolved(alloc, self.table, key, raw, resolved_key, resolved_raw, &candidates);
-            }
-            list.* = candidates.items;
+        var unique = std.StringArrayHashMapUnmanaged(void).empty;
+        for (entities, keys) |entity, *key| {
+            const rendered = try self.resolver.renderKeyAlloc(a, entity);
+            key.* = if (self.mode == .prefix) rendered[0..if (std.mem.indexOfScalar(u8, rendered, '/')) |i| i + 1 else rendered.len] else rendered;
+            try unique.put(a, key.*, {});
         }
+        var collected = BatchDocuments{ .alloc = a };
+        var prefixes = std.StringHashMapUnmanaged([]const []const u8).empty;
+        if (self.mode == .exact_key) {
+            try self.collectKeys(&collected, unique.keys());
+        } else {
+            collected.limit = self.candidate_limit;
+            for (unique.keys()) |prefix| {
+                collected.keys = .empty;
+                self.source.scanPrefix(a, self.table, prefix, .{ .limit = self.candidate_limit }, &collected, BatchDocuments.consume) catch |err| switch (err) {
+                    error.ScanUnsupported, error.CandidateLimitReached => {},
+                    else => return err,
+                };
+                try prefixes.put(a, prefix, collected.keys.items);
+            }
+        }
+        // Hydrate distinct one-hop redirect destinations in a second bulk pass.
+        // An absent destination stays absent for this work unit, including when
+        // many mentions or aliases point at it.
+        var redirects = std.StringArrayHashMapUnmanaged(void).empty;
+        var documents = collected.docs.valueIterator();
+        while (documents.next()) |raw| {
+            if (try jsonStringFieldAlloc(a, raw.*, "merged_into")) |key|
+                if (!collected.docs.contains(key)) {
+                    try redirects.put(a, key, {});
+                };
+        }
+        collected.limit = 0;
+        collected.keys = .empty;
+        try self.collectKeys(&collected, redirects.keys());
+        var prepared = std.StringHashMapUnmanaged([]const resolver_lib.Candidate).empty;
+        for (unique.keys()) |key| {
+            var candidates = std.ArrayListUnmanaged(resolver_lib.Candidate).empty;
+            const selected: []const []const u8 = if (self.mode == .exact_key) &.{key} else prefixes.get(key).?;
+            for (selected) |candidate_key| {
+                if (collected.docs.get(candidate_key)) |raw| {
+                    const resolved_key = try jsonStringFieldAlloc(a, raw, "merged_into");
+                    const resolved_raw = if (resolved_key) |rk| collected.docs.get(rk) else null;
+                    try appendEntityCandidateWithResolved(alloc, self.table, candidate_key, raw, resolved_key, resolved_raw, &candidates);
+                }
+            }
+            try prepared.put(a, key, candidates.items);
+        }
+        // Candidate records are immutable; repeated mentions share decoding and
+        // allocation while the scorer still evaluates each mention separately.
+        for (keys, lists) |key, *list| list.* = prepared.get(key).?;
     }
 
     const ScanCtx = struct {
@@ -3694,8 +3745,14 @@ test "SourceCandidateProvider bulk exact keys retain duplicates missing candidat
         fn getMany(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, keys: []const []const u8, ctx: *anyopaque, consume: CandidateSource.Consume) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
-            try testing.expectEqual(@as(usize, 3), keys.len);
-            try consume(ctx, "person/ada", "{\"canonical_name\":\"Ada\",\"label\":\"person\",\"merged_into\":\"person/canonical\"}");
+            if (self.calls == 1) {
+                try testing.expectEqual(@as(usize, 2), keys.len);
+                try consume(ctx, "person/ada", "{\"canonical_name\":\"Ada\",\"label\":\"person\",\"merged_into\":\"person/canonical\"}");
+            } else {
+                try testing.expectEqual(@as(usize, 1), keys.len);
+                try testing.expectEqualStrings("person/canonical", keys[0]);
+                try consume(ctx, keys[0], "{\"canonical_name\":\"Canonical\",\"label\":\"person\"}");
+            }
         }
     };
     var fake: Bulk = .{};
@@ -3718,8 +3775,8 @@ test "SourceCandidateProvider bulk exact keys retain duplicates missing candidat
     };
     var lists: [3][]const resolver_lib.Candidate = undefined;
     try provider.provider().candidatesForBatch(arena.allocator(), &entities, &lists);
-    try testing.expectEqual(@as(usize, 1), fake.calls);
-    try testing.expectEqual(@as(usize, 1), fake.gets);
+    try testing.expectEqual(@as(usize, 2), fake.calls);
+    try testing.expectEqual(@as(usize, 0), fake.gets);
     try testing.expectEqual(@as(usize, 0), lists[1].len);
     for ([_]usize{ 0, 2 }) |i| {
         try testing.expectEqual(@as(usize, 1), lists[i].len);
@@ -3883,4 +3940,46 @@ test "SourceCandidateProvider ann blocking links via cross-shard nearest neighbo
     // Linked by vector similarity across the shard boundary despite differing text.
     try testing.expectEqualStrings("match", ent.get("decision").?.string);
     try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+}
+
+test "SourceCandidateProvider shares prefix scans and negatively caches redirect destinations across mentions" {
+    const alloc = testing.allocator;
+    const Fake = struct {
+        scans: usize = 0,
+        bulk_reads: usize = 0,
+        fn get(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) anyerror!?[]u8 {
+            return error.UnexpectedPointRead;
+        }
+        fn scan(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, prefix: []const u8, opts: CandidateSource.ScanOptions, ctx: *anyopaque, consume: CandidateSource.Consume) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.scans += 1;
+            try testing.expectEqualStrings("person/", prefix);
+            try testing.expectEqual(@as(usize, 2), opts.limit);
+            try consume(ctx, "person/ada", "{\"canonical_name\":\"Ada\",\"label\":\"person\",\"merged_into\":\"person/missing\"}");
+            try consume(ctx, "person/grace", "{\"canonical_name\":\"Grace\",\"label\":\"person\",\"merged_into\":\"person/missing\"}");
+            // The provider enforces the limit even if a custom source does not.
+            try consume(ctx, "person/ignored", "{}");
+        }
+        fn getMany(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, keys: []const []const u8, _: *anyopaque, _: CandidateSource.Consume) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.bulk_reads += 1;
+            try testing.expectEqual(@as(usize, 1), keys.len);
+            try testing.expectEqualStrings("person/missing", keys[0]);
+        }
+    };
+    var fake = Fake{};
+    var resolver = try resolver_lib.Resolver.initFromParts(alloc, "entities", "{{ lower _entity.label }}/{{ slug _entity.text }}", false, "");
+    defer resolver.deinit();
+    var provider = SourceCandidateProvider{ .source = .{ .ptr = &fake, .vtable = &.{ .get = Fake.get, .get_many = Fake.getMany, .scan_prefix = Fake.scan } }, .resolver = &resolver, .table = "entities", .mode = .prefix, .ann_index_name = "", .candidate_limit = 2 };
+    const entities = [_]resolver_lib.ExtractedEntity{.{ .local_id = "one", .label = "person", .text = "Ada" }} ** 100;
+    var lists: [100][]const resolver_lib.Candidate = undefined;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    try provider.provider().candidatesForBatch(arena.allocator(), &entities, &lists);
+    try testing.expectEqual(@as(usize, 1), fake.scans);
+    try testing.expectEqual(@as(usize, 1), fake.bulk_reads);
+    for (lists) |list| {
+        try testing.expectEqual(@as(usize, 2), list.len);
+        for (list) |candidate| try testing.expect(candidate.resolved_record == null);
+    }
 }

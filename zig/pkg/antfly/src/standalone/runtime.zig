@@ -876,6 +876,7 @@ const LocalStandaloneMetadata = struct {
             .vtable = &.{
                 .status = status,
                 .system_catalog = systemCatalog,
+                .supports_query_definitions = true,
                 .admin_snapshot = catalogAdminSnapshot,
                 .cached_admin_snapshot = cachedAdminSnapshot,
                 .linearizable_snapshot = linearizableSnapshot,
@@ -1175,6 +1176,11 @@ const LocalStandaloneMetadata = struct {
         defer self.mutex.unlock();
         try context.ensureActive();
         switch (call) {
+            .query_definition => |name| {
+                const table = self.manager.findTableByName(name);
+                const definition: ?system_catalog.QueryDefinition = if (table) |value| system_catalog.QueryDefinition.fromTable(value) else null;
+                return std.json.Stringify.valueAlloc(alloc, definition, .{});
+            },
             .snapshot => return std.json.Stringify.valueAlloc(alloc, self.systemCatalogState(), .{}),
             .resolve => |target| {
                 const table = try self.resolveSystemCatalogLocked(target);
@@ -1188,7 +1194,11 @@ const LocalStandaloneMetadata = struct {
                 const tables = try alloc.alloc(?system_catalog.ResolvedTable, request.targets.len);
                 defer alloc.free(tables);
                 for (request.targets, tables) |target, *table| {
-                    table.* = if (try self.resolveSystemCatalogLocked(target)) |value| system_catalog.ResolvedTable.fromTable(value) else null;
+                    table.* = if (try self.resolveSystemCatalogLocked(target)) |value| blk: {
+                        var identity = system_catalog.ResolvedTable.fromTable(value);
+                        if (request.include_query_definitions) identity.query_definition = system_catalog.QueryDefinition.fromTable(value);
+                        break :blk identity;
+                    } else null;
                 }
                 return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = revision, .tables = tables }, .{});
             },

@@ -1382,6 +1382,7 @@ pub const StatusSource = struct {
     routing: ?table_catalog.CatalogRoutingSource = null,
 
     pub const VTable = struct {
+        supports_query_definitions: bool = false,
         system_catalog: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: system_catalog.Call) anyerror![]u8 = null,
 
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
@@ -1887,6 +1888,7 @@ pub const StatusSource = struct {
 
         return .{
             .system_catalog = Gen.systemCatalog,
+            .supports_query_definitions = true,
             .status = Gen.status,
             .admin_snapshot = Gen.adminSnapshot,
             .cached_admin_snapshot = Gen.cachedAdminSnapshot,
@@ -3992,9 +3994,32 @@ pub const ApiHttpServer = struct {
         _ = try self.source.removeJoinShuffleLease(job_id);
     }
 
+    const CatalogJoinExecution = struct {
+        server: *ApiHttpServer,
+        resolver: *CatalogQueryResolver,
+        identity: ?AuthenticatedIdentity,
+
+        fn context(self: *@This()) distributed_join.JoinContext.QueryExecution {
+            return .{ .ptr = self, .plain = plain, .dispatch = dispatch, .build = build };
+        }
+        fn plain(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table: []const u8, body: []const u8, filter: ?[]const u8, deadline: ?u64, cancellation: ?CancellationToken) anyerror!query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.server.executePlainPublicTableQuery(alloc, source, table, body, filter, self.identity, deadline, queryEmbeddingSecurityScope(self.identity), cancellation, null, self.resolver);
+        }
+        fn dispatch(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table: []const u8, body: []const u8, filter: ?[]const u8, deadline: ?u64, cancellation: ?CancellationToken) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const result = try self.server.executePublicTableQueryDispatchWithIdentity(alloc, source, table, body, filter, self.identity, deadline, cancellation, null, null, self.resolver);
+            return result.json;
+        }
+        fn build(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, value: std.json.Value, deadline: ?u64, cancellation: ?CancellationToken) anyerror!query_api.OwnedQueryRequest {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.server.buildOwnedSearchRequestFromQueryValue(alloc, table, value, deadline, cancellation, self.resolver);
+        }
+    };
+
     fn joinCtxExecutePlainQuery(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8, execution_deadline_ns: ?u64, cancellation: ?CancellationToken) anyerror!query_api.QueryResponse {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.executePlainPublicTableQuery(alloc, source, table_name, body, row_filter_json, null, execution_deadline_ns, .{ .domain = .internal, .value = "" }, cancellation, null);
+        return try self.executePlainPublicTableQuery(alloc, source, table_name, body, row_filter_json, null, execution_deadline_ns, .{ .domain = .internal, .value = "" }, cancellation, null, null);
     }
 
     fn joinCtxExecuteQueryDispatch(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8, execution_deadline_ns: ?u64, cancellation: ?CancellationToken) anyerror![]u8 {
@@ -4010,6 +4035,7 @@ pub const ApiHttpServer = struct {
             cancellation,
             null,
             null,
+            null,
         );
         return response.json;
     }
@@ -4023,6 +4049,7 @@ pub const ApiHttpServer = struct {
             query_value,
             execution_deadline_ns,
             cancellation,
+            null,
         );
     }
 
@@ -7187,26 +7214,59 @@ pub const ApiHttpServer = struct {
         return try self.maybeRouteQueryToReadSchema(table_name, req);
     }
 
-    pub fn maybeRouteQueryToReadSchema(self: *ApiHttpServer, table_name: []const u8, query_req: *db_mod.types.SearchRequest) !void {
-        var snapshot = (try self.source.adminSnapshot()) orelse return;
-        defer self.source.freeAdminSnapshot(&snapshot);
-        const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-        try tables_api.routeQueryRequestToActiveReadIndex(self.alloc, table, query_req);
+    fn queryTableDefinition(self: *ApiHttpServer, alloc: std.mem.Allocator, resolver: ?*CatalogQueryResolver, table_name: []const u8, context: api_operation.RequestContext) !?metadata_table_manager.TableRecord {
+        if (resolver) |cache| if (cache.definitions.get(table_name)) |definition| return .{
+            .table_id = 0,
+            .name = table_name,
+            .schema_json = definition.schema_json,
+            .read_schema_json = definition.read_schema_json,
+            .indexes_json = definition.indexes_json,
+        };
+        const definition: system_catalog.QueryDefinition = if (self.source.vtable.supports_query_definitions) blk: {
+            const bytes = try self.source.systemCatalog(alloc, context, .{ .query_definition = table_name });
+            const parsed = try std.json.parseFromSliceLeaky(?system_catalog.QueryDefinition, alloc, bytes, .{ .allocate = .alloc_always });
+            break :blk parsed orelse return error.TableNotFound;
+        } else blk: {
+            var snapshot = (try self.source.adminSnapshot()) orelse return null;
+            defer self.source.freeAdminSnapshot(&snapshot);
+            const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+            break :blk try system_catalog.QueryDefinition.fromTable(table).clone(alloc);
+        };
+        if (resolver) |cache| try cache.definitions.put(alloc, try alloc.dupe(u8, table_name), definition);
+        return .{ .table_id = 0, .name = table_name, .schema_json = definition.schema_json, .read_schema_json = definition.read_schema_json, .indexes_json = definition.indexes_json };
     }
 
-    fn validatePublicQuerySortCapabilities(
+    pub fn maybeRouteQueryToReadSchema(self: *ApiHttpServer, table_name: []const u8, query_req: *db_mod.types.SearchRequest) !void {
+        return self.routeQueryToReadSchemaWithResolver(table_name, query_req, null);
+    }
+
+    fn routeQueryToReadSchemaWithResolver(self: *ApiHttpServer, table_name: []const u8, query_req: *db_mod.types.SearchRequest, resolver: ?*CatalogQueryResolver) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const alloc = if (resolver) |cache| cache.arena else arena.allocator();
+        const table = (try self.queryTableDefinition(alloc, resolver, table_name, .{ .deadline_ns = query_req.execution_deadline_ns, .cancellation = query_req.cancellation orelse .none })) orelse return;
+        try tables_api.routeQueryRequestToActiveReadIndex(self.alloc, &table, query_req);
+    }
+
+    fn validatePublicQuerySortCapabilities(self: *ApiHttpServer, table_name: []const u8, query_req: db_mod.types.SearchRequest) !void {
+        return self.validateQuerySortWithResolver(table_name, query_req, null);
+    }
+
+    fn validateQuerySortWithResolver(
         self: *ApiHttpServer,
         table_name: []const u8,
         query_req: db_mod.types.SearchRequest,
+        resolver: ?*CatalogQueryResolver,
     ) !void {
         if (!publicSearchRequestHasSortPageControls(query_req)) return;
         // Reject shape/source errors and finish synthetic-only sorts before
         // opening table state or validating any physical column.
         if (try validatePublicQuerySortRequestContract(query_req)) return;
 
-        var snapshot = (try self.source.adminSnapshot()) orelse return;
-        defer self.source.freeAdminSnapshot(&snapshot);
-        const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const definition_alloc = if (resolver) |cache| cache.arena else arena.allocator();
+        const table = (try self.queryTableDefinition(definition_alloc, resolver, table_name, .{ .deadline_ns = query_req.execution_deadline_ns, .cancellation = query_req.cancellation orelse .none })) orelse return;
         const schema_json = if (table.read_schema_json.len > 0)
             table.read_schema_json
         else
@@ -11037,7 +11097,7 @@ pub const ApiHttpServer = struct {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const source = self.table_reads orelse return error.NotFound;
         try ensureTableOperationActive(request);
-        const response = self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null, request.cancellation, null, null) catch |err| switch (err) {
+        const response = self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null, request.cancellation, null, null, null) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
@@ -11119,6 +11179,7 @@ pub const ApiHttpServer = struct {
             null,
             null,
             null,
+            null,
         );
         return response.json;
     }
@@ -11134,7 +11195,13 @@ pub const ApiHttpServer = struct {
         cancellation: ?CancellationToken,
         response_label: ?[]const u8,
         bound_join: ?*const distributed_join.ParsedSupportedJoinRequest,
+        catalog_resolver: ?*CatalogQueryResolver,
     ) !query_api.QueryResponse {
+        var catalog_arena = std.heap.ArenaAllocator.init(alloc);
+        defer catalog_arena.deinit();
+        var local_catalog = CatalogQueryResolver{ .arena = catalog_arena.allocator() };
+        const resolver = catalog_resolver orelse &local_catalog;
+
         const retry_timeout_ns: u64 = if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
         const retry_poll_ns = 50 * std.time.ns_per_ms;
         const retry_io = self.sharedApiIo();
@@ -11155,6 +11222,7 @@ pub const ApiHttpServer = struct {
                 cancellation,
                 response_label,
                 bound_join,
+                resolver,
             ) catch |err| switch (err) {
                 error.DocIdentityNamespaceMismatch,
                 error.IdentityReadGenerationChanged,
@@ -11239,7 +11307,10 @@ pub const ApiHttpServer = struct {
         const source = self.table_reads orelse return error.TableNotFound;
         var identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
         defer if (identity) |*owned| owned.deinit(self.alloc);
-        var binding = try self.bindCatalogQuery(alloc, context, logical_name, body, &identity, null);
+        var catalog_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer catalog_arena.deinit();
+        var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator() };
+        var binding = try self.bindCatalogQuery(alloc, context, logical_name, body, &identity, &resolver);
         defer binding.deinit();
         const row_filter = try resolveEffectiveRowFilterJson(alloc, identity, binding.physical);
         defer if (row_filter) |value| alloc.free(value);
@@ -11254,6 +11325,7 @@ pub const ApiHttpServer = struct {
             context.cancellation,
             binding.label,
             if (binding.join) |*join| join else null,
+            &resolver,
         ) catch |err| {
             if (query_api.isPublicQueryValidationError(err)) return error.InvalidRetrievalAgentRequest;
             return err;
@@ -11272,7 +11344,13 @@ pub const ApiHttpServer = struct {
         cancellation: ?CancellationToken,
         response_label: ?[]const u8,
         bound_join: ?*const distributed_join.ParsedSupportedJoinRequest,
+        catalog_resolver: ?*CatalogQueryResolver,
     ) !query_api.QueryResponse {
+        var catalog_arena = std.heap.ArenaAllocator.init(alloc);
+        defer catalog_arena.deinit();
+        var local_catalog = CatalogQueryResolver{ .arena = catalog_arena.allocator() };
+        const resolver = catalog_resolver orelse &local_catalog;
+
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
         if (try shouldDispatchPlainPublicSearch(alloc, body)) {
@@ -11287,6 +11365,7 @@ pub const ApiHttpServer = struct {
                 queryEmbeddingSecurityScope(authenticated_identity),
                 cancellation,
                 response_label,
+                resolver,
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest,
                 error.InvalidFilterQueryRequest,
@@ -11301,6 +11380,7 @@ pub const ApiHttpServer = struct {
                 error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
                 error.HierarchyCursorStale => return error.HierarchyCursorStale,
                 error.TopologyChanged => return error.TopologyChanged,
+                error.CatalogGenerationChanged => return error.CatalogGenerationChanged,
                 error.ModelNotFound => return error.ModelNotFound,
                 error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
                 error.GraphWorkBudgetExceeded,
@@ -11357,7 +11437,8 @@ pub const ApiHttpServer = struct {
 
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
-        if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity, request_deadline_ns, cancellation, bound_join) catch |err| switch (err) {
+        var foreign_execution = CatalogJoinExecution{ .server = self, .resolver = resolver, .identity = authenticated_identity };
+        if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity, request_deadline_ns, cancellation, bound_join, foreign_execution.context()) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
             error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
@@ -11386,6 +11467,7 @@ pub const ApiHttpServer = struct {
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
             error.TopologyChanged => return error.TopologyChanged,
+            error.CatalogGenerationChanged => return error.CatalogGenerationChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.IndexRebuilding => return error.IndexRebuilding,
             error.TableNotFound, error.NotFound => return error.NotFound,
@@ -11432,7 +11514,9 @@ pub const ApiHttpServer = struct {
             if (bound_join == null) if (authenticated_identity) |identity| {
                 try applyAuthenticatedIdentityToJoinRequest(alloc, identity, &parsed_join.join);
             };
-            const join_ctx = self.joinContext().withNativeExecutionDeadline(request_deadline_ns).withCancellation(cancellation).withResponseLabel(response_label);
+            var execution = CatalogJoinExecution{ .server = self, .resolver = resolver, .identity = authenticated_identity };
+            var join_ctx = self.joinContext().withNativeExecutionDeadline(request_deadline_ns).withCancellation(cancellation).withResponseLabel(response_label);
+            join_ctx.query_execution = execution.context();
             return .{ .json = try distributed_join.executeSupportedJoinedPublicTableQueryRequest(join_ctx, &self.join_job_store, alloc, source, table_name, body, row_filter_json, parsed_join.join, parsed_join.foreign_sources) };
         }
 
@@ -11447,6 +11531,7 @@ pub const ApiHttpServer = struct {
             queryEmbeddingSecurityScope(authenticated_identity),
             cancellation,
             response_label,
+            resolver,
         ) catch |err| switch (err) {
             error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest,
@@ -11461,6 +11546,7 @@ pub const ApiHttpServer = struct {
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
             error.TopologyChanged => return error.TopologyChanged,
+            error.CatalogGenerationChanged => return error.CatalogGenerationChanged,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             error.GraphWorkBudgetExceeded,
@@ -11556,6 +11642,7 @@ pub const ApiHttpServer = struct {
         request_deadline_ns: ?u64,
         cancellation: ?CancellationToken,
         bound_join: ?*const distributed_join.ParsedSupportedJoinRequest,
+        query_execution: ?distributed_join.JoinContext.QueryExecution,
     ) anyerror!?[]u8 {
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
@@ -11600,6 +11687,7 @@ pub const ApiHttpServer = struct {
                 parsed_join.foreign_sources,
                 request_deadline_ns,
                 cancellation,
+                query_execution,
             );
         }
 
@@ -11741,6 +11829,7 @@ pub const ApiHttpServer = struct {
         foreign_sources: foreign_mod.PostgresSourceMap,
         request_deadline_ns: ?u64,
         cancellation: ?CancellationToken,
+        query_execution: ?distributed_join.JoinContext.QueryExecution,
     ) anyerror![]u8 {
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
@@ -11780,7 +11869,8 @@ pub const ApiHttpServer = struct {
 
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
-        const ctx = self.joinContext().withNativeExecutionDeadline(request_deadline_ns).withCancellation(cancellation);
+        var ctx = self.joinContext().withNativeExecutionDeadline(request_deadline_ns).withCancellation(cancellation);
+        ctx.query_execution = query_execution;
         const plan = try distributed_join.planSupportedJoinExecution(ctx, alloc, table_name, join, hits_ptr.items, foreign_sources);
         var right_result = try distributed_join.executeSupportedRightJoinQueryCoordinatorOnly(ctx, &self.join_job_store, alloc, source, join, hits_ptr.items, plan, foreign_sources);
         defer right_result.deinit(alloc);
@@ -11918,7 +12008,13 @@ pub const ApiHttpServer = struct {
         query_embedding_security_scope: QueryEmbeddingSecurityScope,
         cancellation: ?CancellationToken,
         response_label: ?[]const u8,
+        catalog_resolver: ?*CatalogQueryResolver,
     ) !query_api.QueryResponse {
+        var catalog_arena = std.heap.ArenaAllocator.init(alloc);
+        defer catalog_arena.deinit();
+        var local_catalog = CatalogQueryResolver{ .arena = catalog_arena.allocator() };
+        const resolver = catalog_resolver orelse &local_catalog;
+
         try ensureRequestActive(cancellation);
         var semantic_resolver = self.semanticStatusResolver(query_embedding_security_scope.domain, query_embedding_security_scope.value);
         semantic_resolver.query_embedding_deadline_ns = request_deadline_ns;
@@ -11950,12 +12046,12 @@ pub const ApiHttpServer = struct {
         }
         query_req.req.cancellation = cancellation;
         query_req.req.response_table_name = response_label;
-        self.maybeRouteQueryToReadSchema(table_name, &query_req.req) catch |err| switch (err) {
+        self.routeQueryToReadSchemaWithResolver(table_name, &query_req.req, resolver) catch |err| switch (err) {
             error.TableNotFound => return error.TableNotFound,
             error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return error.InvalidQueryRequest,
             else => return err,
         };
-        self.validatePublicQuerySortCapabilities(table_name, query_req.req) catch |err| switch (err) {
+        self.validateQuerySortWithResolver(table_name, query_req.req, resolver) catch |err| switch (err) {
             error.TableNotFound => return error.TableNotFound,
             error.InvalidSchemaUpdateRequest => return error.InvalidQueryRequest,
             else => return err,
@@ -11963,13 +12059,11 @@ pub const ApiHttpServer = struct {
         if (row_filter_json) |value| {
             injectRowFilterIntoSearchRequest(alloc, &query_req.req, value) catch return error.InvalidQueryRequest;
         }
-        var graph_arena = std.heap.ArenaAllocator.init(alloc);
-        defer graph_arena.deinit();
         var graph_binding = CatalogGraphReadContext{
             .server = self,
             .identity = authenticated_identity,
             .context = .{ .deadline_ns = request_deadline_ns, .cancellation = cancellation orelse .none },
-            .resolver = .{ .arena = graph_arena.allocator() },
+            .resolver = resolver,
         };
         if (self.source.vtable.system_catalog != null and query_req.req.graph_queries.len > 0 and distributed_graph.supportsCrossRange(query_req.req)) {
             query_req.req.graph_table_read_authorizer = .{ .ctx = &graph_binding, .authorize_table = CatalogGraphReadContext.authorize };
@@ -11998,14 +12092,14 @@ pub const ApiHttpServer = struct {
         server: *ApiHttpServer,
         identity: ?AuthenticatedIdentity,
         context: api_operation.RequestContext,
-        resolver: CatalogQueryResolver,
+        resolver: *CatalogQueryResolver,
 
         fn authorize(ctx: ?*const anyopaque, alloc: std.mem.Allocator, name: []const u8) anyerror!db_mod.types.GraphTableReadAuthorization {
             const self: *@This() = @ptrCast(@alignCast(@constCast(ctx orelse return .{ .allowed = false })));
             const target = try system_catalog.Target.literal(name);
             const key = try target.resourceNameAlloc(self.resolver.arena);
             if (!try tablePermissionCurrentlyAllowed(self.identity, key, .read)) return .{ .allowed = false };
-            const resolved = try self.server.resolveQueryCatalog(&self.resolver, self.context, &.{target});
+            const resolved = try self.server.resolveQueryCatalog(self.resolver, self.context, &.{target}, false);
             const table = resolved.tables[0] orelse return .{ .allowed = false };
             const physical = try alloc.dupe(u8, table.name);
             errdefer alloc.free(physical);
@@ -12292,6 +12386,7 @@ pub const ApiHttpServer = struct {
         query_value: std.json.Value,
         execution_deadline_ns: ?u64,
         cancellation: ?CancellationToken,
+        resolver: ?*CatalogQueryResolver,
     ) !query_api.OwnedQueryRequest {
         try ensureRequestActive(cancellation);
         const query_body = try stringifyJsonValueAlloc(alloc, query_value);
@@ -12309,8 +12404,8 @@ pub const ApiHttpServer = struct {
         errdefer owned.deinit(alloc);
         owned.req.cancellation = cancellation;
         try ensureRequestActive(cancellation);
-        try self.maybeRouteQueryToReadSchema(table_name, &owned.req);
-        try self.validatePublicQuerySortCapabilities(table_name, owned.req);
+        try self.routeQueryToReadSchemaWithResolver(table_name, &owned.req, resolver);
+        try self.validateQuerySortWithResolver(table_name, owned.req, resolver);
         return owned;
     }
 
@@ -14870,6 +14965,7 @@ pub const ApiHttpServer = struct {
             null,
             null,
             null,
+            null,
         );
         defer query_response.deinit(self.alloc);
         return try result_alloc.dupe(u8, query_response.json);
@@ -14911,9 +15007,10 @@ pub const ApiHttpServer = struct {
         arena: std.mem.Allocator,
         revision: ?u64 = null,
         tables: std.StringHashMapUnmanaged(?system_catalog.ResolvedTable) = .empty,
+        definitions: std.StringHashMapUnmanaged(system_catalog.QueryDefinition) = .empty,
     };
 
-    fn resolveQueryCatalog(self: *ApiHttpServer, resolver: *CatalogQueryResolver, context: api_operation.RequestContext, targets: []const system_catalog.Target) !system_catalog.ResolvedMany {
+    fn resolveQueryCatalog(self: *ApiHttpServer, resolver: *CatalogQueryResolver, context: api_operation.RequestContext, targets: []const system_catalog.Target, include_definitions: bool) !system_catalog.ResolvedMany {
         const a = resolver.arena;
         var missing: std.ArrayList(system_catalog.Target) = .empty;
         var keys: std.ArrayList([]const u8) = .empty;
@@ -14926,11 +15023,15 @@ pub const ApiHttpServer = struct {
             try keys.append(a, key);
         }
         if (missing.items.len > 0) {
-            const bytes = try self.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = missing.items, .expected_revision = resolver.revision } });
+            const bytes = try self.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = missing.items, .expected_revision = resolver.revision, .include_query_definitions = include_definitions and self.source.vtable.supports_query_definitions } });
             const result = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, a, bytes, .{});
             if (result.tables.len != missing.items.len) return error.InvalidCatalogRecord;
             if (resolver.revision) |revision| if (revision != result.revision) return error.CatalogGenerationChanged;
-            for (keys.items, result.tables) |key, table| try resolver.tables.put(a, key, table);
+            for (keys.items, result.tables) |key, table| {
+                try resolver.tables.put(a, key, table);
+                if (table) |value| if (value.query_definition) |definition|
+                    try resolver.definitions.put(a, value.name, definition);
+            }
             resolver.revision = result.revision;
         }
         const tables = try a.alloc(?system_catalog.ResolvedTable, targets.len);
@@ -14982,7 +15083,7 @@ pub const ApiHttpServer = struct {
         }
         if (targets.items.len == 0) return .{ .arena = arena, .physical = try a.dupe(u8, logical), .label = label, .join = join };
         var local_resolver = CatalogQueryResolver{ .arena = a };
-        const result = try self.resolveQueryCatalog(shared_resolver orelse &local_resolver, context, targets.items);
+        const result = try self.resolveQueryCatalog(shared_resolver orelse &local_resolver, context, targets.items, true);
         if (result.tables.len != targets.items.len) return error.InvalidCatalogRecord;
         for (result.tables) |table| if (table == null) return error.TableNotFound;
         const offset: usize = if (primary_foreign) 0 else 1;
@@ -15549,9 +15650,12 @@ pub const ApiHttpServer = struct {
         var identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
         defer if (identity) |*owned| owned.deinit(self.alloc);
         const deadline = query_contract.queryExecutionDeadlineNsFromBody(self.alloc, body) catch return self.publicQueryOperationErrorResponse(table_name, body, error.InvalidQueryRequest);
-        var binding = self.bindCatalogQuery(self.alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none }, table_name, body, &identity, null) catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err);
+        var catalog_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer catalog_arena.deinit();
+        var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator() };
+        var binding = self.bindCatalogQuery(self.alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none }, table_name, body, &identity, &resolver) catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err);
         defer binding.deinit();
-        return self.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, body, content_type, identity, cancellation, binding.label, if (binding.join) |*value| value else null);
+        return self.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, body, content_type, identity, cancellation, binding.label, if (binding.join) |*value| value else null, &resolver);
     }
 
     pub fn handleAdmittedResolvedTableQueryWithContentTypeCancellation(
@@ -15563,11 +15667,12 @@ pub const ApiHttpServer = struct {
         cancellation: ?*const http_common.RequestCancellation,
         response_label: ?[]const u8,
         bound_join: ?*const distributed_join.ParsedSupportedJoinRequest,
+        catalog_resolver: ?*CatalogQueryResolver,
     ) !contextual_operations.OwnedResponse {
         if (isNdjsonContentType(content_type)) {
             return try self.handlePublicTableMultiQueryWithCancellation(table_name, body, authenticated_identity, cancellation, response_label, bound_join);
         }
-        return try self.handlePublicTableQueryWithCancellation(table_name, body, authenticated_identity, cancellation, response_label, bound_join);
+        return try self.handlePublicTableQueryWithCancellation(table_name, body, authenticated_identity, cancellation, response_label, bound_join, catalog_resolver);
     }
 
     pub fn handlePublicGlobalMultiQuery(self: *ApiHttpServer, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !contextual_operations.OwnedResponse {
@@ -15721,6 +15826,7 @@ pub const ApiHttpServer = struct {
         cancellation: ?*const http_common.RequestCancellation,
         response_label: ?[]const u8,
         bound_join: ?*const distributed_join.ParsedSupportedJoinRequest,
+        catalog_resolver: ?*CatalogQueryResolver,
     ) !contextual_operations.OwnedResponse {
         var diagnostic_context: query_request_diagnostics.Context = .{};
         const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
@@ -15747,6 +15853,7 @@ pub const ApiHttpServer = struct {
             if (cancellation) |value| value.token() else null,
             response_label,
             bound_join,
+            catalog_resolver,
         ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, body, err);
         self.reachQueryResultLifecycle("public.table.query", table_name, query_response.json.len) catch |err| {
             query_response.deinit(self.alloc);
@@ -15842,6 +15949,7 @@ pub const ApiHttpServer = struct {
                 if (cancellation) |value| value.token() else null,
                 line_label,
                 if (binding.join) |*value| value else bound_join,
+                &catalog_resolver,
             ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, line, err);
             defer query_response.deinit(self.alloc);
             try self.reachQueryResultLifecycle(
@@ -23574,6 +23682,7 @@ test "api http unsupported count ordered page response exposes stable sort reaso
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
         @"error": []const u8,
+        message: []const u8,
         reason: []const u8,
         sort_rejection_reason: []const u8,
         sort_rejection_detail: []const u8,
@@ -23583,6 +23692,7 @@ test "api http unsupported count ordered page response exposes stable sort reaso
 
     try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
     try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
+    try std.testing.expectEqualStrings("exact sort is unsupported for this query", parsed.value.message);
     try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.reason);
     try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.sort_rejection_reason);
     try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.sort_rejection_detail);
@@ -24397,6 +24507,7 @@ test "api http plain public query preserves outer absolute request deadline" {
         .{ .domain = .internal, .value = "test" },
         null,
         null,
+        null,
     );
     defer response.deinit(alloc);
     try std.testing.expectEqualStrings("{\"hits\":[],\"total\":0}", response.json);
@@ -24548,6 +24659,7 @@ test "api http hierarchy traversal preserves policy and cursor across remote hyd
         .{ .domain = .internal, .value = "test" },
         null,
         null,
+        null,
     );
     defer first.deinit(alloc);
     var first_json = try std.json.parseFromSlice(std.json.Value, alloc, first.json, .{});
@@ -24566,6 +24678,7 @@ test "api http hierarchy traversal preserves policy and cursor across remote hyd
         null,
         null,
         .{ .domain = .internal, .value = "test" },
+        null,
         null,
         null,
     );
@@ -47543,14 +47656,14 @@ test "api http server join context carries cancellation into owned right request
     var query_value = try parseOwnedJsonValueAlloc(alloc, "{}");
     defer ApiHttpServer.deinitJsonValue(alloc, &query_value);
     var cancellation = std.atomic.Value(bool).init(false);
-    var owned = try server.joinContext().withCancellation(&cancellation).buildOwnedSearchRequest(
+    var owned = try server.joinContext().withCancellation(CancellationToken.fromAtomic(&cancellation)).buildOwnedSearchRequest(
         alloc,
         "right",
         query_value,
     );
     defer owned.deinit(alloc);
 
-    try std.testing.expect(owned.req.cancellation.? == &cancellation);
+    try std.testing.expect(!owned.req.cancellation.?.isCancelled());
     cancellation.store(true, .release);
     try std.testing.expectError(error.Cancelled, ensureRequestActive(owned.req.cancellation));
 }
@@ -47642,7 +47755,7 @@ test "api http server executes foreign right join query through registry" {
     };
     var cancellation = std.atomic.Value(bool).init(false);
     var right = try distributed_join.executeForeignRightJoinQuery(
-        server.joinContext().withCancellation(&cancellation),
+        server.joinContext().withCancellation(CancellationToken.fromAtomic(&cancellation)),
         &server.join_job_store,
         alloc,
         dummy_source,
@@ -47741,12 +47854,12 @@ test "api http server executes direct foreign table query through registry" {
 
     try std.testing.expectError(
         error.Timeout,
-        server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null, 0, null, null),
+        server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null, 0, null, null, null),
     );
     try std.testing.expect(DummyForeign.last_dsn == null);
 
     var cancellation = std.atomic.Value(bool).init(false);
-    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null, null, &cancellation, null)).?;
+    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null, null, &cancellation, null, null)).?;
     defer alloc.free(json);
 
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, json, .{});
@@ -47775,6 +47888,7 @@ test "api http server executes direct foreign table query through registry" {
             null,
             null,
             &cancellation,
+            null,
             null,
         ),
     );
@@ -47865,7 +47979,7 @@ test "api http server executes direct foreign table aggregations through registr
     ;
 
     var cancellation = std.atomic.Value(bool).init(false);
-    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null, null, &cancellation, null)).?;
+    const json = (try server.executeForeignPublicTableQueryIfAny(alloc, dummy_source, "pg_customers", body, null, null, null, &cancellation, null, null)).?;
     defer alloc.free(json);
 
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, json, .{});
@@ -48196,4 +48310,95 @@ test "system catalog row filter path decoding preserves exact star and escaped p
     try std.testing.expectEqualStrings("%2A", (try system_catalog.Target.parse(escaped)).table);
     try std.testing.expect(!system_catalog.tableResourceMatches(star, "other"));
     try std.testing.expect(!system_catalog.tableResourceMatches(star, escaped));
+}
+
+test "system catalog graph retries retain destination identity" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        queries: usize = 0,
+        bindings: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: system_catalog.Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(input == .resolve_many);
+            self.bindings += 1;
+            const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = self.bindings, .name = if (self.bindings == 1) "table:original" else "table:replacement" }};
+            return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = self.bindings, .tables = &tables }, .{});
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return null;
+        }
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return null;
+        }
+        fn query(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, req: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.queries += 1;
+            var binding = try req.graph_table_read_authorizer.?.authorize(a, "entities");
+            defer binding.deinit(a);
+            try std.testing.expectEqualStrings("table:original", binding.physical_table_name.?);
+            if (self.queries == 1) return error.StorageReadTemporarilyUnavailable;
+            return .{ .json = try a.dupe(u8, "{\"responses\":[]}") };
+        }
+    };
+    var fake = Fake{};
+    const reads: table_reads.TableReadSource = .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = Fake.scan, .query = Fake.query } };
+    const writes: table_writes.TableWriteSource = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch } };
+    var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.catalog } }, reads, writes);
+    defer server.deinit();
+    var response = try server.executePublicTableQueryDispatchWithReadinessRetry(alloc, reads, "docs",
+        \\{"query":{"match_all":{}},"graph_queries":{"mentions":{"index":"relations_graph","traverse":{"start":{"keys":["doc"]},"edge_types":["mentions"],"max_depth":1,"limit":10,"include_documents":true}}},"limit":10}
+    , null, null, null, null, null, null);
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), fake.queries);
+    try std.testing.expectEqual(@as(usize, 1), fake.bindings);
+}
+
+test "system catalog NDJSON reuses one query definition without administrative snapshots" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        bindings: usize = 0,
+        queries: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedAdministrativeSnapshot;
+        }
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: system_catalog.Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.bindings += 1;
+            try std.testing.expect(input == .resolve_many);
+            try std.testing.expect(input.resolve_many.include_query_definitions);
+            const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = 7, .name = "table:docs", .query_definition = .{ .schema_json = "{}", .read_schema_json = "", .indexes_json = "{}" } }};
+            return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 3, .tables = &tables }, .{});
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return null;
+        }
+        fn query(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.queries += 1;
+            try std.testing.expectEqualStrings("table:docs", table);
+            return .{ .json = try a.dupe(u8, "{\"responses\":[{\"hits\":{\"hits\":[]}}]}") };
+        }
+    };
+    var fake = Fake{};
+    const reads: table_reads.TableReadSource = .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = Fake.scan, .query = Fake.query } };
+    var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .admin_snapshot = Fake.snapshot, .system_catalog = Fake.catalog, .supports_query_definitions = true } }, reads, null);
+    defer server.deinit();
+    const line = "{\"table\":\"docs\",\"full_text_search\":{\"match_all\":{}}}\n";
+    var response = try server.handlePublicGlobalMultiQuery(line ** 20, null);
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try std.testing.expectEqual(@as(usize, 20), fake.queries);
+    try std.testing.expectEqual(@as(usize, 1), fake.bindings);
 }

@@ -25,22 +25,58 @@ pub const max_name_bytes = 128;
 pub const max_command_bytes = 3 * 1024 * 1024;
 pub const Kind = enum { database, namespace, tablespace, table };
 
-/// Routing response deliberately excludes schema, index definitions, and
-/// credentials. A document operation needs only this stable identity.
+/// Request-owned query preparation data, excluding topology and unrelated
+/// tables. Read schema and index generations are captured together.
+pub const QueryDefinition = struct {
+    schema_json: []const u8,
+    read_schema_json: []const u8,
+    indexes_json: []const u8,
+
+    pub fn fromTable(table: anytype) @This() {
+        return .{ .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = table.indexes_json };
+    }
+    pub fn clone(self: @This(), alloc: std.mem.Allocator) !@This() {
+        const schema = try alloc.dupe(u8, self.schema_json);
+        errdefer alloc.free(schema);
+        const read_schema = try alloc.dupe(u8, self.read_schema_json);
+        errdefer alloc.free(read_schema);
+        return .{ .schema_json = schema, .read_schema_json = read_schema, .indexes_json = try alloc.dupe(u8, self.indexes_json) };
+    }
+    pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.schema_json);
+        alloc.free(self.read_schema_json);
+        alloc.free(self.indexes_json);
+    }
+};
+
+/// Document operations request only identity; query admission can include a
+/// narrow definition captured in the same catalog read transaction.
 pub const ResolvedTable = struct {
     table_id: u64,
     name: []const u8,
+    query_definition: ?QueryDefinition = null,
 
     pub fn fromTable(table: anytype) @This() {
         return .{ .table_id = table.table_id, .name = table.name };
     }
 
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        if (self.query_definition) |definition| {
+            try jw.write(.{ .table_id = self.table_id, .name = self.name, .query_definition = definition });
+        } else {
+            try jw.write(.{ .table_id = self.table_id, .name = self.name });
+        }
+    }
+
     pub fn clone(self: @This(), alloc: std.mem.Allocator) !@This() {
-        return .{ .table_id = self.table_id, .name = try alloc.dupe(u8, self.name) };
+        const name = try alloc.dupe(u8, self.name);
+        errdefer alloc.free(name);
+        return .{ .table_id = self.table_id, .name = name, .query_definition = if (self.query_definition) |definition| try definition.clone(alloc) else null };
     }
 
     pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
         alloc.free(self.name);
+        if (self.query_definition) |definition| definition.deinit(alloc);
     }
 };
 
@@ -465,6 +501,7 @@ pub const Request = struct {
 
 pub const ResolveMany = struct {
     targets: []const Target,
+    include_query_definitions: bool = false,
     expected_revision: ?u64 = null,
 };
 
@@ -482,6 +519,7 @@ pub const Call = union(enum) {
     snapshot: void,
     resolve: Target,
     resolve_many: ResolveMany,
+    query_definition: []const u8,
     mutate: Request,
 };
 

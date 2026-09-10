@@ -58,7 +58,13 @@ resolution owns a lazy binding per changed extraction artifact and resolver
 configuration. All mentions in that work unit reuse the same immutable candidate
 table destination. Exact-key resolution reads up to 256 candidate IDs at a time
 through the existing fenced document-value query path. It preserves duplicate
-mentions and missing candidates; a work-unit cache reuses curated merge targets.
+mentions and missing candidates. Exact keys and label prefixes are deduplicated
+per work unit. Prefix search scans each distinct prefix once, enforcing the
+candidate bound even with a custom source. A second bulk read hydrates distinct
+one-hop curated merge destinations; missing destinations are cached for the
+work unit too. Immutable candidate records are decoded once per distinct lookup
+and shared while each mention is scored independently. ANN retains its
+mention-specific nearest-neighbor search.
 Deterministic mint-only configurations skip candidate and embedding I/O while
 still retaining the destination binding. Malformed candidate responses fail the
 work unit instead of silently minting
@@ -103,8 +109,9 @@ request-owned, never a process-wide name cache with a time-based expiry.
 
 ## Metadata reads and durability
 
-Catalog records, name indexes, revisions, and table topology commit through
-metadata Raft. Standalone persists the same state in its atomic catalog
+Catalog records, revisions, and table topology commit through metadata Raft.
+Logical and physical name indexes are local derived projections maintained in
+the same transaction as authoritative mutations. Standalone persists the same state in its atomic catalog
 checkpoint and rollback boundary. Create and restore publish table topology
 and the logical binding together. Reopen and snapshot installation retain the
 catalog. System catalog admission requires topology protocol version 5;
@@ -116,12 +123,28 @@ incarnation evidence. The reader validates it against its pinned identity and
 uses bounded endpoint failover, a shared deadline, and cancellation. Mutations
 retain the existing at-most-once forwarding and ambiguous-outcome rules.
 
-Indexed reads return only table ID and physical name. Compact binary decoding
-validates record framing without copying or decoding large schema and index
-definitions. Mutation inventories likewise read compact identities from a
-borrowed cursor. Missing name-index entries still check the inventory to
-distinguish absence from corruption; an index-integrity proof would be needed
-before safely eliminating that fallback.
+Identity-only reads return table ID and physical name. Query binding optionally
+includes only the selected tables' schema, active read schema, and index
+definitions, captured in the same read transaction as their identities. Routing
+and sort validation reuse this request-owned projection, including across
+NDJSON lines and synchronous native join execution. Internal physical-table
+queries use the same narrow point-read contract. Administrative snapshots remain
+available to callers that actually need whole-catalog topology or listings.
+Compact binary decoding validates all record framing while copying only the
+requested projection, skipping unrelated descriptions and restore metadata.
+Mutation inventories likewise read compact identities from a borrowed cursor.
+
+A writable projection rebuilds name indexes from validated authoritative records
+before its first catalog point read after open or snapshot installation. Read-only
+open validates the persisted projection instead. A version marker, checked inside
+each read transaction, establishes that both positive and negative lookups use a
+complete projection. Raft apply maintains indexes atomically; snapshot install
+invalidates the in-process verification and excludes all derived rows from the
+snapshot. Reopen repairs missing derived rows; malformed or duplicate primary
+records fail closed. This lifecycle proof relies on transactional mutation paths
+and the storage engine's integrity checks. Negative and legacy unbound lookups
+therefore use point reads without allocating or scanning unrelated catalog
+records. First-use rebuild/validation remains proportional to catalog size.
 
 Table listings build an identity map and select scope, prefix, and authorized
 tables before per-table status collection and public schema materialization.

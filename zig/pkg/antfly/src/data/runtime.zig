@@ -19807,6 +19807,7 @@ const RemoteMetadataSource = struct {
             .routing = self.catalogSource().routingSource() catch unreachable,
             .vtable = &.{
                 .system_catalog = remoteSystemCatalog,
+                .supports_query_definitions = true,
                 .status = remoteStatus,
                 .admin_snapshot = remoteAdminSnapshot,
                 .cached_admin_snapshot = remoteCachedAdminSnapshot,
@@ -36155,6 +36156,10 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                         defer response_alloc.free(tables);
                         for (input.targets, tables) |target, *table| table.* = resolve(snapshot, target);
                         break :blk try std.json.Stringify.valueAlloc(response_alloc, catalog.ResolvedMany{ .revision = snapshot.status.metadata_epoch, .tables = tables }, .{});
+                    },
+                    .query_definition => |name| blk: {
+                        const table = antfly.public_api.tables.findTableByName(snapshot, name) orelse return .{ .status = 404 };
+                        break :blk try std.json.Stringify.valueAlloc(response_alloc, catalog.QueryDefinition.fromTable(table), .{});
                     },
                     .mutate => return error.UnexpectedCatalogMutation,
                 };

@@ -124,6 +124,10 @@ pub const LifecycleHook = struct {
 // ---------------------------------------------------------------------------
 
 pub const JoinContext = struct {
+    /// Borrowed synchronous query state. Background jobs retain only the
+    /// ordinary server context; request bindings never escape their owner.
+    query_execution: ?QueryExecution = null,
+
     response_label: ?[]const u8 = null,
 
     ptr: *anyopaque,
@@ -132,6 +136,13 @@ pub const JoinContext = struct {
     execution_deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
     lifecycle_hook: ?LifecycleHook = null,
+
+    pub const QueryExecution = struct {
+        ptr: *anyopaque,
+        plain: @FieldType(VTable, "execute_plain_query"),
+        dispatch: @FieldType(VTable, "execute_query_dispatch"),
+        build: @FieldType(VTable, "build_owned_search_request"),
+    };
 
     pub fn withResponseLabel(self: @This(), label: ?[]const u8) @This() {
         var out = self;
@@ -255,8 +266,9 @@ pub const JoinContext = struct {
     }
 
     pub fn executePlainQuery(self: JoinContext, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8) !query_api.QueryResponse {
-        return try self.vtable.execute_plain_query(
-            self.ptr,
+        const execute = if (self.query_execution) |q| q.plain else self.vtable.execute_plain_query;
+        return try execute(
+            if (self.query_execution) |q| q.ptr else self.ptr,
             alloc,
             source,
             table_name,
@@ -268,8 +280,9 @@ pub const JoinContext = struct {
     }
 
     pub fn executeQueryDispatch(self: JoinContext, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8) ![]u8 {
-        return try self.vtable.execute_query_dispatch(
-            self.ptr,
+        const execute = if (self.query_execution) |q| q.dispatch else self.vtable.execute_query_dispatch;
+        return try execute(
+            if (self.query_execution) |q| q.ptr else self.ptr,
             alloc,
             source,
             table_name,
@@ -281,8 +294,9 @@ pub const JoinContext = struct {
     }
 
     pub fn buildOwnedSearchRequest(self: JoinContext, alloc: std.mem.Allocator, table_name: []const u8, query_value: std.json.Value) !query_api.OwnedQueryRequest {
-        return try self.vtable.build_owned_search_request(
-            self.ptr,
+        const execute = if (self.query_execution) |q| q.build else self.vtable.build_owned_search_request;
+        return try execute(
+            if (self.query_execution) |q| q.ptr else self.ptr,
             alloc,
             table_name,
             query_value,
@@ -990,6 +1004,7 @@ pub const JoinJobStore = struct {
 
     pub fn setContext(self: *JoinJobStore, ctx: JoinContext) void {
         self.ctx = ctx;
+        self.ctx.?.query_execution = null;
     }
 
     pub fn hasDurableStore(self: *const JoinJobStore) bool {
@@ -6259,7 +6274,7 @@ test "distributed join transports relative budgets and rejects exhausted handoff
     var state: u8 = 0;
     const ctx = JoinContext{
         .ptr = &state,
-        .vtable = undefined,
+        .vtable = &.{ .admin_snapshot = undefined, .free_admin_snapshot = undefined, .execute_plain_query = undefined, .execute_query_dispatch = undefined, .build_owned_search_request = undefined, .ensure_foreign_registry = undefined },
         .execution_deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s,
     };
     const remaining_ms = (try ctx.remainingExecutionBudgetMs()).?;
@@ -6292,7 +6307,7 @@ test "distributed join transports relative budgets and rejects exhausted handoff
     try std.testing.expectEqual(@as(?u64, remaining_ms), parsed.remaining_timeout_ms);
     const worker_ctx = try (JoinContext{
         .ptr = &state,
-        .vtable = undefined,
+        .vtable = &.{ .admin_snapshot = undefined, .free_admin_snapshot = undefined, .execute_plain_query = undefined, .execute_query_dispatch = undefined, .build_owned_search_request = undefined, .ensure_foreign_registry = undefined },
     }).withRemainingExecutionBudgetMs(parsed.remaining_timeout_ms);
     try worker_ctx.ensureExecutionDeadline();
 }
@@ -7026,8 +7041,8 @@ test "distributed join apply context cancels a linear non-equality merge" {
     var state: u8 = 0;
     const ctx = JoinContext{
         .ptr = &state,
-        .vtable = undefined,
-        .cancellation = &cancellation,
+        .vtable = &.{ .admin_snapshot = undefined, .free_admin_snapshot = undefined, .execute_plain_query = undefined, .execute_query_dispatch = undefined, .build_owned_search_request = undefined, .ensure_foreign_registry = undefined },
+        .cancellation = CancellationToken.fromAtomic(&cancellation),
     };
 
     try std.testing.expectError(
