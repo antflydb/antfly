@@ -18,6 +18,7 @@
     .fingerprint = 0xaf6720431d9566e1,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .onnx_graph = .{ .path = "lib/onnx" },
         .handlebars = .{
             .path = "lib/handlebars",
         },

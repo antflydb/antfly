@@ -72,15 +72,24 @@ The checks cover:
   it does not repeat those compilations in a disposable cache.
 - Offline adapter/checkpoint commands use roots scoped to their asset owner.
   Checkpoint operations and shared types live in `pkg/inference/src/finetune/assets/`;
-  training imports those implementations. ONNX file parsing and tensor-byte
+  training imports those implementations. Bundle inspection and cached entity
+  cleanup also have explicit offline owners. ONNX file parsing and tensor-byte
   access use `onnx_data`, independently of graph conversion and optimizers.
-  One actual executable per owner checks these boundaries in both entrypoints;
+  One library constructor returns the configured data and graph modules for
+  native and browser consumers.
+  Actual executables from every owner check these boundaries in both entrypoints;
   composition, inspection, and head materialization also run on tiny SafeTensors
-  inputs. Backend flags, release metadata, training code, CUDA kernels, and
-  optimizer edits leave all sampled tools cached. A head-format edit rebuilds
+  inputs. The cleanup tools prepare two mentions per split and train one epoch;
+  their reports and saved head are checked. Backend flags, release metadata,
+  unrelated training code, CUDA kernels, and optimizer edits leave all sampled tools cached. A head-format edit rebuilds
   only its owning command and changes its output; a PEFT edit rebuilds its
-  consumers and changes the composed weights. Invalid input after a valid
-  adapter returns an error with correct cleanup.
+  consumers and changes the composed weights. A cleanup-cache format edit
+  rebuilds only the two cleanup tools and changes the emitted cache. Invalid
+  input after a valid adapter returns an error with correct cleanup.
+- ONNX data and graph tests both participate in `lib-onnx-test`, `lib-test`,
+  and standalone inference's `test-onnx-graph`. The coverage regression executes
+  the actual parser test artifact, verifies that a failing parser test fails
+  the run, and rejects a removed aggregate dependency.
 - All six served schemas invalidate only the API kernel; the other archives can
   build with a schema missing.
 - The remote CLI has no transitive tokenizer, storage-engine, or inference

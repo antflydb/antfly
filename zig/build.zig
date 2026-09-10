@@ -508,21 +508,15 @@ pub fn create(b: *std.Build) ?Artifacts {
         .target = target,
         .optimize = optimize,
     });
-    const inference_onnx_graph_mod = b.addModule("inference_onnx_graph", .{
-        .root_source_file = b.path("lib/onnx/src/root.zig"),
+    const onnx_build = @import("onnx_graph").support;
+    const inference_onnx = onnx_build.create(b, .{
+        .root = b.path("lib/onnx"),
         .target = target,
         .optimize = optimize,
+        .protobuf = protobuf_mod,
+        .ml = inference_ml_mod,
     });
-    const inference_onnx_data_mod = b.createModule(.{
-        .root_source_file = b.path("lib/onnx/src/data.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    inference_onnx_data_mod.addImport("protobuf", protobuf_mod);
-    inference_onnx_graph_mod.addImport("onnx_data", inference_onnx_data_mod);
-    inference_onnx_graph_mod.addImport("protobuf", protobuf_mod);
-    inference_onnx_graph_mod.addImport("ml", inference_ml_mod);
-    inference_onnx_graph_mod.addImport("structlog", structlog_mod);
+    b.modules.put(b.allocator, b.dupe("inference_onnx_graph"), inference_onnx.graph) catch @panic("OOM");
     const inference_pjrt_xla_proto_mod = b.createModule(.{
         .root_source_file = b.path("lib/pjrt/proto/xla_proto_stub.zig"),
         .target = target,
@@ -594,7 +588,7 @@ pub fn create(b: *std.Build) ?Artifacts {
             .sentencepiece_proto = sentencepiece_proto_mod,
             .ml = inference_ml_mod,
             .ml_tabular = ml_tabular_mod,
-            .onnx_graph = inference_onnx_graph_mod,
+            .onnx = inference_onnx,
             .pjrt = inference_pjrt_mod,
             .audio_openapi = audio_openapi_mod,
             .s3_openapi = s3_openapi_mod,
@@ -842,17 +836,14 @@ pub fn create(b: *std.Build) ?Artifacts {
     const lib_ml_tabular_test_step = b.step("lib-ml-tabular-test", "Run standalone lib/ml/tabular tests");
     lib_ml_tabular_test_step.dependOn(&run_lib_ml_tabular_tests.step);
 
-    const lib_onnx_tests = b.addTest(.{
-        .root_module = inference_onnx_graph_mod,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
+    const onnx_tests = onnx_build.createTests(b, inference_onnx, .{
+        .path = b.path("pkg/antfly/src/test_runner.zig"),
+        .mode = .simple,
     });
-    const run_lib_onnx_tests = b.addRunArtifact(lib_onnx_tests);
-    run_lib_onnx_tests.setEnvironmentVariable("ANTFLY_TEST_FAIL_ON_ERROR_LOGS", "0");
+    onnx_tests.graph.setEnvironmentVariable("ANTFLY_TEST_FAIL_ON_ERROR_LOGS", "0");
     const lib_onnx_test_step = b.step("lib-onnx-test", "Run standalone lib/onnx tests");
-    lib_onnx_test_step.dependOn(&run_lib_onnx_tests.step);
+    lib_onnx_test_step.dependOn(&onnx_tests.data.step);
+    lib_onnx_test_step.dependOn(&onnx_tests.graph.step);
 
     const fuzz_tabular_loader = b.addTest(.{
         .root_module = b.createModule(.{
@@ -1244,7 +1235,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     lib_test_step.dependOn(platform_test_step);
     dependOnAll(lib_test_step, &.{
         &run_lib_json_tests.step,
-        &run_lib_onnx_tests.step,
+        lib_onnx_test_step,
         &run_objectstore_tests.step,
         &run_httpx_json_tests.step,
         &run_httpx_tests.step,

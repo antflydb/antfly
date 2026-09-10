@@ -12,5 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Keep src/ as the module boundary for this command and its implementation.
-pub const main = @import("finetune/tools/inspect_layoutlmv3_bundle.zig").main;
+//! Offline bundle discovery and reporting.
+pub const models = struct {
+    pub const manifest = @import("models/manifest.zig");
+};
+pub const io = struct {
+    pub const compat = @import("io/compat.zig");
+};
+pub const util = struct {
+    pub const c_file = @import("util/c_file.zig");
+};

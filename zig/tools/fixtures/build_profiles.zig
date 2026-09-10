@@ -140,7 +140,7 @@ pub fn addAssetToolChecks(b: *std.Build, steps: *std.AutoHashMap(*std.Build.Step
     if (assets.count() == 0) @panic("no offline asset commands registered");
     const check_step = b.step("cache-finetune-assets", "Run actual bounded offline checkpoint operations");
     // One real executable per source owner exercises every extracted boundary.
-    // Reuse the three commands with bounded I/O workloads below. Other owners
+    // Reuse the commands with bounded I/O workloads below. Other owners
     // choose a deterministic representative from the production registry.
     var owners = std.StringHashMap(*std.Build.Step.Compile).init(b.allocator);
     var asset_iterator = assets.valueIterator();
@@ -155,8 +155,13 @@ pub fn addAssetToolChecks(b: *std.Build, steps: *std.AutoHashMap(*std.Build.Step
         const source = artifact.root_module.import_table.get("inference_finetune_assets").?.root_source_file.?.getPath(b);
         owners.put(source, artifact) catch @panic("OOM");
     }
+    var checked = std.AutoHashMap(*std.Build.Step.Compile, void).init(b.allocator);
     var owner_iterator = owners.valueIterator();
-    while (owner_iterator.next()) |entry| {
+    while (owner_iterator.next()) |entry| checked.put(entry.*, {}) catch @panic("OOM");
+    // Both consumers of the cleanup owner have actual I/O workloads below.
+    checked.put(assets.get("train-eval-entity-cleanup-head").?, {}) catch @panic("OOM");
+    var checked_iterator = checked.keyIterator();
+    while (checked_iterator.next()) |entry| {
         const artifact = entry.*;
         std.debug.print("ASSET_COMMAND {s}\n", .{artifact.name});
         check_step.dependOn(&artifact.step);
@@ -178,6 +183,25 @@ pub fn addAssetToolChecks(b: *std.Build, steps: *std.AutoHashMap(*std.Build.Step
     materialize.addFileArg(b.path("cache_asset_inputs/head.safetensors"));
     _ = materialize.addOutputDirectoryArg("materialized-head");
     check_step.dependOn(&materialize.step);
+    const bundle_report = b.addRunArtifact(assets.get("inspect-layoutlmv3-bundle").?);
+    bundle_report.addDirectoryArg(b.path("cache_asset_inputs/base"));
+    _ = bundle_report.captureStdOut(.{ .basename = "bundle-inspection.json" });
+    check_step.dependOn(&bundle_report.step);
+
+    var cleanup_inputs: [2]std.Build.LazyPath = undefined;
+    for ([_][]const u8{ "train", "eval" }, &cleanup_inputs) |split, *input| {
+        const prepare = b.addRunArtifact(assets.get("prepare-entity-cleanup-cache").?);
+        prepare.addFileArg(b.path("cache_asset_inputs/cleanup.jsonl"));
+        input.* = prepare.addOutputFileArg(b.fmt("cleanup-{s}.json", .{split}));
+        prepare.addArgs(&.{ split, "16", "4" });
+    }
+    const train_cleanup = b.addRunArtifact(assets.get("train-eval-entity-cleanup-head").?);
+    for (cleanup_inputs) |input| train_cleanup.addFileArg(input);
+    _ = train_cleanup.addOutputDirectoryArg("cleanup-head");
+    train_cleanup.addArgs(&.{ "--epochs", "1", "--embedding-dim", "4" });
+    _ = train_cleanup.captureStdOut(.{ .basename = "cleanup-training.json" });
+    check_step.dependOn(&train_cleanup.step);
+
     const rejected = b.addRunArtifact(assets.get("compose-lora-adapters").?);
     rejected.addArgs(&.{ "--out", "unused.safetensors" });
     rejected.addFileArg(b.path("cache_asset_inputs/adapter/adapter_model.safetensors"));
@@ -251,4 +275,30 @@ fn collectModules(module: *std.Build.Module, steps: *std.AutoHashMap(*std.Build.
         else => {},
     };
     for (module.import_table.values()) |dependency| collectModules(dependency, steps, modules);
+}
+
+/// Check the actual parser test run remains reachable from normal entrypoints.
+pub fn addOnnxTestChecks(b: *std.Build) void {
+    const owner = b.top_level_steps.get("lib-onnx-test") orelse b.top_level_steps.get("test-onnx-graph") orelse return;
+    var steps = std.AutoHashMap(*std.Build.Step, void).init(b.allocator);
+    var modules = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
+    collectSteps(&owner.step, &steps, &modules);
+    var data_run: ?*std.Build.Step.Run = null;
+    var iterator = steps.keyIterator();
+    while (iterator.next()) |entry| {
+        const run = entry.*.cast(std.Build.Step.Run) orelse continue;
+        for (run.step.dependencies.items) |dependency| {
+            const artifact = dependency.cast(std.Build.Step.Compile) orelse continue;
+            const source = artifact.root_module.root_source_file orelse continue;
+            if (artifact.kind.isTest() and std.mem.endsWith(u8, source.getPath(b), "/onnx/src/data.zig")) data_run = run;
+        }
+    }
+    const run = data_run orelse @panic("ONNX aggregate omits its data tests");
+    if (b.top_level_steps.get("lib-test")) |libraries| {
+        var library_steps = std.AutoHashMap(*std.Build.Step, void).init(b.allocator);
+        var library_modules = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
+        collectSteps(&libraries.step, &library_steps, &library_modules);
+        if (!library_steps.contains(&run.step)) @panic("library aggregate omits ONNX data tests");
+    }
+    b.step("cache-onnx-tests", "Run the parser tests from the actual ONNX aggregate").dependOn(&run.step);
 }

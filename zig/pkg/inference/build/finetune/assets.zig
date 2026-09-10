@@ -15,7 +15,7 @@
 //! Offline command dependencies, independent of product backend configuration.
 const std = @import("std");
 
-pub const Owner = enum { peft, gliner2, gemma4, colqwen2, layoutlmv3, reranker_head, reranker_lora, gliner2_run_validation };
+pub const Owner = enum { peft, gliner2, gemma4, colqwen2, layoutlmv3, reranker_head, reranker_lora, gliner2_run_validation, manifest, entity_cleanup };
 
 pub fn create(options: struct {
     b: *std.Build,
@@ -40,7 +40,7 @@ pub fn create(options: struct {
         .optimize = options.optimize,
     }));
     switch (options.owner) {
-        .peft, .gliner2_run_validation => {},
+        .peft, .gliner2_run_validation, .manifest, .entity_cleanup => {},
         else => {
             module.addImport("onnx_data", options.onnx_data);
             module.addImport("jinja", options.jinja);

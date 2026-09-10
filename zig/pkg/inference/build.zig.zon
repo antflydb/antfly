@@ -18,6 +18,7 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .onnx_graph = .{ .path = "../../lib/onnx" },
         .tokenizer_build = .{ .path = "../../lib/tokenizer" },
         .build_info = .{ .path = "../../lib/build_info" },
         .openapi = .{
@@ -34,9 +35,6 @@
         },
         .protobuf = .{
             .path = "../../lib/protobuf",
-        },
-        .onnx_graph = .{
-            .path = "../../lib/onnx",
         },
         .antfly_platform = .{
             .path = "../../lib/platform",

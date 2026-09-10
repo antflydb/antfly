@@ -23,9 +23,9 @@ const gemma_lora_imports = &.{ .build_options, .ml, .inference_internal };
 pub const specs = [_]common.CommandSpec{
     .{
         .name = "inspect-layoutlmv3-bundle",
-        .root_source_file = "src/finetune_inspect_layoutlmv3_bundle.zig",
+        .root_source_file = "src/finetune/tools/inspect_layoutlmv3_bundle.zig",
         .description = "Inspect a LayoutLMv3 runtime bundle",
-        .imports = &.{.build_options},
+        .assets = .manifest,
     },
     .{
         .name = "compose-lora-adapters",
@@ -87,7 +87,7 @@ pub const specs = [_]common.CommandSpec{
         .name = "prepare-entity-cleanup-cache",
         .root_source_file = "src/finetune/tools/prepare_entity_cleanup_cache.zig",
         .description = "Prepare learned entity cleanup cache from annotated mention spans",
-        .imports = &.{.inference_internal},
+        .assets = .entity_cleanup,
     },
     .{
         .name = "prepare-gliner2-entity-cleanup-cache",
@@ -134,7 +134,7 @@ pub const specs = [_]common.CommandSpec{
         .name = "train-eval-entity-cleanup-head",
         .root_source_file = "src/finetune/train/train_eval_entity_cleanup_head.zig",
         .description = "Train/eval a learned entity cleanup head from cached mention features",
-        .imports = &.{.inference_internal},
+        .assets = .entity_cleanup,
     },
     .{
         .name = "train-gliner2-autodiff",

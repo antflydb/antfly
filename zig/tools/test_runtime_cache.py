@@ -766,6 +766,35 @@ class RuntimeCacheTest(unittest.TestCase):
                         ("legacy_reranker.classifier.bias", [1], [0.5]),
                     ],
                 )
+                (inputs / "cleanup.jsonl").write_text(
+                    "\n".join(
+                        json.dumps(
+                            {
+                                "schema": "entity_cleanup/v1",
+                                "split": split,
+                                "text": "Paris noise",
+                                "mentions": [
+                                    {
+                                        "start": 0,
+                                        "end": 5,
+                                        "label": "location",
+                                        "keep": True,
+                                        "group_id": "paris",
+                                        "preferred_surface": True,
+                                    },
+                                    {
+                                        "start": 6,
+                                        "end": 11,
+                                        "label": "location",
+                                        "keep": False,
+                                    },
+                                ],
+                            }
+                        )
+                        for split in ("train", "eval")
+                    )
+                    + "\n"
+                )
                 old_outputs = set(
                     (self.root / "cache/o").glob("*/composed-adapter.safetensors")
                 )
@@ -795,6 +824,7 @@ class RuntimeCacheTest(unittest.TestCase):
                     self.own(relative)
                 self.own("zig/pkg/inference/src/finetune/assets/reranker_head.zig")
                 self.own("zig/pkg/inference/src/finetune/peft.zig")
+                self.own("zig/pkg/inference/src/finetune/entity_cleanup_model.zig")
                 check(self.build("cache-finetune-assets"), cold=True)
                 check(self.build("cache-finetune-assets"))
                 for backend, settings in (
@@ -844,6 +874,40 @@ class RuntimeCacheTest(unittest.TestCase):
                     self.assertEqual(
                         read_tensors(output)[tensor + ".lora_A.weight"], (1.0, 2.0)
                     )
+                bundle_reports = list(
+                    (self.root / "cache/o").glob("*/bundle-inspection.json")
+                )
+                self.assertTrue(bundle_reports)
+                for report in bundle_reports:
+                    bundle = json.loads(report.read_text())
+                    self.assertEqual(bundle["hidden_size"], 2)
+                    self.assertTrue(bundle["has_merged_weights"])
+                cleanup_reports = list(
+                    (self.root / "cache/o").glob("*/cleanup-training.json")
+                )
+                self.assertTrue(cleanup_reports)
+                for report in cleanup_reports:
+                    trained = json.loads(report.read_text())
+                    self.assertEqual(
+                        (trained["train_mentions"], trained["eval_mentions"]), (2, 2)
+                    )
+                    self.assertEqual(
+                        (trained["feature_dim"], trained["embedding_dim"]), (16, 4)
+                    )
+                    self.assertEqual(trained["epochs"], 1)
+                    self.assertTrue(math.isfinite(trained["eval"]["validity_accuracy"]))
+                heads = list(
+                    (self.root / "cache/o").glob(
+                        "*/cleanup-head/entity_cleanup_head.json"
+                    )
+                )
+                self.assertTrue(heads)
+                self.assertTrue(
+                    all(
+                        len(json.loads(head.read_text())["validity_weight"]) == 16
+                        for head in heads
+                    )
+                )
                 # Every owner must ignore training, backend execution, and
                 # optimizer implementation changes. Restore even after failure.
                 for relative in unrelated_sources:
@@ -857,6 +921,41 @@ class RuntimeCacheTest(unittest.TestCase):
                             check(self.build("cache-finetune-assets"))
                         finally:
                             source.write_bytes(contents)
+                source = self.own(
+                    "zig/pkg/inference/src/finetune/entity_cleanup_model.zig"
+                )
+                contents = source.read_text()
+                original_family = "entity_cleanup_cache/v1alpha1"
+                self.assertIn(original_family, contents)
+                source.write_text(
+                    contents.replace(
+                        original_family, "entity_cleanup_cache/cache_probe"
+                    )
+                )
+                try:
+                    check(
+                        self.build("cache-finetune-assets"),
+                        rebuilt=(
+                            "prepare-entity-cleanup-cache",
+                            "train-eval-entity-cleanup-head",
+                        ),
+                    )
+                    self.assertTrue(
+                        any(
+                            json.loads(path.read_text())["summary"][
+                                "artifact_family_version"
+                            ]
+                            == "entity_cleanup_cache/cache_probe"
+                            for path in (self.root / "cache/o").glob(
+                                "*/cleanup-train.json"
+                            )
+                        )
+                    )
+                finally:
+                    source.write_text(contents)
+                # Restoring source is another relevant edit; warm it before
+                # checking the next independent mutation.
+                self.build("cache-finetune-assets")
                 # A format change rebuilds its owning command while unrelated
                 # families stay cached. The changed checkpoint contains the new
                 # key, proving that this is a semantic dependency.
@@ -936,6 +1035,41 @@ class RuntimeCacheTest(unittest.TestCase):
                 # A failed read after one valid input must return an error,
                 # without double-freeing partially composed tensor storage.
                 self.build("cache-finetune-assets-error")
+
+    def test_onnx_data_test_coverage(self):
+        for standalone in (False, True):
+            with self.subTest(standalone=standalone):
+                if standalone:
+                    self.use_standalone()
+                proto = self.own("zig/lib/onnx/src/proto.zig")
+                self.build("cache-onnx-tests")
+                contents = proto.read_text()
+                proto.write_text(
+                    contents
+                    + '\ntest "data coverage sentinel" { return error.DataCoverageSentinel; }\n'
+                )
+                try:
+                    failure = self.build("cache-onnx-tests", succeeds=False)
+                    self.assertIn("DataCoverageSentinel", failure)
+                finally:
+                    proto.write_text(contents)
+                # Detect removal of the aggregate edge, not just missing tests
+                # in a separately reconstructed test module.
+                project = self.build_directory / "project_build.zig"
+                contents = project.read_text()
+                aggregate = (
+                    "onnx_graph_test_step" if standalone else "lib_onnx_test_step"
+                )
+                edge = f"{aggregate}.dependOn(&onnx_tests.data.step);"
+                self.assertIn(edge, contents)
+                project.write_text(contents.replace(edge, ""))
+                try:
+                    self.assertIn(
+                        "ONNX aggregate omits its data tests",
+                        self.build("--help", succeeds=False),
+                    )
+                finally:
+                    project.write_text(contents)
 
     def test_finetune_command_registry(self):
         shutil.copyfile(

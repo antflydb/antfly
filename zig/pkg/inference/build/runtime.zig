@@ -13,6 +13,8 @@
 // limitations under the License.
 
 const std = @import("std");
+const onnx_build = @import("onnx_graph").support;
+pub const OnnxModules = onnx_build.Modules;
 const jit_identity = @import("jit_identity.zig");
 
 pub const BackendOptions = struct {
@@ -67,7 +69,7 @@ pub const SharedModules = struct {
     sentencepiece_proto: *std.Build.Module,
     ml: ?*std.Build.Module = null,
     ml_tabular: ?*std.Build.Module = null,
-    onnx_graph: ?*std.Build.Module = null,
+    onnx: ?OnnxModules = null,
     pjrt: ?*std.Build.Module = null,
     inference_api: ?*std.Build.Module = null,
     inference_api_source: ?std.Build.LazyPath = null,
@@ -115,7 +117,7 @@ pub const Graph = struct {
     sentencepiece_proto_mod: *std.Build.Module,
     ml_mod: *std.Build.Module,
     ml_tabular_mod: *std.Build.Module,
-    onnx_graph_mod: *std.Build.Module,
+    onnx: OnnxModules,
     pjrt_mod: ?*std.Build.Module,
     /// Tests may qualify PJRT contracts even when the product backend is disabled.
     qualification_pjrt_mod: *std.Build.Module,
@@ -216,14 +218,13 @@ pub fn create(config: Config) Graph {
         break :blk mod;
     };
     const ml_tabular_mod = shared.ml_tabular orelse createSharedModuleNamed(config, "ml_tabular", "lib/ml/tabular/src/root.zig");
-    const onnx_graph_mod = shared.onnx_graph orelse blk: {
-        const mod = b.dependency("onnx_graph", .{
-            .target = target,
-            .optimize = optimize,
-        }).module("onnx");
-        mod.addImport("ml", ml_mod);
-        break :blk mod;
-    };
+    const onnx = shared.onnx orelse onnx_build.create(b, .{
+        .root = b.path(pathJoin(b, paths.shared_lib_root, "lib/onnx")),
+        .target = target,
+        .optimize = optimize,
+        .protobuf = protobuf_mod,
+        .ml = ml_mod,
+    });
     const qualification_pjrt_mod = shared.pjrt orelse b.dependency("pjrt", .{
         .target = target,
         .optimize = optimize,
@@ -344,7 +345,7 @@ pub fn create(config: Config) Graph {
         .ml_tabular_mod = ml_tabular_mod,
         .prometheus_mod = prometheus_mod,
         .structlog_mod = structlog_mod,
-        .onnx_graph_mod = onnx_graph_mod,
+        .onnx = onnx,
         .pjrt_mod = pjrt_mod,
         .platform_mod = platform_mod,
         .protobuf_mod = protobuf_mod,
@@ -378,8 +379,8 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.addImport("inference_linalg", inference_linalg_mod);
     inference_internal_mod.addImport("protobuf", protobuf_mod);
     inference_internal_mod.addImport("antfly_platform", platform_mod);
-    inference_internal_mod.addImport("onnx_graph", onnx_graph_mod);
-    inference_internal_mod.addImport("onnx_data", onnx_graph_mod.import_table.get("onnx_data").?);
+    inference_internal_mod.addImport("onnx_graph", onnx.graph);
+    inference_internal_mod.addImport("onnx_data", onnx.data);
     configureRuntimeLinks(b, inference_internal_mod, target, backend, paths);
     inference_internal_mod.link_libc = backend.link_libc;
 
@@ -409,7 +410,7 @@ pub fn create(config: Config) Graph {
         .sentencepiece_proto_mod = sentencepiece_proto_mod,
         .ml_mod = ml_mod,
         .ml_tabular_mod = ml_tabular_mod,
-        .onnx_graph_mod = onnx_graph_mod,
+        .onnx = onnx,
         .pjrt_mod = pjrt_mod,
         .qualification_pjrt_mod = qualification_pjrt_mod,
         .inference_api_mod = inference_api_mod,
@@ -471,7 +472,7 @@ const InferenceRootImports = struct {
     ml_tabular_mod: *std.Build.Module,
     prometheus_mod: *std.Build.Module,
     structlog_mod: *std.Build.Module,
-    onnx_graph_mod: *std.Build.Module,
+    onnx: OnnxModules,
     pjrt_mod: ?*std.Build.Module,
     platform_mod: *std.Build.Module,
     protobuf_mod: *std.Build.Module,
@@ -500,8 +501,8 @@ pub fn addInferenceRootImports(module: *std.Build.Module, imports: InferenceRoot
     module.addImport("ml_tabular", imports.ml_tabular_mod);
     module.addImport("prometheus", imports.prometheus_mod);
     module.addImport("structlog", imports.structlog_mod);
-    module.addImport("onnx_graph", imports.onnx_graph_mod);
-    module.addImport("onnx_data", imports.onnx_graph_mod.import_table.get("onnx_data").?);
+    module.addImport("onnx_graph", imports.onnx.graph);
+    module.addImport("onnx_data", imports.onnx.data);
     if (imports.pjrt_mod) |pjrt| module.addImport("pjrt", pjrt);
     module.addImport("antfly_platform", imports.platform_mod);
     module.addImport("protobuf", imports.protobuf_mod);

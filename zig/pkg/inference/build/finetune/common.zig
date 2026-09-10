@@ -57,7 +57,7 @@ pub const Context = struct {
     build_options_mod: *std.Build.Module,
     jinja_mod: *std.Build.Module,
     ml_mod: *std.Build.Module,
-    onnx_graph_mod: *std.Build.Module,
+    onnx: @import("../runtime.zig").OnnxModules,
     inference_internal_mod: *std.Build.Module,
     inference_tokenizer_mod: *std.Build.Module,
     inference_hf_tokenizer_mod: *std.Build.Module,
@@ -83,7 +83,7 @@ pub const Context = struct {
             .build_info => ctx.build_info_mod,
             .jinja => ctx.jinja_mod,
             .ml => ctx.ml_mod,
-            .onnx_graph => ctx.onnx_graph_mod,
+            .onnx_graph => ctx.onnx.graph,
             .pjrt => ctx.qualification_pjrt_mod,
             .protobuf => ctx.protobuf_mod,
             .termite_c_file => ctx.b.createModule(.{
@@ -172,7 +172,7 @@ pub fn addCommand(ctx: Context, spec: CommandSpec) Command {
         .target = ctx.target,
         .optimize = ctx.optimize,
         .owner = owner,
-        .onnx_data = ctx.onnx_graph_mod.import_table.get("onnx_data").?,
+        .onnx_data = ctx.onnx.data,
         .jinja = ctx.jinja_mod,
         .platform = ctx.antfly_platform_mod,
     }));
@@ -229,7 +229,7 @@ fn addImports(ctx: Context, module: *std.Build.Module, imports: []const Import, 
     for (imports) |import| {
         const dependency = if (import == .pjrt) (pjrt orelse continue) else ctx.moduleFor(import);
         module.addImport(@tagName(import), dependency);
-        if (import == .onnx_graph) module.addImport("onnx_data", dependency.import_table.get("onnx_data").?);
+        if (import == .onnx_graph) module.addImport("onnx_data", ctx.onnx.data);
     }
 }
 
@@ -327,7 +327,7 @@ pub fn fromWorkflow(ctx: @import("../context.zig").Context) Context {
         .build_options_mod = ctx.graph.build_options_mod,
         .jinja_mod = ctx.graph.jinja_mod,
         .ml_mod = ctx.graph.ml_mod,
-        .onnx_graph_mod = ctx.graph.onnx_graph_mod,
+        .onnx = ctx.graph.onnx,
         .inference_internal_mod = ctx.graph.inference_internal_mod,
         .inference_tokenizer_mod = ctx.graph.inference_tokenizer_mod,
         .inference_hf_tokenizer_mod = ctx.graph.inference_hf_tokenizer_mod,

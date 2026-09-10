@@ -107,12 +107,6 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
         .single_threaded = true,
     });
     wasm_ml_mod.addImport("antfly_platform", wasm_platform_mod);
-    const wasm_onnx_graph_mod = b.createModule(.{
-        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/onnx/src/root.zig" })),
-        .target = wasm_target,
-        .optimize = .ReleaseSafe,
-        .single_threaded = true,
-    });
     const wasm_protobuf = b.dependency("protobuf", .{ .target = wasm_target, .optimize = .ReleaseSafe }).module("protobuf");
     // Reuse generated source without importing the native runtime module.
     const wasm_sentencepiece_proto = b.createModule(.{
@@ -121,15 +115,14 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
         .optimize = .ReleaseSafe,
         .imports = &.{.{ .name = "protobuf", .module = wasm_protobuf }},
     });
-    const wasm_onnx_data_mod = b.createModule(.{
-        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/onnx/src/data.zig" })),
+    const wasm_onnx = @import("onnx_graph").support.create(b, .{
+        .root = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/onnx" })),
         .target = wasm_target,
         .optimize = .ReleaseSafe,
+        .single_threaded = true,
+        .protobuf = wasm_protobuf,
+        .ml = wasm_ml_mod,
     });
-    wasm_onnx_data_mod.addImport("protobuf", wasm_protobuf);
-    wasm_onnx_graph_mod.addImport("onnx_data", wasm_onnx_data_mod);
-    wasm_onnx_graph_mod.addImport("protobuf", wasm_protobuf);
-    wasm_onnx_graph_mod.addImport("ml", wasm_ml_mod);
     wasm_tokenizer_mod.addImport("sentencepiece_proto", wasm_sentencepiece_proto);
     wasm_hf_tokenizer_mod.addImport("inference_tokenizer", wasm_tokenizer_mod);
     wasm_lib.root_module.addImport("jinja", wasm_jinja_mod);
@@ -140,8 +133,8 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
     wasm_lib.root_module.addImport("antfly_image", wasm_image_mod);
     wasm_lib.root_module.addImport("antfly_platform", wasm_platform_mod);
     wasm_lib.root_module.addImport("ml", wasm_ml_mod);
-    wasm_lib.root_module.addImport("onnx_graph", wasm_onnx_graph_mod);
-    wasm_lib.root_module.addImport("onnx_data", wasm_onnx_graph_mod.import_table.get("onnx_data").?);
+    wasm_lib.root_module.addImport("onnx_graph", wasm_onnx.graph);
+    wasm_lib.root_module.addImport("onnx_data", wasm_onnx.data);
 
     const wasm_install = b.addInstallArtifact(wasm_lib, .{
         .dest_sub_path = wasm_install_name,

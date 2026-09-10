@@ -252,21 +252,14 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .single_threaded = true,
     });
     wasm_inference_ml_mod.addImport("antfly_platform", wasm_platform_mod);
-    const wasm_inference_onnx_graph_mod = b.createModule(.{
-        .root_source_file = b.path("lib/onnx/src/root.zig"),
+    const wasm_onnx = @import("onnx_graph").support.create(b, .{
+        .root = b.path("lib/onnx"),
         .target = wasm_target,
         .optimize = optimize,
         .single_threaded = true,
+        .protobuf = wasm_protobuf_mod,
+        .ml = wasm_inference_ml_mod,
     });
-    const wasm_inference_onnx_data_mod = b.createModule(.{
-        .root_source_file = b.path("lib/onnx/src/data.zig"),
-        .target = wasm_target,
-        .optimize = .ReleaseSafe,
-    });
-    wasm_inference_onnx_data_mod.addImport("protobuf", wasm_protobuf_mod);
-    wasm_inference_onnx_graph_mod.addImport("onnx_data", wasm_inference_onnx_data_mod);
-    wasm_inference_onnx_graph_mod.addImport("protobuf", wasm_protobuf_mod);
-    wasm_inference_onnx_graph_mod.addImport("ml", wasm_inference_ml_mod);
     const wasm_inference_audio_mod = b.createModule(.{
         .root_source_file = b.path("lib/audio/src/mod.zig"),
         .target = wasm_target,
@@ -286,8 +279,8 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     inference_wasm_inference_mod.addImport("antfly_platform", wasm_platform_mod);
     inference_wasm_inference_mod.addImport("jinja", wasm_inference_jinja_mod);
     inference_wasm_inference_mod.addImport("ml", wasm_inference_ml_mod);
-    inference_wasm_inference_mod.addImport("onnx_graph", wasm_inference_onnx_graph_mod);
-    inference_wasm_inference_mod.addImport("onnx_data", wasm_inference_onnx_graph_mod.import_table.get("onnx_data").?);
+    inference_wasm_inference_mod.addImport("onnx_graph", wasm_onnx.graph);
+    inference_wasm_inference_mod.addImport("onnx_data", wasm_onnx.data);
 
     const antfly_wasm_mod = b.createModule(.{
         .root_source_file = b.path("examples/antfly_wasm.zig"),

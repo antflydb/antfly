@@ -12,21 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-.{
-    .fingerprint = 0xa5e861444f15318e,
-    .name = .onnx,
-    .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
-    .dependencies = .{
-        .protobuf = .{
-            .path = "../protobuf",
-        },
-    },
-    .paths = .{
-        "build.zig",
-        "build_support.zig",
-        "build.zig.zon",
-        "proto",
-        "src",
-    },
-}
+//! Cached entity features and their CPU-only cleanup head.
+pub const finetune = struct {
+    pub const entity_cleanup_data = @import("finetune/entity_cleanup_data.zig");
+    pub const entity_cleanup_model = @import("finetune/entity_cleanup_model.zig");
+};

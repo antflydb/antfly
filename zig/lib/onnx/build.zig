@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+pub const support = @import("build_support.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -32,26 +33,18 @@ pub fn build(b: *std.Build) void {
     // consumers need the auto-generated bindings again, either restore the
     // upstream codegen helper or check in a generated `onnx_proto.zig`.
 
-    const data_mod = b.addModule("onnx_data", .{
-        .root_source_file = b.path("src/data.zig"),
+    const modules = support.create(b, .{
+        .root = b.path("."),
         .target = target,
         .optimize = optimize,
+        .protobuf = protobuf_mod,
     });
-    data_mod.addImport("protobuf", protobuf_mod);
+    b.modules.put(b.allocator, b.dupe("onnx_data"), modules.data) catch @panic("OOM");
+    b.modules.put(b.allocator, b.dupe("onnx"), modules.graph) catch @panic("OOM");
 
-    const onnx_mod = b.addModule("onnx", .{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    onnx_mod.addImport("protobuf", protobuf_mod);
-    onnx_mod.addImport("onnx_data", data_mod);
-
-    // File-format tests run with protobuf alone. The parent build supplies ML
-    // to the separate graph conversion suite.
+    // Standalone file-format tests need protobuf alone.
     const test_step = b.step("test", "Run unit tests");
-    const data_tests = b.addTest(.{ .root_module = data_mod });
-    test_step.dependOn(&b.addRunArtifact(data_tests).step);
+    test_step.dependOn(&support.createDataTests(b, modules.data).step);
 
     // Attribute decoding uses the same proto types as the data module.
     const standalone_tests = [_][]const u8{
@@ -66,7 +59,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
-        t.root_module.addImport("onnx_data", data_mod);
+        t.root_module.addImport("onnx_data", modules.data);
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
 }

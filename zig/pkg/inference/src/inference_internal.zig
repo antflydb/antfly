@@ -97,6 +97,7 @@ pub const architectures = struct {
     pub const gliner_head_graph = @import("architectures/gliner_head_graph.zig");
 };
 pub const models = struct {
+    pub const manifest = @import("models/manifest.zig");
     pub const deberta = @import("models/deberta.zig");
     pub const clip = @import("models/clip.zig");
     pub const clap = @import("models/clap.zig");
