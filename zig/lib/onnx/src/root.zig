@@ -26,7 +26,7 @@
 //   defer result.deinit(allocator);
 //   // result.graph is a termite Graph ready for execution
 
-pub const proto = @import("proto.zig");
+pub const proto = @import("onnx_data").proto;
 pub const attrs = @import("attrs.zig");
 pub const tensor = @import("tensor.zig");
 pub const ops = @import("ops.zig");

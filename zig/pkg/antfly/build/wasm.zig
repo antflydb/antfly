@@ -258,6 +258,13 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .optimize = optimize,
         .single_threaded = true,
     });
+    const wasm_inference_onnx_data_mod = b.createModule(.{
+        .root_source_file = b.path("lib/onnx/src/data.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSafe,
+    });
+    wasm_inference_onnx_data_mod.addImport("protobuf", wasm_protobuf_mod);
+    wasm_inference_onnx_graph_mod.addImport("onnx_data", wasm_inference_onnx_data_mod);
     wasm_inference_onnx_graph_mod.addImport("protobuf", wasm_protobuf_mod);
     wasm_inference_onnx_graph_mod.addImport("ml", wasm_inference_ml_mod);
     const wasm_inference_audio_mod = b.createModule(.{
@@ -280,6 +287,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     inference_wasm_inference_mod.addImport("jinja", wasm_inference_jinja_mod);
     inference_wasm_inference_mod.addImport("ml", wasm_inference_ml_mod);
     inference_wasm_inference_mod.addImport("onnx_graph", wasm_inference_onnx_graph_mod);
+    inference_wasm_inference_mod.addImport("onnx_data", wasm_inference_onnx_graph_mod.import_table.get("onnx_data").?);
 
     const antfly_wasm_mod = b.createModule(.{
         .root_source_file = b.path("examples/antfly_wasm.zig"),

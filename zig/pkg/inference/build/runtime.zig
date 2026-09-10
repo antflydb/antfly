@@ -379,6 +379,7 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.addImport("protobuf", protobuf_mod);
     inference_internal_mod.addImport("antfly_platform", platform_mod);
     inference_internal_mod.addImport("onnx_graph", onnx_graph_mod);
+    inference_internal_mod.addImport("onnx_data", onnx_graph_mod.import_table.get("onnx_data").?);
     configureRuntimeLinks(b, inference_internal_mod, target, backend, paths);
     inference_internal_mod.link_libc = backend.link_libc;
 
@@ -500,6 +501,7 @@ pub fn addInferenceRootImports(module: *std.Build.Module, imports: InferenceRoot
     module.addImport("prometheus", imports.prometheus_mod);
     module.addImport("structlog", imports.structlog_mod);
     module.addImport("onnx_graph", imports.onnx_graph_mod);
+    module.addImport("onnx_data", imports.onnx_graph_mod.import_table.get("onnx_data").?);
     if (imports.pjrt_mod) |pjrt| module.addImport("pjrt", pjrt);
     module.addImport("antfly_platform", imports.platform_mod);
     module.addImport("protobuf", imports.protobuf_mod);

@@ -139,6 +139,28 @@ pub fn addAssetToolChecks(b: *std.Build, steps: *std.AutoHashMap(*std.Build.Step
     }
     if (assets.count() == 0) @panic("no offline asset commands registered");
     const check_step = b.step("cache-finetune-assets", "Run actual bounded offline checkpoint operations");
+    // One real executable per source owner exercises every extracted boundary.
+    // Reuse the three commands with bounded I/O workloads below. Other owners
+    // choose a deterministic representative from the production registry.
+    var owners = std.StringHashMap(*std.Build.Step.Compile).init(b.allocator);
+    var asset_iterator = assets.valueIterator();
+    while (asset_iterator.next()) |entry| {
+        const artifact = entry.*;
+        const source = artifact.root_module.import_table.get("inference_finetune_assets").?.root_source_file.?.getPath(b);
+        const owner = owners.getOrPut(source) catch @panic("OOM");
+        if (!owner.found_existing or std.mem.lessThan(u8, artifact.name, owner.value_ptr.*.name)) owner.value_ptr.* = artifact;
+    }
+    for ([_][]const u8{ "compose-lora-adapters", "inspect-reranker-lora-bundle", "materialize-reranker-head" }) |name| {
+        const artifact = assets.get(name).?;
+        const source = artifact.root_module.import_table.get("inference_finetune_assets").?.root_source_file.?.getPath(b);
+        owners.put(source, artifact) catch @panic("OOM");
+    }
+    var owner_iterator = owners.valueIterator();
+    while (owner_iterator.next()) |entry| {
+        const artifact = entry.*;
+        std.debug.print("ASSET_COMMAND {s}\n", .{artifact.name});
+        check_step.dependOn(&artifact.step);
+    }
     const compose = b.addRunArtifact(assets.get("compose-lora-adapters").?);
     compose.addArg("--out");
     _ = compose.addOutputFileArg("composed-adapter.safetensors");
@@ -172,6 +194,8 @@ fn checkAssetModule(b: *std.Build, module: *std.Build.Module, seen: *std.AutoHas
         const name = entry.key_ptr.*;
         if (std.mem.eql(u8, name, "inference_internal") or std.mem.eql(u8, name, "build_info") or
             std.mem.endsWith(u8, name, "jit_identity")) @panic("offline assets import runtime dependencies");
+        if (std.mem.eql(u8, name, "ml") or std.mem.eql(u8, name, "onnx_graph"))
+            @panic("offline assets import graph conversion or training");
         if (std.mem.eql(u8, name, "build_options")) {
             const source = entry.value_ptr.*.root_source_file.?.getPath(b);
             if (!std.mem.endsWith(u8, source, "/finetune/assets_options.zig"))

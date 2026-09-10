@@ -1309,6 +1309,7 @@ pub fn build(b: *std.Build) void {
     gliner2_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
     gliner2_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     gliner2_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
+    gliner2_e2e_bench_exe.root_module.addImport("onnx_data", onnx_graph_mod.import_table.get("onnx_data").?);
     gliner2_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
     runtime_graph.identities.addImports(gliner2_e2e_bench_exe.root_module);
     gliner2_e2e_bench_exe.root_module.link_libc = true;
@@ -1337,6 +1338,7 @@ pub fn build(b: *std.Build) void {
     clipclap_native_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
     clipclap_native_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     clipclap_native_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
+    clipclap_native_bench_exe.root_module.addImport("onnx_data", onnx_graph_mod.import_table.get("onnx_data").?);
     clipclap_native_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
     runtime_graph.identities.addImports(clipclap_native_bench_exe.root_module);
     // inference_internal already owns the Metal source and frameworks.
@@ -1366,6 +1368,7 @@ pub fn build(b: *std.Build) void {
     clipclap_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
     clipclap_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     clipclap_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
+    clipclap_e2e_bench_exe.root_module.addImport("onnx_data", onnx_graph_mod.import_table.get("onnx_data").?);
     clipclap_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
     runtime_graph.identities.addImports(clipclap_e2e_bench_exe.root_module);
     // inference_internal already owns the Metal source and frameworks.
@@ -1405,6 +1408,7 @@ pub fn build(b: *std.Build) void {
     qwen3_embedding_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
     qwen3_embedding_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     qwen3_embedding_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
+    qwen3_embedding_e2e_bench_exe.root_module.addImport("onnx_data", onnx_graph_mod.import_table.get("onnx_data").?);
     qwen3_embedding_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
     runtime_graph.identities.addImports(qwen3_embedding_e2e_bench_exe.root_module);
     // inference_internal already owns the Metal source and frameworks.
@@ -1434,6 +1438,7 @@ pub fn build(b: *std.Build) void {
     nomic_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
     nomic_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     nomic_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
+    nomic_e2e_bench_exe.root_module.addImport("onnx_data", onnx_graph_mod.import_table.get("onnx_data").?);
     nomic_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
     runtime_graph.identities.addImports(nomic_e2e_bench_exe.root_module);
     // inference_internal already owns the Metal source and frameworks.
@@ -1463,6 +1468,7 @@ pub fn build(b: *std.Build) void {
     reranker_e2e_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
     reranker_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     reranker_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
+    reranker_e2e_bench_exe.root_module.addImport("onnx_data", onnx_graph_mod.import_table.get("onnx_data").?);
     reranker_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
     runtime_graph.identities.addImports(reranker_e2e_bench_exe.root_module);
     reranker_e2e_bench_exe.root_module.link_libc = true;
@@ -1555,6 +1561,7 @@ pub fn build(b: *std.Build) void {
     wasm_compute_tests.root_module.addImport("antfly_image", antfly_image_mod);
     wasm_compute_tests.root_module.addImport("ml", ml_mod);
     wasm_compute_tests.root_module.addImport("onnx_graph", onnx_graph_mod);
+    wasm_compute_tests.root_module.addImport("onnx_data", onnx_graph_mod.import_table.get("onnx_data").?);
     wasm_compute_tests.root_module.addImport("pjrt", runtime_graph.qualification_pjrt_mod);
     wasm_compute_tests.root_module.addImport("prometheus", prometheus_mod);
     wasm_compute_tests.root_module.addImport("structlog", structlog_mod);
@@ -1611,6 +1618,7 @@ pub fn build(b: *std.Build) void {
     web_projector_tests.root_module.addImport("antfly_image", antfly_image_mod);
     web_projector_tests.root_module.addImport("ml", ml_mod);
     web_projector_tests.root_module.addImport("onnx_graph", onnx_graph_mod);
+    web_projector_tests.root_module.addImport("onnx_data", onnx_graph_mod.import_table.get("onnx_data").?);
     web_projector_tests.root_module.addImport("pjrt", runtime_graph.qualification_pjrt_mod);
     web_projector_tests.root_module.addImport("prometheus", prometheus_mod);
     web_projector_tests.root_module.addImport("structlog", structlog_mod);
@@ -2072,6 +2080,7 @@ pub fn build(b: *std.Build) void {
     });
     onnx_graph_tests.root_module.addImport("protobuf", protobuf_mod);
     onnx_graph_tests.root_module.addImport("ml", ml_mod);
+    onnx_graph_tests.root_module.addImport("onnx_data", onnx_graph_mod.import_table.get("onnx_data").?);
     const run_onnx_graph_tests = b.addRunArtifact(onnx_graph_tests);
     const onnx_graph_test_step = b.step("test-onnx-graph", "Run ONNX graph converter tests");
     onnx_graph_test_step.dependOn(&run_onnx_graph_tests.step);

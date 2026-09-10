@@ -513,6 +513,13 @@ pub fn create(b: *std.Build) ?Artifacts {
         .target = target,
         .optimize = optimize,
     });
+    const inference_onnx_data_mod = b.createModule(.{
+        .root_source_file = b.path("lib/onnx/src/data.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_onnx_data_mod.addImport("protobuf", protobuf_mod);
+    inference_onnx_graph_mod.addImport("onnx_data", inference_onnx_data_mod);
     inference_onnx_graph_mod.addImport("protobuf", protobuf_mod);
     inference_onnx_graph_mod.addImport("ml", inference_ml_mod);
     inference_onnx_graph_mod.addImport("structlog", structlog_mod);

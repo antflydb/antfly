@@ -102,6 +102,7 @@ pub fn addGliner(ctx: Context) void {
     gliner2_bench_exe.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
     gliner2_bench_exe.root_module.addImport("protobuf", ctx.graph.protobuf_mod);
     gliner2_bench_exe.root_module.addImport("onnx_graph", ctx.graph.onnx_graph_mod);
+    gliner2_bench_exe.root_module.addImport("onnx_data", ctx.graph.onnx_graph_mod.import_table.get("onnx_data").?);
     gliner2_bench_exe.root_module.addImport("antfly_platform", ctx.graph.platform_mod);
     ctx.graph.identities.addImports(gliner2_bench_exe.root_module);
     gliner2_bench_exe.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
@@ -202,6 +203,7 @@ pub fn createBge(ctx: Context) CreateBgeResult {
         artifact.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
         artifact.root_module.addImport("protobuf", ctx.graph.protobuf_mod);
         artifact.root_module.addImport("onnx_graph", ctx.graph.onnx_graph_mod);
+        artifact.root_module.addImport("onnx_data", ctx.graph.onnx_graph_mod.import_table.get("onnx_data").?);
         artifact.root_module.addImport("bge_m3_runtime", bge_m3_runtime_mod);
         ctx.configureNativeTool(artifact, ctx.backend.enable_metal);
         runtime_build.configureOnnxRuntime(b, artifact.root_module, ctx.backend.enable_onnx, ctx.backend.onnx_root);

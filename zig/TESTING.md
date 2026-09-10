@@ -70,12 +70,17 @@ The checks cover:
   its regular build cache. A configuration-only regression checks aggregate
   membership against the command registries and detects a removed dependency;
   it does not repeat those compilations in a disposable cache.
-- Offline adapter/checkpoint commands use a separate asset module with fixed
-  editing capabilities and no runtime/backend links. Actual composition,
-  inspection, and head materialization run on tiny SafeTensors inputs in both
-  entrypoints. Backend flags and release metadata leave their binaries cached;
-  an asset implementation edit rebuilds them and changes the composed weights.
-  Invalid input after a valid adapter returns an error with correct cleanup.
+- Offline adapter/checkpoint commands use roots scoped to their asset owner.
+  Checkpoint operations and shared types live in `pkg/inference/src/finetune/assets/`;
+  training imports those implementations. ONNX file parsing and tensor-byte
+  access use `onnx_data`, independently of graph conversion and optimizers.
+  One actual executable per owner checks these boundaries in both entrypoints;
+  composition, inspection, and head materialization also run on tiny SafeTensors
+  inputs. Backend flags, release metadata, training code, CUDA kernels, and
+  optimizer edits leave all sampled tools cached. A head-format edit rebuilds
+  only its owning command and changes its output; a PEFT edit rebuilds its
+  consumers and changes the composed weights. Invalid input after a valid
+  adapter returns an error with correct cleanup.
 - All six served schemas invalidate only the API kernel; the other archives can
   build with a schema missing.
 - The remote CLI has no transitive tokenizer, storage-engine, or inference

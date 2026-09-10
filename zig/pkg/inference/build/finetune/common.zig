@@ -26,7 +26,6 @@ pub const Import = enum {
     protobuf,
     termite_c_file,
     inference_finetune_data,
-    inference_finetune_assets,
     inference_finetune_tokenizer_batch,
     inference_hf_tokenizer,
     inference_internal,
@@ -94,23 +93,6 @@ pub const Context = struct {
             }),
             // These roots intentionally live directly under src/. Their
             // transitive imports need src as the Zig module boundary.
-            .inference_finetune_assets => blk: {
-                const mod = ctx.b.createModule(.{
-                    .root_source_file = ctx.path("src/finetune_assets_root.zig"),
-                    .target = ctx.target,
-                    .optimize = ctx.optimize,
-                });
-                mod.addImport("build_options", ctx.b.createModule(.{
-                    .root_source_file = ctx.path("src/finetune/assets_options.zig"),
-                    .target = ctx.target,
-                    .optimize = ctx.optimize,
-                }));
-                mod.addImport("ml", ctx.ml_mod);
-                mod.addImport("onnx_graph", ctx.onnx_graph_mod);
-                mod.addImport("jinja", ctx.jinja_mod);
-                mod.addImport("antfly_platform", ctx.antfly_platform_mod);
-                break :blk mod;
-            },
             .inference_finetune_data => ctx.b.createModule(.{
                 .root_source_file = ctx.path("src/finetune_data_root.zig"),
                 .target = ctx.target,
@@ -144,6 +126,7 @@ pub const CommandSpec = struct {
     root_source_file: []const u8,
     description: []const u8,
     imports: []const Import = &.{},
+    assets: ?@import("assets.zig").Owner = null,
     native_link: NativeLink = .none,
     link_libc: bool = false,
     /// This command writes a release version to its output or training manifest.
@@ -183,6 +166,16 @@ pub fn addCommand(ctx: Context, spec: CommandSpec) Command {
         }),
     });
     addImports(ctx, exe.root_module, spec.imports, ctx.pjrt_mod);
+    if (spec.assets) |owner| exe.root_module.addImport("inference_finetune_assets", @import("assets.zig").create(.{
+        .b = b,
+        .root = ctx.root orelse b.path("."),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+        .owner = owner,
+        .onnx_data = ctx.onnx_graph_mod.import_table.get("onnx_data").?,
+        .jinja = ctx.jinja_mod,
+        .platform = ctx.antfly_platform_mod,
+    }));
     configureNative(ctx, exe, spec.native_link, spec.imports);
     if (spec.release_metadata) {
         exe.root_module.addImport("build_info", ctx.build_info_mod);
@@ -236,6 +229,7 @@ fn addImports(ctx: Context, module: *std.Build.Module, imports: []const Import, 
     for (imports) |import| {
         const dependency = if (import == .pjrt) (pjrt orelse continue) else ctx.moduleFor(import);
         module.addImport(@tagName(import), dependency);
+        if (import == .onnx_graph) module.addImport("onnx_data", dependency.import_table.get("onnx_data").?);
     }
 }
 

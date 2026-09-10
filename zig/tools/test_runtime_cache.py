@@ -694,15 +694,12 @@ class RuntimeCacheTest(unittest.TestCase):
                     source.write_bytes(content)
 
     def test_finetune_asset_dependencies(self):
-        names = (
-            "compose-lora-adapters",
-            "inspect-reranker-lora-bundle",
-            "materialize-reranker-head",
-        )
-
-        def check(output, rebuilt=()):
+        def check(output, rebuilt=(), cold=False):
+            names = re.findall(r"^ASSET_COMMAND (.+)$", output, re.MULTILINE)
+            self.assertTrue(names)
+            self.assertEqual(len(names), len(set(names)))
             for name in names:
-                status = "success" if name in rebuilt else "cached"
+                status = "success" if cold or name in rebuilt else "cached"
                 self.assertRegex(output, rf"compile exe {name} Debug \S+ {status}")
 
         def write_tensors(path, tensors):
@@ -772,7 +769,33 @@ class RuntimeCacheTest(unittest.TestCase):
                 old_outputs = set(
                     (self.root / "cache/o").glob("*/composed-adapter.safetensors")
                 )
-                check(self.build("cache-finetune-assets"), rebuilt=names)
+                old_heads = set(
+                    (self.root / "cache/o").glob(
+                        "*/materialized-head/model.safetensors"
+                    )
+                )
+                # Copy all edited paths before warming the cache so mutations
+                # cannot be confused with a change in the overlay's symlinks.
+                unrelated_sources = [
+                    f"zig/pkg/inference/src/finetune/{owner}.zig"
+                    for owner in (
+                        "gliner2",
+                        "gemma4",
+                        "colqwen2",
+                        "layoutlmv3",
+                        "reranker_head",
+                        "reranker_lora",
+                    )
+                ] + [
+                    "zig/pkg/inference/src/ops/cuda/kernels.zig",
+                    "zig/pkg/inference/src/architectures/session_factory.zig",
+                    "zig/lib/ml/src/graph/optimizers.zig",
+                ]
+                for relative in unrelated_sources:
+                    self.own(relative)
+                self.own("zig/pkg/inference/src/finetune/assets/reranker_head.zig")
+                self.own("zig/pkg/inference/src/finetune/peft.zig")
+                check(self.build("cache-finetune-assets"), cold=True)
                 check(self.build("cache-finetune-assets"))
                 for backend, settings in (
                     ("metal", ()),
@@ -789,10 +812,13 @@ class RuntimeCacheTest(unittest.TestCase):
                         )
                     )
                 check(self.build("cache-finetune-assets", version="unrelated-version"))
-                heads = list(
-                    (self.root / "cache/o").glob(
-                        "*/materialized-head/model.safetensors"
+                heads = (
+                    set(
+                        (self.root / "cache/o").glob(
+                            "*/materialized-head/model.safetensors"
+                        )
                     )
+                    - old_heads
                 )
                 self.assertTrue(heads)
                 for output in heads:
@@ -818,17 +844,85 @@ class RuntimeCacheTest(unittest.TestCase):
                     self.assertEqual(
                         read_tensors(output)[tensor + ".lora_A.weight"], (1.0, 2.0)
                     )
+                # Every owner must ignore training, backend execution, and
+                # optimizer implementation changes. Restore even after failure.
+                for relative in unrelated_sources:
+                    with self.subTest(unrelated_source=relative):
+                        source = self.own(relative)
+                        contents = source.read_bytes()
+                        source.write_bytes(
+                            contents + b"\n// unrelated implementation edit\n"
+                        )
+                        try:
+                            check(self.build("cache-finetune-assets"))
+                        finally:
+                            source.write_bytes(contents)
+                # A format change rebuilds its owning command while unrelated
+                # families stay cached. The changed checkpoint contains the new
+                # key, proving that this is a semantic dependency.
+                source = self.own(
+                    "zig/pkg/inference/src/finetune/assets/reranker_head.zig"
+                )
+                contents = source.read_text()
+                self.assertIn('"classifier.out_proj.bias"', contents)
+                before_heads = set(
+                    (self.root / "cache/o").glob(
+                        "*/materialized-head/model.safetensors"
+                    )
+                )
+                source.write_text(
+                    contents.replace(
+                        '"classifier.out_proj.bias"', '"classifier.cache_probe.bias"'
+                    )
+                )
+                try:
+                    check(
+                        self.build("cache-finetune-assets"),
+                        rebuilt=("materialize-reranker-head",),
+                    )
+                    self.assertTrue(
+                        any(
+                            "classifier.cache_probe.bias" in read_tensors(output)
+                            for output in set(
+                                (self.root / "cache/o").glob(
+                                    "*/materialized-head/model.safetensors"
+                                )
+                            )
+                            - before_heads
+                        )
+                    )
+                finally:
+                    source.write_text(contents)
+                self.build("cache-finetune-assets")
                 # Actual source changes still rebuild and change the output.
                 source = self.own("zig/pkg/inference/src/finetune/peft.zig")
                 contents = source.read_text()
                 self.assertIn("input.weight * v", contents)
+                before_outputs = set(
+                    (self.root / "cache/o").glob("*/composed-adapter.safetensors")
+                )
                 source.write_text(
                     contents.replace("input.weight * v", "2 * input.weight * v")
                 )
                 try:
-                    check(self.build("cache-finetune-assets"), rebuilt=names)
-                    outputs = list(
-                        (self.root / "cache/o").glob("*/composed-adapter.safetensors")
+                    check(
+                        self.build("cache-finetune-assets"),
+                        rebuilt=(
+                            "compose-lora-adapters",
+                            "inspect-reranker-lora-bundle",
+                            "bootstrap-gliner2-lora",
+                            "bootstrap-gemma4-lora",
+                            "bootstrap-colqwen2-lora",
+                            "bootstrap-layoutlmv3-lora",
+                        ),
+                    )
+                    outputs = (
+                        set(
+                            (self.root / "cache/o").glob(
+                                "*/composed-adapter.safetensors"
+                            )
+                        )
+                        - before_outputs
                     )
                     self.assertTrue(
                         any(

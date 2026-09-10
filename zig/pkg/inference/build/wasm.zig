@@ -121,6 +121,13 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
         .optimize = .ReleaseSafe,
         .imports = &.{.{ .name = "protobuf", .module = wasm_protobuf }},
     });
+    const wasm_onnx_data_mod = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/onnx/src/data.zig" })),
+        .target = wasm_target,
+        .optimize = .ReleaseSafe,
+    });
+    wasm_onnx_data_mod.addImport("protobuf", wasm_protobuf);
+    wasm_onnx_graph_mod.addImport("onnx_data", wasm_onnx_data_mod);
     wasm_onnx_graph_mod.addImport("protobuf", wasm_protobuf);
     wasm_onnx_graph_mod.addImport("ml", wasm_ml_mod);
     wasm_tokenizer_mod.addImport("sentencepiece_proto", wasm_sentencepiece_proto);
@@ -134,6 +141,7 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
     wasm_lib.root_module.addImport("antfly_platform", wasm_platform_mod);
     wasm_lib.root_module.addImport("ml", wasm_ml_mod);
     wasm_lib.root_module.addImport("onnx_graph", wasm_onnx_graph_mod);
+    wasm_lib.root_module.addImport("onnx_data", wasm_onnx_graph_mod.import_table.get("onnx_data").?);
 
     const wasm_install = b.addInstallArtifact(wasm_lib, .{
         .dest_sub_path = wasm_install_name,
