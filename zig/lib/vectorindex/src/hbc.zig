@@ -39,6 +39,9 @@ pub const IndexMetadata = struct {
     projection_status: u8 = 1,
     projection_generation: u64 = 0,
     projection_config_hash: u64 = 0,
+    topology_rebuild_algorithm: u8 = std.math.maxInt(u8),
+    topology_vector_base_generation: u64 = 0,
+    topology_vector_wal_mutation_sequence: u64 = 0,
 
     pub fn encode(self: *const IndexMetadata, buf: []u8) []u8 {
         var pos: usize = 0;
@@ -59,6 +62,10 @@ pub const IndexMetadata = struct {
         pos += 1;
         writeU64LE(buf, &pos, self.projection_generation);
         writeU64LE(buf, &pos, self.projection_config_hash);
+        buf[pos] = self.topology_rebuild_algorithm;
+        pos += 1;
+        writeU64LE(buf, &pos, self.topology_vector_base_generation);
+        writeU64LE(buf, &pos, self.topology_vector_wal_mutation_sequence);
         return buf[0..pos];
     }
 
@@ -81,6 +88,10 @@ pub const IndexMetadata = struct {
         pos += 1;
         const projection_generation = readU64LE(data, &pos);
         const projection_config_hash = readU64LE(data, &pos);
+        const topology_rebuild_algorithm = if (data.len >= encoded_size) data[pos] else std.math.maxInt(u8);
+        if (data.len >= encoded_size) pos += 1;
+        const topology_vector_base_generation = if (data.len >= encoded_size) readU64LE(data, &pos) else 0;
+        const topology_vector_wal_mutation_sequence = if (data.len >= encoded_size) readU64LE(data, &pos) else 0;
         return .{
             .version = version,
             .dims = dims,
@@ -96,6 +107,9 @@ pub const IndexMetadata = struct {
             .projection_status = projection_status,
             .projection_generation = projection_generation,
             .projection_config_hash = projection_config_hash,
+            .topology_rebuild_algorithm = topology_rebuild_algorithm,
+            .topology_vector_base_generation = topology_vector_base_generation,
+            .topology_vector_wal_mutation_sequence = topology_vector_wal_mutation_sequence,
         };
     }
 
@@ -115,7 +129,8 @@ pub const IndexMetadata = struct {
         self.projection_config_hash = checkpoint.config_hash;
     }
 
-    pub const encoded_size = 4 + 4 + 4 + 4 + 8 + 8 + 8 + 1 + 8 + 1 + 8 + 1 + 8 + 8;
+    pub const legacy_encoded_size = 4 + 4 + 4 + 4 + 8 + 8 + 8 + 1 + 8 + 1 + 8 + 1 + 8 + 8;
+    pub const encoded_size = legacy_encoded_size + 1 + 8 + 8;
 };
 
 pub const Suffix = enum(u8) {

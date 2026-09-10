@@ -348,6 +348,12 @@ pub const Detail = enum(c_int) {
     generation_rate_limit,
     unsupported_tensor_type,
     generation_capacity_unavailable,
+    invalid_table_storage_settings,
+    vector_store_requires_local_single_shard_table,
+    vector_store_requires_empty_table,
+    immutable_table_storage_settings,
+    vector_store_lifecycle_unsupported,
+    vector_store_reference_format_required,
     // System catalog errors cross the independently compiled runtime boundary.
     database_not_found,
     namespace_not_found,
@@ -708,6 +714,12 @@ pub fn statusFromError(err: anyerror) Status {
         error.UnsupportedSourceKind => status(.unsupported, .unsupported_source_kind),
         error.UpdatePathNotFound => status(.not_found, .update_path_not_found),
         error.UserExists => status(.already_exists, .user_exists),
+        error.InvalidTableStorageSettings => status(.invalid_argument, .invalid_table_storage_settings),
+        error.VectorStoreRequiresLocalSingleShardTable => status(.invalid_argument, .vector_store_requires_local_single_shard_table),
+        error.VectorStoreRequiresEmptyTable => status(.conflict, .vector_store_requires_empty_table),
+        error.ImmutableTableStorageSettings => status(.conflict, .immutable_table_storage_settings),
+        error.VectorStoreLifecycleUnsupported => status(.unsupported, .vector_store_lifecycle_unsupported),
+        error.VectorStoreReferenceFormatRequired => status(.unsupported, .vector_store_reference_format_required),
         else => status(.internal, .none),
     };
 }
@@ -770,6 +782,13 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .catalog_id_exhausted => "CatalogIdExhausted",
 
         .none => "RuntimeBoundaryFailure",
+        .invalid_table_storage_settings => "InvalidTableStorageSettings",
+        .vector_store_requires_local_single_shard_table => "VectorStoreRequiresLocalSingleShardTable",
+        .vector_store_requires_empty_table => "VectorStoreRequiresEmptyTable",
+        .immutable_table_storage_settings => "ImmutableTableStorageSettings",
+        .vector_store_lifecycle_unsupported => "VectorStoreLifecycleUnsupported",
+        .vector_store_reference_format_required => "VectorStoreReferenceFormatRequired",
+
         .out_of_memory => "OutOfMemory",
         .invalid_argument => "InvalidArgument",
         .invalid_arguments => "InvalidArguments",
@@ -1158,6 +1177,15 @@ test "unknown wire values fail closed" {
         .code = @intFromEnum(Code.invalid_argument),
         .detail = @intFromEnum(Detail.table_not_found),
     }));
+}
+
+test "table vector storage errors retain their runtime boundary classification" {
+    try std.testing.expectEqual(error.InvalidTableStorageSettings, errorFromStatus(statusFromError(error.InvalidTableStorageSettings)));
+    try std.testing.expectEqual(error.VectorStoreRequiresLocalSingleShardTable, errorFromStatus(statusFromError(error.VectorStoreRequiresLocalSingleShardTable)));
+    try std.testing.expectEqual(error.VectorStoreRequiresEmptyTable, errorFromStatus(statusFromError(error.VectorStoreRequiresEmptyTable)));
+    try std.testing.expectEqual(error.ImmutableTableStorageSettings, errorFromStatus(statusFromError(error.ImmutableTableStorageSettings)));
+    try std.testing.expectEqual(error.VectorStoreLifecycleUnsupported, errorFromStatus(statusFromError(error.VectorStoreLifecycleUnsupported)));
+    try std.testing.expectEqual(error.VectorStoreReferenceFormatRequired, errorFromStatus(statusFromError(error.VectorStoreReferenceFormatRequired)));
 }
 
 test "provider quota errors retain stable boundary details" {

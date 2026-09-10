@@ -178,6 +178,14 @@ const Summary = struct {
     }
 };
 
+/// Retain the standalone qualification entry point alongside storage_bench.
+pub fn main(init: std.process.Init) !void {
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
+    defer args.deinit();
+    _ = args.skip();
+    return run(init, &args);
+}
+
 pub fn run(_: std.process.Init, args: *std.process.Args.Iterator) !void {
     const alloc = std.heap.c_allocator;
     const cfg = try parseArgs(args);

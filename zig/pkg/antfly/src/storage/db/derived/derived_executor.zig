@@ -38,6 +38,9 @@ pub const FinishCatchUpFn = runtime_types.FinishCatchUpFn;
 pub const CanAdvanceToTargetFn = runtime_types.CanAdvanceToTargetFn;
 pub const AppliedSequenceAdvancedFn = runtime_types.AppliedSequenceAdvancedFn;
 pub const RuntimeError = runtime_types.RuntimeError;
+pub const CatchUpSessionToken = runtime_types.CatchUpSessionToken;
+pub const CatchUpFinishResult = runtime_types.CatchUpFinishResult;
+pub const BacklogAdmission = backlog_tracker_mod.Tracker.Admission;
 
 pub const Backend = runtime_backend.Backend;
 
@@ -62,6 +65,8 @@ pub const Executor = struct {
         notify_indexes: *const fn (ptr: *anyopaque, sequence: u64, index_names: []const []const u8) void,
         notify_except_kind: *const fn (ptr: *anyopaque, sequence: u64, excluded_kind: types.IndexKind) void,
         force_sequence: *const fn (ptr: *anyopaque, sequence: u64) void,
+        admit_backlog_bytes: *const fn (ptr: *anyopaque, bytes: u64) anyerror!BacklogAdmission,
+        commit_backlog_admission: *const fn (ptr: *anyopaque, sequence: u64, admission: *BacklogAdmission) void,
         track_backlog_bytes: *const fn (ptr: *anyopaque, sequence: u64, bytes: u64) anyerror!void,
         backlog_throttle_target_sequence: *const fn (ptr: *anyopaque) ?u64,
         release_backlog_through: *const fn (ptr: *anyopaque, sequence: u64) void,
@@ -123,6 +128,14 @@ pub const Executor = struct {
 
     pub fn trackBacklogBytes(self: *Executor, sequence: u64, bytes: u64) !void {
         return try self.vtable.track_backlog_bytes(self.ptr, sequence, bytes);
+    }
+
+    pub fn admitBacklogBytes(self: *Executor, bytes: u64) !BacklogAdmission {
+        return try self.vtable.admit_backlog_bytes(self.ptr, bytes);
+    }
+
+    pub fn commitBacklogAdmission(self: *Executor, sequence: u64, admission: *BacklogAdmission) void {
+        self.vtable.commit_backlog_admission(self.ptr, sequence, admission);
     }
 
     pub fn backlogThrottleTargetSequence(self: *Executor) ?u64 {
@@ -277,6 +290,14 @@ const ManualRuntime = struct {
         return try self.backlog.track(self.alloc, sequence, bytes);
     }
 
+    fn admitBacklogBytes(self: *ManualRuntime, bytes: u64) !BacklogAdmission {
+        return try self.backlog.admit(self.alloc, bytes);
+    }
+
+    fn commitBacklogAdmission(self: *ManualRuntime, sequence: u64, admission: *BacklogAdmission) void {
+        self.backlog.commitAdmission(sequence, admission);
+    }
+
     fn backlogThrottleTargetSequence(self: *ManualRuntime) ?u64 {
         return self.backlog.throttleTargetSequence();
     }
@@ -292,8 +313,23 @@ const ManualRuntime = struct {
         return true;
     }
 
-    fn catchUpWorker(self: *ManualRuntime, worker: *ManualWorker) !derived_worker.CatchUpStats {
-        return try derived_worker.catchUpIndexWithOptions(
+    const CatchUpResult = struct {
+        stats: derived_worker.CatchUpStats,
+        token: CatchUpSessionToken,
+    };
+
+    fn catchUpWorker(self: *ManualRuntime, worker: *ManualWorker) !CatchUpResult {
+        const token = if (self.begin_catch_up_fn) |begin_catch_up|
+            try begin_catch_up(self.ctx, worker.kind)
+        else
+            CatchUpSessionToken{};
+        var catch_up_open = true;
+        errdefer {
+            if (catch_up_open) if (self.finish_catch_up_fn) |finish_catch_up| {
+                _ = finish_catch_up(self.ctx, worker.kind, token, worker.applied_sequence, false) catch {};
+            };
+        }
+        const stats = try derived_worker.catchUpIndexWithOptions(
             self.alloc,
             self.replay_source,
             worker.kind,
@@ -302,11 +338,10 @@ const ManualRuntime = struct {
             self.apply_fn,
             .{
                 .resource_manager = self.backlog.resource_manager,
-                .catch_up_ctx = self.ctx,
-                .begin_catch_up_fn = self.begin_catch_up_fn,
-                .finish_catch_up_fn = self.finish_catch_up_fn,
             },
         );
+        catch_up_open = false;
+        return .{ .stats = stats, .token = token };
     }
 
     fn waitForAll(self: *ManualRuntime, sequence: u64, wait: VisibilityWait) !void {
@@ -315,7 +350,14 @@ const ManualRuntime = struct {
             if (worker.target_sequence <= worker.applied_sequence) continue;
             try wait.check();
 
-            const stats = try self.catchUpWorker(worker);
+            const result = try self.catchUpWorker(worker);
+            var session_open = true;
+            defer {
+                if (session_open) if (self.finish_catch_up_fn) |finish_catch_up| {
+                    _ = finish_catch_up(self.ctx, worker.kind, result.token, worker.applied_sequence, false) catch {};
+                };
+            }
+            const stats = result.stats;
             try wait.check();
             const caught_up_sequence = if (stats.appliedSequenceAdvance(worker.applied_sequence)) |applied_sequence|
                 applied_sequence
@@ -324,10 +366,17 @@ const ManualRuntime = struct {
                 worker.target_sequence
             else
                 worker.applied_sequence;
+            session_open = false;
+            const finish_result = if (self.finish_catch_up_fn) |finish_catch_up|
+                try finish_catch_up(self.ctx, worker.kind, result.token, caught_up_sequence, true)
+            else
+                CatchUpFinishResult{};
             if (caught_up_sequence > worker.applied_sequence) {
-                while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
-                    try wait.check();
-                    std.atomic.spinLoopHint();
+                if (!finish_result.applied_sequence_persisted) {
+                    while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
+                        try wait.check();
+                        std.atomic.spinLoopHint();
+                    }
                 }
                 worker.applied_sequence = caught_up_sequence;
                 if (self.applied_sequence_advanced_fn) |callback| callback(self.ctx, worker.name, caught_up_sequence);
@@ -349,7 +398,14 @@ const ManualRuntime = struct {
             if (worker.target_sequence <= worker.applied_sequence) continue;
             try wait.check();
 
-            const stats = try self.catchUpWorker(worker);
+            const result = try self.catchUpWorker(worker);
+            var session_open = true;
+            defer {
+                if (session_open) if (self.finish_catch_up_fn) |finish_catch_up| {
+                    _ = finish_catch_up(self.ctx, worker.kind, result.token, worker.applied_sequence, false) catch {};
+                };
+            }
+            const stats = result.stats;
             try wait.check();
             const caught_up_sequence = if (stats.appliedSequenceAdvance(worker.applied_sequence)) |applied_sequence|
                 applied_sequence
@@ -358,10 +414,17 @@ const ManualRuntime = struct {
                 worker.target_sequence
             else
                 worker.applied_sequence;
+            session_open = false;
+            const finish_result = if (self.finish_catch_up_fn) |finish_catch_up|
+                try finish_catch_up(self.ctx, worker.kind, result.token, caught_up_sequence, true)
+            else
+                CatchUpFinishResult{};
             if (caught_up_sequence > worker.applied_sequence) {
-                while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
-                    try wait.check();
-                    std.atomic.spinLoopHint();
+                if (!finish_result.applied_sequence_persisted) {
+                    while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
+                        try wait.check();
+                        std.atomic.spinLoopHint();
+                    }
                 }
                 worker.applied_sequence = caught_up_sequence;
                 if (self.applied_sequence_advanced_fn) |callback| callback(self.ctx, worker.name, caught_up_sequence);
@@ -439,6 +502,8 @@ const manual_vtable = Executor.VTable{
     .notify_indexes = manualNotifyIndexes,
     .notify_except_kind = manualNotifyExceptKind,
     .force_sequence = manualForceSequence,
+    .admit_backlog_bytes = manualAdmitBacklogBytes,
+    .commit_backlog_admission = manualCommitBacklogAdmission,
     .track_backlog_bytes = manualTrackBacklogBytes,
     .backlog_throttle_target_sequence = manualBacklogThrottleTargetSequence,
     .release_backlog_through = manualReleaseBacklogThrough,
@@ -509,6 +574,16 @@ fn manualTrackBacklogBytes(ptr: *anyopaque, sequence: u64, bytes: u64) !void {
     return try runtime.trackBacklogBytes(sequence, bytes);
 }
 
+fn manualAdmitBacklogBytes(ptr: *anyopaque, bytes: u64) !BacklogAdmission {
+    const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
+    return try runtime.admitBacklogBytes(bytes);
+}
+
+fn manualCommitBacklogAdmission(ptr: *anyopaque, sequence: u64, admission: *BacklogAdmission) void {
+    const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
+    runtime.commitBacklogAdmission(sequence, admission);
+}
+
 fn manualBacklogThrottleTargetSequence(ptr: *anyopaque) ?u64 {
     const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
     return runtime.backlogThrottleTargetSequence();
@@ -573,6 +648,8 @@ const io_threaded_vtable = Executor.VTable{
     .notify_indexes = ioThreadedNotifyIndexes,
     .notify_except_kind = ioThreadedNotifyExceptKind,
     .force_sequence = ioThreadedForceSequence,
+    .admit_backlog_bytes = ioThreadedAdmitBacklogBytes,
+    .commit_backlog_admission = ioThreadedCommitBacklogAdmission,
     .track_backlog_bytes = ioThreadedTrackBacklogBytes,
     .backlog_throttle_target_sequence = ioThreadedBacklogThrottleTargetSequence,
     .release_backlog_through = ioThreadedReleaseBacklogThrough,
@@ -644,6 +721,16 @@ fn ioThreadedForceSequence(ptr: *anyopaque, sequence: u64) void {
 fn ioThreadedTrackBacklogBytes(ptr: *anyopaque, sequence: u64, bytes: u64) !void {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
     return try runtime.trackBacklogBytes(sequence, bytes);
+}
+
+fn ioThreadedAdmitBacklogBytes(ptr: *anyopaque, bytes: u64) !BacklogAdmission {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    return try runtime.admitBacklogBytes(bytes);
+}
+
+fn ioThreadedCommitBacklogAdmission(ptr: *anyopaque, sequence: u64, admission: *BacklogAdmission) void {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    runtime.commitBacklogAdmission(sequence, admission);
 }
 
 fn ioThreadedBacklogThrottleTargetSequence(ptr: *anyopaque) ?u64 {

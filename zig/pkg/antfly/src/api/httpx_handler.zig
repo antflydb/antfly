@@ -5421,6 +5421,10 @@ pub const AntflyApiHandler = struct {
                     _ = ctx.status(400);
                     return ctx.text("invalid table configuration");
                 },
+                error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => {
+                    _ = ctx.status(400);
+                    return ctx.text("vector_store requires a fresh local single-shard standalone table without replication");
+                },
                 error.InvalidTableName, error.CreateTableShardCountOutOfRange => {
                     _ = ctx.status(400);
                     return ctx.text("invalid table configuration");

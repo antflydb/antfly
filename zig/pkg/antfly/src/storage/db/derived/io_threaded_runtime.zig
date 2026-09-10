@@ -38,6 +38,8 @@ pub const BeginCatchUpFn = runtime_types.BeginCatchUpFn;
 pub const FinishCatchUpFn = runtime_types.FinishCatchUpFn;
 pub const CanAdvanceToTargetFn = runtime_types.CanAdvanceToTargetFn;
 pub const AppliedSequenceAdvancedFn = runtime_types.AppliedSequenceAdvancedFn;
+pub const CatchUpSessionToken = runtime_types.CatchUpSessionToken;
+pub const CatchUpFinishResult = runtime_types.CatchUpFinishResult;
 
 const Worker = struct {
     runtime: *DerivedRuntime,
@@ -51,6 +53,7 @@ const Worker = struct {
     next_delay_ms: ?u64 = 0,
     idle_since_ns: ?u64 = null,
     catch_up_open: bool = false,
+    catch_up_token: CatchUpSessionToken = .{},
     catch_up_close_requested: bool = false,
     catch_up_close_active: bool = false,
     catch_up_close_failed: bool = false,
@@ -368,7 +371,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
 
         for (self.workers.items) |worker| {
             if (worker.future) |*future| _ = future.await(io);
-            closeWorkerCatchUpState(self, worker, true) catch |err| {
+            _ = closeWorkerCatchUpState(self, worker, worker.applied_sequence, true) catch |err| {
                 std.log.warn("derived worker final catch-up close failed worker={s}: {s}", .{ worker.name, @errorName(err) });
             };
             if (worker.applied_sequence > worker.persisted_sequence) {
@@ -474,7 +477,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         self.mutex.unlock(io);
 
         if (worker.future) |*future| _ = future.await(io);
-        closeWorkerCatchUpState(self, worker, true) catch |err| {
+        _ = closeWorkerCatchUpState(self, worker, worker.applied_sequence, true) catch |err| {
             std.log.warn("derived worker final catch-up close failed worker={s}: {s}", .{ worker.name, @errorName(err) });
         };
         self.alloc.free(worker.name);
@@ -581,6 +584,24 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         return try self.backlog.track(self.alloc, sequence, bytes);
+    }
+
+    pub fn admitBacklogBytes(self: *DerivedRuntime, bytes: u64) !backlog_tracker_mod.Tracker.Admission {
+        const io = self.ioContext();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return try self.backlog.admit(self.alloc, bytes);
+    }
+
+    pub fn commitBacklogAdmission(
+        self: *DerivedRuntime,
+        sequence: u64,
+        admission: *backlog_tracker_mod.Tracker.Admission,
+    ) void {
+        const io = self.ioContext();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.backlog.commitAdmission(sequence, admission);
     }
 
     pub fn backlogThrottleTargetSequence(self: *DerivedRuntime) ?u64 {
@@ -827,8 +848,11 @@ fn workerMain(worker: *Worker) void {
     const runtime = worker.runtime;
     const io = runtime.ioContext();
     var close_success = true;
-    defer if (!close_success or workerIsStopping(runtime, worker, io))
-        closeWorkerCatchUpState(runtime, worker, close_success) catch |err| runtime.recordError(io, worker.name, "close_session", err);
+    defer if (!close_success or workerIsStopping(runtime, worker, io)) {
+        _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, close_success) catch |err| {
+            runtime.recordError(io, worker.name, "close_session", err);
+        };
+    };
 
     // One replay window per dispatch. Session state belongs to the worker
     // registration and survives yields; no physical thread is pinned at idle.
@@ -867,7 +891,7 @@ fn workerMain(worker: *Worker) void {
                 worker.next_delay_ms = @max(1, remaining / std.time.ns_per_ms);
                 return;
             }
-            closeWorkerCatchUpState(runtime, worker, true) catch |err| {
+            _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, true) catch |err| {
                 close_success = false;
                 runtime.recordError(io, worker.name, "idle_close", err);
                 return;
@@ -888,6 +912,11 @@ fn workerMain(worker: *Worker) void {
         worker.catch_up_active = true;
         runtime.mutex.unlock(io);
 
+        // Do not pin the primary replay generation until the coalescing wait
+        // has collected its batch. Otherwise a stable cursor can only observe
+        // the pre-wait tail and every newly arrived record forces another
+        // publication cycle.
+        waitForReplayWindow(runtime, worker, from_sequence, io);
         ensureWorkerCatchUpState(runtime, worker, from_sequence) catch |err| {
             runtime.mutex.lockUncancelable(io);
             worker.catch_up_active = false;
@@ -895,7 +924,7 @@ fn workerMain(worker: *Worker) void {
             runtime.mutex.unlock(io);
             if (workerIsStopping(runtime, worker, io)) return;
             if (isRecoverableCatchUpError(worker, err)) {
-                closeWorkerCatchUpState(runtime, worker, false) catch |close_err| {
+                _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, false) catch |close_err| {
                     close_success = false;
                     runtime.recordError(io, worker.name, "recoverable_begin_catch_up_close", close_err);
                     return;
@@ -907,8 +936,6 @@ fn workerMain(worker: *Worker) void {
             runtime.recordError(io, worker.name, "begin_catch_up_session", err);
             return;
         };
-        waitForReplayWindow(runtime, worker, from_sequence, io);
-
         var stats = catchUpWorker(runtime, worker) catch |err| {
             runtime.mutex.lockUncancelable(io);
             worker.catch_up_active = false;
@@ -916,7 +943,7 @@ fn workerMain(worker: *Worker) void {
             runtime.mutex.unlock(io);
             if (workerIsStopping(runtime, worker, io)) return;
             if (isRecoverableCatchUpError(worker, err)) {
-                closeWorkerCatchUpState(runtime, worker, false) catch |close_err| {
+                _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, false) catch |close_err| {
                     close_success = false;
                     runtime.recordError(io, worker.name, "recoverable_catch_up_close", close_err);
                     return;
@@ -957,7 +984,7 @@ fn workerMain(worker: *Worker) void {
                     runtime.mutex.unlock(io);
                     if (workerIsStopping(runtime, worker, io)) return;
                     if (isRecoverableCatchUpError(worker, err)) {
-                        closeWorkerCatchUpState(runtime, worker, false) catch |close_err| {
+                        _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, false) catch |close_err| {
                             close_success = false;
                             runtime.recordError(io, worker.name, "recoverable_refresh_replay_cursor_close", close_err);
                             return;
@@ -976,7 +1003,7 @@ fn workerMain(worker: *Worker) void {
                     runtime.mutex.unlock(io);
                     if (workerIsStopping(runtime, worker, io)) return;
                     if (isRecoverableCatchUpError(worker, err)) {
-                        closeWorkerCatchUpState(runtime, worker, false) catch |close_err| {
+                        _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, false) catch |close_err| {
                             close_success = false;
                             runtime.recordError(io, worker.name, "recoverable_refreshed_catch_up_close", close_err);
                             return;
@@ -1013,7 +1040,7 @@ fn workerMain(worker: *Worker) void {
         else
             from_sequence;
         if (caught_up_sequence == from_sequence and stats.shouldTryTargetAdvance(from_sequence, target_sequence)) {
-            closeWorkerCatchUpState(runtime, worker, false) catch |err| {
+            _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, false) catch |err| {
                 close_success = false;
                 runtime.recordError(io, worker.name, "coverage_gap_close", err);
                 return;
@@ -1022,8 +1049,9 @@ fn workerMain(worker: *Worker) void {
             continue;
         }
 
+        var persisted = false;
         if (caught_up_sequence > from_sequence) {
-            closeWorkerCatchUpState(runtime, worker, true) catch |err| {
+            const finish_result = closeWorkerCatchUpState(runtime, worker, caught_up_sequence, true) catch |err| {
                 if (isRecoverablePublishError(worker, err)) {
                     scheduleRecoverableCatchUpRetry(worker, err);
                     continue;
@@ -1032,10 +1060,10 @@ fn workerMain(worker: *Worker) void {
                 runtime.recordError(io, worker.name, "publish_catch_up", err);
                 return;
             };
+            persisted = finish_result.applied_sequence_persisted;
         }
 
-        var persisted = false;
-        if (caught_up_sequence > from_sequence) {
+        if (caught_up_sequence > from_sequence and !persisted) {
             persisted = runtime.persist_fn(runtime.ctx, worker.name, caught_up_sequence, forcePersistAppliedSequence(worker)) catch |err| {
                 if (catch_up_policy.isRecoverableAdmissionError(err)) {
                     scheduleRecoverableCatchUpRetry(worker, err);
@@ -1152,16 +1180,8 @@ fn truncateWithRecoverableRetry(runtime: *DerivedRuntime, worker: *Worker, seque
 }
 
 fn ensureWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, from_sequence: u64) !void {
-    if (!worker.catch_up_open) {
-        const io = runtime.ioContext();
-        runtime.mutex.lockUncancelable(io);
-        worker.catch_up_close_failed = false;
-        runtime.mutex.unlock(io);
-        if (runtime.begin_catch_up_fn) |begin_catch_up| try begin_catch_up(runtime.ctx, worker.kind);
-        runtime.mutex.lockUncancelable(io);
-        worker.catch_up_open = true;
-        runtime.mutex.unlock(io);
-    }
+    if (!catch_up_policy.deferSourceCapture(worker.kind, runtime.backlog.resource_manager))
+        try ensureWorkerSourceCapture(runtime, worker);
     if (worker.replay_cursor == null) {
         worker.replay_cursor = try runtime.replay_source.openMatchingCursor(
             runtime.alloc,
@@ -1170,6 +1190,29 @@ fn ensureWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, from_sequ
         );
         worker.replay_cursor_open_sequence = from_sequence;
     }
+}
+
+fn ensureWorkerSourceCapture(runtime: *DerivedRuntime, worker: *Worker) !void {
+    if (!worker.catch_up_open) {
+        const io = runtime.ioContext();
+        runtime.mutex.lockUncancelable(io);
+        worker.catch_up_close_failed = false;
+        runtime.mutex.unlock(io);
+        worker.catch_up_token = if (runtime.begin_catch_up_fn) |begin_catch_up|
+            try begin_catch_up(runtime.ctx, worker.kind)
+        else
+            .{};
+        runtime.mutex.lockUncancelable(io);
+        worker.catch_up_open = true;
+        runtime.mutex.unlock(io);
+    }
+}
+
+fn beginCollectedWindowCapture(ctx: *anyopaque, _: index_manager_mod.ManagedIndexRef) !void {
+    const worker: *Worker = @ptrCast(@alignCast(ctx));
+    // Called after collection and before any apply callback. Subsequent chunks
+    // borrow this same token; no source record or coalesced transaction is split.
+    try ensureWorkerSourceCapture(worker.runtime, worker);
 }
 
 fn closeWorkerReplayCursor(runtime: *DerivedRuntime, worker: *Worker) void {
@@ -1183,14 +1226,21 @@ fn closeWorkerReplayCursor(runtime: *DerivedRuntime, worker: *Worker) void {
     if (replay_cursor) |*cursor| cursor.deinit(runtime.alloc);
 }
 
-fn closeWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, success: bool) !void {
+fn closeWorkerCatchUpState(
+    runtime: *DerivedRuntime,
+    worker: *Worker,
+    applied_sequence: u64,
+    success: bool,
+) !CatchUpFinishResult {
     const io = runtime.ioContext();
     runtime.mutex.lockUncancelable(io);
     var replay_cursor = worker.replay_cursor;
     const catch_up_open = worker.catch_up_open;
+    const token = worker.catch_up_token;
     worker.replay_cursor = null;
     worker.replay_cursor_open_sequence = 0;
     worker.catch_up_open = false;
+    worker.catch_up_token = .{};
     worker.catch_up_close_requested = false;
     if (catch_up_open) {
         worker.catch_up_close_active = true;
@@ -1200,10 +1250,11 @@ fn closeWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, success: b
     runtime.mutex.unlock(io);
 
     if (replay_cursor) |*cursor| cursor.deinit(runtime.alloc);
-    if (!catch_up_open) return;
+    if (!catch_up_open) return .{};
 
+    var finish_result: CatchUpFinishResult = .{};
     if (runtime.finish_catch_up_fn) |finish_catch_up| {
-        finish_catch_up(runtime.ctx, worker.kind, success) catch |err| {
+        finish_result = finish_catch_up(runtime.ctx, worker.kind, token, applied_sequence, success) catch |err| {
             runtime.mutex.lockUncancelable(io);
             worker.catch_up_close_active = false;
             worker.catch_up_close_failed = true;
@@ -1219,6 +1270,11 @@ fn closeWorkerCatchUpState(runtime: *DerivedRuntime, worker: *Worker, success: b
         runtime.cond.broadcast(io);
         runtime.mutex.unlock(io);
     }
+    if (worker.kind.kind == .dense_vector and @import("../../dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_CAPTURE_STAGES"))
+        std.log.info("dense replay capture finish token={} sequence={} success={} applied_sequence_persisted={}", .{
+            token.value, applied_sequence, success, finish_result.applied_sequence_persisted,
+        });
+    return finish_result;
 }
 
 fn isRecoverablePublishError(worker: *const Worker, err: anyerror) bool {
@@ -1230,7 +1286,9 @@ fn isRecoverablePublishError(worker: *const Worker, err: anyerror) bool {
         // so reopening and replaying is idempotent and preserves visibility.
         error.NoActiveWriteSession => true,
         error.NotFound => catch_up_policy.forIndex(worker.kind, worker.runtime.backlog.resource_manager).not_found_is_recoverable,
-        error.ReplayDocumentNotVisible, error.ArtifactRepairRequired => true,
+        error.ReplayDocumentNotVisible,
+        error.ArtifactRepairRequired,
+        => true,
         else => false,
     };
 }
@@ -1239,6 +1297,7 @@ fn isRecoverableCatchUpError(worker: *const Worker, err: anyerror) bool {
     if (catch_up_policy.isRecoverableAdmissionError(err)) return true;
     return switch (err) {
         error.ReplayDocumentNotVisible,
+        error.PostingWalCaptureOwnershipConflict,
         error.ArtifactRepairRequired,
         => true,
         error.NotFound => catch_up_policy.forIndex(worker.kind, worker.runtime.backlog.resource_manager).not_found_is_recoverable,
@@ -1302,11 +1361,17 @@ fn waitForReplayWindow(runtime: *DerivedRuntime, worker: *Worker, from_sequence:
         const sleep_ns = @min(delay_ns, max_wait_ns - waited_ns);
         io.sleep(Io.Duration.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {};
         waited_ns +|= sleep_ns;
+
+        runtime.mutex.lockUncancelable(io);
+        const target_advanced = worker.target_sequence > target;
+        runtime.mutex.unlock(io);
+        if (!target_advanced) return;
     }
 }
 
 fn catchUpWorker(runtime: *DerivedRuntime, worker: *Worker) !derived_worker.CatchUpStats {
     const policy = catch_up_policy.forIndex(worker.kind, runtime.backlog.resource_manager);
+    const deferred_capture = catch_up_policy.deferSourceCapture(worker.kind, runtime.backlog.resource_manager);
     if (worker.replay_cursor == null) {
         try ensureWorkerCatchUpState(runtime, worker, worker.applied_sequence);
     }
@@ -1317,7 +1382,8 @@ fn catchUpWorker(runtime: *DerivedRuntime, worker: *Worker) !derived_worker.Catc
         if (runtime.force_catch_up_sequence >= worker.target_sequence) break :blk 0;
         break :blk policy.max_windows_per_publish;
     };
-    return try derived_worker.catchUpIndexFromMatchingCursor(
+    const capture_before_collection = worker.catch_up_open;
+    const stats = try derived_worker.catchUpIndexFromMatchingCursor(
         runtime.alloc,
         &worker.replay_cursor.?,
         worker.kind,
@@ -1325,13 +1391,23 @@ fn catchUpWorker(runtime: *DerivedRuntime, worker: *Worker) !derived_worker.Catc
         runtime.apply_fn,
         .{
             .resource_manager = runtime.backlog.resource_manager,
+            .window_ctx = worker,
+            .begin_window_fn = if (deferred_capture) beginCollectedWindowCapture else null,
             .max_windows_per_call = max_windows_per_call,
+            .max_call_ns = policy.max_call_ns,
+            .max_call_bytes = policy.max_call_bytes,
             .max_items_per_window = policy.max_items_per_window,
             .max_chunk_bytes = policy.max_chunk_bytes,
             .estimated_dense_vector_bytes = policy.estimated_dense_vector_bytes,
             .target_sequence = worker.target_sequence,
         },
     );
+    if (worker.kind.kind == .dense_vector and @import("../../dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_CAPTURE_STAGES"))
+        std.log.info("dense replay collection token={} sequence={} records={} applied_windows={} deferred_capture={} capture_before_collection={} collect_ns={} apply_ns={}", .{
+            worker.catch_up_token.value, stats.last_sequence,     stats.scanned_entries, stats.applied_entries, deferred_capture,
+            capture_before_collection,   stats.window_collect_ns, stats.apply_ns,
+        });
+    return stats;
 }
 
 fn shouldRefreshReplayCursor(worker: *const Worker, caught_up_sequence: u64) bool {
@@ -1353,6 +1429,9 @@ fn stopAndJoinWorker(runtime: *DerivedRuntime, worker: *Worker, io: Io) void {
 }
 
 const TestThreadedRuntimeCapture = struct {
+    require_capture_worker: ?*Worker = null,
+    fail_next_begin: bool = false,
+    empty_coverage_checks: std.atomic.Value(u64) = .init(0),
     runtime: ?*DerivedRuntime = null,
     apply_calls: std.atomic.Value(u64) = .init(0),
     begin_calls: std.atomic.Value(u64) = .init(0),
@@ -1385,6 +1464,11 @@ fn testThreadedRuntimeAppliedSequenceAdvanced(ctx: *anyopaque, index_name: []con
 fn testThreadedRuntimeApply(ctx: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !bool {
     _ = batch;
     const capture: *TestThreadedRuntimeCapture = @ptrCast(@alignCast(ctx));
+    if (capture.require_capture_worker) |worker| {
+        try std.testing.expect(worker.catch_up_open);
+        try std.testing.expect(!worker.catch_up_token.isNone());
+        try std.testing.expect(worker.replay_cursor != null);
+    }
     _ = capture.apply_calls.fetchAdd(1, .monotonic);
     if (capture.fail_next_apply_resource_budget.swap(false, .monotonic)) {
         _ = capture.resource_budget_failures.fetchAdd(1, .monotonic);
@@ -1412,14 +1496,26 @@ fn testThreadedRuntimeTruncate(ctx: *anyopaque, sequence: u64) !void {
     capture.truncated_sequence.store(sequence, .monotonic);
 }
 
-fn testThreadedRuntimeBeginCatchUp(ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) !void {
+fn testThreadedRuntimeBeginCatchUp(ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) !CatchUpSessionToken {
     _ = index_ref;
     const capture: *TestThreadedRuntimeCapture = @ptrCast(@alignCast(ctx));
-    _ = capture.begin_calls.fetchAdd(1, .monotonic);
+    if (capture.fail_next_begin) {
+        capture.fail_next_begin = false;
+        return error.ResourceBudgetExceeded;
+    }
+    return .{ .value = capture.begin_calls.fetchAdd(1, .monotonic) + 1 };
 }
 
-fn testThreadedRuntimeFinishCatchUp(ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, success: bool) !void {
+fn testThreadedRuntimeFinishCatchUp(
+    ctx: *anyopaque,
+    index_ref: index_manager_mod.ManagedIndexRef,
+    token: CatchUpSessionToken,
+    applied_sequence: u64,
+    success: bool,
+) !CatchUpFinishResult {
     _ = index_ref;
+    _ = token;
+    _ = applied_sequence;
     const capture: *TestThreadedRuntimeCapture = @ptrCast(@alignCast(ctx));
     _ = capture.finish_calls.fetchAdd(1, .monotonic);
     if (capture.block_finish.load(.acquire)) {
@@ -1430,6 +1526,7 @@ fn testThreadedRuntimeFinishCatchUp(ctx: *anyopaque, index_ref: index_manager_mo
         _ = capture.publish_failures.fetchAdd(1, .monotonic);
         return error.NotFound;
     }
+    return .{};
 }
 
 fn testThreadedRuntimeJournalOpenOptions() change_journal_mod.OpenOptions {
@@ -1448,6 +1545,113 @@ fn appendTestThreadedRuntimeRecord(log: *change_journal_mod.Journal, alloc: Allo
     const payload = try change_journal_mod.encodeRecord(alloc, record);
     defer alloc.free(payload);
     _ = try log.appendOpaque(payload);
+}
+
+test "io threaded deferred source capture excludes preparation and preserves failure ownership" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/late-capture", .{tmp.sub_path}, 0);
+    defer alloc.free(path);
+    var journal = try change_journal_mod.Journal.open(path, testThreadedRuntimeJournalOpenOptions());
+    defer journal.close();
+    try appendTestThreadedRuntimeRecord(&journal, alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{ .dense_vector, .full_text },
+    });
+    for ([_]bool{ false, true }) |enabled| {
+        var manager = resource_manager_mod.ResourceManager.init(.{});
+        defer manager.deinit(alloc);
+        manager.dense_deferred_source_capture = enabled;
+        var capture: TestThreadedRuntimeCapture = .{};
+        var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, null, null, &manager);
+        defer runtime.deinit();
+        var name = "dense".*;
+        var worker: Worker = .{ .runtime = &runtime, .name = &name, .kind = .{ .name = &name, .kind = .dense_vector }, .applied_sequence = 0, .persisted_sequence = 0, .target_sequence = 1 };
+        defer _ = closeWorkerCatchUpState(&runtime, &worker, 0, false) catch {};
+        capture.require_capture_worker = &worker;
+
+        try ensureWorkerCatchUpState(&runtime, &worker, 0);
+        try std.testing.expect(worker.replay_cursor != null);
+        try std.testing.expectEqual(!enabled, worker.catch_up_open);
+        const stats = try catchUpWorker(&runtime, &worker);
+        try std.testing.expectEqual(@as(u64, 1), stats.last_sequence);
+        try std.testing.expectEqual(@as(u64, 1), capture.begin_calls.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 1), capture.apply_calls.load(.monotonic));
+        const first_token = worker.catch_up_token;
+        // More collected windows retain the exact owner, never mint a borrower
+        // capable of closing a later transaction or publish before finish.
+        try beginCollectedWindowCapture(&worker, worker.kind);
+        try std.testing.expectEqual(first_token, worker.catch_up_token);
+        try std.testing.expectEqual(@as(u64, 0), capture.finish_calls.load(.monotonic));
+        _ = try closeWorkerCatchUpState(&runtime, &worker, 1, true);
+        try std.testing.expect(worker.replay_cursor == null and !worker.catch_up_open);
+        try std.testing.expectEqual(@as(u64, 1), capture.finish_calls.load(.monotonic));
+
+        // An empty cursor does not need a mutation lease in the deferred path.
+        try ensureWorkerCatchUpState(&runtime, &worker, 1);
+        const empty = try catchUpWorker(&runtime, &worker);
+        try std.testing.expectEqual(@as(u64, 0), empty.last_sequence);
+        try std.testing.expectEqual(!enabled, worker.catch_up_open);
+        _ = try closeWorkerCatchUpState(&runtime, &worker, 1, true);
+
+        if (enabled) {
+            capture.fail_next_begin = true;
+            try ensureWorkerCatchUpState(&runtime, &worker, 0);
+            try std.testing.expectError(error.ResourceBudgetExceeded, catchUpWorker(&runtime, &worker));
+            try std.testing.expect(!worker.catch_up_open and worker.catch_up_token.isNone());
+            try std.testing.expectEqual(@as(u64, 1), capture.apply_calls.load(.monotonic));
+            _ = try closeWorkerCatchUpState(&runtime, &worker, 0, false);
+            try std.testing.expect(worker.replay_cursor == null);
+            // Retry starts from the persisted boundary, not the consumed cursor.
+            try ensureWorkerCatchUpState(&runtime, &worker, 0);
+            _ = try catchUpWorker(&runtime, &worker);
+            try std.testing.expect(worker.catch_up_token.value > first_token.value);
+            _ = try closeWorkerCatchUpState(&runtime, &worker, 1, true);
+        }
+        worker.kind.kind = .full_text;
+        try ensureWorkerCatchUpState(&runtime, &worker, 0);
+        try std.testing.expect(worker.catch_up_open); // unchanged non-dense policy
+        _ = try closeWorkerCatchUpState(&runtime, &worker, 0, false);
+    }
+}
+
+test "io threaded deferred source capture advances empty targets only through coverage guard" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/empty-late-capture", .{tmp.sub_path}, 0);
+    defer alloc.free(path);
+    var journal = try change_journal_mod.Journal.open(path, testThreadedRuntimeJournalOpenOptions());
+    defer journal.close();
+    try appendTestThreadedRuntimeRecord(&journal, alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"text:only"},
+        .target_hints = &.{.full_text},
+    });
+    const Coverage = struct {
+        fn allow(ctx: *anyopaque, _: index_manager_mod.ManagedIndexRef, from: u64, target: u64) !bool {
+            const capture: *TestThreadedRuntimeCapture = @ptrCast(@alignCast(ctx));
+            try std.testing.expectEqual(@as(u64, 0), from);
+            try std.testing.expectEqual(@as(u64, 1), target);
+            // The first guard refusal must leave the durable boundary at 0.
+            return capture.empty_coverage_checks.fetchAdd(1, .monotonic) != 0;
+        }
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(alloc);
+    manager.dense_deferred_source_capture = true;
+    var capture: TestThreadedRuntimeCapture = .{};
+    var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, Coverage.allow, null, &manager);
+    defer runtime.deinit();
+    try runtime.addWorker("dense", .{ .name = "dense", .kind = .dense_vector }, 0);
+    try runtime.waitForAllWithVisibilityWait(1, .none, platform_time.monotonicNs() + 5 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(u64, 2), capture.empty_coverage_checks.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), capture.begin_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), capture.apply_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), capture.finish_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), capture.persisted_sequence.load(.monotonic));
 }
 
 test "io threaded scheduled terminal pass releases its retained session" {
@@ -1774,7 +1978,7 @@ test "io threaded wait observes failed worker-owned catch-up close" {
     runtime.mutex.unlock(io);
     capture.fail_next_publish.store(true, .release);
 
-    try std.testing.expectError(error.NotFound, closeWorkerCatchUpState(&runtime, worker, true));
+    try std.testing.expectError(error.NotFound, closeWorkerCatchUpState(&runtime, worker, worker.applied_sequence, true));
     {
         runtime.mutex.lockUncancelable(io);
         defer runtime.mutex.unlock(io);

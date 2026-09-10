@@ -15,13 +15,18 @@
 const std = @import("std");
 
 pub const artifact_sources_protocol_version: u16 = 1;
+/// The store understands native HBC authority markers, WAL recovery, and the
+/// fail-closed placement contract used during rolling upgrades.
+pub const dense_native_storage_protocol_version: u16 = 1;
 pub const embedding_activity_protocol_version: u16 = 2;
 const group_ids = @import("../common/group_ids.zig");
 const topology_records = @import("../common/topology_records.zig");
 const index_repair_status = @import("../common/index_repair_status.zig");
+const dense_native_storage_phase = @import("../common/dense_native_storage_phase.zig");
 const transition_state = @import("transition_state.zig");
 
 pub const IndexRepairStatus = index_repair_status.IndexRepairStatus;
+pub const DenseNativeStoragePhase = dense_native_storage_phase.DenseNativeStoragePhase;
 
 pub const PlacementClass = enum {
     data,
@@ -39,7 +44,8 @@ pub const TableRecord = topology_records.TableRecord;
 pub const TableDefinition = TableRecord;
 
 pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
-    return lhs.table_id == rhs.table_id and
+    return lhs.storage.dense_embeddings == rhs.storage.dense_embeddings and
+        lhs.table_id == rhs.table_id and
         std.mem.eql(u8, lhs.name, rhs.name) and
         std.mem.eql(u8, lhs.description, rhs.description) and
         std.mem.eql(u8, lhs.schema_json, rhs.schema_json) and
@@ -65,6 +71,9 @@ fn hashTableDefinitionPart(hasher: *std.crypto.hash.sha2.Sha256, value: []const 
 pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerprint {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update("antfly-table-definition-v1");
+    // Preserve fingerprints of existing default-mode tables.
+    if (table.storage.dense_embeddings != .primary_lsm)
+        hashTableDefinitionPart(&hasher, @tagName(table.storage.dense_embeddings));
     var encoded: [@sizeOf(u64)]u8 = undefined;
     std.mem.writeInt(u64, &encoded, table.table_id, .little);
     hasher.update(&encoded);
@@ -441,6 +450,7 @@ pub const StoreRecord = struct {
     /// not-yet-observed reporter and therefore fails cluster admission closed.
     artifact_sources_protocol_version: u16 = 0,
     native_generation_restore_version: u16 = 0,
+    dense_native_storage_protocol_version: u16 = 0,
     api_url: []const u8 = "",
     raft_url: []const u8 = "",
     role: []const u8 = "data",
@@ -799,6 +809,7 @@ pub const StoreStatusReport = struct {
     /// Monotonic snapshot generation within `reporter_incarnation`.
     status_generation: u64 = 0,
     artifact_sources_protocol_version: u16 = 0,
+    dense_native_storage_protocol_version: u16 = 0,
     live: bool = true,
     health_class: []const u8 = "healthy",
     capacity_bytes: u64 = 0,
@@ -867,6 +878,17 @@ pub fn artifactSourcesProtocolSupported(reporter_incarnation: u64, protocol_vers
     return reporter_incarnation != 0 and
         protocol_version >= artifact_sources_protocol_version and
         artifactSourcesProtocolValid(reporter_incarnation, protocol_version);
+}
+
+pub fn denseNativeStorageProtocolValid(reporter_incarnation: u64, protocol_version: u16) bool {
+    return protocol_version <= dense_native_storage_protocol_version and
+        (protocol_version == 0 or reporter_incarnation != 0);
+}
+
+pub fn denseNativeStorageProtocolSupported(reporter_incarnation: u64, protocol_version: u16) bool {
+    return reporter_incarnation != 0 and
+        protocol_version >= dense_native_storage_protocol_version and
+        denseNativeStorageProtocolValid(reporter_incarnation, protocol_version);
 }
 
 /// Store roles are placement classes, not process kinds. Data runtimes may use
@@ -1130,6 +1152,8 @@ pub const RuntimeIndexStatusReport = struct {
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
     replay_catch_up_required: bool = false,
+    dense_vector_projection_pending: bool = false,
+    dense_native_storage_phase: DenseNativeStoragePhase = .legacy,
     /// True when the owner observed `embedding_activity` at a stable lifecycle
     /// boundary. False means unavailable for this heartbeat, not idle.
     embedding_activity_observed: bool = false,
@@ -2099,6 +2123,7 @@ pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
     const restore_location = try alloc.dupe(u8, record.restore_location);
     errdefer alloc.free(restore_location);
     return .{
+        .storage = record.storage,
         .table_id = record.table_id,
         .name = name,
         .description = description,
@@ -2467,6 +2492,7 @@ pub fn cloneStore(alloc: std.mem.Allocator, record: StoreRecord) !StoreRecord {
         .status_generation = record.status_generation,
         .artifact_sources_protocol_version = record.artifact_sources_protocol_version,
         .native_generation_restore_version = record.native_generation_restore_version,
+        .dense_native_storage_protocol_version = record.dense_native_storage_protocol_version,
         .api_url = api_url,
         .raft_url = raft_url,
         .role = role,
@@ -2699,6 +2725,8 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
         .replay_applied_sequence = record.replay_applied_sequence,
         .replay_target_sequence = record.replay_target_sequence,
         .replay_catch_up_required = record.replay_catch_up_required,
+        .dense_vector_projection_pending = record.dense_vector_projection_pending,
+        .dense_native_storage_phase = record.dense_native_storage_phase,
         .embedding_activity_observed = record.embedding_activity_observed,
         .embedding_activity = record.embedding_activity,
         .source_replay = source_replay,

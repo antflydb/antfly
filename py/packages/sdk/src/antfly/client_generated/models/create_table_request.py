@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from ..models.create_table_request_indexes import CreateTableRequestIndexes
     from ..models.replication_source import ReplicationSource
     from ..models.table_schema import TableSchema
+    from ..models.table_storage_settings import TableStorageSettings
 
 
 T = TypeVar("T", bound="CreateTableRequest")
@@ -23,6 +24,7 @@ class CreateTableRequest:
     Attributes:
         tablespace_name (str | Unset): Explicit tablespace policy for the new table, overriding namespace and database
             defaults.
+        storage (TableStorageSettings | Unset): Immutable source embedding storage selected when creating a table.
         num_shards (int | Unset): Number of shards to create for the table. Data is partitioned across shards based on
             key ranges.
 
@@ -79,6 +81,7 @@ class CreateTableRequest:
     """
 
     tablespace_name: str | Unset = UNSET
+    storage: TableStorageSettings | Unset = UNSET
     num_shards: int | Unset = UNSET
     description: str | Unset = UNSET
     indexes: CreateTableRequestIndexes | Unset = UNSET
@@ -88,6 +91,10 @@ class CreateTableRequest:
 
     def to_dict(self) -> dict[str, Any]:
         tablespace_name = self.tablespace_name
+
+        storage: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.storage, Unset):
+            storage = self.storage.to_dict()
 
         num_shards = self.num_shards
 
@@ -113,6 +120,8 @@ class CreateTableRequest:
         field_dict.update({})
         if tablespace_name is not UNSET:
             field_dict["tablespace_name"] = tablespace_name
+        if storage is not UNSET:
+            field_dict["storage"] = storage
         if num_shards is not UNSET:
             field_dict["num_shards"] = num_shards
         if description is not UNSET:
@@ -131,9 +140,17 @@ class CreateTableRequest:
         from ..models.create_table_request_indexes import CreateTableRequestIndexes
         from ..models.replication_source import ReplicationSource
         from ..models.table_schema import TableSchema
+        from ..models.table_storage_settings import TableStorageSettings
 
         d = dict(src_dict)
         tablespace_name = d.pop("tablespace_name", UNSET)
+
+        _storage = d.pop("storage", UNSET)
+        storage: TableStorageSettings | Unset
+        if isinstance(_storage, Unset):
+            storage = UNSET
+        else:
+            storage = TableStorageSettings.from_dict(_storage)
 
         num_shards = d.pop("num_shards", UNSET)
 
@@ -164,6 +181,7 @@ class CreateTableRequest:
 
         create_table_request = cls(
             tablespace_name=tablespace_name,
+            storage=storage,
             num_shards=num_shards,
             description=description,
             indexes=indexes,

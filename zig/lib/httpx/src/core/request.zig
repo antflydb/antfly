@@ -53,6 +53,19 @@ pub const Request = struct {
     /// this to the configured client-wide maximum.
     max_response_size: ?usize = null,
     attempt_observer: ?@import("attempt_observer.zig").AttemptObserver = null,
+    /// Borrowed through synchronous execution, including retries and redirects.
+    /// Called before request bytes can reach the peer, never during setup.
+    /// The callback must be nonblocking and must not reset earlier send proof.
+    delivery_observer: ?DeliveryObserver = null,
+
+    pub const DeliveryObserver = struct {
+        context: *anyopaque,
+        before_send: *const fn (*anyopaque) void,
+    };
+
+    pub fn notifySend(self: *const Request) void {
+        if (self.delivery_observer) |observer| observer.before_send(observer.context);
+    }
 
     const Self = @This();
 

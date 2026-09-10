@@ -3703,22 +3703,33 @@ test "public api e2e recreates managed embeddings index after corrupt artifact" 
     // structural worker may legitimately retire its cached writer before the
     // repair owner publishes the replacement, so wait on the public lifecycle
     // contract rather than cache residency or a fixed number of rounds.
-    var wait_io = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer wait_io.deinit();
-    var wait_attempts: usize = 0;
+    const ready_deadline_ns = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
     var semantic_ready = false;
-    while (wait_attempts < 120_000) : (wait_attempts += 1) {
+    var last_backfill_active: ?bool = null;
+    var last_doc_count: ?u64 = null;
+    var last_status_body: ?[]u8 = null;
+    defer if (last_status_body) |body| std.testing.allocator.free(body);
+    while (platform.time.monotonicNs() < ready_deadline_ns) {
         try svc.runRound();
         var status_response = try client.fetchTableIndex(base_uri, "docs", "semantic_idx");
         defer status_response.deinit(std.testing.allocator);
+        const status_body = try std.testing.allocator.dupe(u8, status_response.body);
+        if (last_status_body) |body| std.testing.allocator.free(body);
+        last_status_body = status_body;
         var status = try parseJsonBodyIgnoreUnknown(IndexStatusSummary, std.testing.allocator, status_response.body);
         defer status.deinit();
+        last_backfill_active = status.value.status.backfill_active;
+        last_doc_count = status.value.status.doc_count;
         if (status.value.status.backfill_active == false and status.value.status.doc_count == 2) {
             semantic_ready = true;
             break;
         }
-        wait_io.io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+        probe_retry_io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
     }
+    if (!semantic_ready) std.log.err(
+        "managed embeddings recreation readiness deadline exceeded backfill_active={any} doc_count={any} status={s}",
+        .{ last_backfill_active, last_doc_count, last_status_body orelse "missing" },
+    );
     try std.testing.expect(semantic_ready);
 }
 
