@@ -55,6 +55,51 @@ its readiness, maintenance-cycle, query, and restart checks and takes about
 Linux reproduction and soak results are recorded in the
 [E2E history](e2e/FLAKES.md#completed-cli-readiness-regresses-after-publication-696).
 
+## Slow Raft sync kills the runtime; targeted activation joins sibling work (#694)
+
+The Linux soak of `70e0b11869` exposed two additional signatures, separate from
+late source notification and catalog-admission coverage lag. A quickstart
+could see the new thumbnail incarnation in the catalog without any owning-group
+runtime observation within its five-second activation deadline. Two retained
+standalone logs showed structural reconciliation pending during dense projection
+finalization. The cached-writer path started its replacement enrichment runtime
+before catalog mutation, forcing a second cancellation/join; target reconciliation
+also synced every index, including unrelated storage maintenance.
+
+Cached-writer reconciliation now installs the replacement producer paused,
+reconciles durable index admission, then starts it and publishes the matching
+configuration fingerprint. Targeted reconciliation syncs only its installed
+index; deletion does not sync surviving siblings. The lifecycle regression
+checks the paused admission boundary, and another regression holds a sibling's
+actual LSM storage lock while creating and dropping the target index.
+
+Two metadata processes exited with `RaftProgressDriverStalled` after successful
+WAL syncs of 6.315 and 6.495 seconds. The five-second progress watchdog was used
+both for readiness and terminal supervision. Supervision now observes only
+actual source errors; elapsed round duration continues to make readiness false.
+Its failure-event wait retains the full control cadence, preventing a hot loop
+while a round is stalled. Both metadata and data runtimes use this separation.
+No durability acknowledgement moves ahead of sync. Raft's existing
+`async_storage_writes` flag still calls the persistence hook inline, so enabling
+that flag alone would not remove the I/O wait.
+
+A deterministic blocked-round regression verifies unhealthy readiness, continued
+nonfatal supervision with a real timed wait, and readiness recovery on the same
+driver after release. Actual source errors still fail immediately. The focused
+Raft run passed all 12 checks; the final activation lifecycle run passed all
+222 checks, including both new regressions, without leaks. Fixed Linux acceptance
+is pending. Backup failure teardown now captures bounded native thread stacks
+through the existing opt-in disposable-child launcher; the shared helper is also
+used by scaling tests. All 71 affected Python harness checks passed, and debugger
+attachment was verified in the Linux runner without changing host ptrace policy.
+
+The same diagnostic soak also recorded a seed batch with unknown write outcome
+and contended Raft state, a restore job remaining nonterminal for 120 seconds,
+and a partial-coverage index whose replay target stalled while a later source
+was pending. Their cluster states and logs are retained separately; these
+changes do not yet establish that those causes are resolved. Failed soak executions
+remain baseline evidence and are not included in final acceptance counts.
+
 ## Initial catalog admission quarantines a healthy generation on shadow coverage lag (#694)
 
 Splitting CLI retry exhaustion from the quickstart exposed an additional

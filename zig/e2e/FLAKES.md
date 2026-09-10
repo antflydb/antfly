@@ -56,6 +56,14 @@ retirement and rejects stale incarnation reports at apply time; see the
 Final acceptance requires **100/100 for each affected test**, using the branch
 with the native-storage main merge and all fixes, without failure retries.
 
+The follow-up Linux soak of `70e0b11869` is **not a passing acceptance run**.
+It exposed thumbnail activation without a runtime owner observation, two
+metadata exits after slow successful WAL sync, and a seed batch with unknown
+write outcome. Failure roots and raw worker logs were retained. See the
+[runtime diagnosis](../FLAKES.md#slow-raft-sync-kills-the-runtime-targeted-activation-joins-sibling-work-694)
+for the production changes and remaining write-timeout investigation. A fresh
+100-per-scenario soak is required after those changes.
+
 The CLI quickstart now separates retry exhaustion into
 `test_cli_index_wait_survives_retry_exhaustion_and_restart`. The quickstart
 retains the 10.5-second maintenance observation, completed list/detail

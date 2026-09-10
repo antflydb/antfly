@@ -24107,7 +24107,7 @@ pub fn runFromIterator(
     while (!supervisor.shouldStop(termination_signals.cancellationRequested())) {
         if (data_server.publicListenerFailure()) |err| return supervisor.fail("data", "public-http", err);
         if (health_server) |hs| if (hs.runtimeFailure()) |err| return supervisor.fail("health", "http", err);
-        if (data_server.data_raft != null) raft_progress.check() catch |err| {
+        if (data_server.data_raft != null) raft_progress.checkFailure() catch |err| {
             return supervisor.fail("data", "raft-progress", err);
         };
         data_server.runControlRoundOnly() catch |err| {

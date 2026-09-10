@@ -40,6 +40,7 @@ from conftest import (
 )
 from e2e_scheduler import e2e_resource
 from helpers import assert_created_index, wait_until
+from native_debug import debuggable_command, native_stack_dumps
 from port_reservations import LoopbackPortReservations
 
 BACKUP_CONNECTION = "e2e-backups"
@@ -711,7 +712,7 @@ class ThreeByThreeBackupCluster:
             proc = self.port_reservations.handoff_to(
                 (self.metadata_raft_ports[i], self.metadata_admin_ports[i]),
                 lambda: subprocess.Popen(
-                    command,
+                    debuggable_command(command),
                     stdout=self.metadata_log_files[i],
                     stderr=subprocess.STDOUT,
                     cwd=REPO_ROOT,
@@ -739,7 +740,7 @@ class ThreeByThreeBackupCluster:
                 (self.data_ports[i], self.data_raft_ports[i]),
                 lambda command=data_command, log_file=self.data_log_files[i]: (
                     subprocess.Popen(
-                        command,
+                        debuggable_command(command),
                         stdout=log_file,
                         stderr=subprocess.STDOUT,
                         cwd=REPO_ROOT,
@@ -1096,6 +1097,20 @@ class ThreeByThreeBackupCluster:
         return self.metadata_public_urls[leader_id - 1]
 
     def stop(self, *, test_failed: bool = False) -> None:
+        if test_failed and os.environ.get("ANTFLY_E2E_NATIVE_STACKS") == "1":
+            stacks = native_stack_dumps(
+                (f"{label}-{index}", proc)
+                for label, procs in (
+                    ("data", self.data_procs),
+                    ("metadata", self.metadata_procs),
+                )
+                for index, proc in enumerate(procs, start=1)
+            )
+            try:
+                (self.root / "native-stacks.log").write_text(stacks, encoding="utf-8")
+            except OSError as exc:
+                print(f"Unable to preserve native failure stacks: {exc}", flush=True)
+
         if not self._metadata_probe_executor_shutdown:
             self._metadata_probe_executor.shutdown(wait=True, cancel_futures=True)
             self._metadata_probe_executor_shutdown = True
