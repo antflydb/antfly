@@ -1665,7 +1665,7 @@ test "io threaded deferred source capture advances empty targets only through co
     var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, Coverage.allow, null, &manager);
     defer runtime.deinit();
     try runtime.addWorker("dense", .{ .name = "dense", .kind = .dense_vector }, 0);
-    try runtime.waitForAllWithVisibilityWait(1, .none, platform_time.monotonicNs() + 5 * std.time.ns_per_s);
+    try runtime.waitForAllWithVisibilityWait(1, .{ .deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s });
     try std.testing.expectEqual(@as(u64, 2), capture.empty_coverage_checks.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), capture.begin_calls.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), capture.apply_calls.load(.monotonic));

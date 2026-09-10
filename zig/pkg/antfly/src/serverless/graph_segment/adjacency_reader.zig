@@ -113,7 +113,7 @@ pub const Reader = struct {
         self.page = page;
     }
 
-    fn ordinal(self: *Reader, key: []const u8) !?u32 {
+    pub fn ordinal(self: *Reader, key: []const u8) !?u32 {
         const pages = self.context.layout.?.pages;
         if (pages == 0) return null;
         // Authenticated 64-byte fence prefixes usually identify one page with
@@ -167,6 +167,11 @@ pub const Reader = struct {
     }
     fn row(self: *Reader, key: []const u8) !?Row {
         const node = try self.ordinal(key) orelse return null;
+        return self.rowOrdinal(node);
+    }
+
+    fn rowOrdinal(self: *Reader, node: u32) !?Row {
+        if (node >= self.context.layout.?.nodes) return error.InvalidGraphSegment;
         const routing = self.context.trailer.body_len + self.context.trailer.topology_len;
         const raw = try self.context.readAlloc(self.alloc, routing + @as(u64, node) * 8, 8);
         defer self.alloc.free(raw);
@@ -207,9 +212,14 @@ pub const Reader = struct {
         return lower;
     }
 
-    fn copyEdge(self: *Reader, edge: wire.Edge) !types.Edge {
-        try self.loadPage(edge.node / wire.node_page_entries);
-        const neighbor = try self.alloc.dupe(u8, self.page_nodes[edge.node % wire.node_page_entries]);
+    pub fn nodeNameAlloc(self: *Reader, node: u32) ![]u8 {
+        if (node >= self.context.layout.?.nodes) return error.InvalidGraphSegment;
+        try self.loadPage(node / wire.node_page_entries);
+        return self.alloc.dupe(u8, self.page_nodes[node % wire.node_page_entries]);
+    }
+
+    pub fn copyEdge(self: *Reader, edge: wire.Edge) !types.Edge {
+        const neighbor = try self.nodeNameAlloc(edge.node);
         errdefer self.alloc.free(neighbor);
         return .{ .neighbor_id = neighbor, .edge_type = try self.context.kindAlloc(edge.edge_type), .weight = edge.weight, .neighbor_table_id = edge.table };
     }
@@ -238,7 +248,7 @@ pub const Reader = struct {
             return try self.reader.copyEdge(try self.nextWire() orelse return null);
         }
 
-        fn nextWire(self: *Cursor) !?wire.Edge {
+        pub fn nextWire(self: *Cursor) !?wire.Edge {
             while (self.range < self.ranges.len) {
                 const selected = self.ranges[self.range];
                 self.position = @max(self.position, selected.begin);
@@ -271,18 +281,40 @@ pub const Reader = struct {
         return self.cursorAt(offset, count, requested, work);
     }
 
+    /// Resolve the type dictionary once per query, not once per expanded row.
+    /// Null means wildcard; an owned empty list means no matching types.
+    pub fn resolveTypes(self: *Reader, requested: []const []const u8) !?[]u32 {
+        if (requested.len == 0) return null;
+        var ids: std.ArrayListUnmanaged(u32) = .empty;
+        errdefer ids.deinit(self.alloc);
+        for (requested) |kind| if (try self.context.kindId(kind)) |id| {
+            if (std.mem.indexOfScalar(u32, ids.items, id) == null) try ids.append(self.alloc, id);
+        };
+        std.mem.sort(u32, ids.items, {}, std.sort.asc(u32));
+        return try ids.toOwnedSlice(self.alloc);
+    }
+
+    pub fn cursorOrdinal(self: *Reader, node: u32, types_filter: ?[]const u32, incoming: bool, work: *usize) !Cursor {
+        const found = try self.rowOrdinal(node);
+        const offset = if (found) |r| r.offset + (if (incoming) @as(u64, r.out) * wire.edge_len else 0) else 0;
+        const count: usize = if (found) |r| (if (incoming) r.in else r.out) else 0;
+        return self.cursorAtTypes(offset, count, types_filter, work);
+    }
+
     fn cursorAt(self: *Reader, offset: u64, count: usize, requested: []const []const u8, work: *usize) !Cursor {
+        if (count == 0) return .{ .reader = self, .offset = offset, .ranges = &.{}, .work = work };
+        const ids = try self.resolveTypes(requested);
+        defer if (ids) |values| self.alloc.free(values);
+        return self.cursorAtTypes(offset, count, ids, work);
+    }
+
+    fn cursorAtTypes(self: *Reader, offset: u64, count: usize, types_filter: ?[]const u32, work: *usize) !Cursor {
         if (count == 0) return .{ .reader = self, .offset = offset, .ranges = &.{}, .work = work };
         var ranges: std.ArrayListUnmanaged(Cursor.Range) = .empty;
         errdefer ranges.deinit(self.alloc);
-        if (requested.len == 0) {
+        if (types_filter == null) {
             if (count != 0) try ranges.append(self.alloc, .{ .begin = 0, .end = count });
-        } else for (requested, 0..) |kind, i| {
-            const duplicate = for (requested[0..i]) |prior| {
-                if (std.mem.eql(u8, prior, kind)) break true;
-            } else false;
-            if (duplicate) continue;
-            const id = try self.context.kindId(kind) orelse continue;
+        } else for (types_filter.?) |id| {
             const begin = try self.lowerBound(offset, count, @intCast(id), 0, work);
             const end = try self.lowerBound(offset, count, @intCast(id + 1), 0, work);
             if (begin != end) try ranges.append(self.alloc, .{ .begin = begin, .end = end });

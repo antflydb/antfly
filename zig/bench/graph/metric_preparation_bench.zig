@@ -199,6 +199,7 @@ pub fn main(init: std.process.Init) !void {
     var indexing_only = false;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--paged-only")) return @import("paged_read_bench.zig").run(init.io, &output);
+        if (std.mem.eql(u8, arg, "--prune-only")) return benchmarkRangePrune(init.io, &output);
         if (std.mem.eql(u8, arg, "--presence-only")) return benchmarkPresence(&output);
         if (std.mem.eql(u8, arg, "--tree-only")) return benchmarkTreeValidation(init.io, &output);
         if (std.mem.eql(u8, arg, "--indexing-only")) {
@@ -489,6 +490,38 @@ fn benchmarkTreeValidation(io: std.Io, out: anytype) !void {
             try out.interface.writeByte('\n');
             try out.flush();
         }
+    }
+}
+
+fn benchmarkRangePrune(io: std.Io, out: anytype) !void {
+    const alloc = std.heap.smp_allocator;
+    for ([_]usize{ 4096, 16384 }) |count| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const root = try std.fmt.allocPrint(a, "/tmp/antfly-range-prune-bench-{d}", .{antfly.platform_time.monotonicNs()});
+        try std.Io.Dir.cwd().createDirPath(io, root);
+        defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        const forward = try std.fmt.allocPrintSentinel(a, "{s}/forward", .{root}, 0);
+        const reverse = try std.fmt.allocPrintSentinel(a, "{s}/reverse", .{root}, 0);
+        var index = try antfly.graph.GraphIndex.openWithPrivateStores(alloc, forward, reverse, "g", .{});
+        defer index.close();
+        const writes = try a.alloc(antfly.graph.BatchWrite, count);
+        for (writes, 0..) |*write, i| write.* = .{ .source = try std.fmt.allocPrint(a, "source-{d:0>8}", .{i}), .target = "hub", .edge_type = "link" };
+        var samples: [5]u64 = undefined;
+        for (0..6) |sample| {
+            try index.batchApply(writes, &.{});
+            const start = std.Io.Clock.awake.now(io);
+            const removed = try index.pruneOwnedRange(alloc, "source-", "");
+            const elapsed: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds());
+            if (removed != count or index.edge_count != 0 or index.node_count != 0) return error.InvalidBenchmarkResult;
+            if (sample != 0) samples[sample - 1] = elapsed;
+        }
+        std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+        const json = try std.json.Stringify.valueAlloc(a, .{ .mode = "durable_stateful_range_prune", .edges = count, .page_record_limit = 1024, .page_identity_byte_limit = 4 * 1024 * 1024, .median_ns = samples[2], .note = "default LSM; includes durable intent, forward sync, reverse accounting and intent retirement; excludes fixture insertion; five warm samples" }, .{});
+        try out.interface.writeAll(json);
+        try out.interface.writeByte('\n');
+        try out.flush();
     }
 }
 

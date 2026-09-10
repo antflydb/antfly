@@ -250,16 +250,31 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
   the same bounded single-flight cache as metric reads. Keys bind artifact
   identity, extent, and trusted digest; canceled or failed producers cannot
   publish partial data. Cache hits consume no origin-read bytes.
-- Dedicated graph traversal and shortest-path queries consume resumable edge
-  cursors, charging inspected records as the consumer advances. Traversal owns
-  distinct identities, not complete visited rows. Neighbor selection retains
-  only top-k candidates under the request memory allowance.
+- Dedicated packed graph traversal and shortest-path queries retain numeric
+  node/type IDs during BFS and decode only returned paths. Table-qualified
+  targets cannot alias local identities. Ordered neighbor queries stop after
+  the requested prefix; all inspected records still consume the work budget.
+- Public traversal, path, and MATCH consumers use request-local edge streams
+  on both native graph indexes and packed serverless artifacts. Native streams
+  use the caller-pinned generation; packed streams bind immutable artifacts.
+  Batches hold at most 64 edges, preserve vectorized admission/filtering, and
+  stop when the consumer has its answer. Adapters without a streaming source
+  retain the existing bounded materialized fallback.
 - Stateful tree ingestion validates final identities once per `(source, type)`;
   deletes precede writes, including reinsertion of a deleted identity. Reverse
   rebuild and outgoing split-copy scans borrow cursor entries from a stable
   snapshot and commit batches bounded by both record count and 4 MiB of encoded
-  key/value bytes (or one larger indivisible record). Counter reconstruction
-  still retains endpoint metadata, independently of edge payload bytes.
+  key/value bytes (or one larger indivisible record).
+- Split pruning persists a bounded identity intent before removing forward
+  edges, then atomically retires that intent with reverse edges, counters,
+  typed postings, and metric dependency invalidation. Forward data is synced
+  before intent retirement, including relaxed-durability splits. Opening an
+  index resumes unfinished intents before publishing it to readers.
+- Exclusive counter repair uses durable cleanup/recount cursors committed with
+  each page, not a graph-wide endpoint map. Pages retain at most 1,024 identities
+  and 4 MiB of identity bytes (one oversized identity is indivisible). A new
+  dependency epoch marks published scores stale; operator pause/disable settings
+  survive repair. Reopening finishes an interrupted repair before serving reads.
 - An authenticated eight-byte-per-dictionary-node routing array addresses
   adjacency rows. Public MATCH, traversal, path, and dedicated graph-query
   readers resolve dictionary pages through the small fence directory, then read

@@ -7145,9 +7145,112 @@ const ServerlessGraphReadBudget = struct {
     }
 };
 
+fn openPublicEdgeStream(a: Allocator, cached: *const CachedPublicGraphSegment, budget: *ServerlessGraphReadBudget, key: []const u8, kinds: []const []const u8, direction: graph_mod.EdgeDirection, include_qualified: bool) !@import("../../graph/edge_stream.zig").Stream {
+    const Stream = @import("../../graph/edge_stream.zig").Stream;
+    if (cached.paged == null) {
+        const edges = try allocPublicSegmentEdgesBounded(a, cached, budget, null, key, kinds, direction, include_qualified, if (budget.work_budget) |b| b.edgeLimit() else public_graph_max_edges_scanned, if (budget.work_budget) |b| b.edgeByteLimit() else 64 * 1024 * 1024);
+        errdefer {
+            for (edges) |edge| freeOwnedGraphEdge(a, edge);
+            a.free(edges);
+        }
+        return Stream.fromOwned(a, ServerlessTraversalEdgeReader{ .cached = cached, .budget = budget }, edges);
+    }
+    const reader = &cached.paged.?.reader;
+    const ids = reader.resolveTypes(kinds) catch |err| return cached.paged.?.translate(err);
+    errdefer if (ids) |values| reader.alloc.free(values);
+    const node = reader.ordinal(key) catch |err| return cached.paged.?.translate(err);
+    return Stream.init(a, PublicEdgeCursor{ .cached = cached, .budget = budget, .key = key, .node = node, .types_filter = ids, .direction = direction, .phase = if (direction == .in) .in else .out, .include_qualified = include_qualified });
+}
+
+const PublicEdgeCursor = struct {
+    const WireEdge = @import("../graph_segment/packed.zig").Edge;
+    cached: *const CachedPublicGraphSegment,
+    budget: *ServerlessGraphReadBudget,
+    key: []const u8,
+    node: ?u32,
+    types_filter: ?[]u32,
+    direction: graph_mod.EdgeDirection,
+    phase: graph_mod.EdgeDirection,
+    include_qualified: bool,
+    cursor: ?graph_segment_mod.AdjacencyReader.Cursor = null,
+    pending: ?WireEdge = null,
+    remaining: usize = 0,
+    done: bool = false,
+
+    pub fn deinit(self: *PublicEdgeCursor, _: Allocator) void {
+        if (self.cursor) |*cursor| cursor.deinit();
+        if (self.types_filter) |ids| self.cached.paged.?.reader.alloc.free(ids);
+    }
+
+    fn nextWire(self: *PublicEdgeCursor) !?WireEdge {
+        if (self.pending) |edge| {
+            self.pending = null;
+            return edge;
+        }
+        const reader = &self.cached.paged.?.reader;
+        while (!self.done and self.node != null) {
+            self.remaining = public_graph_max_edges_scanned -| self.budget.edges_scanned;
+            const initial = self.remaining;
+            if (self.cursor == null) self.cursor = try reader.cursorOrdinal(self.node.?, self.types_filter, self.phase == .in, &self.remaining);
+            const edge = try self.cursor.?.nextWire();
+            try self.budget.admitEdges(initial - self.remaining);
+            if (edge) |value| {
+                if ((!self.include_qualified and value.table != null) or
+                    (self.direction == .both and self.phase == .in and value.node == self.node.?)) continue;
+                return value;
+            }
+            self.cursor.?.deinit();
+            self.cursor = null;
+            if (self.direction == .both and self.phase == .out) self.phase = .in else self.done = true;
+        }
+        return null;
+    }
+
+    pub fn nextPage(self: *PublicEdgeCursor, a: Allocator, count: usize, max_bytes: usize) !?[]graph_mod.Edge {
+        return self.nextPageInner(a, count, max_bytes) catch |err| return self.cached.paged.?.translate(err);
+    }
+
+    fn nextPageInner(self: *PublicEdgeCursor, a: Allocator, count: usize, max_bytes: usize) !?[]graph_mod.Edge {
+        var out = std.ArrayListUnmanaged(graph_mod.Edge).empty;
+        errdefer {
+            for (out.items) |edge| freeOwnedGraphEdge(a, edge);
+            out.deinit(a);
+        }
+        const reader = &self.cached.paged.?.reader;
+        var owned_bytes: usize = 0;
+        while (out.items.len < count) {
+            const wire_edge = try self.nextWire() orelse break;
+            var edge = try reader.copyEdge(wire_edge);
+            defer edge.deinit(reader.alloc);
+            const metadata = if (self.phase == .out) self.cached.edgeMetadata(edge) else null;
+            var size: usize = @sizeOf(graph_mod.Edge);
+            for ([_]usize{ self.key.len, edge.neighbor_id.len, edge.edge_type.len, if (metadata) |bytes| bytes.len else 0 }) |len| {
+                size = std.math.add(usize, size, len) catch return error.GraphExploredEdgeBytesBudgetExceeded;
+            }
+            if (size > max_bytes -| owned_bytes or (out.items.len > 0 and size +| owned_bytes > @import("../../graph/edge_stream.zig").batch_bytes)) {
+                if (out.items.len == 0) return error.GraphExploredEdgeBytesBudgetExceeded;
+                self.pending = wire_edge;
+                break;
+            }
+            try out.ensureUnusedCapacity(a, 1);
+            out.appendAssumeCapacity(try clonePublicSegmentEdge(a, if (self.phase == .in) edge.neighbor_id else self.key, if (self.phase == .in) self.key else edge.neighbor_id, edge.edge_type, edge.weight, metadata));
+            owned_bytes += size;
+        }
+        if (out.items.len == 0) {
+            out.deinit(a);
+            return null;
+        }
+        return try out.toOwnedSlice(a);
+    }
+};
+
 const ServerlessTraversalEdgeReader = struct {
     cached: *const CachedPublicGraphSegment,
     budget: *ServerlessGraphReadBudget,
+
+    pub fn openEdgeStream(self: @This(), a: Allocator, key: []const u8, kinds: []const []const u8, direction: graph_mod.EdgeDirection) !@import("../../graph/edge_stream.zig").Stream {
+        return openPublicEdgeStream(a, self.cached, self.budget, key, kinds, direction, true);
+    }
 
     pub fn getEdges(
         self: @This(),
@@ -7183,6 +7286,10 @@ const ServerlessPathEdgeReader = struct {
     cached: *const CachedPublicGraphSegment,
     budget: *ServerlessGraphReadBudget,
 
+    pub fn openEdgeStream(self: @This(), a: Allocator, key: []const u8, kinds: []const []const u8, direction: graph_mod.EdgeDirection) !@import("../../graph/edge_stream.zig").Stream {
+        return openPublicEdgeStream(a, self.cached, self.budget, key, kinds, direction, false);
+    }
+
     pub fn getEdges(
         self: @This(),
         alloc: Allocator,
@@ -7214,6 +7321,11 @@ const ServerlessPatternEdgeReader = struct {
     cached: *const CachedPublicGraphSegment,
     budget: *ServerlessGraphReadBudget,
     source_table: []const u8,
+
+    pub fn openPatternEdgeStream(self: @This(), a: Allocator, table: ?[]const u8, key: []const u8, kinds: []const []const u8, direction: graph_mod.EdgeDirection, declared: bool) !@import("../../graph/edge_stream.zig").Stream {
+        try self.validatePatternSourceTable(table, declared);
+        return openPublicEdgeStream(a, self.cached, self.budget, key, kinds, direction, true);
+    }
 
     /// MATCH represents nodes in the queried table with a null qualifier. Keep
     /// explicit source-table spelling equivalent to omission in every runtime.
@@ -14018,6 +14130,45 @@ test "serverless public graph query rejects exact sort controls" {
         generated_plain_body,
         .none,
     )) == null);
+}
+
+test "serverless public packed graph streams bound hub prefixes and resume across pages" {
+    const a = std.testing.allocator;
+    var root_buf: [256]u8 = undefined;
+    const root = tmpPath(&root_buf, "public-graph-stream");
+    defer cleanupTmp(root);
+    var fs = try artifacts_mod.FsStore.init(a, std.mem.span(root));
+    var store = fs.artifactStore();
+    defer store.deinit();
+    var builder = graph_segment_mod.Builder{ .alloc = a };
+    defer builder.deinit();
+    for (0..130) |i| {
+        const key = try std.fmt.allocPrint(a, "n{d:0>3}", .{i});
+        defer a.free(key);
+        try builder.addEdge("hub", key, "link", 1, null);
+    }
+    const payload = try builder.encodeAlloc(1024 * 1024, .none);
+    defer a.free(payload);
+    var meta = try store.put(payload);
+    defer meta.deinit(a);
+    var ref = manifest_mod.ArtifactRef{ .kind = .graph_segment, .name = "g", .artifact_id = meta.artifact_id, .checksum = meta.checksum, .byte_len = meta.byte_len };
+    try graph_segment_mod.codec.compact.bindTopologyControl(&ref, payload);
+    var paged: AdmittedAdjacencyReader = undefined;
+    paged.allocation = .{ .backing = a, .budget = null };
+    var remaining: u64 = 1024 * 1024;
+    paged.reader = (try graph_segment_mod.AdjacencyReader.init(paged.allocation.allocator(), &store, ref, .none, &remaining)).?;
+    defer paged.reader.deinit();
+    const cached = CachedPublicGraphSegment{ .index_name = @constCast("g"), .paged = &paged };
+    for ([_]usize{ 1, 130 }) |limit| {
+        var budget = graph_work_budget_mod.WorkBudget.init(200, limit);
+        var reads = ServerlessGraphReadBudget{ .cancellation = .none, .work_budget = &budget };
+        const reader = ServerlessTraversalEdgeReader{ .cached = &cached, .budget = &reads };
+        const reached = try graph_traversal.traverseWithEdgeReader(a, reader, "hub", .{ .max_depth = 1, .max_results = @intCast(limit), .work_budget = &budget });
+        defer graph_traversal.freeOwnedResults(a, reached);
+        try std.testing.expectEqual(limit, reached.len);
+        try std.testing.expectEqualStrings("n000", reached[0].key);
+        try std.testing.expectEqual(limit, reads.edges_scanned);
+    }
 }
 
 test "serverless public graph reader shares weighted traversal and k shortest semantics" {

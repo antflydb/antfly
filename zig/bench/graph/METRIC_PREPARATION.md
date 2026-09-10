@@ -1,5 +1,37 @@
 # Graph metric execution and query benchmarks
 
+## Demand-driven queries and recoverable pruning (2026-09-10)
+
+The `--paged-only` harness now also runs complete dedicated limit-1 neighbor
+and traversal queries with a one-edge scan budget. Apple M4 Max, Zig 0.16.0,
+ReleaseSafe, five samples after one warmup; each query has a fresh session and
+no shared cache. Timings include authentication, result ownership, and cleanup.
+
+| 100,000-edge hub | Median | Fetched bytes | GETs |
+| --- | ---: | ---: | ---: |
+| Eager row materialization | 11.566 ms | 4,070,765 | 64 |
+| Limit-1 neighbors | 0.212 ms | 335,213 | 7 |
+| Limit-1 traversal | 0.198 ms | 335,213 | 7 |
+
+This compares a materialization baseline with complete prefix queries, not
+identical result workloads or measured network latency. Both queries inspect
+one edge; the old complete-row consumption could fail that budget before
+returning an otherwise available first result.
+
+`--prune-only` exercises the default durable stateful LSM with six insert/prune
+cycles, excluding insertion from timing and discarding the first sample.
+Pruning 4,096 edges measured 145.619 ms; 16,384 edges measured 676.200 ms. These
+are absolute durability-inclusive costs, not a claimed speedup over the old
+unsafe pruning path. Every page includes intent persistence, forward sync,
+reverse accounting, and intent retirement, with a 1,024-record / 4 MiB identity
+input bound. Tests separately interrupt pruning after the forward commit and
+counter reconstruction between pages, then verify recovery on reopen.
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseSafe -j1 -- --paged-only
+zig build graph-metric-preparation-bench -Doptimize=ReleaseSafe -j1 -- --prune-only
+```
+
 ## Streaming cursors, paged control, and tree batches (2026-09-10)
 
 Current graph wire v8 / manifest v23 / materializer epoch 24 uses a 112-byte

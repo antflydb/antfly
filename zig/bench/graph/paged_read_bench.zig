@@ -184,7 +184,56 @@ pub fn run(io: std.Io, out: anytype) !void {
             try out.flush();
         }
     }
+    try demandQueries(io, out);
     try largeNodeDirectory(io, out);
+}
+
+fn demandQueries(io: std.Io, out: anytype) !void {
+    const alloc = std.heap.smp_allocator;
+    const query = antfly.serverless.query;
+    for ([_]usize{ 16384, 100000 }) |count| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var builder = graph.Builder{ .alloc = a };
+        defer builder.deinit();
+        for (0..count) |i| try builder.addEdge("hub", try std.fmt.allocPrint(a, "customer-{d:0>8}", .{i}), "link", 1, null);
+        const payload = try builder.encodeAlloc(256 * 1024 * 1024, .none);
+        const checksum = try digestAlloc(a, payload);
+        var refs = [_]antfly.serverless.ArtifactRef{.{ .kind = .graph_segment, .name = "g", .artifact_id = try std.fmt.allocPrint(a, "sha256:{s}", .{checksum}), .checksum = checksum, .byte_len = payload.len }};
+        try graph.codec.compact.bindTopologyControl(&refs[0], payload);
+        for ([_]bool{ false, true }) |traversal| {
+            var memory = Memory{ .payload = payload };
+            var store = artifacts.ArtifactStore{ .allocator = alloc, .ptr = &memory, .vtable = &Memory.vtable };
+            var samples: [5]u64 = undefined;
+            for (0..6) |sample| {
+                memory.calls = 0;
+                memory.bytes = 0;
+                const start = std.Io.Clock.awake.now(io);
+                {
+                    var session = query.QuerySession{ .alloc = alloc, .artifacts = &store, .owns_manifest = false, .manifest = .{ .namespace = "n", .version = 1, .built_at_ns = 0, .wal_start_lsn = 0, .wal_end_lsn = 0, .stats = .{}, .artifacts = &refs } };
+                    defer session.deinit();
+                    if (traversal) {
+                        const nodes = try query.graphTraverseWithLimitsAlloc(alloc, &session, .{ .index_name = @constCast("g"), .start_doc_id = @constCast("hub"), .limit = 1, .max_depth = 2, .include_start = false }, .{ .max_edges_scanned = 1 });
+                        defer alloc.free(nodes);
+                        defer for (nodes) |*node| node.deinit(alloc);
+                        if (nodes.len != 1 or !std.mem.eql(u8, nodes[0].doc_id, "customer-00000000")) return error.InvalidBenchmarkResult;
+                    } else {
+                        const nodes = try query.graphNeighborsWithLimitsAlloc(alloc, &session, .{ .index_name = @constCast("g"), .doc_id = @constCast("hub"), .limit = 1 }, .{ .max_edges_scanned = 1 });
+                        defer alloc.free(nodes);
+                        defer for (nodes) |*node| node.deinit(alloc);
+                        if (nodes.len != 1 or !std.mem.eql(u8, nodes[0].doc_id, "customer-00000000")) return error.InvalidBenchmarkResult;
+                    }
+                }
+                if (sample != 0) samples[sample - 1] = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds());
+            }
+            std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+            const json = try std.json.Stringify.valueAlloc(a, .{ .mode = if (traversal) "traverse_hub_limit_1" else "neighbors_hub_limit_1", .edges = count, .artifact_bytes = payload.len, .range_calls = memory.calls, .read_bytes = memory.bytes, .edge_budget = 1, .median_ns = samples[2], .note = "cold query session, no cache or network latency; includes result materialization and cleanup" }, .{});
+            try out.interface.writeAll(json);
+            try out.interface.writeByte('\n');
+            try out.flush();
+        }
+    }
 }
 
 fn largeNodeDirectory(io: std.Io, out: anytype) !void {

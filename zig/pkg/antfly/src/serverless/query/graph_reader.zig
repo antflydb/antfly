@@ -354,6 +354,7 @@ pub fn traverseWithLimitsAlloc(
     try source.init(alloc, session, graph_index, req.edge_types, req.direction, limits.max_edges_scanned);
     defer source.deinit();
     if (!try source.contains(req.start_doc_id)) return try alloc.alloc(TraversalNode, 0);
+    if (source.paged != null) return ordinalTraverseAlloc(alloc, &source, req, &budget) catch |err| return source.translate(err);
 
     var queue = std.ArrayListUnmanaged(QueueItem).empty;
     defer queue.deinit(alloc);
@@ -389,6 +390,7 @@ pub fn traverseWithLimitsAlloc(
             var cursor_edges = try source.cursor(item.doc_id, direction);
             defer cursor_edges.deinit();
             while (try cursor_edges.nextRetained()) |edge| {
+                if (edge.neighbor_table_id != null) continue;
                 try enqueueEdgesAlloc(alloc, &queue, &seen, &parents, &.{edge}, item, direction, req, &budget);
             }
         }
@@ -437,6 +439,7 @@ pub fn shortestPathWithLimitsAlloc(
             .edge_path = try alloc.alloc(PathHop, 0),
         };
     }
+    if (source.paged != null) return ordinalShortestPathAlloc(alloc, &source, req, &budget) catch |err| return source.translate(err);
 
     var queue = std.ArrayListUnmanaged(QueueItem).empty;
     defer queue.deinit(alloc);
@@ -460,6 +463,7 @@ pub fn shortestPathWithLimitsAlloc(
             var cursor_edges = try source.cursor(item.doc_id, direction);
             defer cursor_edges.deinit();
             while (try cursor_edges.nextRetained()) |edge| {
+                if (edge.neighbor_table_id != null) continue;
                 if (try enqueueShortestPathEdgesAlloc(alloc, &queue, &seen, &parents, &.{edge}, item, direction, req, &budget)) |depth| {
                     found_depth = depth;
                     break :search;
@@ -514,7 +518,7 @@ fn streamingNeighborsAlloc(alloc: Allocator, source: *GraphSource, req: request_
         selected.deinit(admitted);
     }
     selected.ensureTotalCapacityPrecise(admitted, req.limit) catch |err| return source.translate(err);
-    for ([_]request_mod.GraphQueryDirection{ .out, .in }) |direction| {
+    directions: for ([_]request_mod.GraphQueryDirection{ .out, .in }) |direction| {
         if (req.direction != .both and req.direction != direction) continue;
         var cursor = try source.cursor(req.doc_id, direction);
         defer cursor.deinit();
@@ -532,9 +536,133 @@ fn streamingNeighborsAlloc(alloc: Allocator, source: *GraphSource, req: request_
             }
             selected.push(admitted, candidate) catch |err| return source.translate(err);
             moved = true;
+            // Current packed rows and directional/type ranges are already in
+            // neighborOrder. The kth match is final; do not scan the hub tail.
+            if (source.paged != null and selected.count() == req.limit) break :directions;
         }
     }
     return materializeNeighborsAlloc(alloc, &selected, limits);
+}
+
+const OrdinalNode = struct {
+    node: u32,
+    parent: ?usize = null,
+    kind: u32 = 0,
+    weight: f32 = 0,
+    depth: u32 = 0,
+    direction: request_mod.GraphQueryDirection = .out,
+};
+
+/// BFS state contains numeric identities only. The immutable artifact defines
+/// their lifetime; names are decoded solely for returned nodes and ancestors.
+fn ordinalSearch(source: *GraphSource, start: []const u8, target: ?[]const u8, max_depth: u32, result_limit: usize, include_start: bool, budget: *GraphTraversalBudget) ![]OrdinalNode {
+    const a = source.allocation.allocator();
+    const reader = &source.paged.?;
+    const start_id = (try reader.ordinal(start)).?;
+    const target_id: ?u32 = if (target) |key| (try reader.ordinal(key)).? else null;
+    const types_filter = try reader.resolveTypes(source.edge_types);
+    defer if (types_filter) |ids| a.free(ids);
+    var nodes = std.ArrayListUnmanaged(OrdinalNode).empty;
+    errdefer nodes.deinit(a);
+    var seen = std.AutoHashMapUnmanaged(u32, void).empty;
+    defer seen.deinit(a);
+    try nodes.append(a, .{ .node = start_id });
+    try seen.put(a, start_id, {});
+    const skip: usize = @intFromBool(!include_start);
+    var head: usize = 0;
+    search: while (head < nodes.items.len and !source.no_edges) : (head += 1) {
+        if (head % 64 == 0) try budget.cancellation.check();
+        if (target_id == null and nodes.items.len - skip >= result_limit) break;
+        const current = nodes.items[head];
+        if (current.depth >= max_depth) continue;
+        for ([_]request_mod.GraphQueryDirection{ .out, .in }) |direction| {
+            if (source.direction != .both and source.direction != direction) continue;
+            var cursor = try reader.cursorOrdinal(current.node, types_filter, direction == .in, &source.remaining_edges);
+            defer cursor.deinit();
+            while (try cursor.nextWire()) |edge| {
+                // Dedicated graph queries use table-local identities. A
+                // qualified target must not alias a local node with that key.
+                if (edge.table != null or seen.contains(edge.node)) continue;
+                try budget.admitNode();
+                try seen.put(a, edge.node, {});
+                try nodes.append(a, .{ .node = edge.node, .parent = head, .kind = edge.edge_type, .weight = edge.weight, .depth = current.depth + 1, .direction = direction });
+                if (target_id) |wanted| {
+                    if (edge.node == wanted) break :search;
+                } else if (nodes.items.len - skip >= result_limit) break :search;
+            }
+        }
+    }
+    return nodes.toOwnedSlice(a);
+}
+
+fn numericResultParents(a: Allocator, source: *GraphSource, nodes: []const OrdinalNode, index: usize, names: *std.AutoHashMapUnmanaged(u32, []const u8), kinds: *std.AutoHashMapUnmanaged(u32, []const u8), parents: *std.StringHashMapUnmanaged(ParentInfo)) ![]const u8 {
+    const reader = &source.paged.?;
+    var current: ?usize = index;
+    while (current) |i| : (current = nodes[i].parent) {
+        if (names.contains(nodes[i].node)) break;
+        const raw = try reader.nodeNameAlloc(nodes[i].node);
+        defer reader.alloc.free(raw);
+        try names.put(a, nodes[i].node, try a.dupe(u8, raw));
+    }
+    current = index;
+    while (current) |i| : (current = nodes[i].parent) {
+        const parent = nodes[i].parent orelse break;
+        const name = names.get(nodes[i].node).?;
+        if (parents.contains(name)) break;
+        if (!kinds.contains(nodes[i].kind)) {
+            const raw = try reader.context.kindAlloc(nodes[i].kind);
+            defer reader.alloc.free(raw);
+            try kinds.put(a, nodes[i].kind, try a.dupe(u8, raw));
+        }
+        try parents.put(a, name, .{ .parent_doc_id = names.get(nodes[parent].node).?, .via_edge_type = kinds.get(nodes[i].kind).?, .direction = nodes[i].direction, .weight = nodes[i].weight });
+    }
+    return names.get(nodes[index].node).?;
+}
+
+fn ordinalTraverseAlloc(alloc: Allocator, source: *GraphSource, req: request_mod.GraphTraverseRequest, budget: *GraphTraversalBudget) ![]TraversalNode {
+    const nodes = try ordinalSearch(source, req.start_doc_id, null, req.max_depth, req.limit, req.include_start, budget);
+    defer source.allocation.allocator().free(nodes);
+    var arena = std.heap.ArenaAllocator.init(source.allocation.allocator());
+    defer arena.deinit();
+    const a = arena.allocator();
+    var names = std.AutoHashMapUnmanaged(u32, []const u8).empty;
+    var kinds = std.AutoHashMapUnmanaged(u32, []const u8).empty;
+    var parents = std.StringHashMapUnmanaged(ParentInfo).empty;
+    const skip: usize = @intFromBool(!req.include_start);
+    const count = @min(req.limit, nodes.len - skip);
+    const minimum_bytes = std.math.mul(usize, count, @sizeOf(TraversalNode)) catch return error.GraphTraversalQueryBudgetExceeded;
+    if (minimum_bytes > budget.limits.max_result_bytes -| budget.result_bytes) return error.GraphTraversalQueryBudgetExceeded;
+    const result = try alloc.alloc(TraversalNode, count);
+    errdefer alloc.free(result);
+    var initialized: usize = 0;
+    errdefer for (result[0..initialized]) |*node| node.deinit(alloc);
+    for (result, skip..) |*node, i| {
+        const name = try numericResultParents(a, source, nodes, i, &names, &kinds, &parents);
+        try budget.admitResultBytes(try traversalNodeAllocatedBytes(&parents, name, req.include_start));
+        node.* = try buildTraversalNodeAlloc(alloc, &parents, .{ .doc_id = name, .depth = nodes[i].depth }, req.include_start);
+        initialized += 1;
+    }
+    return result;
+}
+
+fn ordinalShortestPathAlloc(alloc: Allocator, source: *GraphSource, req: request_mod.GraphShortestPathRequest, budget: *GraphTraversalBudget) !?ShortestPath {
+    const nodes = try ordinalSearch(source, req.start_doc_id, req.end_doc_id, req.max_depth, 0, true, budget);
+    defer source.allocation.allocator().free(nodes);
+    if (nodes[nodes.len - 1].node != (try source.paged.?.ordinal(req.end_doc_id)).?) return null;
+    var arena = std.heap.ArenaAllocator.init(source.allocation.allocator());
+    defer arena.deinit();
+    const a = arena.allocator();
+    var names = std.AutoHashMapUnmanaged(u32, []const u8).empty;
+    var kinds = std.AutoHashMapUnmanaged(u32, []const u8).empty;
+    var parents = std.StringHashMapUnmanaged(ParentInfo).empty;
+    const name = try numericResultParents(a, source, nodes, nodes.len - 1, &names, &kinds, &parents);
+    try budget.admitResultBytes(try graphResultAdd(@sizeOf(ShortestPath), try pathResultAllocatedBytes(&parents, name, true)));
+    const path = try buildPathAlloc(alloc, &parents, name, true);
+    errdefer {
+        for (path) |part| alloc.free(part);
+        alloc.free(path);
+    }
+    return .{ .depth = nodes[nodes.len - 1].depth, .path = path, .edge_path = try buildEdgePathAlloc(alloc, &parents, name) };
 }
 
 fn selectNeighborsAlloc(
@@ -950,10 +1078,16 @@ test "serverless graph cursor queries stop early retain top k and share authenti
             var path = (try shortestPathWithLimitsAlloc(a, &session, .{ .start_doc_id = @constCast("a"), .end_doc_id = @constCast("b"), .direction = .both }, .{ .max_edges_scanned = 1 })).?;
             defer path.deinit(a);
             try std.testing.expectEqual(@as(u32, 1), path.depth);
-            const neighbors = try neighborsWithLimitsAlloc(a, &session, .{ .doc_id = @constCast("a"), .limit = 1, .direction = .both }, .{ .max_edges_scanned = 3 });
+            const neighbors = try neighborsWithLimitsAlloc(a, &session, .{ .doc_id = @constCast("a"), .limit = 1, .direction = .both }, .{ .max_edges_scanned = 1 });
             defer freeNeighbors(a, neighbors);
             try std.testing.expectEqual(@as(usize, 1), neighbors.len);
             try std.testing.expectEqualStrings("b", neighbors[0].doc_id);
+            const reached = try traverseWithLimitsAlloc(a, &session, .{ .start_doc_id = @constCast("a"), .max_depth = 2, .limit = 1, .include_start = false }, .{ .max_edges_scanned = 1 });
+            defer freeTraversalNodes(a, reached);
+            try std.testing.expectEqual(@as(usize, 1), reached.len);
+            try std.testing.expectEqualStrings("b", reached[0].doc_id);
+            const qualified = try shortestPathWithLimitsAlloc(a, &session, .{ .start_doc_id = @constCast("a"), .end_doc_id = @constCast("b"), .edge_types = &.{"remote"} }, .{});
+            try std.testing.expect(qualified == null);
             const empty = try neighborsWithLimitsAlloc(a, &session, .{ .doc_id = @constCast("a"), .limit = 1, .edge_types = &.{} }, .{ .max_edges_scanned = 1 });
             defer freeNeighbors(a, empty);
             try std.testing.expectEqual(@as(usize, 0), empty.len);
@@ -974,6 +1108,8 @@ test "serverless graph cursor queries stop early retain top k and share authenti
     try builder.addEdge("a", "b", "link", 1, null);
     try builder.addEdge("a", "c", "link", 1, null);
     try builder.addEdge("d", "a", "link", 1, null);
+    // The foreign b shares a spelling with local b, but not its identity.
+    try builder.addEdge("a", "b", "remote", 1, "foreign");
     const payload = try builder.encodeAlloc(1024 * 1024, .none);
     defer alloc.free(payload);
     var digest: [32]u8 = undefined;

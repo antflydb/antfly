@@ -4959,7 +4959,7 @@ pub fn build(b: *std.Build) void {
     const serverless_tests = b.addTest(.{
         // macOS ReleaseFast measured 10.74 GB for this root. Reserve realistic
         // compiler headroom for aggregate scheduling; Linux CI stays bounded.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 11 else 7) * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
         .root_module = antfly_test_mod,
         .filters = &serverless_default_filters,
         .test_runner = .{
@@ -10231,6 +10231,7 @@ pub fn build(b: *std.Build) void {
     chaos_test_step.dependOn(storage_vopr_step);
 
     const graph_metric_unit_filters = [_][]const u8{
+        "graph maintenance",
         "graph metric tree batch validation",
         "graph rebuildReverseFromOwnedOutgoingEdges",
         "db graph reverse rebuild resumes after interrupted reopen",

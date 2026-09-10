@@ -35,6 +35,7 @@ const ordinal_blocks = @import("ordinal.zig");
 const adjacency_blocks = @import("adjacency.zig");
 const topology_owner = @import("topology_owner.zig");
 const typed_edges = @import("typed_edges.zig");
+const maintenance = @import("maintenance.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const backend_scan = @import("../storage/backend_scan.zig");
 const docstore = @import("../storage/docstore.zig");
@@ -750,6 +751,8 @@ test "graph metric edge filter validation uses configured edge type metadata" {
 
 const reverse_rebuild_batch_size: usize = 1024;
 pub var test_abort_reverse_rebuild_after_batches: ?usize = null;
+pub var test_abort_prune_after_forward_commit = false;
+pub var test_abort_counter_rebuild_after_pages: ?usize = null;
 const graph_meta_prefix = "meta:";
 const graph_edge_count_key = "meta:edge_count";
 const graph_node_count_key = "meta:node_count";
@@ -819,6 +822,7 @@ pub const GraphIndex = struct {
     topology_preparation_only: bool = false,
     topology_preparation_mutex: std.atomic.Mutex = .unlocked,
     topology_preparation_cursor: ?[64]u8 = null,
+    prune_pending: bool = false,
     alloc: Allocator,
     index_name: []const u8,
     outgoing_store: backend_erased.Store,
@@ -5930,83 +5934,134 @@ pub const GraphIndex = struct {
         }
     }
 
-    fn rememberNodeRefCount(self: *GraphIndex, counts: *std.StringHashMapUnmanaged(u64), node: []const u8) !void {
-        const result = try counts.getOrPut(self.alloc, node);
-        if (result.found_existing) {
-            result.value_ptr.* += 1;
-            return;
+    fn rebuildCounterMetadata(self: *GraphIndex) !void {
+        // Rebuild is exclusive maintenance, not a query-time fallback. Its
+        // marker remains durable until counters and the final cursor commit.
+        // Opening the index resumes it before readers/workers can observe it.
+        {
+            var batch = try self.beginWriteReverseBatch();
+            errdefer batch.abort();
+            if (batch.get(maintenance.counters_key)) |_| {
+                batch.abort();
+            } else |err| switch (err) {
+                error.NotFound => {
+                    const generation = try std.math.add(u64, self.edge_generation, 1);
+                    try batch.put(maintenance.counters_key, &.{0});
+                    try putU64(&batch, graph_edge_count_key, 0);
+                    try putU64(&batch, graph_node_count_key, 0);
+                    try putU64(&batch, graph_edge_generation_key, generation);
+                    for (self.metric_configs) |cfg| {
+                        const key = try self.graphMetricDirtyGenerationKeyAlloc(cfg.name);
+                        defer self.alloc.free(key);
+                        try putU64(&batch, key, generation);
+                    }
+                    try batch.commit();
+                    self.edge_count = 0;
+                    self.node_count = 0;
+                    self.edge_generation = generation;
+                },
+                else => return err,
+            }
         }
-        errdefer _ = counts.remove(node);
-        result.key_ptr.* = try self.alloc.dupe(u8, node);
-        result.value_ptr.* = 1;
+        var pages: usize = 0;
+        while (true) {
+            const complete = try self.rebuildCounterPage();
+            pages += 1;
+            if (builtin.is_test) if (test_abort_counter_rebuild_after_pages) |limit| {
+                if (pages >= limit) return error.TestInjectedBackfillFailure;
+            };
+            if (complete) return;
+        }
     }
 
-    fn rebuildCounterMetadata(self: *GraphIndex) !void {
-        const prev_edge_count = self.edge_count;
-        const prev_node_count = self.node_count;
-        errdefer {
-            self.edge_count = prev_edge_count;
-            self.node_count = prev_node_count;
-        }
-
-        var read_txn = try self.beginReadReverseTxn();
-        defer read_txn.abort();
-
-        var meta_keys = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (meta_keys.items) |key| self.alloc.free(key);
-            meta_keys.deinit(self.alloc);
-        }
-        var node_refs = std.StringHashMapUnmanaged(u64).empty;
-        defer {
-            var key_it = node_refs.keyIterator();
-            while (key_it.next()) |key| self.alloc.free(key.*);
-            node_refs.deinit(self.alloc);
-        }
-
-        var edge_count: u64 = 0;
-        var cur = try read_txn.openCursor();
-        defer cur.close();
-        var maybe_entry = try cur.first();
-        while (maybe_entry) |entry| {
-            if (std.mem.startsWith(u8, entry.key, graph_meta_prefix)) {
-                if (!std.mem.startsWith(u8, entry.key, graph_metric_key_prefix)) {
-                    try self.appendOwnedBytes(&meta_keys, entry.key);
-                }
-            } else {
-                edge_count += 1;
-                if (try parseMetricReverseEdgeKeyView(self.alloc, entry.key, self.index_name)) |parsed_owned| {
-                    var parsed = parsed_owned;
-                    defer parsed.deinit(self.alloc);
-                    try self.rememberNodeRefCount(&node_refs, parsed.source.bytes);
-                    try self.rememberNodeRefCount(&node_refs, parsed.target.bytes);
-                }
+    fn rebuildCounterPage(self: *GraphIndex) !bool {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const temp = arena.allocator();
+        var keys = std.ArrayListUnmanaged([]const u8).empty;
+        var phase: u8 = undefined;
+        var last: []const u8 = "";
+        var complete = false;
+        var preserved = std.StringHashMapUnmanaged(void).empty;
+        for (self.metric_configs) |cfg| {
+            // Operator intent survives index repair even though old numerical
+            // jobs and topology scratch are invalidated by the new epoch.
+            for ([_][]const u8{ "maintenance_paused", "disabled" }) |field| {
+                try preserved.put(temp, try graphMetricControlKeyWithAllocator(temp, &.{ cfg.name, field }), {});
             }
-            maybe_entry = try cur.next();
         }
-
+        {
+            var read = try self.beginReadReverseTxn();
+            defer read.abort();
+            const progress = try read.get(maintenance.counters_key);
+            if (progress.len == 0 or progress[0] > 1) return error.InvalidGraphMaintenancePage;
+            phase = progress[0];
+            var cursor = try read.openCursor();
+            defer cursor.close();
+            var item = if (progress.len > 1) try cursor.seekAtOrAfter(progress[1..]) else if (phase == 0) try cursor.seekAtOrAfter(graph_meta_prefix) else try cursor.first();
+            if (item) |entry| if (std.mem.eql(u8, entry.key, progress[1..])) {
+                item = try cursor.next();
+            };
+            var bytes: usize = 0;
+            while (item) |entry| {
+                if (phase == 0 and !std.mem.startsWith(u8, entry.key, graph_meta_prefix)) {
+                    item = null;
+                    break;
+                }
+                // Published scores are immutable and stay available as stale.
+                // Skip their entire namespace without scanning every score.
+                if (phase == 0 and std.mem.startsWith(u8, entry.key, graph_metric_key_prefix)) {
+                    item = try cursor.seekAtOrAfter("meta:metric;");
+                    continue;
+                }
+                if (phase == 1 and std.mem.startsWith(u8, entry.key, graph_meta_prefix)) {
+                    item = try cursor.seekAtOrAfter("meta;");
+                    continue;
+                }
+                if (keys.items.len == maintenance.max_records or (keys.items.len > 0 and bytes +| entry.key.len > maintenance.max_bytes)) break;
+                last = try temp.dupe(u8, entry.key);
+                if (phase == 1 or (!preserved.contains(entry.key) and !std.mem.eql(u8, entry.key, maintenance.counters_key) and
+                    !std.mem.eql(u8, entry.key, graph_edge_count_key) and !std.mem.eql(u8, entry.key, graph_node_count_key) and
+                    !std.mem.eql(u8, entry.key, graph_edge_generation_key)))
+                {
+                    try keys.append(temp, last);
+                    bytes +|= entry.key.len;
+                }
+                item = try cursor.next();
+            }
+            complete = item == null;
+        }
+        const previous_edges = self.edge_count;
+        const previous_nodes = self.node_count;
+        errdefer {
+            self.edge_count = previous_edges;
+            self.node_count = previous_nodes;
+        }
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
-        for (meta_keys.items) |key| {
-            batch.delete(key) catch |err| switch (err) {
-                error.NotFound => {},
-                else => return err,
-            };
+        if (phase == 0) {
+            for (keys.items) |key| try batch.delete(key);
+        } else {
+            var mutations = std.StringHashMapUnmanaged(TopologyMutation).empty;
+            for (keys.items) |key| {
+                const parsed = (try parseMetricReverseEdgeKeyView(temp, key, self.index_name)) orelse return error.InvalidGraphMaintenancePage;
+                try mutations.put(temp, key, .{ .before = false, .after = true, .source = parsed.source.bytes, .target = parsed.target.bytes, .kind = parsed.edge_type.bytes });
+            }
+            try self.accountTopologyMutations(&batch, &mutations);
+            try self.persistGraphCounters(&batch);
         }
-
-        var node_count: u64 = 0;
-        var refs_it = node_refs.iterator();
-        while (refs_it.next()) |entry| {
-            const ref_key = try graphNodeRefKeyAlloc(self.alloc, entry.key_ptr.*);
-            defer self.alloc.free(ref_key);
-            try putU64(&batch, ref_key, entry.value_ptr.*);
-            node_count += 1;
+        if (complete and phase == 1) {
+            try batch.delete(maintenance.counters_key);
+        } else if (complete) {
+            try batch.put(maintenance.counters_key, &.{1});
+        } else {
+            const progress = try temp.alloc(u8, 1 + last.len);
+            progress[0] = phase;
+            @memcpy(progress[1..], last);
+            try batch.put(maintenance.counters_key, progress);
         }
-
-        self.edge_count = edge_count;
-        self.node_count = node_count;
-        try self.persistGraphCounters(&batch);
         try batch.commit();
+        return complete and phase == 1;
     }
 
     fn openEdgeStore(alloc: Allocator, path: [*:0]const u8, opts: GraphIndexOptions) !OpenedReverseStore {
@@ -6114,7 +6169,7 @@ pub const GraphIndex = struct {
         try reverse_store.owner.ensureDurableEmptyManifest();
         const loaded_stats = try loadGraphCounters(&reverse_store.store);
 
-        return .{
+        var result: GraphIndex = .{
             .alloc = alloc,
             .index_name = index_name,
             .outgoing_store = outgoing_store.store,
@@ -6137,6 +6192,19 @@ pub const GraphIndex = struct {
             .algebraic_traversal_fallback_count = 0,
             .algebraic_traversal_result_node_count = 0,
         };
+        errdefer if (result.rebuild_root_path) |path| alloc.free(path);
+        _ = try result.resumePrunePage();
+        const counters_pending = blk: {
+            var read = try result.beginReadReverseTxn();
+            defer read.abort();
+            _ = read.get(maintenance.counters_key) catch |err| switch (err) {
+                error.NotFound => break :blk false,
+                else => return err,
+            };
+            break :blk true;
+        };
+        if (counters_pending) try result.rebuildCounterMetadata();
+        return result;
     }
 
     pub fn close(self: *GraphIndex) void {
@@ -6384,6 +6452,7 @@ pub const GraphIndex = struct {
     }
 
     pub fn batchApply(self: *GraphIndex, writes: []const BatchWrite, deletes: []const BatchDelete) !void {
+        if (self.prune_pending) _ = try self.resumePrunePage();
         return self.batchApplyWithAccounting(writes, deletes, true);
     }
 
@@ -6396,6 +6465,10 @@ pub const GraphIndex = struct {
     }
 
     fn batchApplyWithAccounting(self: *GraphIndex, writes: []const BatchWrite, deletes: []const BatchDelete, comptime coalesced: bool) !void {
+        return self.applyMutationPage(writes, deletes, coalesced, null);
+    }
+
+    fn applyMutationPage(self: *GraphIndex, writes: []const BatchWrite, deletes: []const BatchDelete, comptime coalesced: bool, completed_intent: ?[]const u8) !void {
         if (writes.len == 0 and deletes.len == 0) return;
 
         // Validate the complete batch before opening either physical write
@@ -6410,7 +6483,8 @@ pub const GraphIndex = struct {
         try self.validateTreeBatchWrites(writes, deletes);
 
         var main_batch = try self.beginWriteOutgoingBatch();
-        errdefer main_batch.abort();
+        var main_active = true;
+        errdefer if (main_active) main_batch.abort();
 
         var reverse_batch = try self.beginWriteReverseBatch();
         errdefer reverse_batch.abort();
@@ -6511,7 +6585,11 @@ pub const GraphIndex = struct {
             try self.markMetricDirty(&reverse_batch, &changed_types);
         }
         try self.persistGraphCounters(&reverse_batch);
+        if (completed_intent) |key| try reverse_batch.delete(key);
         try main_batch.commit();
+        main_active = false;
+        if (completed_intent != null) try self.outgoing_owner.sync(true);
+        if (builtin.is_test and completed_intent != null and test_abort_prune_after_forward_commit) return error.TestInjectedBackfillFailure;
         try reverse_batch.commit();
     }
 
@@ -7466,14 +7544,14 @@ pub const GraphIndex = struct {
 
         try txn.commit();
         txn_active = false;
-        if (rebuild_state) |state| try state.clearWithIo(io);
         try self.rebuildCounterMetadata();
         try self.checkpointLsmWalAfterDurableBoundary();
+        if (rebuild_state) |state| try state.clearWithIo(io);
         return rebuilt;
     }
 
     pub fn pruneOwnedRange(self: *GraphIndex, alloc: Allocator, lower: []const u8, upper: []const u8) !usize {
-        var removed: usize = 0;
+        var removed = try self.resumePrunePage();
 
         const range_lower_owned = if (lower.len > 0) try internal_keys.documentRangeLowerAlloc(alloc, lower) else null;
         defer if (range_lower_owned) |key| alloc.free(key);
@@ -7482,44 +7560,76 @@ pub const GraphIndex = struct {
         const range_lower = range_lower_owned orelse "";
         const range_upper = range_upper_owned orelse "";
 
-        const owned_pairs = try self.mainStoreScanRange(alloc, range_lower, range_upper);
-        defer backend_scan.freeResults(alloc, owned_pairs);
-
-        var outgoing_batch = try self.beginWriteOutgoingBatch();
-        errdefer outgoing_batch.abort();
-        var reverse_txn = try self.beginWriteReverseTxn();
-        errdefer reverse_txn.abort();
-
-        for (owned_pairs) |pair| {
-            var parsed = (try parseOutgoingEdgeKeyAlloc(alloc, pair.key)) orelse continue;
-            defer parsed.deinit(alloc);
-            if (!std.mem.eql(u8, parsed.index_name, self.index_name)) continue;
-
-            const rev_key = try reverseEdgeKeyAlloc(alloc, parsed.target, self.index_name, parsed.edge_type, parsed.source);
-            defer alloc.free(rev_key);
-            outgoing_batch.delete(pair.key) catch |err| switch (err) {
-                error.NotFound => {},
-                else => return err,
-            };
-            reverse_txn.delete(rev_key) catch |err| switch (err) {
-                error.NotFound => {},
-                else => return err,
-            };
-            removed += 1;
+        // The caller holds graph ownership. Deleted keys are the range cursor;
+        // each page releases its snapshot before mutation and retains no values.
+        while (true) {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const temp = arena.allocator();
+            var keys = std.ArrayListUnmanaged([]const u8).empty;
+            var bytes: usize = 0;
+            {
+                var read = try self.outgoing_store.beginRead();
+                defer read.abort();
+                var cursor = try read.openCursor();
+                defer cursor.close();
+                cursor.setUpperBound(if (range_upper.len == 0) null else range_upper);
+                var item = try cursor.seekAtOrAfter(range_lower);
+                while (item) |entry| : (item = try cursor.next()) {
+                    if (range_upper.len != 0 and std.mem.order(u8, entry.key, range_upper) != .lt) break;
+                    if (keys.items.len == maintenance.max_records or (keys.items.len > 0 and bytes +| entry.key.len > maintenance.max_bytes)) break;
+                    var parsed = (try parseOutgoingEdgeKeyAlloc(temp, entry.key)) orelse return error.InvalidGraphMaintenancePage;
+                    defer parsed.deinit(temp);
+                    if (!std.mem.eql(u8, parsed.index_name, self.index_name)) return error.InvalidGraphMaintenancePage;
+                    try keys.append(temp, try temp.dupe(u8, entry.key));
+                    bytes +|= entry.key.len;
+                }
+            }
+            if (keys.items.len == 0) break;
+            const intent = try maintenance.encodeKeys(temp, keys.items);
+            {
+                var batch = try self.beginWriteReverseBatch();
+                errdefer batch.abort();
+                try batch.put(maintenance.prune_key, intent);
+                try batch.commit();
+            }
+            self.prune_pending = true;
+            // Intent must survive before forward ownership is removed, even
+            // when the surrounding split uses relaxed index durability.
+            try self.reverse_owner.sync(true);
+            removed += try self.resumePrunePage();
         }
-
-        // Reverse rows are projections of source-owned outgoing edges, not
-        // target-owned records. Keep projections whose target moved to another
-        // range; distributed incoming reads fan out across source owners. The
-        // loop above already removes the exact reverse projection for every
-        // outgoing edge whose source is leaving this range.
-        //
-        // Match normal graph batch publication order: make forward ownership
-        // authoritative first, then retire the corresponding projections.
-        try outgoing_batch.commit();
-        try reverse_txn.commit();
-        try self.rebuildCounterMetadata();
         return removed;
+    }
+
+    fn resumePrunePage(self: *GraphIndex) !usize {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const temp = arena.allocator();
+        const bytes = blk: {
+            var read = try self.beginReadReverseTxn();
+            defer read.abort();
+            const raw = read.get(maintenance.prune_key) catch |err| switch (err) {
+                error.NotFound => {
+                    self.prune_pending = false;
+                    return 0;
+                },
+                else => return err,
+            };
+            break :blk try temp.dupe(u8, raw);
+        };
+        self.prune_pending = true;
+        const keys = try maintenance.decodeKeys(temp, bytes);
+        const deletes = try temp.alloc(BatchDelete, keys.len);
+        for (keys, deletes) |key, *delete| {
+            const parsed = (try parseOutgoingEdgeKeyAlloc(temp, key)) orelse return error.InvalidGraphMaintenancePage;
+            if (!std.mem.eql(u8, parsed.index_name, self.index_name)) return error.InvalidGraphMaintenancePage;
+            delete.* = .{ .source = parsed.source, .target = parsed.target, .edge_type = parsed.edge_type };
+        }
+        try self.applyMutationPage(&.{}, deletes, true, maintenance.prune_key);
+        try self.reverse_owner.sync(true);
+        self.prune_pending = false;
+        return deletes.len;
     }
 
     fn mainStoreScanPrefix(self: *GraphIndex, alloc: Allocator, prefix: []const u8) ![]backend_scan.OwnedKVPair {
@@ -33970,6 +34080,113 @@ test "graph rebuildReverseFromOwnedOutgoingEdges respects split ownership bounds
     const incoming_y = try graph.getEdges(alloc, "doc:y", "ref", .in);
     defer GraphIndex.freeEdges(alloc, incoming_y);
     try std.testing.expectEqual(@as(usize, 0), incoming_y.len);
+}
+
+test "graph maintenance prune recovers its durable intent and invalidates metric dependencies" {
+    const a = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "prune-intent-store");
+    defer cleanupTmp(store_path);
+    var store = try docstore.DocStore.open(a, store_path, .{});
+    defer store.close();
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "prune-intent-reverse");
+    defer cleanupTmp(rev_path);
+    const configs = [_]GraphMetricConfig{ .{ .name = "degree", .kind = .degree }, .{ .name = "typed", .kind = .degree, .edge_filter = .{ .mode = .types, .types = &.{"link"} } } };
+    {
+        var g = try openTestGraphIndex(a, &store, rev_path, "g", .{ .metric_configs = &configs });
+        defer g.close();
+        try g.addEdge("a", "b", "link", 1, 0, 0, "");
+        try g.addEdge("z", "b", "link", 1, 0, 0, "");
+        for (configs) |cfg| {
+            var status = try g.runDegreeMetric(cfg.name);
+            status.deinit(a);
+        }
+        test_abort_prune_after_forward_commit = true;
+        defer test_abort_prune_after_forward_commit = false;
+        try std.testing.expectError(error.TestInjectedBackfillFailure, g.pruneOwnedRange(a, "z", ""));
+    }
+    var g = try openTestGraphIndex(a, &store, rev_path, "g", .{ .metric_configs = &configs });
+    defer g.close();
+    try std.testing.expectEqual(@as(u64, 1), (try g.stats(a)).edge_count);
+    for (configs) |cfg| {
+        var status = try g.graphMetricStatus(cfg.name);
+        defer status.deinit(a);
+        try std.testing.expectEqual(GraphIndex.GraphMetricState.stale, status.state);
+        var rebuilt = try g.runDegreeMetric(cfg.name);
+        defer rebuilt.deinit(a);
+        try std.testing.expectEqual(@as(?f64, 1), try g.graphMetricScore(cfg.name, "b"));
+    }
+    const epoch = g.edge_generation;
+    try std.testing.expectEqual(@as(usize, 0), try g.pruneOwnedRange(a, "z", ""));
+    try std.testing.expectEqual(epoch, g.edge_generation);
+}
+
+test "graph maintenance stateful query streams stop at the admitted prefix" {
+    const a = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    const sp = tmpPath(&sb, "query-stream-store");
+    defer cleanupTmp(sp);
+    var rb: [256]u8 = undefined;
+    const rp = tmpPath(&rb, "query-stream-reverse");
+    defer cleanupTmp(rp);
+    var store = try docstore.DocStore.open(a, sp, .{});
+    defer store.close();
+    var g = try openTestGraphIndex(a, &store, rp, "g", .{});
+    defer g.close();
+    try g.addEdge("a", "b", "link", 1, 0, 0, "");
+    try g.addEdge("a", "c", "link", 1, 0, 0, "");
+    const work = @import("work_budget.zig");
+    const traversal = @import("traversal.zig");
+    var budget = work.WorkBudget.init(10, 1);
+    const reached = try traversal.traverse(a, &g, "a", .{ .max_results = 1, .work_budget = &budget });
+    defer traversal.freeOwnedResults(a, reached);
+    try std.testing.expectEqual(@as(usize, 1), reached.len);
+    try std.testing.expectEqualStrings("b", reached[0].key);
+    const paths = @import("paths.zig");
+    var path_budget = work.WorkBudget.init(10, 1);
+    const path = (try paths.findShortestPath(a, &g, "a", "b", .{ .work_budget = &path_budget })).?;
+    defer paths.freePath(a, path);
+    try std.testing.expectEqual(@as(usize, 2), path.nodes.len);
+}
+
+test "graph maintenance counter reconstruction resumes bounded pages without double counting" {
+    const a = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "counter-pages-store");
+    defer cleanupTmp(store_path);
+    var store = try docstore.DocStore.open(a, store_path, .{});
+    defer store.close();
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "counter-pages-reverse");
+    defer cleanupTmp(rev_path);
+    const configs = [_]GraphMetricConfig{.{ .name = "degree", .kind = .degree }};
+    {
+        var g = try openTestGraphIndex(a, &store, rev_path, "g", .{ .metric_configs = &configs });
+        defer g.close();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const temp = arena.allocator();
+        const writes = try temp.alloc(BatchWrite, 2050);
+        for (writes, 0..) |*write, i| write.* = .{ .source = try std.fmt.allocPrint(temp, "n{d:0>5}", .{i}), .target = "hub", .edge_type = "link" };
+        try g.batchApply(writes, &.{});
+        var paused = try g.pauseGraphMetricMaintenance("degree");
+        paused.deinit(a);
+        test_abort_counter_rebuild_after_pages = 5;
+        defer test_abort_counter_rebuild_after_pages = null;
+        try std.testing.expectError(error.TestInjectedBackfillFailure, g.rebuildCounterMetadata());
+    }
+    var g = try openTestGraphIndex(a, &store, rev_path, "g", .{ .metric_configs = &configs });
+    defer g.close();
+    const counted = try g.stats(a);
+    const scanned = try g.scanStats(a);
+    try std.testing.expectEqual(@as(u64, 2050), counted.edge_count);
+    try std.testing.expectEqual(@as(u64, 2051), counted.node_count);
+    try std.testing.expectEqual(scanned.edge_count, counted.edge_count);
+    try std.testing.expectEqual(scanned.node_count, counted.node_count);
+    var status = try g.graphMetricStatus("degree");
+    defer status.deinit(a);
+    try std.testing.expect(status.maintenance_paused);
 }
 
 test "graph pruneOwnedRange preserves reverse edges for retained cross-range sources" {
