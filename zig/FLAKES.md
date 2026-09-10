@@ -4,6 +4,25 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## Metadata cache incorrectly orders peer-local lifecycle counters (#694)
+
+Ordinary metadata cache refresh compared `AdminSnapshot.status.metadata_epoch`
+numerically across peers. Those lifecycle counters are process-local: an old
+empty catalog at counter 1000 could suppress a newly created table returned by
+another peer at counter 1 indefinitely. The regression failed before the fix
+with expected one table, observed zero (`/private/tmp/ci694-observation-before.log`).
+
+Observation publication now uses the existing snapshot fence generation and
+mutation-invalidation rules, without ordering peer-local counters. A concurrent
+linearizable publication still supersedes an older in-flight observation; a
+mutation invalidation still rejects it when no replacement exists. The cache
+publication helper owns and releases its incoming snapshot on every path.
+Changed placement and retirement retain their separate authority requirements.
+The new regression exercises refresh, concurrent fence publication, invalidation,
+and ownership cleanup, and is included in the default data-runtime test lane.
+All 11 metadata-source checks pass without skips or leaks
+(`/private/tmp/ci694-observation-fixed.log`).
+
 ## Follower catalog observations can retire live data-Raft history (#694)
 
 The failed `00dd1e4aef` restore case (`sjng4qip`) recorded repeated admission of

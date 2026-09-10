@@ -5046,6 +5046,7 @@ pub fn build(b: *std.Build) void {
         "remote metadata mutation discovery preserves forwarding budget for the configured leader",
         "remote metadata mutation discovery preserves endpoint coverage and delivery time",
         "remote metadata source retains mutation authority across cache invalidation",
+        "remote metadata observation accepts newer catalog from a peer with a lower lifecycle counter",
         "remote metadata source installs fenced snapshot without comparing epoch domains",
         "remote metadata source rejects fenced snapshot across mutation invalidation",
         "remote metadata source treats superseded concurrent fenced snapshot as success",

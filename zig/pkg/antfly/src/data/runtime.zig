@@ -19758,10 +19758,16 @@ const RemoteMetadataSource = struct {
         }
         self.cache_mutex.unlock();
 
-        var fresh = try self.fetchSnapshotRemoteWithBudget(head, budget);
+        const fresh = try self.fetchSnapshotRemoteWithBudget(head, budget);
+        return self.acceptObservedSnapshot(fresh, head, observed_fence_generation, now_ms);
+    }
+
+    /// Takes ownership of the remote observation whether it is published,
+    /// superseded by a fence, or rejected after mutation invalidation.
+    fn acceptObservedSnapshot(self: *RemoteMetadataSource, incoming: antfly.metadata_api.AdminSnapshot, head: antfly.metadata_api.MetadataHead, observed_fence_generation: u64, now_ms: u64) !antfly.metadata_api.AdminSnapshot {
+        var fresh = incoming;
         var fresh_owned = true;
         defer if (fresh_owned) freeAdminSnapshotOwned(self.alloc, &fresh);
-        const fresh_head = snapshotHead(&fresh);
 
         lockAtomic(&self.cache_mutex);
         defer self.cache_mutex.unlock();
@@ -19774,16 +19780,10 @@ const RemoteMetadataSource = struct {
         if (self.cached_head) |current_head| {
             if (!std.meta.eql(current_head, head)) return error.MetadataSnapshotHeadMismatch;
         }
-        if (self.cached_snapshot) |snapshot| {
-            const cached_snapshot_head = snapshotHead(&snapshot);
-            // Concurrent follower reads may complete after a leader read.
-            // Never let that race regress the process-wide catalog view.
-            if (sameMetadataIncarnation(cached_snapshot_head, fresh_head) and
-                cached_snapshot_head.metadata_epoch > fresh_head.metadata_epoch)
-            {
-                return try cloneAdminSnapshotOwned(self.alloc, snapshot);
-            }
-        }
+        // Lifecycle counters are process-local, so their numeric order cannot
+        // establish which peer has the newer catalog. The generation above
+        // fences concurrent authoritative reads and mutations. Observations
+        // remain non-authoritative for placement changes and name retirement.
         if (self.cached_snapshot) |*snapshot| freeAdminSnapshotOwned(self.alloc, snapshot);
         self.cached_snapshot = fresh;
         fresh_owned = false;
@@ -40305,6 +40305,47 @@ test "remote metadata source bounds repeated fenced snapshot generations" {
             .deadline_ns = platform_time.monotonicNs() +| 10 * std.time.ns_per_ms,
         }),
     );
+}
+
+test "remote metadata observation accepts newer catalog from a peer with a lower lifecycle counter" {
+    const alloc = std.testing.allocator;
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(alloc, &.{"http://metadata.invalid"}, backend_runtime.ptr().apiIoImpl().?);
+    defer source.deinit();
+    const incarnation: antfly.metadata_api.MetadataClusterIncarnation = "11111111111111111111111111111111".*;
+    try source.acceptMetadataIdentity(9, incarnation);
+    const head: antfly.metadata_api.MetadataHead = .{ .metadata_group_id = 9, .metadata_incarnation = incarnation, .metadata_epoch = 42 };
+    var old: antfly.metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 9, .metadata_incarnation = incarnation, .metadata_epoch = 1000, .metrics = .{} },
+        .tables = &.{},
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+    var first = try source.acceptObservedSnapshot(try cloneAdminSnapshotOwned(alloc, old), head, 0, 1);
+    defer freeAdminSnapshotOwned(alloc, &first);
+    old.status.metadata_epoch = 1;
+    var tables = [_]antfly.metadata.TableRecord{.{ .table_id = 7, .name = "newly_created" }};
+    old.tables = &tables;
+    var updated = try source.acceptObservedSnapshot(try cloneAdminSnapshotOwned(alloc, old), head, 0, 2);
+    defer freeAdminSnapshotOwned(alloc, &updated);
+    try std.testing.expectEqual(@as(usize, 1), updated.tables.len);
+    try std.testing.expectEqualStrings("newly_created", updated.tables[0].name);
+    try std.testing.expectEqual(@as(u64, 1), source.cached_snapshot.?.status.metadata_epoch);
+
+    const ticket = source.beginLinearizableSnapshot();
+    try std.testing.expectEqual(RemoteMetadataSource.LinearizableSnapshotAcceptance.published, try source.acceptLinearizableSnapshot(try cloneAdminSnapshotOwned(alloc, old), ticket));
+    old.tables = &.{};
+    old.status.metadata_epoch = 2000;
+    var superseded = try source.acceptObservedSnapshot(try cloneAdminSnapshotOwned(alloc, old), head, 0, 3);
+    defer freeAdminSnapshotOwned(alloc, &superseded);
+    try std.testing.expectEqual(@as(usize, 1), superseded.tables.len);
+    source.invalidateCache();
+    try std.testing.expectError(error.MetadataSnapshotHeadMismatch, source.acceptObservedSnapshot(try cloneAdminSnapshotOwned(alloc, old), head, 0, 4));
+    try std.testing.expect(source.cached_snapshot == null);
 }
 
 test "remote metadata source installs fenced snapshot without comparing epoch domains" {
