@@ -48,7 +48,25 @@ The standalone object-store suite passes in Debug and ReleaseFast: **69 passed,
 two opt-in cloud integration tests skipped** in each mode. The root
 `lib-objectstore-test` target also passes with the same counts; the suite is now
 included in the default `lib-test` CI aggregate. The focused serverless manifest
-suite passes **12/12**. E2E soak results are recorded below after completion.
+suite passes **12/12**.
+
+The macOS arm64 ReleaseFast executable (SHA-256
+`fa2c790e57cea2cc35cc449ce01839e146eb781795b9d525e043f2af74cf32bd`)
+passes **30/30** repetitions of the failing E2E test with three concurrent
+workers. All **11/11** serverless index-lifecycle cases also pass. The first
+sandboxed launch could not bind a localhost port; these results are from the
+successful rerun with local-server access. The HTTP flake was not reproduced
+in a baseline E2E soak; the before/after evidence is the deterministic backend
+regression, and the passing E2E soak validates the integrated fix.
+
+```sh
+SKIP_BUILD=1 ANTFLY_E2E_ENV_LOADED=1 \
+  ANTFLY_E2E_REGRESSION_WORKERS=3 ANTFLY_E2E_REGRESSION_REPEATS=10 \
+  scripts/ci/zig-e2e-regression-loop.sh \
+  e2e/antfly/test_index_lifecycle.py::test_serverless_named_embedding_indexes_report_publication_actions
+ANTFLY_E2E_WORKERS=1 scripts/ci/zig-antfly-e2e-pytest.sh \
+  e2e/antfly/test_index_lifecycle.py -k serverless
+```
 
 ## Autograph second-document write timeout (#690)
 
