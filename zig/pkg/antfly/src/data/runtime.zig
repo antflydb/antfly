@@ -36148,6 +36148,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                 const parsed = try std.json.parseFromSlice(catalog.Call, response_alloc, request.body, .{});
                 defer parsed.deinit();
                 const body = switch (parsed.value) {
+                    .read => return error.UnexpectedCatalogRead,
                     .snapshot => try std.json.Stringify.valueAlloc(response_alloc, catalog.State{ .revision = snapshot.status.metadata_epoch }, .{}),
                     .resolve => |target| try std.json.Stringify.valueAlloc(response_alloc, resolve(snapshot, target), .{}),
                     .resolve_many => |input| blk: {

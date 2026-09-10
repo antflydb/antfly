@@ -17,6 +17,9 @@ for indexed versus scanned name lookup and table-rename planning at 1,000,
 database drop with 1,000 or 10,000 empty namespaces while retaining another
 database's tables. Fixture construction is outside the timed region. Rename
 includes construction of the planner's indexes; lookup reuses an owned index.
+Tenant-management microbenchmarks additionally compare repeated related-record
+scans with indexed projection, and per-command index rebuilding with a retained
+reader. Those comparisons isolate algorithm costs, not HTTP or Raft latency.
 
 ## Live application workflows
 
@@ -82,6 +85,14 @@ uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
 uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
   --scenario resolution --resolution-workload redirects \
   --output /tmp/catalog-redirects.json
+# Tenant discovery and DDL while unrelated catalog inventory grows.
+uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
+  --scenario management --deployment cluster --tenant-counts 10 100 1000 \
+  --samples 10 --concurrency 4 --output /tmp/catalog-management.json
+# Compare clustered keys with keys distributed across entity ranges.
+uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
+  --scenario resolution --entity-shards 8 --entity-key-layout spread \
+  --output /tmp/catalog-resolution-sharded.json
 ```
 
 The prefix workload repeats a pool of ten names (or fewer for small mention
@@ -93,6 +104,14 @@ The storage regression suite separately verifies that legacy and missing lookups
 fit a 4 KiB caller allocator with 1,000 unrelated databases, and that reopening
 repairs derived name indexes. These are allocation/correctness checks rather
 than elapsed-time thresholds.
+
+The management workload measures tenant point reads, database listings,
+namespace create/drop, identity-preserving rename round trips, and concurrent
+readers alongside namespace DDL. Provisioning is reported separately. Resolution
+accepts `--entity-shards` (for example 1, 8, or 32) and `--entity-key-layout`.
+`clustered` keeps the label-prefixed keys; `spread` uses a declared key template
+with hexadecimal-leading names distributed across initial ranges. Use identical
+settings for each binary and report clustered and spread cases separately.
 
 Useful controls include `--table-counts`, `--mentions`, `--documents`, `--samples`,
 `--warmup`, `--concurrency`, and `--ndjson-lines`. A quick harness check can use

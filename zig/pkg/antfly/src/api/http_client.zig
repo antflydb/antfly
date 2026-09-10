@@ -266,6 +266,8 @@ pub const ApiHttpClient = struct {
     alloc: std.mem.Allocator,
     executor: http_common.RequestExecutor,
     internal_service: ?internal_service_auth.Config = null,
+    /// Borrowed, scoped to one internal query/preflight client.
+    prepared_query_routing: ?[]const u8 = null,
 
     pub fn init(alloc: std.mem.Allocator, executor: http_common.RequestExecutor) ApiHttpClient {
         return .{
@@ -295,12 +297,15 @@ pub const ApiHttpClient = struct {
     /// authentication and prevents the credential from leaking to public API
     /// requests made through the same client.
     pub fn executeRequest(self: *ApiHttpClient, request: http_common.HttpRequest) !http_common.HttpResponse {
-        return internal_service_auth.executeRequest(
-            self.alloc,
-            self.executor,
-            request,
-            self.internal_service,
-        );
+        var forwarded = request;
+        var headers: std.ArrayListUnmanaged(http_common.RequestHeader) = .empty;
+        defer headers.deinit(self.alloc);
+        if (self.prepared_query_routing) |value| if (internal_service_auth.requestTargetsInternalApi(request.uri)) {
+            try headers.appendSlice(self.alloc, request.headers);
+            try headers.append(self.alloc, .{ .name = @import("prepared_query_routing.zig").header_name, .value = value });
+            forwarded.headers = headers.items;
+        };
+        return internal_service_auth.executeRequest(self.alloc, self.executor, forwarded, self.internal_service);
     }
 
     /// Public generated operations live below `/db/v1`. Internal forwarding

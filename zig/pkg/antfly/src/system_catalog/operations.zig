@@ -35,31 +35,27 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
     try svc.ensureLinearizableReadWithContext(context);
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    var snapshot = try store.systemCatalogSnapshot(alloc, svc.metadata_group_id);
-    defer snapshot.deinit();
-    var command: storage.SystemCatalogCommand = .{ .expected_revision = snapshot.meta.revision, .mutation = request.mutation };
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
+    const admission = try store.systemCatalogAdmission(a, svc.metadata_group_id, request.mutation);
+    var command: storage.SystemCatalogCommand = .{ .expected_revision = admission.meta.revision, .mutation = request.mutation };
     if (request.mutation.action == .create and request.mutation.kind == .table) {
         const json = request.create_table_json orelse return error.InvalidCatalogMutation;
         var req = try tables_api.parseStoredCreateTableRequest(a, json);
-        const storage_name = request.physical_name orelse try std.fmt.allocPrint(a, "table:{d}", .{snapshot.meta.next_id});
+        const storage_name = request.physical_name orelse try std.fmt.allocPrint(a, "table:{d}", .{admission.meta.next_id});
         if (!std.mem.startsWith(u8, storage_name, "table:") or storage_name.len > 1024) return error.InvalidCatalogMutation;
         req.indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(a, storage_name, req.indexes_json orelse tables_api.default_indexes_json, tables_api.effectiveSchemaJson(req.schema_json));
         try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(a, req.indexes_json.?);
         try managed_embedder.validateEmbeddingProducerOwnershipJson(a, req.indexes_json.?);
         var table = tables_api.deriveTableRecord(storage_name, req);
-        const namespace = try snapshot.value.namespaceFor(request.mutation.database, request.mutation.namespace);
-        const explicit = if (request.mutation.tablespace) |name| (snapshot.value.find(.tablespace, 0, name) orelse return error.TablespaceNotFound).id else 0;
-        if (try snapshot.value.effectiveTablespace(namespace, explicit)) |tablespace| {
-            try tablespace.placement_policy.validate();
-            if (tablespace.placement_policy.placement_role) |role| table.placement_role = role;
-            if (tablespace.placement_policy.desired_replica_count) |count| table.desired_replica_count = count;
-            if (req.num_shards == null) if (tablespace.placement_policy.min_ranges) |count| {
-                table.min_ranges = count;
-            };
-        }
+        const policy = admission.placement_policy;
+        try policy.validate();
+        if (policy.placement_role) |role| table.placement_role = role;
+        if (policy.desired_replica_count) |count| table.desired_replica_count = count;
+        if (req.num_shards == null) if (policy.min_ranges) |count| {
+            table.min_ranges = count;
+        };
         const generation = try svc.captureTableCreateGeneration(a, table.table_id);
         const ranges = try tables_api.deriveInitialRangesForGeneration(a, table, generation);
         command.mutation.table_id = table.table_id;
@@ -69,9 +65,7 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
     if (request.mutation.action == .set_tablespace and request.mutation.kind == .table) {
         const target: domain.Target = .{ .database = request.mutation.database, .namespace = request.mutation.namespace, .table = request.mutation.name };
         const current = (try store.resolveSystemCatalogTable(a, svc.metadata_group_id, target)) orelse return error.TableNotFound;
-        const namespace = try snapshot.value.namespaceFor(target.database, target.namespace);
-        const explicit = if (request.mutation.tablespace) |name| (snapshot.value.find(.tablespace, 0, name) orelse return error.TablespaceNotFound).id else 0;
-        const policy = if (try snapshot.value.effectiveTablespace(namespace, explicit)) |tablespace| tablespace.placement_policy else domain.PlacementPolicy{};
+        const policy = admission.placement_policy;
         var replacement = current;
         replacement.placement_role = policy.placement_role orelse "data";
         replacement.desired_replica_count = policy.desired_replica_count orelse 3;
@@ -84,11 +78,10 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
     try context.ensureActive();
     const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_system_catalog = bytes });
     svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
-    var observed = store.systemCatalogSnapshot(alloc, svc.metadata_group_id) catch return error.MetadataMutationOutcomeUnknown;
-    defer observed.deinit();
+    const observed = store.systemCatalogMeta(alloc, svc.metadata_group_id) catch return error.MetadataMutationOutcomeUnknown;
     var expected_hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &expected_hash, .{});
-    if (observed.meta.revision != command.expected_revision + 1 or !std.mem.eql(u8, &observed.meta.last_command, &expected_hash)) return error.MetadataMutationOutcomeUnknown;
+    if (observed.revision != command.expected_revision + 1 or !std.mem.eql(u8, &observed.last_command, &expected_hash)) return error.MetadataMutationOutcomeUnknown;
     if (command.topology) |topology| svc.verifyTableCreateProjection(a, topology.create.table, topology.create.ranges) catch return error.MetadataMutationOutcomeUnknown;
 }
 
@@ -108,6 +101,11 @@ pub fn resolve(svc: anytype, alloc: std.mem.Allocator, context: operation.Reques
 
 pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: domain.Call) ![]u8 {
     return switch (input) {
+        .read => |request| blk: {
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.systemCatalogRead(alloc, svc.metadata_group_id, request);
+        },
         .query_definition => |name| blk: {
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
@@ -146,8 +144,7 @@ pub fn restore(svc: anytype, alloc: std.mem.Allocator, context: operation.Reques
     try svc.ensureLinearizableReadWithContext(context);
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    var snapshot = try store.systemCatalogSnapshot(alloc, svc.metadata_group_id);
-    defer snapshot.deinit();
+    const meta = try store.systemCatalogMeta(alloc, svc.metadata_group_id);
     const admission = try svc.captureTableRestoreAdmission(alloc, table);
     const ranges = try @import("../metadata/table_topology_mutations.zig").deriveRestoreDestinationRanges(alloc, table, source_ranges, admission.incarnation_generation);
     defer {
@@ -161,7 +158,7 @@ pub fn restore(svc: anytype, alloc: std.mem.Allocator, context: operation.Reques
         return svc.verifyTableCreateProjection(alloc, table, ranges);
     }
     const command: storage.SystemCatalogCommand = .{
-        .expected_revision = snapshot.meta.revision,
+        .expected_revision = meta.revision,
         .mutation = .{ .action = .create, .kind = .table, .database = target.database, .namespace = target.namespace, .name = target.table, .table_id = table.table_id, .storage_name = table.name },
         .topology = .{ .create = .{ .expected_transition_generation = admission.expected_transition_generation, .table = table, .ranges = ranges } },
     };

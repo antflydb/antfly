@@ -2594,6 +2594,9 @@ pub const AntflyApiHandler = struct {
         table_name: []const u8,
         request: *db_mod.types.SearchRequest,
     ) !?httpx.Response {
+        const prepared = @import("prepared_query_routing.zig");
+        const applied = prepared.apply(ctx.allocator, table_name, ctx.header(prepared.header_name), ctx.header(metadata_api.catalog_route_fence_header), request) catch |err| return try textResponse(ctx, 400, @errorName(err));
+        if (applied) return null;
         query_context.routeQuery(table_name, request) catch |err| {
             const response = switch (err) {
                 error.TableNotFound => try textResponse(ctx, 404, @errorName(err)),

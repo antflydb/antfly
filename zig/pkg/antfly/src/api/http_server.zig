@@ -7216,7 +7216,7 @@ pub const ApiHttpServer = struct {
 
     fn queryTableDefinition(self: *ApiHttpServer, alloc: std.mem.Allocator, resolver: ?*CatalogQueryResolver, table_name: []const u8, context: api_operation.RequestContext) !?metadata_table_manager.TableRecord {
         if (resolver) |cache| if (cache.definitions.get(table_name)) |definition| return .{
-            .table_id = 0,
+            .table_id = definition.table_id,
             .name = table_name,
             .schema_json = definition.schema_json,
             .read_schema_json = definition.read_schema_json,
@@ -7233,7 +7233,7 @@ pub const ApiHttpServer = struct {
             break :blk try system_catalog.QueryDefinition.fromTable(table).clone(alloc);
         };
         if (resolver) |cache| try cache.definitions.put(alloc, try alloc.dupe(u8, table_name), definition);
-        return .{ .table_id = 0, .name = table_name, .schema_json = definition.schema_json, .read_schema_json = definition.read_schema_json, .indexes_json = definition.indexes_json };
+        return .{ .table_id = definition.table_id, .name = table_name, .schema_json = definition.schema_json, .read_schema_json = definition.read_schema_json, .indexes_json = definition.indexes_json };
     }
 
     pub fn maybeRouteQueryToReadSchema(self: *ApiHttpServer, table_name: []const u8, query_req: *db_mod.types.SearchRequest) !void {
@@ -7246,6 +7246,7 @@ pub const ApiHttpServer = struct {
         const alloc = if (resolver) |cache| cache.arena else arena.allocator();
         const table = (try self.queryTableDefinition(alloc, resolver, table_name, .{ .deadline_ns = query_req.execution_deadline_ns, .cancellation = query_req.cancellation orelse .none })) orelse return;
         try tables_api.routeQueryRequestToActiveReadIndex(self.alloc, &table, query_req);
+        query_req.prepared_read_table_id = table.table_id;
     }
 
     fn validatePublicQuerySortCapabilities(self: *ApiHttpServer, table_name: []const u8, query_req: db_mod.types.SearchRequest) !void {

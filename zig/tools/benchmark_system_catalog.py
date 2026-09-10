@@ -35,6 +35,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import requests
 
@@ -148,25 +149,31 @@ def concurrent_lookups(base: str, path: str, args) -> dict:
 
 @contextmanager
 def server(binary: Path, deployment: str):
-    start = time.perf_counter()
-    instance = (
-        StandaloneAntflyServer(str(binary), "127.0.0.1", 0)
-        if deployment == "standalone"
-        else MultiNodeScalingCluster(str(binary), initial_data_node_count=3)
-    )
-    api = Api(
-        antfly_public_api_url(instance.url, binary=str(binary))
-        if deployment == "standalone"
-        else instance.data_api_urls[0]
-    )
-    try:
-        yield api, (time.perf_counter() - start) * 1000, instance
-    except Exception:
-        print(instance.debug_logs()[-12000:], file=sys.stderr)
-        raise
-    finally:
-        api.session.close()
-        instance.stop()
+    # E2E fixtures distinguish the Zig API root by executable basename.
+    # Preserve arbitrary --binary paths without changing the measured binary.
+    with TemporaryDirectory(prefix="antfly-catalog-binary-") as directory:
+        alias = Path(directory) / "antfly"
+        alias.symlink_to(binary)
+        binary = alias
+        start = time.perf_counter()
+        instance = (
+            StandaloneAntflyServer(str(binary), "127.0.0.1", 0)
+            if deployment == "standalone"
+            else MultiNodeScalingCluster(str(binary), initial_data_node_count=3)
+        )
+        api = Api(
+            antfly_public_api_url(instance.url, binary=str(binary))
+            if deployment == "standalone"
+            else instance.data_api_urls[0]
+        )
+        try:
+            yield api, (time.perf_counter() - start) * 1000, instance
+        except Exception:
+            print(instance.debug_logs()[-12000:], file=sys.stderr)
+            raise
+        finally:
+            api.session.close()
+            instance.stop()
 
 
 def wait_for_catalog_shards(api: Api, instance, created: dict, args) -> float:
@@ -386,6 +393,106 @@ def catalog_scenario(args, binary: Path) -> dict:
         }
 
 
+def management_scenario(args, binary: Path) -> dict:
+    """Tenant discovery and DDL against an increasing unrelated inventory."""
+    with server(binary, args.deployment) as (api, startup, _instance):
+        checkpoints = []
+        created = 0
+        serial = 0
+        for count in sorted(set(args.tenant_counts)):
+            print(
+                f"management: provisioning {count} tenants", file=sys.stderr, flush=True
+            )
+            setup = []
+            while created < count:
+                start = time.perf_counter_ns()
+                api.request("POST", f"/databases/tenant_{created}", {})
+                setup.append((time.perf_counter_ns() - start) / 1e6)
+                created += 1
+            path = f"/databases/tenant_{count - 1}"
+            identity = api.request("GET", path)["database_id"]
+
+            def get(path=path, identity=identity):
+                if api.request("GET", path)["database_id"] != identity:
+                    raise RuntimeError("tenant identity changed")
+
+            def listing(count=count):
+                rows = api.request("GET", "/databases")
+                if len(rows) != count + 1:
+                    raise RuntimeError(f"database listing mismatch: {len(rows)}")
+
+            def namespace_cycle(path=path):
+                nonlocal serial
+                serial += 1
+                namespace = path + f"/namespaces/temporary_{serial}"
+                api.request("POST", namespace, {})
+                api.request("DELETE", namespace)
+
+            def rename_cycle(path=path, identity=identity, count=count):
+                api.request("POST", path + "/rename", {"name": "renamed_tenant"})
+                renamed = api.request("GET", "/databases/renamed_tenant")
+                if renamed["database_id"] != identity:
+                    raise RuntimeError("rename changed tenant identity")
+                api.request(
+                    "POST",
+                    "/databases/renamed_tenant/rename",
+                    {"name": f"tenant_{count - 1}"},
+                )
+
+            # Distinct clients exercise catalog mutation serialization while
+            # other clients perform point reads. Every mutation is checked.
+            def mixed_worker(worker, path=path, identity=identity, count=count):
+                client = Api(api.base)
+                reads, writes = [], []
+                try:
+                    for i in range(args.samples):
+                        start = time.perf_counter_ns()
+                        if worker % 2:
+                            namespace = f"/databases/tenant_0/namespaces/work_{count}_{worker}_{i}"
+                            client.request("POST", namespace, {})
+                            client.request("DELETE", namespace)
+                            writes.append((time.perf_counter_ns() - start) / 1e6)
+                        else:
+                            if client.request("GET", path)["database_id"] != identity:
+                                raise RuntimeError("concurrent tenant identity changed")
+                            reads.append((time.perf_counter_ns() - start) / 1e6)
+                    return reads, writes
+                finally:
+                    client.session.close()
+
+            print(f"management: measuring {count} tenants", file=sys.stderr, flush=True)
+            measured = {
+                "point_get": api.measure(get, args.samples, args.warmup),
+                "list_databases": api.measure(listing, args.samples, args.warmup),
+                "namespace_create_drop": api.measure(
+                    namespace_cycle, args.samples, args.warmup
+                ),
+                "rename_round_trip": api.measure(
+                    rename_cycle, args.samples, args.warmup
+                ),
+            }
+            with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+                results = list(pool.map(mixed_worker, range(args.concurrency)))
+            measured["concurrent_reads"] = summary(
+                [x for reads, _ in results for x in reads]
+            )
+            writes = [x for _, writes in results for x in writes]
+            if writes:
+                measured["concurrent_namespace_create_drop"] = summary(writes)
+            checkpoints.append(
+                {
+                    "tenant_count": count,
+                    "database_create": summary(setup),
+                    "operations": measured,
+                }
+            )
+        return {
+            "deployment": args.deployment,
+            "startup_ms": startup,
+            "checkpoints": checkpoints,
+        }
+
+
 def graph_nodes(response):
     graph = response["responses"][0].get("graph_results", {}).get("mentions", {})
     return graph.get("nodes", [])
@@ -393,12 +500,24 @@ def graph_nodes(response):
 
 def resolution_scenario(args, binary: Path) -> dict:
     with server(binary, "cluster") as (api, startup, instance):
-        entities = api.request("POST", "/tables/entities", {"num_shards": 1})
+        entities = api.request(
+            "POST", "/tables/entities", {"num_shards": args.entity_shards}
+        )
         wait_for_catalog_shards(api, instance, entities, args)
         indexes = json.loads(json.dumps(DOCUMENTS_INDEXES))
         indexes["relations_graph"]["resolvers"][0]["candidate_search"] = (
             "prefix" if args.resolution_workload == "prefix" else "exact_key"
         )
+        if args.entity_key_layout == "spread":
+            indexes["relations_graph"]["resolvers"][0]["key_template"] = (
+                "{{ slug _entity.text }}"
+            )
+
+        def entity_key(name):
+            return (
+                "" if args.entity_key_layout == "spread" else "person/"
+            ) + name.lower().replace(" ", "_")
+
         documents = api.request(
             "POST", "/tables/documents", {"num_shards": 3, "indexes": indexes}
         )
@@ -421,11 +540,14 @@ def resolution_scenario(args, binary: Path) -> dict:
                     if args.resolution_workload == "prefix"
                     else [f"Entity {mentions} {document} {i}" for i in range(mentions)]
                 )
-                expected = {
-                    "person/" + name.lower().replace(" ", "_") for name in names
-                }
+                if args.entity_key_layout == "spread":
+                    names = [
+                        f"{i % (min(mentions, 10) if args.resolution_workload == 'prefix' else 16):x} {name}"
+                        for i, name in enumerate(names)
+                    ]
+                expected = {entity_key(name) for name in names}
                 seed = {
-                    "person/" + name.lower().replace(" ", "_"): {
+                    entity_key(name): {
                         "entity_type": "person",
                         "canonical_name": name,
                         "aliases": [name],
@@ -436,7 +558,7 @@ def resolution_scenario(args, binary: Path) -> dict:
                     seed = {}
                     expected = set()
                     for name in names:
-                        original = "person/" + name.lower().replace(" ", "_")
+                        original = entity_key(name)
                         survivor = original + "_curated"
                         seed[original] = {
                             "entity_type": "person",
@@ -551,7 +673,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=ZIG_ROOT / "zig-out/bin/antfly")
     parser.add_argument(
-        "--scenario", choices=["all", "catalog", "resolution"], default="all"
+        "--scenario",
+        choices=["all", "catalog", "management", "resolution"],
+        default="all",
     )
     parser.add_argument(
         "--deployment",
@@ -570,6 +694,11 @@ def main():
         type=int,
         default=0,
         help="Extra string fields per catalog table",
+    )
+    parser.add_argument("--tenant-counts", nargs="+", type=positive, default=[10, 100])
+    parser.add_argument("--entity-shards", type=positive, default=1)
+    parser.add_argument(
+        "--entity-key-layout", choices=["clustered", "spread"], default="clustered"
     )
     parser.add_argument("--mentions", nargs="+", type=positive, default=[10, 100])
     parser.add_argument("--documents", type=positive, default=5)
@@ -598,6 +727,7 @@ def main():
     for name, run in [
         ("catalog", catalog_scenario),
         ("resolution", resolution_scenario),
+        ("management", management_scenario),
     ]:
         if args.scenario in ("all", name):
             result["scenarios"][name] = run(args, binary)

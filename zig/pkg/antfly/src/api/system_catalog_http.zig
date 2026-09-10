@@ -76,7 +76,7 @@ pub fn execute(source: anytype, alloc: std.mem.Allocator, request: operation.Req
         alloc.free(result);
         if (mutation_action == .drop or mutation_action == .rename or route.kind == .table) return .{ .status = 204, .body = &.{} };
     }
-    const bytes = source.systemCatalog(a, request, .snapshot) catch |err| {
+    const bytes = source.systemCatalog(a, request, .{ .read = .{ .kind = route.kind, .database = route.database, .name = route.name } }) catch |err| {
         if (action != null) return visibilityPending(alloc);
         return failure(alloc, err);
     };
@@ -101,13 +101,15 @@ fn projectSnapshot(alloc: std.mem.Allocator, a: std.mem.Allocator, route: routes
         try inventory.append(a, domain.default_namespace);
     }
     state.resources = inventory.items;
+    var index = try domain.StateIndex.init(a, state);
+    defer index.deinit(a);
     const parent_id: u64 = if (route.kind == .namespace) (state.find(.database, 0, route.database) orelse return error.DatabaseNotFound).id else 0;
     const status: u16 = if (action == .create) 201 else 200;
     if (route.name) |name| {
         const resource = state.find(route.kind, parent_id, name) orelse return error.CatalogNotFound;
         return switch (route.kind) {
-            .database => response(alloc, status, databaseValue(state, resource)),
-            .namespace => response(alloc, status, try namespaceValue(state, resource)),
+            .database => response(alloc, status, databaseValue(&index, resource)),
+            .namespace => response(alloc, status, try namespaceValue(&index, resource)),
             .tablespace => response(alloc, status, try tablespaceValue(a, resource)),
             .table => failure(alloc, error.InvalidCatalogMutation),
         };
@@ -115,7 +117,7 @@ fn projectSnapshot(alloc: std.mem.Allocator, a: std.mem.Allocator, route: routes
     switch (route.kind) {
         .database => {
             var out = std.ArrayListUnmanaged(Database).empty;
-            for (state.resources) |r| if (r.kind == .database) try out.append(a, databaseValue(state, r));
+            for (state.resources) |r| if (r.kind == .database) try out.append(a, databaseValue(&index, r));
             std.mem.sort(Database, out.items, {}, struct {
                 fn less(_: void, l: Database, r: Database) bool {
                     return std.mem.lessThan(u8, l.name, r.name);
@@ -125,7 +127,7 @@ fn projectSnapshot(alloc: std.mem.Allocator, a: std.mem.Allocator, route: routes
         },
         .namespace => {
             var out = std.ArrayListUnmanaged(Namespace).empty;
-            for (state.resources) |r| if (r.kind == .namespace and r.parent_id == parent_id) try out.append(a, try namespaceValue(state, r));
+            for (state.resources) |r| if (r.kind == .namespace and r.parent_id == parent_id) try out.append(a, try namespaceValue(&index, r));
             std.mem.sort(Namespace, out.items, {}, struct {
                 fn less(_: void, l: Namespace, r: Namespace) bool {
                     return std.mem.lessThan(u8, l.name, r.name);
@@ -147,13 +149,14 @@ fn projectSnapshot(alloc: std.mem.Allocator, a: std.mem.Allocator, route: routes
     }
 }
 
-fn bindingName(state: domain.State, resource: domain.Resource) ?[]const u8 {
+fn bindingName(state: *const domain.StateIndex, resource: domain.Resource) ?[]const u8 {
+    if (resource.tablespace_id == 0) return null;
     return if (state.byId(.tablespace, resource.tablespace_id)) |r| r.name else null;
 }
-fn databaseValue(state: domain.State, resource: domain.Resource) Database {
+fn databaseValue(state: *const domain.StateIndex, resource: domain.Resource) Database {
     return .{ .database_id = resource.id, .name = resource.name, .tablespace_name = bindingName(state, resource) };
 }
-fn namespaceValue(state: domain.State, resource: domain.Resource) !Namespace {
+fn namespaceValue(state: *const domain.StateIndex, resource: domain.Resource) !Namespace {
     return .{ .namespace_id = resource.id, .database_id = resource.parent_id, .database_name = (state.byId(.database, resource.parent_id) orelse return error.InvalidCatalogRecord).name, .name = resource.name, .tablespace_name = bindingName(state, resource) };
 }
 fn tablespaceValue(alloc: std.mem.Allocator, resource: domain.Resource) !Tablespace {
@@ -166,7 +169,7 @@ test "system catalog committed mutations retain success when projection fails" {
         fn systemCatalog(self: @This(), alloc: std.mem.Allocator, _: operation.RequestContext, call: domain.Call) ![]const u8 {
             return switch (call) {
                 .mutate => try alloc.dupe(u8, "{}"),
-                .snapshot => try alloc.dupe(u8, self.snapshot orelse return error.Timeout),
+                .read => try alloc.dupe(u8, self.snapshot orelse return error.Timeout),
                 else => error.UnexpectedCall,
             };
         }

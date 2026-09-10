@@ -113,6 +113,96 @@ pub fn find(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64
     return resource;
 }
 
+/// All returned records borrow this view's arena. Its transaction pins one
+/// catalog revision for both planning and response projection.
+pub const View = struct {
+    alloc: std.mem.Allocator,
+    txn: *docstore.DocStore.Txn,
+    group_id: u64,
+    meta: Meta,
+
+    pub fn byId(self: View, kind: domain.Kind, id: u64) !?domain.Resource {
+        if (try getById(self.alloc, self.txn, self.group_id, kind, id)) |record| return record.value;
+        return (domain.State{}).byId(kind, id);
+    }
+    pub fn lookup(self: View, kind: domain.Kind, parent: u64, name: []const u8) !?domain.Resource {
+        if (try find(self.alloc, self.txn, self.group_id, kind, parent, name)) |record| return record.value;
+        return (domain.State{}).find(kind, parent, name);
+    }
+    pub fn children(self: View, kind: domain.Kind, parent: u64, limit: usize) ![]const domain.Resource {
+        const prefix = try std.fmt.allocPrint(self.alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:children:{s}:{d}:", .{ self.group_id, @tagName(kind), parent });
+        var cursor = try self.txn.openCursor();
+        defer cursor.close();
+        var out: std.ArrayListUnmanaged(domain.Resource) = .empty;
+        var entry = try cursor.seekAtOrAfter(prefix);
+        while (entry) |kv| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+            const record = try std.json.parseFromSliceLeaky(domain.Resource, self.alloc, kv.value, .{ .allocate = .alloc_always });
+            if (record.kind != kind or record.parent_id != parent or record.id == 0 or !std.mem.eql(u8, kv.key, try childKey(self.alloc, self.group_id, record))) return error.InvalidCatalogRecord;
+            try domain.validateResourceName(record.kind, record.name);
+            try out.append(self.alloc, record);
+            if (limit != 0 and out.items.len >= limit) break;
+        }
+        if (out.items.len == 0 and self.meta.revision == 0) {
+            if (kind == .database and parent == 0) try out.append(self.alloc, domain.default_database);
+            if (kind == .namespace and parent == domain.default_database_id) try out.append(self.alloc, domain.default_namespace);
+        }
+        return out.items;
+    }
+    pub fn bindingForStorage(self: View, name: []const u8) !?domain.Resource {
+        const key = try storageBindingKey(self.alloc, self.group_id, name);
+        const bytes = self.txn.get(key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        if (bytes.len != 8) return error.InvalidCatalogRecord;
+        const record = (try self.byId(.table, std.mem.readInt(u64, bytes[0..8], .little))) orelse return error.InvalidCatalogRecord;
+        if (!std.mem.eql(u8, record.storage_name, name)) return error.InvalidCatalogRecord;
+        return record;
+    }
+    pub fn tablespaceInUse(self: View, id: u64) !bool {
+        const prefix = try std.fmt.allocPrint(self.alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:uses:{d}:", .{ self.group_id, id });
+        var cursor = try self.txn.openCursor();
+        defer cursor.close();
+        const kv = (try cursor.seekAtOrAfter(prefix)) orelse return false;
+        if (!std.mem.startsWith(u8, kv.key, prefix)) return false;
+        const suffix = kv.key[prefix.len..];
+        const colon = std.mem.indexOfScalar(u8, suffix, ':') orelse return error.InvalidCatalogRecord;
+        const kind = std.meta.stringToEnum(domain.Kind, suffix[0..colon]) orelse return error.InvalidCatalogRecord;
+        const resource_id = std.fmt.parseInt(u64, suffix[colon + 1 ..], 10) catch return error.InvalidCatalogRecord;
+        const record = (try self.byId(kind, resource_id)) orelse return error.InvalidCatalogRecord;
+        if (record.tablespace_id != id) return error.InvalidCatalogRecord;
+        return true;
+    }
+    pub fn namespaceFor(self: View, database: []const u8, namespace: []const u8) !domain.Resource {
+        const db = (try self.lookup(.database, 0, database)) orelse return error.DatabaseNotFound;
+        return (try self.lookup(.namespace, db.id, namespace)) orelse error.NamespaceNotFound;
+    }
+    pub fn effectiveTablespace(self: View, namespace: domain.Resource, explicit: u64) !?domain.Resource {
+        const db = (try self.byId(.database, namespace.parent_id)) orelse return error.DatabaseNotFound;
+        const id = if (explicit != 0) explicit else if (namespace.tablespace_id != 0) namespace.tablespace_id else db.tablespace_id;
+        return if (id == 0) null else (try self.byId(.tablespace, id)) orelse return error.TablespaceNotFound;
+    }
+    pub fn read(self: View, request: domain.Read) !domain.State {
+        if (request.kind == .table) return error.InvalidCatalogMutation;
+        const parent = if (request.kind == .namespace) ((try self.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound).id else 0;
+        var out: std.ArrayListUnmanaged(domain.Resource) = .empty;
+        if (request.name) |name| {
+            try out.append(self.alloc, (try self.lookup(request.kind, parent, name)) orelse return error.CatalogNotFound);
+        } else try out.appendSlice(self.alloc, try self.children(request.kind, parent, 0));
+        var related: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        const count = out.items.len;
+        for (0..count) |i| {
+            const id = out.items[i].tablespace_id;
+            if (id == 0 or related.contains(id)) continue;
+            try related.put(self.alloc, id, {});
+            try out.append(self.alloc, (try self.byId(.tablespace, id)) orelse return error.InvalidCatalogRecord);
+        }
+        if (request.kind == .namespace) try out.append(self.alloc, (try self.byId(.database, parent)) orelse return error.InvalidCatalogRecord);
+        return .{ .revision = self.meta.revision, .next_id = self.meta.next_id, .resources = out.items };
+    }
+};
+
 pub fn namePrefixAlloc(alloc: std.mem.Allocator, group_id: u64) ![]u8 {
     return std.fmt.allocPrint(alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:", .{group_id});
 }
@@ -144,6 +234,7 @@ pub fn rebuildNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, g
         var id: [8]u8 = undefined;
         std.mem.writeInt(u64, &id, resource.id, .little);
         try txn.put(key, &id);
+        try writeReferences(alloc, txn, group_id, resource);
     }
 }
 
@@ -156,6 +247,82 @@ pub fn validateNameIndex(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, 
         var found = (try find(alloc, txn, group_id, resource.kind, resource.parent_id, resource.name)) orelse return error.InvalidCatalogRecord;
         defer found.deinit();
         if (found.value.id != resource.id) return error.InvalidCatalogRecord;
+        const child_key = try childKey(alloc, group_id, resource);
+        defer alloc.free(child_key);
+        const child_json = try std.json.Stringify.valueAlloc(alloc, resource, .{});
+        defer alloc.free(child_json);
+        if (!std.mem.eql(u8, txn.get(child_key) catch return error.InvalidCatalogRecord, child_json)) return error.InvalidCatalogRecord;
+        if (resource.kind == .table) {
+            const key = try storageBindingKey(alloc, group_id, resource.storage_name);
+            defer alloc.free(key);
+            const bytes = txn.get(key) catch return error.InvalidCatalogRecord;
+            if (bytes.len != 8 or std.mem.readInt(u64, bytes[0..8], .little) != resource.id) return error.InvalidCatalogRecord;
+        }
+        if (resource.tablespace_id != 0) {
+            const key = try tablespaceUseKey(alloc, group_id, resource);
+            defer alloc.free(key);
+            _ = txn.get(key) catch return error.InvalidCatalogRecord;
+        }
+    }
+}
+
+fn storageBindingKey(alloc: std.mem.Allocator, group_id: u64, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:storage:{s}", .{ group_id, name });
+}
+fn tablespaceUseKey(alloc: std.mem.Allocator, group_id: u64, r: domain.Resource) ![]u8 {
+    return std.fmt.allocPrint(alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:uses:{d}:{s}:{d}", .{ group_id, r.tablespace_id, @tagName(r.kind), r.id });
+}
+// Covering parent rows keep list reads sequential. These values are derived,
+// written atomically with the primary record, and rebuilt on index migration.
+fn childKey(alloc: std.mem.Allocator, group_id: u64, r: domain.Resource) ![]u8 {
+    return std.fmt.allocPrint(alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:children:{s}:{d}:{s}", .{ group_id, @tagName(r.kind), r.parent_id, r.name });
+}
+fn writeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, r: domain.Resource) !void {
+    const child_key = try childKey(alloc, group_id, r);
+    defer alloc.free(child_key);
+    const child_json = try std.json.Stringify.valueAlloc(alloc, r, .{});
+    defer alloc.free(child_json);
+    try txn.put(child_key, child_json);
+    if (r.kind == .table) {
+        const key = try storageBindingKey(alloc, group_id, r.storage_name);
+        defer alloc.free(key);
+        var id: [8]u8 = undefined;
+        std.mem.writeInt(u64, &id, r.id, .little);
+        const previous = txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (previous) |value| if (!std.mem.eql(u8, value, &id)) return error.InvalidCatalogRecord;
+        try txn.put(key, &id);
+    }
+    if (r.tablespace_id != 0) {
+        const key = try tablespaceUseKey(alloc, group_id, r);
+        defer alloc.free(key);
+        try txn.put(key, "");
+    }
+}
+fn removeReferences(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, r: domain.Resource) !void {
+    const child_key = try childKey(alloc, group_id, r);
+    defer alloc.free(child_key);
+    txn.delete(child_key) catch |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    };
+    if (r.kind == .table) {
+        const key = try storageBindingKey(alloc, group_id, r.storage_name);
+        defer alloc.free(key);
+        txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+    if (r.tablespace_id != 0) {
+        const key = try tablespaceUseKey(alloc, group_id, r);
+        defer alloc.free(key);
+        txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
     }
 }
 
@@ -163,6 +330,7 @@ pub fn writeResource(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, grou
     if (try getById(alloc, txn, group_id, resource.kind, resource.id)) |old_value| {
         var old = old_value;
         defer old.deinit();
+        try removeReferences(alloc, txn, group_id, old.value);
         const old_name_key = try nameKeyAlloc(alloc, group_id, old.value.kind, old.value.parent_id, old.value.name);
         defer alloc.free(old_name_key);
         txn.delete(old_name_key) catch |err| switch (err) {
@@ -180,9 +348,11 @@ pub fn writeResource(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, grou
     std.mem.writeInt(u64, &encoded_id, resource.id, .little);
     try txn.put(record_key, json);
     try txn.put(name_key, &encoded_id);
+    try writeReferences(alloc, txn, group_id, resource);
 }
 
 pub fn removeResource(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, resource: domain.Resource) !void {
+    try removeReferences(alloc, txn, group_id, resource);
     const record_key = try recordKeyAlloc(alloc, group_id, resource.kind, resource.id);
     defer alloc.free(record_key);
     const name_key = try nameKeyAlloc(alloc, group_id, resource.kind, resource.parent_id, resource.name);

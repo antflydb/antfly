@@ -2280,7 +2280,7 @@ pub fn build(b: *std.Build) void {
     });
     const system_catalog_api_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
-        .filters = &.{"system catalog"},
+        .filters = &.{ "system catalog", "prepared query routing", "routing session pins every table" },
     });
     const system_catalog_api_step = b.step("antfly-system-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
     system_catalog_api_step.dependOn(&b.addRunArtifact(system_catalog_api_tests).step);

@@ -22,6 +22,10 @@ fn median(values: *[samples]i96) f64 {
     std.mem.sort(i96, values, {}, std.sort.asc(i96));
     return @as(f64, @floatFromInt(values[samples / 2]));
 }
+noinline fn scanTablespace(state: catalog.State, id: u64) ?catalog.Resource {
+    return state.byId(.tablespace, id);
+}
+
 pub fn main() !void {
     const alloc = std.heap.page_allocator;
     var runtime = std.Io.Threaded.init(alloc, .{});
@@ -84,5 +88,47 @@ pub fn main() !void {
             drop_ns[sample] = std.Io.Clock.now(.awake, io).nanoseconds - start;
         }
         std.debug.print("namespaces={d} unrelated_tables={d} samples={d} drop_plan_apply_median_ms={d:.3}\n", .{ n, n, samples, median(&drop_ns) / 1e6 });
+    }
+    // Tenant control-plane work: unrelated namespaces/tables must not enter
+    // point rename planning or related-record lookup for each listed tenant.
+    for ([_]usize{ 1000, 10000 }) |n| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const resources = try a.alloc(catalog.Resource, n * 2);
+        for (0..n) |i| {
+            resources[i * 2] = .{ .kind = .database, .id = i * 2 + 100, .name = try std.fmt.allocPrint(a, "tenant_{d}", .{i}) };
+            resources[i * 2 + 1] = .{ .kind = .namespace, .id = i * 2 + 101, .parent_id = i * 2 + 100, .name = "public" };
+        }
+        const state: catalog.State = .{ .revision = 1, .next_id = n * 2 + 100, .resources = resources };
+        var index = try catalog.StateIndex.init(alloc, state);
+        defer index.deinit(alloc);
+        var scan_listing: [samples]i96 = undefined;
+        var indexed_listing: [samples]i96 = undefined;
+        var rebuilt_plan: [samples]i96 = undefined;
+        var indexed_plan: [samples]i96 = undefined;
+        for (0..samples) |sample| {
+            var start = std.Io.Clock.now(.awake, io).nanoseconds;
+            for (index.list(.database, 0)) |record| std.mem.doNotOptimizeAway(scanTablespace(state, record.tablespace_id));
+            scan_listing[sample] = std.Io.Clock.now(.awake, io).nanoseconds - start;
+            start = std.Io.Clock.now(.awake, io).nanoseconds;
+            const projected = try catalog.projectRead(alloc, &index, .{ .kind = .database });
+            std.mem.doNotOptimizeAway(projected);
+            alloc.free(projected);
+            indexed_listing[sample] = std.Io.Clock.now(.awake, io).nanoseconds - start;
+            const mutation: catalog.Mutation = .{ .action = .rename, .kind = .database, .name = resources[resources.len - 2].name, .new_name = "renamed" };
+            start = std.Io.Clock.now(.awake, io).nanoseconds;
+            var rebuilt = try catalog.plan(alloc, state, mutation, &.{});
+            rebuilt.deinit(alloc);
+            rebuilt_plan[sample] = std.Io.Clock.now(.awake, io).nanoseconds - start;
+            start = std.Io.Clock.now(.awake, io).nanoseconds;
+            for (0..lookups) |_| {
+                var delta = try catalog.planWithReader(alloc, catalog.MemoryReader{ .index = &index, .tables = &.{} }, state.next_id, mutation);
+                std.mem.doNotOptimizeAway(delta.upserts);
+                delta.deinit(alloc);
+            }
+            indexed_plan[sample] = std.Io.Clock.now(.awake, io).nanoseconds - start;
+        }
+        std.debug.print("tenants={d} listing_scan_ms={d:.3} listing_indexed_ms={d:.3} rename_rebuild_ms={d:.3} rename_indexed_us={d:.3}\n", .{ n, median(&scan_listing) / 1e6, median(&indexed_listing) / 1e6, median(&rebuilt_plan) / 1e6, median(&indexed_plan) / lookups / 1e3 });
     }
 }

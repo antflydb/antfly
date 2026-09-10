@@ -1143,14 +1143,41 @@ const LocalStandaloneMetadata = struct {
         self.system_catalog_state = next;
     }
 
-    fn systemCatalogPhysicalTablesLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator) ![]system_catalog.PhysicalTable {
-        const physical = try alloc.alloc(system_catalog.PhysicalTable, self.manager.tables.count());
-        var it = self.manager.tables.valueIterator();
-        for (physical) |*item| {
-            const table = it.next().?;
-            item.* = .{ .id = table.table_id, .name = table.name };
+    const CatalogReader = struct {
+        owner: *LocalStandaloneMetadata,
+        index: *const system_catalog.StateIndex,
+        pub fn lookup(self: @This(), kind: system_catalog.Kind, parent: u64, name: []const u8) !?system_catalog.Resource {
+            return self.index.find(kind, parent, name);
         }
-        return physical;
+        pub fn byId(self: @This(), kind: system_catalog.Kind, id: u64) !?system_catalog.Resource {
+            return self.index.byId(kind, id);
+        }
+        pub fn namespaceFor(self: @This(), database: []const u8, namespace: []const u8) !system_catalog.Resource {
+            return self.index.namespaceFor(database, namespace);
+        }
+        pub fn children(self: @This(), kind: system_catalog.Kind, parent: u64, limit: usize) ![]const system_catalog.Resource {
+            const rows = self.index.list(kind, parent);
+            return if (limit == 0) rows else rows[0..@min(rows.len, limit)];
+        }
+        pub fn bindingForStorage(self: @This(), name: []const u8) !?system_catalog.Resource {
+            return self.index.storage_names.get(name);
+        }
+        pub fn tablespaceInUse(self: @This(), id: u64) !bool {
+            return self.index.tablespace_users.contains(id);
+        }
+        pub fn physicalByName(self: @This(), name: []const u8) !?system_catalog.PhysicalTable {
+            const table = self.owner.manager.findTableByName(name) orelse return null;
+            return .{ .id = table.table_id, .name = table.name };
+        }
+        pub fn physicalById(self: @This(), id: u64) !?system_catalog.PhysicalTable {
+            const table = self.owner.manager.tables.get(id) orelse return null;
+            return .{ .id = table.table_id, .name = table.name };
+        }
+    };
+    fn planCatalogLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, command: system_catalog.Mutation) !system_catalog.Delta {
+        const empty: system_catalog.StateIndex = .{};
+        const reader: CatalogReader = .{ .owner = self, .index = if (self.system_catalog_state) |*state| &state.index else &empty };
+        return system_catalog.planWithReader(alloc, reader, self.systemCatalogState().next_id, command);
     }
 
     fn resolveSystemCatalogLocked(self: *LocalStandaloneMetadata, target: system_catalog.Target) !?antfly.metadata.TableRecord {
@@ -1176,6 +1203,14 @@ const LocalStandaloneMetadata = struct {
         defer self.mutex.unlock();
         try context.ensureActive();
         switch (call) {
+            .read => |request| {
+                var empty = try system_catalog.StateIndex.init(alloc, .{});
+                defer empty.deinit(alloc);
+                const index = if (self.system_catalog_state) |*state| &state.index else &empty;
+                const resources = try system_catalog.projectRead(alloc, index, request);
+                defer alloc.free(resources);
+                return std.json.Stringify.valueAlloc(alloc, system_catalog.State{ .revision = self.systemCatalogState().revision, .resources = resources }, .{});
+            },
             .query_definition => |name| {
                 const table = self.manager.findTableByName(name);
                 const definition: ?system_catalog.QueryDefinition = if (table) |value| system_catalog.QueryDefinition.fromTable(value) else null;
@@ -1227,8 +1262,7 @@ const LocalStandaloneMetadata = struct {
                     command.table_id = table.?.table_id;
                     command.storage_name = name;
                 } else if (request.create_table_json != null or request.physical_name != null) return error.InvalidCatalogMutation;
-                const physical = try self.systemCatalogPhysicalTablesLocked(a);
-                const delta = try system_catalog.plan(a, state, command, physical);
+                const delta = try self.planCatalogLocked(a, command);
                 var mutation = try self.beginCatalogMutationLocked();
                 defer mutation.deinit(self);
                 if (table) |created| {
@@ -1383,9 +1417,7 @@ const LocalStandaloneMetadata = struct {
         if (try system_catalog.restoreTarget(alloc, table_name)) |owned_target| {
             defer owned_target.deinit(alloc);
             const target = owned_target.value;
-            const physical = try self.systemCatalogPhysicalTablesLocked(alloc);
-            defer alloc.free(physical);
-            var delta = try system_catalog.plan(alloc, self.systemCatalogState(), .{ .action = .create, .kind = .table, .database = target.database, .namespace = target.namespace, .name = target.table, .table_id = table.table_id, .storage_name = table_name }, physical);
+            var delta = try self.planCatalogLocked(alloc, .{ .action = .create, .kind = .table, .database = target.database, .namespace = target.namespace, .name = target.table, .table_id = table.table_id, .storage_name = table_name });
             defer delta.deinit(alloc);
             try self.applySystemCatalogDeltaLocked(delta);
         }

@@ -870,6 +870,57 @@ def _exercise_autograph(resolution_cluster, candidate_search):
     assert second_entity_key in second_node_keys
 
 
+def test_multinode_exact_candidates_follow_redirects_across_entity_shards(
+    resolution_cluster,
+):
+    """A batch spans owners; redirects cross owners and duplicate mentions reuse it."""
+    api = _Api(resolution_cluster.data_api_urls[0], resolution_cluster)
+    indexes = json.loads(json.dumps(DOCUMENTS_INDEXES))
+    resolver = indexes["relations_graph"]["resolvers"][0]
+    resolver["candidate_search"] = "exact_key"
+    resolver["key_template"] = "{{ slug _entity.text }}"
+    api.create_table("entities", num_shards=8, deadline=_new_e2e_deadline())
+    api.create_table(
+        "documents", num_shards=3, indexes=indexes, deadline=_new_e2e_deadline()
+    )
+    expected = {}
+    names = ["0 Ada", "5 Grace", "a Alan", "f Edsger"]
+    for name, survivor in zip(
+        names, ["f_curated", "a_curated", "5_curated", "0_curated"]
+    ):
+        expected[survivor] = name
+        for key, fields in [
+            (survivor, {}),
+            (name.lower().replace(" ", "_"), {"merged_into": survivor}),
+        ]:
+            api.insert(
+                "entities",
+                key,
+                {"canonical_name": name, "entity_type": "person", **fields},
+                sync_level="full_index",
+                deadline=_new_e2e_deadline(),
+            )
+    api.insert(
+        "documents",
+        "7:batch",
+        {
+            "relations": {
+                "entities": [
+                    {"id": f"e{i}", "label": "person", "text": names[i % len(names)]}
+                    for i in range(100)
+                ]
+            }
+        },
+        deadline=_new_e2e_deadline(),
+    )
+    graph = _wait_for_mention_hydration(
+        api, start_node="7:batch", expected_names=expected, deadline=_new_e2e_deadline()
+    )
+    keys = {node["key"] for node in graph["nodes"]}
+    assert set(expected) <= keys
+    assert not {name.lower().replace(" ", "_") for name in names} & keys
+
+
 def test_multinode_autograph_deleted_target_does_not_fail_surviving_graph(
     resolution_cluster,
 ):

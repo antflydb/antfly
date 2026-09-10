@@ -128,11 +128,31 @@ includes only the selected tables' schema, active read schema, and index
 definitions, captured in the same read transaction as their identities. Routing
 and sort validation reuse this request-owned projection, including across
 NDJSON lines and synchronous native join execution. Internal physical-table
-queries use the same narrow point-read contract. Administrative snapshots remain
-available to callers that actually need whole-catalog topology or listings.
+queries use the narrow point-read contract when a prepared selection is absent.
+The coordinator otherwise attaches versioned internal routing metadata carrying
+its physical table ID/name and selected text indexes. Receivers accept it only
+with a matching catalog route fence; storage admission still validates that fence.
+Older peers ignore the optional header and use their existing preparation path.
+Public JSON cannot populate this capability. Vector workers retain their own
+retrieval index while sharing the coordinator's primary text-index selection.
+Administrative snapshots remain available for whole-catalog topology consumers.
 Compact binary decoding validates all record framing while copying only the
 requested projection, skipping unrelated descriptions and restore metadata.
-Mutation inventories likewise read compact identities from a borrowed cursor.
+Metadata mutation planning uses the same transaction-pinned reader interface as
+standalone's owned indexes. Ordinary create/rename/binding changes read their
+names, identities, and dependencies directly. Namespace and database deletion
+scan only the affected child scopes. Reverse indexes answer physical-binding
+collisions and tablespace-use checks. The indexes update atomically with primary
+records and share their rebuild/version boundary. Completion verifies compact
+revision/hash metadata without rereading the catalog inventory.
+
+Named database/namespace/tablespace reads return only their selected resources
+and related labels. Listings scan covering kind/parent rows sequentially, avoiding
+a separate primary-record seek for every result; related tablespaces are fetched
+once. Covering rows are disposable derived records, maintained atomically and
+validated/rebuilt with the other catalog indexes. Standalone owns equivalent child/name/ID/reference indexes.
+Response formatting uses an index instead of repeated inventory scans. Its
+atomic standalone checkpoint still persists the complete catalog state.
 
 A writable projection rebuilds name indexes from validated authoritative records
 before its first catalog point read after open or snapshot installation. Read-only
@@ -146,6 +166,12 @@ and the storage engine's integrity checks. Negative and legacy unbound lookups
 therefore use point reads without allocating or scanning unrelated catalog
 records. First-use rebuild/validation remains proportional to catalog size.
 
+Bounded exact-document candidate queries select only owning shards from the
+request's pinned routing snapshot. Sorted range references support binary search
+per key, and each shard receives only its own keys. They retain the existing
+index-independent document-value execution path and route/generation fencing;
+scored, graph, and hierarchy queries keep their existing fan-out semantics.
+
 Table listings build an identity map and select scope, prefix, and authorized
 tables before per-table status collection and public schema materialization.
 The administrative snapshot remains the source of topology information.
@@ -153,10 +179,11 @@ The administrative snapshot remains the source of topology information.
 Standalone owns name and ID indexes with each immutable catalog state and a
 physical-name index with its table manager. Indexes are rebuilt before checkpoint
 publication and restored with rollback state; their keys borrow the owned records.
-Resolution performs indexed reads under the existing metadata lock. Mutation
-inventories borrow compact table identities without cloning schemas. Mutation
-planning builds one index, keeping rename collision and database-empty validation
-linear in catalog size instead of repeatedly scanning child bindings.
+Resolution and mutation planning use the owned indexes under the existing
+metadata lock. Physical collision checks use the table manager’s name/ID indexes;
+planning enumerates only affected children. Publication still clones, indexes,
+and checkpoints the complete standalone state, so total standalone mutation
+cost remains proportional to catalog size.
 
 ## Grants and row filters
 

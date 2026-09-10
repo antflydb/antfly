@@ -149,7 +149,7 @@ pub const TableDropProjection = struct {
     }
 };
 
-const derived_catalog_index_version = "3";
+const derived_catalog_index_version = "5";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -2611,22 +2611,91 @@ pub const RaftApplyStore = struct {
         return table;
     }
 
+    pub fn systemCatalogRead(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.Read) ![]u8 {
+        var txn = try self.beginQueryCatalogReadTxn(group_id);
+        defer txn.abort();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = &txn, .group_id = group_id, .meta = try system_catalog_storage.readMeta(a, &txn, group_id) };
+        return std.json.Stringify.valueAlloc(alloc, try view.read(request), .{});
+    }
+
     pub fn systemCatalogSnapshot(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !system_catalog_storage.OwnedState {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
         return system_catalog_storage.loadState(alloc, &txn, group_id);
     }
 
+    const CatalogReader = struct {
+        store: *RaftApplyStore,
+        view: system_catalog_storage.View,
+        pub fn lookup(self: @This(), kind: system_catalog.Kind, parent: u64, name: []const u8) !?system_catalog.Resource {
+            return self.view.lookup(kind, parent, name);
+        }
+        pub fn byId(self: @This(), kind: system_catalog.Kind, id: u64) !?system_catalog.Resource {
+            return self.view.byId(kind, id);
+        }
+        pub fn namespaceFor(self: @This(), database: []const u8, namespace: []const u8) !system_catalog.Resource {
+            return self.view.namespaceFor(database, namespace);
+        }
+        pub fn children(self: @This(), kind: system_catalog.Kind, parent: u64, limit: usize) ![]const system_catalog.Resource {
+            return self.view.children(kind, parent, limit);
+        }
+        pub fn bindingForStorage(self: @This(), name: []const u8) !?system_catalog.Resource {
+            return self.view.bindingForStorage(name);
+        }
+        pub fn tablespaceInUse(self: @This(), id: u64) !bool {
+            return self.view.tablespaceInUse(id);
+        }
+        pub fn physicalByName(self: @This(), name: []const u8) !?system_catalog.PhysicalTable {
+            const value = (try self.store.getTableByNameResultTxn(system_catalog.ResolvedTable, self.view.alloc, self.view.txn, self.view.group_id, name)) orelse return null;
+            return .{ .id = value.table_id, .name = value.name };
+        }
+        pub fn physicalById(self: @This(), id: u64) !?system_catalog.PhysicalTable {
+            var buf: [160]u8 = undefined;
+            const bytes = self.view.txn.get(try tableKeyForGroup(&buf, self.view.group_id, id)) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            };
+            const value = try decodeTableIdentity(self.view.alloc, bytes);
+            if (value.table_id != id) return error.InvalidCatalogRecord;
+            return .{ .id = value.table_id, .name = value.name };
+        }
+    };
+
+    pub const CatalogAdmission = struct { meta: system_catalog_storage.Meta, placement_policy: system_catalog.PlacementPolicy = .{} };
+    pub fn systemCatalogAdmission(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.Mutation) !CatalogAdmission {
+        var txn = try self.beginQueryCatalogReadTxn(group_id);
+        defer txn.abort();
+        const meta = try system_catalog_storage.readMeta(alloc, &txn, group_id);
+        var result: CatalogAdmission = .{ .meta = meta };
+        if (request.kind == .table and (request.action == .create or request.action == .set_tablespace)) {
+            const view: system_catalog_storage.View = .{ .alloc = alloc, .txn = &txn, .group_id = group_id, .meta = meta };
+            const namespace = try view.namespaceFor(request.database, request.namespace);
+            const explicit = if (request.tablespace) |name| ((try view.lookup(.tablespace, 0, name)) orelse return error.TablespaceNotFound).id else 0;
+            if (try view.effectiveTablespace(namespace, explicit)) |space| result.placement_policy = space.placement_policy;
+        }
+        return result;
+    }
+
+    pub fn systemCatalogMeta(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !system_catalog_storage.Meta {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        return system_catalog_storage.readMeta(alloc, &txn, group_id);
+    }
+
     pub fn validateSystemCatalog(self: *RaftApplyStore, group_id: u64, command: SystemCatalogCommand) !void {
         var txn = try self.beginQueryCatalogReadTxn(group_id);
         defer txn.abort();
-        var snapshot = try system_catalog_storage.loadState(self.alloc, &txn, group_id);
-        defer snapshot.deinit();
-        if (snapshot.meta.revision != command.expected_revision) return error.CatalogGenerationChanged;
-        const physical = try listPhysicalTableIdentities(self.alloc, &txn, group_id);
-        defer freePhysicalTableIdentities(self.alloc, physical);
-        var delta = try system_catalog.plan(self.alloc, snapshot.value, command.mutation, physical);
-        defer delta.deinit(self.alloc);
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const meta = try system_catalog_storage.readMeta(a, &txn, group_id);
+        if (meta.revision != command.expected_revision) return error.CatalogGenerationChanged;
+        const reader: CatalogReader = .{ .store = self, .view = .{ .alloc = a, .txn = &txn, .group_id = group_id, .meta = meta } };
+        var delta = try system_catalog.planWithReader(a, reader, meta.next_id, command.mutation);
+        defer delta.deinit(a);
         if ((command.mutation.kind == .table and command.mutation.action == .create) != (command.topology != null)) return error.InvalidCatalogMutation;
         if (command.placement_update) |update| {
             if (command.mutation.kind != .table or command.mutation.action != .set_tablespace or update.expected.table_id != update.replacement.table_id or !std.mem.eql(u8, update.expected.name, update.replacement.name)) return error.InvalidCatalogMutation;
@@ -2737,16 +2806,17 @@ pub const RaftApplyStore = struct {
         defer parsed.deinit();
         const command = parsed.value;
         if (command.version != 1) return error.InvalidCatalogMutation;
-        var snapshot = try system_catalog_storage.loadState(self.alloc, txn, group_id);
-        defer snapshot.deinit();
-        if (snapshot.meta.revision != command.expected_revision) return;
-        const physical = try listPhysicalTableIdentities(self.alloc, txn, group_id);
-        defer freePhysicalTableIdentities(self.alloc, physical);
-        var delta = system_catalog.plan(self.alloc, snapshot.value, command.mutation, physical) catch |err| switch (err) {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const meta = try system_catalog_storage.readMeta(a, txn, group_id);
+        if (meta.revision != command.expected_revision) return;
+        const reader: CatalogReader = .{ .store = self, .view = .{ .alloc = a, .txn = txn, .group_id = group_id, .meta = meta } };
+        var delta = system_catalog.planWithReader(a, reader, meta.next_id, command.mutation) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return, // A concurrent catalog/topology operation defeated admission.
         };
-        defer delta.deinit(self.alloc);
+        defer delta.deinit(a);
         if ((command.mutation.kind == .table and command.mutation.action == .create) != (command.topology != null)) return;
         if (command.placement_update) |update| {
             if (command.mutation.kind != .table or command.mutation.action != .set_tablespace or update.expected.table_id != update.replacement.table_id or !std.mem.eql(u8, update.expected.name, update.replacement.name)) return;
@@ -2771,7 +2841,7 @@ pub const RaftApplyStore = struct {
         }
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
-        try system_catalog_storage.applyDelta(self.alloc, txn, group_id, delta, snapshot.meta, hash);
+        try system_catalog_storage.applyDelta(self.alloc, txn, group_id, delta, meta, hash);
         // Invalidate metadata readers through the existing catalog event path.
         self.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = group_id });
     }
@@ -8180,6 +8250,7 @@ fn decodeTableQueryProjection(alloc: std.mem.Allocator, encoded: []const u8, inc
     // framed fields to validate the encoding, but copy only query-owned data.
     if (count != 5 and count != 6 and count != 8) return error.InvalidMetadataTransitionEncoding;
     return .{ .table_id = table_id, .name = name, .query_definition = if (include_definition) try (system_catalog.QueryDefinition{
+        .table_id = table_id,
         .schema_json = fields[1],
         .read_schema_json = if (count == 5) "" else fields[2],
         .indexes_json = fields[if (count == 5) 2 else 3],
@@ -16424,4 +16495,61 @@ test "system catalog legacy and missing point reads have catalog-independent all
     const result = (try store.resolveSystemCatalogIdentity(alloc, 21, .{ .table = "legacy" })).?;
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 7), result.table_id);
+}
+
+test "system catalog indexed management reads and mutation planning ignore unrelated inventory" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog-management", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        for (0..1000) |i| {
+            const name = try std.fmt.allocPrint(alloc, "database_{d}", .{i});
+            defer alloc.free(name);
+            try system_catalog_storage.writeResource(alloc, &txn, 21, .{ .kind = .database, .id = 100 + i, .name = name });
+        }
+        try txn.commit();
+    }
+    try store.ensureQueryCatalogIndexes(21);
+    {
+        var buffer: [16 * 1024]u8 = undefined;
+        var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+        const a = bounded.allocator();
+        var txn = try store.beginQueryCatalogReadTxn(21);
+        defer txn.abort();
+        const view: system_catalog_storage.View = .{ .alloc = a, .txn = &txn, .group_id = 21, .meta = try system_catalog_storage.readMeta(a, &txn, 21) };
+        const selected = try view.read(.{ .kind = .database, .name = "database_999" });
+        try std.testing.expectEqual(@as(usize, 1), selected.resources.len);
+        const reader: RaftApplyStore.CatalogReader = .{ .store = &store, .view = view };
+        const delta = try system_catalog.planWithReader(a, reader, view.meta.next_id, .{ .action = .rename, .kind = .database, .name = "database_999", .new_name = "renamed" });
+        try std.testing.expectEqual(@as(usize, 1), delta.upserts.len);
+        try std.testing.expectEqualStrings("renamed", delta.upserts[0].name);
+    }
+    // Reverse references move with the authoritative record and rebuild after
+    // reopen. A cleared binding must not keep its former tablespace in use.
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        var db: system_catalog.Resource = .{ .kind = .database, .id = 100, .name = "database_0", .tablespace_id = 70 };
+        try system_catalog_storage.writeResource(alloc, &txn, 21, db);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const view: system_catalog_storage.View = .{ .alloc = arena.allocator(), .txn = &txn, .group_id = 21, .meta = .{} };
+        try std.testing.expect(try view.tablespaceInUse(70));
+        db.tablespace_id = 0;
+        try system_catalog_storage.writeResource(alloc, &txn, 21, db);
+        try std.testing.expect(!try view.tablespaceInUse(70));
+        try txn.commit();
+    }
+    store.deinit();
+    store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    const response = try store.systemCatalogRead(alloc, 21, .{ .kind = .database, .name = "database_999" });
+    defer alloc.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "database_999") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "database_998") == null);
 }
