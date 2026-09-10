@@ -2,6 +2,8 @@
 
 Run these from `zig/`. Results describe a particular binary, machine, and workload;
 they are not CI latency thresholds or production capacity claims.
+See [recorded measurements](SYSTEM_CATALOG_RESULTS.md) for a reproducible local
+before/after comparison and representative request latencies.
 
 ## Catalog scale in process
 
@@ -30,7 +32,9 @@ uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
 The harness starts disposable servers with reserved loopback ports, uses real
 HTTP requests, validates results, and stops its servers on exit. It needs the
 normal E2E Python dependencies and permission to open local sockets. Startup,
-table creation, warmup, and measured requests are kept separate. The output
+table creation, shard-readiness waits, warmup, and measured requests are kept
+separate. Cluster setup waits for each new shard to report a healthy voter and
+a known leader on every metadata node before starting the next table. The output
 records the binary SHA-256, platform, complete settings, sample counts, and
 p50/p95/max latency. Supply `--binary` to compare separately built revisions;
 use the same build mode and settings, and run them without competing workloads.
@@ -40,7 +44,7 @@ The catalog workload models an application serving tenant-scoped tables:
 
 - Provision a database, namespace, and inherited placement policy; grow from
   10 to 100 tables by default, with one document in each measured target.
-- Read a document, issue a qualified query and self-join, and run 20 NDJSON
+- Read a document, issue a qualified query and join to a second table, and run 20 NDJSON
   queries sharing a target. NDJSON timing is for the whole HTTP batch.
 - List the namespace's tables, rename a table while checking stable identity,
   and run concurrent qualified lookups with eight independent client sessions.

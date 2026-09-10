@@ -154,7 +154,7 @@ def server(binary: Path, deployment: str):
         else instance.data_api_urls[0]
     )
     try:
-        yield api, (time.perf_counter() - start) * 1000
+        yield api, (time.perf_counter() - start) * 1000, instance
     except Exception:
         print(instance.debug_logs()[-12000:], file=sys.stderr)
         raise
@@ -163,8 +163,47 @@ def server(binary: Path, deployment: str):
         instance.stop()
 
 
+def wait_for_catalog_shards(api: Api, instance, created: dict, args) -> float:
+    """Keep asynchronous shard bootstrap outside steady-state measurements."""
+    if not isinstance(instance, MultiNodeScalingCluster):
+        return 0.0
+    groups = {int(group) for group in created["shards"]}
+    if not groups:
+        raise RuntimeError("created table has no shards")
+    start = time.perf_counter()
+    deadline = start + args.readiness_timeout
+    pending = list(instance.metadata_urls)
+    while pending:
+        for url in pending.copy():
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"shard readiness timed out: {groups}, peers {pending}"
+                )
+            try:
+                response = api.session.get(
+                    url + "/metadata/v1/admin/snapshot", timeout=min(5, remaining)
+                )
+                response.raise_for_status()
+                ready = {
+                    int(status["group_id"])
+                    for status in response.json().get("merged_group_statuses", [])
+                    if status.get("leader_known")
+                    and int(status.get("leader_store_id", 0)) != 0
+                    and int(status.get("healthy_voter_reports", 0)) >= 1
+                }
+                if groups <= ready:
+                    pending.remove(url)
+            except requests.RequestException:
+                # Only setup's read-only observation is retried.
+                pass
+        if pending:
+            time.sleep(min(args.poll_ms / 1000, max(0, deadline - time.perf_counter())))
+    return (time.perf_counter() - start) * 1000
+
+
 def catalog_scenario(args, binary: Path) -> dict:
-    with server(binary, args.deployment) as (api, startup):
+    with server(binary, args.deployment) as (api, startup, instance):
         scope = "/databases/benchmark/namespaces/serving"
         api.request("POST", "/databases/benchmark", {})
         api.request("POST", scope, {})
@@ -182,10 +221,16 @@ def catalog_scenario(args, binary: Path) -> dict:
                 file=sys.stderr,
             )
             creates = []
+            shard_readiness = []
             for i in range(previous, count):
                 start = time.perf_counter_ns()
-                api.request("POST", f"{scope}/tables/events_{i}", {"num_shards": 1})
+                created = api.request(
+                    "POST", f"{scope}/tables/events_{i}", {"num_shards": 1}
+                )
                 creates.append((time.perf_counter_ns() - start) / 1e6)
+                shard_readiness.append(
+                    wait_for_catalog_shards(api, instance, created, args)
+                )
             previous = count
             table = f"events_{count - 1}"
             path = f"{scope}/tables/{table}"
@@ -292,6 +337,7 @@ def catalog_scenario(args, binary: Path) -> dict:
                 {
                     "table_count": count,
                     "table_create": summary(creates),
+                    "shard_readiness": summary(shard_readiness),
                     "operations": measured,
                 }
             )
@@ -308,7 +354,7 @@ def graph_nodes(response):
 
 
 def resolution_scenario(args, binary: Path) -> dict:
-    with server(binary, "cluster") as (api, startup):
+    with server(binary, "cluster") as (api, startup, _instance):
         api.request("POST", "/tables/entities", {"num_shards": 1})
         indexes = json.loads(json.dumps(DOCUMENTS_INDEXES))
         indexes["relations_graph"]["resolvers"][0]["candidate_search"] = "exact_key"
