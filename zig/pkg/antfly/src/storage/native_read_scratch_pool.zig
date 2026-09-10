@@ -67,7 +67,10 @@ pub const Pool = struct {
         const slot = try self.alloc.create(Slot);
         // Stable allocation: arena allocator handles point to the slot's
         // budget, not a query-stack value that can be moved or destroyed.
-        slot.budget = resources.BudgetedAllocator.init(self.manager, .dense_search_working_set, std.heap.page_allocator, 1);
+        // A leased slot is absent from the idle list, and neither arena growth
+        // nor reset holds the pool lock. Admission may therefore reclaim idle
+        // slots (including this pool's) without recursing into the active arena.
+        slot.budget = resources.BudgetedAllocator.initReclaiming(self.manager, .dense_search_working_set, std.heap.page_allocator, 1);
         slot.arena = std.heap.ArenaAllocator.init(slot.budget.allocator());
         return slot;
     }

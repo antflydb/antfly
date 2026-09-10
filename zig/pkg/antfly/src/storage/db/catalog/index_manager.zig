@@ -38549,6 +38549,11 @@ test "native read scratch pool bounds idle slots and rejects oversized retention
 }
 
 test "native read scratch pool participates in hard-budget reclamation" {
+    try testNativeReadScratchReclamation(false);
+    try testNativeReadScratchReclamation(true);
+}
+
+fn testNativeReadScratchReclamation(cross_pool: bool) !void {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@intFromEnum(resource_manager_mod.Slice.dense_search_working_set)] = .{
@@ -38559,19 +38564,25 @@ test "native read scratch pool participates in hard-budget reclamation" {
     defer resources.deinit(alloc);
     const pool = try native_read_scratch_pool.Pool.create(alloc, &resources);
     defer pool.destroy();
+    const idle_pool = if (cross_pool) try native_read_scratch_pool.Pool.create(alloc, &resources) else pool;
+    defer if (cross_pool) idle_pool.destroy();
     const active = try pool.acquire();
     defer pool.release(active);
     const original = try active.allocator().alloc(u8, 1024);
     @memset(original, 91);
-    const idle = try pool.acquire();
+    const idle = try idle_pool.acquire();
     _ = try idle.allocator().alloc(u8, 4096);
-    pool.release(idle);
+    idle_pool.release(idle);
+    try std.testing.expectEqual(@as(usize, 1), idle_pool.idle_count);
     _ = try active.allocator().alloc(u8, 2048);
-    try std.testing.expectEqual(@as(usize, 0), pool.idle_count);
+    try std.testing.expectEqual(@as(usize, 0), idle_pool.idle_count);
+    try std.testing.expect(resources.sliceStats(.dense_search_working_set).used_bytes <= 8192);
     for (original) |byte| try std.testing.expectEqual(@as(u8, 91), byte);
     try std.testing.expectError(error.OutOfMemory, active.allocator().alloc(u8, 16384));
     try std.testing.expectEqual(error.ResourceBudgetExceeded, active.allocationError(error.OutOfMemory));
     try std.testing.expectEqual(error.Corrupted, active.allocationError(error.Corrupted));
+    // Failed admission must not invalidate the live caller's arena either.
+    for (original) |byte| try std.testing.expectEqual(@as(u8, 91), byte);
 }
 
 test "native read scratch pool keeps concurrent leases isolated" {
