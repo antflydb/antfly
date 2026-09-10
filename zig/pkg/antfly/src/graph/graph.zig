@@ -6372,17 +6372,6 @@ pub const GraphIndex = struct {
         updated_at: u64,
         metadata: []const u8,
     ) !void {
-        // Tree topology: source can have at most one outgoing edge of this type
-        if (self.getTopologyMode(edge_type) == .tree) {
-            const existing = try self.getEdges(self.alloc, source, edge_type, .out);
-            defer freeEdges(self.alloc, existing);
-            for (existing) |e| {
-                if (!std.mem.eql(u8, e.target, target)) {
-                    return TreeTopologyViolation.TreeTopologyViolation;
-                }
-            }
-        }
-
         return try self.batchApply(&.{.{
             .source = source,
             .target = target,
@@ -7258,27 +7247,83 @@ pub const GraphIndex = struct {
         try self.batchApply(&.{}, deletes);
     }
 
-    fn validateTreeBatchWrites(self: *GraphIndex, writes: []const BatchWrite, deletes: []const BatchDelete) !void {
+    /// Read-only benchmark oracle for distinct-source tree ingestion. The
+    /// reference preserves the former per-write scan and prior-write walk.
+    pub fn benchmarkTreeBatchValidation(self: *GraphIndex, writes: []const BatchWrite, reference: bool) !void {
+        if (!reference) return self.validateTreeBatchWrites(writes, &.{});
         for (writes, 0..) |write, i| {
             if (self.getTopologyMode(write.edge_type) != .tree) continue;
-
             const existing = try self.getEdges(self.alloc, write.source, write.edge_type, .out);
             defer freeEdges(self.alloc, existing);
-
-            for (existing) |edge| {
-                if (containsBatchDelete(deletes, edge.source, edge.target, edge.edge_type)) continue;
-                if (!std.mem.eql(u8, edge.target, write.target)) {
-                    return TreeTopologyViolation.TreeTopologyViolation;
-                }
-            }
-
+            for (existing) |edge| if (!std.mem.eql(u8, edge.target, write.target)) return error.TreeTopologyViolation;
             for (writes[0..i]) |prior| {
-                if (!std.mem.eql(u8, prior.source, write.source)) continue;
-                if (!std.mem.eql(u8, prior.edge_type, write.edge_type)) continue;
-                if (containsBatchDelete(deletes, prior.source, prior.target, prior.edge_type)) continue;
-                if (!std.mem.eql(u8, prior.target, write.target)) {
-                    return TreeTopologyViolation.TreeTopologyViolation;
-                }
+                if (std.mem.eql(u8, prior.source, write.source) and std.mem.eql(u8, prior.edge_type, write.edge_type) and !std.mem.eql(u8, prior.target, write.target)) return error.TreeTopologyViolation;
+            }
+        }
+    }
+
+    fn validateTreeBatchWrites(self: *GraphIndex, writes: []const BatchWrite, deletes: []const BatchDelete) !void {
+        // Validate final identities once per (source, type), independently of
+        // batch ordering. Deletes run before all writes: a deleted identity
+        // subsequently reinserted by this batch still participates in the tree.
+        var groups = std.StringHashMapUnmanaged([]const u8).empty;
+        defer {
+            var keys = groups.keyIterator();
+            while (keys.next()) |key| self.alloc.free(key.*);
+            groups.deinit(self.alloc);
+        }
+        for (writes) |write| {
+            if (self.getTopologyMode(write.edge_type) != .tree) continue;
+            const key = try edgePrefixAlloc(self.alloc, write.source, self.index_name, write.edge_type);
+            const entry = groups.getOrPut(self.alloc, key) catch |err| {
+                self.alloc.free(key);
+                return err;
+            };
+            if (entry.found_existing) {
+                self.alloc.free(key);
+                if (!std.mem.eql(u8, entry.value_ptr.*, write.target)) return TreeTopologyViolation.TreeTopologyViolation;
+            } else {
+                entry.value_ptr.* = write.target;
+            }
+        }
+        if (groups.count() == 0) return;
+        var removed = std.StringHashMapUnmanaged(void).empty;
+        defer {
+            var keys = removed.keyIterator();
+            while (keys.next()) |key| self.alloc.free(key.*);
+            removed.deinit(self.alloc);
+        }
+        for (deletes) |item| {
+            if (self.getTopologyMode(item.edge_type) != .tree) continue;
+            const key = try edgeKeyAlloc(self.alloc, item.source, self.index_name, item.edge_type, item.target);
+            const entry = removed.getOrPut(self.alloc, key) catch |err| {
+                self.alloc.free(key);
+                return err;
+            };
+            if (entry.found_existing) self.alloc.free(key);
+        }
+        var txn = try self.outgoing_store.beginRead();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        const ordered = try self.alloc.alloc([]const u8, groups.count());
+        defer self.alloc.free(ordered);
+        var keys = groups.keyIterator();
+        for (ordered) |*key| key.* = keys.next().?.*;
+        std.mem.sort([]const u8, ordered, {}, struct {
+            fn less(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.less);
+        for (ordered) |prefix| {
+            const target = groups.get(prefix).?;
+            var entry = try cursor.seekAtOrAfter(prefix);
+            while (entry) |kv| : (entry = try cursor.next()) {
+                if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+                if (removed.contains(kv.key)) continue;
+                var parsed = (try parseOutgoingEdgeKeyAlloc(self.alloc, kv.key)) orelse return error.InvalidGraphSegment;
+                defer parsed.deinit(self.alloc);
+                if (!std.mem.eql(u8, parsed.target, target)) return TreeTopologyViolation.TreeTopologyViolation;
             }
         }
     }
@@ -7297,21 +7342,36 @@ pub const GraphIndex = struct {
         const range_lower = range_lower_owned orelse "";
         const range_upper = range_upper_owned orelse "";
 
-        const pairs = try self.mainStoreScanRange(alloc, range_lower, range_upper);
-        defer backend_scan.freeResults(alloc, pairs);
-
+        var source = try self.outgoing_store.beginRead();
+        defer source.abort();
+        var cursor = try source.openCursor();
+        defer cursor.close();
+        cursor.setUpperBound(if (range_upper.len > 0) range_upper else null);
         var batch = try dest.beginWriteOutgoingBatch();
-        errdefer batch.abort();
+        var active = true;
+        errdefer if (active) batch.abort();
         var copied: usize = 0;
-        for (pairs) |pair| {
+        var bytes: usize = 0;
+        var entry = try cursor.seekAtOrAfter(range_lower);
+        while (entry) |pair| : (entry = try cursor.next()) {
+            if (range_upper.len > 0 and std.mem.order(u8, pair.key, range_upper) != .lt) break;
             var parsed = (try parseOutgoingEdgeKeyAlloc(alloc, pair.key)) orelse continue;
             defer parsed.deinit(alloc);
             if (!std.mem.eql(u8, parsed.index_name, self.index_name)) continue;
             if (!std.mem.eql(u8, dest.index_name, self.index_name)) continue;
             try batch.put(pair.key, pair.value);
             copied += 1;
+            bytes +|= pair.key.len +| pair.value.len;
+            if (bytes >= 4 * 1024 * 1024 or copied % reverse_rebuild_batch_size == 0) {
+                try batch.commit();
+                active = false;
+                batch = try dest.beginWriteOutgoingBatch();
+                active = true;
+                bytes = 0;
+            }
         }
         try batch.commit();
+        active = false;
         return copied;
     }
 
@@ -7346,11 +7406,16 @@ pub const GraphIndex = struct {
             base_lower;
         const range_upper = range_upper_owned orelse "";
 
-        const pairs = try self.mainStoreScanRange(alloc, range_lower, range_upper);
-        defer backend_scan.freeResults(alloc, pairs);
-
+        // Keep a stable source snapshot, but borrow only the current cursor
+        // entry. Write admission is bounded by bytes as well as record count.
+        var source = try self.outgoing_store.beginRead();
+        defer source.abort();
+        var cursor = try source.openCursor();
+        defer cursor.close();
+        cursor.setUpperBound(if (range_upper.len > 0) range_upper else null);
         var rebuilt: usize = 0;
         var batch_count: usize = 0;
+        var batch_bytes: usize = 0;
         var flushed_batches: usize = 0;
         var matching_edges: usize = 0;
         var txn = try self.beginWriteReverseTxn();
@@ -7364,7 +7429,9 @@ pub const GraphIndex = struct {
         else
             null;
 
-        for (pairs) |pair| {
+        var entry = try cursor.seekAtOrAfter(range_lower);
+        while (entry) |pair| : (entry = try cursor.next()) {
+            if (range_upper.len > 0 and std.mem.order(u8, pair.key, range_upper) != .lt) break;
             if (resume_from) |resume_key| {
                 if (resume_key.len > 0 and std.mem.order(u8, pair.key, resume_key) != .gt) continue;
             }
@@ -7378,8 +7445,9 @@ pub const GraphIndex = struct {
             try txn.put(rev_key, pair.value);
             rebuilt += 1;
             batch_count += 1;
+            batch_bytes +|= rev_key.len +| pair.value.len;
 
-            if (batch_count >= reverse_rebuild_batch_size) {
+            if (batch_count >= reverse_rebuild_batch_size or batch_bytes >= 4 * 1024 * 1024) {
                 try txn.commit();
                 txn_active = false;
                 if (rebuild_state) |state| try state.updateWithIo(io, pair.key);
@@ -7392,6 +7460,7 @@ pub const GraphIndex = struct {
                 txn = try self.beginWriteReverseTxn();
                 txn_active = true;
                 batch_count = 0;
+                batch_bytes = 0;
             }
         }
 
@@ -7459,21 +7528,6 @@ pub const GraphIndex = struct {
 
     fn mainStoreScanRange(self: *GraphIndex, alloc: Allocator, lower: []const u8, upper: []const u8) ![]backend_scan.OwnedKVPair {
         return try backend_scan.scanRange(alloc, &self.outgoing_store, lower, upper);
-    }
-
-    fn containsBatchDelete(
-        deletes: []const BatchDelete,
-        source: []const u8,
-        target: []const u8,
-        edge_type: []const u8,
-    ) bool {
-        for (deletes) |delete| {
-            if (!std.mem.eql(u8, delete.source, source)) continue;
-            if (!std.mem.eql(u8, delete.target, target)) continue;
-            if (!std.mem.eql(u8, delete.edge_type, edge_type)) continue;
-            return true;
-        }
-        return false;
     }
 
     pub const GraphMetricState = enum {
@@ -33990,6 +34044,31 @@ test "tree topology rejects second outgoing edge" {
     defer GraphIndex.freeEdges(alloc, edges);
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("parent1", edges[0].target);
+}
+
+test "graph metric tree batch validation uses final identities after deletes" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "store-tree-batch-final");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "rev-tree-batch-final");
+    defer cleanupTmp(rev_path);
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    var graph = try openTestGraphIndex(alloc, &store, rev_path, "g", .{ .edge_type_configs = &.{.{ .name = "parent", .topology = .tree }} });
+    defer graph.close();
+    const first = BatchWrite{ .source = "child", .target = "parent1", .edge_type = "parent", .weight = 1, .created_at = 0, .updated_at = 0, .metadata_json = "" };
+    var second = first;
+    second.target = "parent2";
+    const deleted = BatchDelete{ .source = first.source, .target = first.target, .edge_type = first.edge_type };
+    try graph.batchApply(&.{ first, first }, &.{});
+    try std.testing.expectError(error.TreeTopologyViolation, graph.batchApply(&.{ first, second }, &.{deleted}));
+    try graph.batchApply(&.{ second, second }, &.{ deleted, deleted });
+    const edges = try graph.getEdges(alloc, "child", "parent", .out);
+    defer GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("parent2", edges[0].target);
 }
 
 test "tree topology allows update to same target" {

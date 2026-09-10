@@ -6984,7 +6984,7 @@ const PublicGraphRequestCache = struct {
         const paged = try self.handler.alloc.create(AdmittedAdjacencyReader);
         errdefer self.handler.alloc.destroy(paged);
         paged.allocation = .{ .backing = self.handler.alloc, .budget = self.work_budget };
-        paged.reader = (graph_segment_mod.AdjacencyReader.init(paged.allocation.allocator(), self.session.artifacts, artifact_ref, self.session.cancellation, &self.graph_read_remaining) catch |err| return paged.translate(err)) orelse {
+        paged.reader = (graph_segment_mod.AdjacencyReader.initCached(paged.allocation.allocator(), self.session.artifacts, artifact_ref, self.session.cancellation, &self.graph_read_remaining, self.session.graphAdjacencyCache()) catch |err| return paged.translate(err)) orelse {
             self.handler.alloc.destroy(paged);
             try self.retained_lease.resize(prior);
             return null;

@@ -27,7 +27,6 @@ const CancellationToken = @import("../../common/cancellation.zig").CancellationT
 pub const Reader = struct {
     alloc: Allocator,
     context: topology.Context,
-    kinds: []const []const u8,
     tables: []const []const u8,
     table_bytes: []u8,
     page_bytes: []u8 = &.{},
@@ -36,12 +35,16 @@ pub const Reader = struct {
     page_count: usize = 0,
 
     pub fn init(alloc: Allocator, store: *artifacts.ArtifactStore, source: refs.ArtifactRef, cancellation: CancellationToken, remaining: *u64) !?Reader {
+        return initCached(alloc, store, source, cancellation, remaining, null);
+    }
+
+    pub fn initCached(alloc: Allocator, store: *artifacts.ArtifactStore, source: refs.ArtifactRef, cancellation: CancellationToken, remaining: *u64, cache: ?topology.ReadCache) !?Reader {
         // Queries alternate dictionary, routing, and adjacency blocks. A small
         // request-local working set avoids thrashing these independent ranges;
         // streaming topology preparation keeps its one-block configuration.
-        var context = try topology.Context.initWithCache(alloc, store, source, cancellation, remaining, 8);
+        var context = try topology.Context.initQuery(alloc, store, source, cancellation, remaining, cache);
         errdefer context.deinit();
-        const directory = context.directory orelse {
+        const directory = context.layout orelse {
             context.deinit();
             return null;
         };
@@ -52,13 +55,9 @@ pub const Reader = struct {
         if (std.mem.readInt(u32, header[10..14], .little) != directory.nodes) return error.InvalidGraphSegment;
         const table_count = std.mem.readInt(u32, header[6..10], .little);
         const kind_count = std.mem.readInt(u32, header[14..18], .little);
-        if (kind_count > directory.entries.len / 52) return error.InvalidGraphSegment;
-        const kinds = try alloc.alloc([]const u8, kind_count);
-        errdefer alloc.free(kinds);
-        var iterator = directory.iterator();
-        for (kinds) |*kind| kind.* = (try iterator.next() orelse return error.InvalidGraphSegment).kind;
-        if (try iterator.next() != null) return error.InvalidGraphSegment;
-        const nodes_begin = std.mem.readInt(u64, directory.page_offsets[0..8], .little);
+        if (kind_count != directory.types) return error.InvalidGraphSegment;
+        const first_offset = try context.control(8, 16);
+        const nodes_begin = std.mem.readInt(u64, &first_offset, .little);
         if (nodes_begin < wire.header_len or nodes_begin > context.trailer.body_len) return error.InvalidGraphSegment;
         if (table_count > (nodes_begin - wire.header_len) / 4) return error.InvalidGraphSegment;
         const table_bytes = try context.readAlloc(alloc, wire.header_len, nodes_begin - wire.header_len);
@@ -71,14 +70,13 @@ pub const Reader = struct {
             if (table.len == 0) return error.InvalidGraphSegment;
         }
         if (pos != table_bytes.len) return error.InvalidGraphSegment;
-        return .{ .alloc = alloc, .context = context, .kinds = kinds, .tables = tables, .table_bytes = table_bytes };
+        return .{ .alloc = alloc, .context = context, .tables = tables, .table_bytes = table_bytes };
     }
 
     pub fn deinit(self: *Reader) void {
         self.alloc.free(self.page_bytes);
         self.alloc.free(self.tables);
         self.alloc.free(self.table_bytes);
-        self.alloc.free(self.kinds);
         self.context.deinit();
         self.* = undefined;
     }
@@ -95,8 +93,8 @@ pub const Reader = struct {
 
     fn loadPage(self: *Reader, page: usize) !void {
         if (self.page == page) return;
-        const directory = self.context.directory.?;
-        const range = try directory.nodePage(page);
+        const directory = self.context.layout.?;
+        const range = try self.context.nodePage(page);
         if (range.offset < wire.header_len or range.offset > self.context.trailer.body_len or range.len > self.context.trailer.body_len - range.offset)
             return error.InvalidGraphSegment;
         self.alloc.free(self.page_bytes);
@@ -110,14 +108,13 @@ pub const Reader = struct {
             if (i > 0 and std.mem.order(u8, self.page_nodes[i - 1], node.*) != .lt) return error.InvalidGraphSegment;
         }
         if (pos != self.page_bytes.len) return error.InvalidGraphSegment;
-        const fence_bytes = directory.page_fences[page * wire.node_page_fence_bytes ..][0..wire.node_page_fence_bytes];
-        if (self.page_nodes[0].len != std.mem.readInt(u32, fence_bytes[0..4], .little) or !std.mem.eql(u8, self.fence(page), self.page_nodes[0][0..@min(self.page_nodes[0].len, 64)])) return error.InvalidGraphSegment;
+        const fence_bytes = try self.context.nodeFence(page);
+        if (self.page_nodes[0].len != std.mem.readInt(u32, fence_bytes[0..4], .little) or !std.mem.eql(u8, fence(&fence_bytes), self.page_nodes[0][0..@min(self.page_nodes[0].len, 64)])) return error.InvalidGraphSegment;
         self.page = page;
     }
 
     fn ordinal(self: *Reader, key: []const u8) !?u32 {
-        const directory = self.context.directory.?;
-        const pages = directory.page_offsets.len / 8 - 1;
+        const pages = self.context.layout.?.pages;
         if (pages == 0) return null;
         // Authenticated 64-byte fence prefixes usually identify one page with
         // no I/O. Long shared prefixes only widen the binary-search interval;
@@ -127,18 +124,20 @@ pub const Reader = struct {
         var end = pages;
         while (begin < end) {
             const middle = begin + (end - begin) / 2;
-            if (std.mem.order(u8, self.fence(middle), prefix) == .lt) begin = middle + 1 else end = middle;
+            const raw = try self.context.nodeFence(middle);
+            if (std.mem.order(u8, fence(&raw), prefix) == .lt) begin = middle + 1 else end = middle;
         }
         const first = begin;
         if (first < pages and key.len <= 64) {
-            const raw = directory.page_fences[first * wire.node_page_fence_bytes ..][0..wire.node_page_fence_bytes];
-            if (std.mem.readInt(u32, raw[0..4], .little) == key.len and std.mem.eql(u8, self.fence(first), key))
+            const raw = try self.context.nodeFence(first);
+            if (std.mem.readInt(u32, raw[0..4], .little) == key.len and std.mem.eql(u8, fence(&raw), key))
                 return @intCast(first * wire.node_page_entries);
         }
         end = pages;
         while (begin < end) {
             const middle = begin + (end - begin) / 2;
-            if (std.mem.order(u8, self.fence(middle), prefix) != .gt) begin = middle + 1 else end = middle;
+            const raw = try self.context.nodeFence(middle);
+            if (std.mem.order(u8, fence(&raw), prefix) != .gt) begin = middle + 1 else end = middle;
         }
         if (begin == 0) return null;
         var lower = first -| 1;
@@ -154,8 +153,7 @@ pub const Reader = struct {
         return @intCast(lower * wire.node_page_entries + index);
     }
 
-    fn fence(self: *Reader, page: usize) []const u8 {
-        const bytes = self.context.directory.?.page_fences[page * wire.node_page_fence_bytes ..][0..wire.node_page_fence_bytes];
+    fn fence(bytes: []const u8) []const u8 {
         return bytes[4..][0..@min(std.mem.readInt(u32, bytes[0..4], .little), 64)];
     }
 
@@ -193,7 +191,7 @@ pub const Reader = struct {
 
     fn validEdge(self: *Reader, bytes: []const u8, index: usize) !wire.Edge {
         const edge = wire.readEdge(bytes, index);
-        if (edge.node >= self.context.directory.?.nodes or edge.edge_type >= self.kinds.len or !std.math.isFinite(edge.weight)) return error.InvalidGraphSegment;
+        if (edge.node >= self.context.layout.?.nodes or edge.edge_type >= self.context.layout.?.types or !std.math.isFinite(edge.weight)) return error.InvalidGraphSegment;
         if (edge.table) |table| if (table >= self.tables.len) return error.InvalidGraphSegment;
         return edge;
     }
@@ -213,13 +211,94 @@ pub const Reader = struct {
         try self.loadPage(edge.node / wire.node_page_entries);
         const neighbor = try self.alloc.dupe(u8, self.page_nodes[edge.node % wire.node_page_entries]);
         errdefer self.alloc.free(neighbor);
-        return .{ .neighbor_id = neighbor, .edge_type = try self.alloc.dupe(u8, self.kinds[edge.edge_type]), .weight = edge.weight, .neighbor_table_id = edge.table };
+        return .{ .neighbor_id = neighbor, .edge_type = try self.context.kindAlloc(edge.edge_type), .weight = edge.weight, .neighbor_table_id = edge.table };
+    }
+
+    /// A resumable directional scan. Transport is chunked, but edge work and
+    /// string materialization are admitted only as the consumer advances. A
+    /// shortest-path consumer can stop without decoding the rest of a hub.
+    pub const Cursor = struct {
+        const Range = struct { begin: usize, end: usize };
+        reader: *Reader,
+        offset: u64,
+        ranges: []Range,
+        range: usize = 0,
+        position: usize = 0,
+        bytes: []u8 = &.{},
+        bytes_begin: usize = 0,
+        work: *usize,
+
+        pub fn deinit(self: *Cursor) void {
+            self.reader.alloc.free(self.ranges);
+            self.reader.alloc.free(self.bytes);
+            self.* = undefined;
+        }
+
+        pub fn next(self: *Cursor) !?types.Edge {
+            return try self.reader.copyEdge(try self.nextWire() orelse return null);
+        }
+
+        fn nextWire(self: *Cursor) !?wire.Edge {
+            while (self.range < self.ranges.len) {
+                const selected = self.ranges[self.range];
+                self.position = @max(self.position, selected.begin);
+                if (self.position == selected.end) {
+                    self.range += 1;
+                    continue;
+                }
+                try self.reader.context.reader.cancellation.check();
+                if (self.work.* == 0) return error.GraphTraversalQueryBudgetExceeded;
+                if (self.bytes.len == 0 or self.position < self.bytes_begin or self.position - self.bytes_begin >= self.bytes.len / wire.edge_len) {
+                    self.reader.alloc.free(self.bytes);
+                    self.bytes = &.{};
+                    self.bytes_begin = self.position;
+                    const count: usize = @min(selected.end - self.position, @min(self.work.*, 4096));
+                    self.bytes = try self.reader.context.readAlloc(self.reader.alloc, self.offset + self.position * wire.edge_len, count * wire.edge_len);
+                }
+                self.work.* -= 1;
+                const edge = try self.reader.validEdge(self.bytes, self.position - self.bytes_begin);
+                self.position += 1;
+                return edge;
+            }
+            return null;
+        }
+    };
+
+    pub fn cursor(self: *Reader, key: []const u8, requested: []const []const u8, incoming: bool, work: *usize) !Cursor {
+        const found = try self.row(key);
+        const offset = if (found) |row_value| row_value.offset + (if (incoming) @as(u64, row_value.out) * wire.edge_len else 0) else 0;
+        const count: usize = if (found) |row_value| (if (incoming) row_value.in else row_value.out) else 0;
+        return self.cursorAt(offset, count, requested, work);
+    }
+
+    fn cursorAt(self: *Reader, offset: u64, count: usize, requested: []const []const u8, work: *usize) !Cursor {
+        if (count == 0) return .{ .reader = self, .offset = offset, .ranges = &.{}, .work = work };
+        var ranges: std.ArrayListUnmanaged(Cursor.Range) = .empty;
+        errdefer ranges.deinit(self.alloc);
+        if (requested.len == 0) {
+            if (count != 0) try ranges.append(self.alloc, .{ .begin = 0, .end = count });
+        } else for (requested, 0..) |kind, i| {
+            const duplicate = for (requested[0..i]) |prior| {
+                if (std.mem.eql(u8, prior, kind)) break true;
+            } else false;
+            if (duplicate) continue;
+            const id = try self.context.kindId(kind) orelse continue;
+            const begin = try self.lowerBound(offset, count, @intCast(id), 0, work);
+            const end = try self.lowerBound(offset, count, @intCast(id + 1), 0, work);
+            if (begin != end) try ranges.append(self.alloc, .{ .begin = begin, .end = end });
+        }
+        std.mem.sort(Cursor.Range, ranges.items, {}, struct {
+            fn less(_: void, a: Cursor.Range, b: Cursor.Range) bool {
+                return a.begin < b.begin;
+            }
+        }.less);
+        return .{ .reader = self, .offset = offset, .ranges = try ranges.toOwnedSlice(self.alloc), .work = work };
     }
 
     /// Work is a shared remaining physical-edge allowance, consumed before I/O.
     /// Returned edges own their strings using this reader's admitted allocator.
     pub fn probe(self: *Reader, source: []const u8, kind: []const u8, target: []const u8, work: *usize) !?types.Edge {
-        const kind_id = std.sort.binarySearch([]const u8, self.kinds, kind, compareString) orelse return null;
+        const kind_id = try self.context.kindId(kind) orelse return null;
         const target_id = try self.ordinal(target) orelse return null;
         const found = try self.row(source) orelse return null;
         const index = try self.lowerBound(found.offset, found.out, @intCast(kind_id), target_id, work);
@@ -230,58 +309,26 @@ pub const Reader = struct {
     }
 
     fn readEdges(self: *Reader, offset: u64, count: usize, requested: []const []const u8, limit: usize, work: *usize, skip_qualified: bool, skip_node: ?[]const u8) ![]types.Edge {
-        const Range = struct { begin: usize, end: usize };
-        var ranges: std.ArrayListUnmanaged(Range) = .empty;
-        defer ranges.deinit(self.alloc);
+        var selected = try self.cursorAt(offset, count, requested, work);
+        defer selected.deinit();
         var total: usize = 0;
-        if (requested.len == 0) {
-            total = count;
-            try ranges.append(self.alloc, .{ .begin = 0, .end = count });
-        } else for (requested, 0..) |kind, i| {
-            // Duplicate filters never duplicate physical edges or admission.
-            const duplicate = for (requested[0..i]) |prior| {
-                if (std.mem.eql(u8, prior, kind)) break true;
-            } else false;
-            if (duplicate) continue;
-            const id = std.sort.binarySearch([]const u8, self.kinds, kind, compareString) orelse continue;
-            const begin = try self.lowerBound(offset, count, @intCast(id), 0, work);
-            const end = try self.lowerBound(offset, count, @intCast(id + 1), 0, work);
-            total = std.math.add(usize, total, end - begin) catch return error.QueryCandidateBudgetExceeded;
-            try ranges.append(self.alloc, .{ .begin = begin, .end = end });
-        }
+        for (selected.ranges) |range| total = std.math.add(usize, total, range.end - range.begin) catch return error.QueryCandidateBudgetExceeded;
         if (!skip_qualified and skip_node == null and total > limit) return error.QueryCandidateBudgetExceeded;
         if (total > work.*) return error.GraphTraversalQueryBudgetExceeded;
-        work.* -= total;
-        // Preserve canonical order independent of filter order.
-        std.mem.sort(Range, ranges.items, {}, struct {
-            fn less(_: void, a: Range, b: Range) bool {
-                return a.begin < b.begin;
-            }
-        }.less);
         var result: std.ArrayListUnmanaged(types.Edge) = .empty;
         errdefer {
             for (result.items) |*edge| edge.deinit(self.alloc);
             result.deinit(self.alloc);
         }
-        for (ranges.items) |range| {
-            var begin = range.begin;
-            while (begin < range.end) {
-                const n = @min(range.end - begin, 4096);
-                const bytes = try self.context.readAlloc(self.alloc, offset + begin * wire.edge_len, n * wire.edge_len);
-                defer self.alloc.free(bytes);
-                for (0..n) |i| {
-                    const edge = try self.validEdge(bytes, i);
-                    if (skip_qualified and edge.table != null) continue;
-                    if (skip_node) |node| {
-                        try self.loadPage(edge.node / wire.node_page_entries);
-                        if (std.mem.eql(u8, node, self.page_nodes[edge.node % wire.node_page_entries])) continue;
-                    }
-                    if (result.items.len == limit) return error.QueryCandidateBudgetExceeded;
-                    try result.ensureUnusedCapacity(self.alloc, 1);
-                    result.appendAssumeCapacity(try self.copyEdge(edge));
-                }
-                begin += n;
+        while (try selected.nextWire()) |edge| {
+            if (skip_qualified and edge.table != null) continue;
+            if (skip_node) |node| {
+                try self.loadPage(edge.node / wire.node_page_entries);
+                if (std.mem.eql(u8, node, self.page_nodes[edge.node % wire.node_page_entries])) continue;
             }
+            if (result.items.len == limit) return error.QueryCandidateBudgetExceeded;
+            try result.ensureUnusedCapacity(self.alloc, 1);
+            result.appendAssumeCapacity(try self.copyEdge(edge));
         }
         return result.toOwnedSlice(self.alloc);
     }
@@ -353,6 +400,14 @@ fn exerciseReader(alloc: Allocator, payload: []const u8, source: refs.ArtifactRe
     try std.testing.expectEqual(@as(f32, 2), exact.weight);
     try std.testing.expect(try reader.probe("a", "absent", "b", &work) == null);
     try std.testing.expect(try reader.adjacency("absent", &.{}, Direction.out, 8, &work) == null);
+    var one: usize = 1;
+    var cursor = try reader.cursor("a", &.{}, false, &one);
+    defer cursor.deinit();
+    var first = (try cursor.next()).?;
+    defer first.deinit(alloc);
+    try std.testing.expectEqualStrings("a", first.neighbor_id);
+    try std.testing.expectEqual(@as(usize, 0), one);
+    try std.testing.expectError(error.GraphTraversalQueryBudgetExceeded, cursor.next());
     var incoming = (try reader.adjacency("b", &.{"link"}, Direction.in, 8, &work)).?;
     defer incoming.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), incoming.out_edges.len);
@@ -366,7 +421,7 @@ fn exerciseReader(alloc: Allocator, payload: []const u8, source: refs.ArtifactRe
         if (err == error.OutOfMemory) return err;
         try std.testing.expectEqual(error.GraphTraversalQueryBudgetExceeded, err);
     }
-    try std.testing.expectEqual(@as(usize, 3), memory.calls);
+    try std.testing.expectEqual(@as(usize, 4), memory.calls);
     try std.testing.expectEqual(payload.len, memory.bytes);
 }
 
@@ -430,6 +485,51 @@ test "serverless graph paged preparation coalesces thousands of small type runs"
     try std.testing.expectEqual(@as(usize, 10000), prepared.edge_types.len);
     try std.testing.expect(memory.calls <= 8);
     try std.testing.expect(memory.bytes <= payload.len);
+}
+
+test "serverless graph paged routing survives large type directories and authenticates root and leaves" {
+    const alloc = std.testing.allocator;
+    var fixture = std.heap.ArenaAllocator.init(alloc);
+    defer fixture.deinit();
+    var builder = @import("builder.zig").Builder{ .alloc = fixture.allocator() };
+    defer builder.deinit();
+    for (0..20000) |i| try builder.addEdge("a", "b", try std.fmt.allocPrint(fixture.allocator(), "kind{d:0>5}", .{i}), 1, null);
+    const payload = try builder.encodeAlloc(4 * 1024 * 1024, .none);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+    const checksum = std.fmt.bytesToHex(digest, .lower);
+    const id = try std.fmt.allocPrint(fixture.allocator(), "sha256:{s}", .{checksum});
+    var source = refs.ArtifactRef{ .kind = .graph_segment, .name = "g", .artifact_id = id, .checksum = &checksum, .byte_len = payload.len };
+    try wire.bindTopologyControl(&source, payload);
+    const trailer = try wire.decodeTopologyTrailer(payload[payload.len - wire.topology_trailer_len ..], payload.len);
+    try std.testing.expect(trailer.directory_len > 1024 * 1024);
+    var memory = TestStore{ .payload = payload };
+    var store = artifacts.ArtifactStore{ .allocator = alloc, .ptr = &memory, .vtable = &TestStore.vtable };
+    var remaining: u64 = 4 * 1024 * 1024;
+    {
+        var reader = (try Reader.init(alloc, &store, source, .none, &remaining)).?;
+        defer reader.deinit();
+        var work: usize = 100;
+        var edge = (try reader.probe("a", "kind00001", "b", &work)).?;
+        defer edge.deinit(alloc);
+        try std.testing.expectEqualStrings("kind00001", edge.edge_type);
+        try std.testing.expect(reader.context.retainedBytes() < 1024 * 1024);
+        try std.testing.expect(memory.bytes < payload.len);
+        // Alternating type offsets, type labels and data checksums must not
+        // fetch a directory leaf for every edge. Also crosses the 4,096-edge
+        // chunk boundary that formerly overflowed its inferred integer type.
+        remaining = 4 * 1024 * 1024;
+        work = 20000;
+        var all = (try reader.adjacency("a", &.{}, enum { out, in, both }.out, 20000, &work)).?;
+        defer all.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 20000), all.out_edges.len);
+        try std.testing.expectEqual(@as(usize, 0), work);
+    }
+    payload[@intCast(trailer.rootOffset())] ^= 1;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, Reader.init(alloc, &store, source, .none, &remaining));
+    payload[@intCast(trailer.rootOffset())] ^= 1;
+    payload[@intCast(trailer.directoryOffset())] ^= 1;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, Reader.init(alloc, &store, source, .none, &remaining));
 }
 
 test "serverless graph paged dictionary fences handle long shared prefixes and page boundaries" {

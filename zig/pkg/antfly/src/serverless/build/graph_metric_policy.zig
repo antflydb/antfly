@@ -24,7 +24,7 @@ const bounded_decode = @import("../bounded_decode.zig");
 /// Increment whenever an implementation change can alter admission or output
 /// without changing the user-visible metric configuration.
 // Addressable topology changes cold read/work admission, not metric semantics.
-pub const materializer_epoch: u32 = 23;
+pub const materializer_epoch: u32 = 24;
 const max_tracked_graph_indexes: usize = 16;
 
 pub const Limits = struct {

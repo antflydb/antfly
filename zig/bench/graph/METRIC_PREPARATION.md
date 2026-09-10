@@ -1,9 +1,59 @@
 # Graph metric execution and query benchmarks
 
+## Streaming cursors, paged control, and tree batches (2026-09-10)
+
+Current graph wire v8 / manifest v23 / materializer epoch 24 uses a 112-byte
+trailer, a bounded authenticated root, and 64 KiB directory leaves. A directory
+larger than 1 MiB stays addressable. Queries load type names and node fences
+lazily, and request sessions share authenticated blocks with single-flight fills.
+
+Reproduce the updated `--paged-only` benchmark and tree validation comparison:
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --paged-only
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --tree-only
+```
+
+Apple M4 Max / Zig 0.16.0, ReleaseFast; five timed samples after one warmup.
+Hub comparisons use the same reader, immutable in-memory transport, and fresh
+request-local caches. They differ only in consuming the entire hub versus
+stopping at its first edge. Transport overfetch is included in byte counts.
+
+| Workload | Eager/reference | Incremental/grouped |
+| --- | ---: | ---: |
+| 16,384-edge hub: local median | 1.335 ms | 0.124 ms |
+| 16,384-edge hub: fetched bytes | 743,205 | 218,917 |
+| 100,000-edge hub: local median | 7.600 ms | 0.216 ms |
+| 100,000-edge hub: fetched bytes | 4,070,765 | 400,749 |
+| 100,000-edge hub: origin GETs | 64 | 8 |
+| 100,000-edge hub: inspected edges | 100,000 | 1 |
+| 2,048 distinct tree writes: validation | 3.815 ms | 0.470 ms |
+| 8,192 distinct tree writes: validation | 55.355 ms | 2.318 ms |
+| 16,384 distinct tree writes: validation | 217.887 ms | 5.037 ms |
+
+Tree measurements exercise read-only production validation against an empty
+native graph, excluding fixture setup and commits. These are not end-to-end
+ingestion speedups. The previous quadratic prior-write walk is retained only as
+a benchmark oracle. Grouped validation also sorts source/type probes for storage
+locality (included in these timings). Final-identity semantics, duplicate deletes/reinsertions,
+and rejection before writes have separate regression coverage.
+
+The 20,000-type fixture now remains paged (2,441,556 encoded bytes); preparation
+uses seven GETs / 1,654,404 fetched bytes. Query tests verify that a fresh second
+request sharing the authenticated cache performs zero origin reads. These are
+CPU/I/O-work measurements, not claims about real cloud latency or throughput.
+
+A four-million-node isolated-node fixture produces a 129,250,850-byte artifact
+with a 1,250,060-byte directory. A cold point lookup succeeds with 792,076 fetched
+bytes / 15 GETs and 726,428 retained control/data-cache bytes (0.576 ms locally).
+This fixture uses production `finishEncoding` to build/authenticate its routing
+structures; fixture construction is excluded from query timings. It validates
+that node cardinality cannot trigger the former 1 MiB full-decode fallback.
+
 ## Addressed adjacency and existence-only mutation probes (2026-09-10)
 
-Current graph wire is v7, manifest wire v22, materializer epoch 23. Serverless
-supports this current layout only. Node-ordinal row offsets cost eight bytes per
+The preceding baseline used graph wire v7, manifest wire v22, materializer epoch
+23. Node-ordinal row offsets cost eight bytes per
 dictionary node; dictionary fences add 68 bytes per 256-node page. Both are
 authenticated by the manifest-bound control structure. The control directory
 remains capped at 1 MiB; oversized controls explicitly omit the accelerator.

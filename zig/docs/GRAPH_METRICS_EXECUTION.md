@@ -231,17 +231,35 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
   and isolated local nodes are preserved.
   Both JSON adapters propagate allocator exhaustion and unwind partial edge
   ownership; allocation failure cannot silently produce an empty graph.
-- Graph wire v7 and manifest v22 bind an 80-byte topology trailer to the
+- Graph wire v8 and manifest v23 bind a 112-byte topology trailer to the
   manifest. Its SHA-256-authenticated directory contains canonical per-type
   semantic digests, dictionary page offsets, bounded first-key fence prefixes,
   and SHA-256 checksums for 64 KiB
-  data blocks. Cold readers fetch only the trailer, directory and blocks covering
+  data blocks. A small authenticated root binds independently addressable
+  64 KiB directory leaves; a fixed-width type-offset array supports lazy type
+  lookup. Cold query readers fetch only the trailer, root, directory leaves and blocks covering
   selected ranges. They verify every fetched block before decoding; actual
-  aligned/overfetched bytes count against the shared read allowance. Directory
-  size remains capped at 1 MiB. An explicitly unavailable directory retains the
+  aligned/overfetched origin bytes count against the shared read allowance.
+  Crossing 1 MiB of directory metadata no longer removes the accelerator.
+  Preparation may read the complete directory under its existing peak budget;
+  queries retain up to four directory leaves and eight data blocks. An explicitly unavailable directory retains the
   current-wire full-preparation path, not a legacy decoder. Low-level callers
   without a manifest control binding must authenticate the complete artifact
   before trusting its directory.
+- Query sessions share authenticated root, directory, and data blocks through
+  the same bounded single-flight cache as metric reads. Keys bind artifact
+  identity, extent, and trusted digest; canceled or failed producers cannot
+  publish partial data. Cache hits consume no origin-read bytes.
+- Dedicated graph traversal and shortest-path queries consume resumable edge
+  cursors, charging inspected records as the consumer advances. Traversal owns
+  distinct identities, not complete visited rows. Neighbor selection retains
+  only top-k candidates under the request memory allowance.
+- Stateful tree ingestion validates final identities once per `(source, type)`;
+  deletes precede writes, including reinsertion of a deleted identity. Reverse
+  rebuild and outgoing split-copy scans borrow cursor entries from a stable
+  snapshot and commit batches bounded by both record count and 4 MiB of encoded
+  key/value bytes (or one larger indivisible record). Counter reconstruction
+  still retains endpoint metadata, independently of edge payload bytes.
 - An authenticated eight-byte-per-dictionary-node routing array addresses
   adjacency rows. Public MATCH, traversal, path, and dedicated graph-query
   readers resolve dictionary pages through the small fence directory, then read
@@ -277,7 +295,7 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
   allocation; exact construction admission and the live-allocation limiter
   remain authoritative. Serverless additionally reserves local-ID adapters,
   selection permutations and replacement-node buffers before allocation.
-  Materializer epoch 23 binds the current addressed graph layout and preparation admission.
+  Materializer epoch 24 binds the current addressed graph layout and preparation admission.
 - Preparation has two admission phases. The projection census is charged before
   allocations or edge scans; exact projection construction is charged after the
   census and before CSR allocation. Reserved census work remains charged when

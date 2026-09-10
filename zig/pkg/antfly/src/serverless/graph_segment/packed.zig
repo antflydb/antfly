@@ -21,35 +21,43 @@ const edge_type = @import("../../graph/edge_type.zig");
 const bounded = @import("../bounded_decode.zig");
 const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 pub const wire_magic = "AFSG";
-pub const wire_version: u16 = 7;
+pub const wire_version: u16 = 8;
 pub const header_len = 22;
 pub const edge_len = 16;
 pub const no_table = std.math.maxInt(u32);
-pub const topology_trailer_len = 80;
+pub const topology_trailer_len = 112;
 pub const node_page_entries = 256;
 pub const node_page_fence_bytes = 68;
 pub const authentication_block_bytes = 64 * 1024;
-pub const max_topology_directory_bytes = 1024 * 1024;
+// A bounded root authenticates independently addressable directory leaves.
+// This is a wire-size bound, not a request-local allocation allowance.
+pub const max_topology_directory_bytes = 256 * 1024 * 1024;
+pub const directory_leaf_bytes = 64 * 1024;
 const absent_directory = std.math.maxInt(u32);
 
-/// Type descriptors and dictionary page offsets have a bounded control size.
-/// The limit depends on directory bytes, not graph-wide hashing scratch; a
-/// million-node graph with a small type dictionary retains the accelerator.
+pub fn topologyRootSize(directory_len: usize) usize {
+    return 16 + ((directory_len + directory_leaf_bytes - 1) / directory_leaf_bytes) * 32;
+}
+
+/// Directory leaves grow with the graph; the small root never requires a
+/// whole-directory query read or dropping routing at a cardinality threshold.
 pub fn topologyDirectorySize(kinds: []const []const u8, nodes: usize, covered_bytes: usize, tables: usize) usize {
     _ = tables;
     const pages = nodes / node_page_entries + @intFromBool(nodes % node_page_entries != 0);
     var size: usize = 16 +| ((pages + 1) *| 8) +| (pages *| node_page_fence_bytes);
     const covered = covered_bytes +| (nodes *| 8);
     size +|= ((covered / authentication_block_bytes + @intFromBool(covered % authentication_block_bytes != 0)) *| 32);
+    size +|= (kinds.len +| 1) *| 8;
     for (kinds) |kind| size +|= 52 +| kind.len;
-    return if (size <= max_topology_directory_bytes) size else 4;
+    return size;
 }
 
 pub fn topologyExtensionSize(kinds: []const []const u8, nodes: usize, edges: usize, body_len: usize) !usize {
     const covered = std.math.add(usize, body_len, std.math.mul(usize, edges, 8) catch return error.GraphSegmentTooLarge) catch return error.GraphSegmentTooLarge;
     const directory = topologyDirectorySize(kinds, nodes, covered, 0);
+    if (directory > max_topology_directory_bytes) return error.GraphSegmentTooLarge;
     const bytes = if (directory == 4) 0 else std.math.mul(usize, std.math.add(usize, edges, nodes) catch return error.GraphSegmentTooLarge, 8) catch return error.GraphSegmentTooLarge;
-    return std.math.add(usize, bytes, directory + topology_trailer_len) catch error.GraphSegmentTooLarge;
+    return std.math.add(usize, bytes, directory + topologyRootSize(directory) + topology_trailer_len) catch error.GraphSegmentTooLarge;
 }
 
 pub const TopologyTrailer = struct {
@@ -60,9 +68,13 @@ pub const TopologyTrailer = struct {
     source_edges: u64,
     topology_len: u64,
     adjacency_index_len: u64,
+    root_checksum: [32]u8,
 
     pub fn directoryOffset(self: @This()) u64 {
         return self.body_len + self.topology_len + self.adjacency_index_len;
+    }
+    pub fn rootOffset(self: @This()) u64 {
+        return self.directoryOffset() + self.directory_len;
     }
 };
 
@@ -76,7 +88,7 @@ pub fn bindTopologyControl(ref: anytype, payload: []const u8) !void {
 }
 
 pub fn decodeTopologyTrailer(raw: []const u8, payload_len: u64) !TopologyTrailer {
-    if (raw.len != topology_trailer_len or !std.mem.eql(u8, raw[0..4], "GTD3")) return error.InvalidGraphSegment;
+    if (raw.len != topology_trailer_len or !std.mem.eql(u8, raw[0..4], "GTD4")) return error.InvalidGraphSegment;
     const dir_len = std.mem.readInt(u32, raw[4..8], .little);
     const body_len = std.mem.readInt(u64, raw[8..16], .little);
     const topology_len = std.mem.readInt(u64, raw[64..72], .little);
@@ -84,9 +96,9 @@ pub fn decodeTopologyTrailer(raw: []const u8, payload_len: u64) !TopologyTrailer
     if (dir_len < 4 or dir_len > max_topology_directory_bytes or body_len < header_len or
         body_len > payload_len or topology_len > payload_len - body_len or topology_len % 8 != 0 or
         adjacency_index_len > payload_len - body_len - topology_len or adjacency_index_len % 8 != 0 or
-        payload_len - body_len - topology_len - adjacency_index_len != @as(u64, dir_len) + topology_trailer_len) return error.InvalidGraphSegment;
+        payload_len - body_len - topology_len - adjacency_index_len != @as(u64, dir_len) + topologyRootSize(dir_len) + topology_trailer_len) return error.InvalidGraphSegment;
     if (!std.mem.eql(u8, raw[60..64], &.{ 0, 0, 0, 0 })) return error.InvalidGraphSegment;
-    return .{ .body_len = body_len, .topology_len = topology_len, .adjacency_index_len = adjacency_index_len, .directory_len = dir_len, .checksum = raw[16..48].*, .source_nodes = std.mem.readInt(u32, raw[48..52], .little), .source_edges = std.mem.readInt(u64, raw[52..60], .little) };
+    return .{ .body_len = body_len, .topology_len = topology_len, .adjacency_index_len = adjacency_index_len, .directory_len = dir_len, .checksum = raw[16..48].*, .root_checksum = raw[80..112].*, .source_nodes = std.mem.readInt(u32, raw[48..52], .little), .source_edges = std.mem.readInt(u64, raw[52..60], .little) };
 }
 
 test "serverless graph topology directory is bounded authenticated and distinguishes empty from unavailable" {
@@ -108,9 +120,7 @@ test "serverless graph topology directory is bounded authenticated and distingui
     try std.testing.expect((try selectedDirectoryChecksum(raw, checksum, Filter{})) == null);
     try std.testing.expect(topologyDirectorySize(&.{"link"}, 1024 * 1024, 1024 * 1024, 0) > 4);
     try std.testing.expect(topologyDirectorySize(&.{"link"}, 1, 1, 8 * 1024 * 1024) > 4);
-    const long_kind = try alloc.alloc(u8, max_topology_directory_bytes);
-    defer alloc.free(long_kind);
-    try std.testing.expectEqual(@as(usize, 4), topologyDirectorySize(&.{long_kind}, 1, 1, 0));
+    try std.testing.expect(topologyDirectorySize(&.{"link"}, 3300000, 211200030, 0) > 1024 * 1024);
     // Forged sizes are rejected before any range allocation or request.
     const footer = payload[payload.len - topology_trailer_len ..];
     std.mem.writeInt(u32, footer[4..8], max_topology_directory_bytes + 1, .little);
@@ -139,6 +149,7 @@ pub const TopologyDirectory = struct {
     page_offsets: []const u8,
     page_fences: []const u8,
     block_checksums: []const u8,
+    type_offsets: []const u8,
     entries: []const u8,
     pub fn iterator(self: @This()) TypeIterator {
         return .{ .bytes = self.entries };
@@ -171,7 +182,9 @@ pub const TopologyDirectory = struct {
         const blocks = std.mem.readInt(u32, raw[12..16], .little);
         if (blocks > (raw.len - end) / 32) return error.InvalidGraphSegment;
         const checksums_end = end + @as(usize, blocks) * 32;
-        const result = @This(){ .nodes = nodes, .page_offsets = raw[16..offsets_end], .page_fences = raw[offsets_end..end], .block_checksums = raw[end..checksums_end], .entries = raw[checksums_end..] };
+        if (@as(u64, count) + 1 > (raw.len - checksums_end) / 8) return error.InvalidGraphSegment;
+        const entries_start = checksums_end + (@as(usize, count) + 1) * 8;
+        const result = @This(){ .nodes = nodes, .page_offsets = raw[16..offsets_end], .page_fences = raw[offsets_end..end], .block_checksums = raw[end..checksums_end], .type_offsets = raw[checksums_end..entries_start], .entries = raw[entries_start..] };
         var previous_fence: ?[]const u8 = null;
         for (0..pages) |page| {
             _ = try result.nodePage(page);
@@ -187,6 +200,8 @@ pub const TopologyDirectory = struct {
         var previous_end: ?u64 = null;
         var seen: u32 = 0;
         while (try entries.next()) |entry| {
+            if (seen >= count) return error.InvalidGraphSegment;
+            if (std.mem.readInt(u64, result.type_offsets[@as(usize, seen) * 8 ..][0..8], .little) != entries_start + entries.pos - 52 - entry.kind.len) return error.InvalidGraphSegment;
             if (!edge_type.isValid(entry.kind)) return error.InvalidGraphSegment;
             if (previous) |name| if (std.mem.order(u8, name, entry.kind) != .lt) return error.InvalidGraphSegment;
             if (previous_end) |offset| if (entry.offset != offset) return error.InvalidGraphSegment;
@@ -194,7 +209,7 @@ pub const TopologyDirectory = struct {
             previous = entry.kind;
             seen = std.math.add(u32, seen, 1) catch return error.InvalidGraphSegment;
         }
-        if (seen != count) return error.InvalidGraphSegment;
+        if (seen != count or std.mem.readInt(u64, result.type_offsets[@as(usize, count) * 8 ..][0..8], .little) != raw.len) return error.InvalidGraphSegment;
         return result;
     }
 };
@@ -218,7 +233,9 @@ pub fn selectedDirectoryChecksum(raw: []const u8, expected: [32]u8, filter: anyt
 /// Topology edges scatter directly into their final immutable type runs.
 pub fn finishEncoding(alloc: Allocator, payload: []u8, body_len: usize, directory_len: usize, cancellation: CancellationToken) !void {
     if (payload.len < topology_trailer_len or directory_len > payload.len - topology_trailer_len or body_len < header_len or body_len > payload.len - topology_trailer_len - directory_len) return error.InvalidGraphSegment;
-    const directory_start = payload.len - topology_trailer_len - directory_len;
+    const root_len = topologyRootSize(directory_len);
+    if (root_len > payload.len - topology_trailer_len - directory_len) return error.InvalidGraphSegment;
+    const directory_start = payload.len - topology_trailer_len - root_len - directory_len;
     const directory = payload[directory_start..][0..directory_len];
     const adjacency_index_len: usize = if (directory_len == 4) 0 else @as(usize, std.mem.readInt(u32, payload[10..14], .little)) * 8;
     if (adjacency_index_len > directory_start - body_len) return error.InvalidGraphSegment;
@@ -278,6 +295,8 @@ pub fn finishEncoding(alloc: Allocator, payload: []u8, body_len: usize, director
         pos += fences.len;
         const block_checksums_start = pos;
         pos += block_count * 32;
+        const type_offsets_start = pos;
+        pos += (@as(usize, type_count) + 1) * 8;
         for (states, 0..) |*state, i| {
             const kind = try cursor.take(try cursor.int());
             if (!edge_type.isValid(kind) or (i > 0 and std.mem.order(u8, states[i - 1].kind, kind) != .lt)) return error.InvalidGraphSegment;
@@ -369,13 +388,15 @@ pub fn finishEncoding(alloc: Allocator, payload: []u8, body_len: usize, director
             }
             _ = try cursor.take(@as(usize, incoming) * edge_len);
         }
-        for (states) |*state| {
+        for (states, 0..) |*state, type_id| {
+            std.mem.writeInt(u64, directory[type_offsets_start + type_id * 8 ..][0..8], pos, .little);
             putString(directory, &pos, state.kind);
             std.mem.writeInt(u64, directory[pos..][0..8], state.count, .little);
             state.hash.final(directory[pos + 8 ..][0..32]);
             std.mem.writeInt(u64, directory[pos + 40 ..][0..8], state.start, .little);
             pos += 48;
         }
+        std.mem.writeInt(u64, directory[type_offsets_start + @as(usize, type_count) * 8 ..][0..8], pos, .little);
         if (pos != directory.len) return error.InvalidGraphSegment;
         for (0..block_count) |block| {
             try cancellation.check();
@@ -388,8 +409,16 @@ pub fn finishEncoding(alloc: Allocator, payload: []u8, body_len: usize, director
         }
     }
     const trailer = payload[payload.len - topology_trailer_len ..];
+    const root = payload[directory_start + directory_len ..][0..root_len];
+    @memset(root, 0);
+    @memcpy(root[0..@min(16, directory.len)], directory[0..@min(16, directory.len)]);
+    for (0..(root_len - 16) / 32) |leaf| {
+        try cancellation.check();
+        const begin = leaf * directory_leaf_bytes;
+        std.crypto.hash.sha2.Sha256.hash(directory[begin..@min(directory.len, begin + directory_leaf_bytes)], root[16 + leaf * 32 ..][0..32], .{});
+    }
     @memset(trailer, 0);
-    @memcpy(trailer[0..4], "GTD3");
+    @memcpy(trailer[0..4], "GTD4");
     std.mem.writeInt(u32, trailer[4..8], @intCast(directory.len), .little);
     std.mem.writeInt(u64, trailer[8..16], body_len, .little);
     std.crypto.hash.sha2.Sha256.hash(directory, trailer[16..48], .{});
@@ -397,6 +426,7 @@ pub fn finishEncoding(alloc: Allocator, payload: []u8, body_len: usize, director
     std.mem.writeInt(u64, trailer[52..60], source_edges, .little);
     std.mem.writeInt(u64, trailer[64..72], topology_len, .little);
     std.mem.writeInt(u64, trailer[72..80], adjacency_index_len, .little);
+    std.crypto.hash.sha2.Sha256.hash(root, trailer[80..112], .{});
 }
 
 pub fn viewRetainedBytes(data: []const u8) !usize {
@@ -618,8 +648,10 @@ pub fn viewAlloc(alloc: Allocator, data: []const u8, limits: bounded.Limits, can
     const trailer = try decodeTopologyTrailer(data[data.len - topology_trailer_len ..], data.len);
     const body_len: usize = @intCast(trailer.body_len);
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(data[@intCast(trailer.directoryOffset()) .. data.len - topology_trailer_len], &digest, .{});
+    std.crypto.hash.sha2.Sha256.hash(data[@intCast(trailer.directoryOffset())..][0..trailer.directory_len], &digest, .{});
     if (!std.mem.eql(u8, &digest, &trailer.checksum)) return error.InvalidGraphSegment;
+    std.crypto.hash.sha2.Sha256.hash(data[@intCast(trailer.rootOffset())..][0..topologyRootSize(trailer.directory_len)], &digest, .{});
+    if (!std.mem.eql(u8, &digest, &trailer.root_checksum)) return error.InvalidGraphSegment;
     return readView(limiter.allocator(), data[0..body_len], limits.max_elements, cancellation) catch |err| {
         if (err == error.OutOfMemory and limiter.limit_exceeded) return error.DecodedArtifactTooLarge;
         return err;

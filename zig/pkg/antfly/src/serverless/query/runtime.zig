@@ -381,6 +381,35 @@ pub const QuerySession = struct {
     // Pre-admitted transport workspace owned by a joined parent execution.
     graph_metric_transport_credit: usize = 0,
 
+    pub fn graphAdjacencyCache(self: *QuerySession) ?@import("../graph_segment/topology_reader.zig").ReadCache {
+        if (self.cache == null) return null;
+        return .{ .ptr = self, .read = readGraphAdjacencyBlock };
+    }
+
+    fn readGraphAdjacencyBlock(ptr: *anyopaque, alloc: Allocator, artifacts: *artifacts_mod.ArtifactStore, source: manifest_mod.ArtifactRef, offset: u64, len: usize, checksum: [32]u8, cancellation: CancellationToken, remaining: *u64) ![]u8 {
+        const self: *QuerySession = @ptrCast(@alignCast(ptr));
+        const cache = self.cache.?;
+        const fills = @import("authenticated_block_fills.zig");
+        const key = fills.blockKey(source.artifact_id, source.checksum, offset, len, &checksum);
+        var batch = try cache.graph_metric_blocks.acquire(cache.alloc, alloc, &.{.{ .key = key, .len = len }}, self.io, cancellation);
+        defer batch.deinit();
+        const item = batch.items[0];
+        if (item.producer) {
+            if (len > remaining.*) return error.GraphMetricBuildBudgetExceeded;
+            remaining.* -= len;
+            const bytes = try artifacts.getRangeAllocWithCancellationUsingAllocator(alloc, source.artifact_id, offset, len, cancellation);
+            defer alloc.free(bytes);
+            if (bytes.len != len) return error.ArtifactIntegrityMismatch;
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+            if (!std.mem.eql(u8, &digest, &checksum)) return error.ArtifactIntegrityMismatch;
+            @memcpy(item.buffer(), bytes);
+        }
+        try cancellation.check();
+        batch.publish(self.io);
+        return alloc.dupe(u8, item.bytes());
+    }
+
     pub fn deinit(self: *QuerySession) void {
         if (self.owns_graph_metric_specs) self.clearGraphMetricSpecs();
         if (self.owns_manifest) self.manifest.deinit(self.alloc);

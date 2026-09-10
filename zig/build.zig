@@ -10231,6 +10231,9 @@ pub fn build(b: *std.Build) void {
     chaos_test_step.dependOn(storage_vopr_step);
 
     const graph_metric_unit_filters = [_][]const u8{
+        "graph metric tree batch validation",
+        "graph rebuildReverseFromOwnedOutgoingEdges",
+        "db graph reverse rebuild resumes after interrupted reopen",
         "graph metric sorted batch presence",
         "db reverse graph probe rejects a deleted or replaced index incarnation",
         "graph pagerank planned scan page writes durable out-degree intermediates",
@@ -10309,8 +10312,8 @@ pub fn build(b: *std.Build) void {
         "graph hits coordinator publish failure preserves prior published pair after reopen",
     };
     const graph_metric_unit_tests = b.addTest(.{
-        // The merged storage root measured 7.61 GB on macOS ReleaseFast.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 8 else 7) * 1024 * 1024 * 1024,
+        // The expanded storage-root suite exceeded 8 GiB on macOS ReleaseFast.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
         .root_module = db_test_mod,
         .filters = compileFiltersWithAnchors(
             b,

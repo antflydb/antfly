@@ -55,7 +55,7 @@ pub fn main(init: std.process.Init) !void {
 
 pub fn run(io: std.Io, out: anytype) !void {
     const alloc = std.heap.smp_allocator;
-    for ([_]usize{ 64, 1024, 10000 }) |count| {
+    for ([_]usize{ 64, 1024, 10000, 20000 }) |count| {
         var fixture = std.heap.ArenaAllocator.init(alloc);
         defer fixture.deinit();
         const a = fixture.allocator();
@@ -136,6 +136,111 @@ pub fn run(io: std.Io, out: anytype) !void {
             try out.flush();
         }
     }
+
+    // Same authenticated reader and transport on both sides. Only the
+    // consumer changes: eager hub materialization versus stopping at edge 1.
+    for ([_]usize{ 16384, 100000 }) |count| {
+        var fixture = std.heap.ArenaAllocator.init(alloc);
+        defer fixture.deinit();
+        const a = fixture.allocator();
+        var builder = graph.Builder{ .alloc = a };
+        defer builder.deinit();
+        for (0..count) |i| try builder.addEdge("hub", try std.fmt.allocPrint(a, "customer-{d:0>8}", .{i}), "link", 1, null);
+        const payload = try builder.encodeAlloc(256 * 1024 * 1024, .none);
+        const checksum = try digestAlloc(a, payload);
+        var source = antfly.serverless.ArtifactRef{ .kind = .graph_segment, .name = "g", .artifact_id = try std.fmt.allocPrint(a, "sha256:{s}", .{checksum}), .checksum = checksum, .byte_len = payload.len };
+        try graph.codec.compact.bindTopologyControl(&source, payload);
+        for ([_]bool{ true, false }) |reference| {
+            var memory = Memory{ .payload = payload };
+            var store = artifacts.ArtifactStore{ .allocator = alloc, .ptr = &memory, .vtable = &Memory.vtable };
+            var samples: [5]u64 = undefined;
+            var inspected: usize = 0;
+            for (0..6) |sample| {
+                memory.calls = 0;
+                memory.bytes = 0;
+                const start = std.Io.Clock.awake.now(io);
+                var remaining: u64 = 512 * 1024 * 1024;
+                var reader = (try graph.AdjacencyReader.init(alloc, &store, source, .none, &remaining)).?;
+                var work: usize = count;
+                if (reference) {
+                    var row = (try reader.adjacency("hub", &.{}, enum { out, in, both }.out, count, &work)).?;
+                    defer row.deinit(alloc);
+                    if (row.out_edges.len != count) return error.InvalidBenchmarkResult;
+                } else {
+                    var cursor = try reader.cursor("hub", &.{}, false, &work);
+                    defer cursor.deinit();
+                    var edge = (try cursor.next()).?;
+                    defer edge.deinit(alloc);
+                    if (!std.mem.eql(u8, edge.neighbor_id, "customer-00000000")) return error.InvalidBenchmarkResult;
+                }
+                inspected = count - work;
+                reader.deinit();
+                if (sample != 0) samples[sample - 1] = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds());
+            }
+            std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+            const json = try std.json.Stringify.valueAlloc(a, .{ .mode = if (reference) "eager_hub" else "cursor_hub_first_edge", .edges = count, .artifact_bytes = payload.len, .range_calls = memory.calls, .read_bytes = memory.bytes, .inspected_edges = inspected, .median_ns = samples[2] }, .{});
+            try out.interface.writeAll(json);
+            try out.interface.writeByte('\n');
+            try out.flush();
+        }
+    }
+    try largeNodeDirectory(io, out);
+}
+
+fn largeNodeDirectory(io: std.Io, out: anytype) !void {
+    const alloc = std.heap.smp_allocator;
+    const wire = graph.codec.compact;
+    const count: usize = 4_000_000;
+    // Write canonical isolated rows directly to avoid charging a giant
+    // dictionary hash-map fixture to this routing-only benchmark. Production
+    // finishEncoding builds and authenticates every routing/control structure.
+    const body_len = wire.header_len + count * (12 + 12);
+    const size = body_len + try wire.topologyExtensionSize(&.{}, count, 0, body_len);
+    const payload = try alloc.alloc(u8, size);
+    defer alloc.free(payload);
+    @memset(payload[0..wire.header_len], 0);
+    @memcpy(payload[0..4], wire.wire_magic);
+    std.mem.writeInt(u16, payload[4..6], wire.wire_version, .little);
+    std.mem.writeInt(u32, payload[10..14], count, .little);
+    std.mem.writeInt(u32, payload[18..22], count, .little);
+    for (0..count) |i| {
+        const begin = wire.header_len + i * 12;
+        std.mem.writeInt(u32, payload[begin..][0..4], 8, .little);
+        _ = try std.fmt.bufPrint(payload[begin + 4 ..][0..8], "{d:0>8}", .{i});
+        const row = payload[wire.header_len + count * 12 + i * 12 ..][0..12];
+        @memset(row, 0);
+        std.mem.writeInt(u32, row[0..4], @intCast(i), .little);
+    }
+    const directory_len = wire.topologyDirectorySize(&.{}, count, body_len, 0);
+    try wire.finishEncoding(alloc, payload, body_len, directory_len, .none);
+    const checksum = try digestAlloc(alloc, payload);
+    defer alloc.free(checksum);
+    const id = try std.fmt.allocPrint(alloc, "sha256:{s}", .{checksum});
+    defer alloc.free(id);
+    var source = antfly.serverless.ArtifactRef{ .kind = .graph_segment, .name = "g", .artifact_id = id, .checksum = checksum, .byte_len = payload.len };
+    try wire.bindTopologyControl(&source, payload);
+    var memory = Memory{ .payload = payload };
+    var store = artifacts.ArtifactStore{ .allocator = alloc, .ptr = &memory, .vtable = &Memory.vtable };
+    var samples: [5]u64 = undefined;
+    var retained: usize = 0;
+    for (0..6) |sample| {
+        memory.calls = 0;
+        memory.bytes = 0;
+        var remaining: u64 = 2 * 1024 * 1024;
+        const start = std.Io.Clock.awake.now(io);
+        var reader = (try graph.AdjacencyReader.init(alloc, &store, source, .none, &remaining)).?;
+        if (!try reader.containsNode("03777777")) return error.InvalidBenchmarkResult;
+        retained = reader.context.retainedBytes();
+        reader.deinit();
+        if (sample != 0) samples[sample - 1] = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds());
+    }
+    if (directory_len <= 1024 * 1024 or retained >= 1024 * 1024) return error.InvalidBenchmarkResult;
+    std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+    const json = try std.json.Stringify.valueAlloc(alloc, .{ .mode = "large_node_directory", .nodes = count, .artifact_bytes = payload.len, .directory_bytes = directory_len, .retained_control_data_bytes = retained, .range_calls = memory.calls, .read_bytes = memory.bytes, .median_ns = samples[2] }, .{});
+    defer alloc.free(json);
+    try out.interface.writeAll(json);
+    try out.interface.writeByte('\n');
+    try out.flush();
 }
 
 fn digestAlloc(alloc: Allocator, payload: []const u8) ![]u8 {

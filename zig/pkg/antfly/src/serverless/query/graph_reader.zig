@@ -22,28 +22,28 @@ const runtime_mod = @import("runtime.zig");
 const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 const work_budget_mod = @import("../../graph/work_budget.zig");
 
-/// Rows retained here supply stable borrowed identities to BFS parent/queue
-/// state. Only visited adjacency is decoded, with one shared I/O/work/memory
-/// allowance for the entire query, including dictionary and routing reads.
+/// Retain distinct traversal identities, not visited adjacency. Streaming
+/// cursors share one I/O/work/memory allowance across the entire query.
 const GraphSource = struct {
     budget: work_budget_mod.WorkBudget,
     allocation: work_budget_mod.RetainedAllocator,
     paged: ?graph_segment_mod.AdjacencyReader = null,
     segment: graph_segment_mod.Segment = .{ .adjacencies = &.{} },
     index: graph_segment_mod.AdjacencyIndex = .{},
-    rows: std.StringHashMapUnmanaged(graph_segment_mod.Adjacency) = .empty,
+    identities: std.StringHashMapUnmanaged(void) = .empty,
     remaining_bytes: u64 = 512 * 1024 * 1024,
     remaining_edges: usize,
     edge_types: []const []const u8,
+    no_edges: bool,
     direction: request_mod.GraphQueryDirection,
 
-    fn init(self: *GraphSource, alloc: Allocator, session: *runtime_mod.QuerySession, artifact_index: usize, edge_types: []const []const u8, direction: request_mod.GraphQueryDirection, max_edges: usize) !void {
-        self.* = .{ .budget = work_budget_mod.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 256 * 1024 * 1024 }), .allocation = undefined, .remaining_edges = max_edges, .edge_types = edge_types, .direction = direction };
+    fn init(self: *GraphSource, alloc: Allocator, session: *runtime_mod.QuerySession, artifact_index: usize, edge_types: ?[]const []const u8, direction: request_mod.GraphQueryDirection, max_edges: usize) !void {
+        self.* = .{ .budget = work_budget_mod.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 256 * 1024 * 1024 }), .allocation = undefined, .remaining_edges = max_edges, .edge_types = edge_types orelse &.{}, .no_edges = if (edge_types) |values| values.len == 0 else false, .direction = direction };
         self.allocation = .{ .backing = alloc, .budget = &self.budget };
         errdefer self.deinit();
         const admitted = self.allocation.allocator();
         const source = session.artifactRef(artifact_index) orelse return error.GraphSegmentNotFound;
-        self.paged = graph_segment_mod.AdjacencyReader.init(admitted, session.artifacts, source, session.cancellation, &self.remaining_bytes) catch |err| return self.translate(err);
+        self.paged = graph_segment_mod.AdjacencyReader.initCached(admitted, session.artifacts, source, session.cancellation, &self.remaining_bytes, session.graphAdjacencyCache()) catch |err| return self.translate(err);
         if (self.paged != null) return;
         // Current-wire sources may omit the optional bounded accelerator.
         var lease = work_budget_mod.RetainedLease.init(&self.budget, std.math.cast(usize, source.byte_len) orelse return error.GraphTraversalQueryBudgetExceeded) catch |err| return self.translate(err);
@@ -63,9 +63,9 @@ const GraphSource = struct {
 
     fn deinit(self: *GraphSource) void {
         const alloc = self.allocation.allocator();
-        var rows = self.rows.valueIterator();
-        while (rows.next()) |row| row.deinit(alloc);
-        self.rows.deinit(alloc);
+        var identities = self.identities.keyIterator();
+        while (identities.next()) |key| alloc.free(key.*);
+        self.identities.deinit(alloc);
         self.index.deinit(alloc);
         self.segment.deinit(alloc);
         if (self.paged) |*paged| paged.deinit();
@@ -77,15 +77,47 @@ const GraphSource = struct {
         return self.index.find(self.segment, key) != null;
     }
 
-    fn find(self: *GraphSource, key: []const u8) !?graph_segment_mod.Adjacency {
-        if (self.paged) |*paged| {
-            if (self.rows.get(key)) |row| return row;
-            var row = (paged.adjacency(key, self.edge_types, self.direction, self.remaining_edges, &self.remaining_edges) catch |err| return self.translate(err)) orelse return null;
-            errdefer row.deinit(self.allocation.allocator());
-            self.rows.put(self.allocation.allocator(), row.node_id, row) catch |err| return self.translate(err);
-            return row;
+    fn intern(self: *GraphSource, value: []const u8) ![]u8 {
+        if (self.identities.getKey(value)) |key| return @constCast(key);
+        const alloc = self.allocation.allocator();
+        const owned = alloc.dupe(u8, value) catch |err| return self.translate(err);
+        errdefer alloc.free(owned);
+        self.identities.put(alloc, owned, {}) catch |err| return self.translate(err);
+        return owned;
+    }
+
+    const Cursor = struct {
+        source: *GraphSource,
+        paged: ?graph_segment_mod.AdjacencyReader.Cursor = null,
+        edges: []const graph_segment_mod.Edge = &.{},
+        position: usize = 0,
+        fn deinit(self: *Cursor) void {
+            if (self.paged) |*paged| paged.deinit();
         }
-        return self.index.find(self.segment, key);
+        fn next(self: *Cursor) !?graph_segment_mod.Edge {
+            if (self.paged) |*paged| return paged.next() catch |err| return self.source.translate(err);
+            if (self.position == self.edges.len) return null;
+            if (self.source.remaining_edges == 0) return error.GraphTraversalQueryBudgetExceeded;
+            self.source.remaining_edges -= 1;
+            const edge = self.edges[self.position];
+            self.position += 1;
+            const alloc = self.source.allocation.allocator();
+            const node = alloc.dupe(u8, edge.neighbor_id) catch |err| return self.source.translate(err);
+            errdefer alloc.free(node);
+            return .{ .neighbor_id = node, .edge_type = alloc.dupe(u8, edge.edge_type) catch |err| return self.source.translate(err), .weight = edge.weight, .neighbor_table_id = edge.neighbor_table_id };
+        }
+        fn nextRetained(self: *Cursor) !?graph_segment_mod.Edge {
+            var edge = try self.next() orelse return null;
+            defer edge.deinit(self.source.allocation.allocator());
+            return .{ .neighbor_id = try self.source.intern(edge.neighbor_id), .edge_type = try self.source.intern(edge.edge_type), .weight = edge.weight, .neighbor_table_id = edge.neighbor_table_id };
+        }
+    };
+
+    fn cursor(self: *GraphSource, key: []const u8, direction: request_mod.GraphQueryDirection) !Cursor {
+        if (self.no_edges) return .{ .source = self };
+        if (self.paged) |*paged| return .{ .source = self, .paged = paged.cursor(key, self.edge_types, direction == .in, &self.remaining_edges) catch |err| return self.translate(err) };
+        const row = self.index.find(self.segment, key) orelse return .{ .source = self };
+        return .{ .source = self, .edges = if (direction == .in) row.in_edges else row.out_edges };
     }
 };
 
@@ -284,16 +316,15 @@ pub fn neighborsWithLimitsAlloc(
     if (req.limit == 0) return try alloc.alloc(Neighbor, 0);
     const graph_index = findGraphArtifactIndex(session, req.index_name) orelse return error.GraphSegmentNotFound;
     var source: GraphSource = undefined;
-    source.init(alloc, session, graph_index, req.edge_types orelse &.{}, req.direction, limits.max_edges_scanned) catch |err| switch (err) {
+    source.init(alloc, session, graph_index, req.edge_types, req.direction, limits.max_edges_scanned) catch |err| switch (err) {
         error.GraphTraversalQueryBudgetExceeded => return error.GraphNeighborQueryBudgetExceeded,
         else => return err,
     };
     defer source.deinit();
-    const adjacency = (source.find(req.doc_id) catch |err| switch (err) {
+    return streamingNeighborsAlloc(alloc, &source, req, limits) catch |err| switch (err) {
         error.GraphTraversalQueryBudgetExceeded => return error.GraphNeighborQueryBudgetExceeded,
         else => return err,
-    }) orelse return try alloc.alloc(Neighbor, 0);
-    return try selectNeighborsAlloc(alloc, session, adjacency, req, limits);
+    };
 }
 
 pub fn traverseAlloc(
@@ -320,7 +351,7 @@ pub fn traverseWithLimitsAlloc(
     if (req.limit == 0) return try alloc.alloc(TraversalNode, 0);
     const graph_index = findGraphArtifactIndex(session, req.index_name) orelse return error.GraphSegmentNotFound;
     var source: GraphSource = undefined;
-    try source.init(alloc, session, graph_index, req.edge_types orelse &.{}, req.direction, limits.max_edges_scanned);
+    try source.init(alloc, session, graph_index, req.edge_types, req.direction, limits.max_edges_scanned);
     defer source.deinit();
     if (!try source.contains(req.start_doc_id)) return try alloc.alloc(TraversalNode, 0);
 
@@ -353,12 +384,13 @@ pub fn traverseWithLimitsAlloc(
             if (out.items.len >= req.limit) break;
         }
         if (item.depth == req.max_depth) continue;
-        const adjacency = try source.find(item.doc_id) orelse continue;
-        if (req.direction == .out or req.direction == .both) {
-            try enqueueEdgesAlloc(alloc, &queue, &seen, &parents, adjacency.out_edges, item, .out, req, &budget);
-        }
-        if (req.direction == .in or req.direction == .both) {
-            try enqueueEdgesAlloc(alloc, &queue, &seen, &parents, adjacency.in_edges, item, .in, req, &budget);
+        for ([_]request_mod.GraphQueryDirection{ .out, .in }) |direction| {
+            if (req.direction != .both and req.direction != direction) continue;
+            var cursor_edges = try source.cursor(item.doc_id, direction);
+            defer cursor_edges.deinit();
+            while (try cursor_edges.nextRetained()) |edge| {
+                try enqueueEdgesAlloc(alloc, &queue, &seen, &parents, &.{edge}, item, direction, req, &budget);
+            }
         }
     }
     return try out.toOwnedSlice(alloc);
@@ -387,7 +419,7 @@ pub fn shortestPathWithLimitsAlloc(
     }
     const graph_index = findGraphArtifactIndex(session, req.index_name) orelse return error.GraphSegmentNotFound;
     var source: GraphSource = undefined;
-    try source.init(alloc, session, graph_index, req.edge_types orelse &.{}, req.direction, limits.max_edges_scanned);
+    try source.init(alloc, session, graph_index, req.edge_types, req.direction, limits.max_edges_scanned);
     defer source.deinit();
     if (!try source.contains(req.start_doc_id)) return null;
     if (!try source.contains(req.end_doc_id)) return null;
@@ -423,17 +455,15 @@ pub fn shortestPathWithLimitsAlloc(
         if (cursor % 64 == 0) try session.checkCancellation();
         const item = queue.items[cursor];
         if (item.depth >= req.max_depth) continue;
-        const adjacency = try source.find(item.doc_id) orelse continue;
-        if (req.direction == .out or req.direction == .both) {
-            if (try enqueueShortestPathEdgesAlloc(alloc, &queue, &seen, &parents, adjacency.out_edges, item, .out, req, &budget)) |depth| {
-                found_depth = depth;
-                break :search;
-            }
-        }
-        if (req.direction == .in or req.direction == .both) {
-            if (try enqueueShortestPathEdgesAlloc(alloc, &queue, &seen, &parents, adjacency.in_edges, item, .in, req, &budget)) |depth| {
-                found_depth = depth;
-                break :search;
+        for ([_]request_mod.GraphQueryDirection{ .out, .in }) |direction| {
+            if (req.direction != .both and req.direction != direction) continue;
+            var cursor_edges = try source.cursor(item.doc_id, direction);
+            defer cursor_edges.deinit();
+            while (try cursor_edges.nextRetained()) |edge| {
+                if (try enqueueShortestPathEdgesAlloc(alloc, &queue, &seen, &parents, &.{edge}, item, direction, req, &budget)) |depth| {
+                    found_depth = depth;
+                    break :search;
+                }
             }
         }
     }
@@ -473,6 +503,40 @@ pub fn findGraphArtifactIndex(session: *const runtime_mod.QuerySession, index_na
     return null;
 }
 
+fn streamingNeighborsAlloc(alloc: Allocator, source: *GraphSource, req: request_mod.GraphNeighborsRequest, limits: GraphNeighborLimits) ![]Neighbor {
+    const admitted = source.allocation.allocator();
+    var selected = NeighborQueue.empty;
+    defer {
+        for (selected.items) |neighbor| {
+            admitted.free(neighbor.doc_id);
+            admitted.free(neighbor.edge_type);
+        }
+        selected.deinit(admitted);
+    }
+    selected.ensureTotalCapacityPrecise(admitted, req.limit) catch |err| return source.translate(err);
+    for ([_]request_mod.GraphQueryDirection{ .out, .in }) |direction| {
+        if (req.direction != .both and req.direction != direction) continue;
+        var cursor = try source.cursor(req.doc_id, direction);
+        defer cursor.deinit();
+        while (try cursor.next()) |value| {
+            var edge = value;
+            var moved = false;
+            defer if (!moved) edge.deinit(admitted);
+            if (!matchesEdgeTypes(req.edge_types, edge.edge_type)) continue;
+            const candidate = BorrowedNeighbor{ .doc_id = edge.neighbor_id, .edge_type = edge.edge_type, .weight = edge.weight, .direction = direction };
+            if (selected.count() == req.limit) {
+                if (neighborOrder(candidate, selected.peek().?) != .lt) continue;
+                const retired = selected.pop().?;
+                admitted.free(retired.doc_id);
+                admitted.free(retired.edge_type);
+            }
+            selected.push(admitted, candidate) catch |err| return source.translate(err);
+            moved = true;
+        }
+    }
+    return materializeNeighborsAlloc(alloc, &selected, limits);
+}
+
 fn selectNeighborsAlloc(
     alloc: Allocator,
     session: *const runtime_mod.QuerySession,
@@ -495,6 +559,10 @@ fn selectNeighborsAlloc(
     }
     try session.checkCancellation();
 
+    return materializeNeighborsAlloc(alloc, &selected, limits);
+}
+
+fn materializeNeighborsAlloc(alloc: Allocator, selected: *NeighborQueue, limits: GraphNeighborLimits) ![]Neighbor {
     std.mem.sort(BorrowedNeighbor, selected.items, {}, lessBorrowedNeighbor);
     var result_bytes = std.math.mul(usize, selected.items.len, @sizeOf(Neighbor)) catch
         return error.GraphNeighborQueryBudgetExceeded;
@@ -844,6 +912,106 @@ fn lessBorrowedNeighbor(_: void, lhs: BorrowedNeighbor, rhs: BorrowedNeighbor) b
 fn lessTraversalNode(_: void, lhs: TraversalNode, rhs: TraversalNode) bool {
     if (lhs.depth != rhs.depth) return lhs.depth < rhs.depth;
     return std.mem.order(u8, lhs.doc_id, rhs.doc_id) == .lt;
+}
+
+test "serverless graph cursor queries stop early retain top k and share authenticated pages" {
+    const alloc = std.testing.allocator;
+    const artifacts = @import("../artifacts/mod.zig");
+    const Memory = struct {
+        payload: []const u8,
+        calls: usize = 0,
+        fn deinit(_: Allocator, _: *anyopaque) void {}
+        fn put(_: *anyopaque, _: Allocator, _: []const u8) !artifacts.ArtifactMetadata {
+            return error.Unsupported;
+        }
+        fn get(_: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
+            return error.UnexpectedFullRead;
+        }
+        fn range(ptr: *anyopaque, a: Allocator, _: []const u8, offset: u64, len: usize) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return a.dupe(u8, self.payload[@intCast(offset)..][0..len]);
+        }
+        fn stat(_: *anyopaque, _: Allocator, _: []const u8) !artifacts.ArtifactMetadata {
+            return error.Unsupported;
+        }
+        fn delete(_: *anyopaque, _: []const u8) !void {
+            return error.Unsupported;
+        }
+        const vtable = artifacts.ArtifactStore.VTable{ .deinit = deinit, .put = put, .get_alloc = get, .get_range_alloc = range, .stat = stat, .delete = delete };
+    };
+    const Run = struct {
+        fn run(a: Allocator, payload: []const u8, ref: manifest_mod.ArtifactRef, cache: ?*@import("cache.zig").QueryCache) !usize {
+            var memory = Memory{ .payload = payload };
+            var store = artifacts.ArtifactStore{ .allocator = a, .ptr = &memory, .vtable = &Memory.vtable };
+            var refs = [_]manifest_mod.ArtifactRef{ref};
+            var session = runtime_mod.QuerySession{ .alloc = a, .artifacts = &store, .cache = cache, .owns_manifest = false, .manifest = .{ .namespace = "n", .version = 1, .built_at_ns = 0, .wal_start_lsn = 0, .wal_end_lsn = 0, .stats = .{}, .artifacts = &refs } };
+            defer session.deinit();
+            var path = (try shortestPathWithLimitsAlloc(a, &session, .{ .start_doc_id = @constCast("a"), .end_doc_id = @constCast("b"), .direction = .both }, .{ .max_edges_scanned = 1 })).?;
+            defer path.deinit(a);
+            try std.testing.expectEqual(@as(u32, 1), path.depth);
+            const neighbors = try neighborsWithLimitsAlloc(a, &session, .{ .doc_id = @constCast("a"), .limit = 1, .direction = .both }, .{ .max_edges_scanned = 3 });
+            defer freeNeighbors(a, neighbors);
+            try std.testing.expectEqual(@as(usize, 1), neighbors.len);
+            try std.testing.expectEqualStrings("b", neighbors[0].doc_id);
+            const empty = try neighborsWithLimitsAlloc(a, &session, .{ .doc_id = @constCast("a"), .limit = 1, .edge_types = &.{} }, .{ .max_edges_scanned = 1 });
+            defer freeNeighbors(a, empty);
+            try std.testing.expectEqual(@as(usize, 0), empty.len);
+            return memory.calls;
+        }
+        fn allocationFailure(a: Allocator, payload: []const u8, ref: manifest_mod.ArtifactRef) !void {
+            _ = try run(a, payload, ref, null);
+        }
+        fn concurrent(a: Allocator, payload: []const u8, ref: manifest_mod.ArtifactRef, cache: *@import("cache.zig").QueryCache, calls: *usize, failure: *?anyerror) void {
+            calls.* = run(a, payload, ref, cache) catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+    };
+    var builder = graph_segment_mod.Builder{ .alloc = alloc };
+    defer builder.deinit();
+    try builder.addEdge("a", "b", "link", 1, null);
+    try builder.addEdge("a", "c", "link", 1, null);
+    try builder.addEdge("d", "a", "link", 1, null);
+    const payload = try builder.encodeAlloc(1024 * 1024, .none);
+    defer alloc.free(payload);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+    const checksum = std.fmt.bytesToHex(digest, .lower);
+    const id = "sha256:" ++ checksum;
+    var ref = manifest_mod.ArtifactRef{ .kind = .graph_segment, .name = "g", .artifact_id = id, .checksum = &checksum, .byte_len = payload.len };
+    try graph_segment_mod.codec.compact.bindTopologyControl(&ref, payload);
+    try std.testing.checkAllAllocationFailures(alloc, Run.allocationFailure, .{ payload, ref });
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cache_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-cursor", .{tmp.sub_path});
+    defer alloc.free(cache_root);
+    var cache = try @import("cache.zig").QueryCache.init(alloc, cache_root);
+    defer cache.deinit();
+    const cold_calls = try Run.run(alloc, payload, ref, &cache);
+    try std.testing.expect(cold_calls > 0);
+    try std.testing.expectEqual(@as(usize, 0), try Run.run(alloc, payload, ref, &cache));
+    cache.graph_metric_blocks.deinit();
+    cache.graph_metric_blocks = .{};
+    payload[0] ^= 1;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, Run.run(alloc, payload, ref, &cache));
+    payload[0] ^= 1;
+    _ = try Run.run(alloc, payload, ref, &cache);
+    cache.graph_metric_blocks.deinit();
+    cache.graph_metric_blocks = .{};
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var group: std.Io.Group = .init;
+    defer group.cancel(io_impl.io());
+    var calls: [4]usize = @splat(0);
+    var failures: [4]?anyerror = @splat(null);
+    for (&calls, &failures) |*count, *failure| group.async(io_impl.io(), Run.concurrent, .{ alloc, payload, ref, &cache, count, failure });
+    try group.await(io_impl.io());
+    for (failures) |failure| if (failure) |err| return err;
+    var total: usize = 0;
+    for (calls) |count| total += count;
+    try std.testing.expectEqual(cold_calls, total);
 }
 
 test "serverless graph reader filters by direction and edge type" {

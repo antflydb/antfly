@@ -200,6 +200,7 @@ pub fn main(init: std.process.Init) !void {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--paged-only")) return @import("paged_read_bench.zig").run(init.io, &output);
         if (std.mem.eql(u8, arg, "--presence-only")) return benchmarkPresence(&output);
+        if (std.mem.eql(u8, arg, "--tree-only")) return benchmarkTreeValidation(init.io, &output);
         if (std.mem.eql(u8, arg, "--indexing-only")) {
             indexing_only = true;
             continue;
@@ -451,6 +452,39 @@ fn benchmarkGraphIndexConstruction(out: anytype) !void {
                 .payload_bytes = payload_len,
                 .note = "same JSON input; exact encoded SHA256 parity; input residency excluded; six samples, first discarded; parse, construction and encoding included",
             }, .{});
+            try out.interface.writeAll(json);
+            try out.interface.writeByte('\n');
+            try out.flush();
+        }
+    }
+}
+
+fn benchmarkTreeValidation(io: std.Io, out: anytype) !void {
+    const alloc = std.heap.smp_allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const fixture = arena.allocator();
+    const root = try std.fmt.allocPrint(fixture, "/tmp/antfly-tree-validation-bench-{d}", .{antfly.platform_time.monotonicNs()});
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    const store_path = try std.fmt.allocPrint(fixture, "{s}/store\x00", .{root});
+    const reverse_path = try std.fmt.allocPrint(fixture, "{s}/reverse\x00", .{root});
+    var store = try antfly.docstore.DocStore.open(alloc, @ptrCast(store_path.ptr), .{});
+    defer store.close();
+    var index = try antfly.graph.GraphIndex.open(alloc, &store, @ptrCast(reverse_path.ptr), "links", .{ .edge_type_configs = &.{.{ .name = "parent", .topology = .tree }} });
+    defer index.close();
+    for ([_]usize{ 2048, 8192, 16384 }) |count| {
+        const writes = try fixture.alloc(antfly.graph.BatchWrite, count);
+        for (writes, 0..) |*write, i| write.* = .{ .source = try std.fmt.allocPrint(fixture, "child-{d:0>8}", .{i}), .target = "parent", .edge_type = "parent" };
+        for ([_]bool{ true, false }) |reference| {
+            var times: [5]u64 = undefined;
+            for (0..6) |sample| {
+                const start = antfly.platform_time.monotonicNs();
+                try index.benchmarkTreeBatchValidation(writes, reference);
+                if (sample != 0) times[sample - 1] = antfly.platform_time.monotonicNs() - start;
+            }
+            std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+            const json = try std.json.Stringify.valueAlloc(fixture, .{ .mode = if (reference) "tree_prior_write_walk" else "tree_grouped_validation", .writes = count, .median_ns = times[2], .note = "read-only production validation against an empty native graph; identical valid distinct-source writes; excludes commit and fixture setup" }, .{});
             try out.interface.writeAll(json);
             try out.interface.writeByte('\n');
             try out.flush();
