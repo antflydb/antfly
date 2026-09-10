@@ -38,6 +38,7 @@ const CandidateSource = db_mod.CandidateSource;
 /// it must not outlive the read source it wraps.
 pub const DistributedCandidateSource = struct {
     reads: table_reads.TableReadSource,
+    catalog_binding: ?@import("../system_catalog/domain.zig").BindingSource = null,
     /// Read consistency for blocking queries. Resolution runs leader-only, so
     /// `read_index` keeps candidates consistent with committed writes; callers
     /// can relax this to `stale` to trade freshness for latency.
@@ -60,7 +61,9 @@ pub const DistributedCandidateSource = struct {
         key: []const u8,
     ) anyerror!?[]u8 {
         const self: *DistributedCandidateSource = @ptrCast(@alignCast(ptr));
-        var resp = (try self.reads.lookup(allocator, table, key, .{}, self.consistency)) orelse return null;
+        const physical = if (self.catalog_binding) |binding| try binding.bindOne(allocator, table) else try allocator.dupe(u8, table);
+        defer allocator.free(physical);
+        var resp = (try self.reads.lookup(allocator, physical, key, .{}, self.consistency)) orelse return null;
         defer resp.deinit(allocator);
         return try allocator.dupe(u8, resp.json);
     }
@@ -75,11 +78,13 @@ pub const DistributedCandidateSource = struct {
         consume: CandidateSource.Consume,
     ) anyerror!void {
         const self: *DistributedCandidateSource = @ptrCast(@alignCast(ptr));
+        const physical = if (self.catalog_binding) |binding| try binding.bindOne(allocator, table) else try allocator.dupe(u8, table);
+        defer allocator.free(physical);
         // [prefix, prefixUpperBound) covers exactly the keys under `prefix`.
         const upper = (try prefixUpperBoundAlloc(allocator, prefix)) orelse return;
         defer allocator.free(upper);
 
-        var resp = (try self.reads.scan(allocator, table, prefix, upper, .{
+        var resp = (try self.reads.scan(allocator, physical, prefix, upper, .{
             .inclusive_from = true,
             .exclusive_to = true,
             .include_documents = true,
@@ -103,6 +108,8 @@ pub const DistributedCandidateSource = struct {
         consume: CandidateSource.Consume,
     ) anyerror!void {
         const self: *DistributedCandidateSource = @ptrCast(@alignCast(ptr));
+        const physical = if (self.catalog_binding) |binding| try binding.bindOne(allocator, table) else try allocator.dupe(u8, table);
+        defer allocator.free(physical);
         const limit: u32 = @intCast(@min(query.k, std.math.maxInt(u32)));
         const dense_query = db_mod.types.DenseKnnQuery{ .vector = query.embedding, .k = limit };
         const named_queries = [_]db_mod.types.NamedDenseQuery{.{
@@ -117,7 +124,7 @@ pub const DistributedCandidateSource = struct {
             .include_stored = true,
             .include_all_fields = true,
         };
-        var resp = (try self.reads.query(allocator, table, req, self.consistency)) orelse return;
+        var resp = (try self.reads.query(allocator, physical, req, self.consistency)) orelse return;
         defer resp.deinit(allocator);
         try consumeQueryHits(allocator, resp.json, ctx, consume);
     }

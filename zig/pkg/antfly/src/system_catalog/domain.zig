@@ -600,3 +600,21 @@ test "catalog targets preserve literal names and distinguish exact from scoped g
     try std.testing.expect(!tableResourceMatches(literal_star, scoped));
     try std.testing.expectError(error.InvalidCatalogName, Target.literal(scoped));
 }
+
+/// Borrowed catalog adapter for background operations. Bind all table names in
+/// one read before handing immutable identities to a retrying storage operation.
+pub const BindingSource = struct {
+    ptr: *anyopaque,
+    bind_fn: *const fn (*anyopaque, std.mem.Allocator, []const []const u8) anyerror![][]u8,
+
+    pub fn bind(self: @This(), alloc: std.mem.Allocator, names: []const []const u8) ![][]u8 {
+        return self.bind_fn(self.ptr, alloc, names);
+    }
+
+    pub fn bindOne(self: @This(), alloc: std.mem.Allocator, name: []const u8) ![]u8 {
+        const names = try self.bind(alloc, &.{name});
+        defer alloc.free(names);
+        std.debug.assert(names.len == 1);
+        return names[0];
+    }
+};

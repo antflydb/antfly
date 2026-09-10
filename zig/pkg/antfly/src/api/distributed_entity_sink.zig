@@ -38,6 +38,7 @@ const EntitySink = db_mod.EntitySink;
 /// Holds only borrowed handles, so it must not outlive the write source.
 pub const DistributedEntitySink = struct {
     writes: table_writes.TableWriteSource,
+    catalog_binding: ?@import("../system_catalog/domain.zig").BindingSource = null,
     /// Sync level for entity upserts. `write` (durable, not full-index) keeps
     /// promotion latency low; the entity shard indexes asynchronously.
     sync_level: db_mod.types.SyncLevel = .write,
@@ -94,8 +95,9 @@ pub const DistributedEntitySink = struct {
         }
         if (tables.items.len == 0) return;
 
+        const physical_tables: []const []const u8 = if (self.catalog_binding) |binding| try binding.bind(a, tables.items) else tables.items;
         var reqs = std.ArrayListUnmanaged(distributed_txn.TableCommitRequest).empty;
-        for (tables.items, 0..) |t, i| {
+        for (physical_tables, 0..) |t, i| {
             try reqs.append(a, .{ .table_name = t, .transforms = table_ops.items[i].items });
         }
 
@@ -129,6 +131,7 @@ pub const DistributedEntitySink = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const a = arena.allocator();
+        const physical = if (self.catalog_binding) |binding| try binding.bindOne(a, table) else table;
 
         const ops = try buildMergeOps(a, doc_json);
         if (ops.len == 0) return;
@@ -138,7 +141,7 @@ pub const DistributedEntitySink = struct {
             // Commit the merge through the atomic batch path. A null outcome
             // means the write source has no atomic commit callback, so fail
             // closed without publishing a weaker independent write.
-            const outcome = try self.writes.commitBatch(allocator, &.{.{ .table_name = table, .transforms = &.{transform} }}, self.sync_level);
+            const outcome = try self.writes.commitBatch(allocator, &.{.{ .table_name = physical, .transforms = &.{transform} }}, self.sync_level);
             if (outcome) |result| {
                 switch (result) {
                     .committed => return,
@@ -151,7 +154,7 @@ pub const DistributedEntitySink = struct {
             return error.EntityPromotionAtomicCommitUnavailable;
         }
 
-        return self.batchUpsert(allocator, table, transform);
+        return self.batchUpsert(allocator, physical, transform);
     }
 
     fn batchUpsert(self: *DistributedEntitySink, allocator: std.mem.Allocator, table: []const u8, transform: db_mod.types.DocumentTransform) anyerror!void {

@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const system_catalog = @import("../system_catalog/domain.zig");
 const runtime_io_abi = @import("../runtime_io_abi.zig");
 const ant_json = @import("antfly-json");
 const httpx = @import("httpx");
@@ -6305,7 +6306,7 @@ pub const DataServer = struct {
         // shard owns the entity table, then hand it to the write source(s) that
         // open managed DBs. Captures `read_source.source()` (ptr+vtable), so
         // later read-source mutations remain visible.
-        self.distributed_candidate_source = .{ .reads = self.read_source.source() };
+        self.distributed_candidate_source = .{ .reads = self.read_source.source(), .catalog_binding = .{ .ptr = self, .bind_fn = bindSystemCatalogTables } };
         const candidate_source = self.distributed_candidate_source.?.candidateSource();
         _ = self.write_source.withResolutionCandidateSource(candidate_source);
         if (self.data_raft_apply) |apply_sm| {
@@ -6318,7 +6319,7 @@ pub const DataServer = struct {
         // that open managed DBs.
         // Require atomic promotion: one fenced batch for a single shard and
         // 2PC only when the entity set spans multiple shards.
-        self.distributed_entity_sink = .{ .writes = self.write_source.source(), .atomic_batch_required = true };
+        self.distributed_entity_sink = .{ .writes = self.write_source.source(), .atomic_batch_required = true, .catalog_binding = .{ .ptr = self, .bind_fn = bindSystemCatalogTables } };
         const entity_sink = self.distributed_entity_sink.?.entitySink();
         _ = self.write_source.withEntitySink(entity_sink);
         if (self.data_raft_apply) |apply_sm| {
@@ -8550,6 +8551,29 @@ pub const DataServer = struct {
         defer remote_metadata.cache_mutex.unlock();
         remote_metadata.test_faults.fetch_head_error = fetch_error;
         remote_metadata.test_faults.force_snapshot_cache_miss = fetch_error != null;
+    }
+
+    fn bindSystemCatalogTables(ptr: *anyopaque, alloc: std.mem.Allocator, names: []const []const u8) ![][]u8 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const targets = try a.alloc(system_catalog.Target, names.len);
+        for (names, targets) |name, *target| target.* = try system_catalog.Target.literal(name);
+        const bytes = try self.status_source.systemCatalog(a, .{}, .{ .resolve_many = .{ .targets = targets } });
+        const resolved = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, a, bytes, .{});
+        if (resolved.tables.len != names.len) return error.InvalidCatalogRecord;
+        const result = try alloc.alloc([]u8, names.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |name| alloc.free(name);
+            alloc.free(result);
+        }
+        for (resolved.tables, result) |table, *name| {
+            name.* = try alloc.dupe(u8, (table orelse return error.TableNotFound).name);
+            initialized += 1;
+        }
+        return result;
     }
 
     pub fn remoteMetadataLifecycleLinearizableReadsForTest(self: *DataServer) u64 {
