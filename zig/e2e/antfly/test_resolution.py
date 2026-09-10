@@ -641,7 +641,10 @@ def _doc_text(doc: dict) -> str:
 def _transient_poll_error(exc: requests.RequestException) -> bool:
     response = getattr(exc, "response", None)
     if response is not None:
-        return response.status_code >= 500
+        return response.status_code >= 500 or (
+            response.status_code == 409
+            and response.text.strip() == "read topology changed"
+        )
     return isinstance(
         exc,
         (

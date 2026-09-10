@@ -957,7 +957,12 @@ def test_concurrent_insert_delete_publications_match_search_results(stateful_api
         return statuses
 
     initial = wait_until(exact_publication, timeout_s=30, interval_s=0.05)
-    assert initial is not None, {"indexes": last_details, "logs": stateful_api.debug_logs()}
+    if initial is None:
+        raise AssertionError(
+            json.dumps(
+                {"indexes": last_details, "logs": stateful_api.debug_logs()}, indent=2
+            )
+        )
     incarnations = {name: status["incarnation"] for name, status in initial.items()}
     for iteration in range(3):
         deleted = sorted(expected)[:3]
