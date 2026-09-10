@@ -22557,6 +22557,9 @@ test "bound table read source reranks hits after materialization" {
 
     var source = BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var ts = try httpx.TestServer.start(alloc, io_impl.io(), &.{
+        .{ .method = .GET, .path = "/ai/v1/models", .respond = .{
+            .body = "{\"rerankers\":{\"cross-encoder/ms-marco-MiniLM-L-6-v2\":{}}}",
+        } },
         .{ .method = .POST, .path = "/rerank", .respond = .{
             .body = "{\"scores\":[0.1,0.9]}",
         } },
@@ -22568,7 +22571,7 @@ test "bound table read source reranks hits after materialization" {
 
     const Serve = struct {
         fn run(server: *httpx.TestServer) !void {
-            try server.handleOne();
+            for (0..2) |_| try server.handleOne();
         }
     };
     var serving = try io_impl.io().concurrent(Serve.run, .{&ts});
