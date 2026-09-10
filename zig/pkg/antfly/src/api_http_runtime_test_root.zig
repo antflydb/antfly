@@ -22,6 +22,8 @@ pub const storage_backend_erased = @import("storage/backend_erased.zig");
 pub const lsm_backend = @import("storage/lsm_backend.zig");
 
 test {
+    _ = @import("api/distributed_candidate_source.zig");
+    _ = @import("api/distributed_entity_sink.zig");
     _ = @import("api/http_client.zig");
     _ = @import("api/distributed_join.zig");
     _ = @import("api/distributed_graph.zig");

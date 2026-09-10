@@ -726,10 +726,18 @@ def _wait_for_mention_hydration(
     )
 
 
+@pytest.mark.parametrize("candidate_search", ["prefix", "exact_key"])
 def test_multinode_autograph_resolves_promotes_and_hydrates_entities(
     resolution_cluster,
+    candidate_search,
 ):
+    _exercise_autograph(resolution_cluster, candidate_search)
+
+
+def _exercise_autograph(resolution_cluster, candidate_search):
     cluster = resolution_cluster
+    indexes = json.loads(json.dumps(DOCUMENTS_INDEXES))
+    indexes["relations_graph"]["resolvers"][0]["candidate_search"] = candidate_search
     api = _Api(cluster.data_api_urls[0], cluster)
 
     # Entities live in their own table (own shard group); documents are spread
@@ -740,7 +748,7 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(
     api.create_table(
         "documents",
         num_shards=3,
-        indexes=DOCUMENTS_INDEXES,
+        indexes=indexes,
         deadline=_new_e2e_deadline(),
     )
 
@@ -768,6 +776,17 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(
         },
         deadline=_new_e2e_deadline(),
     )
+
+    # At least two coordinators must forward to the entity shard's owner.
+    # This covers decoding native physical table names on internal lookups.
+    for base_url in resolution_cluster.data_api_urls:
+        node_api = _Api(base_url, resolution_cluster)
+        try:
+            assert "Ada Lovelace" in _doc_text(
+                node_api.lookup("entities", "person/ada_lovelace")
+            )
+        finally:
+            node_api.s.close()
 
     # A second document mentioning the same person resolves (prefix blocking) to
     # the existing entity rather than minting a new one; the entity persists with
@@ -803,3 +822,34 @@ def test_multinode_autograph_resolves_promotes_and_hydrates_entities(
     )
     second_node_keys = {node["key"] for node in second_mentions["nodes"]}
     assert "person/ada_lovelace" in second_node_keys
+
+
+def test_multinode_autograph_deleted_target_does_not_fail_surviving_graph(
+    resolution_cluster,
+):
+    _exercise_autograph(resolution_cluster, "exact_key")
+    api = _Api(resolution_cluster.data_api_urls[0], resolution_cluster)
+    response = api.s.delete(f"{api.url}/tables/entities", timeout=30)
+    api._check(response)
+    result = api.query_table(
+        "documents",
+        {
+            "query": {"match_all": {}},
+            "graph_queries": {
+                "mentions": {
+                    "index": "relations_graph",
+                    "traverse": {
+                        "start": {"keys": ["doc:a"]},
+                        "edge_types": ["mentions"],
+                        "max_depth": 1,
+                        "limit": 10,
+                        "include_documents": True,
+                    },
+                }
+            },
+            "limit": 10,
+        },
+    )
+    graph = _graph_result(result, "mentions")
+    assert graph is not None
+    assert not any(node.get("table") == "entities" for node in graph.get("nodes", []))

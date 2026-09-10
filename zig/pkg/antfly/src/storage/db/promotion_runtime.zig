@@ -57,6 +57,7 @@ pub const scope_name = "promotion";
 /// One canonical entity upsert: the document `doc_json` at `key` in `table`.
 pub const EntityUpsert = struct {
     table: []const u8,
+    storage_table: ?[]const u8 = null,
     key: []const u8,
     doc_json: []const u8,
 };
@@ -90,7 +91,12 @@ pub const EntitySink = struct {
 
     pub fn upsertBatch(self: EntitySink, allocator: std.mem.Allocator, entries: []const EntityUpsert) anyerror!void {
         if (self.vtable.upsert_batch) |f| return f(self.ptr, allocator, entries);
-        for (entries) |e| try self.upsert(allocator, e.table, e.key, e.doc_json);
+        for (entries) |e| {
+            if (e.storage_table != null) return error.EntityPromotionAtomicCommitUnavailable;
+        }
+        for (entries) |e| {
+            try self.upsert(allocator, e.table, e.key, e.doc_json);
+        }
     }
 };
 
@@ -205,6 +211,7 @@ fn processResolutionArtifactWithCatalog(
         if (e.canonical_name.len == 0) continue;
         try entries.append(a, .{
             .table = e.doc_ref.table,
+            .storage_table = e.doc_ref.storage_table,
             .key = e.doc_ref.key,
             .doc_json = try buildEntityDocAlloc(a, e),
         });

@@ -54,11 +54,21 @@ are protected. Rename requires authority on both the old and new names.
 ## Binding and execution
 
 HTTP and A2A retrieval use the same query binding boundary. Background entity
-resolution binds candidate reads, and promotion binds every distinct destination
-in one catalog read before submitting its atomic write batch. Graph hydration
+resolution owns a lazy binding per changed extraction artifact and resolver
+configuration. All mentions in that work unit reuse the same immutable candidate
+table destination. Resolution artifacts persist that destination alongside the
+logical `doc_ref.table`, so deferred promotion and replay cannot redirect writes
+to a replacement table. Older artifacts without a destination bind every distinct
+logical target in one catalog read before submitting their atomic write batch.
+Curated endpoints outside the resolver's declared table retain their independent
+promotion binding. Graph hydration
 keeps logical endpoint names for authorization and result provenance, while its
 request-owned resolver pins physical target identities and a catalog revision
 through execution retries. Target row filters run against the resolved table.
+A missing graph endpoint is omitted rather than failing the surviving graph.
+Binding alone does not require document admission reads: unauthenticated graph
+requests hydrate only when documents are requested. Authenticated requests and
+row filters retain their document-admission checks.
 
 Default index incarnations are assigned during public create normalization and
 preserved through the metadata hop and local materialization. Creating another
@@ -110,6 +120,14 @@ before safely eliminating that fallback.
 Table listings build an identity map and select scope, prefix, and authorized
 tables before per-table status collection and public schema materialization.
 The administrative snapshot remains the source of topology information.
+
+Standalone owns name and ID indexes with each immutable catalog state and a
+physical-name index with its table manager. Indexes are rebuilt before checkpoint
+publication and restored with rollback state; their keys borrow the owned records.
+Resolution performs indexed reads under the existing metadata lock. Mutation
+inventories borrow compact table identities without cloning schemas. Mutation
+planning builds one index, keeping rename collision and database-empty validation
+linear in catalog size instead of repeatedly scanning child bindings.
 
 ## Grants and row filters
 

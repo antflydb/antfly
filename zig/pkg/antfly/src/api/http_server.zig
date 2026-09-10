@@ -11999,6 +11999,7 @@ pub const ApiHttpServer = struct {
             return .{
                 .allowed = true,
                 .physical_table_name = physical,
+                .requires_document_admission = self.identity != null,
                 .filter_query_json = try resolveEffectiveRowFilterJson(alloc, self.identity, key),
             };
         }
@@ -14896,7 +14897,7 @@ pub const ApiHttpServer = struct {
     const CatalogQueryResolver = struct {
         arena: std.mem.Allocator,
         revision: ?u64 = null,
-        tables: std.StringHashMapUnmanaged(system_catalog.ResolvedTable) = .empty,
+        tables: std.StringHashMapUnmanaged(?system_catalog.ResolvedTable) = .empty,
     };
 
     fn resolveQueryCatalog(self: *ApiHttpServer, resolver: *CatalogQueryResolver, context: api_operation.RequestContext, targets: []const system_catalog.Target) !system_catalog.ResolvedMany {
@@ -14916,11 +14917,11 @@ pub const ApiHttpServer = struct {
             const result = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, a, bytes, .{});
             if (result.tables.len != missing.items.len) return error.InvalidCatalogRecord;
             if (resolver.revision) |revision| if (revision != result.revision) return error.CatalogGenerationChanged;
-            for (keys.items, result.tables) |key, table| try resolver.tables.put(a, key, table orelse return error.TableNotFound);
+            for (keys.items, result.tables) |key, table| try resolver.tables.put(a, key, table);
             resolver.revision = result.revision;
         }
         const tables = try a.alloc(?system_catalog.ResolvedTable, targets.len);
-        for (targets, tables) |target, *table| table.* = resolver.tables.get(try target.resourceNameAlloc(a)) orelse return error.InvalidCatalogRecord;
+        for (targets, tables) |target, *table| table.* = (resolver.tables.getEntry(try target.resourceNameAlloc(a)) orelse return error.InvalidCatalogRecord).value_ptr.*;
         return .{ .revision = resolver.revision orelse 0, .tables = tables };
     }
 
@@ -29081,7 +29082,7 @@ test "api http server serves user management routes when auth is enabled" {
     var permissions = try std.json.parseFromSlice([]usermgr_openapi.Permission, alloc, permissions_resp.body, .{});
     defer permissions.deinit();
     try std.testing.expectEqual(@as(usize, 1), permissions.value.len);
-    try std.testing.expectEqualStrings("docs", permissions.value[0].resource);
+    try std.testing.expectEqualStrings("docs", permissions.value[0].resource.?);
 
     var user_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
@@ -29371,7 +29372,7 @@ test "api http server serves api key and row filter routes" {
     var empty_permissions = try std.json.parseFromSlice([]usermgr_openapi.Permission, alloc, empty_permissions_resp.body, .{});
     defer empty_permissions.deinit();
     try std.testing.expectEqual(@as(usize, 1), empty_permissions.value.len);
-    try std.testing.expectEqualStrings("reports", empty_permissions.value[0].resource);
+    try std.testing.expectEqualStrings("reports", empty_permissions.value[0].resource.?);
 
     const delete_api_key_uri = try std.fmt.allocPrint(alloc, "/auth/v1/users/alice/api-keys/{s}", .{created_key_id});
     defer alloc.free(delete_api_key_uri);

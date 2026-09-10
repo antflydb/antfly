@@ -2001,10 +2001,8 @@ pub const AntflyApiHandler = struct {
     }
 
     fn internalGroupLookup(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
-        const group_id_raw = ctx.param("group_id") orelse return textResponse(ctx, 400, "invalid group id");
-        const group_id = std.fmt.parseUnsigned(u64, group_id_raw, 10) catch
-            return textResponse(ctx, 400, "invalid group id");
-        const table_name = ctx.param("table_name") orelse return textResponse(ctx, 400, "invalid table name");
+        var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
+        defer params.deinit(ctx.allocator);
         const encoded_key = ctx.param("key") orelse return textResponse(ctx, 400, "invalid path parameter");
         const key = (try decodePathParamOrBadRequest(ctx, encoded_key)) orelse
             return textResponse(ctx, 400, "invalid path parameter");
@@ -2020,8 +2018,8 @@ pub const AntflyApiHandler = struct {
             ctx.allocator,
             operationContext(ctx, null),
             .{
-                .group_id = group_id,
-                .table_name = table_name,
+                .group_id = params.group_id,
+                .table_name = params.table_name,
                 .key = key,
                 .options = lookup_options.opts,
                 .consistency = consistency,

@@ -1315,6 +1315,7 @@ pub const MergeIntent = struct {
 pub const TableManager = struct {
     alloc: std.mem.Allocator,
     tables: std.AutoHashMapUnmanaged(u64, TableRecord) = .empty,
+    table_names: std.StringHashMapUnmanaged(u64) = .empty,
     ranges: std.AutoHashMapUnmanaged(u64, RangeRecord) = .empty,
     split_intents: std.AutoHashMapUnmanaged(u64, SplitIntent) = .empty,
     merge_intents: std.AutoHashMapUnmanaged(u64, MergeIntent) = .empty,
@@ -1324,6 +1325,7 @@ pub const TableManager = struct {
     }
 
     pub fn deinit(self: *TableManager) void {
+        self.table_names.deinit(self.alloc);
         var table_it = self.tables.valueIterator();
         while (table_it.next()) |table| freeTable(self.alloc, table.*);
         self.tables.deinit(self.alloc);
@@ -1343,15 +1345,25 @@ pub const TableManager = struct {
         self.* = undefined;
     }
 
+    pub fn findTableByName(self: *const TableManager, name: []const u8) ?*const TableRecord {
+        const id = self.table_names.get(name) orelse return null;
+        return self.tables.getPtr(id);
+    }
+
     pub fn upsertTable(self: *TableManager, record: TableRecord) !void {
+        if (self.table_names.get(record.name)) |id| if (id != record.table_id) return error.TableAlreadyExists;
         const owned = try cloneTable(self.alloc, record);
         errdefer freeTable(self.alloc, owned);
+        // Complete every allocation before changing either index or freeing a
+        // borrowed name. Replacement/rollback cannot publish half an index.
+        try self.tables.ensureUnusedCapacity(self.alloc, 1);
+        try self.table_names.ensureUnusedCapacity(self.alloc, 1);
         if (self.tables.getPtr(record.table_id)) |existing| {
+            _ = self.table_names.remove(existing.name);
             freeTable(self.alloc, existing.*);
             existing.* = owned;
-            return;
-        }
-        try self.tables.put(self.alloc, record.table_id, owned);
+        } else self.tables.putAssumeCapacity(record.table_id, owned);
+        self.table_names.putAssumeCapacity(owned.name, owned.table_id);
     }
 
     pub fn upsertRange(self: *TableManager, record: RangeRecord) !void {
@@ -1372,6 +1384,7 @@ pub const TableManager = struct {
     }
 
     pub fn clearTopology(self: *TableManager) void {
+        self.table_names.clearRetainingCapacity();
         var table_it = self.tables.valueIterator();
         while (table_it.next()) |table| freeTable(self.alloc, table.*);
         self.tables.clearRetainingCapacity();
@@ -1409,6 +1422,7 @@ pub const TableManager = struct {
     pub fn removeTable(self: *TableManager, table_id: u64) bool {
         const removed = self.tables.fetchRemove(table_id);
         if (removed) |entry| {
+            _ = self.table_names.remove(entry.value.name);
             freeTable(self.alloc, entry.value);
             return true;
         }
@@ -3380,4 +3394,39 @@ test "table manager parses placement classes and checks compatibility" {
     try std.testing.expect(!placementRoleCompatible("serving", "bulk"));
     try std.testing.expect(placementRoleCompatible("custom", "custom"));
     try std.testing.expect(!placementRoleCompatible("custom", "archive"));
+}
+
+test "system catalog table name index follows replacement removal and topology reset" {
+    const alloc = std.testing.allocator;
+    var manager = TableManager.init(alloc);
+    defer manager.deinit();
+    try manager.upsertTable(.{ .table_id = 1, .name = "before" });
+    try manager.upsertTable(.{ .table_id = 1, .name = "after" });
+    try std.testing.expect(manager.findTableByName("before") == null);
+    try std.testing.expectEqual(@as(u64, 1), manager.findTableByName("after").?.table_id);
+    try std.testing.expectError(error.TableAlreadyExists, manager.upsertTable(.{ .table_id = 2, .name = "after" }));
+    try std.testing.expect(manager.tables.get(2) == null);
+    try std.testing.expect(manager.removeTable(1));
+    try std.testing.expect(manager.findTableByName("after") == null);
+    try manager.upsertTable(.{ .table_id = 2, .name = "after" });
+    manager.clearTopology();
+    try std.testing.expect(manager.findTableByName("after") == null);
+}
+
+test "system catalog table name index replacement is atomic on allocation failure" {
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var manager = TableManager.init(alloc);
+            defer manager.deinit();
+            try manager.upsertTable(.{ .table_id = 1, .name = "before" });
+            manager.upsertTable(.{ .table_id = 1, .name = "after" }) catch |err| {
+                try std.testing.expectEqual(@as(u64, 1), manager.findTableByName("before").?.table_id);
+                try std.testing.expect(manager.findTableByName("after") == null);
+                return err;
+            };
+            try std.testing.expect(manager.findTableByName("before") == null);
+            try std.testing.expectEqual(@as(u64, 1), manager.findTableByName("after").?.table_id);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

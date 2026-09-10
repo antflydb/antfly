@@ -49,10 +49,65 @@ pub const DistributedCandidateSource = struct {
     }
 
     const vtable = CandidateSource.VTable{
+        .begin_batch = beginBatch,
         .get = getFn,
         .scan_prefix = scanPrefixFn,
         .nearest = nearestFn,
     };
+
+    const BoundBatch = struct {
+        arena: std.heap.ArenaAllocator,
+        raw: DistributedCandidateSource,
+        binding: @import("../system_catalog/domain.zig").BindingSource,
+        names: []const []const u8,
+        physical: ?[][]u8 = null,
+
+        fn resolve(self: *@This(), table: []const u8) !?[]const u8 {
+            // Curated endpoints outside this resolver's declared target retain
+            // their independent promotion binding; never guess physical names.
+            for (self.names, 0..) |name, i| if (std.mem.eql(u8, name, table)) {
+                if (self.physical == null) self.physical = try self.binding.bind(self.arena.allocator(), self.names);
+                if (self.physical.?.len != self.names.len) return error.InvalidCatalogRecord;
+                return self.physical.?[i];
+            };
+            return null;
+        }
+        fn boundTable(ptr: *anyopaque, table: []const u8) anyerror!?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.resolve(table);
+        }
+        fn get(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, key: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return getFn(&self.raw, alloc, (try self.resolve(table)) orelse return error.TableNotFound, key);
+        }
+        fn scan(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, prefix: []const u8, opts: CandidateSource.ScanOptions, ctx: *anyopaque, consume: CandidateSource.Consume) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return scanPrefixFn(&self.raw, alloc, (try self.resolve(table)) orelse return error.TableNotFound, prefix, opts, ctx, consume);
+        }
+        fn nearest(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, query: CandidateSource.NearestQuery, ctx: *anyopaque, consume: CandidateSource.Consume) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return nearestFn(&self.raw, alloc, (try self.resolve(table)) orelse return error.TableNotFound, query, ctx, consume);
+        }
+        fn release(ptr: *anyopaque, alloc: std.mem.Allocator) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.arena.deinit();
+            alloc.destroy(self);
+        }
+        const vtable: CandidateSource.VTable = .{ .get = get, .scan_prefix = scan, .nearest = nearest, .bound_table = boundTable };
+    };
+
+    fn beginBatch(ptr: *anyopaque, alloc: std.mem.Allocator, names: []const []const u8) anyerror!CandidateSource.Batch {
+        const self: *DistributedCandidateSource = @ptrCast(@alignCast(ptr));
+        const binding = self.catalog_binding orelse return .{ .source = self.candidateSource() };
+        const batch = try alloc.create(BoundBatch);
+        errdefer alloc.destroy(batch);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        const owned = try arena.allocator().alloc([]const u8, names.len);
+        for (names, owned) |name, *copy| copy.* = try arena.allocator().dupe(u8, name);
+        batch.* = .{ .arena = arena, .raw = .{ .reads = self.reads, .consistency = self.consistency }, .binding = binding, .names = owned };
+        return .{ .source = .{ .ptr = batch, .vtable = &BoundBatch.vtable }, .release = BoundBatch.release };
+    }
 
     fn getFn(
         ptr: *anyopaque,
@@ -61,8 +116,8 @@ pub const DistributedCandidateSource = struct {
         key: []const u8,
     ) anyerror!?[]u8 {
         const self: *DistributedCandidateSource = @ptrCast(@alignCast(ptr));
-        const physical = if (self.catalog_binding) |binding| try binding.bindOne(allocator, table) else try allocator.dupe(u8, table);
-        defer allocator.free(physical);
+        const physical = if (self.catalog_binding) |binding| try binding.bindOne(allocator, table) else table;
+        defer if (self.catalog_binding != null) allocator.free(physical);
         var resp = (try self.reads.lookup(allocator, physical, key, .{}, self.consistency)) orelse return null;
         defer resp.deinit(allocator);
         return try allocator.dupe(u8, resp.json);
@@ -78,8 +133,8 @@ pub const DistributedCandidateSource = struct {
         consume: CandidateSource.Consume,
     ) anyerror!void {
         const self: *DistributedCandidateSource = @ptrCast(@alignCast(ptr));
-        const physical = if (self.catalog_binding) |binding| try binding.bindOne(allocator, table) else try allocator.dupe(u8, table);
-        defer allocator.free(physical);
+        const physical = if (self.catalog_binding) |binding| try binding.bindOne(allocator, table) else table;
+        defer if (self.catalog_binding != null) allocator.free(physical);
         // [prefix, prefixUpperBound) covers exactly the keys under `prefix`.
         const upper = (try prefixUpperBoundAlloc(allocator, prefix)) orelse return;
         defer allocator.free(upper);
@@ -108,8 +163,8 @@ pub const DistributedCandidateSource = struct {
         consume: CandidateSource.Consume,
     ) anyerror!void {
         const self: *DistributedCandidateSource = @ptrCast(@alignCast(ptr));
-        const physical = if (self.catalog_binding) |binding| try binding.bindOne(allocator, table) else try allocator.dupe(u8, table);
-        defer allocator.free(physical);
+        const physical = if (self.catalog_binding) |binding| try binding.bindOne(allocator, table) else table;
+        defer if (self.catalog_binding != null) allocator.free(physical);
         const limit: u32 = @intCast(@min(query.k, std.math.maxInt(u32)));
         const dense_query = db_mod.types.DenseKnnQuery{ .vector = query.embedding, .k = limit };
         const named_queries = [_]db_mod.types.NamedDenseQuery{.{
@@ -408,4 +463,42 @@ test "DistributedCandidateSource nearest parses query hits into candidates" {
     try testing.expectEqual(@as(usize, 1), ctx.keys.items.len);
     try testing.expectEqualStrings("person/ada_lovelace", ctx.keys.items[0]);
     try testing.expect(std.mem.indexOf(u8, ctx.values.items[0], "Ada Lovelace") != null);
+}
+
+test "DistributedCandidateSource system catalog batch binds once and retains the old destination" {
+    const alloc = testing.allocator;
+    const Binding = struct {
+        calls: usize = 0,
+        physical: []const u8 = "table:old",
+        fn bind(ptr: *anyopaque, a: std.mem.Allocator, names: []const []const u8) anyerror![][]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try testing.expectEqual(@as(usize, 1), names.len);
+            try testing.expectEqualStrings("entities", names[0]);
+            const result = try a.alloc([]u8, 1);
+            errdefer a.free(result);
+            result[0] = try a.dupe(u8, self.physical);
+            return result;
+        }
+    };
+    var binding: Binding = .{};
+    var fake = FakeTableReadSource{ .alloc = alloc, .table = "table:old" };
+    defer fake.docs.deinit(alloc);
+    try fake.docs.put(alloc, "person/ada", "{\"canonical_name\":\"Ada\"}");
+    var adapter = DistributedCandidateSource{ .reads = fake.source(), .catalog_binding = .{ .ptr = &binding, .bind_fn = Binding.bind } };
+    const batch = try adapter.candidateSource().beginBatch(alloc, &.{"entities"});
+    defer batch.deinit(alloc);
+    // Beginning a batch with no source artifact performs no metadata I/O.
+    try testing.expectEqual(@as(usize, 0), binding.calls);
+    for (0..100) |_| {
+        const doc = (try batch.source.get(alloc, "entities", "person/ada")).?;
+        alloc.free(doc);
+        binding.physical = "table:replacement";
+    }
+    try testing.expectEqual(@as(usize, 1), binding.calls);
+    try testing.expectEqualStrings("table:old", (try batch.source.boundTable("entities")).?);
+    const next = try adapter.candidateSource().beginBatch(alloc, &.{"entities"});
+    defer next.deinit(alloc);
+    try testing.expectEqualStrings("table:replacement", (try next.source.boundTable("entities")).?);
+    try testing.expectEqual(@as(usize, 2), binding.calls);
 }

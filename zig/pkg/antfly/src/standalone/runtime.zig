@@ -738,7 +738,7 @@ const LocalStandaloneMetadata = struct {
     last_schema_migration_finalize_at_ms: u64 = 0,
     local_schema_progress_provider: ?LocalSchemaProgressProvider = null,
 
-    system_catalog_state: ?std.json.Parsed(system_catalog.State) = null,
+    system_catalog_state: ?system_catalog.IndexedState = null,
 
     const PersistedCatalog = struct {
         system_catalog: system_catalog.State = .{},
@@ -755,7 +755,7 @@ const LocalStandaloneMetadata = struct {
         previous_manager: antfly.metadata.TableManager,
         previous_extensions: antfly.extensions.ExtensionCatalog,
         previous_epoch: u64,
-        previous_system_catalog: std.json.Parsed(system_catalog.State),
+        previous_system_catalog: system_catalog.IndexedState,
         committed: bool = false,
 
         fn commit(self: *CatalogMutation, metadata: *LocalStandaloneMetadata) !void {
@@ -793,7 +793,7 @@ const LocalStandaloneMetadata = struct {
         return .{
             .previous_manager = manager,
             .previous_extensions = extensions,
-            .previous_system_catalog = try system_catalog.cloneStateAlloc(self.alloc, self.systemCatalogState()),
+            .previous_system_catalog = try system_catalog.IndexedState.clone(self.alloc, self.systemCatalogState()),
             .previous_epoch = self.epoch,
         };
     }
@@ -1134,34 +1134,36 @@ const LocalStandaloneMetadata = struct {
     }
 
     fn applySystemCatalogDeltaLocked(self: *LocalStandaloneMetadata, delta: system_catalog.Delta) !void {
-        const next = try system_catalog.applyDeltaStateAlloc(self.alloc, self.systemCatalogState(), delta);
+        var owned = try system_catalog.applyDeltaStateAlloc(self.alloc, self.systemCatalogState(), delta);
+        errdefer owned.deinit();
+        const next = try system_catalog.IndexedState.init(self.alloc, owned);
         if (self.system_catalog_state) |*state| state.deinit();
         self.system_catalog_state = next;
     }
 
     fn systemCatalogPhysicalTablesLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator) ![]system_catalog.PhysicalTable {
-        const tables = try self.manager.listTables(alloc);
-        defer self.manager.freeTables(alloc, tables);
-        const physical = try alloc.alloc(system_catalog.PhysicalTable, tables.len);
-        for (tables, physical) |table, *item| {
-            // Borrow names from the live manager rather than the temporary clone.
-            item.* = .{ .id = table.table_id, .name = self.findTableByNameLocked(table.name).?.name };
+        const physical = try alloc.alloc(system_catalog.PhysicalTable, self.manager.tables.count());
+        var it = self.manager.tables.valueIterator();
+        for (physical) |*item| {
+            const table = it.next().?;
+            item.* = .{ .id = table.table_id, .name = table.name };
         }
         return physical;
     }
 
     fn resolveSystemCatalogLocked(self: *LocalStandaloneMetadata, target: system_catalog.Target) !?antfly.metadata.TableRecord {
         try target.validate();
-        const state = self.systemCatalogState();
-        const namespace = state.namespaceFor(target.database, target.namespace) catch return null;
-        if (state.find(.table, namespace.id, target.table)) |binding| {
-            const table = self.findTableByNameLocked(binding.storage_name) orelse return error.InvalidCatalogRecord;
-            if (table.table_id != binding.id) return error.InvalidCatalogRecord;
+        const empty: system_catalog.StateIndex = .{};
+        const index = if (self.system_catalog_state) |*state| &state.index else &empty;
+        const namespace = index.namespaceFor(target.database, target.namespace) catch return null;
+        if (index.find(.table, namespace.id, target.table)) |binding| {
+            const table = self.manager.tables.getPtr(binding.id) orelse return error.InvalidCatalogRecord;
+            if (!std.mem.eql(u8, table.name, binding.storage_name)) return error.InvalidCatalogRecord;
             return table.*;
         }
         if (namespace.id != system_catalog.default_namespace_id) return null;
         const table = self.findTableByNameLocked(target.table) orelse return null;
-        if (system_catalog.hasBinding(state, table.table_id)) return null;
+        if (index.byId(.table, table.table_id) != null) return null;
         return table.*;
     }
 
@@ -1808,11 +1810,7 @@ const LocalStandaloneMetadata = struct {
     }
 
     fn findTableByNameLocked(self: *LocalStandaloneMetadata, table_name: []const u8) ?*const antfly.metadata.TableRecord {
-        var it = self.manager.tables.valueIterator();
-        while (it.next()) |table| {
-            if (std.mem.eql(u8, table.name, table_name)) return table;
-        }
-        return null;
+        return self.manager.findTableByName(table_name);
     }
 
     fn loadPersistedCatalog(self: *LocalStandaloneMetadata) !void {
@@ -1848,7 +1846,7 @@ const LocalStandaloneMetadata = struct {
             parsed.value.extension_members,
             parsed.value.extension_dependencies,
         );
-        self.system_catalog_state = try system_catalog.cloneStateAlloc(self.alloc, parsed.value.system_catalog);
+        self.system_catalog_state = try system_catalog.IndexedState.clone(self.alloc, parsed.value.system_catalog);
         self.epoch = @max(parsed.value.epoch, 1);
     }
 

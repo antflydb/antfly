@@ -2282,6 +2282,20 @@ pub fn build(b: *std.Build) void {
     });
     const system_catalog_api_step = b.step("antfly-system-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
     system_catalog_api_step.dependOn(&b.addRunArtifact(system_catalog_api_tests).step);
+    const system_catalog_bench = b.addExecutable(.{
+        .name = "system-catalog-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/benchmarks/system_catalog.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    system_catalog_bench.root_module.addImport("system_catalog", b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/system_catalog/domain.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    }));
+    b.step("antfly-system-catalog-bench", "Benchmark indexed catalog lookups and mutation planning").dependOn(&b.addRunArtifact(system_catalog_bench).step);
     const system_catalog_test_step = b.step("antfly-system-catalog-test", "Run system catalog durability, identity, and routing tests");
     system_catalog_test_step.dependOn(&b.addRunArtifact(system_catalog_tests).step);
     const system_catalog_transport_tests = b.addTest(.{ .root_module = metadata_unit_baseline_mods[1], .filters = &.{"system catalog"} });
@@ -6229,7 +6243,7 @@ pub fn build(b: *std.Build) void {
     public_api_parity_test_step.dependOn(&run_public_api_parity_tests.step);
 
     const lib_resolution_source_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = api_http_runtime_test_mod,
         .filters = &.{
             "DistributedCandidateSource",
             "prefixUpperBoundAlloc",

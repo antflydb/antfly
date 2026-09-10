@@ -2564,7 +2564,7 @@ const GraphNodeAdmissionContext = struct {
             else
                 0;
             allowed = exists;
-            requires_hydration = self.table_authorizer != null;
+            requires_hydration = self.table_authorizer != null and (authorization.requires_document_admission or authorization.filter_query_json != null);
             if (authorization.filter_query_json) |filter| {
                 filter_query_json = filter;
                 filter_query_json_live = true;
@@ -11517,14 +11517,14 @@ pub fn testHydrateIdentityGenerationAndCrossRangeOrdinalBoundary(alloc: std.mem.
 }
 
 pub fn testCrossTableHydrateAppliesTargetAuthorizationAndClearsOrdinals(alloc: std.mem.Allocator) !void {
-    try testCrossTableHydration(alloc, false);
+    try testCrossTableHydration(alloc, false, true);
 }
 
 test "system catalog graph hydration authorizes logical names and routes physical identities" {
-    try testCrossTableHydration(std.testing.allocator, true);
+    try testCrossTableHydration(std.testing.allocator, true, true);
 }
 
-fn testCrossTableHydration(alloc: std.mem.Allocator, comptime bind_catalog: bool) !void {
+fn testCrossTableHydration(alloc: std.mem.Allocator, comptime bind_catalog: bool, comptime filter_target: bool) !void {
     const TestState = struct {
         filter_ptr: *const anyopaque,
         same_table_calls: u32 = 0,
@@ -11547,7 +11547,8 @@ fn testCrossTableHydration(alloc: std.mem.Allocator, comptime bind_catalog: bool
             }
             return .{
                 .allowed = true,
-                .filter_query_json = try alloc_inner.dupe(u8, target_filter),
+                .filter_query_json = if (filter_target) try alloc_inner.dupe(u8, target_filter) else null,
+                .requires_document_admission = false,
                 .physical_table_name = if (bind_catalog) try alloc_inner.dupe(u8, "table:entity-id") else null,
             };
         }
@@ -11644,7 +11645,7 @@ fn testCrossTableHydration(alloc: std.mem.Allocator, comptime bind_catalog: bool
                 try std.testing.expect(req.identity_read_generation == null);
                 try std.testing.expect(req.resolved_doc_filter == null);
                 try std.testing.expect(req.resolved_doc_filter_wire_context == null);
-                try std.testing.expectEqualStrings(target_filter, req.filter_query_json);
+                try std.testing.expectEqualStrings(if (filter_target) target_filter else "", req.filter_query_json);
             } else {
                 return error.UnexpectedTable;
             }
@@ -11704,6 +11705,12 @@ fn testCrossTableHydration(alloc: std.mem.Allocator, comptime bind_catalog: bool
         .read_index,
     );
     defer admission.deinit();
+    if (!filter_target) {
+        const admitted = try admission.iface().filterAlloc(alloc, &.{.{ .key = "person/ada", .table = "entities", .external = true }});
+        defer alloc.free(admitted);
+        try std.testing.expect(admitted[0]);
+        try std.testing.expectEqual(@as(u32, 0), state.cross_table_calls);
+    }
     const hits = try hydrateHitsForResultNodes(alloc, &admission, nodes[0..], true, &.{});
     defer {
         for (hits) |*hit| hit.deinit(alloc);
@@ -14902,4 +14909,8 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
         .read_index,
     ));
     try std.testing.expectEqual(@as(u32, 2), state.expand_calls.load(.monotonic));
+}
+
+test "system catalog graph binding alone performs no admission hydration" {
+    try testCrossTableHydration(std.testing.allocator, true, false);
 }

@@ -38,6 +38,9 @@ const matcher = @import("antfly_matcher");
 /// later redesign.
 pub const DocRef = struct {
     table: []const u8,
+    /// Trusted execution binding persisted for deferred promotion. Logical
+    /// table remains the public endpoint and curation identity.
+    storage_table: ?[]const u8 = null,
     key: []const u8,
 };
 
@@ -123,6 +126,10 @@ pub const Resolution = struct {
             try writeJsonString(allocator, &out, e.doc_ref.table);
             try out.appendSlice(allocator, ",\"key\":");
             try writeJsonString(allocator, &out, e.doc_ref.key);
+            if (e.doc_ref.storage_table) |physical| {
+                try out.appendSlice(allocator, ",\"storage_table\":");
+                try writeJsonString(allocator, &out, physical);
+            }
             try out.appendSlice(allocator, "},\"confidence\":");
             try appendFloat(allocator, &out, e.confidence);
             try out.appendSlice(allocator, ",\"decision\":");
@@ -636,6 +643,7 @@ pub fn parseResolution(gpa: std.mem.Allocator, json_bytes: []const u8) !ParsedRe
             .doc_ref = .{
                 .table = try a.dupe(u8, jsonString(ref.object.get("table") orelse return error.InvalidResolution) orelse return error.InvalidResolution),
                 .key = try a.dupe(u8, jsonString(ref.object.get("key") orelse return error.InvalidResolution) orelse return error.InvalidResolution),
+                .storage_table = if (ref.object.get("storage_table")) |v| try a.dupe(u8, jsonString(v) orelse return error.InvalidResolution) else null,
             },
             .confidence = switch (o.get("confidence") orelse std.json.Value{ .float = 0 }) {
                 .float => |f| f,
@@ -798,6 +806,7 @@ pub const RunResult = enum {
 /// shard's `BackendRuntime.durable_jobs` lane; crash recovery is the normal
 /// replay path (the change journal re-emits the extraction artifact key).
 pub const ResolutionStage = struct {
+    doc_ref_binding: ?struct { ptr: *anyopaque, bind: *const fn (*anyopaque, []const u8) anyerror!?[]const u8 } = null,
     resolver: *const Resolver,
     config_generation: u64,
     /// Optional name-embedding backfill: when set, each mention lacking an
@@ -873,6 +882,13 @@ pub const ResolutionStage = struct {
             }
         }
 
+        if (self.doc_ref_binding) |binding| {
+            for (@constCast(resolution.entities)) |*entity| {
+                if (try binding.bind(binding.ptr, entity.doc_ref.table)) |physical| {
+                    entity.doc_ref.storage_table = try resolution.arena.allocator().dupe(u8, physical);
+                }
+            }
+        }
         return try resolution.toJson(gpa);
     }
 
@@ -1498,4 +1514,18 @@ test "resolution stage backfills a mention embedding so cosine blocking links" {
         try testing.expectEqualStrings("match", ent.get("decision").?.string);
         try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
     }
+}
+
+test "resolution durable doc ref binding round trips without changing its logical table" {
+    const alloc = testing.allocator;
+    var parsed = try parseResolution(alloc, "{\"config_generation\":1,\"entities\":[{\"local_id\":\"e1\",\"doc_ref\":{\"table\":\"entities\",\"key\":\"person/ada\",\"storage_table\":\"table:original\"},\"confidence\":1,\"decision\":\"new\",\"label\":\"person\",\"canonical_name\":\"Ada\",\"surface_form\":\"Ada\"}]}");
+    defer parsed.deinit();
+    try testing.expectEqualStrings("entities", parsed.entities[0].doc_ref.table);
+    try testing.expectEqualStrings("table:original", parsed.entities[0].doc_ref.storage_table.?);
+    const value: Resolution = .{ .arena = undefined, .config_generation = parsed.config_generation, .entities = parsed.entities };
+    const encoded = try value.toJson(alloc);
+    defer alloc.free(encoded);
+    var replay = try parseResolution(alloc, encoded);
+    defer replay.deinit();
+    try testing.expectEqualStrings("table:original", replay.entities[0].doc_ref.storage_table.?);
 }

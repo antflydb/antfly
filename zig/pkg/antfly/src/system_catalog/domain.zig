@@ -215,6 +215,79 @@ pub const State = struct {
     }
 };
 
+/// Borrowed indexes over one immutable state. Rebuild before publication; keys
+/// borrow state strings and must be destroyed before their owner.
+pub const StateIndex = struct {
+    const Name = struct { kind: Kind, parent: u64, name: []const u8 };
+    const NameContext = struct {
+        pub fn hash(_: @This(), key: Name) u64 {
+            var h = std.hash.Wyhash.init(@intFromEnum(key.kind));
+            h.update(std.mem.asBytes(&key.parent));
+            h.update(key.name);
+            return h.final();
+        }
+        pub fn eql(_: @This(), a: Name, b: Name) bool {
+            return a.kind == b.kind and a.parent == b.parent and std.mem.eql(u8, a.name, b.name);
+        }
+    };
+    const Id = struct { kind: Kind, id: u64 };
+    names: std.HashMapUnmanaged(Name, Resource, NameContext, 80) = .empty,
+    ids: std.AutoHashMapUnmanaged(Id, Resource) = .empty,
+
+    pub fn init(alloc: std.mem.Allocator, state: State) !StateIndex {
+        var self: StateIndex = .{};
+        errdefer self.deinit(alloc);
+        try self.names.ensureTotalCapacity(alloc, @intCast(state.resources.len));
+        try self.ids.ensureTotalCapacity(alloc, @intCast(state.resources.len));
+        for (state.resources) |r| {
+            const name = try self.names.getOrPut(alloc, .{ .kind = r.kind, .parent = r.parent_id, .name = r.name });
+            if (name.found_existing) return error.InvalidCatalogRecord;
+            name.value_ptr.* = r;
+            const id = try self.ids.getOrPut(alloc, .{ .kind = r.kind, .id = r.id });
+            if (id.found_existing) return error.InvalidCatalogRecord;
+            id.value_ptr.* = r;
+        }
+        return self;
+    }
+    pub fn deinit(self: *StateIndex, alloc: std.mem.Allocator) void {
+        self.names.deinit(alloc);
+        self.ids.deinit(alloc);
+        self.* = undefined;
+    }
+    pub fn find(self: *const StateIndex, kind: Kind, parent: u64, name: []const u8) ?Resource {
+        return self.names.get(.{ .kind = kind, .parent = parent, .name = name }) orelse (State{}).find(kind, parent, name);
+    }
+    pub fn byId(self: *const StateIndex, kind: Kind, id: u64) ?Resource {
+        return self.ids.get(.{ .kind = kind, .id = id }) orelse (State{}).byId(kind, id);
+    }
+    pub fn namespaceFor(self: *const StateIndex, database: []const u8, namespace: []const u8) !Resource {
+        const db = self.find(.database, 0, database) orelse return error.DatabaseNotFound;
+        return self.find(.namespace, db.id, namespace) orelse error.NamespaceNotFound;
+    }
+};
+
+pub const IndexedState = struct {
+    alloc: std.mem.Allocator,
+    owned: std.json.Parsed(State),
+    value: State,
+    index: StateIndex,
+
+    /// Consumes owned on success; callers retain it on failure.
+    pub fn init(alloc: std.mem.Allocator, owned: std.json.Parsed(State)) !IndexedState {
+        return .{ .alloc = alloc, .owned = owned, .value = owned.value, .index = try StateIndex.init(alloc, owned.value) };
+    }
+    pub fn clone(alloc: std.mem.Allocator, state: State) !IndexedState {
+        var owned = try cloneStateAlloc(alloc, state);
+        errdefer owned.deinit();
+        return init(alloc, owned);
+    }
+    pub fn deinit(self: *IndexedState) void {
+        self.index.deinit(self.alloc);
+        self.owned.deinit();
+        self.* = undefined;
+    }
+};
+
 /// A deterministic single-command delta. All data is borrowed from the request
 /// and snapshot; the allocator owns only the delta arrays.
 pub const Delta = struct {
@@ -235,6 +308,8 @@ pub const Delta = struct {
 pub const PhysicalTable = struct { id: u64, name: []const u8 };
 
 pub fn plan(alloc: std.mem.Allocator, state: State, request: Mutation, tables: []const PhysicalTable) !Delta {
+    var index = try StateIndex.init(alloc, state);
+    defer index.deinit(alloc);
     try validateResourceName(request.kind, request.name);
     try validateName(request.database);
     try validateName(request.namespace);
@@ -252,12 +327,12 @@ pub fn plan(alloc: std.mem.Allocator, state: State, request: Mutation, tables: [
         return error.InvalidCatalogMutation;
     const parent_id: u64 = switch (request.kind) {
         .database, .tablespace => 0,
-        .namespace => (state.find(.database, 0, request.database) orelse return error.DatabaseNotFound).id,
-        .table => (try state.namespaceFor(request.database, request.namespace)).id,
+        .namespace => (index.find(.database, 0, request.database) orelse return error.DatabaseNotFound).id,
+        .table => (try index.namespaceFor(request.database, request.namespace)).id,
     };
-    var found = state.find(request.kind, parent_id, request.name);
+    var found = index.find(request.kind, parent_id, request.name);
     if (found == null and request.kind == .table and parent_id == default_namespace_id and request.action != .create) {
-        for (tables) |table| if (std.mem.eql(u8, table.name, request.name) and !hasBinding(state, table.id)) {
+        for (tables) |table| if (std.mem.eql(u8, table.name, request.name) and index.byId(.table, table.id) == null) {
             found = .{ .kind = .table, .id = table.id, .parent_id = default_namespace_id, .name = table.name, .storage_name = table.name };
             break;
         };
@@ -271,7 +346,7 @@ pub fn plan(alloc: std.mem.Allocator, state: State, request: Mutation, tables: [
         .create => {
             if (found != null) return error.CatalogAlreadyExists;
             if (request.new_name != null) return error.InvalidCatalogMutation;
-            const binding = if (request.tablespace) |name| (state.find(.tablespace, 0, name) orelse return error.TablespaceNotFound).id else 0;
+            const binding = if (request.tablespace) |name| (index.find(.tablespace, 0, name) orelse return error.TablespaceNotFound).id else 0;
             if (request.kind == .tablespace and binding != 0) return error.InvalidCatalogMutation;
             var resource: Resource = .{ .kind = request.kind, .id = next_id, .parent_id = parent_id, .name = request.name, .tablespace_id = binding, .placement_policy = request.placement_policy, .location_json = request.location_json };
             if (request.kind == .table) {
@@ -279,7 +354,7 @@ pub fn plan(alloc: std.mem.Allocator, state: State, request: Mutation, tables: [
                 for (state.resources) |r| if (r.kind == .table and (r.id == request.table_id or std.mem.eql(u8, r.storage_name, request.storage_name))) return error.CatalogAlreadyExists;
                 for (tables) |t| {
                     if (t.id == request.table_id or std.mem.eql(u8, t.name, request.storage_name)) return error.CatalogAlreadyExists;
-                    if (parent_id == default_namespace_id and std.mem.eql(u8, t.name, request.name) and !hasBinding(state, t.id)) return error.CatalogAlreadyExists;
+                    if (parent_id == default_namespace_id and std.mem.eql(u8, t.name, request.name) and index.byId(.table, t.id) == null) return error.CatalogAlreadyExists;
                 }
                 resource.id = request.table_id;
                 resource.storage_name = request.storage_name;
@@ -296,25 +371,28 @@ pub fn plan(alloc: std.mem.Allocator, state: State, request: Mutation, tables: [
             if (request.action == .set_tablespace) {
                 if (existing.kind == .tablespace or request.new_name != null) return error.InvalidCatalogMutation;
                 var updated = existing;
-                updated.tablespace_id = if (request.tablespace) |name| (state.find(.tablespace, 0, name) orelse return error.TablespaceNotFound).id else 0;
+                updated.tablespace_id = if (request.tablespace) |name| (index.find(.tablespace, 0, name) orelse return error.TablespaceNotFound).id else 0;
                 try upserts.append(alloc, updated);
             } else {
                 if ((existing.kind == .database and existing.id == default_database_id) or (existing.kind == .namespace and existing.id == default_namespace_id)) return error.ProtectedCatalogResource;
                 if (request.action == .rename) {
                     const name = request.new_name orelse return error.InvalidCatalogMutation;
-                    if (state.find(existing.kind, parent_id, name)) |other| if (other.id != existing.id) return error.CatalogAlreadyExists;
+                    if (index.find(existing.kind, parent_id, name)) |other| if (other.id != existing.id) return error.CatalogAlreadyExists;
                     if (existing.kind == .table and parent_id == default_namespace_id) for (tables) |t| {
-                        if (!hasBinding(state, t.id) and std.mem.eql(u8, t.name, name)) return error.CatalogAlreadyExists;
+                        if (std.mem.eql(u8, t.name, name) and index.byId(.table, t.id) == null) return error.CatalogAlreadyExists;
                     };
                     var updated = existing;
                     updated.name = name;
                     try upserts.append(alloc, updated);
                 } else {
                     for (state.resources) |r| {
+                        if (existing.kind == .database and r.kind == .table) {
+                            const parent = index.byId(.namespace, r.parent_id) orelse return error.InvalidCatalogRecord;
+                            if (parent.parent_id == existing.id) return error.DatabaseNotEmpty;
+                        }
                         if (existing.kind == .tablespace and r.tablespace_id == existing.id) return error.TablespaceInUse;
                         if (existing.kind == .namespace and r.kind == .table and r.parent_id == existing.id) return error.NamespaceNotEmpty;
                         if (existing.kind == .database and r.kind == .namespace and r.parent_id == existing.id) {
-                            for (state.resources) |child| if (child.kind == .table and child.parent_id == r.id) return error.DatabaseNotEmpty;
                             try removes.append(alloc, r);
                         }
                     }
@@ -527,17 +605,13 @@ pub fn applyDeltaStateAlloc(alloc: std.mem.Allocator, state: State, delta: Delta
     var resources = std.ArrayListUnmanaged(Resource).empty;
     defer resources.deinit(alloc);
     const existing = if (state.revision == 0) &[_]Resource{ default_database, default_namespace } else state.resources;
+    var replaced: std.AutoHashMapUnmanaged(StateIndex.Id, void) = .empty;
+    defer replaced.deinit(alloc);
+    try replaced.ensureTotalCapacity(alloc, @intCast(delta.removes.len + delta.upserts.len));
+    for (delta.removes) |item| replaced.putAssumeCapacity(.{ .kind = item.kind, .id = item.id }, {});
+    for (delta.upserts) |item| replaced.putAssumeCapacity(.{ .kind = item.kind, .id = item.id }, {});
     for (existing) |resource| {
-        var replaced = false;
-        for (delta.removes) |item| if (item.kind == resource.kind and item.id == resource.id) {
-            replaced = true;
-            break;
-        };
-        for (delta.upserts) |item| if (item.kind == resource.kind and item.id == resource.id) {
-            replaced = true;
-            break;
-        };
-        if (!replaced) try resources.append(alloc, resource);
+        if (!replaced.contains(.{ .kind = resource.kind, .id = resource.id })) try resources.append(alloc, resource);
     }
     try resources.appendSlice(alloc, delta.upserts);
     return cloneStateAlloc(alloc, .{ .revision = try std.math.add(u64, state.revision, 1), .next_id = delta.next_id, .resources = resources.items });
@@ -618,3 +692,19 @@ pub const BindingSource = struct {
         return names[0];
     }
 };
+
+test "system catalog database drop removes all empty namespaces without losing another database" {
+    const alloc = std.testing.allocator;
+    const state: State = .{ .revision = 1, .next_id = 20, .resources = &.{
+        default_database,                                                    default_namespace,
+        .{ .kind = .database, .id = 10, .name = "retired" },                 .{ .kind = .namespace, .id = 11, .parent_id = 10, .name = "public" },
+        .{ .kind = .namespace, .id = 12, .parent_id = 10, .name = "extra" }, .{ .kind = .table, .id = 13, .parent_id = default_namespace_id, .name = "retained", .storage_name = "table:13" },
+    } };
+    var delta = try plan(alloc, state, .{ .action = .drop, .kind = .database, .name = "retired" }, &.{});
+    defer delta.deinit(alloc);
+    var next = try applyDeltaStateAlloc(alloc, state, delta);
+    defer next.deinit();
+    try std.testing.expectEqual(@as(usize, 3), next.value.resources.len);
+    try std.testing.expect(next.value.byId(.table, 13) != null);
+    try std.testing.expect(next.value.byId(.namespace, 12) == null);
+}

@@ -1774,6 +1774,8 @@ pub fn canonicalGroupedMatchDescendantRequest(
 
 pub const GraphTableReadAuthorization = struct {
     allowed: bool,
+    /// Binding alone does not require a document-existence or predicate read.
+    requires_document_admission: bool = true,
     /// Owned physical routing name; authorization remains against the logical target.
     physical_table_name: ?[]u8 = null,
     /// Owned by this value when non-null.

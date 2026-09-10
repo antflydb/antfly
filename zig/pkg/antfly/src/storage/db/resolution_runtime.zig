@@ -92,7 +92,26 @@ pub const CandidateSource = struct {
         limit: usize = 0,
     };
 
+    pub const Batch = struct {
+        source: CandidateSource,
+        release: ?*const fn (*anyopaque, std.mem.Allocator) void = null,
+        pub fn deinit(self: Batch, alloc: std.mem.Allocator) void {
+            if (self.release) |f| f(self.source.ptr, alloc);
+        }
+    };
+    pub fn beginBatch(self: CandidateSource, alloc: std.mem.Allocator, tables: []const []const u8) !Batch {
+        if (self.vtable.begin_batch) |f| return f(self.ptr, alloc, tables);
+        return .{ .source = self };
+    }
+    pub fn boundTable(self: CandidateSource, table: []const u8) !?[]const u8 {
+        if (self.vtable.bound_table) |f| return f(self.ptr, table);
+        return null;
+    }
     pub const VTable = struct {
+        /// A work-unit-owned binding; never shared between background workers.
+        begin_batch: ?*const fn (*anyopaque, std.mem.Allocator, []const []const u8) anyerror!Batch = null,
+        /// Borrowed immutable destination, retained through batch deinit.
+        bound_table: ?*const fn (*anyopaque, []const u8) anyerror!?[]const u8 = null,
         /// Fetch the entity doc for `key` in `table` (owned bytes or null).
         get: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, key: []const u8) anyerror!?[]u8,
         /// Scan `table` for entities whose key starts with `prefix`.
@@ -282,6 +301,10 @@ fn processChangedExtractionWithConfig(
     defer parsed.deinit(gpa);
     if (!resolverMatchesArtifact(cfg, parsed.source_artifact_kind, parsed.artifact_name)) return null;
 
+    const candidate_batch = if (candidate_source) |source| try source.beginBatch(gpa, &.{cfg.table}) else null;
+    defer if (candidate_batch) |batch| batch.deinit(gpa);
+    const batch_source = if (candidate_batch) |batch| batch.source else null;
+
     var resolver = try resolver_lib.Resolver.initFromParts(
         gpa,
         cfg.table,
@@ -303,7 +326,7 @@ fn processChangedExtractionWithConfig(
     const effective_provider = provider orelse blk: {
         // A cross-shard source (injected by the api layer) wins over the local
         // in-store providers when the resolver declares a candidate search mode.
-        if (candidate_source) |src| {
+        if (batch_source) |src| {
             if (candidateModeFromConfig(cfg.candidate_search)) |mode| {
                 source_provider = .{
                     .source = src,
@@ -357,6 +380,14 @@ fn processChangedExtractionWithConfig(
         .config_generation = cfg.config_generation,
         .embedder = stage_embedder,
         .overrides = stage_overrides,
+        .doc_ref_binding = if (batch_source) |source| .{
+            .ptr = source.ptr,
+            .bind = source.vtable.bound_table orelse struct {
+                fn none(_: *anyopaque, _: []const u8) anyerror!?[]const u8 {
+                    return null;
+                }
+            }.none,
+        } else null,
     };
     if (persistence == .immediate) {
         const result = try stage.run(gpa, store, effective_provider, changed_key, resolution_key);

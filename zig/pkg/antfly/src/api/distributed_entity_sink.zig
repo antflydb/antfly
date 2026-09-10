@@ -67,7 +67,12 @@ pub const DistributedEntitySink = struct {
         const self: *DistributedEntitySink = @ptrCast(@alignCast(ptr));
         if (entries.len == 0) return;
         if (!self.atomic_batch_required) {
-            for (entries) |e| try upsertFn(ptr, allocator, e.table, e.key, e.doc_json);
+            for (entries) |e| {
+                if (e.storage_table != null) return error.EntityPromotionAtomicCommitUnavailable;
+            }
+            for (entries) |e| {
+                try upsertFn(ptr, allocator, e.table, e.key, e.doc_json);
+            }
             return;
         }
 
@@ -75,31 +80,35 @@ pub const DistributedEntitySink = struct {
         defer arena.deinit();
         const a = arena.allocator();
 
-        // Group merge transforms by table (one TableCommitRequest per table;
-        // commitBatch routes each key and chooses one-shard or 2PC atomically).
-        var tables = std.ArrayListUnmanaged([]const u8).empty;
-        var table_ops = std.ArrayListUnmanaged(std.ArrayListUnmanaged(db_mod.types.DocumentTransform)).empty;
+        // Preserve the resolution work unit's immutable destination through
+        // deferred promotion. Older artifacts bind all missing destinations in
+        // one metadata read; pinned artifacts never resolve a logical name again.
+        const TableBatch = struct {
+            physical: ?[]const u8 = null,
+            transforms: std.ArrayListUnmanaged(db_mod.types.DocumentTransform) = .empty,
+        };
+        var tables = std.StringArrayHashMapUnmanaged(TableBatch).empty;
         for (entries) |e| {
             const ops = try buildMergeOps(a, e.doc_json);
             if (ops.len == 0) continue;
-            const transform = db_mod.types.DocumentTransform{ .key = e.key, .operations = ops, .upsert = true };
-            const idx = blk: {
-                for (tables.items, 0..) |t, i| {
-                    if (std.mem.eql(u8, t, e.table)) break :blk i;
-                }
-                try tables.append(a, e.table);
-                try table_ops.append(a, .empty);
-                break :blk tables.items.len - 1;
-            };
-            try table_ops.items[idx].append(a, transform);
+            const entry = try tables.getOrPut(a, e.table);
+            if (!entry.found_existing) entry.value_ptr.* = .{ .physical = e.storage_table } else {
+                const previous = entry.value_ptr.physical;
+                if ((previous == null) != (e.storage_table == null) or
+                    (previous != null and !std.mem.eql(u8, previous.?, e.storage_table.?))) return error.EntityPromotionConflict;
+            }
+            try entry.value_ptr.transforms.append(a, .{ .key = e.key, .operations = ops, .upsert = true });
         }
-        if (tables.items.len == 0) return;
-
-        const physical_tables: []const []const u8 = if (self.catalog_binding) |binding| try binding.bind(a, tables.items) else tables.items;
+        if (tables.count() == 0) return;
+        var missing = std.ArrayListUnmanaged([]const u8).empty;
+        for (tables.keys(), tables.values()) |name, batch| if (batch.physical == null) try missing.append(a, name);
+        if (missing.items.len > 0) {
+            const physical: []const []const u8 = if (self.catalog_binding) |binding| try binding.bind(a, missing.items) else missing.items;
+            if (physical.len != missing.items.len) return error.InvalidCatalogRecord;
+            for (missing.items, physical) |name, target| tables.getPtr(name).?.physical = target;
+        }
         var reqs = std.ArrayListUnmanaged(distributed_txn.TableCommitRequest).empty;
-        for (physical_tables, 0..) |t, i| {
-            try reqs.append(a, .{ .table_name = t, .transforms = table_ops.items[i].items });
-        }
+        for (tables.values()) |batch| try reqs.append(a, .{ .table_name = batch.physical.?, .transforms = batch.transforms.items });
 
         // Promotion is a stateless, idempotent batch. Use the batch commit
         // contract so first-party sources can safely retry topology races and
@@ -470,5 +479,36 @@ test "DistributedEntitySink atomic mode fails closed when unsupported" {
 
     // No callback means no partial write; catch-up can retry after convergence.
     try testing.expectEqual(@as(usize, 0), fake.commit_calls);
+    try testing.expectEqual(@as(usize, 0), fake.keys.items.len);
+}
+
+test "DistributedEntitySink system catalog pinned promotion never rebinds a replacement" {
+    const alloc = testing.allocator;
+    const Binding = struct {
+        fn bind(_: *anyopaque, _: std.mem.Allocator, _: []const []const u8) anyerror![][]u8 {
+            return error.TestUnexpectedCatalogRead;
+        }
+    };
+    var fake = FakeTableWriteSource{ .alloc = alloc, .table = "table:old", .support_commit_batch = true };
+    defer fake.deinit();
+    var adapter = DistributedEntitySink{ .writes = fake.source(), .atomic_batch_required = true, .catalog_binding = .{ .ptr = &fake, .bind_fn = Binding.bind } };
+    const entries = [_]db_mod.EntityUpsert{.{ .table = "entities", .storage_table = "table:old", .key = "person/ada", .doc_json = "{\"canonical_name\":\"Ada\"}" }};
+    try adapter.entitySink().upsertBatch(alloc, &entries);
+    try testing.expectEqual(@as(usize, 1), fake.commit_batch_calls);
+    fake.table = "table:replacement";
+    if (adapter.entitySink().upsertBatch(alloc, &entries)) |_| return error.TestUnexpectedResult else |_| {}
+    try testing.expectEqual(@as(usize, 1), fake.keys.items.len);
+}
+
+test "DistributedEntitySink system catalog fallback rejects a mixed pinned batch before writing" {
+    const alloc = testing.allocator;
+    var fake = FakeTableWriteSource{ .alloc = alloc, .table = "entities" };
+    defer fake.deinit();
+    var adapter = DistributedEntitySink{ .writes = fake.source() };
+    const entries = [_]db_mod.EntityUpsert{
+        .{ .table = "entities", .key = "one", .doc_json = "{\"canonical_name\":\"One\"}" },
+        .{ .table = "entities", .storage_table = "table:old", .key = "two", .doc_json = "{\"canonical_name\":\"Two\"}" },
+    };
+    try testing.expectError(error.EntityPromotionAtomicCommitUnavailable, adapter.entitySink().upsertBatch(alloc, &entries));
     try testing.expectEqual(@as(usize, 0), fake.keys.items.len);
 }
