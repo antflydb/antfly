@@ -9484,18 +9484,24 @@ test "standalone routing watch does not report absence after one probe" {
     metadata.epoch = 9;
 
     const start_ns = platform_time.monotonicNs();
+    const deadline_ns = start_ns + 60 * std.time.ns_per_ms;
     const result = try (try metadata.catalogSource().routingSource()).waitForChange(
         .{ .metadata_group_id = group_ids.main_metadata_group_id, .revision = 9 },
-        start_ns + 60 * std.time.ns_per_ms,
+        deadline_ns,
         2 * std.time.ns_per_ms,
     );
-    try std.testing.expectEqual(
-        antfly.public_api.table_catalog.CatalogChangeWaitResult.authoritative_absence,
-        result,
-    );
+    const end_ns = platform_time.monotonicNs();
+    switch (result) {
+        .authoritative_absence => {},
+        // Scheduler delays can exhaust the confirmation budget. In that case
+        // the deadline-aware mutex correctly refuses the final read and the
+        // watch must retry instead of claiming authoritative absence.
+        .retry => try std.testing.expect(end_ns >= deadline_ns),
+        .changed => return error.TestUnexpectedResult,
+    }
     // The old one-probe implementation returned in roughly 2 ms. Keep a
-    // generous lower bound so scheduler jitter can only make the test safer.
-    try std.testing.expect(platform_time.monotonicNs() -| start_ns >= 30 * std.time.ns_per_ms);
+    // generous lower bound that still rejects premature absence or retry.
+    try std.testing.expect(end_ns -| start_ns >= 30 * std.time.ns_per_ms);
 }
 
 test "standalone metadata rejects corrupt catalog without double-freeing owned paths" {
