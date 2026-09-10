@@ -7185,6 +7185,8 @@ pub fn build(b: *std.Build) void {
             "derived coverage embedding activity aggregation is order independent and phase authoritative",
             "derived coverage ready full text status reports complete progress",
             "readiness observation completion requires convergence and full topology",
+            "late source target notification cannot revoke an already observed target",
+            "late source notification cannot reuse an observation from before a catalog fence",
             "readiness evaluation cannot complete while convergence work remains",
             "readiness completion fences include every observation dimension",
             "chunked dense completion follows the physical publication target",

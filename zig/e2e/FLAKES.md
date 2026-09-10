@@ -9,6 +9,7 @@ entries so later failures can be compared with the original signature.
 
 | Test | CI evidence | Fix commit | Status |
 | --- | --- | --- | --- |
+| Same CLI pipeline, completion regresses between `index get` and `index list` | [PR #696, run 34428885099, job 102726530711](https://github.com/antflydb/antfly/actions/runs/34428885099/job/102726530711?pr=696) | PR #694 | Reproduced with the original Linux CI executable; delayed source callbacks now recognize completed observations within the same catalog epoch. See below. |
 | Same three-by-three backup test, seed batch `409 write outcome unknown` | [PR #694, run 34423487352, job 102714559943](https://github.com/antflydb/antfly/actions/runs/34423487352/job/102714559943) | This change | Reproduced control-executor exhaustion; forwarding moved to outbound Raft executor. Fixed-runtime soak: 59/60 passed, no seed 409; one earlier table-create timeout remains open below. |
 | `test_index_lifecycle.py::test_serverless_named_embedding_indexes_report_publication_actions` | [PR #692, run 34420585088, job 102704104941](https://github.com/antflydb/antfly/actions/runs/34420585088/job/102704104941?pr=692) | This change | Filesystem GET keeps metadata and payload on one open descriptor across atomic publication; see [deterministic reproduction and validation](../FLAKES.md#serverless-build-status-preconditionfailed-during-publication-692). |
 | `test_resolution.py::test_multinode_autograph_resolves_promotes_and_hydrates_entities` | [PR #690, run 34395199129, job 102623777993](https://github.com/antflydb/antfly/actions/runs/34395199129/job/102623777993?pr=690) | This change | Resolver work moved out of refresh; per-group Raft apply deferral preserves healthy progress; see [runtime investigation and validation](../FLAKES.md#autograph-second-document-write-timeout-690). |
@@ -19,6 +20,22 @@ entries so later failures can be compared with the original signature.
 | Same three-by-three backup test, initial table create | [PR #664, run 34263167199, job 102199089027](https://github.com/antflydb/antfly/actions/runs/34263167199/job/102199089027?pr=664), merge `d6108b73b85a8e77dfcb740d5518279b2a51d826` | This change | Read waiter clock and pre-admission handling fixed; 100/100 Debug soak runs passed. |
 | `test_quickstart.py::test_public_quickstart_query_string_boolean_controls` | [PR #657, run 34296218257, job 102299245250](https://github.com/antflydb/antfly/actions/runs/34296218257/job/102299245250?pr=657), head `292e5ec9c` | This change | Deterministic fixture mismatch reproduced 9/9; fresh stateful restart fixture passed 30/30 final soak runs. |
 | `test_standby.py::test_standby_streams_public_writes_restarts_and_rejects_writes` | Same #657 job | This change | Live replication startup wait passed 30/30 ordinary and 30/30 delayed-fetch runs. Delayed first fetch reproduces the pending-durability 503 without the wait; original CI delay was not observed locally. |
+
+### Completed CLI readiness regresses after publication (#696)
+
+The CI job reported 397 passed, five skipped, and two failures: this CLI
+readiness regression and the backup seed 409 described below. The CLI test
+had already observed complete readiness through `index get`, then found
+`observation_complete=false` through `index list` without another source
+mutation. Revision and coverage counts remained intact. The
+[runtime entry](../FLAKES.md#completed-cli-index-readiness-regresses-after-a-delayed-notification-696-694)
+records the callback ordering, epoch-qualified fix, and deterministic tests.
+
+Linux validation uses the original CI artifact from head `5c54729b6` as the
+baseline and PR #694 with main merged as the fixed source. The repository's
+`scripts/ci/zig-e2e-regression-loop.sh` runs both failing node IDs with three
+workers and ten repetitions per worker, pinned to eight CPUs on a disposable
+runner with a fresh filesystem. The baseline reproduces both CI signatures.
 
 ### Three-by-three backup seed batch: unknown outcome (#694)
 

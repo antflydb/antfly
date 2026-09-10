@@ -4,6 +4,38 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## Completed CLI index readiness regresses after a delayed notification (#696, #694)
+
+[PR #696, run 34428885099, job 102726530711](https://github.com/antflydb/antfly/actions/runs/34428885099/job/102726530711?pr=696)
+failed `test_cli_inline_create_load_wait_query_image_and_rag_pipeline` after
+`index get` reported complete readiness. A subsequent `index list` retained
+the thumbnail index's target/published revision 6 and all three coverage
+outcomes, but regressed `source_coverage.observation_complete` to false.
+The same job also failed the backup seed batch with HTTP 409, the forwarding
+failure described below. The serverless filesystem GET regression did not
+recur, and the Autograph case passed.
+
+The runtime owner can sample an accepted source target before that write's
+deferred publication callback reaches the status cache. The cache previously
+deduplicated callbacks only against earlier notifications. With no notification
+watermark yet, even an already-observed revision minted a new observation
+fence and revoked completion. A deterministic cache regression reproduces
+this ordering without sleeps: publish complete target 6, deliver notifications
+for 6 and 5, and inspect both list and detail snapshots.
+
+The cache now also recognizes a completed observation of the notified source
+revision in the current table epoch. Each accepted group publication records
+its cache epoch; a retained snapshot from before a catalog fence cannot
+acknowledge a notification in the new epoch. Newer source revisions,
+unsequenced structural invalidations, and owner retirement still fence
+completion. A separate regression checks the same revision across a catalog
+fence. No readiness assertions or production deadlines were relaxed.
+
+The ordering regression fails before the fix. With the fix, all 173
+`antfly-api-derived-coverage-test` tests pass on macOS ARM64 without leaks.
+Linux reproduction and soak results are recorded in the
+[E2E history](e2e/FLAKES.md#completed-cli-readiness-regresses-after-publication-696).
+
 ## Standalone routing watch deadline (#689, #694)
 
 [PR #689, run 34418061842, job 102687782332](https://github.com/antflydb/antfly/actions/runs/34418061842/job/102687782332)
