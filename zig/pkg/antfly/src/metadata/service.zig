@@ -4112,7 +4112,7 @@ pub const MetadataService = struct {
             self.lockRuntime();
             {
                 defer self.unlockRuntime();
-                try self.raft.runRaftRoundOnly();
+                try self.raft.runRaftProgressOnly();
             }
             if (self.linearizable_read_tracker.isComplete(request_id)) return;
             try request.ensureActive();
@@ -4967,7 +4967,7 @@ pub const MetadataService = struct {
                 defer self.unlockRuntime();
                 if (!self.raft.host.host.isLocalLeader(self.metadata_group_id))
                     return error.NotLeader;
-                try self.raft.runRaftRoundOnly();
+                try self.raft.runRaftProgressOnly();
             }
             platform_clock.Clock.real().sleepMs(1);
         }
@@ -5057,7 +5057,7 @@ pub const MetadataService = struct {
                 defer self.unlockRuntime();
                 if (!self.raft.host.host.isLocalLeader(self.metadata_group_id))
                     return error.NotLeader;
-                try self.raft.runRaftRoundOnly();
+                try self.raft.runRaftProgressOnly();
             }
             platform_clock.Clock.real().sleepMs(1);
         }
@@ -5133,7 +5133,7 @@ pub const MetadataService = struct {
                 defer self.unlockRuntime();
                 if (!self.raft.host.host.isLocalLeader(self.metadata_group_id))
                     return error.NotLeader;
-                try self.raft.runRaftRoundOnly();
+                try self.raft.runRaftProgressOnly();
             }
             platform_clock.Clock.real().sleepMs(1);
         }
@@ -5299,7 +5299,7 @@ pub const MetadataService = struct {
         self.lockRuntime();
         {
             defer self.unlockRuntime();
-            try self.raft.runRaftRoundOnly();
+            try self.raft.runRaftProgressOnly();
         }
         if (!try self.ensureMetadataIncarnation()) return;
         if (!self.observe_local_replica_root) return;
@@ -5374,7 +5374,7 @@ pub const MetadataService = struct {
         var rounds: usize = 0;
         while (rounds < 32) : (rounds += 1) {
             if (try self.reconcileOnceIfLeaseHeld(loop)) |summary| return summary;
-            try self.runRound();
+            try self.runRaftProgressOnly();
         }
         return error.ReconcileLeaseNotHeld;
     }
@@ -5397,7 +5397,7 @@ pub const MetadataService = struct {
             try request.ensureActive();
             if (try self.ensureReconcileLease()) return;
             try request.ensureActive();
-            try self.runRound();
+            try self.runRaftProgressOnly();
         }
         try request.ensureActive();
         return error.ReconcileLeaseNotHeld;
@@ -5411,7 +5411,7 @@ pub const MetadataService = struct {
         var rounds: usize = 0;
         while (rounds < 32) : (rounds += 1) {
             if (try self.reconcilePreparedIfLeaseHeld(loop)) |summary| return summary;
-            try self.runRound();
+            try self.runRaftProgressOnly();
         }
         return error.ReconcileLeaseNotHeld;
     }
@@ -7631,9 +7631,9 @@ pub const MetadataHttpService = struct {
                     self.metadata_group_id,
                 )) return error.NotLeader;
                 if (self.raft.pending_updates.items.len > 0) {
-                    _ = try self.raft.syncPendingRaftOnly();
+                    _ = try self.raft.syncPendingRaftProgressOnly();
                 } else {
-                    try self.raft.runRaftRoundOnly();
+                    try self.raft.runRaftProgressOnly();
                 }
             }
             platform_clock.Clock.real().sleepMs(1);
@@ -7725,9 +7725,9 @@ pub const MetadataHttpService = struct {
                 if (!self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id))
                     return error.NotLeader;
                 if (self.raft.pending_updates.items.len > 0) {
-                    _ = try self.raft.syncPendingRaftOnly();
+                    _ = try self.raft.syncPendingRaftProgressOnly();
                 } else {
-                    try self.raft.runRaftRoundOnly();
+                    try self.raft.runRaftProgressOnly();
                 }
             }
             platform_clock.Clock.real().sleepMs(1);
@@ -7806,9 +7806,9 @@ pub const MetadataHttpService = struct {
                     self.metadata_group_id,
                 )) return error.NotLeader;
                 if (self.raft.pending_updates.items.len > 0) {
-                    _ = try self.raft.syncPendingRaftOnly();
+                    _ = try self.raft.syncPendingRaftProgressOnly();
                 } else {
-                    try self.raft.runRaftRoundOnly();
+                    try self.raft.runRaftProgressOnly();
                 }
             }
             platform_clock.Clock.real().sleepMs(1);
@@ -8466,9 +8466,9 @@ pub const MetadataHttpService = struct {
         {
             defer self.unlockRuntime();
             if (self.raft.pending_updates.items.len > 0) {
-                _ = try self.raft.syncPendingRaftOnly();
+                _ = try self.raft.syncPendingRaftProgressOnly();
             } else {
-                try self.raft.runRaftRoundOnly();
+                try self.raft.runRaftProgressOnly();
             }
         }
         if (!try self.ensureMetadataIncarnation()) {
@@ -8552,7 +8552,7 @@ pub const MetadataHttpService = struct {
         var rounds: usize = 0;
         while (rounds < 32) : (rounds += 1) {
             if (try self.reconcileOnceIfLeaseHeld(loop)) |summary| return summary;
-            try self.runRound();
+            try self.runRaftProgressOnly();
         }
         return error.ReconcileLeaseNotHeld;
     }
@@ -8570,7 +8570,7 @@ pub const MetadataHttpService = struct {
             try request.ensureActive();
             if (try self.ensureReconcileLease()) return;
             try request.ensureActive();
-            try self.runRound();
+            try self.runRaftProgressOnly();
         }
         try request.ensureActive();
         return error.ReconcileLeaseNotHeld;
@@ -8583,7 +8583,7 @@ pub const MetadataHttpService = struct {
         var rounds: usize = 0;
         while (rounds < 32) : (rounds += 1) {
             if (try self.reconcilePreparedIfLeaseHeld(loop)) |summary| return summary;
-            try self.runRound();
+            try self.runRaftProgressOnly();
         }
         return error.ReconcileLeaseNotHeld;
     }
@@ -8641,7 +8641,7 @@ pub const MetadataHttpService = struct {
     pub fn syncPending(self: *MetadataHttpService) !raft_managed_host.ManagedSyncResult {
         self.lockRuntime();
         defer self.unlockRuntime();
-        return try self.raft.syncPendingRaftOnly();
+        return try self.raft.syncPendingRaftProgressOnly();
     }
 
     pub fn metrics(self: *MetadataHttpService) raft_service.ManagedServiceMetrics {
@@ -11517,14 +11517,14 @@ fn advanceCdcLeaseRaft(service: anytype) !void {
     if (Service == MetadataService) {
         if (!service.raft.host.host.isLocalLeader(service.metadata_group_id))
             return error.CdcWorkLeaseLost;
-        try service.raft.runRaftRoundOnly();
+        try service.raft.runRaftProgressOnly();
     } else {
         if (!service.raft.host.http_host.host.isLocalLeader(service.metadata_group_id))
             return error.CdcWorkLeaseLost;
         if (service.raft.pending_updates.items.len > 0) {
-            _ = try service.raft.syncPendingRaftOnly();
+            _ = try service.raft.syncPendingRaftProgressOnly();
         } else {
-            try service.raft.runRaftRoundOnly();
+            try service.raft.runRaftProgressOnly();
         }
     }
 }
@@ -18863,6 +18863,25 @@ test "metadata http service linearizable reads leave elections to the cadence dr
     try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
     try std.testing.expect(svc.raft.host.http_host.host.isLocalLeader(2910));
     try std.testing.expect(svc.metrics().read_index_requests > 0);
+
+    // Mutation and lifecycle waiters share the same cadence contract. A
+    // single-node quorum can apply accepted work without an election tick.
+    try svc.raft.submit(.{ .replica_intent = .{ .upsert = .{
+        .record = .{ .group_id = 2910, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .empty },
+        .peer_node_ids = &.{1},
+    } } });
+    _ = try svc.syncPending();
+    try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
+    try svc.ensureCatalogWorkflowLease();
+    try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
+    try svc.upsertTable(.{ .table_id = 99, .name = "cadence_contract" });
+    try svc.runRaftProgressOnly();
+    try svc.removeTable(99);
+    try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
+    try advanceCdcLeaseRaft(&svc);
+    try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
+    try svc.runLifecycleRound();
+    try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
 }
 
 test "metadata http projected clone helpers clean up on allocation failure" {

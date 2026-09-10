@@ -75,9 +75,7 @@ def native_stack_dumps(
             partial = exc.stdout or b""
             if isinstance(partial, bytes):
                 partial = partial.decode(errors="replace")
-            parts.append(
-                f"[{label} pid {proc.pid}] gdb timed out\n{partial[-250000:]}"
-            )
+            parts.append(f"[{label} pid {proc.pid}] gdb timed out\n{partial[-250000:]}")
         except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
             parts.append(f"[{label} pid {proc.pid}] gdb failed: {exc!r}")
     return "\n".join(parts)

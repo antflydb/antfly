@@ -4,6 +4,28 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## Metadata request waiters advance election time outside the cadence driver (#694)
+
+The 60-case diagnostic backup run on `00dd1e4aef` recorded 6,665 metadata
+Raft ticks (666.5 seconds of virtual time) during a short-lived fixture. Ready
+messages grew past the 1 GiB hard ceiling and quarantined the metadata group.
+Mutation, lifecycle, and CDC lease waiters still called tick-bearing Raft rounds
+at their 1 ms polling interval; the dedicated 100 ms cadence driver was therefore
+not the sole clock owner. These waits now drain pending/inbound/Ready work using
+the existing progress-only API. Explicit cadence and combined driver entry
+points retain their ticks. Lease-acquisition helpers no longer execute unrelated
+control rounds while waiting for their own proposal.
+
+The HTTP regression covers pending replica synchronization, lease acquisition,
+table deletion, CDC lease progress, and lifecycle progress after an explicit
+single-node election. Each helper must make progress without moving virtual
+Raft time. The old sync path failed with expected 2000 ms, observed 2100 ms
+(`/private/tmp/ci694-cadence-before.log`). All 80 metadata service checks pass
+without skips or leaks (`/private/tmp/ci694-cadence-fixed-final.log`). The outbound
+ceiling remains unchanged;
+Linux soak validation is still required before attributing every remaining
+consensus failure to this defect.
+
 ## Cold repair completion evicts its newly resident writer (#694)
 
 The `00dd1e4aef` Linux mixed soak passed 294/300; quickstart failed once

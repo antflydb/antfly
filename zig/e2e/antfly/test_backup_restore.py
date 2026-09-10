@@ -711,11 +711,13 @@ class ThreeByThreeBackupCluster:
             command = self._metadata_command(i + 1)
             proc = self.port_reservations.handoff_to(
                 (self.metadata_raft_ports[i], self.metadata_admin_ports[i]),
-                lambda command=command, log_file=self.metadata_log_files[i]: subprocess.Popen(
-                    debuggable_command(command),
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
-                    cwd=REPO_ROOT,
+                lambda command=command, log_file=self.metadata_log_files[i]: (
+                    subprocess.Popen(
+                        debuggable_command(command),
+                        stdout=log_file,
+                        stderr=subprocess.STDOUT,
+                        cwd=REPO_ROOT,
+                    )
                 ),
             )
             self.metadata_procs.append(proc)
@@ -1617,9 +1619,7 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
     )
 
     assert backup["backup_id"] == backup_id
-    assert backup["status"] == "completed", (
-        f"backup={backup}\n{cluster.debug_logs()}"
-    )
+    assert backup["status"] == "completed", f"backup={backup}\n{cluster.debug_logs()}"
     assert [table["name"] for table in backup["tables"]] == [table_name]
     table_manifests = [
         path
@@ -1714,9 +1714,7 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
         ]
         for api_url in candidate_urls:
             try:
-                response = session.get(
-                    f"{api_url}/restore/jobs/{job_id}", timeout=1
-                )
+                response = session.get(f"{api_url}/restore/jobs/{job_id}", timeout=1)
             except requests.RequestException:
                 continue
             if response.status_code == 503:
