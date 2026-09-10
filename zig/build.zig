@@ -3565,7 +3565,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_managed_embedder_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "managed embedder", "antfly numeric", "antfly provider preserves explicit distributed admission denial", "legacy numeric" },
+        .filters = &.{ "managed embedder", "antfly embed request", "antfly embed round trip", "antfly sparse embed round trip", "antfly numeric", "antfly provider preserves explicit distributed admission denial", "legacy numeric" },
     });
     const run_lib_managed_embedder_tests = addFilteredTestRunArtifact(b, lib_managed_embedder_tests);
     const lib_managed_embedder_test_step = b.step("antfly-inference-managed-embedder-test", "Run managed embedder contract and provider tests");
@@ -3921,6 +3921,9 @@ pub fn build(b: *std.Build) void {
         "attachment transport separates wire and peak resident representations",
         "bounded invocation allocator",
         "inline data URI parser validates canonical metadata",
+        "antfly embed request",
+        "antfly embed round trip",
+        "antfly sparse embed round trip",
         "antfly embed parts uses the framed attachment transport",
         "antfly embed parts request sizing is exact for escaped strings",
         "antfly dense JSON response cleanup is allocation-failure safe",
