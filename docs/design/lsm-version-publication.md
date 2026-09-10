@@ -72,11 +72,38 @@ or replaces the background slot. Changing policy retires only that lane's old
 job through the sliced cleanup queue; no slot is replaced while planning is
 off-lock. Both slots participate in memory accounting and shutdown cleanup.
 
-Background maintenance alternates between queued slots, including L0 jobs whose
-request has returned. Synchronous compaction drains those same continuations.
+Background maintenance alternates between background discovery/service and L0
+service, including jobs whose request has returned. An empty background slot
+does not forfeit its discovery turn to a continuously replenished L0 slot.
+An empty discovery turn records scheduling progress so no-op-sensitive workers
+still reach the pending L0 job's next quantum. Synchronous compaction drains
+those same continuations.
 This preserves background progress without indefinitely pinning an abandoned
 foreground epoch. Both lanes retain the existing per-slice work/time bounds;
 they do not introduce parallel builders or an unbounded per-request job queue.
+
+Continuation admission is independent of unrelated run count. A fixed header
+and seed reservation covers the owner; a stable, callback-free budgeted
+allocator charges arena growth before allocation. Scratch remains charged
+through sliced retirement, independently of the selected plan's lifetime.
+Emitted handles and ranks acquire their own exact-size reservation, transferred
+with the arrays to the selected plan. Oversized retries drain the superseded
+arena before admitting replacement seeds, so progress does not require two
+attempts to fit at once. Growth denial is reported as resource admission failure
+and all partial ownership remains reclaimable on error or close.
+
+The ReleaseFast admission regression held two 5,001-input discoveries under a
+4 MiB builder cap. Peak planning reservation was **1,187,312 bytes** at both
+10,000 and 100,000 total runs; total preparation took 3.78 ms and 5.08 ms,
+respectively. Both completed discoveries are held before transfer to make the
+peak independent of retirement timing; the manager's peak also includes
+transient fast-path reservations. The old whole-table reservations alone
+would request about 49 MiB for two lanes at 100,000 runs. These are metadata-only
+measurements, not SST I/O or end-to-end throughput results. Reproduce with:
+
+```sh
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'compaction scratch admission' --test-filter 'compaction discovery receives'
+```
 
 Before acquiring an execution grant, admission checks the current caller's
 source-level and byte restrictions using the input-byte total already computed

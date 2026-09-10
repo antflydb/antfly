@@ -19,6 +19,7 @@ const std = @import("std");
 const Directory = @import("run_directory.zig").Directory;
 const Run = @import("repository.zig").Run;
 const state = @import("state.zig");
+const resource_manager = @import("../resource_manager.zig");
 
 pub const Job = struct {
     const Node = struct {
@@ -49,6 +50,11 @@ pub const Job = struct {
     source_len: usize = 0,
     handles: ?[]Directory.Handle = null,
     indices: ?[]usize = null,
+    // Discovery scratch may use an independently owned budgeted arena. The
+    // emitted arrays use the caller's allocator and carry their own credit
+    // when ownership moves out of this job.
+    output_manager: ?*resource_manager.ResourceManager = null,
+    output_reservation: ?resource_manager.Reservation = null,
     projection_cursor: ?Directory.Cursor = null,
     visits: usize = 0,
 
@@ -93,6 +99,8 @@ pub const Job = struct {
         }
         if (self.indices) |indices| allocator.free(indices);
         self.indices = null;
+        if (self.output_reservation) |*lease| lease.release();
+        self.output_reservation = null;
         // Reclaim one arena allocation per credit using the arena's own
         // destructor, without depending on its private allocation header.
         for ([_]*@TypeOf(self.arena.state.used_list){ &self.arena.state.used_list, &self.arena.state.free_list }) |list| {
@@ -223,6 +231,10 @@ pub const Job = struct {
                     } else if (self.cursor.?.done()) {
                         self.cursor = null;
                         if (self.changed) continue;
+                        if (self.output_manager) |manager| self.output_reservation = try manager.reserve(
+                            .lsm_table_builder_working_set,
+                            self.count * (@sizeOf(Directory.Handle) + @sizeOf(usize)),
+                        );
                         self.handles = try allocator.alloc(Directory.Handle, self.count);
                         self.indices = try allocator.alloc(usize, self.count);
                         // Dense selections can resolve positions with one

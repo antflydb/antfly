@@ -33,7 +33,12 @@ test "resumable closure bounds discovery and emission and cleans up every alloca
         pub fn retainRunSnapshotRef(_: *@This(), _: *Run) !void {}
         pub fn releaseRunSnapshotRef(_: *@This(), _: *Run) void {}
         fn check(allocator: std.mem.Allocator, directory: *const Directory) !void {
-            var job = try ClosureJob.init(allocator, directory, &.{directory.at(0)}, 0, false);
+            var manager = resource_manager_mod.ResourceManager.init(.{});
+            defer std.debug.assert(manager.sliceStats(.lsm_table_builder_working_set).used_bytes == 0);
+            var scratch = resource_manager_mod.BudgetedAllocator.init(&manager, .lsm_table_builder_working_set, allocator, 1);
+            defer scratch.deinit();
+            var job = try ClosureJob.init(scratch.allocator(), directory, &.{directory.at(0)}, 0, false);
+            job.output_manager = &manager;
             defer job.deinit(allocator);
             try std.testing.expect(!try job.step(allocator, 0));
             try std.testing.expect(!try job.stepUntil(allocator, 7, 0));
@@ -362,7 +367,7 @@ test "compaction policy lanes isolate budgets retain progress and drain abandone
     try std.testing.expect(try selectDomainPlan(&backend, 0, true, 0, false, &stats) == null);
     var drained = false;
     for (0..1000) |_| {
-        if (try selectDomainPlan(&backend, 0, false, 0, false, &stats)) |result| {
+        if (try selectDomainPlan(&backend, 1, false, 0, false, &stats)) |result| {
             result.release(&backend);
             drained = true;
             break;
@@ -382,7 +387,7 @@ test "compaction policy lanes isolate budgets retain progress and drain abandone
     try std.testing.expectEqual(@as(usize, 0), backend.compaction_stats.compactions);
     // Synchronous callers also drain the other lane across all of its slices.
     try std.testing.expect(try selectDomainPlan(&backend, 0, true, 0, false, &stats) == null);
-    selected = (try selectDomainPlanSynchronous(&backend, 0, false, 0, false, &stats)).?;
+    selected = (try selectDomainPlanSynchronous(&backend, 1, false, 0, false, &stats)).?;
     selected.release(&backend);
     try std.testing.expect(backend.pending_l0_directory_closure == null);
     // Leave both lanes queued: close must reclaim both, including reservations.
@@ -394,6 +399,145 @@ fn closureSlot(backend: anytype, l0_only: bool) *?*PendingDirectoryClosure {
     return if (l0_only) &backend.pending_l0_directory_closure else &backend.pending_directory_closure;
 }
 
+fn populateClosureDirectoryForTest(backend: anytype, count: usize) !void {
+    std.debug.assert(@import("builtin").is_test and count > 5000);
+    for (0..count) |i| {
+        const lower = try backend.allocator.alloc(u8, 8);
+        errdefer backend.allocator.free(lower);
+        const upper = try backend.allocator.alloc(u8, 8);
+        errdefer backend.allocator.free(upper);
+        std.mem.writeInt(u64, lower[0..8], if (i == 0) 0 else i - 1, .big);
+        std.mem.writeInt(u64, upper[0..8], if (i == 0) 4999 else i - 1, .big);
+        try backend.runs.append(backend.allocator, .{
+            .id = i + 1,
+            .level = if (i == 0) 0 else 1,
+            .size_bytes = 1024,
+            .path = null,
+            .smallest_namespace_name = null,
+            .smallest_key = lower,
+            .largest_namespace_name = null,
+            .largest_key = upper,
+            .entry_count = 1,
+            .bloom_filter = null,
+            .state = .{},
+        });
+    }
+    _ = try backend.planningDirectory();
+}
+
+test "compaction discovery receives turns under replenished foreground continuations" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    var backend = Backend.init(std.testing.allocator, .{ .level_target_runs_base = 4999, .level_target_bytes_base = 0 });
+    defer backend.close();
+    try populateClosureDirectoryForTest(&backend, 5001);
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    defer runtime_mod.unlockBackend(Backend, &backend, locked);
+    var stats: CompactionSelectionStats = .{};
+    for (0..8) |_| {
+        try std.testing.expect(try selectDomainPlan(&backend, 0, true, 0, false, &stats) == null);
+        const foreground = backend.pending_l0_directory_closure.?;
+        const visits = foreground.job.visits;
+        // No background job is queued. Its discovery turn must nevertheless
+        // select the pressured L1, without consuming the foreground cursor.
+        const selected = (try selectDomainPlan(&backend, 1, false, 0, false, &stats)).?;
+        try std.testing.expectEqual(@as(u32, 1), selected.plan.source_level);
+        try std.testing.expectEqual(visits, foreground.job.visits);
+        selected.release(&backend);
+        try std.testing.expect(backend.pending_directory_closure == null);
+        try std.testing.expect(try selectDomainPlan(&backend, 1, false, 0, false, &stats) == null);
+        try std.testing.expect(foreground.job.visits > visits);
+        // Replenish on the next turn, as concurrent foreground arrivals can.
+        backend.pending_l0_directory_closure = null;
+        backend.retireClosurePlanning(foreground);
+    }
+    backend.options.level_target_runs_base = 1000000;
+    try std.testing.expect(try selectDomainPlan(&backend, 0, true, 0, false, &stats) == null);
+    const slices = backend.directory_planning_slices;
+    try std.testing.expect(try selectDomainPlan(&backend, 1, false, 0, false, &stats) == null);
+    try std.testing.expectEqual(slices + 1, backend.directory_planning_slices);
+    try std.testing.expect(try selectDomainPlan(&backend, 1, false, 0, false, &stats) == null);
+    try std.testing.expect(backend.pending_l0_directory_closure.?.job.visits > 0);
+}
+
+test "compaction scratch admission scales with selected inputs not unrelated runs" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const counts = if (@import("builtin").mode == .ReleaseFast) [_]usize{ 10000, 100000 } else [_]usize{ 12000, 24000 };
+    var peaks: [2]u64 = undefined;
+    for (counts, &peaks) |count, *peak| {
+        var budgets = resource_manager_mod.Options.defaultBudgets();
+        budgets[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = 4 * 1024 * 1024 };
+        var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+        defer std.debug.assert(manager.sliceStats(.lsm_table_builder_working_set).used_bytes == 0);
+        var backend = Backend.init(std.testing.allocator, .{ .level_target_runs_base = 1000000, .level_target_bytes_base = 0 });
+        defer backend.close();
+        try populateClosureDirectoryForTest(&backend, count);
+        backend.options.resource_manager = &manager;
+        const locked = runtime_mod.lockBackend(Backend, &backend);
+        defer runtime_mod.unlockBackend(Backend, &backend, locked);
+        var stats: CompactionSelectionStats = .{};
+        const started = @import("antfly_platform").time.monotonicNs();
+        try std.testing.expect(try selectDomainPlan(&backend, 0, false, 0, false, &stats) == null);
+        try std.testing.expect(try selectDomainPlan(&backend, 0, true, 0, false, &stats) == null);
+        for (0..1000) |_| {
+            var done = true;
+            for ([_]bool{ false, true }) |l0_only| {
+                const pending = closureSlot(&backend, l0_only).*.?;
+                if (!try pending.step(backend.allocator, std.math.maxInt(u64))) done = false;
+            }
+            if (done) break;
+        }
+        // Hold both completed discoveries before transfer so the peak is
+        // independent of timing-dependent retirement interleavings.
+        for ([_]bool{ false, true }) |l0_only| {
+            const slot = closureSlot(&backend, l0_only);
+            try std.testing.expect(slot.*.?.job.phase == .done);
+            const result = (try resumeDirectoryClosure(&backend, slot)).?;
+            try std.testing.expectEqual(@as(usize, 5001), result.plan.source_len + result.plan.target_len);
+            result.release(&backend);
+        }
+        try std.testing.expect(backend.pending_directory_closure == null and backend.pending_l0_directory_closure == null);
+        // Include transient fast-path reservations, not just memory sampled
+        // at continuation boundaries.
+        peak.* = manager.sliceStats(.lsm_table_builder_working_set).peak_bytes;
+        try std.testing.expect(peak.* < 2 * 1024 * 1024);
+        if (@import("builtin").mode == .ReleaseFast) std.debug.print("\nLSM admitted closure runs={d} selected=5001 lanes=2 peak_bytes={d} elapsed_ns={d}\n", .{ count, peak.*, @import("antfly_platform").time.monotonicNs() - started });
+
+        // Oversized discovery retires its arena before admitting the smaller
+        // seed window, rather than retaining two attempts against the cap.
+        const directory = try backend.planningDirectory();
+        backend.pending_directory_closure = try PendingDirectoryClosure.create(&backend, &.{ directory.at(1), directory.at(2) }, 1500, false, 0, .{ .l0_limit = 0, .l0_only = false, .max_bytes = 1500, .allow_oversized = false });
+        try std.testing.expect(try resumeDirectoryClosure(&backend, &backend.pending_directory_closure) == null);
+        try std.testing.expectEqual(@as(?u64, 1500), backend.pending_directory_closure.?.restart_limit);
+        try std.testing.expect(try resumeDirectoryClosure(&backend, &backend.pending_directory_closure) == null);
+        try std.testing.expect(backend.pending_directory_closure.?.restart_limit == null);
+        try std.testing.expectEqual(@as(usize, 1), backend.pending_directory_closure.?.job.count);
+        const retried = (try resumeDirectoryClosure(&backend, &backend.pending_directory_closure)).?;
+        retried.release(&backend);
+
+        // Denial during arena growth must remain an admission error and leave
+        // all partially discovered scratch owned by sliced retirement/close.
+        try std.testing.expect(try selectDomainPlan(&backend, 0, false, 0, false, &stats) == null);
+        const remaining = 4 * 1024 * 1024 - manager.sliceStats(.lsm_table_builder_working_set).used_bytes;
+        var blocker = try manager.reserve(.lsm_table_builder_working_set, remaining);
+        defer blocker.release();
+        var denied = false;
+        for (0..1000) |_| {
+            const selected = resumeDirectoryClosure(&backend, &backend.pending_directory_closure) catch |err| {
+                try std.testing.expectEqual(error.ResourceBudgetExceeded, err);
+                denied = true;
+                break;
+            };
+            if (selected) |result| result.release(&backend);
+            if (backend.pending_directory_closure == null) break;
+        }
+        try std.testing.expect(denied);
+        try std.testing.expect(backend.pending_directory_closure == null);
+    }
+    // Extra unrelated runs may alter tree height/traversal, but not discovery
+    // allocation: both inputs and both policy lanes are identical.
+    try std.testing.expectEqual(peaks[0], peaks[1]);
+}
+
 /// An exceptional broad ordinary closure belongs to maintenance, not to the
 /// stack of whichever request first noticed pressure. Keep its epoch and
 /// scratch reservation until the cursor completes or is discarded.
@@ -401,7 +545,7 @@ pub const PendingDirectoryClosure = struct {
     policy: PlanningPolicy,
     directory: *Directory,
     job: ClosureJob,
-    retired_job: ?ClosureJob = null,
+    restart_limit: ?u64 = null,
     retired_next: ?*@This() = null,
     seeds: []Directory.Handle,
     seed_len: usize,
@@ -409,6 +553,8 @@ pub const PendingDirectoryClosure = struct {
     allow_oversized: bool,
     overlap_threshold: usize,
     reservation: ?resource_manager_mod.Reservation = null,
+    // Stable address: the arena borrows this allocator through sliced cleanup.
+    scratch: ?resource_manager_mod.BudgetedAllocator = null,
     selected: ?SelectedPlan = null,
     validation: ?DependencyValidation = null,
 
@@ -417,7 +563,7 @@ pub const PendingDirectoryClosure = struct {
         var reservation: ?resource_manager_mod.Reservation = null;
         errdefer if (reservation) |*lease| lease.release();
         const current = try backend.planningDirectory();
-        if (backend.options.resource_manager) |manager| reservation = try manager.reserve(.lsm_table_builder_working_set, 64 * 1024 + current.count() * 256);
+        if (backend.options.resource_manager) |manager| reservation = try manager.reserve(.lsm_table_builder_working_set, @sizeOf(@This()) + @sizeOf(Directory) + seeds.len * @sizeOf(Directory.Handle));
         const directory = try current.fork(allocator);
         errdefer directory.destroy(allocator);
         const owned = try allocator.dupe(Directory.Handle, seeds);
@@ -427,15 +573,30 @@ pub const PendingDirectoryClosure = struct {
         self.* = .{
             .policy = policy,
             .directory = directory,
-            .job = try ClosureJob.init(allocator, directory, owned, max_bytes, false),
+            .job = undefined,
             .seeds = owned,
             .seed_len = owned.len,
             .max_bytes = max_bytes,
             .allow_oversized = allow_oversized,
             .overlap_threshold = overlap_threshold,
             .reservation = reservation,
+            .scratch = if (backend.options.resource_manager) |manager| .init(manager, .lsm_table_builder_working_set, allocator, 1) else null,
         };
+        errdefer if (self.scratch) |*scratch| scratch.deinit();
+        self.job = try self.initJob(allocator, max_bytes);
         return self;
+    }
+
+    fn initJob(self: *@This(), allocator: std.mem.Allocator, limit: u64) !ClosureJob {
+        const scratch_allocator = if (self.scratch) |*scratch| scratch.allocator() else allocator;
+        var job = ClosureJob.init(scratch_allocator, self.directory, self.seeds[0..self.seed_len], limit, false) catch |err| return self.allocationError(err);
+        job.output_manager = if (self.scratch) |*scratch| scratch.reservation.manager else null;
+        return job;
+    }
+
+    fn allocationError(self: *@This(), err: anyerror) anyerror {
+        if (err == error.OutOfMemory) if (self.scratch) |*scratch| if (scratch.denied()) return error.ResourceBudgetExceeded;
+        return err;
     }
 
     pub fn cleanupStep(self: *@This(), allocator: std.mem.Allocator, credits: *usize) bool {
@@ -444,29 +605,28 @@ pub const PendingDirectoryClosure = struct {
             if (!selected.deinitStep(allocator, credits)) return false;
             self.selected = null;
         }
-        if (self.retired_job) |*job| {
-            if (!job.deinitStep(allocator, credits)) return false;
-            self.retired_job = null;
-        }
         return self.job.deinitStep(allocator, credits);
     }
 
     fn step(self: *@This(), allocator: std.mem.Allocator, deadline: u64) !bool {
         var credits: usize = 2048;
-        if (self.retired_job) |*job| {
+        if (self.restart_limit) |limit| {
+            var done = false;
             while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
                 var quantum: usize = @min(credits, 64);
                 const before = quantum;
-                const done = job.deinitStep(allocator, &quantum);
+                done = self.job.deinitStep(allocator, &quantum);
                 credits -= before - quantum;
-                if (done) {
-                    self.retired_job = null;
-                    break;
-                }
+                if (done) break;
             }
-            if (self.retired_job != null) return false;
+            if (!done) return false;
+            // Release the superseded arena before admitting replacement
+            // seeds. A tight budget must not require both attempts to fit.
+            self.job = try self.initJob(allocator, limit);
+            self.restart_limit = null;
+            return false;
         }
-        return self.job.stepUntil(allocator, credits, deadline);
+        return self.job.stepUntil(allocator, credits, deadline) catch |err| return self.allocationError(err);
     }
 
     pub fn destroy(self: *@This(), backend: anytype) void {
@@ -476,6 +636,7 @@ pub const PendingDirectoryClosure = struct {
         if (self.validation) |*validation| validation.deinit(backend);
         backend.retireCheckpointDirectory(self.directory);
         allocator.free(self.seeds);
+        if (self.scratch) |*scratch| scratch.deinit();
         if (self.reservation) |*lease| lease.release();
         allocator.destroy(self);
     }
@@ -514,9 +675,7 @@ fn resumeDirectoryClosure(backend: anytype, slot: *?*PendingDirectoryClosure) !?
         }
         pending.seed_len = @max(@as(usize, 1), pending.seed_len / 2);
         const limit = if (pending.seed_len == 1 and pending.job.max_bytes != 0 and pending.allow_oversized) 0 else pending.max_bytes;
-        var replacement = try ClosureJob.init(backend.allocator, pending.directory, pending.seeds[0..pending.seed_len], limit, false);
-        std.mem.swap(ClosureJob, &replacement, &pending.job);
-        pending.retired_job = replacement;
+        pending.restart_limit = limit;
         return null;
     }
     if (pending.job.source_len < pending.overlap_threshold) {
@@ -538,8 +697,8 @@ fn resumeDirectoryClosure(backend: anytype, slot: *?*PendingDirectoryClosure) !?
     } };
     pending.job.handles = null;
     pending.job.indices = null;
-    selected.reservation = pending.reservation;
-    pending.reservation = null;
+    selected.reservation = pending.job.output_reservation;
+    pending.job.output_reservation = null;
     pending.selected = selected;
     return resumeClosureValidation(backend, pending, slot);
 }
@@ -1462,13 +1621,17 @@ fn selectDomainPlan(backend: anytype, l0_limit: usize, l0_only: bool, max_bytes:
             slot.* = null;
             backend.retireClosurePlanning(pending);
         };
-        // Background service alternates queued lanes. An abandoned foreground
-        // request must not retain a pinned epoch forever, and foreground calls
-        // must neither consume nor restart a background closure.
+        // Alternate service opportunities, not just occupied slots. Discovery
+        // of deeper-level work needs a turn even when only L0 has queued a job.
+        // Foreground calls never consume or restart a background closure.
         if (!l0_only and backend.pending_l0_directory_closure != null) {
-            const serve_l0 = slot.* == null or backend.closure_service_l0_next;
+            const serve_l0 = backend.closure_service_l0_next;
             backend.closure_service_l0_next = !serve_l0;
             if (serve_l0) return resumeDirectoryClosure(backend, &backend.pending_l0_directory_closure);
+            // Even an empty discovery turn advances the scheduling cursor.
+            // Report that progress so a no-op-sensitive worker does not park
+            // before giving the still-pending L0 job its next quantum.
+            backend.directory_planning_slices +|= 1;
         }
         if (slot.* != null) return resumeDirectoryClosure(backend, slot);
     }
