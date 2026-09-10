@@ -164,12 +164,20 @@ pub fn build(b: *std.Build) void {
         const artifact = artifacts.runtime.runtime_library_artifacts[@intFromEnum(unit)].?;
         var seen = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
         inspect(artifact.root_module, unit, artifacts.inference.build_info_object, &seen);
+        if (unit == .distributed) artifact.root_module.addImport("cache_lite_capabilities", b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/storage/lite/capabilities.zig"),
+            .target = artifact.root_module.resolved_target,
+            .optimize = artifact.root_module.optimize,
+            .imports = &.{.{ .name = "antfly_lite_options", .module = artifact.root_module.import_table.get("antfly_lite_options").? }},
+        }));
         const expression = if (unit == .api_kernel)
             "@import(\"antfly_hash\").Adler32.hash(\"cache probe\") ^ std.hash.Wyhash.hash(0, specs.ard) ^ std.hash.Wyhash.hash(0, specs.antfly) ^ " ++
                 "std.hash.Wyhash.hash(0, specs.metadata) ^ std.hash.Wyhash.hash(0, specs.extensions) ^ " ++
                 "std.hash.Wyhash.hash(0, specs.auth) ^ std.hash.Wyhash.hash(0, specs.inference_config)"
         else if (unit == .inference)
             "@import(\"antfly_hash\").Adler32.hash(\"cache probe\") ^ @sizeOf(@import(\"inference_server\").execution_control.Cancellation)"
+        else if (unit == .distributed)
+            "@import(\"antfly_hash\").Adler32.hash(\"cache probe\") ^ @intFromBool(@import(\"cache_lite_capabilities\").capabilitiesForProfile(.native).local_inference_runtime)"
         else
             "@import(\"antfly_hash\").Adler32.hash(\"cache probe\")";
         artifact.root_module.root_source_file = sources.add(b.fmt("{s}.zig", .{@tagName(unit)}), b.fmt(
@@ -270,6 +278,8 @@ fn inspect(module: *std.Build.Module, unit: runtime.RuntimeLibraryUnit, metadata
             std.debug.panic("{s} archive depends on simulation test support", .{@tagName(unit)});
         if (std.mem.eql(u8, name, "lmdb_engine"))
             std.debug.panic("{s} archive depends on disabled LMDB", .{@tagName(unit)});
+        if (unit != .distributed and std.mem.eql(u8, name, "antfly_lite_options"))
+            std.debug.panic("{s} archive depends on Lite capability settings", .{@tagName(unit)});
         if (unit != .api_kernel and (std.mem.eql(u8, name, "antfly_mcp") or std.mem.eql(u8, name, "antfly_a2a")))
             std.debug.panic("{s} archive depends on API protocol adapters", .{@tagName(unit)});
         if (unit == .serverless and std.mem.eql(u8, name, "raft_engine"))

@@ -184,9 +184,9 @@ pub fn create(b: *std.Build) ?Artifacts {
     if (platform_tests.process) |process| platform_test_step.dependOn(process);
 
     const lmdb_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, true);
-    const standalone_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, lite_local_inference_runtime, true);
-    const production_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, false);
+    const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, true);
+    const standalone_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, true);
+    const production_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, false);
     const lmdb_engine_mod = makeLmdbEngineModule(b, target, optimize, link_libc, lmdb_build_options);
     const raft_engine_mod = b.createModule(.{
         .root_source_file = b.path("lib/raft/src/root.zig"),
@@ -677,6 +677,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const antfly_imports = AntflyRootImports{
         .build_info = build_info,
         .build_options = build_options,
+        .lite_options = antfly_storage_build.createLiteOptions(b, lite_local_inference_runtime),
         .embedded_openapi = pkg_antfly_build_codegen.addEmbeddedSpecs(b, .{
             .root_source_file = b.path("pkg/antfly/src/openapi/embedded_specs.zig"),
             .schema_root = b.path("../specs/openapi"),
@@ -1287,7 +1288,6 @@ pub fn create(b: *std.Build) ?Artifacts {
         .lmdb_backend = lmdb_backend,
         .lmdb_evented_async_io = lmdb_evented_async_io,
         .with_tla = with_tla,
-        .lite_local_inference_runtime = lite_local_inference_runtime,
         .antfly_imports = antfly_imports,
         .antfly_mod = antfly_mod,
         .antfly_test_mod = antfly_test_mod,

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 import shutil
 import struct
@@ -408,6 +409,19 @@ class RuntimeCacheTest(unittest.TestCase):
                 source.write_bytes(contents)
                 self.assert_archives(self.build("cache-probe"))
 
+    def test_lite_capability_options(self):
+        baseline = self.build("cache-probe")
+        self.assert_archives(self.build("cache-probe"))
+        settings = ("-Dlite-local-inference-runtime=true",)
+        changed = self.build("cache-probe", settings=settings)
+        self.assert_archives(changed, rebuilt=("distributed",))
+        # The actual capability implementation must still report the new value.
+        self.assertNotEqual(self.probe(baseline), self.probe(changed))
+        self.assert_archives(self.build("cache-probe", settings=settings))
+        restored = self.build("cache-probe")
+        self.assert_archives(restored)
+        self.assertEqual(self.probe(baseline), self.probe(restored))
+
     def test_explicit_observability_dependencies(self):
         audio = self.own("zig/lib/audio/src/mod.zig")
         audio.write_bytes(
@@ -525,6 +539,63 @@ class RuntimeCacheTest(unittest.TestCase):
                 settings += ("-Dpdf-optimize=Debug",)
             self.build("--help", settings=settings)
 
+    def test_native_compute_benchmark_contracts(self):
+        names = ("paged-attention", "training")
+        targets = tuple(f"cache-antfly-inference-{name}-bench" for name in names)
+
+        def check(output, status):
+            for name in names:
+                self.assertRegex(
+                    output,
+                    rf"compile exe antfly-inference-{name}-bench Debug \S+ {status}",
+                )
+            self.assertIn("backend=native", output)
+            self.assertIn("optimizer_len=64", output)
+            self.assertIn("off graph_batch=2", output)
+            self.assertIn("checkpointed graph_batch=2", output)
+            for metric in ("prompt_paged_ms", "decode_paged_ms_total", "avg_loss"):
+                values = re.findall(rf"\b{metric}=([^\s]+)", output)
+                self.assertTrue(values, output)
+                self.assertTrue(all(math.isfinite(float(value)) for value in values))
+
+        for standalone in (False, True):
+            with self.subTest(standalone=standalone):
+                if standalone:
+                    self.use_standalone()
+                check(self.build(*targets), "success")
+                check(self.build(*targets), "cached")
+                # Server settings and unavailable accelerators must not enter
+                # these native-only workloads' compile or link dependencies.
+                for backend, settings in (
+                    ("metal", ()),
+                    ("cuda", ()),
+                    (None, ("-Dpjrt=true",)),
+                    (
+                        None,
+                        ("-Donnx=true", f"-Donnx-root={self.root / 'missing-onnx'}"),
+                    ),
+                ):
+                    check(
+                        self.build(*targets, backend=backend, settings=settings),
+                        "cached",
+                    )
+                check(self.build(*targets, version="unrelated-release"), "cached")
+                for backend, relative in (("metal", METAL), ("cuda", CUDA)):
+                    source = self.own(relative)
+                    contents = source.read_bytes()
+                    source.unlink()
+                    try:
+                        check(self.build(*targets, backend=backend), "cached")
+                    finally:
+                        source.write_bytes(contents)
+                # Real math changes still rebuild the actual benchmark bodies.
+                source = self.own("zig/lib/linalg/src/mod.zig")
+                source.write_bytes(
+                    source.read_bytes() + b"\n// native math dependency\n"
+                )
+                check(self.build(*targets), "success")
+                check(self.build(*targets), "cached")
+
     def test_tool_metadata_consumers(self):
         self.use_standalone()
         targets = ("cache-pilot", "cache-training-version")
@@ -559,6 +630,7 @@ class RuntimeCacheTest(unittest.TestCase):
         for settings in (
             (),
             ("-Doptimize=ReleaseFast",),
+            ("-Dlite-local-inference-runtime=true",),
             (
                 "-Dtarget=x86_64-linux-musl",
                 "-Doptimize=ReleaseFast",

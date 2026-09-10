@@ -16,23 +16,35 @@ const std = @import("std");
 const Context = @import("context.zig").Context;
 const runtime_build = @import("runtime.zig");
 
+/// These workloads execute NativeCompute with a CPU profile. Product accelerator
+/// and server settings do not configure their options, imports, or native links.
+fn createCpuComputeModule(ctx: Context, source: []const u8) *std.Build.Module {
+    const module = ctx.b.createModule(.{
+        .root_source_file = ctx.path(source),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "ml", .module = ctx.graph.ml_mod },
+            .{ .name = "antfly_platform", .module = ctx.graph.platform_mod },
+            .{ .name = "inference_linalg", .module = ctx.graph.inference_linalg_mod },
+        },
+    });
+    module.addOptions("build_options", runtime_build.addBuildOptions(ctx.b, .{
+        .enable_system_blas = ctx.backend.enable_system_blas,
+        .enable_native_quant_dispatch_stats = ctx.backend.enable_native_quant_dispatch_stats,
+    }));
+    if (ctx.backend.enable_system_blas)
+        runtime_build.configureSystemBlas(ctx.b, module, ctx.target, ctx.backend.blas_root);
+    return module;
+}
+
 pub fn addPagedAttention(ctx: Context) void {
     const b = ctx.b;
     const bench_exe = b.addExecutable(.{
         .name = "antfly-inference-paged-attention-bench",
-        .root_module = b.createModule(.{
-            .root_source_file = ctx.path("src/paged_attention_bench.zig"),
-            .target = ctx.target,
-            .optimize = ctx.optimize,
-        }),
+        .root_module = createCpuComputeModule(ctx, "src/paged_attention_bench.zig"),
     });
-    bench_exe.root_module.addImport("build_options", ctx.graph.build_options_mod);
-    bench_exe.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
-    if (ctx.backend.enable_system_blas) {
-        runtime_build.configureSystemBlas(b, bench_exe.root_module, ctx.target, ctx.backend.blas_root);
-    }
-    runtime_build.configureMetal(b, bench_exe.root_module, ctx.target, ctx.backend.enable_metal, ctx.paths);
-    bench_exe.root_module.link_libc = true;
 
     const run_bench = ctx.addRunArtifact(bench_exe);
     if (ctx.args) |args| {
@@ -46,11 +58,7 @@ pub fn addTrainingAndLinalg(ctx: Context) void {
     const b = ctx.b;
     const training_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-training-bench",
-        .root_module = b.createModule(.{
-            .root_source_file = ctx.path("src/bench/training_bench.zig"),
-            .target = ctx.target,
-            .optimize = ctx.optimize,
-        }),
+        .root_module = createCpuComputeModule(ctx, "src/training_bench.zig"),
     });
     const linalg_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-linalg-bench",
@@ -60,9 +68,6 @@ pub fn addTrainingAndLinalg(ctx: Context) void {
             .optimize = ctx.optimize,
         }),
     });
-    training_bench_exe.root_module.addImport("build_options", ctx.graph.build_options_mod);
-    training_bench_exe.root_module.addImport("ml", ctx.graph.ml_mod);
-    ctx.configureNativeTool(training_bench_exe, ctx.backend.enable_metal);
     const run_training_bench = ctx.addRunArtifact(training_bench_exe);
     if (ctx.args) |args| {
         run_training_bench.addArgs(args);

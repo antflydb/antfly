@@ -19,6 +19,7 @@ pub fn configureModule(
     b: *std.Build,
     mod: *std.Build.Module,
     build_options: *std.Build.Step.Options,
+    lite_options: *std.Build.Module,
     lmdb_engine_mod: *std.Build.Module,
     json_mod: *std.Build.Module,
     public_openapi_mod: *std.Build.Module,
@@ -44,6 +45,7 @@ pub fn configureModule(
     add_snowball_module: *const fn (*std.Build, *std.Build.Module) void,
 ) void {
     mod.addOptions("build_options", build_options);
+    mod.addImport("antfly_lite_options", lite_options);
     mod.addImport("lmdb_engine", lmdb_engine_mod);
     mod.addImport("antfly-json", json_mod);
     mod.addImport("antfly_public_openapi", public_openapi_mod);
@@ -143,6 +145,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const antfly_mod = options.antfly_mod;
     const embedded_deps = .{
         build_options,
+        antfly_imports.lite_options,
         lmdb_engine_mod,
         json_mod,
         public_openapi_mod,

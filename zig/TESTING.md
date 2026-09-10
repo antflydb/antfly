@@ -50,7 +50,9 @@ zig/deps/snowball` from the repository root). The fixtures call the real root an
 standalone inference compositions and replace expensive runtime, test, benchmark,
 and WASM entry bodies. They
 keep external modules, options, generated assets, backend inputs, and final link
-edges; the inference probe also loads the real inference module. The checks cover:
+edges; the inference probe also loads the real inference module. Native training
+and paged-attention benchmarks retain their actual entry bodies and execute small
+workloads. The checks cover:
 
 - All six served schemas invalidate only the API kernel; the other archives can
   build with a schema missing.
@@ -83,10 +85,18 @@ edges; the inference probe also loads the real inference module. The checks cove
   rebuild only the API archive; Raft edits leave serverless cached. Required
   dependencies still invalidate their consumers and fail when removed. Tests
   and the full public package retain their broader interfaces.
+- Lite capability settings live in a dedicated module attached to storage/Lite
+  consumers. Toggling local inference advertising changes the actual capability
+  result and rebuilds storage; API, serverless, CLI, and inference remain cached.
 - Both entrypoints explicitly supply inference's metrics and logging modules.
   Editing those modules rebuilds inference; removing them fails its compilation
   while help and unrelated audio targets still work. Compatibility source edits
   do not affect production or silently change the selected implementation.
+- Native training and paged-attention benchmarks own CPU options and dependencies.
+  Both entrypoints run bounded attention, optimizer, and training workloads and
+  check finite measurements/losses. Accelerator flags, missing GPU kernel files,
+  unavailable ONNX installations, and release versions leave these binaries
+  cached; edits to their math implementation still rebuild them.
 - Release versions live in a small `lib/build_info` object. Archives see only a
   stable accessor module; final links attach the object only for version consumers.
   Tests use stable test metadata. Version-only changes leave the five runtime

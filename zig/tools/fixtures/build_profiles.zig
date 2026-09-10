@@ -46,8 +46,23 @@ fn inspect(artifact: *std.Build.Step.Compile, module: *std.Build.Module, seen: *
     for (module.import_table.values()) |dependency| inspect(artifact, dependency, seen);
 }
 
-/// Compile real audio/linalg imports with a small entry, then read builtin.mode.
+/// Exercise real CPU benchmark bodies; use small profile probes for audio/linalg.
 pub fn addBenchmarkProbe(b: *std.Build, artifact: *std.Build.Step.Compile) void {
+    const training = std.mem.eql(u8, artifact.name, "antfly-inference-training-bench");
+    if (training or std.mem.eql(u8, artifact.name, "antfly-inference-paged-attention-bench")) {
+        const run = b.addRunArtifact(artifact);
+        run.addArgs(if (training) &.{
+            "--mode",        "both", "--optimizer-len",       "64", "--optimizer-steps", "2",
+            "--graph-batch", "2",    "--graph-width",         "8",  "--graph-depth",     "2",
+            "--graph-steps", "2",    "--checkpoint-interval", "1",
+        } else &.{
+            "--backend",   "native", "--prompt-len",   "4", "--decode-steps",  "2",
+            "--page-size", "4",      "--num-heads",    "2", "--num-kv-heads",  "1",
+            "--head-dim",  "32",     "--warmup-iters", "0", "--measure-iters", "1",
+        });
+        b.step(b.fmt("cache-{s}", .{artifact.name}), "Run an actual bounded CPU benchmark workload").dependOn(&run.step);
+        return;
+    }
     const dependency: []const u8 = if (std.mem.eql(u8, artifact.name, "antfly-inference-audio-bench")) "inference_audio" else if (std.mem.eql(u8, artifact.name, "antfly-inference-linalg-bench")) "inference_linalg" else return;
     const files = b.addWriteFiles();
     artifact.root_module.root_source_file = files.add(b.fmt("{s}.zig", .{artifact.name}), b.fmt("const std = @import(\"std\"); pub fn main() void {{ std.debug.print(\"BENCH_PROFILE {{s}} {{s}}\\n\", .{{ @tagName(@import(\"builtin\").mode), @tagName(@import(\"{s}\").cache_test_profile) }}); }}", .{dependency}));

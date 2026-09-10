@@ -19,6 +19,7 @@ const addSnowballModule = @import("snowball.zig").addSnowballModule;
 pub const AntflyRootImports = struct {
     build_info: @import("../../../lib/build_info/build_support.zig").BuildInfo,
     build_options: *std.Build.Step.Options,
+    lite_options: *std.Build.Module,
     // HTTP schema serving is opt-in at the owning compilation roots.
     embedded_openapi: *std.Build.Module,
     raft_engine: *std.Build.Module,
@@ -163,6 +164,7 @@ pub const AntflyRootImports = struct {
         // The public/test facade exposes the whole implementation. Production
         // archives use the owner constructors below to keep caches independent.
         self.configureBase(mod, link_libc);
+        mod.addImport("antfly_lite_options", self.lite_options);
         inline for (import_table) |entry| mod.addImport(entry.name, @field(self, entry.field));
         addSnowballModule(b, mod);
         mod.addImport("build_info", self.build_info.module);
@@ -240,6 +242,11 @@ pub const AntflyRootImports = struct {
     };
 
     pub fn configureStorage(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
+        self.configureStorageDependencies(b, mod, link_libc);
+        mod.addImport("antfly_lite_options", self.lite_options);
+    }
+
+    fn configureStorageDependencies(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
         self.configureDatabase(mod, link_libc);
         inline for (storage_imports) |field| self.addImport(mod, field);
         addSnowballModule(b, mod);
@@ -262,7 +269,7 @@ pub const AntflyRootImports = struct {
 
     /// This driver exercises storage and HTTP API implementations in one root.
     pub fn configureStorageBenchmark(self: @This(), b: *std.Build, mod: *std.Build.Module) void {
-        self.configureStorage(b, mod, true);
+        self.configureStorageDependencies(b, mod, true);
         inline for (api_imports) |field| self.addImport(mod, field);
         mod.addImport("antfly_openapi_specs", self.embedded_openapi);
     }

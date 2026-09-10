@@ -4,6 +4,13 @@ Run these commands from `zig/`. Artifact targets build and install into `zig-out
 
 Benchmarks that share Antfly or inference runtime modules honor `-Doptimize` throughout their imports, with Debug as the default. Use `zig build <target> -Doptimize=ReleaseFast` for timing runs. The DB and sort query matrix scripts select ReleaseFast explicitly. Isolated library benchmarks can retain their own profile; their imported modules use the same profile as the executable.
 
+`inference-bench-training` and `inference-bench-paged-attention` run native CPU
+workloads. Their shared constructor honors optimization and system BLAS settings;
+product GPU and server settings do not change their builds. The standalone
+inference package exposes the same workloads as `bench-training` and
+`bench-paged-attention`. CI executes small real workloads through both entrypoints
+and checks their cache independence.
+
 The commands below preserve the former workload defaults. Replace the arguments with your chosen workload. File arguments remain relative to the working directory.
 
 | Build target | Run command with previous defaults |

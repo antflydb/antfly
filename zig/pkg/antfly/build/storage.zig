@@ -57,7 +57,6 @@ pub fn makeRootBuildOptions(
     with_tla: bool,
     link_libc: bool,
     standalone_runtime_focused_test: bool,
-    lite_local_inference_runtime: bool,
     lmdb_enabled: bool,
 ) *std.Build.Step.Options {
     const options = b.addOptions();
@@ -68,10 +67,16 @@ pub fn makeRootBuildOptions(
     options.addOption(bool, "with_tla", with_tla);
     options.addOption(bool, "link_libc", link_libc);
     options.addOption(bool, "standalone_runtime_focused_test", standalone_runtime_focused_test);
-    options.addOption(bool, "lite_local_inference_runtime", lite_local_inference_runtime);
     options.addOption(bool, "lmdb_enabled", lmdb_enabled);
     options.addOption(bool, "bench_minimal_deps", false);
     return options;
+}
+
+/// Capability advertising belongs to Lite consumers, not general DB options.
+pub fn createLiteOptions(b: *std.Build, local_inference_runtime: bool) *std.Build.Module {
+    const options = b.addOptions();
+    options.addOption(bool, "local_inference_runtime", local_inference_runtime);
+    return options.createModule();
 }
 
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {

@@ -38,7 +38,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .cpu_features_add = std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory, .simd128 }),
     });
     const lmdb_build_options = storage_build.makeLmdbBuildOptions(b, .zig, false, false);
-    const build_options = storage_build.makeRootBuildOptions(b, .zig, false, false, false, false, false, false, true);
+    const build_options = storage_build.makeRootBuildOptions(b, .zig, false, false, false, false, false, true);
     const json_mod = b.createModule(.{ .root_source_file = b.path("lib/json/src/mod.zig"), .target = wasm_target, .optimize = optimize });
     const httpx_mod = b.createModule(.{ .root_source_file = b.path("lib/httpx/src/httpx.zig"), .target = wasm_target, .optimize = optimize });
     httpx_mod.addImport("antfly-json", json_mod);
@@ -128,6 +128,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     reranking_mod.addImport("antfly_reranking_openapi", api.reranking);
     const embedded_wasm_deps = .{
         build_options,
+        storage_build.createLiteOptions(b, false),
         lmdb_engine_wasm_mod,
         json_mod,
         api.public,

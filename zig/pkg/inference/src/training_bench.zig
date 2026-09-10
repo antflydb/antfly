@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const impl = @import("training.zig");
+const impl = @import("bench/training.zig");
 
 pub fn main(init: @import("std").process.Init) !void {
     return impl.main(init);
