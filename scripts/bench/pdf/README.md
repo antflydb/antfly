@@ -1,5 +1,8 @@
 # Remote-PDF ingestion comparison
 
+For the reuse-first model/execution/document qualification runner, contract plan,
+and profiled precommit/replay memory-cap gate, see [QUALIFICATION.md](QUALIFICATION.md).
+
 Internal engineering benchmark using the OHR-Bench corpus and adapter from
 `antflydb/antfly-circus`. The harness serves unchanged PDF bytes over loopback
 HTTP; **Antfly** fetches, parses, OCRs, chunks, embeds, and indexes them. `pypdf`

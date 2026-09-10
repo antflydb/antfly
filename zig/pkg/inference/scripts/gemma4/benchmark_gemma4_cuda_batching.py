@@ -692,6 +692,7 @@ def main() -> None:
     results = {dtype: benchmark_dtype(args, dtype) for dtype in args.cache_dtypes}
     passed = all(result["acceptance"]["passed"] for result in results.values())
     matrix_summary = {
+        "schema": "antfly.gemma4.cuda_batching.v1",
         "config": {
             "model": str(args.model.resolve()),
             "tokens": args.tokens,
