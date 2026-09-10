@@ -740,6 +740,8 @@ pub fn configureOnnxRuntime(
     onnx_root: []const u8,
 ) void {
     if (!enable_onnx) return;
+    // Declare dependencies on the consuming module. Missing installations fail
+    // its compile/link step without blocking configuration of unrelated targets.
     module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{onnx_root}) });
     module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{onnx_root}) });
     module.addRPath(.{ .cwd_relative = b.fmt("{s}/lib", .{onnx_root}) });

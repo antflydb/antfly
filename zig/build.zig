@@ -60,12 +60,6 @@ const makeLmdbEngineModule = antfly_storage_build.makeLmdbEngineModule;
 const makeRootBuildOptions = antfly_storage_build.makeRootBuildOptions;
 const selectTestFilters = antfly_tests_build.selectTestFilters;
 
-fn pathExists(b: *std.Build, path: []const u8) bool {
-    const io = b.graph.io;
-    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
-    return true;
-}
-
 fn defaultInferenceOnnxRoot(b: *std.Build, target: std.Build.ResolvedTarget) []const u8 {
     const platform_str = switch (target.result.os.tag) {
         .macos => "darwin",
@@ -178,13 +172,6 @@ pub fn create(b: *std.Build) ?Artifacts {
         .version = antfly_version,
     });
     const lite_local_inference_runtime = b.option(bool, "lite-local-inference-runtime", "Advertise an embedded local inference runtime in Antfly Lite status") orelse false;
-    if (inference_enable_onnx) {
-        const inference_onnx_available = pathExists(b, b.fmt("{s}/include/onnxruntime_c_api.h", .{inference_onnx_root})) and
-            pathExists(b, b.fmt("{s}/lib", .{inference_onnx_root}));
-        if (!inference_onnx_available) {
-            @panic("-Donnx=true requires an ONNX Runtime install; pass -Donnx-root=<path>");
-        }
-    }
     const platform_tests = platform_build.addTests(b, .{
         .root = b.path("lib/platform"),
         .target = target,
@@ -695,7 +682,6 @@ pub fn create(b: *std.Build) ?Artifacts {
             .schema_root = b.path("../specs/openapi"),
             .public_spec = b.path("../openapi.yaml"),
         }),
-        .vopr = vopr_mod,
         .lmdb_engine = lmdb_engine_mod,
         .raft_engine = raft_engine_mod,
         .public_openapi = public_openapi_mod,
@@ -777,7 +763,9 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
         .sanitize_thread = sanitize_thread,
     });
+    // The full package exports simulation APIs as well as its runtime surface.
     antfly_imports.configure(b, antfly_mod, false, link_libc);
+    antfly_mod.addImport("vopr", vopr_mod);
     antfly_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
 
     const wasm = @import("pkg/antfly/build/wasm.zig").add(b, sentencepiece_proto_source);
@@ -786,6 +774,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     wasm.smoke.step.dependOn(wasm_step);
     b.step("wasm-test", "Build the Antfly WASM bundle and run its Node smoke test").dependOn(&wasm.smoke.step);
     const embedded = antfly_embedded_build.addEmbedded(b, .{
+        .vopr = vopr_mod,
         .optimize = optimize,
         .strip = strip,
         .antfly_imports = antfly_imports,
@@ -1146,6 +1135,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     raft_library_test_step.dependOn(&run_raft_library_tests.step);
 
     const owner_tests = antfly_tests_build.addTests(b, .{
+        .vopr = vopr_mod,
         .optimize = optimize,
         .lmdb_backend = lmdb_backend,
         .lmdb_evented_async_io = lmdb_evented_async_io,

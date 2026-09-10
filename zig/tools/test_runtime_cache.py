@@ -271,6 +271,57 @@ class RuntimeCacheTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(cached.read_bytes(), fresh.read_bytes())
 
+    def test_simulation_cache_contracts(self):
+        source = self.own("zig/lib/vopr/src/root.zig")
+        source.write_bytes(
+            source.read_bytes() + b"\npub const cache_test_revision: u8 = 1;\n"
+        )
+        targets = ("cache-probe", "cache-vopr-tests")
+        self.assertIn("VOPR_REVISION 1", self.build(*targets))
+        self.assert_archives(self.build(*targets))
+        source.write_bytes(
+            source.read_bytes().replace(
+                b"pub const cache_test_revision: u8 = 1;",
+                b"pub const cache_test_revision: u8 = 2;",
+            )
+        )
+        changed = self.build(*targets)
+        self.assert_archives(changed)
+        self.assertRegex(changed, r"compile test Debug \S+ success")
+        self.assertIn("VOPR_REVISION 2", changed)
+        self.assertRegex(self.build(*targets), r"compile test Debug \S+ cached")
+        # The package can still configure its test artifacts without reading
+        # their source; only building the simulation consumer needs that file.
+        source.unlink()
+        self.assert_archives(self.build("cache-probe"))
+        self.assertIn("FileNotFound", self.build("cache-vopr-tests", succeeds=False))
+
+    def test_optional_onnx_dependencies(self):
+        source = self.own("zig/lib/audio/src/mod.zig")
+        source.write_bytes(
+            source.read_bytes()
+            + b'\npub const cache_test_profile = @import("builtin").mode;\n'
+        )
+        settings = ("-Donnx=true", f"-Donnx-root={self.root / 'missing-onnx'}")
+        for standalone in (False, True):
+            with self.subTest(standalone=standalone):
+                if standalone:
+                    self.use_standalone()
+                self.build("--help", settings=settings)
+                self.assertIn(
+                    "BENCH_PROFILE Debug Debug",
+                    self.build("cache-antfly-inference-audio-bench", settings=settings),
+                )
+                if not standalone:
+                    self.build("lib-hash-test", settings=settings)
+                target = "cache-inference" if standalone else "cache-probe"
+                self.build(target)
+                failure = self.build(target, settings=settings, succeeds=False)
+                self.assertIn("onnxruntime", failure)
+                self.assertNotIn("panic:", failure)
+                self.assertIn("Build Summary:", failure)
+                self.build(target)
+
     def test_native_artifact_profiles(self):
         for source in ("zig/lib/audio/src/mod.zig", "zig/lib/linalg/src/mod.zig"):
             path = self.own(source)

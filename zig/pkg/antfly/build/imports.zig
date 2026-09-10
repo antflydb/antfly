@@ -22,7 +22,6 @@ pub const AntflyRootImports = struct {
     build_options: *std.Build.Step.Options,
     // HTTP schema serving is opt-in at the owning compilation roots.
     embedded_openapi: *std.Build.Module,
-    vopr: *std.Build.Module,
     lmdb_engine: *std.Build.Module,
     raft_engine: *std.Build.Module,
     public_openapi: *std.Build.Module,
@@ -95,7 +94,6 @@ pub const AntflyRootImports = struct {
     filesystem_capacity_source_file: std.Build.LazyPath,
 
     const import_table = [_]struct { name: []const u8, field: []const u8 }{
-        .{ .name = "vopr", .field = "vopr" },
         .{ .name = "lmdb_engine", .field = "lmdb_engine" },
         .{ .name = "raft_engine", .field = "raft_engine" },
         .{ .name = "antfly_public_openapi", .field = "public_openapi" },

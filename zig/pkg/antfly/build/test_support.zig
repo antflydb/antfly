@@ -15,6 +15,17 @@
 const std = @import("std");
 const build_test_filters = @import("../../../build_test_filters.zig");
 
+pub const Imports = struct {
+    runtime: @import("imports.zig").AntflyRootImports,
+    vopr: *std.Build.Module,
+
+    /// Inline tests and simulation tools own VOPR; production imports do not.
+    pub fn configure(self: Imports, b: *std.Build, module: *std.Build.Module, include_lmdb_c: bool, link_libc: bool) void {
+        self.runtime.configure(b, module, include_lmdb_c, link_libc);
+        module.addImport("vopr", self.vopr);
+    }
+};
+
 fn addProgressBanner(b: *std.Build, label: []const u8) *std.Build.Step.Run {
     return b.addSystemCommand(&.{
         "sh",

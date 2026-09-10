@@ -22,14 +22,24 @@ pub fn build(b: *std.Build) void {
     var steps = std.AutoHashMap(*std.Build.Step, void).init(b.allocator);
     var modules = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
     for (b.top_level_steps.values()) |top| profiles.collectSteps(&top.step, &steps, &modules);
-    const files = b.addWriteFiles();
     var iterator = steps.keyIterator();
     var pilot_found = false;
     var reporting_found = false;
+    // Give each probe its own output step so unordered artifact traversal cannot
+    // change another probe's generated path and invalidate its compilation.
     while (iterator.next()) |entry| {
         const artifact = entry.*.cast(std.Build.Step.Compile) orelse continue;
         profiles.check(artifact);
         profiles.addBenchmarkProbe(b, artifact);
+        if (std.mem.eql(u8, artifact.name, "antfly-inference")) {
+            // Exercise the real executable's final links without its large body.
+            artifact.root_module.root_source_file = b.addWriteFiles().add("inference_link.zig",
+                \\pub fn main() void {
+                \\    @import("std").debug.print("INFERENCE_VERSION {s}\n", .{@import("build_info").version()});
+                \\}
+            );
+            b.step("cache-inference", "Link the actual inference dependency graph").dependOn(&b.addRunArtifact(artifact).step);
+        }
         if (std.mem.eql(u8, artifact.name, "generate-gemma4-pilot-dataset")) {
             // Compile and run the actual tool body: it uses inference internals,
             // but writes deterministic JSONL without any release metadata.
@@ -46,7 +56,7 @@ pub fn build(b: *std.Build) void {
         if (std.mem.eql(u8, artifact.name, "train-gliner2-autodiff")) {
             // Keep the real manifest writer's module and final-link inputs.
             // Its expensive trainer body becomes a direct version-reporting probe.
-            artifact.root_module.root_source_file = files.add("training_version.zig",
+            artifact.root_module.root_source_file = b.addWriteFiles().add("training_version.zig",
                 \\pub fn main() void {
                 \\    @import("std").debug.print("TRAINING_VERSION {s}\n", .{@import("build_info").version()});
                 \\}

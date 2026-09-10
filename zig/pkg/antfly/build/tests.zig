@@ -45,6 +45,7 @@ const AntflyRootImports = @import("imports.zig").AntflyRootImports;
 const LmdbBackend = @import("storage.zig").LmdbBackend;
 
 pub const AddTestsOptions = struct {
+    vopr: *std.Build.Module,
     optimize: std.builtin.OptimizeMode,
     lmdb_backend: LmdbBackend,
     lmdb_evented_async_io: bool,
@@ -118,7 +119,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const inference_chunker_mod = options.antfly_imports.inference_chunker;
     const reader_config_mod = options.antfly_imports.reader_config;
     const antfly_imports = options.antfly_imports;
-    const vopr_mod = antfly_imports.vopr;
+    const test_imports = @import("test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr };
+    const vopr_mod = options.vopr;
     const casbin_mod = antfly_imports.casbin;
     const antfly_mod = options.antfly_mod;
     const embedded_mod = options.embedded_mod;
@@ -139,7 +141,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, antfly_test_mod, true, true);
+    test_imports.configure(b, antfly_test_mod, true, true);
     antfly_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
 
     const api_http_runtime_test_mod = b.createModule(.{
@@ -147,7 +149,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, api_http_runtime_test_mod, true, true);
+    test_imports.configure(b, api_http_runtime_test_mod, true, true);
     api_http_runtime_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
 
     const metadata_unit_baseline_root_paths = [_][]const u8{
@@ -168,7 +170,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .target = target,
             .optimize = optimize,
         });
-        antfly_imports.configure(b, test_mod.*, true, true);
+        test_imports.configure(b, test_mod.*, true, true);
         test_mod.*.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     }
 
@@ -183,7 +185,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .target = target,
             .optimize = optimize,
         });
-        antfly_imports.configure(b, test_mod.*, true, true);
+        test_imports.configure(b, test_mod.*, true, true);
         test_mod.*.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     }
 
@@ -192,7 +194,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, raft_harness_test_mod, true, true);
+    test_imports.configure(b, raft_harness_test_mod, true, true);
     raft_harness_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
 
     const introducer_test_mod = b.createModule(.{
@@ -200,14 +202,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, introducer_test_mod, true, true);
+    test_imports.configure(b, introducer_test_mod, true, true);
 
     const data_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/data_runtime_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, data_runtime_test_mod, true, true);
+    test_imports.configure(b, data_runtime_test_mod, true, true);
     data_runtime_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
 
     const raft_runtime_test_mod = b.createModule(.{
@@ -215,7 +217,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, raft_runtime_test_mod, true, true);
+    test_imports.configure(b, raft_runtime_test_mod, true, true);
     raft_runtime_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
 
     const raft_restore_test_mod = b.createModule(.{
@@ -223,7 +225,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, raft_restore_test_mod, true, true);
+    test_imports.configure(b, raft_restore_test_mod, true, true);
     raft_restore_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
 
     const filesystem_capacity_test_mod = b.createModule(.{
@@ -231,14 +233,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, filesystem_capacity_test_mod, true, true);
+    test_imports.configure(b, filesystem_capacity_test_mod, true, true);
 
     const data_storage_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/data_storage_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, data_storage_test_mod, true, true);
+    test_imports.configure(b, data_storage_test_mod, true, true);
     data_storage_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
 
     const usermgr_storage_lib_mod = b.createModule(.{
@@ -308,7 +310,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, api_artifact_reprocess_jobs_test_mod, true, true);
+    test_imports.configure(b, api_artifact_reprocess_jobs_test_mod, true, true);
     api_artifact_reprocess_jobs_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const api_artifact_reprocess_jobs_tests = b.addTest(.{
         .root_module = api_artifact_reprocess_jobs_test_mod,
@@ -352,7 +354,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, api_restore_jobs_test_mod, true, true);
+    test_imports.configure(b, api_restore_jobs_test_mod, true, true);
     const api_restore_jobs_tests = b.addTest(.{
         .root_module = api_restore_jobs_test_mod,
         .filters = &.{
@@ -393,7 +395,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, portable_backup_test_mod, true, true);
+    test_imports.configure(b, portable_backup_test_mod, true, true);
     const portable_backup_tests = b.addTest(.{
         .root_module = portable_backup_test_mod,
         .filters = &.{
@@ -602,7 +604,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, api_cluster_secret_status_test_mod, true, true);
+    test_imports.configure(b, api_cluster_secret_status_test_mod, true, true);
     api_cluster_secret_status_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const api_cluster_secret_status_tests = b.addTest(.{
         .root_module = api_cluster_secret_status_test_mod,
@@ -1399,7 +1401,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, lite_native_test_mod, true, true);
+    test_imports.configure(b, lite_native_test_mod, true, true);
     lite_native_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lite_native_tests = b.addTest(.{
         .root_module = lite_native_test_mod,
@@ -1418,7 +1420,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, cmd_test_mod, true, true);
+    test_imports.configure(b, cmd_test_mod, true, true);
     cmd_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const cmd_usermgr_storage_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
@@ -1463,7 +1465,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, lite_cmd_test_mod, true, true);
+    test_imports.configure(b, lite_cmd_test_mod, true, true);
     lite_cmd_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lite_cmd_usermgr_storage_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
@@ -1501,7 +1503,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, raft_read_gate_test_mod, true, true);
+    test_imports.configure(b, raft_read_gate_test_mod, true, true);
     const raft_read_gate_tests = b.addTest(.{
         .root_module = raft_read_gate_test_mod,
         .filters = &.{"raft.read_gate."},
@@ -1587,7 +1589,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, raft_storage_test_mod, true, true);
+    test_imports.configure(b, raft_storage_test_mod, true, true);
     const raft_storage_tests = b.addTest(.{
         .root_module = raft_storage_test_mod,
         .filters = selectTestFilters(b, &.{}),
@@ -1795,7 +1797,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, serverless_manifest_test_mod, true, true);
+    test_imports.configure(b, serverless_manifest_test_mod, true, true);
     serverless_manifest_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const serverless_manifest_tests = b.addTest(.{
         .root_module = serverless_manifest_test_mod,
@@ -1818,7 +1820,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, lake_scaffold_test_mod, true, true);
+    test_imports.configure(b, lake_scaffold_test_mod, true, true);
     lake_scaffold_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lake_scaffold_tests = b.addTest(.{
         .root_module = lake_scaffold_test_mod,
@@ -1861,6 +1863,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_metadata_vopr_public_integration_tests = metadata_tests_addTests_result.run_lib_metadata_vopr_public_integration_tests;
 
     const api_tests_addTests_result = api_tests.addTests(b, .{
+        .vopr = vopr_mod,
         .optimize = optimize,
         .openapi_root_check = openapi_root_check,
         .antfly_imports = antfly_imports,
@@ -3593,7 +3596,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, template_test_mod, false, true);
+    test_imports.configure(b, template_test_mod, false, true);
     const lib_template_tests = b.addTest(.{
         .root_module = template_test_mod,
     });
@@ -3608,7 +3611,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, audio_test_mod, false, true);
+    test_imports.configure(b, audio_test_mod, false, true);
     const lib_audio_tests = b.addTest(.{
         .root_module = audio_test_mod,
     });

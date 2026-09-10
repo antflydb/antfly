@@ -75,6 +75,7 @@ const configureEmbeddedModule = @import("embedded.zig").configureModule;
 const selectTestFilters = @import("tests.zig").selectTestFilters;
 
 pub const AddEmbeddedOptions = struct {
+    vopr: *std.Build.Module,
     optimize: std.builtin.OptimizeMode,
     strip: bool,
     antfly_imports: AntflyRootImports,
@@ -243,7 +244,10 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, capi_root_mod, false, link_libc);
+    // This source root supports C API unit tests. The installed library uses
+    // libantfly_link_mod and the production storage archive below.
+    const test_imports = @import("test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr };
+    test_imports.configure(b, capi_root_mod, false, link_libc);
     const capi_usermgr_storage_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
         .target = target,

@@ -39,6 +39,7 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.step("cache-unit-tests", "Exercise actual test imports with stable metadata");
     unit_tests.dependOn(&b.addRunArtifact(artifacts.runtime.antfly_main_tests).step);
     var template: ?*std.Build.Step.Compile = null;
+    var vopr_test_found = false;
     var host_count: usize = 0;
     var test_count: usize = 0;
     var iterator = steps.keyIterator();
@@ -63,6 +64,19 @@ pub fn build(b: *std.Build) void {
         }
         if (artifact.root_module.root_source_file) |source| switch (source) {
             .src_path => |path| {
+                if (artifact.kind.isTest() and std.mem.endsWith(u8, path.sub_path, "/api_http_runtime_test_root.zig")) {
+                    // Keep the actual API test's imports, flags, and runner.
+                    artifact.root_module.root_source_file = sources.add("vopr_test.zig",
+                        \\test "VOPR cache probe" {
+                        \\    const revision = @import("vopr").cache_test_revision;
+                        \\    try @import("std").testing.expect(revision > 0);
+                        \\    @import("std").debug.print("VOPR_REVISION {d}\n", .{revision});
+                        \\}
+                    );
+                    artifact.filters = &.{"VOPR cache probe"};
+                    b.step("cache-vopr-tests", "Exercise actual simulation test imports").dependOn(&b.addRunArtifact(artifact).step);
+                    vopr_test_found = true;
+                }
                 if (std.mem.endsWith(u8, path.sub_path, "/template_test_root.zig")) template = artifact;
                 if (artifact.kind.isTest() and std.mem.endsWith(u8, path.sub_path, "/lite_main.zig"))
                     unit_tests.dependOn(&b.addRunArtifact(artifact).step);
@@ -86,7 +100,7 @@ pub fn build(b: *std.Build) void {
             host_count += 1;
         }
     }
-    if (host_count != 4 or test_count == 0 or openapi.dependencies.items.len != 2) @panic("cache fixture did not inspect the expected production graph");
+    if (host_count != 4 or test_count == 0 or !vopr_test_found or openapi.dependencies.items.len != 2) @panic("cache fixture did not inspect the expected production graph");
     const wasm = artifacts.wasm;
     inline for (.{ .{ "httpx_profile", "lib/httpx/src/httpx.zig" }, .{ "json_profile", "lib/json/src/mod.zig" } }) |probe| {
         var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
@@ -237,6 +251,8 @@ fn inspect(module: *std.Build.Module, unit: runtime.RuntimeLibraryUnit, metadata
     var imports = module.import_table.iterator();
     while (imports.next()) |entry| {
         const name = entry.key_ptr.*;
+        if (std.mem.eql(u8, name, "vopr"))
+            std.debug.panic("{s} archive depends on simulation test support", .{@tagName(unit)});
         if (unit != .api_kernel and std.mem.eql(u8, name, "antfly_openapi_specs"))
             std.debug.panic("{s} archive depends on served schemas", .{@tagName(unit)});
         if (unit != .inference and (std.mem.eql(u8, name, "metal_jit_identity") or std.mem.eql(u8, name, "cuda_jit_identity")))

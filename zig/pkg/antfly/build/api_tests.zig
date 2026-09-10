@@ -20,6 +20,7 @@ const addFilteredTestRunArtifactWithRuntimeFilters = @import("test_support.zig")
 const addFilteredTestRunArtifact = @import("test_support.zig").addFilteredTestRunArtifact;
 
 pub const AddTestsOptions = struct {
+    vopr: *std.Build.Module,
     optimize: std.builtin.OptimizeMode,
     openapi_root_check: *std.Build.Step.Run,
     antfly_imports: AntflyRootImports,
@@ -53,6 +54,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const optimize = options.optimize;
     const openapi_root_check = options.openapi_root_check;
     const antfly_imports = options.antfly_imports;
+    const test_imports = @import("test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr };
     const antfly_test_mod = options.antfly_test_mod;
     const run_lib_usermgr_tests = options.run_lib_usermgr_tests;
     const public_api_parity_default_filters = [_][]const u8{
@@ -458,7 +460,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, api_connections_test_mod, true, true);
+    test_imports.configure(b, api_connections_test_mod, true, true);
     api_connections_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lib_api_connections_tests = b.addTest(.{
         .root_module = api_connections_test_mod,
@@ -490,7 +492,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, api_storage_authority_test_mod, true, true);
+    test_imports.configure(b, api_storage_authority_test_mod, true, true);
     api_storage_authority_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lib_api_storage_authority_tests = b.addTest(.{
         .root_module = api_storage_authority_test_mod,
@@ -590,7 +592,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, api_session_maintenance_test_mod, true, true);
+    test_imports.configure(b, api_session_maintenance_test_mod, true, true);
     api_session_maintenance_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lib_api_session_maintenance_tests = b.addTest(.{
         .root_module = api_session_maintenance_test_mod,
@@ -841,35 +843,35 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, api_transactions_docid_test_mod, true, true);
+    test_imports.configure(b, api_transactions_docid_test_mod, true, true);
     api_transactions_docid_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const api_table_writes_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_table_writes_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, api_table_writes_docid_test_mod, true, true);
+    test_imports.configure(b, api_table_writes_docid_test_mod, true, true);
     api_table_writes_docid_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const api_table_reads_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_table_reads_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, api_table_reads_docid_test_mod, true, true);
+    test_imports.configure(b, api_table_reads_docid_test_mod, true, true);
     api_table_reads_docid_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const api_public_table_http_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_public_table_http_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, api_public_table_http_docid_test_mod, true, true);
+    test_imports.configure(b, api_public_table_http_docid_test_mod, true, true);
     api_public_table_http_docid_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const raft_transition_runtime_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/raft_transition_runtime_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, raft_transition_runtime_docid_test_mod, true, true);
+    test_imports.configure(b, raft_transition_runtime_docid_test_mod, true, true);
     raft_transition_runtime_docid_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const api_transactions_docid_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
@@ -1231,7 +1233,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, api_derived_coverage_test_mod, true, true);
+    test_imports.configure(b, api_derived_coverage_test_mod, true, true);
     api_derived_coverage_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lib_api_derived_coverage_tests = b.addTest(.{
         .root_module = api_derived_coverage_test_mod,
@@ -1754,7 +1756,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, api_backup_restore_test_mod, true, true);
+    test_imports.configure(b, api_backup_restore_test_mod, true, true);
     api_backup_restore_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lib_api_standalone_backup_restore_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,

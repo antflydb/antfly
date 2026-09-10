@@ -62,6 +62,14 @@ edges; the inference probe also loads the real inference module. The checks cove
   kernel source files absent.
   Enabled fingerprints match an independent implementation of the qualification
   identity format and change when their source inputs change.
+- ONNX headers and libraries are dependencies of their consuming modules. A
+  missing installation fails those compile/link steps; root and standalone
+  inference help and unrelated library targets still work with ONNX enabled.
+- Production runtime archives have no transitive VOPR imports. Editing or removing
+  VOPR source leaves all five archives cached, while the actual API simulation
+  test recompiles on an edit and fails when its dependency is missing. Test
+  constructors receive VOPR explicitly; the full Antfly package retains its
+  public simulation exports.
 - Release versions live in a small `lib/build_info` object. Archives see only a
   stable accessor module; final links attach the object only for version consumers.
   Tests use stable test metadata. Version-only changes leave the five runtime

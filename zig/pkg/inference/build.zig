@@ -59,12 +59,6 @@ fn defaultOnnxRuntimeRoot(b: *std.Build, target: std.Build.ResolvedTarget) []con
     return b.fmt("onnxruntime/{s}-{s}", .{ platform_str, arch_str });
 }
 
-fn pathExists(b: *std.Build, path: []const u8) bool {
-    const io = b.graph.io;
-    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
-    return true;
-}
-
 fn targetRunsOnBuildHost(b: *std.Build, target: std.Build.ResolvedTarget) bool {
     const host = b.graph.host.result;
     return target.result.os.tag == host.os.tag and
@@ -179,13 +173,6 @@ pub fn build(b: *std.Build) void {
     const onnx_root_opt = b.option([]const u8, "onnx-root", "Path to ONNX Runtime root (default: ./onnxruntime/<platform>)");
     const effective_onnx_root = onnx_root_opt orelse defaultOnnxRuntimeRoot(b, target);
     const enable_metal = if (enable_wasm or !link_libc) false else (b.option(bool, "metal", "Enable Apple Metal kernels (macOS only)") orelse (target.result.os.tag == .macos));
-    if (enable_onnx) {
-        const onnx_runtime_available = pathExists(b, b.fmt("{s}/include/onnxruntime_c_api.h", .{effective_onnx_root})) and
-            pathExists(b, b.fmt("{s}/lib", .{effective_onnx_root}));
-        if (!onnx_runtime_available) {
-            @panic("-Donnx=true requires an ONNX Runtime install; pass -Donnx-root=<path>");
-        }
-    }
     const enable_cuda = if (enable_wasm or !link_libc) false else (b.option(bool, "cuda", "Enable CUDA backend through the NVIDIA Driver API") orelse false);
     const cuda_artifacts = b.option([]const u8, "cuda-artifacts", "CUDA artifact bundle: fatbin SASS+PTX, portable PTX, or sm89 cubin") orelse "fatbin";
     if (!std.mem.eql(u8, cuda_artifacts, "portable") and !std.mem.eql(u8, cuda_artifacts, "fatbin") and !std.mem.eql(u8, cuda_artifacts, "sm89")) {
