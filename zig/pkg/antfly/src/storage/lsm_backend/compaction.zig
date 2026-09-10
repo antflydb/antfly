@@ -400,14 +400,18 @@ fn closureSlot(backend: anytype, l0_only: bool) *?*PendingDirectoryClosure {
 }
 
 fn populateClosureDirectoryForTest(backend: anytype, count: usize) !void {
-    std.debug.assert(@import("builtin").is_test and count > 5000);
+    try populateClosureDirectoryWithInputsForTest(backend, count, 5001);
+}
+
+fn populateClosureDirectoryWithInputsForTest(backend: anytype, count: usize, inputs: usize) !void {
+    std.debug.assert(@import("builtin").is_test and inputs > 1 and count >= inputs);
     for (0..count) |i| {
         const lower = try backend.allocator.alloc(u8, 8);
         errdefer backend.allocator.free(lower);
         const upper = try backend.allocator.alloc(u8, 8);
         errdefer backend.allocator.free(upper);
         std.mem.writeInt(u64, lower[0..8], if (i == 0) 0 else i - 1, .big);
-        std.mem.writeInt(u64, upper[0..8], if (i == 0) 4999 else i - 1, .big);
+        std.mem.writeInt(u64, upper[0..8], if (i == 0) inputs - 2 else i - 1, .big);
         try backend.runs.append(backend.allocator, .{
             .id = i + 1,
             .level = if (i == 0) 0 else 1,
@@ -491,7 +495,7 @@ test "compaction scratch admission scales with selected inputs not unrelated run
         for ([_]bool{ false, true }) |l0_only| {
             const slot = closureSlot(&backend, l0_only);
             try std.testing.expect(slot.*.?.job.phase == .done);
-            const result = (try resumeDirectoryClosure(&backend, slot)).?;
+            const result = try resumeClosureToSelectionForTest(&backend, slot);
             try std.testing.expectEqual(@as(usize, 5001), result.plan.source_len + result.plan.target_len);
             result.release(&backend);
         }
@@ -511,7 +515,7 @@ test "compaction scratch admission scales with selected inputs not unrelated run
         try std.testing.expect(try resumeDirectoryClosure(&backend, &backend.pending_directory_closure) == null);
         try std.testing.expect(backend.pending_directory_closure.?.restart_limit == null);
         try std.testing.expectEqual(@as(usize, 1), backend.pending_directory_closure.?.job.count);
-        const retried = (try resumeDirectoryClosure(&backend, &backend.pending_directory_closure)).?;
+        const retried = try resumeClosureToSelectionForTest(&backend, &backend.pending_directory_closure);
         retried.release(&backend);
 
         // Denial during arena growth must remain an admission error and leave
@@ -538,6 +542,102 @@ test "compaction scratch admission scales with selected inputs not unrelated run
     try std.testing.expectEqual(peaks[0], peaks[1]);
 }
 
+fn resumeClosureToSelectionForTest(backend: anytype, slot: *?*PendingDirectoryClosure) !SelectedPlan {
+    std.debug.assert(@import("builtin").is_test);
+    for (0..4096) |_| {
+        if (slot.* == null) break;
+        if (try resumeDirectoryClosure(backend, slot)) |result| return result;
+    }
+    return error.MissingSelectedClosure;
+}
+
+test "compaction phase handoff bounds memory and preserves epoch validation" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const allocator = std.testing.allocator;
+    const inputs = 20001;
+    const cap = 3 * 1024 * 1024;
+    for (0..3) |mode| {
+        var budgets = resource_manager_mod.Options.defaultBudgets();
+        budgets[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = cap };
+        var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+        defer std.debug.assert(manager.sliceStats(.lsm_table_builder_working_set).used_bytes == 0);
+        var backend = Backend.init(allocator, .{ .level_target_runs_base = 1000000, .level_target_bytes_base = 0 });
+        defer backend.close();
+        try populateClosureDirectoryWithInputsForTest(&backend, 30000, inputs);
+        // Any persisted tombstone requires coverage validation, including when
+        // there was no concurrent publication during discovery.
+        const initial = try (try backend.planningDirectory()).fork(allocator);
+        var tombstone = initial.at(1).run.*;
+        tombstone.tombstone_count = 1;
+        try initial.put(&backend, tombstone);
+        backend.publishRunDirectory(initial);
+        backend.options.resource_manager = &manager;
+        const locked = runtime_mod.lockBackend(Backend, &backend);
+        defer runtime_mod.unlockBackend(Backend, &backend, locked);
+        const started = @import("antfly_platform").time.monotonicNs();
+        var stats: CompactionSelectionStats = .{};
+        try std.testing.expect(try selectDomainPlan(&backend, 0, false, 0, false, &stats) == null);
+        const pending = backend.pending_directory_closure.?;
+        for (0..4096) |_| {
+            if (pending.phase == .reclaim_discovery) break;
+            try std.testing.expect(try resumeDirectoryClosure(&backend, &backend.pending_directory_closure) == null);
+        }
+        try std.testing.expect(pending.phase == .reclaim_discovery);
+        try std.testing.expect(pending.validation == null);
+        const ranks = pending.selected.?.plan.run_indices.?.ptr;
+        const used_before = manager.sliceStats(.lsm_table_builder_working_set).used_bytes;
+        const validation_bytes = @sizeOf(DependencyValidation) + 8192 + inputs * 128;
+        try std.testing.expect(used_before + validation_bytes > cap);
+        if (manager.reserve(.lsm_table_builder_working_set, validation_bytes)) |lease| {
+            var unexpected = lease;
+            unexpected.release();
+            return error.ExpectedPhaseOverlapAdmissionDenial;
+        } else |err| try std.testing.expectEqual(error.ResourceBudgetExceeded, err);
+        try std.testing.expect(!pending.reclaimDiscoveryUntil(allocator, 0, std.math.maxInt(u64)));
+        try std.testing.expect(!pending.reclaimDiscoveryUntil(allocator, 1, 0));
+        try std.testing.expectEqual(used_before, manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+        if (mode == 2) {
+            // Leave partial cleanup to close, including selected array credit.
+            try std.testing.expect(!pending.reclaimDiscoveryUntil(allocator, 1, std.math.maxInt(u64)));
+            continue;
+        }
+        // Publish either an unrelated edit or a replacement of an input while
+        // its discovery scratch is being retired. Handles/epoch stay pinned.
+        const changed = try (try backend.planningDirectory()).fork(allocator);
+        var replacement = changed.at(if (mode == 0) 29999 else 1).run.*;
+        replacement.gc_requested = true;
+        try changed.put(&backend, replacement);
+        backend.invalidateReadVersion();
+        backend.publishRunDirectory(changed);
+        for (0..4096) |_| {
+            if (pending.phase == .validate) break;
+            try std.testing.expect(try resumeDirectoryClosure(&backend, &backend.pending_directory_closure) == null);
+            try std.testing.expect(pending.validation == null);
+        }
+        try std.testing.expect(pending.phase == .validate);
+        try std.testing.expectEqual(@as(u64, 0), pending.scratch.?.live_bytes);
+        const retained = manager.sliceStats(.lsm_table_builder_working_set).used_bytes;
+        try std.testing.expect(retained + validation_bytes <= cap);
+        var accepted = false;
+        for (0..4096) |_| {
+            if (backend.pending_directory_closure == null) break;
+            if (try resumeDirectoryClosure(&backend, &backend.pending_directory_closure)) |selected| {
+                try std.testing.expectEqual(@as(usize, inputs), selected.plan.input_handles.?.len);
+                try std.testing.expectEqual(ranks, selected.plan.run_indices.?.ptr);
+                try std.testing.expect(manager.sliceStats(.lsm_table_builder_working_set).used_bytes <= retained + @sizeOf(DependencyValidation) + 8192);
+                selected.release(&backend);
+                accepted = true;
+                break;
+            }
+        }
+        try std.testing.expectEqual(mode == 0, accepted);
+        try std.testing.expect(backend.pending_directory_closure == null);
+        const peak = manager.sliceStats(.lsm_table_builder_working_set).peak_bytes;
+        try std.testing.expect(peak <= cap);
+        if (@import("builtin").mode == .ReleaseFast and mode == 0) std.debug.print("\nLSM phase handoff inputs={d} retained_bytes={d} previous_overlap_bytes={d} peak_bytes={d} elapsed_ns={d}\n", .{ inputs, retained, used_before + validation_bytes, peak, @import("antfly_platform").time.monotonicNs() - started });
+    }
+}
+
 /// An exceptional broad ordinary closure belongs to maintenance, not to the
 /// stack of whichever request first noticed pressure. Keep its epoch and
 /// scratch reservation until the cursor completes or is discarded.
@@ -545,6 +645,7 @@ pub const PendingDirectoryClosure = struct {
     policy: PlanningPolicy,
     directory: *Directory,
     job: ClosureJob,
+    phase: enum { discover, reclaim_discovery, validate } = .discover,
     restart_limit: ?u64 = null,
     retired_next: ?*@This() = null,
     seeds: []Directory.Handle,
@@ -608,25 +709,28 @@ pub const PendingDirectoryClosure = struct {
         return self.job.deinitStep(allocator, credits);
     }
 
+    fn reclaimDiscoveryUntil(self: *@This(), allocator: std.mem.Allocator, credits_arg: usize, deadline: u64) bool {
+        var credits = credits_arg;
+        while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+            var quantum: usize = @min(credits, 64);
+            const before = quantum;
+            const done = self.job.deinitStep(allocator, &quantum);
+            credits -= before - quantum;
+            if (done) return true;
+        }
+        return false;
+    }
+
     fn step(self: *@This(), allocator: std.mem.Allocator, deadline: u64) !bool {
-        var credits: usize = 2048;
         if (self.restart_limit) |limit| {
-            var done = false;
-            while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
-                var quantum: usize = @min(credits, 64);
-                const before = quantum;
-                done = self.job.deinitStep(allocator, &quantum);
-                credits -= before - quantum;
-                if (done) break;
-            }
-            if (!done) return false;
+            if (!self.reclaimDiscoveryUntil(allocator, 2048, deadline)) return false;
             // Release the superseded arena before admitting replacement
             // seeds. A tight budget must not require both attempts to fit.
             self.job = try self.initJob(allocator, limit);
             self.restart_limit = null;
             return false;
         }
-        return self.job.stepUntil(allocator, credits, deadline) catch |err| return self.allocationError(err);
+        return self.job.stepUntil(allocator, 2048, deadline) catch |err| return self.allocationError(err);
     }
 
     pub fn destroy(self: *@This(), backend: anytype) void {
@@ -650,7 +754,7 @@ fn resumeDirectoryClosure(backend: anytype, slot: *?*PendingDirectoryClosure) !?
     backend.retainReaderKind(.compaction);
     defer backend.releaseReaderKind(.compaction);
     const BackendType = @TypeOf(backend.*);
-    if (pending.selected != null) return resumeClosureValidation(backend, pending, slot);
+    if (pending.phase != .discover) return resumeClosureValidation(backend, pending, slot);
     if (backend.manifestCoordinationIo()) |io| try io.checkCancel();
     runtime_mod.unlockBackend(BackendType, backend, true);
     const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
@@ -700,7 +804,10 @@ fn resumeDirectoryClosure(backend: anytype, slot: *?*PendingDirectoryClosure) !?
     selected.reservation = pending.job.output_reservation;
     pending.job.output_reservation = null;
     pending.selected = selected;
-    return resumeClosureValidation(backend, pending, slot);
+    pending.phase = .reclaim_discovery;
+    // Handoff is a separate maintenance quantum. Do not stack reclamation or
+    // validation admission onto the final discovery/emission slice.
+    return null;
 }
 
 fn resumeClosureValidation(backend: anytype, pending: *PendingDirectoryClosure, slot: *?*PendingDirectoryClosure) !?SelectedPlan {
@@ -710,6 +817,27 @@ fn resumeClosureValidation(backend: anytype, pending: *PendingDirectoryClosure, 
         backend.retireClosurePlanning(pending);
     };
     errdefer retire = true;
+    if (pending.phase == .reclaim_discovery) {
+        if (backend.manifestCoordinationIo()) |io| try io.checkCancel();
+        runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
+        const done = pending.reclaimDiscoveryUntil(backend.allocator, 2048, @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms);
+        _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
+        backend.directory_planning_slices +|= 1;
+        if (done) {
+            // Only the selected handles/arrays and pinned epoch cross phases.
+            // The allocator stays address-stable until owner destruction, but
+            // its arena has returned all credit before the next admission.
+            if (pending.scratch) |*scratch| std.debug.assert(scratch.live_bytes == 0);
+            const seed_bytes = pending.seeds.len * @sizeOf(Directory.Handle);
+            backend.allocator.free(pending.seeds);
+            pending.seeds = &.{};
+            pending.seed_len = 0;
+            if (pending.reservation) |*lease| lease.shrink(seed_bytes);
+            pending.phase = .validate;
+        }
+        return null;
+    }
+    std.debug.assert(pending.phase == .validate);
     if (pending.validation == null) {
         const current = try backend.planningDirectory();
         if (current.tree.root == pending.directory.tree.root and current.tombstoneRunCount() == 0) {
@@ -723,6 +851,12 @@ fn resumeClosureValidation(backend: anytype, pending: *PendingDirectoryClosure, 
             return selected;
         }
         pending.validation = try DependencyValidation.init(backend, pending.selected.?.plan);
+        // Validation rewrites these ranks in place from stable handles. Keep
+        // their existing output credit rather than allocating a second array.
+        // This is the exclusively owned mutable buffer emitted by ClosureJob;
+        // CompactionPlan exposes only a const view to execution consumers.
+        pending.validation.?.job.indices = @constCast(pending.selected.?.plan.run_indices.?);
+        pending.selected.?.plan.run_indices = null;
     }
     const result = try pending.validation.?.advanceLocked(backend);
     backend.directory_planning_slices +|= 1;
@@ -731,9 +865,7 @@ fn resumeClosureValidation(backend: anytype, pending: *PendingDirectoryClosure, 
     if (result == .invalid) return null;
     var selected = pending.selected.?;
     pending.selected = null;
-    backend.allocator.free(selected.plan.run_indices.?);
-    selected.plan.run_indices = pending.validation.?.job.indices;
-    pending.validation.?.job.indices = null;
+    selected.plan.run_indices = pending.validation.?.takeIndices();
     selected.plan.complete_coverage = pending.validation.?.job.covered;
     selected.plan.validated_generation = backend.run_directory_generation;
     return selected;
@@ -2100,8 +2232,7 @@ fn relocateDirectoryPlan(backend: anytype, plan: CompactionPlan) !?SelectedPlan 
         }
     }
     var relocated = plan;
-    relocated.run_indices = validation.job.indices;
-    validation.job.indices = null;
+    relocated.run_indices = validation.takeIndices();
     relocated.complete_coverage = validation.job.covered;
     relocated.validated_generation = backend.run_directory_generation;
     return .{ .plan = relocated, .borrowed_inputs = true, .complete_coverage = validation.job.covered };

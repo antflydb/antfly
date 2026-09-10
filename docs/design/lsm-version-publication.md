@@ -85,12 +85,42 @@ they do not introduce parallel builders or an unbounded per-request job queue.
 Continuation admission is independent of unrelated run count. A fixed header
 and seed reservation covers the owner; a stable, callback-free budgeted
 allocator charges arena growth before allocation. Scratch remains charged
-through sliced retirement, independently of the selected plan's lifetime.
+through sliced reclamation, independently of the selected plan's lifetime.
 Emitted handles and ranks acquire their own exact-size reservation, transferred
 with the arrays to the selected plan. Oversized retries drain the superseded
 arena before admitting replacement seeds, so progress does not require two
 attempts to fit at once. Growth denial is reported as resource admission failure
 and all partial ownership remains reclaimable on error or close.
+
+Discovery, discovery-scratch reclamation, and validation are explicit phases.
+The final emission slice hands ownership of handles/ranks to the selected plan
+and yields. Reclamation gets its own off-lock 2,048-credit / two-millisecond
+quantum; only after the arena and seed storage are released may validation
+request its budget. Even the unchanged-epoch shortcut crosses this cleanup
+boundary before execution, so builders cannot overlap with dead discovery
+scratch. The pinned epoch and selected handles remain live throughout.
+
+Validation rewrites the exclusively owned rank buffer in place and returns it
+to the selected plan with the original output credit. No second rank array is
+allocated. Its epoch is captured after cleanup, so input replacement during the
+handoff is still rejected; unrelated publication can proceed. Cancellation and
+close use the same idempotent sliced cleanup in every phase. The regression
+uses 20,001 inputs under a 3 MiB cap that admits either phase but rejects their
+combined scratch, and checks zero-credit/deadline yields, rank reuse, concurrent
+publication, and close during partial reclamation.
+Validation also shrinks its reservation as membership scratch is reclaimed,
+then releases rank credit on ownership transfer. A completed certificate does
+not retain an input-count-sized reservation while execution is admitted.
+
+In a ReleaseFast metadata-only run, the 20,001-input handoff peaked at
+3,059,512 bytes (2.92 MiB), versus 4,697,148 bytes (4.48 MiB) required by
+overlapping discovery scratch and validation admission. Preparation and
+validation completed in 91.7 ms; that timing is a single sample, not an
+end-to-end ingestion result. Reproduce from `zig/` with:
+
+```sh
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'compaction phase handoff'
+```
 
 The ReleaseFast admission regression held two 5,001-input discoveries under a
 4 MiB builder cap. Peak planning reservation was **1,187,312 bytes** at both

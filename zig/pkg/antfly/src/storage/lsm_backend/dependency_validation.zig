@@ -104,6 +104,7 @@ pub const Validation = struct {
                     credits -= before - quantum;
                     if (done) {
                         self.phase = .certificate;
+                        self.shrinkCompletedScratchCredit(if (indices) |ranks| ranks.len * @sizeOf(usize) else 0);
                         break;
                     }
                 }
@@ -120,6 +121,21 @@ pub const Validation = struct {
 
     pub fn cleanupStep(self: *Validation, allocator: std.mem.Allocator, credits: *usize) bool {
         return self.job.deinitStep(allocator, credits);
+    }
+
+    fn shrinkCompletedScratchCredit(self: *Validation, rank_bytes: usize) void {
+        // Membership scratch is gone in the certificate phase. Only epoch/
+        // cursor headers and any still-owned result ranks need admission.
+        const retained = @sizeOf(Validation) + 8192 + rank_bytes;
+        if (self.reservation) |*lease| lease.shrink(lease.bytes -| retained);
+    }
+
+    pub fn takeIndices(self: *Validation) []usize {
+        std.debug.assert(self.phase == .certificate and self.job.valid);
+        const indices = self.job.indices.?;
+        self.job.indices = null;
+        self.shrinkCompletedScratchCredit(0);
+        return indices;
     }
 
     /// Maintenance calls this only after sliced cleanup. Synchronous callers
