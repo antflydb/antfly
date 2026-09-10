@@ -4504,9 +4504,10 @@ pub fn build(b: *std.Build) void {
     const api_http_runtime_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
         .filters = api_http_runtime_filters,
-        // The linked API/DB harness reached 13.65 GB in native macOS
-        // ReleaseFast codegen. Account for it before overlapping other roots.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+        // The native-generation merge raised this linked API/DB harness to
+        // 16.01 GB in macOS ReleaseFast codegen. Reserve measured usage plus
+        // headroom; the shared runner still caps aggregate compilation.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 17 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -10230,6 +10231,7 @@ pub fn build(b: *std.Build) void {
     chaos_test_step.dependOn(storage_vopr_step);
 
     const graph_metric_unit_filters = [_][]const u8{
+        "graph metric sorted batch presence",
         "db reverse graph probe rejects a deleted or replaced index incarnation",
         "graph pagerank planned scan page writes durable out-degree intermediates",
         "graph pagerank contribution and reduce pages resume",
@@ -10424,8 +10426,10 @@ pub fn build(b: *std.Build) void {
         "hosted cross-range graph metric fan-in rejects unpublished or incompatible shard generations",
     };
     const graph_metric_remote_wire_tests = b.addTest(.{
-        // macOS ReleaseFast measured 12.01 GB after the runtime/routing merge.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        // macOS ReleaseFast measured 13.45 GB after the native-generation
+        // merge. Admit this indivisible compiler job with headroom; the shared
+        // runner's 22 GiB cap still bounds aggregate concurrent compilation.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
         .root_module = api_table_reads_docid_test_mod,
         .filters = &graph_metric_remote_wire_filters,
         .test_runner = .{

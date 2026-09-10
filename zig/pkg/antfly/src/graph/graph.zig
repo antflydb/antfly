@@ -6399,7 +6399,8 @@ pub const GraphIndex = struct {
     }
 
     /// Benchmark oracle keeps identical durable writes and topology accounting;
-    /// only global incidence maintenance differs. Both paths commit normally.
+    /// Reference uses scalar presence probes and per-edge global incidence
+    /// maintenance. Both paths commit normally.
     pub fn benchmarkBatchApply(self: *GraphIndex, writes: []const BatchWrite, deletes: []const BatchDelete, reference: bool) !void {
         if (reference) return self.batchApplyWithAccounting(writes, deletes, false);
         return self.batchApplyWithAccounting(writes, deletes, true);
@@ -6437,8 +6438,9 @@ pub const GraphIndex = struct {
         // Compare original and final identity sets, not intermediate delete /
         // insert operations. Replacing attributes or replaying an identical
         // batch must not retire immutable topology or restart numerical jobs.
-        for (deletes) |item| try self.rememberTopologyMutation(&reverse_batch, &topology_changes, item.source, item.target, item.edge_type, false);
-        for (writes) |item| try self.rememberTopologyMutation(&reverse_batch, &topology_changes, item.source, item.target, item.edge_type, true);
+        for (deletes) |item| try self.rememberTopologyMutation(&topology_changes, item.source, item.target, item.edge_type, false);
+        for (writes) |item| try self.rememberTopologyMutation(&topology_changes, item.source, item.target, item.edge_type, true);
+        try self.resolveTopologyMutationPresence(&reverse_batch, &topology_changes, coalesced);
         var changed_types = std.StringHashMapUnmanaged(void).empty;
         defer changed_types.deinit(self.alloc);
         var changes = topology_changes.iterator();
@@ -6587,7 +6589,7 @@ pub const GraphIndex = struct {
         }
     }
 
-    fn rememberTopologyMutation(self: *GraphIndex, txn: anytype, mutations: *std.StringHashMapUnmanaged(TopologyMutation), source: []const u8, target: []const u8, kind: []const u8, after: bool) !void {
+    fn rememberTopologyMutation(self: *GraphIndex, mutations: *std.StringHashMapUnmanaged(TopologyMutation), source: []const u8, target: []const u8, kind: []const u8, after: bool) !void {
         const key = try reverseEdgeKeyAlloc(self.alloc, target, self.index_name, kind, source);
         errdefer self.alloc.free(key);
         if (mutations.getPtr(key)) |existing| {
@@ -6595,11 +6597,32 @@ pub const GraphIndex = struct {
             self.alloc.free(key);
             return;
         }
-        const before = if (txn.get(key)) |_| true else |err| switch (err) {
-            error.NotFound => false,
-            else => return err,
-        };
-        try mutations.put(self.alloc, key, .{ .before = before, .after = after, .kind = kind, .source = source, .target = target });
+        try mutations.put(self.alloc, key, .{ .before = false, .after = after, .kind = kind, .source = source, .target = target });
+    }
+
+    fn resolveTopologyMutationPresence(self: *GraphIndex, batch: anytype, mutations: *std.StringHashMapUnmanaged(TopologyMutation), comptime bulk: bool) !void {
+        const keys = try self.alloc.alloc([]const u8, mutations.count());
+        defer self.alloc.free(keys);
+        var iterator = mutations.keyIterator();
+        for (keys) |*key| key.* = iterator.next().?.*;
+        std.mem.sort([]const u8, keys, {}, struct {
+            fn less(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.less);
+        var present: [256]bool = undefined;
+        var offset: usize = 0;
+        while (offset < keys.len) {
+            const page = keys[offset..@min(keys.len, offset + present.len)];
+            if (bulk) try batch.containsManySorted(page, present[0..page.len]) else {
+                for (page, present[0..page.len]) |key, *exists| exists.* = if (batch.get(key)) |_| true else |err| switch (err) {
+                    error.NotFound => false,
+                    else => return err,
+                };
+            }
+            for (page, present[0..page.len]) |key, exists| mutations.getPtr(key).?.before = exists;
+            offset += page.len;
+        }
     }
 
     fn graphMetricTypeEpochKeyAlloc(self: *GraphIndex, kind: []const u8) ![]u8 {

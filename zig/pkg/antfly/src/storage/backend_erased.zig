@@ -499,6 +499,7 @@ pub const Batch = struct {
         delete: *const fn (*anyopaque, []const u8) anyerror!void,
         open_cursor: ?*const fn (Allocator, *anyopaque) anyerror!Cursor = null,
         set_replay_opaque: ?*const fn (*anyopaque, u64, []const u8) anyerror!void = null,
+        contains_many_sorted: ?*const fn (*anyopaque, []const []const u8, []bool) anyerror!void = null,
     };
 
     pub fn abort(self: *Batch) void {
@@ -516,6 +517,19 @@ pub const Batch = struct {
 
     pub fn get(self: *Batch, key: []const u8) ![]const u8 {
         return try self.vtable.get(self.ptr, key);
+    }
+
+    /// Return presence only. Native backends avoid retained value payloads and
+    /// share sorted-run/block probes; portable fallbacks preserve get semantics.
+    pub fn containsManySorted(self: *Batch, keys: []const []const u8, present: []bool) !void {
+        if (keys.len != present.len) return error.InvalidBatch;
+        for (keys, 0..) |key, i| if (i != 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.InvalidBatch;
+        @memset(present, false);
+        if (self.vtable.contains_many_sorted) |contains| return contains(self.ptr, keys, present);
+        for (keys, present) |key, *exists| exists.* = if (self.get(key)) |_| true else |err| switch (err) {
+            error.NotFound => false,
+            else => return err,
+        };
     }
 
     pub fn getManySorted(self: *Batch, keys: []const []const u8, values: []?[]const u8) !void {
@@ -1393,6 +1407,10 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             return try unbox(ptr).handle.get(key);
         }
 
+        fn containsManySorted(ptr: *anyopaque, keys: []const []const u8, present: []bool) anyerror!void {
+            return unbox(ptr).handle.containsManySorted(keys, present);
+        }
+
         fn getManySorted(ptr: *anyopaque, keys: []const []const u8, values: []?[]const u8) anyerror!void {
             if (@hasDecl(Handle, "getManySorted")) {
                 return try unbox(ptr).handle.getManySorted(keys, values);
@@ -1447,6 +1465,7 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             .delete = vt.delete,
             .open_cursor = if (@hasDecl(Handle, "openCursor")) vt.openCursor else null,
             .set_replay_opaque = if (@hasDecl(Handle, "setReplayOpaque")) vt.setReplayOpaque else null,
+            .contains_many_sorted = if (@hasDecl(Handle, "containsManySorted")) vt.containsManySorted else null,
         },
     };
 }

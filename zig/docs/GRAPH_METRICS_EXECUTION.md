@@ -231,9 +231,10 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
   and isolated local nodes are preserved.
   Both JSON adapters propagate allocator exhaustion and unwind partial edge
   ownership; allocation failure cannot silently produce an empty graph.
-- Graph wire v6 and manifest v21 bind an 80-byte topology trailer to the
+- Graph wire v7 and manifest v22 bind an 80-byte topology trailer to the
   manifest. Its SHA-256-authenticated directory contains canonical per-type
-  semantic digests, dictionary page offsets and SHA-256 checksums for 64 KiB
+  semantic digests, dictionary page offsets, bounded first-key fence prefixes,
+  and SHA-256 checksums for 64 KiB
   data blocks. Cold readers fetch only the trailer, directory and blocks covering
   selected ranges. They verify every fetched block before decoding; actual
   aligned/overfetched bytes count against the shared read allowance. Directory
@@ -241,6 +242,20 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
   current-wire full-preparation path, not a legacy decoder. Low-level callers
   without a manifest control binding must authenticate the complete artifact
   before trusting its directory.
+- An authenticated eight-byte-per-dictionary-node routing array addresses
+  adjacency rows. Public MATCH, traversal, path, and dedicated graph-query
+  readers resolve dictionary pages through the small fence directory, then read
+  only the requested row/type intervals. Exact relationship probes binary-search
+  canonical `(type, neighbor)` ordinals and preserve the minimum-weight match.
+  Fence prefixes are capped at 64 bytes per page; long common prefixes widen a
+  bounded binary search rather than making the control object unbounded.
+  Query allocators admit directory, cache, page, and decoded-row memory before
+  allocation. Traversal parent identities borrow only visited retained rows.
+  All reads share one byte allowance and authenticate every fetched block.
+  Adjacent metric type runs share one authenticated boundary block, preventing
+  thousands of small runs from repeatedly downloading the same 64 KiB range.
+  Point/traversal readers retain up to eight blocks (512 KiB) per source so
+  dictionary, routing, and row reads do not evict each other on every hop.
 - Filesystem object GET pins one file handle for metadata and body reads.
   Concurrent atomic HEAD replacement cannot turn an unconditional read into a
   failed precondition; explicit ETag conditions still bind that pinned object.
@@ -262,7 +277,7 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
   allocation; exact construction admission and the live-allocation limiter
   remain authoritative. Serverless additionally reserves local-ID adapters,
   selection permutations and replacement-node buffers before allocation.
-  Materializer epoch 22 binds grouped and block-authenticated preparation admission.
+  Materializer epoch 23 binds the current addressed graph layout and preparation admission.
 - Preparation has two admission phases. The projection census is charged before
   allocations or edge scans; exact projection construction is charged after the
   census and before CSR allocation. Reserved census work remains charged when

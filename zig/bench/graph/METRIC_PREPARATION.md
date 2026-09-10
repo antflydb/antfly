@@ -1,9 +1,77 @@
 # Graph metric execution and query benchmarks
 
+## Addressed adjacency and existence-only mutation probes (2026-09-10)
+
+Current graph wire is v7, manifest wire v22, materializer epoch 23. Serverless
+supports this current layout only. Node-ordinal row offsets cost eight bytes per
+dictionary node; dictionary fences add 68 bytes per 256-node page. Both are
+authenticated by the manifest-bound control structure. The control directory
+remains capped at 1 MiB; oversized controls explicitly omit the accelerator.
+
+Reproduce with:
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --paged-only
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --presence-only
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --indexing-only
+```
+
+Apple M4 Max / Zig 0.16.0; medians of five measurements after one discarded
+warmup. These are local microbenchmarks, not cloud end-to-end latency claims.
+
+| Cold one-edge lookup | Whole graph | Addressed row |
+| --- | ---: | ---: |
+| 16,384 nodes: fetched bytes | 1,627,870 | 333,504 |
+| 16,384 nodes: local median | 1.341 ms | 0.160 ms |
+| 100,000 nodes: fetched bytes | 9,934,770 | 296,884 |
+| 100,000 nodes: local median | 10.893 ms | 0.177 ms |
+| GETs per fixture | 1 | 6 |
+
+Every sample creates a fresh reader. The transport serves immutable memory and
+counts exact GET bytes. Both paths assert the same neighbor. The full-decode
+reference omits transport SHA verification, while the addressed path verifies
+the footer, directory, and touched blocks. Network RTT can dominate six small
+GETs; measure actual object-store latency before interpreting these CPU timings
+as deployment speedups. Authenticated first-key fence prefixes avoid an object
+GET for every dictionary binary-search comparison; common prefixes longer than
+64 bytes fall back to a bounded search of the ambiguous pages.
+
+The many-type preparation fixture has two nodes and one relationship per type.
+64/1,024/10,000 types require 3/3/6 range reads and 7,580/117,020/812,860 bytes.
+Before boundary-block reuse, the 10,000-type probe exhausted its 512 MiB read
+allowance after 8,184 calls for a roughly 1.14 MiB source. The regression now
+requires completion within 2 MiB, at most eight calls, and no source-size read
+amplification. Block retention is one 64 KiB block, or less for small sources.
+Point and traversal readers instead retain up to eight blocks (512 KiB) per
+source under the request's admitted allocator; a warm-hop regression verifies
+that dictionary, routing, and row reads share that working set without extra GETs.
+
+| 1,024 existing-key presence probes | Scalar value reads | Sorted existence reads |
+| --- | ---: | ---: |
+| 256-byte values: local median | 5.771 ms | 0.526 ms |
+| 256-byte values: extra peak allocation | 298,778 B | 160 B |
+| 16-KiB values: local median | 1.287 ms | 0.693 ms |
+| 16-KiB values: extra peak allocation | 16,810,398 B | 20,360 B |
+| Retained value copies | 1,024 | 0 |
+
+This isolates presence checks on warm immutable LSM runs and block cache using
+modeled storage. It measures batch lifetime, excluding fixture creation and
+disk latency. Different value sizes create different run/block layouts, so
+cross-row timing comparisons are not a payload-size scaling curve. The native
+batch probes sorted keys in 256-key pages, releases temporary pins and decode
+scratch per page, and returns only booleans. Tombstones and batch-local writes
+override persisted data. Non-LSM backends use their existing get semantics.
+
+The separate default durable-LSM benchmark preserves identical topology over
+65,536-edge insert/delete cycles: scalar presence plus per-edge global counters
+takes 2.091 s, versus 1.277 s for sorted presence plus coalesced counters. That
+comparison includes WAL and both directional commits and combines the two
+optimizations; it is not an isolated estimate of the presence-check gain.
+
 ## Block-authenticated preparation and committed counters (2026-09-09)
 
 Run `zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --indexing-only`.
-Current graph wire is v6, manifest wire v21. Both ingestion paths emit the same
+At that measurement, graph wire was v6, manifest wire v21. Both ingestion paths emitted the same
 authenticated block table, and the published manifest binds its control root.
 Selected preparation retains authenticated semantic digests instead of hashing
 the selected graph again. Each cold sample uses a fresh verifier, not a cold OS

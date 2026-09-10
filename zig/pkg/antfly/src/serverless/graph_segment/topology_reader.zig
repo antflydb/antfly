@@ -79,8 +79,20 @@ pub const Context = struct {
     trailer: wire.TopologyTrailer,
     bytes: []u8,
     directory: ?wire.TopologyDirectory,
+    // One authenticated tail block survives adjacent type runs and preparation
+    // groups. Large ranges remain one GET; only their boundary block is retained.
+    block_bytes: []u8,
+    block_offsets: [8]u64 = @splat(0),
+    block_lens: [8]usize = @splat(0),
+    cache_slots: usize,
+    next_slot: usize = 0,
 
     pub fn init(alloc: Allocator, store: *artifacts.ArtifactStore, source: refs.ArtifactRef, cancellation: CancellationToken, remaining: *u64) !Context {
+        return initWithCache(alloc, store, source, cancellation, remaining, 1);
+    }
+
+    pub fn initWithCache(alloc: Allocator, store: *artifacts.ArtifactStore, source: refs.ArtifactRef, cancellation: CancellationToken, remaining: *u64, requested_slots: usize) !Context {
+        if (requested_slots == 0 or requested_slots > 8) return error.InvalidGraphSegment;
         if (source.byte_len < wire.topology_trailer_len) return error.InvalidGraphSegment;
         try artifacts.validateSha256ArtifactIdentity(source.artifact_id, source.checksum);
         const reader = Reader{ .alloc = alloc, .store = store, .source = source, .cancellation = cancellation, .remaining = remaining };
@@ -89,19 +101,25 @@ pub const Context = struct {
         defer alloc.free(footer);
         if (bound) try verify(footer, source.graph_topology_control_checksum);
         const trailer = try wire.decodeTopologyTrailer(footer, source.byte_len);
-        const raw = try reader.raw(trailer.body_len + trailer.topology_len, trailer.directory_len);
+        const raw = try reader.raw(trailer.directoryOffset(), trailer.directory_len);
         errdefer alloc.free(raw);
         const directory = try wire.TopologyDirectory.init(raw, trailer.checksum);
         if (directory) |dir| {
-            const covered = trailer.body_len + trailer.topology_len;
+            const covered = trailer.directoryOffset();
             const blocks = covered / wire.authentication_block_bytes + @intFromBool(covered % wire.authentication_block_bytes != 0);
             if (dir.block_checksums.len / 32 != blocks) return error.InvalidGraphSegment;
+            if (trailer.adjacency_index_len != @as(u64, dir.nodes) * 8) return error.InvalidGraphSegment;
         }
-        return .{ .reader = reader, .trailer = trailer, .bytes = raw, .directory = directory };
+        const covered = trailer.directoryOffset();
+        const slots: usize = if (directory != null) @intCast(@min(requested_slots, (covered + wire.authentication_block_bytes - 1) / wire.authentication_block_bytes)) else 0;
+        const capacity: usize = if (slots == 1) @intCast(@min(wire.authentication_block_bytes, covered)) else slots * wire.authentication_block_bytes;
+        const block_bytes = try alloc.alloc(u8, capacity);
+        return .{ .reader = reader, .trailer = trailer, .bytes = raw, .directory = directory, .block_bytes = block_bytes, .cache_slots = slots };
     }
 
     pub fn deinit(self: *Context) void {
         self.reader.alloc.free(self.bytes);
+        self.reader.alloc.free(self.block_bytes);
         self.* = undefined;
     }
 
@@ -111,25 +129,88 @@ pub const Context = struct {
         if (!std.mem.eql(u8, &digest, &checksum)) return error.ArtifactIntegrityMismatch;
     }
 
-    fn read(self: Context, offset: u64, len: u64) ![]u8 {
+    pub fn retainedBytes(self: Context) usize {
+        return self.bytes.len + self.block_bytes.len;
+    }
+
+    fn cachedSlot(self: *Context, offset: u64) ?usize {
+        for (self.block_offsets[0..self.cache_slots], self.block_lens[0..self.cache_slots], 0..) |at, size, i| {
+            if (at == offset and size != 0) return i;
+        }
+        return null;
+    }
+
+    /// Return an owned exact range, authenticating/coalescing only missing
+    /// blocks. Cache memory belongs to the context; response memory belongs to
+    /// the caller's allocator (and therefore its live-memory admission).
+    pub fn readAlloc(self: *Context, alloc: Allocator, offset: u64, len: u64) ![]u8 {
         try self.reader.cancellation.check();
-        const covered = self.trailer.body_len + self.trailer.topology_len;
+        const covered = self.trailer.directoryOffset();
         if (offset > covered or len > covered - offset) return error.InvalidGraphSegment;
-        if (len == 0) return self.reader.alloc.alloc(u8, 0);
+        if (len == 0) return alloc.alloc(u8, 0);
+        if (self.directory == null) return error.InvalidGraphSegment;
         const block_bytes = wire.authentication_block_bytes;
-        const begin = offset / block_bytes * block_bytes;
+        var begin = offset / block_bytes * block_bytes;
         const end = @min(covered, (offset + len + block_bytes - 1) / block_bytes * block_bytes);
-        const bytes = try self.reader.raw(begin, @intCast(end - begin));
-        errdefer self.reader.alloc.free(bytes);
+        var at = begin;
+        const all_cached = while (at < offset + len) : (at += block_bytes) {
+            if (self.cachedSlot(at) == null) break false;
+        } else true;
+        if (all_cached) {
+            const result = try alloc.alloc(u8, @intCast(len));
+            at = offset;
+            var copied: usize = 0;
+            while (copied < result.len) {
+                const base = at / block_bytes * block_bytes;
+                const i = self.cachedSlot(base).?;
+                const skip: usize = @intCast(at - base);
+                const count = @min(result.len - copied, self.block_lens[i] - skip);
+                @memcpy(result[copied..][0..count], self.block_bytes[i * block_bytes + skip ..][0..count]);
+                copied += count;
+                at += count;
+            }
+            return result;
+        }
+        const slot = self.cachedSlot(begin);
+        const cached: usize = if (slot) |i| @intCast(@min(len, self.block_lens[i] - (offset - begin))) else 0;
+        const prefix_start: usize = if (slot) |i| i * block_bytes + @as(usize, @intCast(offset - begin)) else 0;
+        if (cached == len) return alloc.dupe(u8, self.block_bytes[prefix_start..][0..cached]);
+        const prefix = if (cached != 0) try alloc.dupe(u8, self.block_bytes[prefix_start..][0..cached]) else &.{};
+        defer alloc.free(prefix);
+        if (cached != 0) begin += self.block_lens[slot.?];
+        var reader = self.reader;
+        reader.alloc = alloc;
+        const bytes = try reader.raw(begin, @intCast(end - begin));
+        errdefer alloc.free(bytes);
         var pos: usize = 0;
         while (pos < bytes.len) : (pos += block_bytes) {
             try self.reader.cancellation.check();
             const block: usize = @intCast(begin / block_bytes + pos / block_bytes);
             try verify(bytes[pos..@min(bytes.len, pos + block_bytes)], self.directory.?.block_checksums[block * 32 ..][0..32].*);
         }
+        const fetched_blocks = (bytes.len + block_bytes - 1) / block_bytes;
+        for (fetched_blocks - @min(fetched_blocks, self.cache_slots)..fetched_blocks) |block| {
+            const start = block * block_bytes;
+            const size = @min(block_bytes, bytes.len - start);
+            const tail_slot = self.cachedSlot(begin + start) orelse blk: {
+                const next = self.next_slot;
+                self.next_slot = (next + 1) % self.cache_slots;
+                break :blk next;
+            };
+            @memcpy(self.block_bytes[tail_slot * block_bytes ..][0..size], bytes[start..][0..size]);
+            self.block_offsets[tail_slot] = begin + start;
+            self.block_lens[tail_slot] = size;
+        }
+        if (cached != 0) {
+            const result = try alloc.alloc(u8, @intCast(len));
+            @memcpy(result[0..cached], prefix);
+            @memcpy(result[cached..], bytes[0..@intCast(len - cached)]);
+            alloc.free(bytes);
+            return result;
+        }
         const start: usize = @intCast(offset - begin);
         std.mem.copyForwards(u8, bytes[0..@intCast(len)], bytes[start..][0..@intCast(len)]);
-        return self.reader.alloc.realloc(bytes, @intCast(len));
+        return alloc.realloc(bytes, @intCast(len));
     }
 };
 
@@ -150,9 +231,8 @@ pub fn readAlloc(alloc: Allocator, store: *artifacts.ArtifactStore, source: refs
     return readPreparedAlloc(alloc, &context, configs, limits, cancellation);
 }
 
-pub fn readPreparedAlloc(alloc: Allocator, context: *const Context, configs: anytype, limits: anytype, cancellation: CancellationToken) !?Topology {
-    var reader = context.*;
-    reader.reader.alloc = alloc;
+pub fn readPreparedAlloc(alloc: Allocator, context: *Context, configs: anytype, limits: anytype, cancellation: CancellationToken) !?Topology {
+    const reader = context;
     const trailer = reader.trailer;
     if (trailer.source_nodes > limits.max_nodes or trailer.source_edges > limits.max_edges) return error.GraphMetricBuildBudgetExceeded;
     const directory = reader.directory orelse return null;
@@ -202,7 +282,7 @@ pub fn readPreparedAlloc(alloc: Allocator, context: *const Context, configs: any
         var previous: ?Edge = null;
         while (read_edges < entry.edges) {
             const count: usize = @intCast(@min(entry.edges - read_edges, 128 * 1024));
-            const bytes = try reader.read(entry.offset + read_edges * 8, count * 8);
+            const bytes = try reader.readAlloc(alloc, entry.offset + read_edges * 8, count * 8);
             defer alloc.free(bytes);
             for (0..count) |i| {
                 if (i % 4096 == 0) try cancellation.check();
@@ -265,7 +345,7 @@ pub fn readPreparedAlloc(alloc: Allocator, context: *const Context, configs: any
             last_page = next_page;
         }
         if (range.offset < wire.header_len or range.offset > trailer.body_len or range.len > trailer.body_len - range.offset) return error.InvalidGraphSegment;
-        const bytes = try reader.read(range.offset, range.len);
+        const bytes = try reader.readAlloc(alloc, range.offset, range.len);
         defer alloc.free(bytes);
         const first = page * wire.node_page_entries;
         const count = @min((last_page - page + 1) * wire.node_page_entries, directory.nodes - first);

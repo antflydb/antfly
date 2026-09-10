@@ -19,7 +19,7 @@
 /// The only manifest wire that may publish graph-metric artifacts. Serverless
 /// has not shipped, so partial pre-release graph-metric layouts are rejected
 /// instead of becoming a permanent compatibility surface.
-pub const graph_metric_manifest_wire_version: u16 = 21;
+pub const graph_metric_manifest_wire_version: u16 = 22;
 pub const graph_metric_segment_wire_version: u16 = 10;
 
 pub const GraphMetricMaterializationState = enum(u8) {

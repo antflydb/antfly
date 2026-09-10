@@ -6321,10 +6321,22 @@ const ServerlessGraphAdmissionContext = struct {
     filter: graph_pattern_mod.NodeFilter,
 };
 
+const AdmittedAdjacencyReader = struct {
+    allocation: graph_work_budget_mod.RetainedAllocator,
+    reader: graph_segment_mod.AdjacencyReader,
+
+    fn translate(self: *@This(), err: anyerror) anyerror {
+        if (err == error.OutOfMemory and self.allocation.denied) return error.QueryCandidateBudgetExceeded;
+        if (err == error.GraphMetricBuildBudgetExceeded) return error.GraphTraversalQueryBudgetExceeded;
+        return err;
+    }
+};
+
 const CachedPublicGraphSegment = struct {
     index_name: []u8,
-    segment: graph_segment_mod.Segment,
-    adjacency_index: graph_segment_mod.AdjacencyIndex,
+    segment: graph_segment_mod.Segment = .{ .adjacencies = &.{} },
+    adjacency_index: graph_segment_mod.AdjacencyIndex = .{},
+    paged: ?*AdmittedAdjacencyReader = null,
     /// Canonical edge metadata aligned with segment.neighbor_tables. Building
     /// it once avoids serializing the same table qualifier for every edge scan
     /// and clone in a request.
@@ -6436,6 +6448,7 @@ const PublicGraphRequestCache = struct {
     published_body_blocks: std.ArrayListUnmanaged([]u8) = .empty,
     segments: std.ArrayListUnmanaged(CachedPublicGraphSegment) = .empty,
     filter_cache: db_query_graph.PreparedPatternFilterCache,
+    graph_read_remaining: u64 = 512 * 1024 * 1024,
 
     fn init(
         handler: *HttpHandler,
@@ -6458,6 +6471,11 @@ const PublicGraphRequestCache = struct {
         for (self.published_body_blocks.items) |block| self.handler.alloc.free(block);
         self.published_body_blocks.deinit(self.handler.alloc);
         for (self.segments.items) |*entry| {
+            if (entry.paged) |paged| {
+                paged.reader.deinit();
+                std.debug.assert(paged.allocation.live_bytes == 0);
+                self.handler.alloc.destroy(paged);
+            }
             self.handler.alloc.free(entry.index_name);
             entry.adjacency_index.deinit(self.handler.alloc);
             for (entry.neighbor_table_metadata) |metadata| self.handler.alloc.free(metadata);
@@ -6959,6 +6977,38 @@ const PublicGraphRequestCache = struct {
         return .{ .items = refs, .retained_bytes = retained_bytes };
     }
 
+    fn pagedGraphSegment(self: *PublicGraphRequestCache, index_name: []const u8, artifact_ref: manifest_mod.ArtifactRef) !?*const CachedPublicGraphSegment {
+        const prior = self.retained_lease.bytes;
+        try self.reserveRetained(@sizeOf(AdmittedAdjacencyReader) + index_name.len);
+        errdefer self.retained_lease.resize(prior) catch unreachable;
+        const paged = try self.handler.alloc.create(AdmittedAdjacencyReader);
+        errdefer self.handler.alloc.destroy(paged);
+        paged.allocation = .{ .backing = self.handler.alloc, .budget = self.work_budget };
+        paged.reader = (graph_segment_mod.AdjacencyReader.init(paged.allocation.allocator(), self.session.artifacts, artifact_ref, self.session.cancellation, &self.graph_read_remaining) catch |err| return paged.translate(err)) orelse {
+            self.handler.alloc.destroy(paged);
+            try self.retained_lease.resize(prior);
+            return null;
+        };
+        errdefer paged.reader.deinit();
+        try self.reserveRetained(try std.math.mul(usize, paged.reader.tables.len, @sizeOf([]u8)));
+        const metadata = try self.handler.alloc.alloc([]u8, paged.reader.tables.len);
+        errdefer self.handler.alloc.free(metadata);
+        var initialized: usize = 0;
+        errdefer for (metadata[0..initialized]) |value| self.handler.alloc.free(value);
+        for (paged.reader.tables, metadata) |table, *value| {
+            const reserved = try std.math.add(usize, try std.math.mul(usize, table.len, 6), "{\"target_table\":\"\"}".len);
+            try self.reserveRetained(reserved);
+            value.* = try std.json.Stringify.valueAlloc(self.handler.alloc, .{ .target_table = table }, .{});
+            initialized += 1;
+            try self.retained_lease.resize(self.retained_lease.bytes - (reserved - value.len));
+        }
+        const name = try self.handler.alloc.dupe(u8, index_name);
+        errdefer self.handler.alloc.free(name);
+        try self.ensureRetainedListCapacity(CachedPublicGraphSegment, &self.segments, self.segments.items.len + 1);
+        self.segments.appendAssumeCapacity(.{ .index_name = name, .paged = paged, .neighbor_table_metadata = metadata });
+        return &self.segments.items[self.segments.items.len - 1];
+    }
+
     fn graphSegment(self: *PublicGraphRequestCache, index_name: []const u8) !*const CachedPublicGraphSegment {
         for (self.segments.items) |*entry| {
             if (std.mem.eql(u8, entry.index_name, index_name)) return entry;
@@ -6966,8 +7016,11 @@ const PublicGraphRequestCache = struct {
         const graph_index = query_mod.graph_reader.findGraphArtifactIndex(self.session, index_name) orelse
             return error.GraphSegmentNotFound;
         const artifact_ref = self.session.artifactRef(graph_index) orelse return error.GraphSegmentNotFound;
+        if (try self.pagedGraphSegment(index_name, artifact_ref)) |entry| return entry;
         const payload_len = std.math.cast(usize, artifact_ref.byte_len) orelse
             return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        if (payload_len > self.graph_read_remaining) return error.GraphTraversalQueryBudgetExceeded;
+        self.graph_read_remaining -= payload_len;
         var payload_lease = try graph_work_budget_mod.RetainedLease.init(self.work_budget, payload_len);
         defer payload_lease.deinit();
         const payload = try self.session.fetchArtifactAlloc(graph_index);
@@ -7250,12 +7303,17 @@ const ServerlessPatternEdgeReader = struct {
             return error.GraphExternalAliasSourceUnsupported;
         var owned_bytes: usize = 0;
         for (probes, 0..) |probe, probe_index| {
-            const adjacency = self.cached.adjacency_index.find(self.cached.segment, probe.source) orelse continue;
-            const lookup = graph_segment_mod.findEdgeByTypeAndNeighbor(
-                adjacency.out_edges,
-                probe.edge_type,
-                probe.target,
-            );
+            var paged_edge: ?graph_segment_mod.Edge = null;
+            defer if (paged_edge) |*edge| edge.deinit(self.cached.paged.?.reader.alloc);
+            const lookup: graph_segment_mod.EdgeLookup = if (self.cached.paged) |paged| blk: {
+                var remaining = public_graph_max_edges_scanned -| self.budget.edges_scanned;
+                const initial = remaining;
+                paged_edge = paged.reader.probe(probe.source, probe.edge_type, probe.target, &remaining) catch |err| return paged.translate(err);
+                break :blk .{ .edge = paged_edge, .inspected = initial - remaining };
+            } else blk: {
+                const adjacency = self.cached.adjacency_index.find(self.cached.segment, probe.source) orelse continue;
+                break :blk graph_segment_mod.findEdgeByTypeAndNeighbor(adjacency.out_edges, probe.edge_type, probe.target);
+            };
             try self.budget.admitEdges(lookup.inspected);
             if (lookup.edge) |edge| {
                 const metadata = self.cached.edgeMetadata(edge);
@@ -7330,13 +7388,20 @@ fn allocPublicSegmentEdgesBounded(
     // Serverless snapshots contain one table-local graph segment. Never alias a
     // cross-table identity into that local key space.
     if (table != null) return try alloc.alloc(graph_mod.Edge, 0);
-    const adjacency = cached.adjacency_index.find(cached.segment, key) orelse
-        return try alloc.alloc(graph_mod.Edge, 0);
+    var paged_adjacency: ?graph_segment_mod.Adjacency = null;
+    defer if (paged_adjacency) |*adjacency| adjacency.deinit(cached.paged.?.reader.alloc);
+    const adjacency = if (cached.paged) |paged| blk: {
+        var remaining = public_graph_max_edges_scanned -| budget.edges_scanned;
+        const initial = remaining;
+        paged_adjacency = paged.reader.adjacencyFiltered(key, edge_types, direction, max_edges, &remaining, include_qualified_targets, true) catch |err| return paged.translate(err);
+        try budget.admitEdges(initial - remaining);
+        break :blk paged_adjacency orelse return try alloc.alloc(graph_mod.Edge, 0);
+    } else cached.adjacency_index.find(cached.segment, key) orelse return try alloc.alloc(graph_mod.Edge, 0);
     // Charge physical adjacency work even when a mirrored self-loop is later
     // suppressed from the logical result.
     const scanned = (if (direction == .out or direction == .both) adjacency.out_edges.len else 0) +
         (if (direction == .in or direction == .both) adjacency.in_edges.len else 0);
-    try budget.admitEdges(scanned);
+    if (cached.paged == null) try budget.admitEdges(scanned);
 
     var edge_count: usize = 0;
     var owned_bytes: usize = 0;

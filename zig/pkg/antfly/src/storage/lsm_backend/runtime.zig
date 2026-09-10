@@ -3960,6 +3960,57 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             return self.backend.getMergedWithOverlay(&self.backend.mutable, &self.mutable, self.namespace, key);
         }
 
+        pub fn containsManySorted(self: *@This(), keys: []const []const u8, present: []bool) !void {
+            if (self.closed) return error.TransactionClosed;
+            if (keys.len != present.len or !keysAreSorted(keys)) return error.InvalidBatch;
+            @memset(present, false);
+            self.backend.recordGetManySorted(keys.len);
+            self.backend.recordGetManySortedLocality(keys);
+            var offset: usize = 0;
+            while (offset < keys.len) {
+                const end = @min(keys.len, offset + 256);
+                // Values only borrow the live view while locked. Pins, table
+                // decode scratch and run metadata are released after each page,
+                // never appended to the write batch's retained value inventory.
+                const locked = lockBackend(BackendType, self.backend);
+                defer unlockBackend(BackendType, self.backend, locked);
+                var layout = try CurrentReadLayout(BackendType).init(self.backend, self.allocator);
+                defer layout.deinit();
+                var blocks = std.ArrayListUnmanaged(cache_mod.Handle).empty;
+                defer releaseHeldBlocks(&blocks, self.backend.allocator);
+                var values = std.ArrayListUnmanaged([]u8).empty;
+                defer {
+                    for (values.items) |value| self.allocator.free(value);
+                    values.deinit(self.allocator);
+                }
+                var indexes = RunBatchIndexHandles{ .allocator = self.metadata_allocator };
+                defer indexes.deinit();
+                var group: ?usize = null;
+                var hint: ?BorrowedReadHint = null;
+                for (keys[offset..end], present[offset..end]) |key, *exists| {
+                    var bulk = self.bulk_appends.entries.items.len;
+                    while (bulk != 0) {
+                        bulk -= 1;
+                        const entry = self.bulk_appends.entries.items[bulk];
+                        if (compareEntryTo(entry, self.namespace, key) == .eq) {
+                            exists.* = !entry.tombstone;
+                            break;
+                        }
+                    } else {
+                        if (self.mutable.findIndex(self.namespace, key)) |i| {
+                            exists.* = !self.mutable.entries.items[i].tombstone;
+                            continue;
+                        }
+                        exists.* = if (getFromSnapshotRuns(self.backend, &self.backend.mutable, layout.immutable_memtables, layout.runs, layout.l0_groups, layout.levels, &group, &hint, &blocks, &values, self.allocator, self.namespace, key, true, &indexes)) |_| true else |err| switch (err) {
+                            error.NotFound => false,
+                            else => return err,
+                        };
+                    }
+                }
+                offset = end;
+            }
+        }
+
         pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
             if (self.closed) return error.TransactionClosed;
             if (keys.len != values.len) return error.InvalidBatch;

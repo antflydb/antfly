@@ -198,6 +198,8 @@ pub fn main(init: std.process.Init) !void {
     var ordinal_cursors_only = false;
     var indexing_only = false;
     while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--paged-only")) return @import("paged_read_bench.zig").run(init.io, &output);
+        if (std.mem.eql(u8, arg, "--presence-only")) return benchmarkPresence(&output);
         if (std.mem.eql(u8, arg, "--indexing-only")) {
             indexing_only = true;
             continue;
@@ -496,11 +498,77 @@ fn benchmarkCommittedCounters(io: std.Io, out: anytype) !void {
             .nodes = ids.len,
             .median_ns = samples[2],
             .endpoint_counter_reads = if (reference) writes.len * 4 else ids.len * 2,
-            .note = "default durable LSM; six insert+delete cycles, first discarded; identical original/final topology; includes both directional commits and WAL, excludes fixture; no forced compaction or reopen",
+            .note = "default durable LSM; scalar presence/per-edge counters versus sorted presence/coalesced counters; six insert+delete cycles, first discarded; identical original/final topology; includes both directional commits and WAL, excludes fixture; no forced compaction or reopen",
         }, .{});
         try out.interface.writeAll(json);
         try out.interface.writeByte('\n');
         try out.flush();
+    }
+}
+
+fn benchmarkPresence(out: anytype) !void {
+    const alloc = std.heap.smp_allocator;
+    const lsm = antfly.lsm_backend;
+    for ([_]usize{ 256, 16384 }) |value_bytes| {
+        var fixture = std.heap.ArenaAllocator.init(alloc);
+        defer fixture.deinit();
+        const a = fixture.allocator();
+        const keys = try a.alloc([]const u8, 1024);
+        for (keys, 0..) |*key, i| key.* = try std.fmt.allocPrint(a, "reverse/link/source-{d:0>8}", .{i});
+        const value = try a.alloc(u8, value_bytes);
+        @memset(value, 'm');
+        var stats = PhaseAllocStats{};
+        var tracking = PhaseTrackingAllocator{ .backing = alloc, .stats = &stats };
+        const measured_alloc = tracking.allocator();
+        var storage = lsm.MemoryStorage.init(alloc);
+        defer storage.deinit();
+        var cache = lsm.Cache.init(measured_alloc, lsm.DefaultCacheSizeBytes);
+        defer cache.deinit();
+        var backend = try lsm.Backend.open(measured_alloc, "/graph-presence-bench", .{ .flush_threshold = 1, .storage = storage.storage(), .cache = &cache });
+        defer backend.close();
+        var runtime = try backend.runtimeStore(measured_alloc, .{ .name = "graph" });
+        defer runtime.deinit();
+        {
+            var write = try runtime.beginWrite();
+            errdefer write.abort();
+            for (keys) |key| try write.put(key, value);
+            try write.commit();
+        }
+        while (try backend.runMaintenanceStep()) {}
+        for ([_]bool{ true, false }) |reference| {
+            var samples: [5]u64 = undefined;
+            var peaks: [5]usize = undefined;
+            var copies: u64 = 0;
+            for (0..6) |sample| {
+                const baseline = stats.current_bytes;
+                stats.peak_bytes = baseline;
+                const before = backend.snapshotReadStats();
+                const started = antfly.platform_time.monotonicNs();
+                var batch = try runtime.beginBatch();
+                errdefer batch.abort();
+                if (reference) {
+                    for (keys) |key| if ((try batch.get(key)).len != value.len) return error.InvalidBenchmarkResult;
+                } else {
+                    var present: [1024]bool = undefined;
+                    try batch.containsManySorted(keys, &present);
+                    for (present) |exists| if (!exists) return error.InvalidBenchmarkResult;
+                }
+                batch.abort();
+                const elapsed = antfly.platform_time.monotonicNs() - started;
+                copies = backend.snapshotReadStats().point_value_copies - before.point_value_copies;
+                if (copies != (if (reference) @as(u64, keys.len) else 0)) return error.InvalidBenchmarkResult;
+                if (sample != 0) {
+                    samples[sample - 1] = elapsed;
+                    peaks[sample - 1] = stats.peak_bytes -| baseline;
+                }
+            }
+            std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
+            std.mem.sort(usize, &peaks, {}, std.sort.asc(usize));
+            const json = try std.json.Stringify.valueAlloc(a, .{ .mode = if (reference) "scalar_presence" else "sorted_presence", .keys = keys.len, .value_bytes = value_bytes, .median_ns = samples[2], .extra_peak_bytes = peaks[2], .value_copies = copies, .note = "warm immutable LSM runs and block cache on modeled storage; identical existing-key results; six samples, first discarded; includes batch lifetime; excludes fixture and disk latency" }, .{});
+            try out.interface.writeAll(json);
+            try out.interface.writeByte('\n');
+            try out.flush();
+        }
     }
 }
 
