@@ -142,11 +142,11 @@ def test_last(cli_server, setup_probe):
         assert (root / "server.log").read_text() == "retained diagnostics"
 
 
-@pytest.mark.parametrize("total", [10 * 1024**3, 1024**4])
+@pytest.mark.parametrize("total", [10 * 1024**3, 100 * 1024**3, 1024**4])
 def test_storage_preflight_matches_absolute_and_fractional_safety_floor(
     monkeypatch, tmp_path, total
 ):
-    floor = max(1024**3, total // 20)
+    floor = max(1024**3, min(total // 20, 16 * 1024**3))
     required = floor + 256 * 1024**2
     observation = SimpleNamespace(total=total, free=required - 1)
     paths = []

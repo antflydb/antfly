@@ -172,16 +172,15 @@ pub const RaBitQuantizedVectorSet = struct {
     }
 
     pub fn clone(self: *const RaBitQuantizedVectorSet, alloc: Allocator) !RaBitQuantizedVectorSet {
-        return .{
-            .metric = self.metric,
-            .centroid = try alloc.dupe(f32, self.centroid),
-            .codes = try self.codes.clone(alloc),
-            .code_counts = try alloc.dupe(u32, self.code_counts),
-            .centroid_distances = try alloc.dupe(f32, self.centroid_distances),
-            .quantized_dot_products = try alloc.dupe(f32, self.quantized_dot_products),
-            .centroid_dot_products = try alloc.dupe(f32, self.centroid_dot_products),
-            .centroid_norm = self.centroid_norm,
-        };
+        var result: RaBitQuantizedVectorSet = .{ .metric = self.metric, .centroid_norm = self.centroid_norm };
+        errdefer result.deinit(alloc);
+        result.centroid = try alloc.dupe(f32, self.centroid);
+        result.codes = try self.codes.clone(alloc);
+        result.code_counts = try alloc.dupe(u32, self.code_counts);
+        result.centroid_distances = try alloc.dupe(f32, self.centroid_distances);
+        result.quantized_dot_products = try alloc.dupe(f32, self.quantized_dot_products);
+        result.centroid_dot_products = try alloc.dupe(f32, self.centroid_dot_products);
+        return result;
     }
 
     pub fn deinit(self: *RaBitQuantizedVectorSet, alloc: Allocator) void {

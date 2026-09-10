@@ -325,6 +325,7 @@ pub const LsmStorageStatus = struct {
 };
 
 pub const TableStorageStatus = struct {
+    source_vectors: ?@import("../storage/artifact_payload.zig").Stats = null,
     table_name: []const u8,
     empty: bool,
     disk_usage: ?u64 = null,
@@ -797,6 +798,7 @@ pub fn encodeStoredCreateTableRequestAlloc(alloc: std.mem.Allocator, req: Create
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
     var root = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{}", .{});
+    try root.object.put(arena, "storage", try std.json.parseFromSliceLeaky(std.json.Value, arena, try std.json.Stringify.valueAlloc(arena, req.storage, .{}), .{}));
     if (req.num_shards) |num_shards| {
         try root.object.put(arena, "num_shards", .{ .integer = @intCast(num_shards) });
     }
@@ -842,6 +844,8 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
 
     var req: CreateTableRequest = .{};
     errdefer req.deinit(alloc);
+
+    if (root.get("storage")) |value| req.storage = try @import("../common/table_storage.zig").Settings.parse(value);
 
     if (root.get("num_shards")) |value| {
         if (value != .null) req.num_shards = try parseU32Field(value);
@@ -1180,6 +1184,7 @@ fn isAlgebraicInternalConfigField(field: []const u8) bool {
 pub fn deriveTableRecord(table_name: []const u8, req: CreateTableRequest) metadata_table_manager.TableRecord {
     const min_ranges = req.num_shards orelse 1;
     return .{
+        .storage = req.storage,
         .table_id = deriveId(table_name, 0x54424c45),
         .name = table_name,
         .description = req.description orelse "",
@@ -1514,6 +1519,14 @@ fn validateNamedFullTextQueryIndexes(
     }
 }
 
+fn generatedSourceVectorStats(stats: @import("../storage/artifact_payload.zig").Stats) metadata_openapi.VectorSourceStorageStatus {
+    var out: metadata_openapi.VectorSourceStorageStatus = .{};
+    inline for (@typeInfo(@TypeOf(stats)).@"struct".fields) |field| {
+        @field(out, field.name) = @intCast(@min(@field(stats, field.name), std.math.maxInt(i64)));
+    }
+    return out;
+}
+
 fn buildTableStatus(
     alloc: std.mem.Allocator,
     snapshot: *const metadata_api.AdminSnapshot,
@@ -1541,6 +1554,7 @@ fn buildTableStatus(
     return .{
         .name = table.name,
         .description = if (table.description.len > 0) table.description else null,
+        .storage = .{ .dense_embeddings = @tagName(table.storage.dense_embeddings) },
         .indexes = try parseTableIndexes(alloc, table.indexes_json),
         .shards = shards,
         .schema = try parseOptionalTableSchema(alloc, table.schema_json),
@@ -1551,6 +1565,7 @@ fn buildTableStatus(
         .replication_sources = try parseReplicationSources(alloc, snapshot, table, include_replication_runtime),
         .field_capabilities = try generatedFieldCapabilitiesAlloc(alloc, table, storage_status),
         .storage_status = .{
+            .source_vectors = if (storage_status) |status| if (status.source_vectors) |stats| generatedSourceVectorStats(stats) else null else null,
             .disk_usage = if (storage_status) |status|
                 if (status.disk_usage) |bytes| @intCast(@min(bytes, std.math.maxInt(i64))) else null
             else
@@ -4800,13 +4815,14 @@ test "stored create table encoding round-trips a normalized public request" {
 test "stored create table encoding preserves empty requests" {
     const encoded = try encodeStoredCreateTableRequestAlloc(std.testing.allocator, .{});
     defer std.testing.allocator.free(encoded);
-    try std.testing.expectEqualStrings("{}", encoded);
+    try std.testing.expectEqualStrings("{\"storage\":{\"dense_embeddings\":\"primary_lsm\"}}", encoded);
 
     var decoded = try parseStoredCreateTableRequest(std.testing.allocator, encoded);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?u32, null), decoded.num_shards);
     try std.testing.expect(decoded.description == null);
     try std.testing.expect(decoded.schema_json == null);
+    try std.testing.expectEqual(.primary_lsm, decoded.storage.dense_embeddings);
 }
 
 test "create table parser rejects schemas that cannot derive runtime mappings" {
