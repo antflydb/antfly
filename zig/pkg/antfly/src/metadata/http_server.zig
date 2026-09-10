@@ -2895,6 +2895,7 @@ pub const MetadataHttpServer = struct {
         self.tableOperations().create(ctx.allocator, request_context, table_name, request) catch |err| switch (err) {
             error.TableAlreadyExists => return ctx.status(409).text("table already exists"),
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest, error.InvalidArgument => return ctx.status(400).text("invalid create table request"),
+            error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => return ctx.status(400).text("vector_store requires a fresh local single-shard standalone table without replication"),
             error.CreateTableShardCountOutOfRange => return ctx.status(400).text(tables_api.table_initial_ranges_error_message),
             error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
             error.CreateTableRequestTooLarge => {
@@ -3461,6 +3462,8 @@ const ParsedRuntimeIndexStatus = struct {
     replay_applied_sequence: ?u64 = null,
     replay_target_sequence: ?u64 = null,
     replay_catch_up_required: ?bool = null,
+    dense_vector_projection_pending: ?bool = null,
+    dense_native_storage_phase: ?metadata_table_manager.DenseNativeStoragePhase = null,
     embedding_activity_observed: ?bool = null,
     embedding_activity: ?ParsedRuntimeEmbeddingActivityStatus = null,
     source_replay: ?[]ParsedRuntimeIndexSourceReplayStatus = null,
@@ -3524,6 +3527,7 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         status_generation: ?u64 = null,
         artifact_sources_protocol_version: ?u16 = null,
         native_generation_restore_version: ?u16 = null,
+        dense_native_storage_protocol_version: ?u16 = null,
         api_url: ?[]const u8 = null,
         raft_url: ?[]const u8 = null,
         role: ?[]const u8 = null,
@@ -3553,6 +3557,10 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         parsed.value.reporter_incarnation orelse 0,
         parsed.value.artifact_sources_protocol_version orelse 0,
     )) return error.InvalidStoreReporterFence;
+    if (!metadata_table_manager.denseNativeStorageProtocolValid(
+        parsed.value.reporter_incarnation orelse 0,
+        parsed.value.dense_native_storage_protocol_version orelse 0,
+    )) return error.InvalidStoreReporterFence;
     const group_statuses = try cloneParsedGroupStatuses(alloc, parsed.value.group_statuses orelse &.{});
     errdefer metadata_table_manager.freeGroupStatuses(alloc, group_statuses);
     const runtime_statuses = try cloneParsedRuntimeGroupStatuses(alloc, parsed.value.runtime_statuses orelse &.{});
@@ -3564,6 +3572,7 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         .status_generation = parsed.value.status_generation orelse 0,
         .artifact_sources_protocol_version = parsed.value.artifact_sources_protocol_version orelse 0,
         .native_generation_restore_version = parsed.value.native_generation_restore_version orelse 0,
+        .dense_native_storage_protocol_version = parsed.value.dense_native_storage_protocol_version orelse 0,
         .api_url = try alloc.dupe(u8, parsed.value.api_url orelse ""),
         .raft_url = try alloc.dupe(u8, parsed.value.raft_url orelse ""),
         .role = try alloc.dupe(u8, parsed.value.role orelse "data"),
@@ -3658,6 +3667,7 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
         reporter_incarnation: ?u64 = null,
         status_generation: ?u64 = null,
         artifact_sources_protocol_version: ?u16 = null,
+        dense_native_storage_protocol_version: ?u16 = null,
         live: ?bool = null,
         health_class: ?[]const u8 = null,
         capacity_bytes: ?u64 = null,
@@ -3686,6 +3696,10 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
         parsed.value.reporter_incarnation orelse 0,
         parsed.value.artifact_sources_protocol_version orelse 0,
     )) return error.InvalidStoreReporterFence;
+    if (!metadata_table_manager.denseNativeStorageProtocolValid(
+        parsed.value.reporter_incarnation orelse 0,
+        parsed.value.dense_native_storage_protocol_version orelse 0,
+    )) return error.InvalidStoreReporterFence;
     const group_statuses = try cloneParsedGroupStatuses(alloc, parsed.value.group_statuses orelse &.{});
     errdefer metadata_table_manager.freeGroupStatuses(alloc, group_statuses);
     const runtime_statuses = try cloneParsedRuntimeGroupStatuses(alloc, parsed.value.runtime_statuses orelse &.{});
@@ -3703,6 +3717,7 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
         .reporter_incarnation = parsed.value.reporter_incarnation orelse 0,
         .status_generation = parsed.value.status_generation orelse 0,
         .artifact_sources_protocol_version = parsed.value.artifact_sources_protocol_version orelse 0,
+        .dense_native_storage_protocol_version = parsed.value.dense_native_storage_protocol_version orelse 0,
         .live = parsed.value.live orelse true,
         .health_class = try alloc.dupe(u8, parsed.value.health_class orelse "healthy"),
         .capacity_bytes = parsed.value.capacity_bytes orelse 0,
@@ -3897,6 +3912,8 @@ fn cloneParsedRuntimeIndexStatus(
         .replay_applied_sequence = parsed.replay_applied_sequence orelse 0,
         .replay_target_sequence = parsed.replay_target_sequence orelse 0,
         .replay_catch_up_required = parsed.replay_catch_up_required orelse false,
+        .dense_vector_projection_pending = parsed.dense_vector_projection_pending orelse false,
+        .dense_native_storage_phase = parsed.dense_native_storage_phase orelse .legacy,
         .embedding_activity_observed = parsed.embedding_activity_observed orelse false,
         .embedding_activity = if (parsed.embedding_activity) |activity| .{
             .epoch = activity.epoch orelse 0,
@@ -3916,10 +3933,10 @@ fn cloneParsedRuntimeIndexStatus(
     };
 }
 
-test "metadata status JSON preserves compact managed repair admission state" {
+test "metadata status JSON preserves compact managed index admission state" {
     const alloc = std.testing.allocator;
     const report = try parseStoreStatusReport(alloc,
-        \\{"store_id":20,"reporter_incarnation":77,"embedding_activity_protocol_version":2,"embedding_activity_sequence":3,"runtime_statuses":[{"group_id":10,"indexes":[{"name":"thumbnail","kind":"dense_vector","publication_target_count":2500,"publication_target_ready":true,"serving_snapshot_ready":true,"embedding_activity_observed":true,"embedding_activity":{"epoch":7,"sample_sequence":2,"phase":"waiting_retry","chunks_created":9,"embedding_batches_completed":2,"embeddings_computed":8,"active_batch_size":4,"last_progress_at_ms":1787990400000},"lifecycle_work_class":"repair","repair_status":"waiting","repair_active_generation_serviceable":true},{"name":"legacy","kind":"full_text","repair_active_generation_serviceable":true},{"name":"mixed_version","coverage_generation":7,"coverage_config_hash":8}]}]}
+        \\{"store_id":20,"reporter_incarnation":77,"embedding_activity_protocol_version":2,"embedding_activity_sequence":3,"runtime_statuses":[{"group_id":10,"indexes":[{"name":"thumbnail","kind":"dense_vector","publication_target_count":2500,"publication_target_ready":true,"serving_snapshot_ready":true,"embedding_activity_observed":true,"embedding_activity":{"epoch":7,"sample_sequence":2,"phase":"waiting_retry","chunks_created":9,"embedding_batches_completed":2,"embeddings_computed":8,"active_batch_size":4,"last_progress_at_ms":1787990400000},"lifecycle_work_class":"repair","repair_status":"waiting","repair_active_generation_serviceable":true,"dense_vector_projection_pending":true,"dense_native_storage_phase":"native_validating"},{"name":"legacy","kind":"full_text","repair_active_generation_serviceable":true},{"name":"mixed_version","coverage_generation":7,"coverage_config_hash":8}]}]}
     );
     defer freeStoreStatusReport(alloc, report);
 
@@ -3928,6 +3945,8 @@ test "metadata status JSON preserves compact managed repair admission state" {
     try std.testing.expectEqual(@as(usize, 3), indexes.len);
     try std.testing.expectEqual(metadata_table_manager.IndexRepairStatus.waiting, indexes[0].repair_status.?);
     try std.testing.expect(indexes[0].repair_active_generation_serviceable);
+    try std.testing.expect(indexes[0].dense_vector_projection_pending);
+    try std.testing.expectEqual(metadata_table_manager.DenseNativeStoragePhase.native_validating, indexes[0].dense_native_storage_phase);
     try std.testing.expect(indexes[0].publication_target_ready);
     try std.testing.expectEqual(@as(u64, 2500), indexes[0].publication_target_count);
     try std.testing.expect(indexes[0].serving_snapshot_ready);
@@ -3940,6 +3959,8 @@ test "metadata status JSON preserves compact managed repair admission state" {
     // normalization from a malformed or mixed-version producer.
     try std.testing.expect(indexes[1].repair_status == null);
     try std.testing.expect(!indexes[1].repair_active_generation_serviceable);
+    try std.testing.expect(!indexes[1].dense_vector_projection_pending);
+    try std.testing.expectEqual(metadata_table_manager.DenseNativeStoragePhase.legacy, indexes[1].dense_native_storage_phase);
     // A mixed-version producer can omit both fields. Preserve that absence as
     // an incomplete identity so it cannot authorize repair-state deletion.
     try std.testing.expectEqualStrings("", indexes[2].kind);

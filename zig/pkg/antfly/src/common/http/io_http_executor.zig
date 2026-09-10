@@ -116,13 +116,21 @@ pub const IoHttpExecutor = struct {
             header_index += 1;
         }
 
-        if (req.delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
         var response = try self.client.request(switch (req.method) {
             .GET => .GET,
             .POST => .POST,
             .PUT => .PUT,
             .DELETE => .DELETE,
         }, req.uri, .{
+            .delivery_observer = if (req.delivery_tracker) |tracker| .{
+                .context = tracker,
+                .before_send = struct {
+                    fn mark(context: *anyopaque) void {
+                        const observer: *common.RequestDeliveryTracker = @ptrCast(@alignCast(context));
+                        observer.markMayHaveBeenSent();
+                    }
+                }.mark,
+            } else null,
             .headers = header_pairs,
             .body = if (req.body.len == 0) null else req.body,
             .timeout_ms = if (req.timeout_ms) |timeout_ms| timeout_ms else null,
@@ -191,6 +199,24 @@ test "I/O HTTP executor rejects an already-cancelled request without transport w
         .method = .GET,
         .uri = "http://127.0.0.1:1/never-sent",
         .cancellation = &cancellation,
+        .delivery_tracker = &tracker,
+    }));
+    try std.testing.expectEqual(.not_sent, tracker.load());
+}
+
+test "I/O HTTP executor preserves not-sent proof when concurrency admission fails" {
+    // One task permits the watchdog but rejects the network task. Neither
+    // partial task admission nor its cancellation may lose not-sent proof.
+    var runtime = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
+    defer runtime.deinit();
+    var executor = IoHttpExecutor.init(std.testing.allocator, runtime.io(), .{});
+    defer executor.deinit();
+    var tracker: common.RequestDeliveryTracker = .{};
+    try std.testing.expectError(error.ConcurrencyUnavailable, executor.executor().execute(std.testing.allocator, .{
+        .method = .POST,
+        .uri = "http://127.0.0.1:1/never-sent",
+        .body = "{}",
+        .timeout_ms = 1000,
         .delivery_tracker = &tracker,
     }));
     try std.testing.expectEqual(.not_sent, tracker.load());

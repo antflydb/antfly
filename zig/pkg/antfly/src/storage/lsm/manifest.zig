@@ -17,11 +17,13 @@ const Crc32 = @import("antfly_hash").Crc32;
 const lsm_table_file = @import("table_file.zig");
 
 pub const magic = "ALSMMAN1";
-pub const version: u32 = 9;
+pub const version: u32 = 10;
+const legacy_version: u32 = 9;
 const checksum_len: usize = @sizeOf(u32);
 
 pub const RunMeta = struct {
     id: u64,
+    l0_sequence: u64 = 0,
     level: u32,
     size_bytes: u64,
     compression_stats: lsm_table_file.CompressionStats = .{},
@@ -40,6 +42,7 @@ pub const ObsoletePathMeta = struct {
 
 pub const OwnedRunMeta = struct {
     id: u64,
+    l0_sequence: u64 = 0,
     level: u32,
     size_bytes: u64,
     compression_stats: lsm_table_file.CompressionStats = .{},
@@ -92,6 +95,7 @@ pub const OwnedManifest = struct {
 
 pub const BorrowedRunMeta = struct {
     id: u64,
+    l0_sequence: u64 = 0,
     level: u32,
     size_bytes: u64,
     compression_stats: lsm_table_file.CompressionStats = .{},
@@ -123,16 +127,24 @@ pub const BorrowedManifest = struct {
 };
 
 pub fn encodeAlloc(allocator: std.mem.Allocator, manifest: Manifest) ![]u8 {
+    return encodeAllocVersion(allocator, manifest, version);
+}
+
+fn encodeAllocVersion(allocator: std.mem.Allocator, manifest: Manifest, encoded_version: u32) ![]u8 {
+    if (encoded_version != version and encoded_version != legacy_version) return error.UnsupportedVersion;
     var bytes = std.ArrayListUnmanaged(u8).empty;
     errdefer bytes.deinit(allocator);
 
     try bytes.appendSlice(allocator, magic);
-    try appendU32(allocator, &bytes, version);
+    try appendU32(allocator, &bytes, encoded_version);
     try appendU64(allocator, &bytes, manifest.next_run_id);
     try appendU32(allocator, &bytes, @intCast(manifest.runs.len));
     try appendU32(allocator, &bytes, @intCast(manifest.obsolete_paths.len));
     for (manifest.runs) |run| {
         try appendU64(allocator, &bytes, run.id);
+        if (encoded_version >= 10) {
+            try appendU64(allocator, &bytes, if (run.l0_sequence != 0) run.l0_sequence else run.id);
+        }
         try appendU32(allocator, &bytes, run.level);
         try appendU64(allocator, &bytes, run.size_bytes);
         try appendCompressionStats(allocator, &bytes, run.compression_stats);
@@ -166,12 +178,13 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, raw: []const u8) !OwnedManifest
     cursor += magic.len;
 
     const found_version = try readU32(body, &cursor);
-    if (found_version != version) return error.UnsupportedVersion;
+    if (found_version != version and found_version != legacy_version) return error.UnsupportedVersion;
 
     const next_run_id = try readU64(body, &cursor);
     const run_count: usize = @intCast(try readU32(body, &cursor));
     const obsolete_count: usize = @intCast(try readU32(body, &cursor));
-    if (run_count > (body.len - cursor) / 84) return error.InvalidManifest;
+    const minimum_run_bytes: usize = if (found_version >= 10) 92 else 84;
+    if (run_count > (body.len - cursor) / minimum_run_bytes) return error.InvalidManifest;
     if (obsolete_count > (body.len - cursor) / 12) return error.InvalidManifest;
     var out: OwnedManifest = .{
         .next_run_id = next_run_id,
@@ -194,6 +207,7 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, raw: []const u8) !OwnedManifest
 
     for (out.runs) |*run| {
         const id = try readU64(body, &cursor);
+        const l0_sequence = if (found_version >= 10) try readU64(body, &cursor) else id;
         const level = try readU32(body, &cursor);
         const size_bytes = try readU64(body, &cursor);
         const compression_stats = try readCompressionStats(body, &cursor);
@@ -207,6 +221,7 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, raw: []const u8) !OwnedManifest
 
         run.* = .{
             .id = id,
+            .l0_sequence = l0_sequence,
             .level = level,
             .size_bytes = size_bytes,
             .compression_stats = compression_stats,
@@ -243,12 +258,13 @@ pub fn decodeBorrowedOwnedAlloc(allocator: std.mem.Allocator, raw: []u8) !Borrow
     cursor += magic.len;
 
     const found_version = try readU32(body, &cursor);
-    if (found_version != version) return error.UnsupportedVersion;
+    if (found_version != version and found_version != legacy_version) return error.UnsupportedVersion;
 
     const next_run_id = try readU64(body, &cursor);
     const run_count: usize = @intCast(try readU32(body, &cursor));
     const obsolete_count: usize = @intCast(try readU32(body, &cursor));
-    if (run_count > (body.len - cursor) / 84) return error.InvalidManifest;
+    const minimum_run_bytes: usize = if (found_version >= 10) 92 else 84;
+    if (run_count > (body.len - cursor) / minimum_run_bytes) return error.InvalidManifest;
     if (obsolete_count > (body.len - cursor) / 12) return error.InvalidManifest;
     const out: BorrowedManifest = .{
         .raw = raw,
@@ -263,6 +279,7 @@ pub fn decodeBorrowedOwnedAlloc(allocator: std.mem.Allocator, raw: []u8) !Borrow
 
     for (out.runs) |*run| {
         const id = try readU64(body, &cursor);
+        const l0_sequence = if (found_version >= 10) try readU64(body, &cursor) else id;
         const level = try readU32(body, &cursor);
         const size_bytes = try readU64(body, &cursor);
         const compression_stats = try readCompressionStats(body, &cursor);
@@ -276,6 +293,7 @@ pub fn decodeBorrowedOwnedAlloc(allocator: std.mem.Allocator, raw: []u8) !Borrow
 
         run.* = .{
             .id = id,
+            .l0_sequence = l0_sequence,
             .level = level,
             .size_bytes = size_bytes,
             .compression_stats = compression_stats,
@@ -361,6 +379,7 @@ test "manifest codec round trips run metadata" {
     const runs = [_]RunMeta{
         .{
             .id = 7,
+            .l0_sequence = 4,
             .level = 0,
             .size_bytes = 700,
             .compression_stats = .{
@@ -415,6 +434,7 @@ test "manifest codec round trips run metadata" {
     try std.testing.expectEqual(@as(u64, 9), decoded.next_run_id);
     try std.testing.expectEqual(@as(usize, 2), decoded.runs.len);
     try std.testing.expectEqual(@as(u64, 7), decoded.runs[0].id);
+    try std.testing.expectEqual(@as(u64, 4), decoded.runs[0].l0_sequence);
     try std.testing.expectEqual(@as(u32, 0), decoded.runs[0].level);
     try std.testing.expectEqual(@as(u64, 700), decoded.runs[0].size_bytes);
     try std.testing.expectEqual(@as(u64, 900), decoded.runs[0].compression_stats.logical_entry_bytes);
@@ -432,6 +452,30 @@ test "manifest codec round trips run metadata" {
     try std.testing.expectEqual(@as(usize, 1), decoded.obsolete_paths.len);
     try std.testing.expectEqual(@as(u64, 1234), decoded.obsolete_paths[0].delete_after_ns);
     try std.testing.expectEqualStrings("runs/000001.tbl", decoded.obsolete_paths[0].path);
+}
+
+test "manifest v9 decoding defaults l0 sequence to physical id" {
+    const runs = [_]RunMeta{.{
+        .id = 7,
+        .l0_sequence = 4,
+        .level = 0,
+        .size_bytes = 700,
+        .path = "runs/000007.tbl",
+        .smallest_namespace_name = null,
+        .smallest_key = "doc:a",
+        .largest_namespace_name = null,
+        .largest_key = "doc:z",
+        .entry_count = 24,
+    }};
+    const encoded = try encodeAllocVersion(std.testing.allocator, .{
+        .next_run_id = 8,
+        .runs = &runs,
+    }, legacy_version);
+    defer std.testing.allocator.free(encoded);
+
+    var decoded = try decodeAlloc(std.testing.allocator, encoded);
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 7), decoded.runs[0].l0_sequence);
 }
 
 test "manifest borrowed codec round trips run metadata" {

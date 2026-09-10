@@ -354,6 +354,11 @@ jobs:
       - name: Check generated sources
         run: make zig-generated-check
 
+      - name: Compile consolidated storage benchmark contracts
+        if: needs.changes.outputs.zig_tests == 'true'
+        working-directory: zig
+        run: zig build antfly-storage-bench-build -Doptimize=Debug
+
       - name: Test bounded-build tooling
         working-directory: zig
         run: >-
