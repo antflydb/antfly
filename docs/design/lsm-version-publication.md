@@ -134,6 +134,55 @@ compaction throughput claim. Admitted jobs still incur scheduler ownership and
 conflict checks. Maximum turns remain cooperative rather than hard real-time
 bounds.
 
+### Owned admission through execution
+
+Ordinary leveled, L0-only, and tombstone-GC selections now retain an admission
+owner until execution or retirement. The owner prepares IDs, indexed membership,
+byte totals, and bounds off-lock in 2,048-input / 2 ms cooperative quanta. Denial
+keeps that work and its dependency certificate; unchanged epochs do not repeat
+preparation, and later publications are checked against the retained certificate.
+Memory, I/O, and scheduler denials advertise a retry deadline. Foreground-paused
+discovery also advertises a wake, and retired owners receive cleanup turns even
+when no runnable compaction remains. Policy changes and stale identities retire
+the job through bounded reclamation. Existing remembered-work metrics include
+these owned admission retries.
+
+Persisted execution consumes immutable directory handles directly. These already
+own metadata and physical-file pins, so successful admission no longer clones
+every run or materializes another ID/pointer array under the writer mutex. Input
+aggregation runs off-lock; run-ID reservation and publication remain serialized,
+with identity/coverage validation before installation. Foreground finalization
+counts completed compactions against its job allowance and every planning turn
+against its wall-time allowance, yielding through `std.Io` between turns.
+
+Scheduler admission checks job/byte capacity before conflicts. Prepared run-ID
+indexes support membership probes against the smaller input set of each active
+job; unprepared callers get a grant-owned, resource-accounted index. Completing
+a grant releases its owned index and credit without affecting borrowed indexes.
+
+Local arm64 ReleaseFast follow-up (synthetic metadata, not SST throughput):
+
+| Input SSTs | Previous admitted handoff to first read | Pinned admitted handoff | Concurrent indexed admission | Capacity-full denial |
+| --- | ---: | ---: | ---: | ---: |
+| 1,000 | 0.2–0.4 ms | 39 µs | 2.7 µs | 6 ns |
+| 10,000 | 2.2–2.7 ms | 137 µs | 33.9 µs | 6 ns |
+| 50,000 | 13.4–14.9 ms | 673 µs | 593 µs | 6 ns |
+
+The admitted benchmark obtains a real grant and stops at the first synthetic
+SST read, including off-lock setup in its elapsed time. It is not a direct mutex
+hold measurement. Concurrent admission averages 100 disjoint grants beside an
+active equal-sized job; capacity denial averages 1,000 attempts. The earlier
+nested conflict check took roughly 0.25 / 23 / 590 ms to deny these sizes at full
+capacity. Initial index construction, SST opening/merging, and publication are
+not included in the scheduler timings; total compaction work still scales with
+input size. Cooperative budgets are not hard real-time bounds.
+
+```sh
+cd zig
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'compaction admitted pinned' --test-filter 'compaction scheduler prepared membership'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -- --test-filter 'compaction admission' --test-filter 'compaction suspended broad'
+```
+
 ## Read epochs
 
 Async batch reads use the same representation-independent entry accessors as

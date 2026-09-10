@@ -1603,6 +1603,11 @@ pub const Backend = struct {
     planner_seed: usize = 0,
     directory_planning_in_flight: bool = false,
     pending_directory_closure: ?*compaction_mod.PendingDirectoryClosure = null,
+    pending_admissions: [3]?*compaction_mod.PendingAdmission = @splat(null),
+    retired_admissions: ?*compaction_mod.PendingAdmission = null,
+    admission_in_flight: bool = false,
+    admission_reclaim_in_flight: bool = false,
+    domain_admission_retry_after_ns: u64 = 0,
     pending_bulk_plan: ?*compaction_mod.PendingBulkPlan = null,
     active_bulk_plans: ?*compaction_mod.PendingBulkPlan = null,
     retired_bulk_plans: ?*compaction_mod.PendingBulkPlan = null,
@@ -2344,6 +2349,12 @@ pub const Backend = struct {
             stats.compaction_scheduler_remembered_pending_runs = @intCast(remembered.input_runs);
             stats.compaction_scheduler_remembered_pending_bytes = remembered.input_bytes;
         }
+        for (self.pending_admissions) |pending| if (pending) |job| {
+            if (!job.denied) continue;
+            stats.compaction_scheduler_remembered_pending += 1;
+            stats.compaction_scheduler_remembered_pending_runs +|= job.work.input_runs;
+            stats.compaction_scheduler_remembered_pending_bytes +|= job.work.input_bytes;
+        };
         stats.background_io_budget_bytes = self.options.background_io_budget_bytes;
         stats.background_io_reserved_bytes = self.background_io_reserved_bytes;
         stats.background_io_denied_jobs = self.background_io_denied_jobs;
@@ -2582,6 +2593,10 @@ pub const Backend = struct {
             score +|= 1;
         };
         if (self.pending_directory_closure != null or self.pending_l0_directory_closure != null or self.retired_closures != null) score += 1;
+        if (self.retired_admissions != null) score += 1;
+        for (self.pending_admissions) |pending| if (pending != null) {
+            score += 1;
+        };
         if (self.pending_gc != null or self.retired_gc != null or self.directory_reclaimer != null or self.retired_run_directories != null) score +|= 1;
         if (self.retired_run_stores != null or self.store_reclaimer != null) score +|= 1;
         if (self.obsolete_run_count != 0 and (self.obsolete_run_drain_remaining != 0 or self.obsolete_run_pin_epoch != file_pin_release_epoch.load(.acquire))) score +|= 1;
@@ -2731,6 +2746,11 @@ pub const Backend = struct {
         if (self.manifest_checkpoint_directory) |directory| bytes +|= directory.accountedMemoryBytes(pass);
         if (self.pending_directory_closure) |pending| bytes +|= pending.directory.accountedMemoryBytes(pass);
         if (self.pending_l0_directory_closure) |pending| bytes +|= pending.directory.accountedMemoryBytes(pass);
+        for (self.pending_admissions) |pending| if (pending) |job| {
+            bytes +|= job.accountedMemoryBytes(pass);
+        };
+        var retired_admission = self.retired_admissions;
+        while (retired_admission) |pending| : (retired_admission = pending.retired_next) bytes +|= pending.accountedMemoryBytes(pass);
         var active_bulk = self.active_bulk_plans;
         while (active_bulk) |pending| : (active_bulk = pending.active_next) bytes +|= pending.accountedMemoryBytes(pass);
         if (self.pending_tombstone_reconcile) |pending| bytes +|= pending.account.chargeOnce(pass);
@@ -2812,6 +2832,7 @@ pub const Backend = struct {
         if (@hasField(@TypeOf(work), "run_ids")) {
             scheduler_work.run_ids = work.run_ids;
         }
+        if (@hasField(@TypeOf(work), "run_id_index")) scheduler_work.run_id_index = work.run_id_index;
         if (@hasField(@TypeOf(work), "key_range")) {
             scheduler_work.key_range = work.key_range;
         }
@@ -2878,6 +2899,7 @@ pub const Backend = struct {
         // continuation. Retire obsolete jobs even while foreground work owns
         // the I/O lane; unlock reclamation drains their pins in bounded slices.
         const bulk_retired = self.retireUnneededBulkPlanLocked();
+        compaction_mod.retireObsoleteAdmissions(self);
         if (!self.manifest_checkpoint_build_in_flight and self.manifest_journal.sequence != null and self.manifest_journal.checkpointDue()) {
             return try self.manifest_journal.runCheckpoint(self);
         }
@@ -3582,6 +3604,38 @@ pub const Backend = struct {
         self.retired_closures = pending;
     }
 
+    pub fn retireAdmission(self: *Backend, pending: *compaction_mod.PendingAdmission) void {
+        pending.retired_next = self.retired_admissions;
+        self.retired_admissions = pending;
+    }
+
+    fn reclaimAdmissionSliceLocked(self: *Backend) void {
+        if (self.admission_reclaim_in_flight) return;
+        const pending = self.retired_admissions orelse return;
+        self.admission_reclaim_in_flight = true;
+        self.retainReaderKind(.other);
+        self.mu.unlock();
+        var credits: usize = 2048;
+        var done = false;
+        const deadline = platform_time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        while (credits != 0 and platform_time.monotonicNs() < deadline) {
+            var quantum: usize = @min(credits, 64);
+            const before = quantum;
+            done = pending.cleanupStep(self.allocator, &quantum);
+            credits -= before - quantum;
+            if (done) break;
+        }
+        _ = runtime_mod.lockBackend(Backend, self);
+        if (done) {
+            var link = &self.retired_admissions;
+            while (link.*.? != pending) link = &link.*.?.retired_next;
+            link.* = pending.retired_next;
+            pending.destroy(self);
+        }
+        self.admission_reclaim_in_flight = false;
+        self.releaseReaderKind(.other);
+    }
+
     pub fn retireBulkPlanning(self: *Backend, pending: *compaction_mod.PendingBulkPlan) void {
         self.unregisterBulkPlanning(pending);
         pending.retired_next = self.retired_bulk_plans;
@@ -3626,6 +3680,7 @@ pub const Backend = struct {
     }
 
     fn reclaimClosurePlanningSliceLocked(self: *Backend) void {
+        self.reclaimAdmissionSliceLocked();
         if (self.closure_reclaim_in_flight) return;
         const pending = self.retired_closures orelse return;
         self.closure_reclaim_in_flight = true;
@@ -5827,6 +5882,14 @@ pub const Backend = struct {
             self.directory_reclaimer = null;
         }
         if (self.pending_directory_closure) |pending| pending.destroy(self);
+        for (&self.pending_admissions) |*slot| {
+            if (slot.*) |pending| pending.destroy(self);
+            slot.* = null;
+        }
+        while (self.retired_admissions) |pending| {
+            self.retired_admissions = pending.retired_next;
+            pending.destroy(self);
+        }
         self.pending_directory_closure = null;
         if (self.pending_l0_directory_closure) |pending| pending.destroy(self);
         self.pending_l0_directory_closure = null;
@@ -7617,13 +7680,14 @@ pub const Backend = struct {
         const limit = options.max_deferred_l0_runs orelse self.effectiveL0SoftLimitRuns();
         const start_ns = self.writeStatsNowNs();
         var steps: usize = 0;
-        while (steps < max_steps) : (steps += 1) {
+        while (steps < max_steps) {
             if (options.max_foreground_compaction_ns) |budget_ns| {
                 if (budget_ns == 0) break;
                 if (self.writeStatsElapsedNs(start_ns) >= budget_ns) break;
             }
             if (limit > 0 and countLevelRuns(&self.runs, 0) <= limit) break;
             const score = self.maintenanceScoreLocked();
+            const slices_before = self.directory_planning_slices;
             const compacted = try compaction_mod.compactL0ToLimitScheduledWithinBudget(
                 Backend,
                 self,
@@ -7631,7 +7695,20 @@ pub const Backend = struct {
                 score,
                 options.max_foreground_compaction_input_bytes,
             );
-            if (!compacted) break;
+            if (compacted) {
+                steps += 1;
+            } else if (self.directory_planning_slices == slices_before) break;
+            // Preparation quanta do not consume an output-job allowance, but
+            // they do consume the caller's wall-time allowance. Yield between
+            // them and recheck that deadline before doing any more work.
+            if (self.manifestCoordinationIo()) |io| {
+                self.retainReaderKind(.compaction);
+                runtime_mod.unlockBackend(Backend, self, true);
+                const yielded = io.sleep(.fromNanoseconds(1), .awake);
+                _ = runtime_mod.lockBackend(Backend, self);
+                self.releaseReaderKind(.compaction);
+                try yielded;
+            }
         }
         _ = self.refreshCachedMaintenanceHintLocked();
     }
@@ -7896,6 +7973,11 @@ pub const Backend = struct {
         }
 
         var delay_ns = self.nextObsoleteReclaimDelayNsLocked();
+        // Retired owners still need bounded reclamation turns even after a
+        // build error or the last runnable plan disappears. Cleanup is not
+        // optional I/O and must not wait for foreground pressure to clear.
+        if ((self.retired_admissions != null and !self.admission_reclaim_in_flight) or
+            (self.retired_closures != null and !self.closure_reclaim_in_flight)) delay_ns = 0;
         if (self.nextMutableIdleFlushDelayNsLocked()) |candidate| {
             delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
         }
@@ -7911,6 +7993,18 @@ pub const Backend = struct {
         }
         if (self.tombstoneReconcileDelayLocked()) |candidate| delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
         if (self.bulkPlanningWakeDelayLocked()) |candidate| delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
+        if (!self.directory_planning_in_flight and !self.admission_in_flight) {
+            var candidate: ?u64 = if (self.pending_directory_closure != null or self.pending_l0_directory_closure != null) 0 else null;
+            if (self.domain_admission_retry_after_ns != 0) candidate = self.domain_admission_retry_after_ns -| self.nowNs();
+            for (self.pending_admissions) |pending| if (pending) |job| {
+                const retry = job.retry_after_ns -| self.nowNs();
+                candidate = if (candidate) |current| @min(current, retry) else retry;
+            };
+            if (candidate) |due| {
+                const retry = @max(due, if (self.optionalMaintenanceDeferredLocked()) maintenance_admission_retry_ns else 0);
+                delay_ns = if (delay_ns) |current| @min(current, retry) else retry;
+            }
+        }
         return delay_ns;
     }
 
@@ -9020,6 +9114,23 @@ test "lsm backend tight base level target reports lower-level overflow" {
     try std.testing.expect(stats.level_overflow_bytes > 0);
 }
 
+fn drainMaintenanceQuantaForTest(backend: *Backend) !bool {
+    const before = backend.compaction_stats.compactions;
+    var progressed = false;
+    for (0..128) |_| {
+        const step = try backend.runMaintenanceStep();
+        progressed = progressed or step;
+        if (!step or backend.compaction_stats.compactions != before) return progressed;
+    }
+    return error.MaintenanceDidNotConverge;
+}
+
+fn makeAdmissionRetriesDueForTest(backend: *Backend) void {
+    for (backend.pending_admissions) |pending| if (pending) |job| {
+        job.retry_after_ns = 0;
+    };
+}
+
 test "lsm backend scheduled compaction admits lower-level plans over scheduler run-id stack cap" {
     var backend = Backend.init(std.testing.allocator, .{
         .level_target_runs_base = 32,
@@ -9038,7 +9149,8 @@ test "lsm backend scheduled compaction admits lower-level plans over scheduler r
     const progressed = blk: {
         const locked = runtime_mod.lockBackend(Backend, &backend);
         defer runtime_mod.unlockBackend(Backend, &backend, locked);
-        break :blk try compaction_mod.maybeCompactRunsScheduled(Backend, &backend, 1);
+        for (0..128) |_| if (try compaction_mod.maybeCompactRunsScheduled(Backend, &backend, 1)) break :blk true;
+        break :blk false;
     };
     try std.testing.expect(progressed);
     try std.testing.expect(countLevelRuns(&backend.runs, 1) < before_runs);
@@ -13807,10 +13919,10 @@ test "lsm backend maintenance step compacts soft L0 debt" {
 
     try std.testing.expect(backend.maintenanceScore() > 0);
     while (backend.activeImmutableMemtableCount() > 0) {
-        try std.testing.expect(try backend.runMaintenanceStep());
+        try std.testing.expect(try drainMaintenanceQuantaForTest(&backend));
     }
     try std.testing.expect(backend.maintenanceScore() > 0);
-    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expect(try drainMaintenanceQuantaForTest(&backend));
     try std.testing.expect(countLevelRuns(&backend.runs, 0) <= 1);
 }
 
@@ -13983,7 +14095,7 @@ test "lsm backend defers soft compaction behind latency-sensitive derived replay
         try txn.commit();
     }
     while (backend.activeImmutableMemtableCount() > 0) {
-        try std.testing.expect(try backend.runMaintenanceStep());
+        try std.testing.expect(try drainMaintenanceQuantaForTest(&backend));
     }
 
     manager.beginLatencySensitiveDerivedReplay();
@@ -13993,7 +14105,7 @@ test "lsm backend defers soft compaction behind latency-sensitive derived replay
 
     try std.testing.expect(!(try backend.runMaintenanceStep()));
     sleepForTest(550 * std.time.ns_per_ms);
-    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expect(try drainMaintenanceQuantaForTest(&backend));
     try std.testing.expect(countLevelRuns(&backend.runs, 0) <= 1);
 }
 
@@ -14136,7 +14248,7 @@ test "lsm backend default writes defer soft compaction to maintenance" {
     try std.testing.expectEqual(@as(usize, 3), countLevelRuns(&backend.runs, 0));
     try std.testing.expect(backend.maintenanceScore() > 0);
 
-    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expect(try drainMaintenanceQuantaForTest(&backend));
     try std.testing.expect(backend.compaction_stats.compactions > 0);
 }
 
@@ -14298,7 +14410,7 @@ test "lsm backend persisted compaction streams run blocks without full run loads
         });
         defer backend.close();
 
-        try std.testing.expect(try backend.runMaintenanceStep());
+        try std.testing.expect(try drainMaintenanceQuantaForTest(&backend));
         try std.testing.expect(backend.compaction_stats.compactions > 0);
         try std.testing.expect(counting.source_trailer_reads > 0);
         try std.testing.expect(counting.source_range_reads > 0);
@@ -14334,6 +14446,7 @@ test "lsm backend compaction scheduler denies and later grants capacity" {
 
     try backend.finalizeDeferredStorageWork();
     try std.testing.expectEqual(@as(usize, 0), backend.compaction_stats.compactions);
+    _ = try drainMaintenanceQuantaForTest(&backend);
     try std.testing.expect(!try backend.runMaintenanceStep());
     var maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_grants);
@@ -14344,7 +14457,8 @@ test "lsm backend compaction scheduler denies and later grants capacity" {
     try std.testing.expect(maintenance.compaction_scheduler_remembered_candidates > 0);
 
     backend.compaction_scheduler.options.max_in_flight_input_bytes = 1024 * 1024;
-    try std.testing.expect(try backend.runMaintenanceStep());
+    makeAdmissionRetriesDueForTest(&backend);
+    try std.testing.expect(try drainMaintenanceQuantaForTest(&backend));
     maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expect(maintenance.compaction_scheduler_grants > 0);
     try std.testing.expectEqual(maintenance.compaction_scheduler_grants, maintenance.compaction_scheduler_completions);
@@ -14412,6 +14526,7 @@ test "lsm backend background io budget defers scheduled compaction" {
 
     try backend.finalizeDeferredStorageWork();
     try std.testing.expectEqual(@as(usize, 3), countLevelRuns(&backend.runs, 0));
+    _ = try drainMaintenanceQuantaForTest(&backend);
     try std.testing.expect(!try backend.runMaintenanceStep());
     var maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_grants);
@@ -14422,7 +14537,8 @@ test "lsm backend background io budget defers scheduled compaction" {
     try std.testing.expectEqual(@as(usize, 3), countLevelRuns(&backend.runs, 0));
 
     backend.options.background_io_budget_bytes = 1024 * 1024;
-    try std.testing.expect(try backend.runMaintenanceStep());
+    makeAdmissionRetriesDueForTest(&backend);
+    try std.testing.expect(try drainMaintenanceQuantaForTest(&backend));
     maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expect(maintenance.background_io_reserved_bytes > 0);
     try std.testing.expect(maintenance.compaction_scheduler_grants > 0);
@@ -14459,7 +14575,7 @@ test "lsm backend max compaction input bytes skips oversized scheduled plan" {
     try std.testing.expectEqual(@as(usize, 3), countLevelRuns(&backend.runs, 0));
 
     backend.options.max_compaction_input_bytes = 1024 * 1024;
-    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expect(try drainMaintenanceQuantaForTest(&backend));
     maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expect(maintenance.compaction_scheduler_grants > 0);
     try std.testing.expect(backend.compaction_stats.compactions > 0);
@@ -14487,7 +14603,7 @@ test "lsm backend max compaction input bytes allows oversized minimum L0 job" {
 
     try backend.finalizeDeferredStorageWork();
     try std.testing.expectEqual(@as(usize, 3), countLevelRuns(&backend.runs, 0));
-    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expect(try drainMaintenanceQuantaForTest(&backend));
     const maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expect(maintenance.compaction_scheduler_grants > 0);
     try std.testing.expect(backend.compaction_stats.compactions > 0);
@@ -14522,6 +14638,7 @@ test "lsm backend compaction scheduler reserves resource-manager work budget" {
     }
 
     try backend.finalizeDeferredStorageWork();
+    _ = try drainMaintenanceQuantaForTest(&backend);
     try std.testing.expect(!try backend.runMaintenanceStep());
     const maintenance = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(@as(u64, 0), maintenance.compaction_scheduler_grants);
@@ -21263,12 +21380,14 @@ test "lsm direct planner admits bounded scratch before selecting inputs" {
     defer backend.options.resource_manager = null;
     try std.testing.expect(!compaction_mod.hasTombstoneGcDebt(&backend));
     try std.testing.expect(!try compaction_mod.compactTombstonesScheduled(Backend, &backend, 1));
-    try std.testing.expectError(error.ResourceBudgetExceeded, compaction_mod.maybeCompactRunsScheduled(Backend, &backend, 1));
+    try std.testing.expect(!try compaction_mod.maybeCompactRunsScheduled(Backend, &backend, 1));
+    try std.testing.expect(backend.domain_admission_retry_after_ns > backend.nowNs());
     try std.testing.expectEqual(@as(u64, 0), backend.domain_index_builds);
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
     try std.testing.expectEqual(@as(usize, 16), backend.runs.count());
     backend.options.compact_threshold_runs = 1000;
     backend.options.l0_overlap_compact_threshold_runs = 0;
+    backend.domain_admission_retry_after_ns = 0;
     try std.testing.expect(!try compaction_mod.maybeCompactRunsScheduled(Backend, &backend, 1));
 }
 

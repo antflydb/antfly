@@ -98,6 +98,8 @@ fn gcNowNs() u64 {
 }
 
 pub fn nextTombstoneGcDelay(backend: anytype) ?u64 {
+    if (comptime @hasField(@TypeOf(backend.*), "pending_admissions")) if (backend.pending_admissions[2]) |pending|
+        return pending.retry_after_ns -| backend.nowNs();
     // A denied, already-eligible job is independent of the age trigger. In
     // particular, disabling age-based GC must not disable admission retries.
     if (comptime @hasField(@TypeOf(backend.*), "tombstone_gc_retry_after_ns")) {
@@ -152,13 +154,296 @@ const CompactionWork = struct {
     run_ids: []u64,
     key_range: ?compaction_scheduler_mod.KeyRange,
     reservation: ?resource_manager_mod.Reservation = null,
+    run_id_index: ?compaction_scheduler_mod.RunIdIndex = null,
 
     fn deinit(self: *CompactionWork, allocator: std.mem.Allocator) void {
+        if (self.run_id_index) |*index| index.deinit(allocator);
         if (self.run_ids.len > 0) allocator.free(self.run_ids);
         if (self.reservation) |*lease| lease.release();
         self.* = undefined;
     }
 };
+
+/// Post-selection ownership shared by the ordinary, L0-only, and GC lanes.
+/// Denied grants keep both prepared inputs and their delta-validation
+/// certificate. Each maintenance turn performs at most one preparation or
+/// validation quantum; only admitted streaming execution drains a whole job.
+pub const PendingAdmission = struct {
+    directory: *Directory,
+    selected: ?SelectedPlan,
+    policy: PlanningPolicy,
+    validation: ?DependencyValidation = null,
+    work: CompactionWork = .{ .score = 0, .input_runs = 0, .input_bytes = 0, .io_bytes = 0, .run_ids = &.{}, .key_range = null },
+    prepared: usize = 0,
+    retry_after_ns: u64 = 0,
+    retired_next: ?*@This() = null,
+    denied: bool = false,
+    option_input_limit: u64,
+    option_allow_oversized: bool,
+    partition_key: PartitionKey,
+    reservation: ?resource_manager_mod.Reservation = null,
+
+    fn create(backend: anytype, selected: SelectedPlan, policy: PlanningPolicy) !*@This() {
+        var reservation: ?resource_manager_mod.Reservation = null;
+        errdefer if (reservation) |*lease| lease.release();
+        if (backend.options.resource_manager) |manager| reservation = try manager.reserve(.lsm_table_builder_working_set, @sizeOf(@This()) + @sizeOf(Directory));
+        const directory = try (try backend.planningDirectory()).fork(backend.allocator);
+        errdefer directory.destroy(backend.allocator);
+        const self = try backend.allocator.create(@This());
+        self.* = .{ .directory = directory, .selected = selected, .policy = policy, .reservation = reservation, .option_input_limit = backend.options.max_compaction_input_bytes, .option_allow_oversized = backend.options.max_compaction_input_allow_oversized_single_job, .partition_key = backend.options.run_partition_key };
+        return self;
+    }
+
+    pub fn accountedMemoryBytes(self: *const @This(), pass: u64) u64 {
+        var bytes = self.directory.accountedMemoryBytes(pass);
+        if (self.validation) |validation| {
+            bytes +|= validation.directory.accountedMemoryBytes(pass);
+            if (validation.latest) |latest| bytes +|= latest.accountedMemoryBytes(pass);
+        }
+        return bytes;
+    }
+
+    fn prepareStep(self: *@This(), backend: anytype) !bool {
+        const plan = self.selected.?.plan;
+        const handles = plan.input_handles.?;
+        const count = plan.source_len + plan.target_len;
+        if (self.work.run_id_index == null) {
+            var work = CompactionWork{ .score = 0, .input_runs = count, .input_bytes = 0, .io_bytes = 0, .run_ids = &.{}, .key_range = null };
+            errdefer work.deinit(backend.allocator);
+            if (backend.options.resource_manager) |manager|
+                work.reservation = try manager.reserve(.lsm_table_builder_working_set, compaction_scheduler_mod.runIdMemoryBound(count));
+            work.run_ids = try backend.allocator.alloc(u64, count);
+            work.run_id_index = .empty;
+            try work.run_id_index.?.ensureTotalCapacity(backend.allocator, std.math.cast(u32, count) orelse return error.OutOfMemory);
+            self.work = work;
+        }
+        const end = @min(count, self.prepared + 2048);
+        const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        while (self.prepared < end and @import("antfly_platform").time.monotonicNs() < deadline) : (self.prepared += 1) {
+            const offset = if (self.prepared < plan.source_len) plan.source_start + self.prepared else plan.target_start + self.prepared - plan.source_len;
+            const run = handles[offset].run.*;
+            self.work.run_ids[self.prepared] = run.id;
+            self.work.run_id_index.?.putAssumeCapacity(run.id, {});
+            self.work.input_bytes +|= run.size_bytes;
+            includeRunInWorkKeyRange(&self.work.key_range, plan.output_level, run);
+        }
+        self.work.io_bytes = self.work.input_bytes +| self.work.input_bytes;
+        return self.prepared == count;
+    }
+
+    fn advanceLocked(self: *@This(), backend: anytype) !enum { pending, valid, invalid } {
+        if (backend.manifestCoordinationIo()) |io| try io.checkCancel();
+        if (self.work.run_id_index == null or self.prepared != self.work.input_runs) {
+            backend.retainReaderKind(.compaction);
+            runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
+            const prepared = self.prepareStep(backend);
+            _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
+            backend.releaseReaderKind(.compaction);
+            backend.directory_planning_slices +|= 1;
+            _ = try prepared;
+            return .pending;
+        }
+        if (self.selected.?.plan.validated_generation == backend.run_directory_generation) return .valid;
+        if (self.validation == null) {
+            self.validation = try DependencyValidation.init(backend, self.selected.?.plan);
+            if (self.selected.?.plan.run_indices) |indices| {
+                self.validation.?.job.indices = @constCast(indices);
+                self.selected.?.plan.run_indices = null;
+            }
+        }
+        const result = try self.validation.?.advanceLocked(backend);
+        backend.directory_planning_slices +|= 1;
+        if (result == .valid) {
+            self.validation.?.rebases = 0;
+            self.selected.?.plan.complete_coverage = self.validation.?.job.covered;
+            self.selected.?.plan.validated_generation = backend.run_directory_generation;
+            return .valid;
+        }
+        return if (result == .invalid or self.validation.?.rebases >= 4) .invalid else .pending;
+    }
+
+    pub fn cleanupStep(self: *@This(), allocator: std.mem.Allocator, credits: *usize) bool {
+        if (self.validation) |*validation| if (!validation.cleanupStep(allocator, credits)) return false;
+        if (self.selected) |*selected| {
+            if (!selected.deinitStep(allocator, credits)) return false;
+            self.selected = null;
+        }
+        return true;
+    }
+
+    pub fn destroy(self: *@This(), backend: anytype) void {
+        var credits: usize = std.math.maxInt(usize);
+        std.debug.assert(self.cleanupStep(backend.allocator, &credits));
+        if (self.validation) |*validation| validation.deinit(backend);
+        backend.retireCheckpointDirectory(self.directory);
+        self.work.deinit(backend.allocator);
+        if (self.reservation) |*lease| lease.release();
+        backend.allocator.destroy(self);
+    }
+};
+
+pub fn retireObsoleteAdmissions(backend: anytype) void {
+    if (backend.admission_in_flight) return;
+    for (&backend.pending_admissions) |*slot| if (slot.*) |pending| {
+        if (pending.option_input_limit == backend.options.max_compaction_input_bytes and
+            pending.option_allow_oversized == backend.options.max_compaction_input_allow_oversized_single_job and
+            pending.partition_key == backend.options.run_partition_key) continue;
+        slot.* = null;
+        backend.retireAdmission(pending);
+    };
+}
+
+test "compaction admission retains prepared work and wakes all paused lanes" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const allocator = std.testing.allocator;
+    for (0..3) |lane| {
+        var budgets = resource_manager_mod.Options.defaultBudgets();
+        budgets[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = 1024 * 1024 };
+        var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+        defer manager.deinit(allocator);
+        var backend = Backend.init(allocator, .{ .resource_manager = &manager, .wal_enabled = false, .compaction_scheduler = .{ .max_in_flight_input_bytes = 1, .allow_oversized_single_job = false } });
+        defer backend.close();
+        try std.testing.expect(backend.mu.tryLock());
+        defer backend.mu.unlock();
+        const source_level: u32 = if (lane == 1) 0 else 1;
+        for (0..6) |i| {
+            var run = testRun(i + 1, source_level, "a", "z", 100);
+            run.path = @constCast("admission-fixture.sst");
+            run.tombstone_count = 0;
+            try backend.runs.append(allocator, run);
+        }
+        const directory = try backend.planningDirectory();
+        const handles = try allocator.alloc(Directory.Handle, 6);
+        for (handles, 0..) |*handle, i| handle.* = directory.at(i).retain();
+        var selected = SelectedPlan{ .plan = .{ .source_level = source_level, .source_start = 0, .source_len = 6, .target_start = 6, .target_len = 0, .output_level = source_level + 1, .input_handles = handles, .partition_key = wholeKeyspace } };
+        var transferred = false;
+        defer if (!transferred) selected.deinit(allocator);
+        const owner = try PendingAdmission.create(&backend, selected, .{ .l0_limit = 0, .l0_only = lane == 1, .max_bytes = 0, .allow_oversized = false });
+        backend.pending_admissions[lane] = owner;
+        transferred = true;
+        var blocker = try manager.reserve(.lsm_table_builder_working_set, 1024 * 1024 - manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+        defer blocker.release();
+        try std.testing.expect(!try resumeAdmission(&backend, lane, 1));
+        try std.testing.expectEqual(owner, backend.pending_admissions[lane].?);
+        try std.testing.expectEqual(@as(usize, 0), owner.prepared);
+        try std.testing.expect(owner.work.run_id_index == null);
+        try std.testing.expect(owner.retry_after_ns > backend.nowNs());
+        blocker.release();
+        owner.retry_after_ns = 0;
+        for (0..64) |_| {
+            try std.testing.expect(!try resumeAdmission(&backend, lane, 1));
+            if (owner.denied) break;
+        }
+        try std.testing.expect(owner.denied);
+        const slices = backend.directory_planning_slices;
+        const ids = owner.work.run_ids.ptr;
+        const certificate = owner.validation.?.directory;
+        owner.retry_after_ns = 0;
+        try std.testing.expect(!try resumeAdmission(&backend, lane, 1));
+        try std.testing.expectEqual(slices, backend.directory_planning_slices);
+        try std.testing.expectEqual(ids, owner.work.run_ids.ptr);
+        try std.testing.expectEqual(certificate, owner.validation.?.directory);
+        try std.testing.expectEqual(owner, backend.pending_admissions[lane].?);
+        manager.foreground_query_sessions.store(1, .release);
+        backend.mu.unlock();
+        const wake = backend.nextMaintenanceWakeDelayNsBestEffort();
+        try std.testing.expect(backend.mu.tryLock());
+        try std.testing.expect(wake != null and wake.? > 0);
+        manager.foreground_query_sessions.store(0, .release);
+
+        // A same-ID move replaces identity. The retained delta certificate
+        // rejects it rather than publishing from stale handles after a grant.
+        const source = backend.runs.find(handles[0].run).?;
+        var replacement = run_store.Store.revision(source, source.*);
+        replacement.level = 2;
+        const moved = try backend.prepareRunDirectoryMove(source, 2);
+        try backend.runs.replace(allocator, source, replacement);
+        backend.invalidateReadVersion();
+        backend.publishRunDirectory(moved);
+        owner.retry_after_ns = 0;
+        for (0..64) |_| {
+            try std.testing.expect(!try resumeAdmission(&backend, lane, 1));
+            if (backend.pending_admissions[lane] == null) break;
+        }
+        try std.testing.expect(backend.pending_admissions[lane] == null);
+        try std.testing.expectEqual(@as(u64, 0), backend.compaction_scheduler.grants);
+    }
+}
+
+test "compaction admission preparation is bounded and policy retirement releases ownership" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const allocator = std.testing.allocator;
+    var backend = Backend.init(allocator, .{ .wal_enabled = false });
+    defer backend.close();
+    try std.testing.expect(backend.mu.tryLock());
+    defer backend.mu.unlock();
+    for (0..5000) |i| {
+        var run = testRun(i + 1, 1, "a", "z", 100);
+        run.path = @constCast("admission-fixture.sst");
+        run.tombstone_count = 0;
+        try backend.runs.append(allocator, run);
+    }
+    const directory = try backend.planningDirectory();
+    const handles = try allocator.alloc(Directory.Handle, 5000);
+    for (handles, 0..) |*handle, i| handle.* = directory.at(i).retain();
+    var selected = SelectedPlan{ .plan = .{ .source_level = 1, .source_start = 0, .source_len = handles.len, .target_start = handles.len, .target_len = 0, .output_level = 2, .input_handles = handles, .partition_key = wholeKeyspace } };
+    var transferred = false;
+    defer if (!transferred) selected.deinit(allocator);
+    const owner = try PendingAdmission.create(&backend, selected, .{ .l0_limit = 0, .l0_only = false, .max_bytes = 0, .allow_oversized = false });
+    backend.pending_admissions[0] = owner;
+    transferred = true;
+    try std.testing.expect(!try resumeAdmission(&backend, 0, 1));
+    try std.testing.expect(owner.prepared > 0 and owner.prepared <= 2048);
+    try std.testing.expectEqual(@as(u64, 0), backend.compaction_scheduler.grants);
+    backend.options.max_compaction_input_bytes = 1;
+    retireObsoleteAdmissions(&backend);
+    try std.testing.expect(backend.pending_admissions[0] == null);
+    try std.testing.expectEqual(owner, backend.retired_admissions.?);
+    backend.mu.unlock();
+    const wake = backend.nextMaintenanceWakeDelayNsBestEffort();
+    try std.testing.expect(backend.mu.tryLock());
+    try std.testing.expectEqual(@as(?u64, 0), wake);
+}
+
+fn resumeAdmission(backend: anytype, lane: usize, score: u64) !bool {
+    if (backend.admission_in_flight) return false;
+    const pending = backend.pending_admissions[lane] orelse return false;
+    if (pending.retry_after_ns > backend.nowNs()) return false;
+    backend.admission_in_flight = true;
+    defer backend.admission_in_flight = false;
+    var retire = false;
+    defer if (retire) {
+        backend.pending_admissions[lane] = null;
+        backend.retireAdmission(pending);
+    };
+    errdefer retire = true;
+    const state = pending.advanceLocked(backend) catch |err| {
+        if (err != error.ResourceBudgetExceeded) return err;
+        pending.retry_after_ns = backend.nowNs() +| 100 * std.time.ns_per_ms;
+        return false;
+    };
+    if (state == .pending) return false;
+    if (state == .invalid or !pending.policy.admits(pending.selected.?.plan, pending.work.input_bytes)) {
+        retire = true;
+        return false;
+    }
+    pending.work.score = score;
+    if (pending.denied) backend.compaction_scheduler.noteRememberedRetry();
+    var grant = backend.acquireCompactionGrant(pending.work) orelse {
+        if (!pending.denied) backend.compaction_scheduler.noteRememberedCandidate();
+        pending.denied = true;
+        pending.retry_after_ns = backend.nowNs() +| 100 * std.time.ns_per_ms;
+        return false;
+    };
+    defer grant.complete();
+    if (pending.denied) backend.compaction_scheduler.noteRememberedHit();
+    // Ownership stays registered while execution drops the mutex. Other
+    // maintenance callers cannot replace or reclaim the active job.
+    retire = true;
+    if (pending.validation) |*validation| pending.selected.?.plan.run_indices = validation.takeIndices();
+    try compactPlanAt(@TypeOf(backend.*), backend, pending.selected.?.plan);
+    return true;
+}
 
 pub const CompactionPlan = struct {
     complete_coverage: ?bool = null,
@@ -1863,11 +2148,19 @@ fn selectGcProgress(backend: anytype, index: *const DomainIndex, limit: u64) !?S
 }
 
 pub fn compactTombstonesScheduled(comptime BackendType: type, backend: *BackendType, score: u64) !bool {
+    if (comptime @hasField(BackendType, "pending_admissions")) {
+        if (backend.admission_in_flight) return false;
+        if (backend.pending_admissions[2] != null) return resumeAdmission(backend, 2, score);
+    }
     if (comptime @hasField(BackendType, "tombstone_gc_retry_after_ns")) {
         if (backend.nowNs() < backend.tombstone_gc_retry_after_ns) return false;
         backend.tombstone_gc_retry_after_ns = 0;
     }
-    const selected = try selectTombstoneGc(backend, backend.options.max_compaction_input_bytes) orelse {
+    const selected = (selectTombstoneGc(backend, backend.options.max_compaction_input_bytes) catch |err| {
+        deferTombstoneGc(backend);
+        if (err == error.ResourceBudgetExceeded) return false;
+        return err;
+    }) orelse {
         // A continuation yielding its quantum is progress, not an admission
         // denial. In particular, aged GC must not sleep 250 ms after every
         // identity, cleanup, or intent slice.
@@ -1875,7 +2168,17 @@ pub fn compactTombstonesScheduled(comptime BackendType: type, backend: *BackendT
         if ((nextTombstoneGcDelay(backend) orelse 1) == 0) deferTombstoneGc(backend);
         return false;
     };
-    defer selected.release(backend);
+    var owned = true;
+    defer if (owned) selected.release(backend);
+    if (comptime @hasField(BackendType, "pending_admissions")) if (selected.plan.input_handles != null) {
+        backend.pending_admissions[2] = PendingAdmission.create(backend, selected, .{ .l0_limit = 0, .l0_only = false, .max_bytes = backend.options.max_compaction_input_bytes, .allow_oversized = false }) catch |err| {
+            deferTombstoneGc(backend);
+            if (err == error.ResourceBudgetExceeded) return false;
+            return err;
+        };
+        owned = false;
+        return resumeAdmission(backend, 2, score);
+    };
     var work = compactionWorkForSelectedPlanLocked(backend, selected.plan, score) catch |err| {
         if (err != error.ResourceBudgetExceeded) return err;
         deferTombstoneGc(backend);
@@ -2308,14 +2611,48 @@ fn selectDomainPlanSynchronous(backend: anytype, l0_limit: usize, l0_only: bool,
 
 fn compactDomainPlan(comptime BackendType: type, backend: *BackendType, l0_limit: usize, l0_only: bool, comptime scheduled: bool, score: u64, max_bytes: u64, allow_oversized: bool) !bool {
     const policy = PlanningPolicy{ .l0_limit = l0_limit, .l0_only = l0_only, .max_bytes = max_bytes, .allow_oversized = allow_oversized };
+    if (scheduled and comptime @hasField(BackendType, "pending_admissions")) {
+        if (backend.admission_in_flight) return false;
+        if (!l0_only and backend.pending_admissions[1] != null) {
+            const serve_l0 = backend.closure_service_l0_next;
+            backend.closure_service_l0_next = !serve_l0;
+            if (serve_l0)
+                return resumeAdmission(backend, 1, score);
+        }
+        const lane: usize = @intFromBool(l0_only);
+        if (backend.pending_admissions[lane]) |pending| {
+            if (pending.policy.matches(policy)) return resumeAdmission(backend, lane, score);
+            backend.pending_admissions[lane] = null;
+            backend.retireAdmission(pending);
+        }
+        if (backend.domain_admission_retry_after_ns > backend.nowNs()) return false;
+        backend.domain_admission_retry_after_ns = 0;
+    }
     if (scheduled and !l0_only) if (try compactRememberedPlanIfValid(BackendType, backend, policy)) return true;
     var stats: CompactionSelectionStats = .{};
     defer noteCompactionSelectionStats(BackendType, backend, stats);
-    const selected = (if (scheduled)
-        try selectDomainPlan(backend, l0_limit, l0_only, max_bytes, allow_oversized, &stats)
+    const selected = ((if (scheduled)
+        selectDomainPlan(backend, l0_limit, l0_only, max_bytes, allow_oversized, &stats)
     else
-        try selectDomainPlanSynchronous(backend, l0_limit, l0_only, max_bytes, allow_oversized, &stats)) orelse return false;
-    defer selected.release(backend);
+        selectDomainPlanSynchronous(backend, l0_limit, l0_only, max_bytes, allow_oversized, &stats)) catch |err| {
+        if (scheduled and comptime @hasField(BackendType, "domain_admission_retry_after_ns")) {
+            backend.domain_admission_retry_after_ns = backend.nowNs() +| 100 * std.time.ns_per_ms;
+            if (err == error.ResourceBudgetExceeded) return false;
+        }
+        return err;
+    }) orelse return false;
+    var owned = true;
+    defer if (owned) selected.release(backend);
+    if (scheduled and comptime @hasField(BackendType, "pending_admissions")) if (selected.plan.input_handles != null) {
+        const lane: usize = @intFromBool(l0_only);
+        backend.pending_admissions[lane] = PendingAdmission.create(backend, selected, policy) catch |err| {
+            backend.domain_admission_retry_after_ns = backend.nowNs() +| 100 * std.time.ns_per_ms;
+            if (err == error.ResourceBudgetExceeded) return false;
+            return err;
+        };
+        owned = false;
+        return resumeAdmission(backend, lane, score);
+    };
     if (scheduled) {
         var work = compactionWorkForSelectedPlanLocked(backend, selected.plan, score) catch |err| {
             if (err != error.ResourceBudgetExceeded) return err;
@@ -2932,12 +3269,14 @@ pub const PendingBulkPlan = struct {
             if (backend.options.resource_manager) |manager|
                 self.output_reservation = try manager.reserve(.lsm_table_builder_working_set, range.len * (@sizeOf(Directory.Handle) + @sizeOf(usize)));
             if (backend.options.resource_manager) |manager|
-                self.work_reservation = try manager.reserve(.lsm_table_builder_working_set, range.len * @sizeOf(u64));
+                self.work_reservation = try manager.reserve(.lsm_table_builder_working_set, compaction_scheduler_mod.runIdMemoryBound(range.len));
             const handles = try allocator.alloc(Directory.Handle, range.len);
             errdefer allocator.free(handles);
             const indices = try allocator.alloc(usize, range.len);
             errdefer allocator.free(indices);
             self.work.run_ids = try allocator.alloc(u64, range.len);
+            self.work.run_id_index = .empty;
+            try self.work.run_id_index.?.ensureTotalCapacity(allocator, std.math.cast(u32, range.len) orelse return error.OutOfMemory);
             self.indices = indices;
             self.handles = handles;
             self.cursor = self.directory.readCursor();
@@ -2947,6 +3286,7 @@ pub const PendingBulkPlan = struct {
             const handle = self.cursor.?.next().?.retain();
             self.handles.?[self.emitted] = handle;
             self.work.run_ids[self.emitted] = handle.run.id;
+            self.work.run_id_index.?.putAssumeCapacity(handle.run.id, {});
             self.work.input_runs += 1;
             self.work.input_bytes +|= handle.run.size_bytes;
             self.work.io_bytes = self.work.input_bytes +| self.work.input_bytes;
@@ -3412,12 +3752,20 @@ fn compactionWorkForSelectedPlanLocked(backend: anytype, plan: CompactionPlan, s
             const count = plan.source_len + plan.target_len;
             var reservation: ?resource_manager_mod.Reservation = null;
             if (backend.options.resource_manager) |manager|
-                reservation = manager.reserve(.lsm_table_builder_working_set, count * @sizeOf(u64)) catch |err| break :blk err;
+                reservation = manager.reserve(.lsm_table_builder_working_set, compaction_scheduler_mod.runIdMemoryBound(count)) catch |err| break :blk err;
             const ids = backend.allocator.alloc(u64, count) catch |err| {
                 if (reservation) |*lease| lease.release();
                 break :blk err;
             };
             var work = CompactionWork{ .score = score, .input_runs = count, .input_bytes = 0, .io_bytes = 0, .run_ids = ids, .key_range = null, .reservation = reservation };
+            work.run_id_index = .empty;
+            work.run_id_index.?.ensureTotalCapacity(backend.allocator, std.math.cast(u32, count) orelse {
+                work.deinit(backend.allocator);
+                break :blk error.OutOfMemory;
+            }) catch |err| {
+                work.deinit(backend.allocator);
+                break :blk err;
+            };
             var index: usize = 0;
             while (index < count) {
                 const end = @min(count, index + 2048);
@@ -3426,6 +3774,7 @@ fn compactionWorkForSelectedPlanLocked(backend: anytype, plan: CompactionPlan, s
                     const offset = if (index < plan.source_len) plan.source_start + index else plan.target_start + index - plan.source_len;
                     const run = handles[offset].run.*;
                     ids[index] = run.id;
+                    work.run_id_index.?.putAssumeCapacity(run.id, {});
                     work.input_bytes +|= run.size_bytes;
                     includeRunInWorkKeyRange(&work.key_range, plan.output_level, run);
                 }
@@ -4028,6 +4377,9 @@ fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendT
     const drop_tombstones = !plan.split_gc and (plan.complete_coverage orelse planHasCompleteCoverage(&backend.runs, plan));
     const start_ns = if (@hasDecl(BackendType, "writeStatsNowNs")) backend.writeStatsNowNs() else 0;
 
+    if (comptime @hasDecl(BackendType, "planningDirectory")) if (backend.root_dir != null and plan.input_handles != null)
+        return compactPinnedPlanWithUnlockedBuild(backend, plan, drop_tombstones, start_ns, yield_for_foreground_queries);
+
     var selected_runs = std.ArrayListUnmanaged(Run).empty;
     errdefer releaseCompactionSnapshots(BackendType, backend, &selected_runs);
     try appendPlanRunSnapshots(BackendType, backend, plan, &selected_runs);
@@ -4128,6 +4480,163 @@ fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendT
     releaseCompactionSnapshots(BackendType, backend, &selected_runs);
 }
 
+/// The directory payload already owns immutable metadata and a physical-file
+/// pin. Execution borrows those handles for its lifetime: no writer-tree
+/// lookups, metadata clones, ID copies, or pointer-array materialization.
+fn compactPinnedPlanWithUnlockedBuild(backend: anytype, plan: CompactionPlan, drop_tombstones: bool, start_ns: u64, yield_for_foreground_queries: bool) !void {
+    const BackendType = @TypeOf(backend.*);
+    const handles = plan.input_handles.?;
+    std.debug.assert(plan.source_start == 0 and plan.target_start == plan.source_len and handles.len == plan.source_len + plan.target_len);
+    backend.retainReaderKind(.compaction);
+    defer backend.releaseReaderKind(.compaction);
+    runtime_mod.unlockBackend(BackendType, backend, true);
+    var locked = false;
+    defer {
+        if (!locked) _ = runtime_mod.lockBackend(BackendType, backend);
+    }
+    var input_bytes: u64 = 0;
+    var entries: u64 = 0;
+    var offset: usize = 0;
+    while (offset < handles.len) {
+        const end = @min(handles.len, offset + 2048);
+        for (handles[offset..end]) |handle| {
+            input_bytes +|= handle.run.size_bytes;
+            entries +|= handle.run.entry_count;
+        }
+        offset = end;
+        if (backend.manifestCoordinationIo()) |io| {
+            try io.checkCancel();
+            if (offset < handles.len) try io.sleep(.fromNanoseconds(1), .awake);
+        }
+    }
+    _ = runtime_mod.lockBackend(BackendType, backend);
+    const first_id = backend.next_run_id;
+    backend.next_run_id = std.math.add(u64, first_id, @max(@as(u64, 1), entries)) catch {
+        locked = true;
+        return error.CompactionRunIdReservationExhausted;
+    };
+    const end_id = backend.next_run_id;
+    runtime_mod.unlockBackend(BackendType, backend, true);
+    var outputs = try buildCompactedRunsFromSnapshots(BackendType, backend, handles, plan.output_level, first_id, end_id, drop_tombstones, plan.split_gc, yield_for_foreground_queries);
+    inheritL0Sequence(&outputs, handles, plan.output_level);
+    _ = runtime_mod.lockBackend(BackendType, backend);
+    locked = true;
+    errdefer discardOutputRuns(BackendType, backend, &outputs);
+    const relocated = try relocateDirectoryPlan(backend, plan) orelse {
+        discardOutputRuns(BackendType, backend, &outputs);
+        return;
+    };
+    defer relocated.deinit(backend.allocator);
+    if (drop_tombstones and !(relocated.complete_coverage orelse false)) {
+        discardOutputRuns(BackendType, backend, &outputs);
+        return;
+    }
+    try installCompactedRuns(BackendType, backend, relocated.plan, handles.len, input_bytes, start_ns, &outputs);
+}
+
+test "compaction admitted pinned execution handoff benchmark" {
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    const lsm = @import("../../root.zig").lsm_backend;
+    const alloc = std.testing.allocator;
+    const now = @import("antfly_platform").time.monotonicNs;
+    const Hooks = struct {
+        var first_io: u64 = 0;
+        fn read(ptr: *anyopaque, a: std.mem.Allocator, path: []const u8, limit: usize) ![]u8 {
+            if (std.mem.eql(u8, path, "fake.sst")) {
+                if (first_io == 0) first_io = now();
+                return error.ReviewStop;
+            }
+            const memory: *lsm.MemoryStorage = @ptrCast(@alignCast(ptr));
+            return memory.storage().vtable.read_file_alloc(ptr, a, path, limit);
+        }
+        fn size(ptr: *anyopaque, path: []const u8) !u64 {
+            if (std.mem.eql(u8, path, "fake.sst")) {
+                if (first_io == 0) first_io = now();
+                return error.ReviewStop;
+            }
+            const memory: *lsm.MemoryStorage = @ptrCast(@alignCast(ptr));
+            return memory.storage().vtable.file_size(ptr, path);
+        }
+    };
+
+    for ([_]usize{ 1000, 10000, 50000 }) |count| {
+        var memory = lsm.MemoryStorage.init(alloc);
+        defer memory.deinit();
+        var vt = memory.storage().vtable.*;
+        vt.read_file_alloc = Hooks.read;
+        vt.file_size = Hooks.size;
+        vt.read_file_trailer_alloc = null;
+        vt.begin_cold_sequential_read = null;
+        vt.begin_cold_random_read = null;
+        vt.try_begin_cold_random_reads = null;
+        var storage = memory.storage();
+        storage.vtable = &vt;
+        const keys = try alloc.alloc(u8, count * 8);
+        defer alloc.free(keys);
+        var backend = try lsm.Backend.open(alloc, "/review-admitted-bulk", .{ .storage = storage, .wal_enabled = false, .compact_threshold_runs = 4, .l0_soft_limit_runs = 4, .l0_hard_limit_runs = 100000, .bulk_ingest_tiered_l0_fan_in = 4, .background_io_budget_bytes = 1, .background_io_allow_oversized_single_job = false });
+        defer backend.close();
+        for (0..count) |i| {
+            const key = keys[i * 8 ..][0..8];
+            std.mem.writeInt(u64, key, i, .big);
+            try backend.runs.append(alloc, .{ .id = i + 1, .visibility_id = count + i / (count / 4), .level = 0, .size_bytes = 1024, .path = @constCast("fake.sst"), .smallest_namespace_name = null, .smallest_key = key, .largest_namespace_name = null, .largest_key = key, .entry_count = 1, .tombstone_count = 0, .bloom_filter = null, .owns_metadata = false, .owns_path = false, .state = null });
+        }
+        backend.next_run_id = count + 5;
+        _ = try backend.planningDirectory();
+        backend.beginBatchMode(.{ .mode = .bulk_ingest });
+        defer backend.finishBatchMode(.{ .mode = .bulk_ingest });
+        for (0..4096) |_| {
+            _ = try backend.runMaintenanceStep();
+            if (backend.background_io_denied_jobs != 0) break;
+        }
+        try std.testing.expect(backend.background_io_denied_jobs != 0);
+        backend.pending_bulk_plan.?.retry_after_ns = 0;
+        backend.options.background_io_budget_bytes = 0;
+        Hooks.first_io = 0;
+        const start = now();
+        _ = backend.runMaintenanceStep() catch |err| {
+            std.debug.print("admitted files={d} first_io_ns={d} whole_error_turn_ns={d} error={s}\n", .{ count, if (Hooks.first_io != 0) Hooks.first_io - start else 0, now() - start, @errorName(err) });
+            try std.testing.expectEqual(error.ReviewStop, err);
+            continue;
+        };
+        return error.ExpectedReadStop;
+    }
+}
+
+test "compaction suspended broad directory continuation retains a wake deadline" {
+    const lsm = @import("../../root.zig").lsm_backend;
+    const alloc = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(alloc);
+    const keys = try alloc.alloc(u8, 5000 * 8);
+    defer alloc.free(keys);
+    var backend = lsm.Backend.init(alloc, .{ .wal_enabled = false, .resource_manager = &manager, .compact_threshold_runs = 0, .l0_soft_limit_runs = 10000, .l0_hard_limit_runs = 10000, .level_target_runs_base = 100000, .level_target_bytes_base = 0, .bulk_ingest_tiered_l0_fan_in = 0 });
+    defer backend.close();
+    for (0..5000) |i| {
+        const key = keys[i * 8 ..][0..8];
+        std.mem.writeInt(u64, key, i + 1, .big);
+        try backend.runs.append(alloc, .{ .id = i + 1, .level = 1, .size_bytes = 1024, .path = @constCast("fake.sst"), .smallest_namespace_name = null, .smallest_key = key, .largest_namespace_name = null, .largest_key = key, .entry_count = 1, .tombstone_count = 0, .bloom_filter = null, .owns_metadata = false, .owns_path = false, .state = null });
+    }
+    try backend.runs.append(alloc, .{ .id = 5001, .level = 0, .size_bytes = 1024, .path = @constCast("fake.sst"), .smallest_namespace_name = null, .smallest_key = @constCast(&([_]u8{0} ** 8)), .largest_namespace_name = null, .largest_key = @constCast(&([_]u8{255} ** 8)), .entry_count = 2, .tombstone_count = 0, .bloom_filter = null, .owns_metadata = false, .owns_path = false, .state = null });
+    backend.next_run_id = 5002;
+    _ = try backend.planningDirectory();
+    {
+        try std.testing.expect(backend.mu.tryLock());
+        defer backend.mu.unlock();
+        try std.testing.expect(!try lsm.compaction.maybeCompactRunsScheduled(lsm.Backend, &backend, 1));
+    }
+    try std.testing.expect(backend.pending_directory_closure != null);
+    manager.foreground_query_sessions.store(1, .release);
+    try std.testing.expect(!try backend.runMaintenanceStep());
+    try std.testing.expect(backend.nextMaintenanceWakeDelayNsBestEffort().? > 0);
+    manager.foreground_query_sessions.store(0, .release);
+    try std.testing.expect(backend.pending_directory_closure != null);
+    try std.testing.expectEqual(@as(?u64, 0), backend.nextMaintenanceWakeDelayNsBestEffort());
+}
+
+fn inputRun(input: anytype) *const Run {
+    return if (@TypeOf(input) == Directory.Handle) input.run else input;
+}
+
 fn appendPlanRunSnapshots(
     comptime BackendType: type,
     backend: *BackendType,
@@ -4174,7 +4683,7 @@ fn releaseCompactionSnapshots(
 fn buildCompactedRunsFromSnapshots(
     comptime BackendType: type,
     backend: *BackendType,
-    selected: []const *Run,
+    selected: anytype,
     output_level: u32,
     reserved_run_id_start: u64,
     reserved_run_id_end: u64,
@@ -4197,7 +4706,7 @@ fn buildCompactedRunsFromSnapshots(
         .next_run_id = reserved_run_id_start,
     };
     if (comptime @hasField(@TypeOf(build_backend.options), "max_run_file_entries")) {
-        if (split_gc) build_backend.options.max_run_file_entries = @max(@as(usize, 1), selected[0].entry_count / 2);
+        if (split_gc) build_backend.options.max_run_file_entries = @max(@as(usize, 1), inputRun(selected[0]).entry_count / 2);
     } else std.debug.assert(!split_gc);
     const runs = if (backend.root_dir != null)
         try makePersistedRunsFromSelectedRunsWithForegroundPolicy(
@@ -4208,11 +4717,13 @@ fn buildCompactedRunsFromSnapshots(
             drop_tombstones,
             yield_for_foreground_queries,
         )
+    else if (comptime @TypeOf(selected[0]) == Directory.Handle)
+        unreachable // Pinned execution is used only for persisted runs.
     else
         try makeStateRunsFromSelectedRuns(BuildBackend, &build_backend, selected, output_level, drop_tombstones);
     inheritTombstoneAge(runs.items, selected);
     if (split_gc) for (runs.items) |*run| {
-        run.visibility_id = if (selected[0].visibility_id == 0) selected[0].id else selected[0].visibility_id;
+        run.visibility_id = if (inputRun(selected[0]).visibility_id == 0) inputRun(selected[0]).id else inputRun(selected[0]).visibility_id;
     };
     errdefer {
         var owned = runs;
@@ -4348,10 +4859,10 @@ fn relocatePlanIfInputsStillMatch(runs: []const Run, plan: CompactionPlan, selec
     return relocated;
 }
 
-fn inheritL0Sequence(output: *std.ArrayListUnmanaged(Run), inputs: []const *Run, output_level: u32) void {
+fn inheritL0Sequence(output: *std.ArrayListUnmanaged(Run), inputs: anytype, output_level: u32) void {
     if (output_level != 0 or output.items.len == 0) return;
     var sequence: u64 = 0;
-    for (inputs) |run| sequence = @max(sequence, l0Sequence(run.*));
+    for (inputs) |run| sequence = @max(sequence, l0Sequence(inputRun(run).*));
     for (output.items) |*run| run.visibility_id = sequence;
 }
 
@@ -5070,9 +5581,9 @@ fn sumRunPtrBytes(runs: []const *Run) u64 {
     return total;
 }
 
-fn countRunPtrEntries(runs: []const *Run) usize {
+fn countRunPtrEntries(runs: anytype) usize {
     var total: usize = 0;
-    for (runs) |run| total +|= @intCast(run.entry_count);
+    for (runs) |run| total +|= @intCast(inputRun(run).entry_count);
     return total;
 }
 
@@ -5940,7 +6451,7 @@ fn makePersistedRunsFromSelectedRunsWithGc(comptime BackendType: type, backend: 
 fn makePersistedRunsFromSelectedRunsWithForegroundPolicy(
     comptime BackendType: type,
     backend: *BackendType,
-    window_runs: []const *Run,
+    window_runs: anytype,
     output_level: u32,
     drop_tombstones: bool,
     yield_for_foreground_queries: bool,
@@ -5954,7 +6465,8 @@ fn makePersistedRunsFromSelectedRunsWithForegroundPolicy(
         for (cursors[0..initialized_cursors]) |*cursor| cursor.deinit();
         allocator.free(cursors);
     }
-    for (window_runs, 0..) |run, i| {
+    for (window_runs, 0..) |input, i| {
+        const run = inputRun(input);
         const path = run.path orelse return error.RunStateUnavailable;
         cursors[i] = try PersistedRunCursor.init(allocator, backend.storage.?, path);
         initialized_cursors += 1;
@@ -6847,10 +7359,11 @@ const minimum_table_entry_logical_bytes = 1 + 3 * @sizeOf(u32);
 /// entire compaction window. The physical input density gives a useful
 /// workload-specific estimate; the encoded minimum supplies a hard upper
 /// bound even for highly compressed inputs or incomplete legacy metadata.
-fn estimatedCompactionOutputEntries(window_runs: []const *Run, target_bytes: usize) usize {
+fn estimatedCompactionOutputEntries(window_runs: anytype, target_bytes: usize) usize {
     var total_entries: u128 = 0;
     var total_bytes: u128 = 0;
-    for (window_runs) |run| {
+    for (window_runs) |input| {
+        const run = inputRun(input);
         total_entries +|= run.entry_count;
         total_bytes +|= run.size_bytes;
     }
@@ -7201,12 +7714,12 @@ fn reconcileGcObjective(live: anytype, plan: CompactionPlan, outputs: []Run) voi
     };
 }
 
-fn inheritTombstoneAge(outputs: []Run, inputs: []const *Run) void {
+fn inheritTombstoneAge(outputs: []Run, inputs: anytype) void {
     var oldest = gcNowNs();
     var requested = false;
-    for (inputs) |run| if ((run.tombstone_count orelse 0) != 0) {
-        oldest = @min(oldest, run.oldest_tombstone_unix_ns);
-        requested = requested or run.gc_requested;
+    for (@as([]const @TypeOf(inputs[0]), inputs)) |run| if ((inputRun(run).tombstone_count orelse 0) != 0) {
+        oldest = @min(oldest, inputRun(run).oldest_tombstone_unix_ns);
+        requested = requested or inputRun(run).gc_requested;
     };
     for (outputs) |*run| {
         const has_deletes = (run.tombstone_count orelse 0) != 0;
