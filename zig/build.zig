@@ -2297,7 +2297,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const raft_harness_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/raft_sim_test_root.zig"),
+        .root_source_file = b.path("pkg/antfly/src/raft_harness_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -3573,7 +3573,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_managed_embedder_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "managed embedder", "antfly numeric", "antfly provider preserves explicit distributed admission denial", "legacy numeric" },
+        .filters = &.{ "managed embedder", "antfly embed request", "antfly embed round trip", "antfly sparse embed round trip", "antfly numeric", "antfly provider preserves explicit distributed admission denial", "legacy numeric" },
     });
     const run_lib_managed_embedder_tests = addFilteredTestRunArtifact(b, lib_managed_embedder_tests);
     const lib_managed_embedder_test_step = b.step("antfly-inference-managed-embedder-test", "Run managed embedder contract and provider tests");
@@ -3929,6 +3929,9 @@ pub fn build(b: *std.Build) void {
         "attachment transport separates wire and peak resident representations",
         "bounded invocation allocator",
         "inline data URI parser validates canonical metadata",
+        "antfly embed request",
+        "antfly embed round trip",
+        "antfly sparse embed round trip",
         "antfly embed parts uses the framed attachment transport",
         "antfly embed parts request sizing is exact for escaped strings",
         "antfly dense JSON response cleanup is allocation-failure safe",
@@ -4824,8 +4827,6 @@ pub fn build(b: *std.Build) void {
     const run_lib_raft_harness_tests = addFilteredTestRunArtifact(b, lib_raft_harness_tests);
     const lib_raft_harness_test_step = b.step("lib-raft-harness-test", "Run the legacy Raft deterministic harness tests");
     lib_raft_harness_test_step.dependOn(&run_lib_raft_harness_tests.step);
-    const lib_raft_sim_test_compat_step = b.step("lib-raft-sim-test", "Compatibility alias for lib-raft-harness-test");
-    lib_raft_sim_test_compat_step.dependOn(lib_raft_harness_test_step);
 
     const lib_raft_chaos_default_filters = [_][]const u8{
         "managed host simulation restores through both raft state backends",
@@ -4881,8 +4882,6 @@ pub fn build(b: *std.Build) void {
     const run_lib_lsm_backend_workload_tests = addFilteredTestRunArtifact(b, lib_lsm_backend_workload_tests);
     const lib_lsm_backend_workload_test_step = b.step("lib-lsm-backend-workload-test", "Run legacy LSM backend storage workload tests");
     lib_lsm_backend_workload_test_step.dependOn(&run_lib_lsm_backend_workload_tests.step);
-    const lib_lsm_backend_sim_test_compat_step = b.step("lib-lsm-backend-sim-test", "Compatibility alias for lib-lsm-backend-workload-test");
-    lib_lsm_backend_sim_test_compat_step.dependOn(lib_lsm_backend_workload_test_step);
 
     const lib_lsm_backend_chaos_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -5084,7 +5083,8 @@ pub fn build(b: *std.Build) void {
         "data runtime structural changes preserve physical root generations",
         "data raft draining leader remains stable through membership expansion",
         "data raft removed leader handoff campaigns preferred serving survivor",
-        "data raft source lifecycle commands bypass document db apply while receiver checkpoints apply",
+        "data raft source finalization and receiver checkpoints apply document range metadata",
+        "data raft split finalization persists the receiver base before merge and survives restart replay",
         "data raft apply defers refresh contention before mutation and retries exactly once",
         "data raft retry checkpoints survive changed ready windows and publication failure",
         "data raft document apply identity prevents non-idempotent restart replay",
@@ -5179,6 +5179,7 @@ pub fn build(b: *std.Build) void {
         "data runtime records and backs off HA standby replication round failures",
         "data runtime HA replication HTTP budget covers base64 apply envelope",
         "data runtime HA apply window remains bounded for control-plane liveness",
+        "data runtime disk usage scanner reads borrowed filesystem for sharding evidence",
         "data runtime HA apply window does not report caught up with pending or deferred WAL",
         "data server keeps upstream replication availability failures nonfatal",
         "data runtime records HA standby apply failures without stopping run round",
@@ -8556,6 +8557,23 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_vopr_runtime_regressions.addArgs(args);
     b.step("vopr-runtime-regression-test", "Run VOPR runtime ownership, clock, snapshot, and replay regressions").dependOn(&run_vopr_runtime_regressions.step);
 
+    const ha_production_vopr_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"production HA owners"},
+        .max_rss = full_cluster_vopr_max_rss,
+    });
+    const run_ha_production_vopr_tests = b.addRunArtifact(ha_production_vopr_tests);
+    b.step("ha-production-vopr-test", "Exercise production HA public writes, standby reads, and promotion on VoprIo").dependOn(&run_ha_production_vopr_tests.step);
+
+    const ha_scaling_vopr_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{"production HA scaling VOPR exact replays"},
+        .max_rss = full_cluster_vopr_max_rss,
+    });
+    const run_ha_scaling_vopr_tests = b.addRunArtifact(ha_scaling_vopr_tests);
+    run_ha_scaling_vopr_tests.step.dependOn(&run_ha_production_vopr_tests.step);
+    b.step("ha-scaling-vopr-test", "Replay production standby promotion with automatic split/merge and replica scale-out/drain").dependOn(&run_ha_scaling_vopr_tests.step);
+
     const full_cluster_vopr_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{"full cluster VOPR exact replays"},
@@ -9362,6 +9380,8 @@ pub fn build(b: *std.Build) void {
     vopr_runtime_adapter_test_step.dependOn(&run_vopr_runtime_adapter_tests.step);
     derived_workflow_vopr_test_step.dependOn(&run_vopr_runtime_adapter_tests.step);
 
+    b.step("vopr-build", "Install the VOPR campaign and replay executable").dependOn(&b.addInstallArtifact(vopr_cli, .{}).step);
+
     const run_vopr_cli = b.addRunArtifact(vopr_cli);
     run_vopr_cli.addArg("run");
     if (b.args) |args| run_vopr_cli.addArgs(args);
@@ -9459,6 +9479,7 @@ pub fn build(b: *std.Build) void {
     vopr_test_step.dependOn(&run_composed_query_vopr_tests.step);
     vopr_test_step.dependOn(&run_query_embedding_cache_vopr_tests.step);
     vopr_test_step.dependOn(&run_full_cluster_vopr_tests.step);
+    vopr_test_step.dependOn(&run_ha_scaling_vopr_tests.step);
     vopr_test_step.dependOn(production_cluster_vopr_smoke_test_step);
     vopr_test_step.dependOn(&run_generation_reranking_vopr_tests.step);
     vopr_test_step.dependOn(&run_distributed_query_vopr_tests.step);
@@ -9516,14 +9537,35 @@ pub fn build(b: *std.Build) void {
     chaos_progress_tail = chainLabeledRun(b, lib_ha_vopr_tests, "ha-vopr-test", chaos_progress_tail);
     chaos_test_step.dependOn(chaos_progress_tail.?);
 
-    const chaos_soak_test_step = b.step("chaos-soak-test", "Run broad metadata VOPR and raft chaos soaks");
-    var chaos_soak_progress_tail: ?*std.Build.Step = null;
-    chaos_soak_progress_tail = chainLabeledFilteredTests(b, antfly_test_mod, "lib-metadata-vopr-transition-chaos-test", lib_metadata_vopr_transition_chaos_filters, chaos_soak_progress_tail);
-    chaos_soak_progress_tail = chainLabeledFilteredTests(b, antfly_test_mod, "lib-metadata-vopr-public-chaos-test", lib_metadata_vopr_public_chaos_filters, chaos_soak_progress_tail);
-    chaos_soak_progress_tail = chainLabeledFilteredTests(b, antfly_test_mod, "lib-metadata-vopr-placement-chaos-test", lib_metadata_vopr_placement_chaos_filters, chaos_soak_progress_tail);
-    chaos_soak_progress_tail = chainLabeledRun(b, lib_raft_chaos_tests, "lib-raft-chaos-test", chaos_soak_progress_tail);
-    chaos_soak_test_step.dependOn(chaos_soak_progress_tail.?);
-    soak_test_step.dependOn(chaos_soak_test_step);
+    const vopr_soak_test_step = b.step("vopr-soak-test", "Run HA/scaling/Raft/data VOPR search campaigns and metadata/Raft native differentials");
+    const vopr_soak_histories = b.option(u64, "vopr-soak-histories", "Histories per VOPR soak campaign") orelse 100;
+    const vopr_soak_production_histories = b.option(u64, "vopr-soak-production-histories", "Histories in the production HA/scaling soak campaign") orelse 2;
+    const vopr_soak_seed = b.option(u64, "vopr-soak-seed", "Base seed for VOPR soak campaigns") orelse 0xa17f_5500;
+    const vopr_soak_artifacts = b.option([]const u8, "vopr-soak-artifacts", "Persistent directory for VOPR soak reports and replay corpus") orelse "zig-out/vopr-soak";
+    var vopr_soak_progress_tail: ?*std.Build.Step = null;
+    // One worker makes corpus-guided selection reproducible as a campaign,
+    // in addition to each history's independent exact-replay guarantee.
+    for ([_][]const u8{ "ha", "raft", "distributed-data", "ha-scaling" }) |scenario| {
+        const histories = if (std.mem.eql(u8, scenario, "ha-scaling")) vopr_soak_production_histories else vopr_soak_histories;
+        const campaign = b.addRunArtifact(vopr_cli);
+        campaign.addArgs(&.{
+            "campaign",                      "--scenario",               scenario,
+            "--histories",                   b.fmt("{d}", .{histories}), "--seed",
+            b.fmt("{d}", .{vopr_soak_seed}), "--workers",                "1",
+            "--fail-on-findings",            "--artifact-dir",           b.pathJoin(&.{ vopr_soak_artifacts, scenario }),
+            "--defer-diagnostics",
+        });
+        if (vopr_soak_progress_tail) |previous| campaign.step.dependOn(previous);
+        vopr_soak_progress_tail = &campaign.step;
+    }
+    // Retain the existing broad differential coverage during consolidation.
+    // Native HTTP/storage tests do not acquire exact replay by being in this tier.
+    vopr_soak_progress_tail = chainLabeledFilteredTests(b, antfly_test_mod, "lib-metadata-vopr-transition-chaos-test", lib_metadata_vopr_transition_chaos_filters, vopr_soak_progress_tail);
+    vopr_soak_progress_tail = chainLabeledFilteredTests(b, antfly_test_mod, "lib-metadata-vopr-public-chaos-test", lib_metadata_vopr_public_chaos_filters, vopr_soak_progress_tail);
+    vopr_soak_progress_tail = chainLabeledFilteredTests(b, antfly_test_mod, "lib-metadata-vopr-placement-chaos-test", lib_metadata_vopr_placement_chaos_filters, vopr_soak_progress_tail);
+    vopr_soak_progress_tail = chainLabeledRun(b, lib_raft_chaos_tests, "lib-raft-chaos-test", vopr_soak_progress_tail);
+    vopr_soak_test_step.dependOn(vopr_soak_progress_tail.?);
+    soak_test_step.dependOn(vopr_soak_test_step);
 
     const template_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/template_test_root.zig"),
@@ -9871,8 +9913,6 @@ pub fn build(b: *std.Build) void {
     const run_storage_lmdb_soak_tests = addFilteredTestRunArtifact(b, storage_lmdb_soak_tests);
     const storage_lmdb_soak_step = b.step("lmdb-workload-soak", "Run only the legacy LMDB randomized workload soak");
     storage_lmdb_soak_step.dependOn(&run_storage_lmdb_soak_tests.step);
-    const lmdb_sim_soak_compat_step = b.step("lmdb-sim-soak", "Compatibility alias for lmdb-workload-soak");
-    lmdb_sim_soak_compat_step.dependOn(storage_lmdb_soak_step);
 
     const docstore_test_mod = makeLmdbModule(b, "pkg/antfly/src/docstore_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     docstore_test_mod.addImport("bloom", bloom_mod);
@@ -9946,8 +9986,6 @@ pub fn build(b: *std.Build) void {
     const run_wal_workload_tests = addFilteredTestRunArtifact(b, wal_workload_tests);
     const wal_workload_test_step = b.step("wal-workload-test", "Run only the legacy WAL randomized workload tests");
     wal_workload_test_step.dependOn(&run_wal_workload_tests.step);
-    const wal_sim_test_compat_step = b.step("wal-sim-test", "Compatibility alias for wal-workload-test");
-    wal_sim_test_compat_step.dependOn(wal_workload_test_step);
 
     const wal_vopr_tests = b.addTest(.{
         .root_module = wal_test_mod,
@@ -9992,14 +10030,10 @@ pub fn build(b: *std.Build) void {
     const run_wal_soak_tests = addFilteredTestRunArtifact(b, wal_soak_tests);
     const wal_soak_step = b.step("wal-workload-soak", "Run only the legacy WAL randomized workload soak");
     wal_soak_step.dependOn(&run_wal_soak_tests.step);
-    const wal_sim_soak_compat_step = b.step("wal-sim-soak", "Compatibility alias for wal-workload-soak");
-    wal_sim_soak_compat_step.dependOn(wal_soak_step);
 
     const storage_workload_soak_step = b.step("storage-workload-soak", "Run the legacy LMDB and WAL randomized workload soaks");
     storage_workload_soak_step.dependOn(&run_storage_lmdb_soak_tests.step);
     storage_workload_soak_step.dependOn(&run_wal_soak_tests.step);
-    const storage_sim_soak_compat_step = b.step("storage-sim-soak", "Compatibility alias for storage-workload-soak");
-    storage_sim_soak_compat_step.dependOn(storage_workload_soak_step);
     soak_test_step.dependOn(storage_workload_soak_step);
 
     const persistent_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
@@ -10042,8 +10076,6 @@ pub fn build(b: *std.Build) void {
     const run_persistent_workload_tests = addFilteredTestRunArtifact(b, persistent_workload_tests);
     const persistent_workload_step = b.step("persistent-workload-test", "Run only the legacy persistent randomized workload tests");
     persistent_workload_step.dependOn(&run_persistent_workload_tests.step);
-    const persistent_sim_test_compat_step = b.step("persistent-sim-test", "Compatibility alias for persistent-workload-test");
-    persistent_sim_test_compat_step.dependOn(persistent_workload_step);
 
     const persistent_replay_tests = b.addTest(.{
         .root_module = persistent_test_mod,
@@ -10082,8 +10114,6 @@ pub fn build(b: *std.Build) void {
     const run_persistent_soak_tests = addFilteredTestRunArtifact(b, persistent_soak_tests);
     const persistent_soak_step = b.step("persistent-workload-soak", "Run only the legacy persistent randomized workload soak");
     persistent_soak_step.dependOn(&run_persistent_soak_tests.step);
-    const persistent_sim_soak_compat_step = b.step("persistent-sim-soak", "Compatibility alias for persistent-workload-soak");
-    persistent_sim_soak_compat_step.dependOn(persistent_soak_step);
 
     storage_workload_soak_step.dependOn(&run_persistent_soak_tests.step);
 
@@ -10131,8 +10161,6 @@ pub fn build(b: *std.Build) void {
     const run_index_manager_workload_tests = addFilteredTestRunArtifact(b, index_manager_workload_tests);
     const index_manager_workload_step = b.step("index-manager-workload-test", "Run only the legacy index-manager randomized workload tests");
     index_manager_workload_step.dependOn(&run_index_manager_workload_tests.step);
-    const index_manager_sim_test_compat_step = b.step("index-manager-sim-test", "Compatibility alias for index-manager-workload-test");
-    index_manager_sim_test_compat_step.dependOn(index_manager_workload_step);
 
     const index_manager_replay_tests = b.addTest(.{
         .root_module = index_manager_test_mod,
@@ -10197,8 +10225,6 @@ pub fn build(b: *std.Build) void {
     const run_db_split_workload_tests = addFilteredTestRunArtifact(b, db_split_workload_tests);
     const db_split_workload_step = b.step("db-split-workload-test", "Run only the legacy DB split randomized workload tests");
     db_split_workload_step.dependOn(&run_db_split_workload_tests.step);
-    const db_split_sim_test_compat_step = b.step("db-split-sim-test", "Compatibility alias for db-split-workload-test");
-    db_split_sim_test_compat_step.dependOn(db_split_workload_step);
 
     const db_split_vopr_tests = b.addTest(.{
         .root_module = db_test_mod,
@@ -10216,8 +10242,6 @@ pub fn build(b: *std.Build) void {
     storage_workload_test_step.dependOn(&run_wal_workload_tests.step);
     storage_workload_test_step.dependOn(&run_persistent_workload_tests.step);
     storage_workload_test_step.dependOn(&run_index_manager_workload_tests.step);
-    const storage_sim_test_compat_step = b.step("storage-sim-test", "Compatibility alias for storage-workload-test");
-    storage_sim_test_compat_step.dependOn(storage_workload_test_step);
 
     const storage_vopr_step = b.step("storage-vopr-test", "Run deterministic storage modeled-time/model-I/O VOPR checks");
     storage_vopr_step.dependOn(&run_storage_vopr_runtime_tests.step);

@@ -1858,7 +1858,7 @@ pub const ManagedHttpClusterSimulation = struct {
         self.nodes[index] = try ManagedHttpHostSimulation.init(self.alloc, cfg, self.deps[index]);
         const node_id = self.configs[index].host.http.host.local_node_id;
         try self.nodes[index].useVirtualBaseUri(node_id);
-        try self.network.registerNode(node_id, self.nodes[index].serverExecutor());
+        try self.network.registerNode(node_id, self.nodes[index].serverRequestExecutor());
         if (self.started) try self.nodes[index].start();
     }
 

@@ -6484,7 +6484,16 @@ test "table runtime snapshot cache replaces snapshots while preserving one group
         .statuses = .{ .items = refresh_logs_items },
     };
 
-    try publishRefreshForTest(&cache, refresh);
+    // A refresh must capture its observation boundary before the live group
+    // publishes. The newer group authority survives that older refresh.
+    var refresh_token = try cache.captureCatalogToken(std.testing.allocator, &.{ "docs", "logs" }, true);
+    defer refresh_token.deinit();
+    var live = (try cache.snapshotGroupStatus(std.testing.allocator, "docs", 7)).?;
+    defer live.deinit(std.testing.allocator);
+    try std.testing.expectEqual(TableRuntimeSnapshotCache.PublishResult.published, try publishGroupForTest(&cache, "docs", live));
+    var result = try cache.publishRefresh(&refresh_token, refresh);
+    defer result.deinit();
+    try std.testing.expect(!result.hasRejectedTables());
 
     var docs = (try cache.snapshot(std.testing.allocator, "docs")).?;
     defer docs.deinit(std.testing.allocator);

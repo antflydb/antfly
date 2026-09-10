@@ -2189,6 +2189,12 @@ class InferenceEmbeddingServer:
                     f"{INFERENCE_PUBLIC_API_ROOT}/embed",
                     f"{INFERENCE_PUBLIC_API_ROOT}/embeddings",
                 ):
+                    # Match the inference API's optional, non-nullable strings.
+                    # Permissive fixtures previously hid invalid database requests.
+                    for field in ("task_type", "instruction"):
+                        if field in payload and not isinstance(payload[field], str):
+                            self.send_error(400, f"{field} must be a string")
+                            return
                     model = payload.get("model", "")
                     is_dimension_probe = (
                         "antfly embedding dimension probe"
