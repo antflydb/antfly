@@ -2069,7 +2069,8 @@ fn promptCacheFromOpenApi(
         .ttl_ms = ttl_ms,
     };
 }
-fn parseInferencePreloadModels(
+// Shared by unified configuration and the standalone inference CLI loader.
+pub fn parseInferencePreloadModels(
     alloc: std.mem.Allocator,
     raw_inference: ?std.json.Value,
 ) ![]Config.InferenceConfig.WarmModelConfig {
@@ -2093,20 +2094,21 @@ fn parseInferencePreloadModels(
             .object => |entry| entry,
             else => return error.InvalidConfig,
         };
-        out[i] = .{
-            .kind = try requiredStringFieldDup(alloc, model_object, "kind"),
-            .name = try requiredStringFieldDup(alloc, model_object, "name"),
-            .backend = try optionalStringFieldDup(alloc, model_object, "backend"),
-            .format = try optionalStringFieldDup(alloc, model_object, "format"),
-            .quantization = try optionalStringFieldDup(alloc, model_object, "quantization"),
-            .residency_mode = try optionalEnumField(
-                Config.InferenceConfig.WarmModelConfig.ResidencyMode,
-                model_object,
-                "residency_mode",
-            ),
-            .memory_budget_mb = try optionalU32Field(model_object, "memory_budget_mb"),
-        };
+        // Include the partially parsed entry in error cleanup as soon as any
+        // owned fields can be allocated (e.g. a missing name after kind).
+        out[i] = .{ .kind = &.{}, .name = &.{} };
         filled = i + 1;
+        out[i].kind = try requiredStringFieldDup(alloc, model_object, "kind");
+        out[i].name = try requiredStringFieldDup(alloc, model_object, "name");
+        out[i].backend = try optionalStringFieldDup(alloc, model_object, "backend");
+        out[i].format = try optionalStringFieldDup(alloc, model_object, "format");
+        out[i].quantization = try optionalStringFieldDup(alloc, model_object, "quantization");
+        out[i].residency_mode = try optionalEnumField(
+            Config.InferenceConfig.WarmModelConfig.ResidencyMode,
+            model_object,
+            "residency_mode",
+        );
+        out[i].memory_budget_mb = try optionalU32Field(model_object, "memory_budget_mb");
     }
     return out;
 }
