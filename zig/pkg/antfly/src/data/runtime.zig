@@ -32399,6 +32399,35 @@ test "data runtime startup catch-up prefers cached admin snapshot" {
     try std.testing.expectEqual(@as(usize, 0), snapshot_source.admin_calls);
 }
 
+// These tests isolate provision admission and retry policy from periodic
+// maintenance. A real LSM worker marks runtime/store status dirty even when
+// there are no DBs; racing that worker can send the control round down the
+// unrelated status-report retry path before it reaches the provision tick.
+fn prepareProvisioningControlRoundForTest(server: *DataServer) void {
+    const now_ms = server.backgroundMonotonicMs();
+    server.lsm_maintenance_next_eligible_ns.store(std.math.maxInt(u64), .monotonic);
+    server.auto_bulk_finish_last_run_at_ms.store(now_ms, .monotonic);
+    server.provisioned_index_repair_last_run_at_ms.store(now_ms, .monotonic);
+}
+
+const ProvisioningControlMetadataForTest = struct {
+    requests: usize = 0,
+
+    fn executor(self: *@This()) antfly.common.http.RequestExecutor {
+        return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+    }
+
+    fn execute(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        _: antfly.common.http.HttpRequest,
+    ) !antfly.common.http.HttpResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.requests += 1;
+        return error.UnexpectedProvisioningMetadataRequest;
+    }
+};
+
 test "data runtime runRound does not refresh provisioned replica root inline while worker is active" {
     const alloc = std.testing.allocator;
 
@@ -32408,11 +32437,25 @@ test "data runtime runRound does not refresh provisioned replica root inline whi
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provision-active", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
 
-    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{
+        .required = .of(&.{ .clock_read, .synchronization }),
+        .monotonic_ns = std.time.ns_per_s,
+    });
+    defer vopr_io.deinit();
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = vopr_io.io() },
+    });
     defer backend_runtime.deinit();
     const remote_metadata = try alloc.create(RemoteMetadataSource);
     const metadata_api_urls = [_][]const u8{"http://metadata.test"};
-    remote_metadata.* = try RemoteMetadataSource.init(alloc, &metadata_api_urls, backend_runtime.ptr().apiIoImpl().?);
+    var metadata_transport = ProvisioningControlMetadataForTest{};
+    remote_metadata.* = try RemoteMetadataSource.initWithRequestExecutors(
+        alloc,
+        &metadata_api_urls,
+        &.{metadata_transport.executor()},
+        vopr_io.io(),
+    );
 
     var server: DataServer = .{
         .alloc = alloc,
@@ -32433,17 +32476,18 @@ test "data runtime runRound does not refresh provisioned replica root inline whi
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
-        .status_source = undefined,
+        .status_source = remote_metadata.statusSource(),
         .api_server_cfg = undefined,
         .query_async_limit = .limited(8),
         .backend_runtime = backend_runtime.ptr(),
         .listener_cfg = undefined,
     };
     defer server.deinit();
+    prepareProvisioningControlRoundForTest(&server);
 
     server.store_registration_confirmed = true;
     server.store_status_dirty.store(false, .release);
-    server.last_store_status_report_at_ms = 1;
+    server.last_store_status_report_at_ms = server.backgroundMonotonicMs();
     server.runtime_status_dirty.store(false, .release);
     server.provisioned_startup_catch_up_dirty.store(false, .release);
     server.provisioned_root_refresh_dirty.store(true, .release);
@@ -32451,7 +32495,9 @@ test "data runtime runRound does not refresh provisioned replica root inline whi
     server.provision_ticks = 3;
 
     try server.runRound();
+    try std.testing.expectEqual(@as(usize, 0), metadata_transport.requests);
 
+    try std.testing.expectEqual(@as(u32, 0), server.metadataBootstrapRetryAttemptsForTest());
     try std.testing.expectEqual(@as(usize, 0), server.provision_ticks);
     try std.testing.expect(server.provisioned_root_refresh_dirty.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_root_refresh_started.load(.monotonic));
@@ -32467,11 +32513,25 @@ test "data runtime runRound backs off retryable provision metadata failures" {
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provision-metadata-backoff", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
 
-    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{
+        .required = .of(&.{ .clock_read, .synchronization }),
+        .monotonic_ns = std.time.ns_per_s,
+    });
+    defer vopr_io.deinit();
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = vopr_io.io() },
+    });
     defer backend_runtime.deinit();
     const remote_metadata = try alloc.create(RemoteMetadataSource);
     const metadata_api_urls = [_][]const u8{"http://metadata.test"};
-    remote_metadata.* = try RemoteMetadataSource.init(alloc, &metadata_api_urls, backend_runtime.ptr().apiIoImpl().?);
+    var metadata_transport = ProvisioningControlMetadataForTest{};
+    remote_metadata.* = try RemoteMetadataSource.initWithRequestExecutors(
+        alloc,
+        &metadata_api_urls,
+        &.{metadata_transport.executor()},
+        vopr_io.io(),
+    );
     remote_metadata.test_faults.fetch_head_error = error.NotLeader;
 
     var server: DataServer = .{
@@ -32493,9 +32553,6 @@ test "data runtime runRound backs off retryable provision metadata failures" {
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
-        // runRound may schedule a runtime-status refresh after the injected
-        // metadata failure. Match production construction so that path has a
-        // valid interface instead of invoking undefined test memory.
         .status_source = remote_metadata.statusSource(),
         .api_server_cfg = undefined,
         .query_async_limit = .limited(8),
@@ -32503,16 +32560,18 @@ test "data runtime runRound backs off retryable provision metadata failures" {
         .listener_cfg = undefined,
     };
     defer server.deinit();
+    prepareProvisioningControlRoundForTest(&server);
 
     server.store_registration_confirmed = true;
     server.store_status_dirty.store(false, .release);
-    server.last_store_status_report_at_ms = 1;
+    server.last_store_status_report_at_ms = server.backgroundMonotonicMs();
     server.runtime_status_dirty.store(false, .release);
     server.provisioned_startup_catch_up_dirty.store(false, .release);
     server.provisioned_root_refresh_dirty.store(false, .release);
     server.provision_ticks = 3;
 
     try server.runRound();
+    try std.testing.expectEqual(@as(usize, 0), metadata_transport.requests);
 
     try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
     try std.testing.expect(server.nextMetadataBootstrapRetryAtMsForTest() != 0);
@@ -32525,11 +32584,17 @@ test "data runtime runRound backs off retryable provision metadata failures" {
     server.provision_ticks = 3;
 
     try server.runRound();
+    try std.testing.expectEqual(@as(usize, 0), metadata_transport.requests);
 
     try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
     try std.testing.expectEqual(next_retry_at_ms, server.nextMetadataBootstrapRetryAtMsForTest());
     try std.testing.expectEqual(last_head_check_at_ms, server.last_provision_head_check_at_ms);
     try std.testing.expectEqual(@as(usize, 3), server.provision_ticks);
+    vopr_io.monotonic_ns = @as(i96, next_retry_at_ms - 1) * std.time.ns_per_ms;
+    try std.testing.expect(!server.metadataBootstrapRetryDue(server.backgroundMonotonicMs()));
+    vopr_io.monotonic_ns += std.time.ns_per_ms;
+    try std.testing.expect(server.metadataBootstrapRetryDue(server.backgroundMonotonicMs()));
+    try vopr_io.ensureNoCapabilityViolation();
 }
 
 test "data runtime provisioned root refresh worker backs off retryable metadata failures" {
@@ -32541,11 +32606,25 @@ test "data runtime provisioned root refresh worker backs off retryable metadata 
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provision-worker-backoff", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
 
-    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    var vopr_io = try @import("vopr").vopr_io.VoprIo.init(.{
+        .required = .of(&.{ .clock_read, .synchronization }),
+        .monotonic_ns = std.time.ns_per_s,
+    });
+    defer vopr_io.deinit();
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = vopr_io.io() },
+    });
     defer backend_runtime.deinit();
     const remote_metadata = try alloc.create(RemoteMetadataSource);
     const metadata_api_urls = [_][]const u8{"http://metadata.test"};
-    remote_metadata.* = try RemoteMetadataSource.init(alloc, &metadata_api_urls, backend_runtime.ptr().apiIoImpl().?);
+    var metadata_transport = ProvisioningControlMetadataForTest{};
+    remote_metadata.* = try RemoteMetadataSource.initWithRequestExecutors(
+        alloc,
+        &metadata_api_urls,
+        &.{metadata_transport.executor()},
+        vopr_io.io(),
+    );
     remote_metadata.test_faults.fetch_head_error = error.NotLeader;
 
     var server: DataServer = .{
@@ -32567,13 +32646,14 @@ test "data runtime provisioned root refresh worker backs off retryable metadata 
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
         ),
-        .status_source = undefined,
+        .status_source = remote_metadata.statusSource(),
         .api_server_cfg = undefined,
         .query_async_limit = .limited(8),
         .backend_runtime = backend_runtime.ptr(),
         .listener_cfg = undefined,
     };
     defer server.deinit();
+    prepareProvisioningControlRoundForTest(&server);
 
     server.provisioned_root_refresh_dirty.store(true, .release);
 
@@ -32592,10 +32672,16 @@ test "data runtime provisioned root refresh worker backs off retryable metadata 
     server.provision_ticks = 3;
 
     try server.runRound();
+    try std.testing.expectEqual(@as(usize, 0), metadata_transport.requests);
 
     try std.testing.expectEqual(@as(u32, 1), server.metadataBootstrapRetryAttemptsForTest());
     try std.testing.expectEqual(next_retry_at_ms, server.nextMetadataBootstrapRetryAtMsForTest());
     try std.testing.expectEqual(@as(usize, 3), server.provision_ticks);
+    vopr_io.monotonic_ns = @as(i96, next_retry_at_ms - 1) * std.time.ns_per_ms;
+    try std.testing.expect(!server.metadataBootstrapRetryDue(server.backgroundMonotonicMs()));
+    vopr_io.monotonic_ns += std.time.ns_per_ms;
+    try std.testing.expect(server.metadataBootstrapRetryDue(server.backgroundMonotonicMs()));
+    try vopr_io.ensureNoCapabilityViolation();
 }
 
 test "data runtime provisioned root refresh spawn failure preserves retry bookkeeping" {
