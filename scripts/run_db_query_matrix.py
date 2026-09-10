@@ -265,7 +265,7 @@ def run_matrix(args):
         (out / "summary.jsonl").open("w") as summaries,
     ):
         if not args.skip_build:
-            command = ["zig", "build", *targets]
+            command = ["zig", "build", "-Doptimize=ReleaseFast", *targets]
             commands.write("build\t" + shlex.join(command) + "\n")
             commands.flush()
             subprocess.run(command, cwd=ROOT / "zig", check=True)

@@ -52,6 +52,7 @@ class RuntimeCacheTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name) / "repo"
+        self.build_directory = self.root / "zig"
         link_children(ZIG_ROOT.parent, self.root)
         self.own("zig/build.zig")
         shutil.copyfile(
@@ -60,6 +61,16 @@ class RuntimeCacheTest(unittest.TestCase):
         shutil.copyfile(
             ZIG_ROOT / "tools/fixtures/runtime_cache.zig", self.root / "zig/build.zig"
         )
+
+    def use_standalone(self):
+        build = self.own("zig/pkg/inference/build.zig")
+        shutil.copyfile(build, build.with_name("project_build.zig"))
+        shutil.copyfile(ZIG_ROOT / "tools/fixtures/inference_cache.zig", build)
+        shutil.copyfile(
+            ZIG_ROOT / "tools/fixtures/build_profiles.zig",
+            build.with_name("cache_profiles.zig"),
+        )
+        self.build_directory = build.parent
 
     def own(self, relative):
         """Copy only edited paths; never write through a repository symlink."""
@@ -98,7 +109,7 @@ class RuntimeCacheTest(unittest.TestCase):
                 str(self.root / "cache"),
                 "-j2",
             ],
-            cwd=self.root / "zig",
+            cwd=self.build_directory,
             text=True,
             capture_output=True,
             check=False,
@@ -259,6 +270,63 @@ class RuntimeCacheTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(cached.read_bytes(), fresh.read_bytes())
+
+    def test_native_artifact_profiles(self):
+        for source in ("zig/lib/audio/src/mod.zig", "zig/lib/linalg/src/mod.zig"):
+            path = self.own(source)
+            path.write_bytes(
+                path.read_bytes()
+                + b'\npub const cache_test_profile = @import("builtin").mode;\n'
+            )
+        targets = (
+            "cache-antfly-inference-audio-bench",
+            "cache-antfly-inference-linalg-bench",
+        )
+        for standalone in (False, True):
+            if standalone:
+                self.use_standalone()
+            for mode in ("Debug", "ReleaseFast"):
+                with self.subTest(standalone=standalone, mode=mode):
+                    settings = (f"-Doptimize={mode}",)
+                    output = self.build(*targets, settings=settings)
+                    self.assertEqual(output.count(f"BENCH_PROFILE {mode} {mode}"), 2)
+                    warm = self.build(
+                        *targets, settings=settings, version="profile-change"
+                    )
+                    for name in ("audio", "linalg"):
+                        self.assertRegex(
+                            warm,
+                            rf"compile exe antfly-inference-{name}-bench {mode} \S+ cached",
+                        )
+            # All import graphs are inspected, including foreign artifacts and
+            # explicit profiles such as the isolated PDF build and WASM.
+            settings = ("-Doptimize=ReleaseSafe", "-Dtarget=x86_64-linux-musl")
+            if not standalone:
+                settings += ("-Dpdf-optimize=Debug",)
+            self.build("--help", settings=settings)
+
+    def test_tool_metadata_consumers(self):
+        self.use_standalone()
+        targets = ("cache-pilot", "cache-training-version")
+        first = self.build(*targets)
+        self.assertIn("TRAINING_VERSION cache-before", first)
+        files = list((self.root / "cache/o").glob("*/pilot.jsonl"))
+        self.assertEqual(len(files), 1)
+        before = files[0].read_bytes()
+        self.assertEqual(len(before.splitlines()), 2)
+        changed = self.build(*targets, version="cache-after")
+        self.assertIn("TRAINING_VERSION cache-after", changed)
+        self.assertRegex(
+            changed, r"compile exe generate-gemma4-pilot-dataset Debug \S+ cached"
+        )
+        self.assertRegex(
+            changed, r"compile exe train-gliner2-autodiff Debug \S+ success"
+        )
+        self.assertEqual(files[0].read_bytes(), before)
+        self.assertRegex(
+            self.build(*targets, version="cache-after"),
+            r"compile exe train-gliner2-autodiff Debug \S+ cached",
+        )
 
     def test_wasm_profile_cache_contracts(self):
         for source in ("zig/lib/httpx/src/httpx.zig", "zig/lib/json/src/mod.zig"):

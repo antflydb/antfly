@@ -2332,7 +2332,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = .ReleaseSafe,
     });
-    vopr_benchmark_mod.addImport("vopr", vopr_mod);
+    vopr_benchmark_mod.addImport("vopr", b.dependency("vopr", .{ .target = target, .optimize = .ReleaseSafe }).module("vopr"));
     const vopr_benchmark = b.addExecutable(.{ .name = "vopr-benchmark", .root_module = vopr_benchmark_mod });
     const vopr_benchmark_step = b.step("vopr-benchmark", "Run deterministic VOPR search-efficiency benchmarks");
     vopr_benchmark_step.dependOn(&b.addRunArtifact(vopr_benchmark).step);

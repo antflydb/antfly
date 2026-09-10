@@ -18,6 +18,8 @@
 const std = @import("std");
 const project = @import("project_build.zig");
 const runtime = @import("pkg/antfly/build/runtime.zig");
+const profiles = @import("tools/fixtures/build_profiles.zig");
+const collectSteps = profiles.collectSteps;
 
 pub fn build(b: *std.Build) void {
     const artifacts = project.create(b) orelse return;
@@ -47,8 +49,8 @@ pub fn build(b: *std.Build) void {
                 openapi.dependOn(&run.step);
         }
         const artifact = entry.*.cast(std.Build.Step.Compile) orelse continue;
-        var configured = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
-        inspectConfiguration(b, artifact.step.name, artifact.root_module, artifact.root_module.resolved_target.?, inference.inference_mod.optimize.?, &configured);
+        profiles.check(artifact);
+        profiles.addBenchmarkProbe(b, artifact);
         const arch = artifact.root_module.resolved_target.?.result.cpu.arch;
         if (arch == .wasm32 or arch == .wasm64) {
             var wasm_modules = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
@@ -246,27 +248,6 @@ fn inspect(module: *std.Build.Module, unit: runtime.RuntimeLibraryUnit, metadata
     }
 }
 
-// Follow generated sources as well as explicit steps, without freezing module
-// graphs before the fixture replaces the expensive compilation bodies.
-fn collectSteps(step: *std.Build.Step, steps: *std.AutoHashMap(*std.Build.Step, void), modules: *std.AutoHashMap(*std.Build.Module, void)) void {
-    if ((steps.getOrPut(step) catch @panic("OOM")).found_existing) return;
-    for (step.dependencies.items) |dependency| collectSteps(dependency, steps, modules);
-    if (step.cast(std.Build.Step.Compile)) |artifact| collectModules(artifact.root_module, steps, modules);
-}
-
-fn collectModules(module: *std.Build.Module, steps: *std.AutoHashMap(*std.Build.Step, void), modules: *std.AutoHashMap(*std.Build.Module, void)) void {
-    if ((modules.getOrPut(module) catch @panic("OOM")).found_existing) return;
-    if (module.root_source_file) |source| switch (source) {
-        .generated => |generated| collectSteps(generated.file.step, steps, modules),
-        else => {},
-    };
-    for (module.link_objects.items) |object| switch (object) {
-        .other_step => |artifact| collectSteps(&artifact.step, steps, modules),
-        else => {},
-    };
-    for (module.import_table.values()) |dependency| collectModules(dependency, steps, modules);
-}
-
 fn rejectMetadata(module: *std.Build.Module, metadata: *std.Build.Step.Compile, seen: *std.AutoHashMap(*std.Build.Module, void)) void {
     if ((seen.getOrPut(module) catch @panic("OOM")).found_existing) return;
     for (module.link_objects.items) |object| switch (object) {
@@ -284,36 +265,4 @@ fn isSqlGenerator(b: *std.Build, artifact: *std.Build.Step.Compile) bool {
     var modules = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
     collectSteps(&b.top_level_steps.get("sql-grammar-generated-check").?.step, &steps, &modules);
     return steps.contains(&artifact.step);
-}
-
-// Check the production module graph, including foreign executables, before
-// replacing any bodies. Host generators contain no product runtime modules.
-fn inspectConfiguration(b: *std.Build, consumer: []const u8, module: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, seen: *std.AutoHashMap(*std.Build.Module, void)) void {
-    if ((seen.getOrPut(module) catch @panic("OOM")).found_existing) return;
-    const wasm = target.result.cpu.arch == .wasm32 or target.result.cpu.arch == .wasm64;
-    if (module.root_source_file) |source| switch (source) {
-        .src_path => {
-            const path = source.getPath(b);
-            if (std.mem.endsWith(u8, path, "/lib/protobuf/src/root.zig") or
-                std.mem.endsWith(u8, path, "/lib/handlebars/src/handlebars.zig"))
-            {
-                if (!std.Target.Query.fromTarget(&module.resolved_target.?.result).eql(std.Target.Query.fromTarget(&target.result)))
-                    std.debug.panic("{s} in {s} uses target {any}, expected {any}", .{ path, consumer, module.resolved_target.?.query, target.query });
-                if (module.optimize != (if (wasm) .ReleaseSafe else optimize))
-                    std.debug.panic("{s} uses an unexpected runtime optimization profile", .{path});
-            }
-        },
-        else => {},
-    };
-    for (module.link_objects.items) |object| switch (object) {
-        .system_lib => |lib| {
-            for ([_][]const u8{ "avformat", "avcodec", "avutil", "swresample" }) |name| {
-                if (std.mem.eql(u8, lib.name, name)) @panic("runtime links an unused external FFmpeg library");
-            }
-        },
-        // Linked artifacts have their own compilation profile and are checked
-        // independently by the outer step traversal.
-        else => {},
-    };
-    for (module.import_table.values()) |dependency| inspectConfiguration(b, consumer, dependency, target, optimize, seen);
 }

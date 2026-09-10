@@ -2,7 +2,9 @@
 
 Run these commands from `zig/`. Artifact targets build and install into `zig-out`; execute the installed binary to run a benchmark or tool. Build flags belong to `zig build`, and runtime arguments belong to the binary.
 
-The commands below preserve the former build-run defaults. Replace the arguments with your chosen workload. File arguments remain relative to the working directory.
+Benchmarks that share Antfly or inference runtime modules honor `-Doptimize` throughout their imports, with Debug as the default. Use `zig build <target> -Doptimize=ReleaseFast` for timing runs. The DB and sort query matrix scripts select ReleaseFast explicitly. Isolated library benchmarks can retain their own profile; their imported modules use the same profile as the executable.
+
+The commands below preserve the former workload defaults. Replace the arguments with your chosen workload. File arguments remain relative to the working directory.
 
 | Build target | Run command with previous defaults |
 |---|---|

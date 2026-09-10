@@ -18,6 +18,7 @@ pub const Import = enum {
     antfly_image,
     antfly_platform,
     build_options,
+    build_info,
     jinja,
     ml,
     onnx_graph,
@@ -78,6 +79,7 @@ pub const Context = struct {
             .antfly_image => ctx.antfly_image_mod,
             .antfly_platform => ctx.antfly_platform_mod,
             .build_options => ctx.build_options_mod,
+            .build_info => ctx.build_info_mod,
             .jinja => ctx.jinja_mod,
             .ml => ctx.ml_mod,
             .onnx_graph => ctx.onnx_graph_mod,
@@ -125,6 +127,8 @@ pub const CommandSpec = struct {
     imports: []const Import = &.{},
     native_link: NativeLink = .none,
     link_libc: bool = false,
+    /// This command writes a release version to its output or training manifest.
+    release_metadata: bool = false,
 };
 
 pub const TestSpec = struct {
@@ -148,6 +152,10 @@ pub fn addCommand(ctx: Context, spec: CommandSpec) *std.Build.Step.Run {
     });
     addImports(ctx, exe.root_module, spec.imports);
     configureNative(ctx, exe, spec.native_link, spec.imports);
+    if (spec.release_metadata) {
+        exe.root_module.addImport("build_info", ctx.build_info_mod);
+        exe.root_module.addObject(ctx.build_info_object);
+    }
     if (spec.link_libc) exe.root_module.link_libc = true;
 
     const run = b.addRunArtifact(exe);
@@ -204,10 +212,6 @@ fn configureNative(
     native_link: NativeLink,
     imports: []const Import,
 ) void {
-    if (native_link != .none or containsImport(imports, .inference_internal)) {
-        artifact.root_module.addImport("build_info", ctx.build_info_mod);
-        if (!artifact.kind.isTest()) artifact.root_module.addObject(ctx.build_info_object);
-    }
     if (native_link != .none) ctx.identities.addImports(artifact.root_module);
     // inference_internal already owns the Metal translation unit. Adding it to
     // the importing executable as well makes Zig pass the same object to the

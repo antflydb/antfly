@@ -46,9 +46,10 @@ runtime archives cached.
 Runtime dependency and cache contracts are checked in CI with
 `python3 -m unittest tools.test_runtime_cache` from `zig/`, with Zig and uv on
 `PATH` and `zig/deps/snowball` initialized (`git submodule update --init
-zig/deps/snowball` from the repository root). The fixture calls the real root
-composition and replaces expensive runtime, test, and WASM entry bodies. It
-keeps external modules, options, generated assets, backend inputs, and final link
+zig/deps/snowball` from the repository root). The fixtures call the real root and
+standalone inference compositions and replace expensive runtime, test, benchmark,
+and WASM entry bodies. They
+keep external modules, options, generated assets, backend inputs, and final link
 edges; the inference probe also loads the real inference module. The checks cover:
 
 - All six served schemas invalidate only the API kernel; the other archives can
@@ -62,15 +63,22 @@ edges; the inference probe also loads the real inference module. The checks cove
   Enabled fingerprints match an independent implementation of the qualification
   identity format and change when their source inputs change.
 - Release versions live in a small `lib/build_info` object. Archives see only a
-  stable accessor module; the object is attached at final executable, shared
-  library, and test links. Version-only changes leave the five runtime archives
-  cached while the resulting binary reports the updated version. ABI constants
-  remain at their interface declarations.
+  stable accessor module; final links attach the object only for version consumers.
+  Tests use stable test metadata. Version-only changes leave the five runtime
+  archives cached while the resulting binary reports the updated version. The
+  unchanged dataset generator compiles, runs, and stays cached across version
+  changes; a training-command probe still links and reports the updated version.
+  ABI constants remain at their interface declarations.
 - Storage options do not invalidate the CLI or inference archives. A real shared
   implementation edit does invalidate its consumers and changes linked behavior;
   an unchanged rebuild reuses compilation and generated outputs.
 - Host generators stay cached across product targets and optimization settings.
   HTTPX runtime edits do not invalidate the OpenAPI compiler.
+- Every published native artifact's runtime imports match its target and
+  optimization profile in both build entrypoints, including benchmark-specific
+  profiles. Compiled audio and linalg probes verify Debug and ReleaseFast reach
+  the actual library modules and stay cached across version changes. Graph checks
+  also cover foreign targets and a separate PDF optimization override.
 - WASM runtime imports retain their target and ReleaseSafe profile. Compiled
   HTTPX/JSON probes and the WASM artifact remain cached when native target,
   optimization, or storage options change.

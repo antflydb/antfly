@@ -34,7 +34,6 @@ pub const AddBenchmarksOptions = struct {
     lmdb_evented_async_io: bool,
     with_tla: bool,
     lite_local_inference_runtime: bool,
-    hash_bench_mod: *std.Build.Module,
     antfly_imports: AntflyRootImports,
     antfly_mod: *std.Build.Module,
     antfly_test_mod: *std.Build.Module,
@@ -60,7 +59,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const bloom_mod = options.antfly_imports.bloom;
     const vector_mod = options.antfly_imports.vector;
     const structlog_mod = options.antfly_imports.structlog;
-    const hash_bench_mod = options.hash_bench_mod;
+    const hash_mod = options.antfly_imports.hash;
     const vectorindex_mod = options.antfly_imports.vectorindex;
     const vellum_mod = options.antfly_imports.vellum;
     const antfly_imports = options.antfly_imports;
@@ -70,12 +69,12 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const compiled_recall_tests = options.compiled_recall_tests;
     const lmdb_bench_engine_options_c = makeLmdbBuildOptions(b, .c, false, false);
     const lmdb_bench_build_options_c = makeRootBuildOptions(b, .c, false, false, false, true, false, lite_local_inference_runtime, true);
-    const lmdb_bench_engine_mod_c = makeLmdbEngineModule(b, target, .ReleaseFast, true, lmdb_bench_engine_options_c);
-    const lmdb_bench_wrapper_mod_c = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, .ReleaseFast, lmdb_bench_build_options_c, lmdb_bench_engine_mod_c, platform_mod, hash_bench_mod);
+    const lmdb_bench_engine_mod_c = makeLmdbEngineModule(b, target, optimize, true, lmdb_bench_engine_options_c);
+    const lmdb_bench_wrapper_mod_c = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, lmdb_bench_build_options_c, lmdb_bench_engine_mod_c, platform_mod, hash_mod);
     const lmstorage_bench_mod_c = b.createModule(.{
         .root_source_file = b.path("bench/storage/lmdb_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     lmstorage_bench_mod_c.addImport("lmdb", lmdb_bench_wrapper_mod_c);
     lmstorage_bench_mod_c.addImport("lmdb_engine", lmdb_bench_engine_mod_c);
@@ -87,12 +86,12 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
 
     const lmdb_bench_engine_options_zig = makeLmdbBuildOptions(b, .zig, lmdb_evented_async_io, false);
     const lmdb_bench_build_options_zig = makeRootBuildOptions(b, .zig, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, true);
-    const lmdb_bench_engine_mod_zig = makeLmdbEngineModule(b, target, .ReleaseFast, true, lmdb_bench_engine_options_zig);
-    const lmdb_bench_wrapper_mod_zig = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, .ReleaseFast, lmdb_bench_build_options_zig, lmdb_bench_engine_mod_zig, platform_mod, hash_bench_mod);
+    const lmdb_bench_engine_mod_zig = makeLmdbEngineModule(b, target, optimize, true, lmdb_bench_engine_options_zig);
+    const lmdb_bench_wrapper_mod_zig = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, lmdb_bench_build_options_zig, lmdb_bench_engine_mod_zig, platform_mod, hash_mod);
     const lmstorage_bench_mod_zig = b.createModule(.{
         .root_source_file = b.path("bench/storage/lmdb_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     lmstorage_bench_mod_zig.addImport("lmdb", lmdb_bench_wrapper_mod_zig);
     lmstorage_bench_mod_zig.addImport("lmdb_engine", lmdb_bench_engine_mod_zig);
@@ -108,12 +107,12 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
 
     const split_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const split_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, true);
-    const split_bench_engine_mod = makeLmdbEngineModule(b, target, .ReleaseFast, true, split_bench_engine_options);
-    const split_bench_root_mod = makeLmdbModule(b, split_bench_root, target, .ReleaseFast, split_bench_build_options, split_bench_engine_mod, platform_mod, hash_bench_mod);
+    const split_bench_engine_mod = makeLmdbEngineModule(b, target, optimize, true, split_bench_engine_options);
+    const split_bench_root_mod = makeLmdbModule(b, split_bench_root, target, optimize, split_bench_build_options, split_bench_engine_mod, platform_mod, hash_mod);
     const split_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/split_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     split_bench_mod.addImport("split_storage", split_bench_root_mod);
 
@@ -128,7 +127,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const db_split_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/db_split_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     db_split_bench_mod.addImport("antfly-zig", antfly_mod);
 
@@ -145,7 +144,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const backend_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/backend_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     backend_bench_mod.addImport("antfly_zig", antfly_mod);
     const backend_bench = b.addExecutable(.{
@@ -159,7 +158,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const graph_pattern_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/graph/pattern_query_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     graph_pattern_bench_mod.addImport("antfly_zig", antfly_mod);
     const graph_pattern_bench = b.addExecutable(.{
@@ -173,7 +172,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const lsm_backend_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/lsm_backend_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     lsm_backend_bench_mod.addImport("antfly_zig", antfly_mod);
     const lsm_backend_bench = b.addExecutable(.{
@@ -187,7 +186,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const hbc_storage_read_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/vectors/hbc_storage_read_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     hbc_storage_read_bench_mod.addImport("antfly-zig", antfly_mod);
     const hbc_storage_read_bench = b.addExecutable(.{
@@ -201,16 +200,16 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const lsm_write_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/lsm_write_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     const lsm_write_bench_root_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lsm_write_bench_root.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     lsm_write_bench_root_mod.addImport("bloom", bloom_mod);
     lsm_write_bench_root_mod.addImport("antfly_platform", platform_mod);
-    lsm_write_bench_root_mod.addImport("antfly_hash", hash_bench_mod);
+    lsm_write_bench_root_mod.addImport("antfly_hash", hash_mod);
     lsm_write_bench_mod.addImport("antfly_zig", lsm_write_bench_root_mod);
     const lsm_write_bench = b.addExecutable(.{
         .name = "lsm_write_bench",
@@ -223,7 +222,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const lsm_write_bench_compare_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/lsm_write_bench_compare.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     const lsm_write_bench_compare = b.addExecutable(.{
         .name = "lsm_write_bench_compare",
@@ -236,17 +235,17 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const text_segment_write_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/text_segment_write_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     const text_segment_bench_root_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/text_segment_bench_root.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     text_segment_bench_root_mod.addImport("bloom", bloom_mod);
     text_segment_bench_root_mod.addImport("antfly_vellum", vellum_mod);
     text_segment_bench_root_mod.addImport("antfly_platform", platform_mod);
-    text_segment_bench_root_mod.addImport("antfly_hash", hash_bench_mod);
+    text_segment_bench_root_mod.addImport("antfly_hash", hash_mod);
     text_segment_write_bench_mod.addImport("antfly_text_bench", text_segment_bench_root_mod);
     const text_segment_write_bench = b.addExecutable(.{
         .name = "text_segment_write_bench",
@@ -259,7 +258,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const lsm_backend_bench_compare_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/lsm_backend_bench_compare.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     const lsm_backend_bench_compare = b.addExecutable(.{
         .name = "lsm_backend_bench_compare",
@@ -271,12 +270,12 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
 
     const wal_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const wal_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, true);
-    const wal_bench_engine_mod = makeLmdbEngineModule(b, target, .ReleaseFast, true, wal_bench_engine_options);
-    const wal_bench_wal_mod = makeLmdbModule(b, wal_bench_root, target, .ReleaseFast, wal_bench_build_options, wal_bench_engine_mod, platform_mod, hash_bench_mod);
+    const wal_bench_engine_mod = makeLmdbEngineModule(b, target, optimize, true, wal_bench_engine_options);
+    const wal_bench_wal_mod = makeLmdbModule(b, wal_bench_root, target, optimize, wal_bench_build_options, wal_bench_engine_mod, platform_mod, hash_mod);
     const wal_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/wal_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     wal_bench_mod.addImport("wal", wal_bench_wal_mod);
     wal_bench_wal_mod.addImport("bloom", bloom_mod);
@@ -298,22 +297,22 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
 
     const derived_log_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const derived_log_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, true);
-    const derived_log_bench_engine_mod = makeLmdbEngineModule(b, target, .ReleaseFast, true, derived_log_bench_engine_options);
+    const derived_log_bench_engine_mod = makeLmdbEngineModule(b, target, optimize, true, derived_log_bench_engine_options);
     const derived_log_bench_root_mod = b.createModule(.{
         .root_source_file = b.path(derived_log_bench_root),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     derived_log_bench_root_mod.addOptions("build_options", derived_log_bench_build_options);
     derived_log_bench_root_mod.addImport("lmdb_engine", derived_log_bench_engine_mod);
     derived_log_bench_root_mod.addImport("bloom", bloom_mod);
     derived_log_bench_root_mod.addImport("antfly_platform", platform_mod);
-    derived_log_bench_root_mod.addImport("antfly_hash", hash_bench_mod);
+    derived_log_bench_root_mod.addImport("antfly_hash", hash_mod);
     derived_log_bench_root_mod.link_libc = true;
     const derived_log_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/derived_log_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     derived_log_bench_mod.addImport("derived_log", derived_log_bench_root_mod);
 
@@ -335,7 +334,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     bench_mod.addImport("antfly-zig", antfly_mod);
 
@@ -355,18 +354,18 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const quickstart_bench_root_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/quickstart_bench_root.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     quickstart_bench_root_mod.addImport("antfly_vellum", vellum_mod);
     quickstart_bench_root_mod.addImport("bloom", bloom_mod);
     quickstart_bench_root_mod.addImport("antfly_platform", platform_mod);
-    quickstart_bench_root_mod.addImport("antfly_hash", hash_bench_mod);
+    quickstart_bench_root_mod.addImport("antfly_hash", hash_mod);
     addSnowballModule(b, quickstart_bench_root_mod);
 
     const quickstart_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/quickstart_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
         .link_libc = true,
     });
     quickstart_bench_mod.addImport("antfly_quickstart_bench", quickstart_bench_root_mod);
@@ -400,7 +399,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const search_benchmark_index_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/search_benchmark_index.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     search_benchmark_index_mod.addImport("antfly-zig", antfly_mod);
     const search_benchmark_index = b.addExecutable(.{
@@ -412,7 +411,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const search_benchmark_query_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/search_benchmark_query.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     search_benchmark_query_mod.addImport("antfly-zig", antfly_mod);
     const search_benchmark_query = b.addExecutable(.{
@@ -507,7 +506,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const search_benchmark_codec_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/search_benchmark_codec_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     search_benchmark_codec_bench_mod.addImport("antfly-zig", antfly_mod);
     const search_benchmark_codec_bench = b.addExecutable(.{
@@ -522,7 +521,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const search_benchmark_bitpack_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/search_benchmark_bitpack_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     search_benchmark_bitpack_bench_mod.addImport("antfly-zig", antfly_mod);
     const search_benchmark_bitpack_bench = b.addExecutable(.{
@@ -537,7 +536,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const search_impact_layout_analyze_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/search_impact_layout_analyze.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     search_impact_layout_analyze_mod.addImport("antfly-zig", antfly_mod);
     const search_impact_layout_analyze = b.addExecutable(.{
@@ -551,7 +550,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const wand_skip_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/wand_skip_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     wand_skip_bench_mod.addImport("antfly-zig", antfly_mod);
     const wand_skip_bench = b.addExecutable(.{
@@ -584,7 +583,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const merge_cycle_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/merge_cycle_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     merge_cycle_mod.addImport("antfly-zig", antfly_mod);
 
@@ -599,7 +598,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const merge_cost_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/merge_cost_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     merge_cost_mod.addImport("antfly-zig", antfly_mod);
 
@@ -629,12 +628,12 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const hbc_isolate_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/tools/hbc_isolate.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     const hbc_isolate_root_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/hbc_isolate_root.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     const hbc_isolate_build_options = b.addOptions();
     hbc_isolate_build_options.addOption([]const u8, "lmdb_backend", @tagName(lmdb_backend));
@@ -651,7 +650,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     hbc_isolate_root_mod.addImport("antfly_vector", vector_mod);
     hbc_isolate_root_mod.addImport("antfly_vectorindex", vectorindex_mod);
     hbc_isolate_root_mod.addImport("antfly_platform", platform_mod);
-    hbc_isolate_root_mod.addImport("antfly_hash", hash_bench_mod);
+    hbc_isolate_root_mod.addImport("antfly_hash", hash_mod);
     hbc_isolate_mod.addImport("antfly_hbc_isolate_root", hbc_isolate_root_mod);
 
     const hbc_isolate = b.addExecutable(.{
@@ -665,13 +664,13 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const dense_stack_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/vectors/dense_stack_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     dense_stack_bench_mod.addImport("antfly-zig", antfly_mod);
     const capi_bench_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/capi/root.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     capi_bench_mod.addImport("antfly_storage_root", antfly_mod);
     capi_bench_mod.addImport("antfly_vector", vector_mod);
@@ -689,12 +688,12 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const storage_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     const storage_bench_root_mod = b.createModule(.{
         .root_source_file = b.path(storage_bench_root),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     antfly_imports.configureRuntime(b, storage_bench_root_mod, false, true, false);
     storage_bench_root_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
@@ -724,7 +723,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         const module = b.createModule(.{
             .root_source_file = b.path(workload[1]),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = optimize,
         });
         module.addImport("antfly-zig", storage_bench_root_mod);
         const artifact = b.addExecutable(.{
@@ -740,7 +739,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const rw_lock_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/rw_lock_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     rw_lock_bench_mod.addImport("antfly-zig", antfly_mod);
 
@@ -755,7 +754,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const provisioned_warmup_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/provisioned_warmup_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     provisioned_warmup_bench_mod.addImport("antfly-zig", antfly_mod);
 
@@ -808,7 +807,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const raft_apply_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/raft_apply_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     raft_apply_bench_mod.addImport("antfly-zig", antfly_mod);
     raft_apply_bench_mod.addImport("raft_engine", raft_engine_mod);
@@ -824,7 +823,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const managed_host_wal_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/managed_host_wal_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     managed_host_wal_bench_mod.addImport("antfly-zig", antfly_mod);
     managed_host_wal_bench_mod.addImport("raft_engine", raft_engine_mod);
@@ -842,7 +841,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .root_module = b.createModule(.{
             .root_source_file = b.path("bench/vectors/dense_profile_summary.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = optimize,
         }),
     });
 
@@ -852,7 +851,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const lmdb_commit_compare_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/lmdb_commit_compare.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     lmdb_commit_compare_mod.addImport("antfly-zig", antfly_mod);
 
@@ -867,7 +866,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const sparse_split_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/vectors/sparse_split_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     sparse_split_bench_mod.addImport("antfly-zig", antfly_mod);
 
@@ -882,7 +881,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const rabitq_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/vectors/rabitq_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     rabitq_bench_mod.addImport("antfly-zig", antfly_mod);
     rabitq_bench_mod.addImport("antfly_vector", vector_mod);
@@ -898,7 +897,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const recall_harness_mod = b.createModule(.{
         .root_source_file = b.path("bench/vectors/recall_harness.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     recall_harness_mod.addImport("antfly-zig", antfly_mod);
 

@@ -40,8 +40,6 @@ pub const Context = struct {
         return run;
     }
     pub fn configureNativeTool(ctx: Context, artifact: *std.Build.Step.Compile, metal: bool) void {
-        artifact.root_module.addImport("build_info", ctx.graph.build_info_mod);
-        if (!artifact.kind.isTest()) artifact.root_module.addObject(ctx.graph.build_info_object);
         ctx.graph.identities.addImports(artifact.root_module);
         if (ctx.backend.enable_system_blas) runtime.configureSystemBlas(ctx.b, artifact.root_module, ctx.target, ctx.backend.blas_root);
         runtime.configureMetal(ctx.b, artifact.root_module, ctx.target, metal, ctx.paths);

@@ -57,7 +57,7 @@ pub fn addTrainingAndLinalg(ctx: Context) void {
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/linalg_bench.zig"),
             .target = ctx.target,
-            .optimize = .ReleaseFast,
+            .optimize = ctx.optimize,
         }),
     });
     training_bench_exe.root_module.addImport("build_options", ctx.graph.build_options_mod);
@@ -85,7 +85,7 @@ pub fn addGliner(ctx: Context) void {
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/bench/gliner2_native.zig"),
             .target = ctx.target,
-            .optimize = .ReleaseFast,
+            .optimize = ctx.optimize,
         }),
     });
     gliner2_bench_exe.root_module.addImport("build_options", ctx.graph.build_options_mod);
@@ -98,7 +98,6 @@ pub fn addGliner(ctx: Context) void {
     gliner2_bench_exe.root_module.addImport("protobuf", ctx.graph.protobuf_mod);
     gliner2_bench_exe.root_module.addImport("onnx_graph", ctx.graph.onnx_graph_mod);
     gliner2_bench_exe.root_module.addImport("antfly_platform", ctx.graph.platform_mod);
-    ctx.graph.linkBuildInfo(gliner2_bench_exe.root_module);
     ctx.graph.identities.addImports(gliner2_bench_exe.root_module);
     gliner2_bench_exe.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
     // inference_internal already owns the native backend linkage, including
@@ -121,7 +120,7 @@ pub fn addAudio(ctx: Context) void {
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/audio_bench.zig"),
             .target = ctx.target,
-            .optimize = .ReleaseFast,
+            .optimize = ctx.optimize,
         }),
     });
     audio_bench_exe.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);

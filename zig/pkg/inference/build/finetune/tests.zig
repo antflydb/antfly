@@ -74,7 +74,7 @@ const tests = [_]common.TestSpec{
         .step_name = "test-gliner2-autodiff-trainer",
         .root_source_file = "src/finetune/train/train_gliner2_autodiff.zig",
         .description = "Run GLiNER2 autodiff trainer unit tests",
-        .imports = &.{ .build_options, .ml, .inference_internal, .inference_hf_tokenizer, .protobuf, .inference_linalg },
+        .imports = &.{ .build_info, .build_options, .ml, .inference_internal, .inference_hf_tokenizer, .protobuf, .inference_linalg },
         .native_link = .default,
     },
     .{

@@ -1088,7 +1088,6 @@ pub fn build(b: *std.Build) void {
     });
     metal_bench_exe.root_module.addImport("build_options", build_options_mod);
     metal_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    runtime_graph.linkBuildInfo(metal_bench_exe.root_module);
     runtime_graph.identities.addImports(metal_bench_exe.root_module);
     // inference_internal already owns the native backend links. Configuring
     // Metal again here compiles metal_kernels.m twice into this executable.
@@ -1275,7 +1274,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/clipclap_kernels_bench.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = optimize,
         }),
     });
     clipclap_bench_exe.root_module.addImport("build_options", build_options_mod);
@@ -1299,7 +1298,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench/gliner2_e2e.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = optimize,
         }),
     });
     gliner2_e2e_bench_exe.root_module.addImport("build_options", build_options_mod);
@@ -1312,7 +1311,6 @@ pub fn build(b: *std.Build) void {
     gliner2_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     gliner2_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     gliner2_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    runtime_graph.linkBuildInfo(gliner2_e2e_bench_exe.root_module);
     runtime_graph.identities.addImports(gliner2_e2e_bench_exe.root_module);
     gliner2_e2e_bench_exe.root_module.link_libc = true;
     configureOnnxRuntime(b, gliner2_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
@@ -1328,7 +1326,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench/clipclap_native.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = optimize,
         }),
     });
     clipclap_native_bench_exe.root_module.addImport("build_options", build_options_mod);
@@ -1341,7 +1339,6 @@ pub fn build(b: *std.Build) void {
     clipclap_native_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     clipclap_native_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     clipclap_native_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    runtime_graph.linkBuildInfo(clipclap_native_bench_exe.root_module);
     runtime_graph.identities.addImports(clipclap_native_bench_exe.root_module);
     // inference_internal already owns the Metal source and frameworks.
     configureNativeTool(b, clipclap_native_bench_exe, target, enable_system_blas, blas_root, false);
@@ -1358,7 +1355,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench/clipclap_e2e.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = optimize,
         }),
     });
     clipclap_e2e_bench_exe.root_module.addImport("build_options", build_options_mod);
@@ -1371,7 +1368,6 @@ pub fn build(b: *std.Build) void {
     clipclap_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     clipclap_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     clipclap_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    runtime_graph.linkBuildInfo(clipclap_e2e_bench_exe.root_module);
     runtime_graph.identities.addImports(clipclap_e2e_bench_exe.root_module);
     // inference_internal already owns the Metal source and frameworks.
     configureNativeTool(b, clipclap_e2e_bench_exe, target, enable_system_blas, blas_root, false);
@@ -1411,7 +1407,6 @@ pub fn build(b: *std.Build) void {
     qwen3_embedding_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     qwen3_embedding_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     qwen3_embedding_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    runtime_graph.linkBuildInfo(qwen3_embedding_e2e_bench_exe.root_module);
     runtime_graph.identities.addImports(qwen3_embedding_e2e_bench_exe.root_module);
     // inference_internal already owns the Metal source and frameworks.
     configureNativeTool(b, qwen3_embedding_e2e_bench_exe, target, enable_system_blas, blas_root, false);
@@ -1441,7 +1436,6 @@ pub fn build(b: *std.Build) void {
     nomic_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     nomic_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     nomic_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    runtime_graph.linkBuildInfo(nomic_e2e_bench_exe.root_module);
     runtime_graph.identities.addImports(nomic_e2e_bench_exe.root_module);
     // inference_internal already owns the Metal source and frameworks.
     configureNativeTool(b, nomic_e2e_bench_exe, target, enable_system_blas, blas_root, false);
@@ -1458,7 +1452,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench/reranker_e2e.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = optimize,
         }),
     });
     reranker_e2e_bench_exe.root_module.addImport("build_options", build_options_mod);
@@ -1471,7 +1465,6 @@ pub fn build(b: *std.Build) void {
     reranker_e2e_bench_exe.root_module.addImport("protobuf", protobuf_mod);
     reranker_e2e_bench_exe.root_module.addImport("onnx_graph", onnx_graph_mod);
     reranker_e2e_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
-    runtime_graph.linkBuildInfo(reranker_e2e_bench_exe.root_module);
     runtime_graph.identities.addImports(reranker_e2e_bench_exe.root_module);
     reranker_e2e_bench_exe.root_module.link_libc = true;
     configureOnnxRuntime(b, reranker_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);

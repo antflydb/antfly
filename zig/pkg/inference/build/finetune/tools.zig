@@ -137,6 +137,7 @@ const commands = [_]common.CommandSpec{
     },
     .{
         .name = "train-gliner2-autodiff",
+        .release_metadata = true,
         .root_source_file = "src/finetune/train/train_gliner2_autodiff.zig",
         .description = "Train GLiNER2 NER with real autodiff through DeBERTa encoder (level-3 LoRA training)",
         .imports = &.{ .build_options, .ml, .inference_internal, .inference_hf_tokenizer, .protobuf, .inference_linalg },

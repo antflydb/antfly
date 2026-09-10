@@ -346,8 +346,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .target = target,
         .optimize = optimize,
     });
-    // Standalone benchmark roots force ReleaseFast even when the root build
-    // defaults to Debug. Keep their checksum dependency equally optimized.
+    // Isolated image/hash benchmarks own a fixed ReleaseFast profile.
     const hash_bench_mod = if (optimize == .ReleaseFast) hash_mod else b.createModule(.{
         .root_source_file = b.path("lib/hash/src/mod.zig"),
         .target = target,
@@ -1076,7 +1075,12 @@ pub fn create(b: *std.Build) ?Artifacts {
     b.step("lib-image-bench", "Build and install lib-image-bench").dependOn(&b.addInstallArtifact(image_benchmark, .{}).step);
 
     const pdf_bench_optimize = b.option(std.builtin.OptimizeMode, "pdf-optimize", "Optimization for the isolated PDF executable") orelse .ReleaseFast;
-    const pdf_bench_image = image_build.createModule(b, b.path("lib/image"), target, pdf_bench_optimize, hash_bench_mod);
+    const pdf_bench_hash = if (pdf_bench_optimize == .ReleaseFast) hash_bench_mod else if (pdf_bench_optimize == optimize) hash_mod else b.createModule(.{
+        .root_source_file = b.path("lib/hash/src/mod.zig"),
+        .target = target,
+        .optimize = pdf_bench_optimize,
+    });
+    const pdf_bench_image = image_build.createModule(b, b.path("lib/image"), target, pdf_bench_optimize, pdf_bench_hash);
     const pdf_bench_font = b.createModule(.{
         .root_source_file = b.path("lib/font/src/mod.zig"),
         .target = target,
@@ -1087,7 +1091,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .target = target,
         .optimize = pdf_bench_optimize,
     });
-    const pdf_bench_pdf = pdf_build.createModule(b, b.path("lib/pdf"), target, pdf_bench_optimize, pdf_bench_image, hash_bench_mod, pdf_bench_font, pdf_bench_fonts);
+    const pdf_bench_pdf = pdf_build.createModule(b, b.path("lib/pdf"), target, pdf_bench_optimize, pdf_bench_image, pdf_bench_hash, pdf_bench_font, pdf_bench_fonts);
     const pdf_bench = pdf_build.addBenchmark(b, .{
         .root = b.path("lib/pdf"),
         .target = target,
@@ -1235,7 +1239,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const regex_bench_mod = b.createModule(.{
         .root_source_file = b.path("lib/regex/bench/regex_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     regex_bench_mod.addImport("antfly_regex", regex_mod);
     regex_bench_mod.addImport("antfly_vellum", vellum_mod);
@@ -1250,7 +1254,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const json_bench_mod = b.createModule(.{
         .root_source_file = b.path("lib/json/bench/json_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     json_bench_mod.addImport("antfly-json", json_mod);
 
@@ -1265,7 +1269,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const tokenizer_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/tokenizer_benchmark.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
         .link_libc = true,
     });
     tokenizer_bench_mod.addImport("inference_tokenizer", inference_graph.inference_tokenizer_mod);
@@ -1290,7 +1294,6 @@ pub fn create(b: *std.Build) ?Artifacts {
         .lmdb_evented_async_io = lmdb_evented_async_io,
         .with_tla = with_tla,
         .lite_local_inference_runtime = lite_local_inference_runtime,
-        .hash_bench_mod = hash_bench_mod,
         .antfly_imports = antfly_imports,
         .antfly_mod = antfly_mod,
         .antfly_test_mod = antfly_test_mod,
@@ -1442,13 +1445,13 @@ pub fn create(b: *std.Build) ?Artifacts {
     const hbc_trace_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/tools/hbc_trace.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     hbc_trace_mod.addImport("antfly-zig", antfly_mod);
     const recall_common_mod = b.createModule(.{
         .root_source_file = b.path("bench/vectors/recall_common.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     recall_common_mod.addImport("antfly-zig", antfly_mod);
     hbc_trace_mod.addImport("recall_common", recall_common_mod);
@@ -1464,7 +1467,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const hbc_leaf_debug_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/tools/hbc_leaf_debug.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     hbc_leaf_debug_mod.addImport("antfly-zig", antfly_mod);
     hbc_leaf_debug_mod.addImport("recall_common", recall_common_mod);
