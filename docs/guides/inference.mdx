@@ -27,6 +27,69 @@ optimized ONNX and native GGUF execution without external API dependencies.
 - **Local Generation** - Text, image, and audio prompts with supported GGUF models
 - **Privacy** - Data never leaves your infrastructure
 
+## Configuring a Separate Inference Process
+
+`antfly inference run --config inference.json` reads admission settings and the
+model settings `models_dir`, `ml_dir`, `max_loaded_models`, and `preload`:
+
+```json
+{
+  "inference": {
+    "models_dir": "/models",
+    "ml_dir": "/ml",
+    "max_loaded_models": 3,
+    "preload": [
+      {"kind": "embedder", "name": "BAAI/bge-small-en-v1.5", "backend": "native"}
+    ]
+  }
+}
+```
+
+Pull the referenced models into that directory before starting the process.
+The operator's flat config spelling (those four fields at the top level) is
+also accepted. If both spellings exist, the nested `inference` value wins for
+each field, including an explicit empty `preload` list. No `api_url` is required
+to start the server; configure the listener with `--host` and `--port`.
+
+Explicit CLI options override config regardless of argument order. Supplying
+one or more `--preload-model` flags replaces the config preload list rather than
+appending to it. For an exact match of kind, model reference (including artifact
+variant), and backend, config-only `residency_mode` and `memory_budget_mb`
+policies are retained; unrelated config models are not loaded. Duplicate config
+entries matching the same CLI selection are rejected as ambiguous.
+A model-count limit of zero disables that limit. When paths are
+absent from both CLI and config, the usual environment/home defaults apply.
+Preload entries retain their backend, artifact format/quantization, and optional
+residency/memory-budget choices.
+An unqualified preload name with `format`/`quantization` is expanded to an
+explicit artifact reference (for example, `owner/model:gguf:Q4_K`) before
+resolution. Conflicts between preferences and already-qualified references are
+rejected rather than silently selecting another installed artifact.
+
+This config support is for the next runtime release; v0.2.1 requires explicit
+model CLI flags. The operator continues passing those flags so its fix can be
+released independently of the runtime update.
+For that compatibility, the operator resolves nested model overrides into the
+flat config spelling before emitting JSON or CLI arguments. It writes default
+model kinds (`generator` when omitted in `spec.config.preload`) and normalized
+artifact references into both outputs. Remaining non-model nested settings are
+preserved with the client URL field required by the legacy schema; admission
+settings and flat per-model policies remain intact.
+Config-only per-model policies require the new runtime; releasing the operator
+does not add those capabilities to v0.2.1.
+
+For operator-generated eager preloads (the default loading strategy), specify a
+recognized task such as `tasks: [embed]` or `tasks: [generate]` on each model.
+The v0.2.1 warm CLI needs a model kind; an omitted or unrecognized task hint
+does not imply a generator. The operator reports a configuration validation
+failure before creating or updating the workload when that kind is ambiguous.
+Alternatively, supply `spec.config.preload` with an explicit `kind`, or use
+lazy/bounded loading to discover the model task at request time. Per-model
+eager strategy overrides have the same requirement.
+
+Empty or null optional `backend`, `format`, and `quantization` fields in operator
+preload configuration are treated as unspecified in both JSON and CLI output.
+
 ## Model Management
 
 ### List Available Models
