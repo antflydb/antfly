@@ -12911,10 +12911,11 @@ pub const DataServer = struct {
         donor: antfly.db.types.ByteRange,
         receiver: antfly.db.types.ByteRange,
     ) !antfly.db.types.ByteRange {
-        if (std.mem.eql(u8, donor.end, receiver.start)) {
+        // Empty starts and ends denote opposite infinities, not adjacency.
+        if (donor.end.len != 0 and std.mem.eql(u8, donor.end, receiver.start)) {
             return .{ .start = donor.start, .end = receiver.end };
         }
-        if (std.mem.eql(u8, receiver.end, donor.start)) {
+        if (receiver.end.len != 0 and std.mem.eql(u8, receiver.end, donor.start)) {
             return .{ .start = receiver.start, .end = donor.end };
         }
         return error.NonAdjacentMergeRanges;
@@ -25056,6 +25057,39 @@ test "data runtime live writer source follows raft apply ownership" {
         server.write_source.localDbMutex(),
         apply_sm.write_source.localDbMutex(),
     );
+}
+
+test "data raft merge ranges preserve unbounded endpoints in either donor orientation" {
+    const Range = antfly.db.types.ByteRange;
+    const cases = [_]struct { left: Range, right: Range }{
+        .{ .left = .{ .start = "", .end = "doc:k" }, .right = .{ .start = "doc:k", .end = "" } },
+        .{ .left = .{ .start = "doc:a", .end = "doc:k" }, .right = .{ .start = "doc:k", .end = "doc:z" } },
+    };
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |reverse| {
+            const donor = if (reverse) case.right else case.left;
+            const receiver = if (reverse) case.left else case.right;
+            const ranges = try DataServer.mergeReceiverAcceptRanges(donor, receiver, null, 42);
+            try std.testing.expectEqualStrings(case.left.start, ranges.merged.start);
+            try std.testing.expectEqualStrings(case.right.end, ranges.merged.end);
+            // Exercise the same validator that consumes the replicated checkpoint.
+            const plan = try antfly.db.merge_state.planCheckpointApply(std.testing.allocator, null, receiver, .{
+                .transition_id = 42,
+                .donor_group_id = 1,
+                .receiver_group_id = 2,
+                .receiver_base_start = ranges.base.start,
+                .receiver_base_end = ranges.base.end,
+                .merged_start = ranges.merged.start,
+                .merged_end = ranges.merged.end,
+                .kind = .accept,
+            });
+            plan.deinit(std.testing.allocator);
+        }
+    }
+    try std.testing.expectError(error.NonAdjacentMergeRanges, DataServer.mergeTransitionRange(
+        .{ .start = "doc:z", .end = "" },
+        .{ .start = "", .end = "doc:a" },
+    ));
 }
 
 test "data raft merge observation derives from replicated source and receiver markers" {

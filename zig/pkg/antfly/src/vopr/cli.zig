@@ -1257,6 +1257,7 @@ fn debugCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 fn campaignCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     var histories: u64 = 100;
     var fail_on_findings = false;
+    var defer_diagnostics = false;
     var requested_transitions: ?usize = null;
     var workers: usize = 1;
     var seed: u64 = 0xa17f_1000;
@@ -1270,6 +1271,8 @@ fn campaignCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u
             _ = try defaultCampaignTransitions(scenario);
         } else if (std.mem.eql(u8, arg, "--fail-on-findings")) {
             fail_on_findings = true;
+        } else if (std.mem.eql(u8, arg, "--defer-diagnostics")) {
+            defer_diagnostics = true;
         } else if (std.mem.eql(u8, arg, "--histories")) {
             histories = try std.fmt.parseInt(u64, try nextValue(args, &index), 10);
         } else if (std.mem.eql(u8, arg, "--transitions")) {
@@ -1301,6 +1304,7 @@ fn campaignCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u
         .scenario = scenario,
         .base_seed = seed,
         .artifact_dir = artifact_dir,
+        .defer_diagnostics = defer_diagnostics,
         .coverage = vopr.coverage.Tracker.init(std.heap.smp_allocator),
         .corpus = vopr.corpus.Corpus.init(std.heap.smp_allocator),
     };
@@ -1731,6 +1735,7 @@ const CampaignContext = struct {
     scenario: []const u8,
     base_seed: u64,
     artifact_dir: []const u8,
+    defer_diagnostics: bool = false,
     worker_count: usize = 0,
     next_history: std.atomic.Value(u64) = .init(0),
     mutex: std.Io.Mutex = .init,
@@ -1903,6 +1908,9 @@ const CampaignContext = struct {
                 try self.recordFailureArtifactsLocked(&artifact, history_index, path, &new_failure_ordinals);
             }
             for (new_failure_ordinals.items) |failure_ordinal| {
+                // Soaks retain the trace, flight recording, and finding
+                // summary above, but can defer expensive replay searches.
+                if (self.defer_diagnostics) continue;
                 try self.writeFailureDiagnostics(&artifact, failure_ordinal);
                 try self.mutex.lock(self.io);
                 self.counterfactual_reports += 1;
@@ -2489,7 +2497,7 @@ fn usage() error{InvalidUsage} {
         \\usage:
         \\  vopr run --scenario metadata|transaction|distributed-data|distributed-transaction|data-plane|derived-workflow|backup-restore|clock-fault|wal|persistent|index-manager|db-split|raft|lmdb|lsm|ha|ha-scaling --seed <u64> [--transitions <n>] [--workload smoke|expanded] --trace-out <path>
         \\  vopr replay --trace <path>
-        \\  vopr campaign --scenario metadata|transaction|distributed-data|distributed-transaction|data-plane|derived-workflow|backup-restore|clock-fault|wal|persistent|index-manager|db-split|raft|lmdb|lsm|ha|ha-scaling --histories <n> [--transitions <n>] --workers <n> --artifact-dir <path> [--fail-on-findings]
+        \\  vopr campaign --scenario metadata|transaction|distributed-data|distributed-transaction|data-plane|derived-workflow|backup-restore|clock-fault|wal|persistent|index-manager|db-split|raft|lmdb|lsm|ha|ha-scaling --histories <n> [--transitions <n>] --workers <n> --artifact-dir <path> [--fail-on-findings] [--defer-diagnostics]
         \\  vopr reduce --trace <path> --out <path> [--attempts <n>]
         \\  vopr promote --trace <path> --name <fixture-name> [--force]
         \\  vopr tla --trace <path> --domain raft|transaction --out <path.ndjson>
@@ -2874,7 +2882,7 @@ test "VOPR scenario registry records and exactly replays every context-free doma
 test "VOPR scenario registry accepts production HA scaling in run and campaign" {
     try std.testing.expectEqual(@as(usize, 600_000), try defaultCampaignTransitions("ha-scaling"));
     try std.testing.expectError(error.TraceOutputRequired, runCommand(std.testing.allocator, std.testing.io, &.{ "--scenario", "ha-scaling" }));
-    try std.testing.expectError(error.InvalidCampaignBudget, campaignCommand(std.testing.allocator, std.testing.io, &.{ "--scenario", "ha-scaling", "--histories", "0" }));
+    try std.testing.expectError(error.InvalidCampaignBudget, campaignCommand(std.testing.allocator, std.testing.io, &.{ "--scenario", "ha-scaling", "--histories", "0", "--defer-diagnostics" }));
 }
 
 test "VOPR scenario registry preserves replay-divergent candidates outside the corpus" {

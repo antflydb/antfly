@@ -89,6 +89,7 @@ def run_shard(binary, scenario, seed, histories, corpus, output):
         "--workers",
         "1",
         "--fail-on-findings",
+        "--defer-diagnostics",
         "--artifact-dir",
         str(output),
     ]

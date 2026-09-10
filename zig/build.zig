@@ -9459,6 +9459,7 @@ pub fn build(b: *std.Build) void {
             "--histories",                   b.fmt("{d}", .{histories}), "--seed",
             b.fmt("{d}", .{vopr_soak_seed}), "--workers",                "1",
             "--fail-on-findings",            "--artifact-dir",           b.pathJoin(&.{ vopr_soak_artifacts, scenario }),
+            "--defer-diagnostics",
         });
         if (vopr_soak_progress_tail) |previous| campaign.step.dependOn(previous);
         vopr_soak_progress_tail = &campaign.step;

@@ -2997,6 +2997,9 @@ lsm                   ha
   for the smaller scenarios and two for production HA/scaling.
   Property findings fail the gate after reports and replay artifacts are
   written; replay divergence and harness errors also fail it.
+- Uses `--defer-diagnostics` to retain findings and flight recordings without
+  spending the soak budget on automatic reduction and counterfactual replay.
+  Run `vopr recipe` against a retained trace for that separate analysis.
 - Retains the metadata transition/public/placement and Raft differential
   selections from the former soak target. Their native I/O is still native;
   sharing a tier does not turn them into exact-replay campaigns.
@@ -3095,6 +3098,12 @@ builds one ReleaseSafe runner, then runs two shards each of `ha`, `raft`,
 1000, 12, and 2 respectively; the dispatch input can override them. Each shard
 uses one worker and records its exact seed, revision, command, initial corpus,
 and completion status in `run.json`.
+
+Scheduled campaigns use `--defer-diagnostics`: every finding still retains its
+trace, flight recording, and aggregate summary, but automatic reduction and
+counterfactual searches run separately through `vopr recipe`. This keeps one
+production finding from consuming the entire scheduled budget before reports
+are published.
 
 The workflow restores the last compatible scenario corpus, copies it into a
 fresh run directory, and uploads reports, traces, logs, and diagnostics even

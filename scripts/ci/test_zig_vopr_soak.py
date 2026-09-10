@@ -19,6 +19,7 @@ class SoakTests(unittest.TestCase):
 
             def campaign(command, **kwargs):
                 self.assertIn("--fail-on-findings", command)
+                self.assertIn("--defer-diagnostics", command)
                 self.assertEqual(command[command.index("--workers") + 1], "1")
                 self.assertFalse((output / "results.json").exists())
                 (output / "history-failure.voprtrace").write_bytes(b"finding")
