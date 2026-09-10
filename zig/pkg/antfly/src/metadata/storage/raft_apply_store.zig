@@ -3940,7 +3940,10 @@ pub const RaftApplyStore = struct {
             .upsert_schema_progress, .remove_schema_progress => metadataSnapshotProjectionBit(.schema_progress),
             .upsert_restore_progress, .remove_restore_progress => metadataSnapshotProjectionBit(.restore_progress),
             .upsert_replication_source_status, .claim_replication_source_cutover, .complete_replication_source_retirement => metadataSnapshotProjectionBit(.replication_source_status),
-            .upsert_range, .complete_restore_range, .remove_range => metadataSnapshotProjectionBit(.range) |
+            .complete_restore_range => metadataSnapshotProjectionBit(.range) |
+                metadataSnapshotProjectionBit(.restore_progress) |
+                metadataSnapshotProjectionBit(.catalog_revision),
+            .upsert_range, .remove_range => metadataSnapshotProjectionBit(.range) |
                 metadataSnapshotProjectionBit(.catalog_revision),
             .admit_split_transition => metadataSnapshotProjectionBit(.split_transition) |
                 metadataSnapshotProjectionBit(.range) |
@@ -4571,6 +4574,26 @@ pub const RaftApplyStore = struct {
             .upsert_restore_progress => |record| {
                 const table_name = try self.lookupTableNameTxn(txn, group_id, record.table_id);
                 defer if (table_name) |name| self.alloc.free(name);
+                if (table_name == null) return;
+                // Admission and apply can straddle completion, replacement,
+                // or drop. Only the currently active restore owns this row.
+                var range_key_buf: [160]u8 = undefined;
+                const range_key = try rangeKeyForGroup(&range_key_buf, group_id, record.group_id);
+                const encoded_range = txn.get(range_key) catch |err| switch (err) {
+                    error.NotFound => return,
+                    else => return err,
+                };
+                const range = try decodeRangeRecord(self.alloc, encoded_range);
+                defer metadata_table_manager.freeRange(self.alloc, range);
+                if (range.table_id != record.table_id or
+                    range.restore_backup_id.len == 0 or range.restore_location.len == 0 or
+                    !std.mem.eql(u8, record.backup_id, range.restore_backup_id) or
+                    !std.mem.eql(u8, record.artifact_backup_id, range.restore_artifact_backup_id) or
+                    !std.mem.eql(u8, record.location, range.restore_location) or
+                    !std.mem.eql(u8, record.snapshot_path, range.restore_snapshot_path) or
+                    !std.mem.eql(u8, record.artifact_sha256, range.restore_artifact_sha256) or
+                    record.native_manifest_size_bytes != range.restore_native_manifest_size_bytes or
+                    !std.mem.eql(u8, record.native_manifest_sha256, range.restore_native_manifest_sha256)) return;
                 var key_buf: [224]u8 = undefined;
                 const key = try restoreProgressKeyForGroup(&key_buf, group_id, record.table_id, record.node_id, record.group_id);
                 const value = try encodeRestoreProgressRecord(self.alloc, record);
@@ -4681,6 +4704,10 @@ pub const RaftApplyStore = struct {
 
                 const table_name = try self.lookupTableNameTxn(txn, group_id, current.table_id);
                 defer if (table_name) |name| self.alloc.free(name);
+                // Retire observations in the same durable transaction that
+                // closes their owner. Data-node cleanup is not a prerequisite
+                // for completion, including when a reporting node goes away.
+                try self.retireRangeRestoreProgressTxn(txn, group_id, current, table_name);
                 try metadata_table_manager.clearOwnedRangeRestoreIntent(self.alloc, &current);
                 const value = try encodeRangeRecord(self.alloc, current);
                 defer self.alloc.free(value);
@@ -5047,6 +5074,36 @@ pub const RaftApplyStore = struct {
             try ids.append(alloc, std.mem.readInt(u64, row.value[0..@sizeOf(u64)], .little));
         }
         return try ids.toOwnedSlice(alloc);
+    }
+
+    fn retireRangeRestoreProgressTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        metadata_group_id: u64,
+        range: metadata.RangeRecord,
+        table_name: ?[]const u8,
+    ) !void {
+        // The existing durable namespace is table/node/group ordered. Bound
+        // cleanup to this table rather than scanning cluster-wide progress.
+        var prefix_buf: [192]u8 = undefined;
+        const prefix = try std.fmt.bufPrint(&prefix_buf, "\x00\x00__metadata__:metadata_restore_progress:{d}:{d}:", .{ metadata_group_id, range.table_id });
+        const rows = try docstore.DocStore.scanPrefixTxn(self.alloc, txn, prefix);
+        defer freeMetadataSnapshotRows(self.alloc, rows);
+        for (rows) |row| {
+            const record = try decodeRestoreProgressRecord(self.alloc, row.value);
+            defer metadata_table_manager.freeRestoreProgress(self.alloc, record);
+            if (record.group_id != range.group_id) continue;
+            try txn.delete(row.key);
+            self.notifyCommittedKeyListeners(.{ .metadata_group_id = metadata_group_id, .key = row.key });
+            self.notifyProjectionListeners(.{
+                .kind = .restore_progress,
+                .metadata_group_id = metadata_group_id,
+                .table_name = table_name,
+                .table_id = range.table_id,
+                .node_id = record.node_id,
+                .group_id = range.group_id,
+            });
+        }
     }
 
     fn indexedRangeMembershipMatchesTxn(
@@ -13974,12 +14031,108 @@ test "metadata raft apply store projects shuffle join lease records from committ
     }
 }
 
+test "metadata raft apply store restore completion retires progress and rejects delayed incarnation reports" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore-progress-retirement", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    const original: metadata.RangeRecord = .{
+        .table_id = 41,
+        .group_id = 4101,
+        .start_key = "",
+        .end_key = null,
+        .restore_backup_id = "old",
+        .restore_artifact_backup_id = "old",
+        .restore_location = "file:///backups",
+        .restore_snapshot_path = "old/4101",
+        .restore_connection = "backups",
+        .restore_artifact_size_bytes = 1,
+        .restore_artifact_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    };
+    var replacement = original;
+    replacement.restore_backup_id = "new";
+    replacement.restore_artifact_backup_id = "new";
+    replacement.restore_snapshot_path = "new/4101";
+    const old_progress: metadata.RestoreProgressRecord = .{
+        .table_id = 41,
+        .node_id = 7,
+        .group_id = 4101,
+        .backup_id = "old",
+        .artifact_backup_id = "old",
+        .location = "file:///backups",
+        .snapshot_path = "old/4101",
+        .artifact_sha256 = original.restore_artifact_sha256,
+        .primary_restored = true,
+        .runtime_repair_complete = true,
+    };
+    var new_progress = old_progress;
+    new_progress.backup_id = "new";
+    new_progress.artifact_backup_id = "new";
+    new_progress.snapshot_path = "new/4101";
+    var sibling = original;
+    sibling.group_id = 4102;
+    sibling.restore_snapshot_path = "old/4102";
+    var sibling_progress = old_progress;
+    sibling_progress.group_id = sibling.group_id;
+    sibling_progress.snapshot_path = sibling.restore_snapshot_path;
+    const cases = [_]struct { command: TransitionCommand, count: usize }{
+        .{ .command = .{ .upsert_table = .{ .table_id = 41, .name = "docs" } }, .count = 0 },
+        .{ .command = .{ .upsert_range = original }, .count = 0 },
+        .{ .command = .{ .upsert_range = sibling }, .count = 0 },
+        .{ .command = .{ .upsert_restore_progress = old_progress }, .count = 1 },
+        .{ .command = .{ .upsert_restore_progress = sibling_progress }, .count = 2 },
+        .{ .command = .{ .complete_restore_range = metadata_table_manager.restoreIntentIdentity(original) }, .count = 1 },
+        .{ .command = .{ .upsert_restore_progress = old_progress }, .count = 1 },
+        .{ .command = .{ .upsert_range = replacement }, .count = 1 },
+        .{ .command = .{ .upsert_restore_progress = new_progress }, .count = 2 },
+        .{ .command = .{ .upsert_restore_progress = old_progress }, .count = 2 },
+        .{ .command = .{ .complete_restore_range = metadata_table_manager.restoreIntentIdentity(original) }, .count = 2 },
+        .{ .command = .{ .complete_restore_range = metadata_table_manager.restoreIntentIdentity(replacement) }, .count = 1 },
+    };
+    for (cases, 1..) |case, index| {
+        const command = try encodeTransitionCommand(alloc, case.command);
+        defer alloc.free(command);
+        const entries = try raft_state_machine.encodeCommittedEntries(alloc, &.{
+            .{ .term = 1, .index = index, .entry_type = .normal, .data = command },
+        });
+        defer alloc.free(entries);
+        try store.snapshotBuilder().applyBatch(.{ .group_id = 41, .commit_index = index, .entries_bytes = entries });
+        const progress = try store.listRestoreProgress(alloc, 41);
+        defer store.freeRestoreProgress(alloc, progress);
+        try std.testing.expectEqual(case.count, progress.len);
+        for (progress) |record| {
+            if (record.group_id == sibling.group_id) try std.testing.expectEqualStrings("old", record.backup_id);
+            if (index >= 9 and record.group_id == original.group_id) try std.testing.expectEqualStrings("new", record.backup_id);
+        }
+    }
+}
+
 test "metadata raft apply store projects restore progress records from committed entries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-restore-progress-store", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
+
+    const table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = .{ .table_id = 41, .name = "docs" },
+    });
+    defer std.testing.allocator.free(table_cmd);
+    const range_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = .{
+            .table_id = 41,
+            .group_id = 4101,
+            .start_key = "",
+            .end_key = null,
+            .restore_backup_id = "snap1",
+            .restore_artifact_backup_id = "snap1-artifacts",
+            .restore_location = "file:///backups",
+        },
+    });
+    defer std.testing.allocator.free(range_cmd);
 
     const progress_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_restore_progress = .{
@@ -13988,11 +14141,14 @@ test "metadata raft apply store projects restore progress records from committed
             .group_id = 4101,
             .backup_id = "snap1",
             .artifact_backup_id = "snap1-artifacts",
+            .location = "file:///backups",
         },
     });
     defer std.testing.allocator.free(progress_cmd);
 
     const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = range_cmd },
         .{ .term = 1, .index = 3, .entry_type = .normal, .data = progress_cmd },
     });
     defer std.testing.allocator.free(encoded_entries);

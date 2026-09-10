@@ -992,6 +992,19 @@ class ThreeByThreeBackupCluster:
                 "[metadata-snapshot-observations]\n"
                 f"{self.last_metadata_snapshot_observations!r}"
             )
+        for index, snapshot in enumerate(self.last_metadata_snapshots, start=1):
+            if snapshot is None:
+                continue
+            parts.append(
+                f"[metadata-{index}-restore-state]\n"
+                + json.dumps(
+                    {
+                        "ranges": snapshot.get("ranges", []),
+                        "restore_progresses": snapshot.get("restore_progresses", []),
+                    },
+                    sort_keys=True,
+                )
+            )
         return "\n".join(parts)
 
     def metadata_statuses(self, *, request_timeout_s: float = 1.0) -> list[dict | None]:
@@ -1558,16 +1571,22 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
         last_response: requests.Response | None = None
         for _ in range(3):
             leader_public_url = cluster.metadata_leader_public_url(timeout_s=30.0)
-            response = session.post(
-                f"{leader_public_url}/backup",
-                json={
-                    "backup_id": backup_id,
-                    "location": _file_location(backup_dir),
-                    "connection": BACKUP_CONNECTION,
-                    "table_names": [table_name],
-                },
-                timeout=30,
-            )
+            try:
+                response = session.post(
+                    f"{leader_public_url}/backup",
+                    json={
+                        "backup_id": backup_id,
+                        "location": _file_location(backup_dir),
+                        "connection": BACKUP_CONNECTION,
+                        "table_names": [table_name],
+                    },
+                    timeout=30,
+                )
+            except requests.RequestException as exc:
+                cluster.metadata_snapshots()
+                raise AssertionError(
+                    f"metadata backup request failed: {exc}\n{cluster.debug_logs()}"
+                ) from exc
             if _is_metadata_not_leader_response(response):
                 last_response = response
                 continue

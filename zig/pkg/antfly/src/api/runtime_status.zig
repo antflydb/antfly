@@ -2794,8 +2794,9 @@ pub const TableRuntimeSnapshotCache = struct {
             self.invalidateTableStateLocked(table_name, state);
             return .state_invalidated;
         };
-        if (state.groups.getPtr(group_id)) |status|
+        if (state.groups.getPtr(group_id)) |status| {
             status.metadata.target_observation_complete = false;
+        }
         return .group_applied;
     }
 
@@ -2959,7 +2960,9 @@ pub const TableRuntimeSnapshotCache = struct {
                 true;
         var reducing_source_sequence = if (serving_set_may_reduce) source_target_sequence else 0;
         var merged_target_sequence = source_target_sequence;
+        var event_revision: u64 = 0;
         if (authority.?.convergence_requirements.get(group_id)) |required| {
+            event_revision = required.event_revision;
             // Commit notifications run after releasing the source lock. Their
             // delivery order is not commit order: an older delete can carry
             // reduction authority that a newer additive callback did not.
@@ -2969,9 +2972,30 @@ pub const TableRuntimeSnapshotCache = struct {
                 reducing_source_sequence == required.reducing_source_sequence)
                 return .no_change;
         }
-        self.advanceTargetObservationRevisionLocked();
+        // A delayed exact callback can arrive after both source observation
+        // and index replay have covered it. Keep the durable target/reduction
+        // watermarks for future merges, but do not demand a second observation
+        // of an already-applied target in this catalog epoch.
+        const already_observed = observed: {
+            const status = current_status orelse break :observed false;
+            const position = current_position orelse break :observed false;
+            const item = status.stats.indexes[position];
+            break :observed status.metadata.target_observation_complete and
+                status.metadata.source != .cached_snapshot and
+                status.metadata.source != .synthetic_config and
+                status.cache_publication_epoch != null and
+                std.meta.eql(status.cache_publication_epoch.?, state.epoch) and
+                status.metadata.target_observation_revision >= merged_target_sequence and
+                item.runtime_target_observation_complete and
+                item.replay_target_sequence >= merged_target_sequence and
+                item.replay_applied_sequence >= merged_target_sequence;
+        };
+        if (!already_observed) {
+            self.advanceTargetObservationRevisionLocked();
+            event_revision = self.target_observation_revision;
+        }
         authority.?.convergence_requirements.put(self.alloc, group_id, .{
-            .event_revision = self.target_observation_revision,
+            .event_revision = event_revision,
             .source_target_sequence = merged_target_sequence,
             .reducing_source_sequence = reducing_source_sequence,
         }) catch {
@@ -2985,10 +3009,12 @@ pub const TableRuntimeSnapshotCache = struct {
                 source_target_sequence,
             );
         };
+        if (already_observed) return .no_change;
         if (current_status) |status| {
             const item = &status.stats.indexes[current_position orelse return .index_applied];
-            if (indexMatchesTargetIdentity(item.*, identity))
+            if (indexMatchesTargetIdentity(item.*, identity)) {
                 item.runtime_target_observation_complete = false;
+            }
         }
         return .index_applied;
     }
@@ -9365,6 +9391,50 @@ test "late source target notification cannot revoke an already observed target" 
     var retired = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
     defer retired.deinit(alloc);
     try std.testing.expect(!retired.metadata.target_observation_complete);
+}
+
+test "late exact index notification preserves completed observation and reduction authority" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("thumbnail"),
+        .kind = .dense_vector,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .replay_applied_sequence = 6,
+        .replay_target_sequence = 6,
+    }};
+    const token = try cache.capturePublicationToken("docs");
+    _ = try cache.publishGroup(token, "docs", .{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .target_observation_revision = 6 },
+        .stats = .{ .index_count = 1, .indexes = &indexes },
+    });
+    const identity = TableRuntimeSnapshotCache.IndexIdentity{
+        .index_name = "thumbnail",
+        .kind = .dense_vector,
+        .incarnation = 42,
+        .config_hash = 99,
+    };
+    cache.markIndexTargetObservationPending("docs", 7, identity, 6);
+    {
+        var listed = (try cache.snapshot(alloc, "docs")).?;
+        defer listed.deinit(alloc);
+        try std.testing.expect(listed.items[0].stats.indexes[0].runtime_target_observation_complete);
+        var detail = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+        defer detail.deinit(alloc);
+        try std.testing.expect(detail.stats.indexes[0].runtime_target_observation_complete);
+        const requirement = cache.tables.get("docs").?.index_authorities.get("thumbnail").?.convergence_requirements.get(7).?;
+        try std.testing.expectEqual(@as(u64, 6), requirement.source_target_sequence);
+        try std.testing.expectEqual(@as(u64, 6), requirement.reducing_source_sequence);
+    }
+    cache.markIndexTargetObservationPending("docs", 7, identity, 7);
+    var pending = (try cache.snapshotGroupStatus(alloc, "docs", 7)).?;
+    defer pending.deinit(alloc);
+    try std.testing.expect(!pending.stats.indexes[0].runtime_target_observation_complete);
 }
 
 test "late source notification cannot reuse an observation from before a catalog fence" {
