@@ -124,6 +124,8 @@ pub fn create(
     // boundary so embedded, HTTP-local, and forwarded callers cannot persist
     // different definitions for the same request.
     var normalized_req = req;
+    if (req.storage.dense_embeddings == .vector_store)
+        return error.VectorStoreRequiresLocalSingleShardTable;
     const expanded_indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(
         alloc,
         table_name,
