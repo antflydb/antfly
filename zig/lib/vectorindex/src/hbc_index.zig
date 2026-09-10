@@ -8059,7 +8059,13 @@ pub fn insertWithMetadataTxnOptions(
     } else if (leaf.posting_state.mutation_version -| leaf.posting_state.centroid_version > 1) {
         // A stale anchor is not an exact mean. At the debt limit reconstruct
         // statistics from authoritative members instead of weighting it.
-        try posting.PostingStore.recomputeCentroid(self, txn, &leaf);
+        // Newly appended members may exist only in this source transaction's
+        // vector context, not in the published primary/projection snapshot.
+        const matrix_len = try std.math.mul(usize, leaf.members.len, self.config.dims);
+        const vectors = try self.alloc.alloc(f32, matrix_len);
+        defer self.alloc.free(vectors);
+        try loadPostingVectorsTransformedWithOptions(self, txn, leaf.members, vectors, options);
+        try posting.PostingStore.recomputeCentroidFromTransformedVectors(self, &leaf, vectors);
     } else if (leaf.centroid.len == 0) {
         leaf.centroid = try self.alloc.dupe(f32, effective_transformed);
         normalizeCentroidForMetric(self, leaf.centroid);

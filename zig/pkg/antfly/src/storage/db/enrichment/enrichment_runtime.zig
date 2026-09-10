@@ -26383,6 +26383,15 @@ fn queueDerivedCoverageOutcome(
 }
 
 fn markDerivedCoverageSkipped(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest, consumer_indexes: []const []const u8) !void {
+    if (request.input_kind == .document) {
+        const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(runtime.alloc, request.doc_key, requestEmbeddingName(request));
+        defer runtime.alloc.free(key);
+        // Retirement and its replay intent travel in the same producer
+        // commit as terminal skip coverage, including asynchronous producers.
+        try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, key);
+        try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, key);
+        try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+    }
     try queueDerivedCoverageOutcome(runtime, window, request, consumer_indexes, .skipped);
 }
 

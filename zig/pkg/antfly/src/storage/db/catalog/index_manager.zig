@@ -12389,11 +12389,13 @@ pub const IndexManager = struct {
             }
 
             {
-                const capture_started = try self.beginDensePostingSidecarCaptureByName(entry.config.name);
-                if (!capture_started) return error.PostingWalCaptureOwnershipConflict;
-                errdefer self.cancelDensePostingSidecarCaptureByName(entry.config.name);
+                const capture = (try self.beginDensePostingSidecarCaptureLeaseByNameWithOptions(entry.config.name, .{})) orelse
+                    return error.PostingWalCaptureOwnershipConflict;
+                errdefer self.cancelDensePostingSidecarCaptureLeaseByName(entry.config.name, capture) catch {};
                 try entry.index.batchDelete(delete_ids.items);
-                try self.finishDensePostingSidecarCaptureByName(entry.config.name, store.lastReplaySequence(0));
+                // A split changes membership without advancing source replay.
+                // Only this exact lease may publish at the already-covered tip.
+                try self.finishDensePostingSidecarCaptureLeaseByName(entry.config.name, capture, store.lastReplaySequence(0));
             }
         }
     }

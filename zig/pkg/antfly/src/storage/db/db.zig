@@ -25187,6 +25187,30 @@ pub const DB = struct {
     }
 
     pub fn publishVectorBlockBasesAtStableTip(self: *DB) !usize {
+        // The explicit idle drain and the background owner share one vector
+        // store. Acquire the same publication claim before taking apply; a
+        // writer lock alone cannot exclude a worker staging outside that lock.
+        // Wait without any primary/catalog lock so the owner can finish.
+        const ctx = self.async_context;
+        const deadline = monotonicTimeNs() +| 30 * std.time.ns_per_s;
+        var wait_ms: u64 = 1;
+        while (true) {
+            var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+            const claimed = tryClaimDenseProjectionFinalizationLocked(ctx);
+            const sessions_active = asyncContextHasDenseSessionsOrWaiters(ctx);
+            session_lock.unlock();
+            if (claimed) break;
+            if (sessions_active or monotonicTimeNs() >= deadline) return error.WriterLocked;
+            if (self.backend_runtime.io()) |io| {
+                try io.sleep(std.Io.Duration.fromMilliseconds(@intCast(wait_ms)), .awake);
+            } else if (comptime builtin.os.tag == .freestanding) {
+                return error.WriterLocked;
+            } else {
+                sleepNs(wait_ms * std.time.ns_per_ms);
+            }
+            wait_ms = @min(wait_ms * 2, 16);
+        }
+        defer finishDenseProjectionFinalization(ctx);
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.index_manager.publishVectorBlockBasesAtStableTip();
@@ -41092,6 +41116,17 @@ fn prepareGeneratedEnrichments(
     // manifest. This keeps terminal outcomes in the same primary commit while
     // preserving genuinely unresolved requests for replay.
     for (coverage_candidates.items) |candidate| {
+        // A terminal no-output document revision retires this producer's
+        // previous artifact in the same commit as its coverage outcome.
+        // Ordinary replacements retain their member identity, and unresolved
+        // or chunk-source work must not be treated as an absent embedding.
+        if (!candidate.produced and candidate.request.input_kind == .document and
+            (try precomputedEmbeddingCoverageOutcome(self, candidate.request, artifact_writes.items, false)) == .skipped)
+        {
+            const key = try embeddingArtifactKeyForBaseAlloc(self.alloc, candidate.request.doc_key, requestEmbeddingName(candidate.request));
+            errdefer self.alloc.free(key);
+            try artifact_delete_keys.append(self.alloc, key);
+        }
         if (!try appendPrecomputedEmbeddingCoverageOutcomes(
             self,
             &coverage_outcomes,
@@ -48627,6 +48662,7 @@ fn applyDerivedBatchToIndexContextProfiled(
                 index_ref.name,
             );
             defer dense_embeddings.deinit();
+            try filterDeletedEmbeddingWrites(&dense_embeddings, batch.deleted_keys);
             if (ctx.index_manager.denseIndex(index_ref.name)) |entry| {
                 try filterAndRecordDenseEmbeddingArtifactRepairIssuesForReplay(ctx, index_ref.name, entry.dims, &dense_embeddings, batch.sequence);
             }
@@ -48734,6 +48770,7 @@ fn applyDerivedBatchToIndexContextProfiled(
                 index_ref.name,
             );
             defer sparse_embeddings.deinit();
+            try filterDeletedEmbeddingWrites(&sparse_embeddings, batch.deleted_keys);
             if (emit_sparse_write_profile) sparse_collect_embedding_ns = monotonicTimeNs() - sparse_collect_embedding_start_ns;
             try filterAndRecordSparseEmbeddingArtifactRepairIssuesForReplay(ctx, index_ref.name, &sparse_embeddings, batch.sequence);
             try ctx.index_manager.validateSparseEmbeddingArtifactsByName(ctx.store, index_ref.name, sparse_embeddings.writes);
@@ -49271,6 +49308,32 @@ const CollectSparseFieldWritesProfile = struct {
     store_hits: usize = 0,
     skipped_without_vector: usize = 0,
 };
+
+/// Changed-artifact hints include removals as well as positive writes. Keep
+/// explicit tombstones in the delete lane: probing them as missing upserts
+/// would create spurious repair debt and wedge replay while the source lives.
+fn filterDeletedEmbeddingWrites(owned: anytype, deleted_keys: []const []const u8) !void {
+    if (deleted_keys.len == 0 or owned.writes.len == 0) return;
+    var deleted = std.StringHashMapUnmanaged(void).empty;
+    defer deleted.deinit(owned.alloc);
+    for (deleted_keys) |key| try deleted.put(owned.alloc, key, {});
+    var kept: usize = 0;
+    for (owned.writes) |write| {
+        if (write.artifact_key) |key| if (deleted.contains(key)) {
+            if (comptime @hasField(@TypeOf(owned.*), "owns_doc_keys")) {
+                if (owned.owns_doc_keys) {
+                    owned.alloc.free(@constCast(write.doc_key));
+                    if (write.parent_doc_key) |parent| owned.alloc.free(@constCast(parent));
+                }
+            }
+            continue;
+        };
+        owned.writes[kept] = write;
+        kept += 1;
+    }
+    // Retain allocation_len for deinit; compaction needs no replacement buffer.
+    owned.writes = owned.writes[0..kept];
+}
 
 const OwnedDenseEmbeddingWrites = struct {
     alloc: Allocator,
@@ -56093,6 +56156,15 @@ fn finalizeCoveredDenseProjectionCheckpoint(
     };
     if (checkpoint.status != .rebuilding) {
         session_lock.unlock();
+        // A clean replay checkpoint is not proof of native acceleration.
+        // Finite loads must wake their maintenance owner even when no repair
+        // generation is being rebuilt and no subsequent write will arrive.
+        if (checkpoint.status == .clean and
+            ctx.index_manager.vectorBlockProjectionRequiredForDenseIndex(index_name) and
+            !ctx.index_manager.vectorBlockReadyForDenseIndexAtSequence(index_name, applied_sequence, ctx.index_manager.denseIndex(index_name).?.index.stats().active_count))
+        {
+            scheduleNativeProjectionMaintenance(ctx);
+        }
         return false;
     }
     if (!tryClaimDenseProjectionFinalizationLocked(ctx)) {
@@ -56312,17 +56384,25 @@ fn nativeProjectionMaintenanceRound(ctx: *AsyncContext) !bool {
     for (manager.dense_indexes.items) |entry| {
         if (ctx.background_closing.load(.acquire)) return false;
         const checkpoint = manager.denseProjectionCheckpointMetadata(entry.config.name) orelse continue;
-        if (checkpoint.status != .rebuilding) continue;
+        if (checkpoint.status != .rebuilding and checkpoint.status != .clean) continue;
         const expected = (try denseTargetCountForIndexContext(ctx, entry.config.name)) orelse continue;
         if (entry.index.stats().active_count != expected) continue;
         const sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse continue;
+        if (manager.vectorBlockReadyForDenseIndexAtSequence(entry.config.name, sequence, expected) and
+            checkpoint.status == .clean) continue;
         _ = try manager.publishVectorBlockBasesOnline(.{
-            .require_quiescence = false,
+            // Ordinary finite loads wait for a stable tip instead of building
+            // a new corpus projection after each small foreground batch.
+            .require_quiescence = checkpoint.status == .clean,
             .covered_rebuilding_index = entry.config.name,
             .only_index = entry.config.name,
         });
         if (!manager.vectorBlockReadyForDenseIndexAtSequence(entry.config.name, sequence, expected)) {
             pending = true;
+            continue;
+        }
+        if (checkpoint.status == .clean) {
+            DB.notifyQueryVisibilityHook(ctx, .publish_blocking);
             continue;
         }
         const completed = blk: {
@@ -77914,6 +77994,21 @@ test "db managed conditional embeddings persist exact mixed corpus coverage acro
             .sync_level = .full_index,
         });
         try ExpectCoverage.run(&db, expected_config_hash, 1, 1);
+
+        // The asynchronous producer must retire the same artifact/member,
+        // without a later write or synchronous enrichment doing the cleanup.
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:text", .value = "{\"image_url\":\"https://example.invalid/async.png\"}" }},
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+        try ExpectCoverage.run(&db, expected_config_hash, 2, 0);
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:text", .value = "{\"body\":\"asynchronous skip\"}" }},
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+        try ExpectCoverage.run(&db, expected_config_hash, 1, 1);
     }
 
     {
@@ -94432,7 +94527,7 @@ test "db dense replay missing artifact remains a normal managed admission depend
     const cfg = types.IndexConfig{
         .name = "dense_idx",
         .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"cosine\",\"external\":true}",
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"cosine\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\"}}",
     };
     const repair_id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
 
@@ -94615,7 +94710,13 @@ test "db incomplete HBC snapshot persists generation repair before maintenance" 
         const dense = db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
 
         const stale_generation = dense.index.publishedGeneration();
-        dense.index.refreshPublishedSearchState();
+        // Native refresh of an identical SearchView is intentionally a no-op.
+        // Commit an actual generation before reporting a delayed old failure.
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
+            .sync_level = .full_index,
+        });
+        try std.testing.expect(dense.index.publishedGeneration() != stale_generation);
         dense.index.noteIncompletePublishedSnapshotForGeneration(stale_generation);
         try std.testing.expect(!try db.persistIncompleteHbcSnapshotRepair(dense));
         try std.testing.expect((try db.indexRepairIdForIndex(alloc, "dense_idx")) == null);
@@ -96234,6 +96335,9 @@ test "db last dense catch-up lease finalizes every covered rebuilding generation
     // exact-vector file is shared by the table. Preserve the independently
     // certified sibling instead of projecting the owner's short fence onto
     // every dense index.
+    // This fixture disables index workers. Stage acceleration explicitly;
+    // the finalization assertions below exercise certification only.
+    _ = try db.publishVectorBlockBasesOnline(.{});
     {
         const owner = db.core.index_manager.denseIndex(configs[0].name) orelse
             return error.TestUnexpectedResult;
@@ -96418,6 +96522,8 @@ test "db dense finalization owner drains requests queued during publication" {
         .sync_level = .full_index,
     });
 
+    _ = try db.publishVectorBlockBasesOnline(.{});
+
     const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, config.name);
     defer alloc.free(counter_key);
     var counter_value: [8]u8 = undefined;
@@ -96473,6 +96579,8 @@ test "db last external dense bulk lease finalizes covered rebuilding generations
         }},
         .sync_level = .full_index,
     });
+
+    _ = try db.publishVectorBlockBasesOnline(.{});
 
     const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, config.name);
     defer alloc.free(counter_key);
@@ -96827,6 +96935,21 @@ test "db runtime status overlay refreshes identity totals with coverage counters
     try std.testing.expect(stale_stats.indexes[0].repair_degraded);
 }
 
+fn waitForNativeDenseReadyForTest(db: *DB, index_name: []const u8) !void {
+    const deadline = monotonicTimeNs() +| 10 * std.time.ns_per_s;
+    while (true) {
+        const stats = try db.stats(std.testing.allocator);
+        defer types.freeDBStats(std.testing.allocator, stats);
+        for (stats.indexes) |item| {
+            if (std.mem.eql(u8, item.name, index_name) and
+                !item.dense_vector_projection_pending and
+                std.mem.eql(u8, item.projection_checkpoint_status, "clean")) return;
+        }
+        if (monotonicTimeNs() >= deadline) return error.TestUnexpectedResult;
+        try std.testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+}
+
 test "db external dense ingest finalizes an exactly covered rebuilding checkpoint" {
     const alloc = std.testing.allocator;
 
@@ -96857,6 +96980,7 @@ test "db external dense ingest finalizes an exactly covered rebuilding checkpoin
         .sync_level = .full_index,
     });
 
+    try waitForNativeDenseReadyForTest(&db, "dense_idx");
     const checkpoint = try db.core.loadProjectionCheckpoint(alloc, "dense_idx");
     try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
     try std.testing.expect(checkpoint.applied_sequence > 0);
@@ -97654,14 +97778,22 @@ test "db dense artifact rebuild force-resets corrupt external dense structure" {
     });
     defer reopened.close();
 
-    try std.testing.expect(try reopened.hasPendingDenseArtifactRebuild(alloc));
+    // Native startup may validate lazily. Exercise the real query detection
+    // path before asking the durable repair owner to replace this generation.
+    try std.testing.expectError(error.IndexRebuilding, reopened.search(alloc, .{
+        .index_name = "dense_idx",
+        .dense = .{ .vector = &.{ 1, 0, 0 }, .k = 6 },
+        .search_effort = 1,
+    }));
+
+    // The query or startup persisted the corrupt generation repair intent.
+    // Broad discovery must not compete with that durable owner.
+    try std.testing.expect(try reopened.hasPendingIndexRepairIntents(alloc));
 
     const rebuilt = try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
-    // Discovery reports one scheduled generation repair, not the number of
-    // source documents that the BackendRuntime-owned state machine will
-    // reconstruct inside that generation.
-    try std.testing.expectEqual(@as(usize, 1), rebuilt);
-    try std.testing.expect(try reopened.hasPendingDenseArtifactRebuild(alloc));
+    try std.testing.expectEqual(@as(usize, 0), rebuilt);
+    try std.testing.expect(!try reopened.hasPendingDenseArtifactRebuild(alloc));
+    try std.testing.expect(try reopened.hasPendingIndexRepairIntents(alloc));
     const repair_id = (try reopened.indexRepairIdForIndex(alloc, "dense_idx")) orelse return error.TestUnexpectedResult;
     const advanced = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
     try std.testing.expect(advanced.repaired);
@@ -107122,6 +107254,7 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
     try db.core.saveProjectionCheckpoint("dense_idx", .{ .status = .rebuilding });
 
     const HookCtx = struct {
+        mutex: *std.Io.Mutex,
         publish_calls: u64 = 0,
         status_calls: u64 = 0,
         status_calls_after_wal_checkpoint: u64 = 0,
@@ -107134,6 +107267,8 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
 
         fn onChange(ptr: *anyopaque, _: []const u8, _: u64, changed_db: ?*DB, event: QueryVisibilityEvent) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.mutex.lockUncancelable(std.testing.io);
+            defer self.mutex.unlock(std.testing.io);
             switch (event.change) {
                 .status => {
                     self.publish_calls += 1;
@@ -107176,7 +107311,8 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
             }
         }
     };
-    var hook_ctx = HookCtx{};
+    var hook_mutex: std.Io.Mutex = .init;
+    var hook_ctx = HookCtx{ .mutex = &hook_mutex };
     db.setQueryVisibilityHook(.{
         .ptr = &hook_ctx,
         .table_name = "docs",
@@ -107206,18 +107342,32 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
     // Finish the implicit bulk publish, but hold the deferred executor wake so
     // the test can prove the replay catch-up itself publishes fresh visibility.
     try db.finishDenseAutoBulkIngestSessionWithOptionsInternal(.{ .compact = false }, false);
-    hook_ctx = .{};
+    hook_mutex.lockUncancelable(std.testing.io);
+    hook_ctx = .{ .mutex = &hook_mutex };
+    hook_mutex.unlock(std.testing.io);
 
     flushDeferredExternalBulkExecutorNotification(db.async_context, db.executor);
     try db.executor.waitForAll(4);
+    // Replay completion schedules native publication; its clean visibility
+    // edge is delivered by maintenance, not synchronously by the executor.
+    const deadline = monotonicTimeNs() +| 10 * std.time.ns_per_s;
+    var observed: HookCtx = undefined;
+    while (true) {
+        hook_mutex.lockUncancelable(std.testing.io);
+        observed = hook_ctx;
+        hook_mutex.unlock(std.testing.io);
+        if (observed.publish_blocking_with_clean_checkpoint > 0) break;
+        if (monotonicTimeNs() >= deadline) return error.TestUnexpectedResult;
+        try std.testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
 
-    try std.testing.expect(hook_ctx.publish_calls > 0);
-    try std.testing.expect(hook_ctx.publish_blocking_calls > 0);
-    try std.testing.expectEqual(@as(u64, 0), hook_ctx.publish_blocking_while_applied_sequence_locked);
-    try std.testing.expectEqual(@as(u64, 4), hook_ctx.publish_blocking_checkpoint_applied);
-    try std.testing.expect(hook_ctx.publish_blocking_checkpoint_clean);
-    try std.testing.expect(hook_ctx.publish_blocking_with_clean_checkpoint > 0);
-    try std.testing.expectEqual(@as(u64, 0), hook_ctx.invalidate_calls);
+    try std.testing.expect(observed.publish_calls > 0);
+    try std.testing.expect(observed.publish_blocking_calls > 0);
+    try std.testing.expectEqual(@as(u64, 0), observed.publish_blocking_while_applied_sequence_locked);
+    try std.testing.expectEqual(@as(u64, 4), observed.publish_blocking_checkpoint_applied);
+    try std.testing.expect(observed.publish_blocking_checkpoint_clean);
+    try std.testing.expect(observed.publish_blocking_with_clean_checkpoint > 0);
+    try std.testing.expectEqual(@as(u64, 0), observed.invalidate_calls);
     const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
     try std.testing.expectEqual(@as(u64, 4), stats.indexes[0].replay_applied_sequence);
@@ -113502,7 +113652,9 @@ test "db restore owner converges rediscovered dense projection intent" {
     try std.testing.expect(!discovered.dense_visibility_changed);
 
     const rediscovered = try db.rebuildDenseIndexesFromStoredEmbeddingArtifactsOutcomeWithProgress(alloc, null, null);
-    try std.testing.expectEqual(@as(usize, 1), rediscovered.reported_work);
+    // Durable repair ownership excludes duplicate in-place discovery work.
+    try std.testing.expectEqual(@as(usize, 0), rediscovered.reported_work);
+    try std.testing.expect((try db.indexRepairIdForIndex(alloc, "dense_idx")) != null);
     try std.testing.expect(!rediscovered.made_progress);
     try std.testing.expect(!rediscovered.dense_visibility_changed);
 
@@ -113578,10 +113730,15 @@ test "db restore dense rebuild publishes mixed progress before worker wait" {
     var restore_state = (try DB.readRestoreStateForPathWithIo(alloc, std.testing.io, std.mem.span(path))).?;
     defer restore_state.deinit(alloc);
     try std.testing.expectEqualStrings("rebuild_replayed_artifacts", restore_state.phase);
-    try std.testing.expectError(
-        error.RestoreRuntimeRepairIncomplete,
-        db.repairRestoreRuntimeStateStepIfNeeded(alloc),
-    );
+    // Watermark repair can publish one more bounded progress quantum after
+    // rebuilding. Once drained, the pending owner must yield, not spin.
+    try std.testing.expect(try db.repairRestoreRuntimeStateStepIfNeeded(alloc));
+    var waiting = (try DB.readRestoreStateForPathWithIo(alloc, std.testing.io, std.mem.span(path))).?;
+    defer waiting.deinit(alloc);
+    try std.testing.expectEqualStrings("rebuild_replayed_artifacts", waiting.phase);
+    try std.testing.expectError(error.RestoreRuntimeRepairIncomplete, db.repairRestoreRuntimeStateStepIfNeeded(alloc));
+    try std.testing.expect(!waiting.runtime_repair_complete);
+    try std.testing.expect((try db.indexRepairIdForIndex(alloc, "dense_b")) != null);
 }
 
 test "db explicit restore runtime repair repairs managed chunked dense embeddings once for restored shard" {

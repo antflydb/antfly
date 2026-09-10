@@ -15473,6 +15473,7 @@ pub const HBCIndex = struct {
         var key_buf: [12]u8 = undefined;
         try self.deleteNamespaced(&txn, .nodes, encodeNodeKey(&key_buf, node_id, .packed_node));
         try self.finishWriteTxn(&txn);
+        self.invalidateNodeCache(node_id);
         try self.finishFormatAgnosticTestMutation(capture_started);
     }
 
@@ -15485,7 +15486,10 @@ pub const HBCIndex = struct {
         const capture_started = try self.beginFormatAgnosticTestMutation();
         errdefer if (capture_started) self.cancelExperimentalPostingMutationCapture();
 
-        try vectorindex_hbc_index.insert(self, vector_id, vector_data, nowNs, elapsedSince);
+        // The injected member intentionally has no primary artifact. Supply
+        // its vector through the normal batch context so centroid refresh
+        // does not depend on whether the decoded cache happens to retain it.
+        try self.batchInsertWithMetadata(&.{.{ .vector_id = vector_id, .vector = vector_data, .metadata = "" }});
         try self.finishFormatAgnosticTestMutation(capture_started);
     }
 
@@ -26563,6 +26567,7 @@ test "managed posting sidecar follows applied sequence and uncovered writes inva
         var coverage_count: usize = 0;
         for (recovered.replay.records.items) |record| switch (record.kind) {
             .base,
+            .row_chunk,
             .quantized_checkpoint,
             .posting_state,
             .node_range,
