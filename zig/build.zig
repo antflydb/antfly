@@ -3579,7 +3579,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_managed_embedder_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"managed embedder"},
+        .filters = &.{ "managed embedder", "antfly embed request", "antfly embed round trip", "antfly sparse embed round trip" },
     });
     const run_lib_managed_embedder_tests = addFilteredTestRunArtifact(b, lib_managed_embedder_tests);
     const lib_managed_embedder_test_step = b.step("lib-managed-embedder-test", "Run managed embedder contract and provider tests");
@@ -3774,6 +3774,9 @@ pub fn build(b: *std.Build) void {
         "boundary dispatcher preserves local calls and maps cross-unit calls",
         "bedrock provider request helpers",
         "embedding provider request helpers",
+        "antfly embed request",
+        "antfly embed round trip",
+        "antfly sparse embed round trip",
         "restore job store is idempotent and fenced",
         "restore requests without idempotency keys create independent opaque jobs",
         "restore runtime store persists checkpoints and requeues interrupted work",
