@@ -296,6 +296,89 @@ class RuntimeCacheTest(unittest.TestCase):
         self.assert_archives(self.build("cache-probe"))
         self.assertIn("FileNotFound", self.build("cache-vopr-tests", succeeds=False))
 
+    def test_lmdb_cache_contracts(self):
+        source = self.own("zig/pkg/antfly/src/lmdb/root.zig")
+        source.write_bytes(
+            source.read_bytes()
+            + b"\npub const cache_test_revision: u8 = 1;\npub const cache_test_evented = build_options.lmdb_evented_async_io;\n"
+        )
+        targets = ("cache-probe", "cache-lmdb-tests")
+        self.assertIn("LMDB_PROBE zig false 1", self.build(*targets))
+        self.assert_archives(self.build(*targets))
+        for settings, expected in (
+            (("-Dlmdb_backend=c",), "LMDB_PROBE c false 1"),
+            (("-Dlmdb_evented_async_io=true",), "LMDB_PROBE zig true 1"),
+        ):
+            with self.subTest(settings=settings):
+                changed = self.build(*targets, settings=settings)
+                self.assert_archives(changed)
+                self.assertRegex(changed, r"compile test Debug \S+ success")
+                self.assertIn(expected, changed)
+        self.assert_archives(self.build(*targets))
+        source.write_bytes(
+            source.read_bytes().replace(
+                b"pub const cache_test_revision: u8 = 1;",
+                b"pub const cache_test_revision: u8 = 2;",
+            )
+        )
+        changed = self.build(*targets)
+        self.assert_archives(changed)
+        self.assertRegex(changed, r"compile test Debug \S+ success")
+        self.assertIn("LMDB_PROBE zig false 2", changed)
+        self.assertRegex(self.build(*targets), r"compile test Debug \S+ cached")
+        source.unlink()
+        self.assert_archives(self.build("cache-probe"))
+        self.assertIn("FileNotFound", self.build("cache-lmdb-tests", succeeds=False))
+
+    def test_pjrt_cache_contracts(self):
+        source = self.own("zig/lib/pjrt/src/root.zig")
+        initial = source.read_bytes() + b"\npub const cache_test_revision: u8 = 1;\n"
+        for standalone in (False, True):
+            with self.subTest(standalone=standalone):
+                source.write_bytes(initial)
+                if standalone:
+                    self.use_standalone()
+                product = "cache-inference" if standalone else "cache-probe"
+                targets = (product, "cache-pjrt-tests")
+
+                def assert_product(output, rebuilt=False):
+                    if standalone:
+                        status = "success" if rebuilt else "cached"
+                        self.assertRegex(
+                            output, rf"compile exe antfly-inference Debug \S+ {status}"
+                        )
+                    else:
+                        self.assert_archives(
+                            output, rebuilt=("inference",) if rebuilt else ()
+                        )
+
+                self.assertIn("PJRT_REVISION 1", self.build(*targets))
+                assert_product(self.build(*targets))
+                source.write_bytes(
+                    initial.replace(b"revision: u8 = 1", b"revision: u8 = 2")
+                )
+                changed = self.build(*targets)
+                assert_product(changed)
+                self.assertRegex(changed, r"compile test Debug \S+ success")
+                self.assertIn("PJRT_REVISION 2", changed)
+                enabled = ("-Dpjrt=true",)
+                assert_product(self.build(*targets, settings=enabled), rebuilt=True)
+                assert_product(self.build(*targets, settings=enabled))
+                source.write_bytes(
+                    initial.replace(b"revision: u8 = 1", b"revision: u8 = 3")
+                )
+                changed = self.build(*targets, settings=enabled)
+                assert_product(changed, rebuilt=True)
+                self.assertIn("PJRT_REVISION 3", changed)
+                assert_product(self.build(product))
+                source.unlink()
+                assert_product(self.build(product))
+                for target, settings in ((product, enabled), ("cache-pjrt-tests", ())):
+                    self.assertIn(
+                        "FileNotFound",
+                        self.build(target, settings=settings, succeeds=False),
+                    )
+
     def test_optional_onnx_dependencies(self):
         source = self.own("zig/lib/audio/src/mod.zig")
         source.write_bytes(

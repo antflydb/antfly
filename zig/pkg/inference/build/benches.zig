@@ -90,7 +90,7 @@ pub fn addGliner(ctx: Context) void {
     });
     gliner2_bench_exe.root_module.addImport("build_options", ctx.graph.build_options_mod);
     gliner2_bench_exe.root_module.addImport("ml", ctx.graph.ml_mod);
-    gliner2_bench_exe.root_module.addImport("pjrt", ctx.graph.pjrt_mod);
+    if (ctx.graph.pjrt_mod) |pjrt| gliner2_bench_exe.root_module.addImport("pjrt", pjrt);
     gliner2_bench_exe.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
     gliner2_bench_exe.root_module.addImport("inference_hf_tokenizer", ctx.graph.inference_hf_tokenizer_mod);
     gliner2_bench_exe.root_module.addImport("antfly_image", ctx.graph.image_mod);
@@ -189,7 +189,8 @@ pub fn createBge(ctx: Context) CreateBgeResult {
     for ([_]*std.Build.Step.Compile{ bge_m3_e2e_bench_exe, tests }) |artifact| {
         artifact.root_module.addImport("build_options", ctx.graph.build_options_mod);
         artifact.root_module.addImport("ml", ctx.graph.ml_mod);
-        artifact.root_module.addImport("pjrt", ctx.graph.pjrt_mod);
+        const pjrt = if (artifact.kind.isTest()) ctx.graph.qualification_pjrt_mod else ctx.graph.pjrt_mod;
+        if (pjrt) |module| artifact.root_module.addImport("pjrt", module);
         artifact.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
         artifact.root_module.addImport("inference_hf_tokenizer", ctx.graph.inference_hf_tokenizer_mod);
         artifact.root_module.addImport("antfly_image", ctx.graph.image_mod);

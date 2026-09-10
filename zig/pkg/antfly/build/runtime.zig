@@ -160,7 +160,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         } else if (unit == .inference) {
             production_antfly_imports.configureInference(b, role_mod, link_libc);
         } else {
-            production_antfly_imports.configureRuntime(b, role_mod, false, link_libc, false);
+            production_antfly_imports.configureRuntime(b, role_mod, link_libc, false);
         }
         // Only the API kernel serves schemas. The other units use its ABI;
         // giving them these file imports would invalidate their caches too.

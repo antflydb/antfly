@@ -21,6 +21,7 @@ const addFilteredTestRunArtifact = @import("test_support.zig").addFilteredTestRu
 
 pub const AddTestsOptions = struct {
     vopr: *std.Build.Module,
+    lmdb_engine: *std.Build.Module,
     optimize: std.builtin.OptimizeMode,
     openapi_root_check: *std.Build.Step.Run,
     antfly_imports: AntflyRootImports,
@@ -54,7 +55,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const optimize = options.optimize;
     const openapi_root_check = options.openapi_root_check;
     const antfly_imports = options.antfly_imports;
-    const test_imports = @import("test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr };
+    const test_imports = @import("test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
     const antfly_test_mod = options.antfly_test_mod;
     const run_lib_usermgr_tests = options.run_lib_usermgr_tests;
     const public_api_parity_default_filters = [_][]const u8{

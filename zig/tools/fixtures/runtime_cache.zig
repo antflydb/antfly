@@ -40,6 +40,8 @@ pub fn build(b: *std.Build) void {
     unit_tests.dependOn(&b.addRunArtifact(artifacts.runtime.antfly_main_tests).step);
     var template: ?*std.Build.Step.Compile = null;
     var vopr_test_found = false;
+    var lmdb_test_found = false;
+    var pjrt_test_found = false;
     var host_count: usize = 0;
     var test_count: usize = 0;
     var iterator = steps.keyIterator();
@@ -52,6 +54,7 @@ pub fn build(b: *std.Build) void {
         const artifact = entry.*.cast(std.Build.Step.Compile) orelse continue;
         profiles.check(artifact);
         profiles.addBenchmarkProbe(b, artifact);
+        pjrt_test_found = profiles.addPjrtQualificationProbe(b, artifact) or pjrt_test_found;
         const arch = artifact.root_module.resolved_target.?.result.cpu.arch;
         if (arch == .wasm32 or arch == .wasm64) {
             var wasm_modules = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
@@ -64,6 +67,18 @@ pub fn build(b: *std.Build) void {
         }
         if (artifact.root_module.root_source_file) |source| switch (source) {
             .src_path => |path| {
+                if (artifact.kind.isTest() and artifact.filters.len == 0 and std.mem.endsWith(u8, path.sub_path, "/storage/lmdb.zig")) {
+                    artifact.root_module.root_source_file = b.addWriteFiles().add("lmdb_test.zig",
+                        \\test "LMDB cache probe" {
+                        \\    const lmdb = @import("lmdb_engine");
+                        \\    try @import("std").testing.expectEqualStrings(@import("build_options").lmdb_backend, lmdb.selected_backend_name);
+                        \\    @import("std").debug.print("LMDB_PROBE {s} {} {d}\n", .{lmdb.selected_backend_name, lmdb.cache_test_evented, lmdb.cache_test_revision});
+                        \\}
+                    );
+                    artifact.filters = &.{"LMDB cache probe"};
+                    b.step("cache-lmdb-tests", "Exercise actual LMDB consumer imports and options").dependOn(&b.addRunArtifact(artifact).step);
+                    lmdb_test_found = true;
+                }
                 if (artifact.kind.isTest() and std.mem.endsWith(u8, path.sub_path, "/api_http_runtime_test_root.zig")) {
                     // Keep the actual API test's imports, flags, and runner.
                     artifact.root_module.root_source_file = sources.add("vopr_test.zig",
@@ -100,7 +115,7 @@ pub fn build(b: *std.Build) void {
             host_count += 1;
         }
     }
-    if (host_count != 4 or test_count == 0 or !vopr_test_found or openapi.dependencies.items.len != 2) @panic("cache fixture did not inspect the expected production graph");
+    if (host_count != 4 or test_count == 0 or !vopr_test_found or !lmdb_test_found or !pjrt_test_found or openapi.dependencies.items.len != 2) @panic("cache fixture did not inspect the expected production graph");
     const wasm = artifacts.wasm;
     inline for (.{ .{ "httpx_profile", "lib/httpx/src/httpx.zig" }, .{ "json_profile", "lib/json/src/mod.zig" } }) |probe| {
         var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
@@ -253,6 +268,8 @@ fn inspect(module: *std.Build.Module, unit: runtime.RuntimeLibraryUnit, metadata
         const name = entry.key_ptr.*;
         if (std.mem.eql(u8, name, "vopr"))
             std.debug.panic("{s} archive depends on simulation test support", .{@tagName(unit)});
+        if (std.mem.eql(u8, name, "lmdb_engine"))
+            std.debug.panic("{s} archive depends on disabled LMDB", .{@tagName(unit)});
         if (unit != .api_kernel and std.mem.eql(u8, name, "antfly_openapi_specs"))
             std.debug.panic("{s} archive depends on served schemas", .{@tagName(unit)});
         if (unit != .inference and (std.mem.eql(u8, name, "metal_jit_identity") or std.mem.eql(u8, name, "cuda_jit_identity")))

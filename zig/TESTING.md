@@ -70,6 +70,15 @@ edges; the inference probe also loads the real inference module. The checks cove
   test recompiles on an edit and fails when its dependency is missing. Test
   constructors receive VOPR explicitly; the full Antfly package retains its
   public simulation exports.
+- Production archives have no transitive LMDB engine imports, and disabled LMDB
+  settings are normalized. Backend/async options and engine edits leave those
+  archives cached; the actual LMDB wrapper test probe rebuilds and reports the
+  selected settings. Removing the engine still allows production builds but
+  fails its test consumer. Embedded, test, and benchmark constructors receive
+  LMDB explicitly.
+- Disabled PJRT has no production import edge in either entrypoint. PJRT edits
+  and removal leave CPU products cached. Enabled products and explicit
+  qualification tests still rebuild on source edits and fail for missing source.
 - Release versions live in a small `lib/build_info` object. Archives see only a
   stable accessor module; final links attach the object only for version consumers.
   Tests use stable test metadata. Version-only changes leave the five runtime

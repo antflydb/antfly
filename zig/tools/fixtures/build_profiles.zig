@@ -54,6 +54,27 @@ pub fn addBenchmarkProbe(b: *std.Build, artifact: *std.Build.Step.Compile) void 
     b.step(b.fmt("cache-{s}", .{artifact.name}), "Read the actual benchmark/library profile").dependOn(&b.addRunArtifact(artifact).step);
 }
 
+/// Keep the actual inference qualification test's imports and runner.
+pub fn addPjrtQualificationProbe(b: *std.Build, artifact: *std.Build.Step.Compile) bool {
+    if (!artifact.kind.isTest() or artifact.test_runner == null) return false;
+    const source = artifact.root_module.root_source_file orelse return false;
+    switch (source) {
+        .src_path => |path| if (!std.mem.eql(u8, path.sub_path, "src/inference.zig") and
+            !std.mem.endsWith(u8, path.sub_path, "/src/inference.zig")) return false,
+        else => return false,
+    }
+    artifact.root_module.root_source_file = b.addWriteFiles().add("pjrt_test.zig",
+        \\test "PJRT cache probe" {
+        \\    const revision = @import("pjrt").cache_test_revision;
+        \\    try @import("std").testing.expect(revision > 0);
+        \\    @import("std").debug.print("PJRT_REVISION {d}\n", .{revision});
+        \\}
+    );
+    artifact.filters = &.{"PJRT cache probe"};
+    b.step("cache-pjrt-tests", "Exercise actual PJRT qualification imports").dependOn(&b.addRunArtifact(artifact).step);
+    return true;
+}
+
 // Follow generated sources as well as explicit steps, without freezing module
 // graphs before the fixture replaces the expensive compilation bodies.
 pub fn collectSteps(step: *std.Build.Step, steps: *std.AutoHashMap(*std.Build.Step, void), modules: *std.AutoHashMap(*std.Build.Module, void)) void {

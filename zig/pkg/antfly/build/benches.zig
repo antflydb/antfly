@@ -28,6 +28,7 @@ const AntflyRootImports = @import("imports.zig").AntflyRootImports;
 const LmdbBackend = @import("storage.zig").LmdbBackend;
 
 pub const AddBenchmarksOptions = struct {
+    lmdb_engine: *std.Build.Module,
     api_bench_standalone: bool,
     optimize: std.builtin.OptimizeMode,
     lmdb_backend: LmdbBackend,
@@ -52,7 +53,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const lmdb_evented_async_io = options.lmdb_evented_async_io;
     const with_tla = options.with_tla;
     const lite_local_inference_runtime = options.lite_local_inference_runtime;
-    const lmdb_engine_mod = options.antfly_imports.lmdb_engine;
+    const lmdb_engine_mod = options.lmdb_engine;
     const raft_engine_mod = options.antfly_imports.raft_engine;
     const httpx_mod = options.antfly_imports.httpx;
     const platform_mod = options.antfly_imports.platform;
@@ -695,7 +696,8 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configureRuntime(b, storage_bench_root_mod, false, true, false);
+    antfly_imports.configureRuntime(b, storage_bench_root_mod, true, false);
+    @import("storage.zig").configureLmdb(b, storage_bench_root_mod, lmdb_engine_mod, false);
     storage_bench_root_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     storage_bench_mod.addImport("antfly-zig", storage_bench_root_mod);
     storage_bench_mod.addImport("antfly_platform", platform_mod);

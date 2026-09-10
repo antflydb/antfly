@@ -37,6 +37,18 @@ pub fn makeLmdbBuildOptions(
     return options;
 }
 
+/// LMDB consumers declare their engine and optional C implementation explicitly.
+pub fn configureLmdb(b: *std.Build, module: *std.Build.Module, engine: *std.Build.Module, include_c: bool) void {
+    module.addImport("lmdb_engine", engine);
+    module.addIncludePath(b.path("lib/lmdb"));
+    if (include_c) {
+        module.addCSourceFiles(.{
+            .files = &.{ "lib/lmdb/mdb.c", "lib/lmdb/midl.c" },
+            .flags = &lmdb_c_flags,
+        });
+    }
+}
+
 pub fn makeRootBuildOptions(
     b: *std.Build,
     backend: LmdbBackend,
@@ -49,8 +61,9 @@ pub fn makeRootBuildOptions(
     lmdb_enabled: bool,
 ) *std.Build.Step.Options {
     const options = b.addOptions();
-    options.addOption([]const u8, "lmdb_backend", @tagName(backend));
-    options.addOption(bool, "lmdb_evented_async_io", evented_async_io);
+    // Disabled storage engines must not change the production module identity.
+    options.addOption([]const u8, "lmdb_backend", @tagName(if (lmdb_enabled) backend else .zig));
+    options.addOption(bool, "lmdb_evented_async_io", lmdb_enabled and evented_async_io);
     options.addOption(bool, "storage_sim_soak", storage_sim_soak);
     options.addOption(bool, "with_tla", with_tla);
     options.addOption(bool, "link_libc", link_libc);

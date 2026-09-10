@@ -46,6 +46,7 @@ const LmdbBackend = @import("storage.zig").LmdbBackend;
 
 pub const AddTestsOptions = struct {
     vopr: *std.Build.Module,
+    lmdb_engine: *std.Build.Module,
     optimize: std.builtin.OptimizeMode,
     lmdb_backend: LmdbBackend,
     lmdb_evented_async_io: bool,
@@ -92,7 +93,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lmdb_evented_async_io = options.lmdb_evented_async_io;
     const build_options = options.antfly_imports.build_options;
     const standalone_runtime_build_options = options.standalone_runtime_build_options;
-    const lmdb_engine_mod = options.antfly_imports.lmdb_engine;
+    const lmdb_engine_mod = options.lmdb_engine;
     const raft_engine_mod = options.antfly_imports.raft_engine;
     const httpx_mod = options.antfly_imports.httpx;
     const structlog_mod = options.antfly_imports.structlog;
@@ -119,7 +120,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const inference_chunker_mod = options.antfly_imports.inference_chunker;
     const reader_config_mod = options.antfly_imports.reader_config;
     const antfly_imports = options.antfly_imports;
-    const test_imports = @import("test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr };
+    const test_imports = @import("test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
     const vopr_mod = options.vopr;
     const casbin_mod = antfly_imports.casbin;
     const antfly_mod = options.antfly_mod;
@@ -1864,6 +1865,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_metadata_vopr_public_integration_tests = metadata_tests_addTests_result.run_lib_metadata_vopr_public_integration_tests;
 
     const api_tests_addTests_result = api_tests.addTests(b, .{
+        .lmdb_engine = lmdb_engine_mod,
         .vopr = vopr_mod,
         .optimize = optimize,
         .openapi_root_check = openapi_root_check,
@@ -3624,10 +3626,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    var standalone_runtime_imports = antfly_imports;
-    standalone_runtime_imports.build_options = standalone_runtime_build_options;
+    var standalone_runtime_imports = test_imports;
+    standalone_runtime_imports.runtime.build_options = standalone_runtime_build_options;
     standalone_runtime_imports.configure(b, standalone_runtime_test_mod, true, true);
-    standalone_runtime_test_mod.addImport("antfly_openapi_specs", standalone_runtime_imports.embedded_openapi);
+    standalone_runtime_test_mod.addImport("antfly_openapi_specs", standalone_runtime_imports.runtime.embedded_openapi);
     const usermgr_storage_standalone_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
         .target = target,
@@ -5093,7 +5095,7 @@ pub fn createPdfIntegration(b: *std.Build, options: struct {
         .target = target,
         .optimize = options.optimize,
     }));
-    options.imports.configure(b, module, false, options.imports.platform_link_libc);
+    options.imports.configure(b, module, options.imports.platform_link_libc);
     const executable = b.addExecutable(.{ .name = "pdf-ocr-integration", .root_module = module });
     const run = b.addRunArtifact(executable);
     const qualification = b.addRunArtifact(executable);

@@ -682,7 +682,6 @@ pub fn create(b: *std.Build) ?Artifacts {
             .schema_root = b.path("../specs/openapi"),
             .public_spec = b.path("../openapi.yaml"),
         }),
-        .lmdb_engine = lmdb_engine_mod,
         .raft_engine = raft_engine_mod,
         .public_openapi = public_openapi_mod,
         .client_openapi = client_openapi_mod,
@@ -764,7 +763,8 @@ pub fn create(b: *std.Build) ?Artifacts {
         .sanitize_thread = sanitize_thread,
     });
     // The full package exports simulation APIs as well as its runtime surface.
-    antfly_imports.configure(b, antfly_mod, false, link_libc);
+    antfly_imports.configure(b, antfly_mod, link_libc);
+    antfly_storage_build.configureLmdb(b, antfly_mod, lmdb_engine_mod, false);
     antfly_mod.addImport("vopr", vopr_mod);
     antfly_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
 
@@ -774,6 +774,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     wasm.smoke.step.dependOn(wasm_step);
     b.step("wasm-test", "Build the Antfly WASM bundle and run its Node smoke test").dependOn(&wasm.smoke.step);
     const embedded = antfly_embedded_build.addEmbedded(b, .{
+        .lmdb_engine = lmdb_engine_mod,
         .vopr = vopr_mod,
         .optimize = optimize,
         .strip = strip,
@@ -1135,6 +1136,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     raft_library_test_step.dependOn(&run_raft_library_tests.step);
 
     const owner_tests = antfly_tests_build.addTests(b, .{
+        .lmdb_engine = lmdb_engine_mod,
         .vopr = vopr_mod,
         .optimize = optimize,
         .lmdb_backend = lmdb_backend,
@@ -1278,6 +1280,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     tokenizer_bench_step.dependOn(&b.addInstallArtifact(tokenizer_bench, .{}).step);
 
     const benchmarks = antfly_benches_build.addBenchmarks(b, .{
+        .lmdb_engine = lmdb_engine_mod,
         .api_bench_standalone = api_bench_standalone,
         .optimize = optimize,
         .lmdb_backend = lmdb_backend,
@@ -1348,7 +1351,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "build_info", .module = build_info.module },
-            .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "build_options", .module = production_build_options.createModule() },
             .{ .name = "structlog", .module = structlog_mod },
             .{ .name = "antfly_platform", .module = platform_mod },
             .{ .name = "antfly_hash", .module = hash_mod },

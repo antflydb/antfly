@@ -14,7 +14,6 @@
 
 const std = @import("std");
 const platform_build = @import("../../../lib/platform/build_support.zig");
-const lmdb_c_flags = @import("storage.zig").lmdb_c_flags;
 const addSnowballModule = @import("snowball.zig").addSnowballModule;
 
 pub const AntflyRootImports = struct {
@@ -22,7 +21,6 @@ pub const AntflyRootImports = struct {
     build_options: *std.Build.Step.Options,
     // HTTP schema serving is opt-in at the owning compilation roots.
     embedded_openapi: *std.Build.Module,
-    lmdb_engine: *std.Build.Module,
     raft_engine: *std.Build.Module,
     public_openapi: *std.Build.Module,
     client_openapi: *std.Build.Module,
@@ -94,7 +92,6 @@ pub const AntflyRootImports = struct {
     filesystem_capacity_source_file: std.Build.LazyPath,
 
     const import_table = [_]struct { name: []const u8, field: []const u8 }{
-        .{ .name = "lmdb_engine", .field = "lmdb_engine" },
         .{ .name = "raft_engine", .field = "raft_engine" },
         .{ .name = "antfly_public_openapi", .field = "public_openapi" },
         .{ .name = "antfly_client_openapi", .field = "client_openapi" },
@@ -162,8 +159,8 @@ pub const AntflyRootImports = struct {
         .{ .name = "structlog", .field = "structlog" },
     };
 
-    pub fn configure(self: @This(), b: *std.Build, mod: *std.Build.Module, include_lmdb_c: bool, link_libc: bool) void {
-        self.configureRuntime(b, mod, include_lmdb_c, link_libc, true);
+    pub fn configure(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
+        self.configureRuntime(b, mod, link_libc, true);
         mod.addImport("build_info", self.build_info.module);
     }
 
@@ -219,7 +216,6 @@ pub const AntflyRootImports = struct {
         self: @This(),
         b: *std.Build,
         mod: *std.Build.Module,
-        include_lmdb_c: bool,
         link_libc: bool,
         include_inference_server: bool,
     ) void {
@@ -236,13 +232,6 @@ pub const AntflyRootImports = struct {
                 self.filesystem_capacity_source_file,
                 self.platform_target,
             );
-        }
-        mod.addIncludePath(b.path("lib/lmdb"));
-        if (include_lmdb_c) {
-            mod.addCSourceFiles(.{
-                .files = &.{ "lib/lmdb/mdb.c", "lib/lmdb/midl.c" },
-                .flags = &lmdb_c_flags,
-            });
         }
         mod.link_libc = link_libc;
         addSnowballModule(b, mod);

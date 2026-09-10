@@ -114,7 +114,9 @@ pub const Graph = struct {
     ml_mod: *std.Build.Module,
     ml_tabular_mod: *std.Build.Module,
     onnx_graph_mod: *std.Build.Module,
-    pjrt_mod: *std.Build.Module,
+    pjrt_mod: ?*std.Build.Module,
+    /// Tests may qualify PJRT contracts even when the product backend is disabled.
+    qualification_pjrt_mod: *std.Build.Module,
     inference_api_mod: *std.Build.Module,
     transcribing_mod: *std.Build.Module,
     inference_client_mod: ?*std.Build.Module,
@@ -220,10 +222,11 @@ pub fn create(config: Config) Graph {
         mod.addImport("ml", ml_mod);
         break :blk mod;
     };
-    const pjrt_mod = shared.pjrt orelse b.dependency("pjrt", .{
+    const qualification_pjrt_mod = shared.pjrt orelse b.dependency("pjrt", .{
         .target = target,
         .optimize = optimize,
     }).module("pjrt");
+    const pjrt_mod = if (backend.enable_pjrt) qualification_pjrt_mod else null;
 
     const generating_openapi_mod = shared.generating_openapi orelse addOrCreateModule(b, config.register_public_modules, "antfly_generating_openapi", .{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_generating_openapi/root.zig")),
@@ -369,7 +372,7 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.addImport("inference_audio", inference_audio_mod);
     inference_internal_mod.addImport("ml", ml_mod);
     inference_internal_mod.addImport("ml_tabular", ml_tabular_mod);
-    inference_internal_mod.addImport("pjrt", pjrt_mod);
+    if (pjrt_mod) |pjrt| inference_internal_mod.addImport("pjrt", pjrt);
     inference_internal_mod.addImport("inference_linalg", inference_linalg_mod);
     inference_internal_mod.addImport("protobuf", protobuf_mod);
     inference_internal_mod.addImport("antfly_platform", platform_mod);
@@ -404,6 +407,7 @@ pub fn create(config: Config) Graph {
         .ml_tabular_mod = ml_tabular_mod,
         .onnx_graph_mod = onnx_graph_mod,
         .pjrt_mod = pjrt_mod,
+        .qualification_pjrt_mod = qualification_pjrt_mod,
         .inference_api_mod = inference_api_mod,
         .transcribing_mod = transcribing_mod,
         .inference_client_mod = inference_client_mod,
@@ -464,7 +468,7 @@ const InferenceRootImports = struct {
     prometheus_mod: *std.Build.Module,
     structlog_mod: *std.Build.Module,
     onnx_graph_mod: *std.Build.Module,
-    pjrt_mod: *std.Build.Module,
+    pjrt_mod: ?*std.Build.Module,
     platform_mod: *std.Build.Module,
     protobuf_mod: *std.Build.Module,
     reader_config_mod: *std.Build.Module,
@@ -493,7 +497,7 @@ pub fn addInferenceRootImports(module: *std.Build.Module, imports: InferenceRoot
     module.addImport("prometheus", imports.prometheus_mod);
     module.addImport("structlog", imports.structlog_mod);
     module.addImport("onnx_graph", imports.onnx_graph_mod);
-    module.addImport("pjrt", imports.pjrt_mod);
+    if (imports.pjrt_mod) |pjrt| module.addImport("pjrt", pjrt);
     module.addImport("antfly_platform", imports.platform_mod);
     module.addImport("protobuf", imports.protobuf_mod);
     module.addImport("antfly_reader_config", imports.reader_config_mod);

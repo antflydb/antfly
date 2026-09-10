@@ -1290,7 +1290,7 @@ pub fn build(b: *std.Build) void {
     });
     gliner2_e2e_bench_exe.root_module.addImport("build_options", build_options_mod);
     gliner2_e2e_bench_exe.root_module.addImport("ml", ml_mod);
-    gliner2_e2e_bench_exe.root_module.addImport("pjrt", pjrt_mod);
+    if (pjrt_mod) |pjrt| gliner2_e2e_bench_exe.root_module.addImport("pjrt", pjrt);
     gliner2_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
     gliner2_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     gliner2_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
@@ -1318,7 +1318,7 @@ pub fn build(b: *std.Build) void {
     });
     clipclap_native_bench_exe.root_module.addImport("build_options", build_options_mod);
     clipclap_native_bench_exe.root_module.addImport("ml", ml_mod);
-    clipclap_native_bench_exe.root_module.addImport("pjrt", pjrt_mod);
+    if (pjrt_mod) |pjrt| clipclap_native_bench_exe.root_module.addImport("pjrt", pjrt);
     clipclap_native_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
     clipclap_native_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     clipclap_native_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
@@ -1347,7 +1347,7 @@ pub fn build(b: *std.Build) void {
     });
     clipclap_e2e_bench_exe.root_module.addImport("build_options", build_options_mod);
     clipclap_e2e_bench_exe.root_module.addImport("ml", ml_mod);
-    clipclap_e2e_bench_exe.root_module.addImport("pjrt", pjrt_mod);
+    if (pjrt_mod) |pjrt| clipclap_e2e_bench_exe.root_module.addImport("pjrt", pjrt);
     clipclap_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
     clipclap_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     clipclap_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
@@ -1386,7 +1386,7 @@ pub fn build(b: *std.Build) void {
     });
     qwen3_embedding_e2e_bench_exe.root_module.addImport("build_options", build_options_mod);
     qwen3_embedding_e2e_bench_exe.root_module.addImport("ml", ml_mod);
-    qwen3_embedding_e2e_bench_exe.root_module.addImport("pjrt", pjrt_mod);
+    if (pjrt_mod) |pjrt| qwen3_embedding_e2e_bench_exe.root_module.addImport("pjrt", pjrt);
     qwen3_embedding_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
     qwen3_embedding_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     qwen3_embedding_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
@@ -1415,7 +1415,7 @@ pub fn build(b: *std.Build) void {
     });
     nomic_e2e_bench_exe.root_module.addImport("build_options", build_options_mod);
     nomic_e2e_bench_exe.root_module.addImport("ml", ml_mod);
-    nomic_e2e_bench_exe.root_module.addImport("pjrt", pjrt_mod);
+    if (pjrt_mod) |pjrt| nomic_e2e_bench_exe.root_module.addImport("pjrt", pjrt);
     nomic_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
     nomic_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     nomic_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
@@ -1444,7 +1444,7 @@ pub fn build(b: *std.Build) void {
     });
     reranker_e2e_bench_exe.root_module.addImport("build_options", build_options_mod);
     reranker_e2e_bench_exe.root_module.addImport("ml", ml_mod);
-    reranker_e2e_bench_exe.root_module.addImport("pjrt", pjrt_mod);
+    if (pjrt_mod) |pjrt| reranker_e2e_bench_exe.root_module.addImport("pjrt", pjrt);
     reranker_e2e_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
     reranker_e2e_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
     reranker_e2e_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
@@ -1541,7 +1541,7 @@ pub fn build(b: *std.Build) void {
     wasm_compute_tests.root_module.addImport("antfly_image", antfly_image_mod);
     wasm_compute_tests.root_module.addImport("ml", ml_mod);
     wasm_compute_tests.root_module.addImport("onnx_graph", onnx_graph_mod);
-    wasm_compute_tests.root_module.addImport("pjrt", pjrt_mod);
+    wasm_compute_tests.root_module.addImport("pjrt", runtime_graph.qualification_pjrt_mod);
     wasm_compute_tests.root_module.addImport("prometheus", prometheus_mod);
     wasm_compute_tests.root_module.addImport("structlog", structlog_mod);
     wasm_compute_tests.root_module.addImport("antfly_reader_config", reader_config_mod);
@@ -1597,7 +1597,7 @@ pub fn build(b: *std.Build) void {
     web_projector_tests.root_module.addImport("antfly_image", antfly_image_mod);
     web_projector_tests.root_module.addImport("ml", ml_mod);
     web_projector_tests.root_module.addImport("onnx_graph", onnx_graph_mod);
-    web_projector_tests.root_module.addImport("pjrt", pjrt_mod);
+    web_projector_tests.root_module.addImport("pjrt", runtime_graph.qualification_pjrt_mod);
     web_projector_tests.root_module.addImport("prometheus", prometheus_mod);
     web_projector_tests.root_module.addImport("structlog", structlog_mod);
     web_projector_tests.root_module.addImport("antfly_reader_config", reader_config_mod);

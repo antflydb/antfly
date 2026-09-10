@@ -25,12 +25,14 @@ pub fn build(b: *std.Build) void {
     var iterator = steps.keyIterator();
     var pilot_found = false;
     var reporting_found = false;
+    var pjrt_test_found = false;
     // Give each probe its own output step so unordered artifact traversal cannot
     // change another probe's generated path and invalidate its compilation.
     while (iterator.next()) |entry| {
         const artifact = entry.*.cast(std.Build.Step.Compile) orelse continue;
         profiles.check(artifact);
         profiles.addBenchmarkProbe(b, artifact);
+        pjrt_test_found = profiles.addPjrtQualificationProbe(b, artifact) or pjrt_test_found;
         if (std.mem.eql(u8, artifact.name, "antfly-inference")) {
             // Exercise the real executable's final links without its large body.
             artifact.root_module.root_source_file = b.addWriteFiles().add("inference_link.zig",
@@ -65,5 +67,5 @@ pub fn build(b: *std.Build) void {
             reporting_found = true;
         }
     }
-    if (!pilot_found or !reporting_found) @panic("standalone fixture did not find its actual tool consumers");
+    if (!pilot_found or !reporting_found or !pjrt_test_found) @panic("standalone fixture did not find its actual tool consumers");
 }

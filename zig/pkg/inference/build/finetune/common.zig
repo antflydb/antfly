@@ -62,7 +62,8 @@ pub const Context = struct {
     inference_tokenizer_mod: *std.Build.Module,
     inference_hf_tokenizer_mod: *std.Build.Module,
     antfly_image_mod: *std.Build.Module,
-    pjrt_mod: *std.Build.Module,
+    pjrt_mod: ?*std.Build.Module,
+    qualification_pjrt_mod: *std.Build.Module,
     protobuf_mod: *std.Build.Module,
     inference_linalg_mod: *std.Build.Module,
     antfly_platform_mod: *std.Build.Module,
@@ -83,7 +84,7 @@ pub const Context = struct {
             .jinja => ctx.jinja_mod,
             .ml => ctx.ml_mod,
             .onnx_graph => ctx.onnx_graph_mod,
-            .pjrt => ctx.pjrt_mod,
+            .pjrt => ctx.qualification_pjrt_mod,
             .protobuf => ctx.protobuf_mod,
             .termite_c_file => ctx.b.createModule(.{
                 .root_source_file = ctx.path("src/util/c_file.zig"),
@@ -150,7 +151,7 @@ pub fn addCommand(ctx: Context, spec: CommandSpec) *std.Build.Step.Run {
             .optimize = ctx.optimize,
         }),
     });
-    addImports(ctx, exe.root_module, spec.imports);
+    addImports(ctx, exe.root_module, spec.imports, ctx.pjrt_mod);
     configureNative(ctx, exe, spec.native_link, spec.imports);
     if (spec.release_metadata) {
         exe.root_module.addImport("build_info", ctx.build_info_mod);
@@ -187,7 +188,7 @@ pub fn addTest(ctx: Context, spec: TestSpec) *std.Build.Step {
             .mode = .simple,
         },
     });
-    addImports(ctx, test_exe.root_module, spec.imports);
+    addImports(ctx, test_exe.root_module, spec.imports, ctx.qualification_pjrt_mod);
     if (!containsImport(spec.imports, .antfly_platform))
         test_exe.root_module.addImport("antfly_platform", ctx.antfly_platform_mod);
     configureNative(ctx, test_exe, spec.native_link, spec.imports);
@@ -200,9 +201,10 @@ pub fn addTest(ctx: Context, spec: TestSpec) *std.Build.Step {
     return step;
 }
 
-fn addImports(ctx: Context, module: *std.Build.Module, imports: []const Import) void {
+fn addImports(ctx: Context, module: *std.Build.Module, imports: []const Import, pjrt: ?*std.Build.Module) void {
     for (imports) |import| {
-        module.addImport(@tagName(import), ctx.moduleFor(import));
+        const dependency = if (import == .pjrt) (pjrt orelse continue) else ctx.moduleFor(import);
+        module.addImport(@tagName(import), dependency);
     }
 }
 
@@ -306,6 +308,7 @@ pub fn fromWorkflow(ctx: @import("../context.zig").Context) Context {
         .inference_hf_tokenizer_mod = ctx.graph.inference_hf_tokenizer_mod,
         .antfly_image_mod = ctx.graph.image_mod,
         .pjrt_mod = ctx.graph.pjrt_mod,
+        .qualification_pjrt_mod = ctx.graph.qualification_pjrt_mod,
         .protobuf_mod = ctx.graph.protobuf_mod,
         .inference_linalg_mod = ctx.graph.inference_linalg_mod,
         .antfly_platform_mod = ctx.graph.platform_mod,

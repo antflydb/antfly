@@ -66,7 +66,7 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("ml", ctx.graph.ml_mod);
     tests.root_module.addImport("ml_tabular", ctx.graph.ml_tabular_mod);
     tests.root_module.addImport("onnx_graph", ctx.graph.onnx_graph_mod);
-    tests.root_module.addImport("pjrt", ctx.graph.pjrt_mod);
+    tests.root_module.addImport("pjrt", ctx.graph.qualification_pjrt_mod);
     tests.root_module.addImport("prometheus", ctx.graph.prometheus_mod);
     tests.root_module.addImport("structlog", ctx.graph.structlog_mod);
     tests.root_module.addImport("antfly_platform", ctx.graph.platform_mod);
