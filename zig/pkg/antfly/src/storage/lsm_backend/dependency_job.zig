@@ -168,6 +168,31 @@ test "dependency certificate delta scaling benchmark" {
     }
 }
 
+test "dependency publication intervals retain older anchors but reject skipped generations" {
+    const allocator = std.testing.allocator;
+    const directory = try Directory.create(allocator);
+    defer directory.destroy(allocator);
+    const base = Job{ .directory = directory, .handles = &.{}, .source_level = 0, .output_level = 0, .visibility = 30, .oldest_visibility = 20, .full_gc = false, .split_gc = false };
+    var outside: @import("repository.zig").Run = .{ .id = 10, .level = 0, .size_bytes = 1, .path = @constCast("anchor.sst"), .smallest_namespace_name = null, .smallest_key = @constCast("a"), .largest_namespace_name = null, .largest_key = @constCast("c"), .entry_count = 1, .bloom_filter = null, .state = null };
+    var older = base;
+    try std.testing.expect(older.acceptOutside(&outside));
+    try std.testing.expect(!older.covered);
+    for ([_]u64{ 20, 25, 30 }) |visibility| {
+        outside.visibility_id = visibility;
+        var skipped = base;
+        try std.testing.expect(!skipped.acceptOutside(&outside));
+    }
+    outside.visibility_id = 31;
+    var newer = base;
+    try std.testing.expect(newer.acceptOutside(&outside));
+    try std.testing.expect(newer.covered);
+    outside.visibility_id = 30;
+    var promotion = base;
+    promotion.output_level = 1;
+    try std.testing.expect(promotion.acceptOutside(&outside));
+    try std.testing.expect(promotion.covered);
+}
+
 pub const Job = struct {
     directory: *const Directory,
     handles: []const Directory.Handle,
@@ -183,6 +208,7 @@ pub const Job = struct {
     source_level: u32,
     output_level: u32,
     visibility: u64,
+    oldest_visibility: u64 = std.math.maxInt(u64),
     full_gc: bool,
     split_gc: bool,
     valid: bool = true,
@@ -212,6 +238,8 @@ pub const Job = struct {
                     return true;
                 };
                 const run = handle.run;
+                if (run.level == 0)
+                    self.oldest_visibility = @min(self.oldest_visibility, if (run.visibility_id == 0) run.id else run.visibility_id);
                 if (self.index == 0 or compare(run.smallest_namespace_name, run.smallest_key, self.lower_ns, self.lower) == .lt) {
                     self.lower_ns = run.smallest_namespace_name;
                     self.lower = run.smallest_key;
@@ -242,7 +270,19 @@ pub const Job = struct {
     }
     fn acceptOutside(self: *Job, run: *const @import("repository.zig").Run) bool {
         const visibility = if (run.visibility_id == 0) run.id else run.visibility_id;
-        const newer = run.level < self.source_level or (self.source_level == 0 and run.level == 0 and visibility > self.visibility);
+        // Files in one L0 publication are disjoint. An unselected peer keeps
+        // precedence over output promoted to L1 just like a newer publication;
+        // it is not an older dependency requiring inclusion in that rewrite.
+        // Same-level rewrites below still require the full overlapping interval.
+        const newer = run.level < self.source_level or (self.source_level == 0 and run.level == 0 and visibility >= self.visibility);
+        if (self.source_level == 0 and self.output_level == 0 and !self.full_gc and !self.split_gc) {
+            // Older L0 anchors are legal if tombstones remain. A skipped
+            // generation inside the rewritten interval would change precedence.
+            if (run.level == 0 and visibility >= self.oldest_visibility and visibility <= self.visibility)
+                self.valid = false;
+            if (!newer) self.covered = false;
+            return self.valid;
+        }
         const older_l0 = self.source_level == 0 and run.level == 0 and !newer;
         if (!self.split_gc and ((self.full_gc and !newer) or older_l0 or run.level == self.output_level)) self.valid = false;
         if (!newer) self.covered = false;

@@ -20,6 +20,14 @@
 //! duplicate, stale, or multiply-owned entries before any shard is compiled.
 
 comptime {
+    _ = @import("admission_waiter.zig");
+    _ = @import("artifact_payload.zig");
+    _ = @import("dense_work_admission.zig");
+    _ = @import("maintenance_signal.zig");
+    _ = @import("projection_page_cache.zig");
+    _ = @import("projection_read_trace.zig");
+    _ = @import("vector_payload_store.zig");
+    _ = @import("vector_wal_view.zig");
     _ = @import("backend_adapter.zig");
     _ = @import("backend_conformance_test.zig");
     _ = @import("backend_erased.zig");
@@ -139,6 +147,7 @@ comptime {
     _ = @import("docstore.zig");
     _ = @import("enrichment.zig");
     _ = @import("filesystem_capacity.zig");
+    _ = @import("generation_publication.zig");
     _ = @import("ha/admin.zig");
     _ = @import("ha/admin_cli.zig");
     _ = @import("ha/admin_exec.zig");
@@ -235,6 +244,7 @@ comptime {
     _ = @import("mem_ordered.zig");
     _ = @import("object_storage.zig");
     _ = @import("persistent.zig");
+    _ = @import("posting_segment_store.zig");
     _ = @import("persistent_vopr.zig");
     _ = @import("portable_backup.zig");
     _ = @import("resource_manager.zig");
@@ -248,6 +258,7 @@ comptime {
     _ = @import("transactions.zig");
     _ = @import("transaction_vopr.zig");
     _ = @import("ttl.zig");
+    _ = @import("vector_block_store.zig");
     _ = @import("wal.zig");
     _ = @import("vopr_durable_job_lane.zig");
     _ = @import("wal_vopr.zig");

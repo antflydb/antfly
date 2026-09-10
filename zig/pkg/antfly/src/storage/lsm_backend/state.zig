@@ -493,6 +493,49 @@ pub const ActiveMemTable = struct {
         return .{ .ordered_root = if (self.ordered.root) |root| root.retain() else null, .account = if (self.ordered.account) |account| account.retain() else null };
     }
 
+    /// Copy only one ordered key range into a stable snapshot.
+    ///
+    /// Active memtables are insertion ordered, so selecting the range still
+    /// visits every entry. The expensive key/value duplication is restricted
+    /// to the requested range, and the result is sorted for merge cursors.
+    pub fn cloneRangeArena(
+        self: *const ActiveMemTable,
+        allocator: Allocator,
+        namespace: backend_types.Namespace,
+        lower: []const u8,
+        upper: []const u8,
+    ) !State {
+        var selected: usize = 0;
+        for (0..self.entryCount()) |entry_index| {
+            const entry = self.entryAt(entry_index);
+            if (compareNamespace(namespaceOf(entry), namespace) != .eq) continue;
+            if (std.mem.order(u8, entry.key, lower) == .lt) continue;
+            if (std.mem.order(u8, entry.key, upper) != .lt) continue;
+            selected += 1;
+        }
+
+        var out: State = .{};
+        errdefer out.deinit(allocator);
+        try out.entries.ensureTotalCapacity(allocator, selected);
+        if (selected == 0) return out;
+        const arena_allocator = try out.ensureArenaAllocator(allocator);
+        for (0..self.entryCount()) |entry_index| {
+            const entry = self.entryAt(entry_index);
+            if (compareNamespace(namespaceOf(entry), namespace) != .eq) continue;
+            if (std.mem.order(u8, entry.key, lower) == .lt) continue;
+            if (std.mem.order(u8, entry.key, upper) != .lt) continue;
+            out.entries.appendAssumeCapacity(try initArenaEntry(
+                arena_allocator,
+                namespaceOf(entry),
+                entry.key,
+                entry.value,
+                entry.tombstone,
+            ));
+        }
+        sortStateEntries(&out);
+        return out;
+    }
+
     pub fn toStateMove(self: *ActiveMemTable, allocator: Allocator) !State {
         if (self.ordered_enabled) {
             // Transfer the generation in constant time. Keep the small spare
@@ -1501,6 +1544,32 @@ test "ActiveMemTable overwrites ordered entries and transfers sorted generation"
     try std.testing.expectEqual(@as(usize, 3), moved.entryCount());
     try std.testing.expectEqualStrings("doc:a", moved.entryAt(0).key);
     try std.testing.expectEqualStrings("doc:c", moved.entryAt(1).key);
+}
+
+test "ActiveMemTable range snapshot excludes unrelated keys and namespaces" {
+    var active: ActiveMemTable = .{};
+    defer active.deinit(std.testing.allocator);
+
+    try active.upsert(std.testing.allocator, .{}, "replay:3", "three", false);
+    try active.upsert(std.testing.allocator, .{}, "doc:large", "unrelated", false);
+    try active.upsert(std.testing.allocator, .{ .name = "other" }, "replay:2", "wrong namespace", false);
+    try active.upsert(std.testing.allocator, .{}, "replay:1", "one", false);
+    try active.upsert(std.testing.allocator, .{}, "replay:2", "deleted", true);
+
+    var snapshot = try active.cloneRangeArena(
+        std.testing.allocator,
+        .{},
+        "replay:1",
+        "replay:3",
+    );
+    defer snapshot.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), snapshot.entries.items.len);
+    try std.testing.expectEqualStrings("replay:1", snapshot.entries.items[0].key);
+    try std.testing.expectEqualStrings("one", snapshot.entries.items[0].value);
+    try std.testing.expectEqualStrings("replay:2", snapshot.entries.items[1].key);
+    try std.testing.expect(snapshot.entries.items[1].tombstone);
+    try std.testing.expect(snapshot.arena_owner != null);
 }
 
 test "EntryIndex stores unique hashes inline and preserves collision lookup" {

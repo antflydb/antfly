@@ -10,6 +10,7 @@
 const std = @import("std");
 
 pub const CreateTableRequest = struct {
+    storage: @import("../common/table_storage.zig").Settings = .{},
     num_shards: ?u32 = null,
     description: ?[]u8 = null,
     indexes_json: ?[]u8 = null,

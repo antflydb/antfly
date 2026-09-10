@@ -109,8 +109,11 @@ const Reader = struct {
     }
 
     fn run(self: *Reader, version: u32) !manifest.OwnedRunMeta {
+        const id = try self.int(u64);
+        const legacy_sequence = if (version == 10) try self.int(u64) else id;
         var out: manifest.OwnedRunMeta = .{
-            .id = try self.int(u64),
+            .id = id,
+            .visibility_id = legacy_sequence,
             .level = try self.int(u32),
             .size_bytes = try self.int(u64),
             .path = &.{},
@@ -129,7 +132,7 @@ const Reader = struct {
         const upper_ns_len = try self.int(u32);
         const upper_len = try self.int(u32);
         out.entry_count = try self.int(u32);
-        if (version >= 10) {
+        if (version >= 11) {
             const tombstones = try self.int(u64);
             if (tombstones != std.math.maxInt(u64)) {
                 if (tombstones > out.entry_count) return error.InvalidManifest;
@@ -138,7 +141,7 @@ const Reader = struct {
             out.oldest_tombstone_unix_ns = try self.int(u64);
             out.visibility_id = try self.int(u64);
             const gc = try self.int(u32);
-            if (gc > 1 or out.visibility_id > out.id) return error.InvalidManifest;
+            if (gc > 1) return error.InvalidManifest;
             out.gc_requested = gc != 0;
         }
         if (out.id == 0 or path_len == 0) return error.InvalidManifest;
@@ -189,15 +192,16 @@ const Reader = struct {
         try self.read(&magic);
         if (!std.mem.eql(u8, &magic, manifest.magic)) return error.InvalidManifest;
         const version = try self.int(u32);
-        if (version != manifest.version and version != 9) return error.UnsupportedVersion;
+        if (version != manifest.version and version != 10 and version != 9) return error.UnsupportedVersion;
         const next_id = try self.int(u64);
         if (!checkpoint and next_id < catalog.next_run_id) return error.InvalidManifest;
         const runs = try self.int(u32);
         const paths = try self.int(u32);
-        if (runs > self.remaining.? / @as(u64, if (version >= 10) 112 else 84) or paths > self.remaining.? / 12) return error.InvalidManifest;
+        if (runs > self.remaining.? / @as(u64, if (version >= 11) 112 else if (version >= 10) 92 else 84) or paths > self.remaining.? / 12) return error.InvalidManifest;
         for (0..runs) |_| {
             var entry = try self.run(version);
             errdefer entry.deinit(self.allocator);
+            if (entry.visibility_id >= next_id) return error.InvalidManifest;
             const slot = try catalog.runs.getOrPut(self.allocator, entry.id);
             if (slot.found_existing) slot.value_ptr.deinit(self.allocator);
             slot.value_ptr.* = entry;

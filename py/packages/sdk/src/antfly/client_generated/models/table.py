@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from ..models.table_migration import TableMigration
     from ..models.table_schema import TableSchema
     from ..models.table_shards import TableShards
+    from ..models.table_storage_settings import TableStorageSettings
 
 
 T = TypeVar("T", bound="Table")
@@ -27,6 +28,7 @@ class Table:
         name (str):
         indexes (TableIndexes):
         shards (TableShards):
+        storage (TableStorageSettings | Unset): Immutable source embedding storage selected when creating a table.
         description (str | Unset): Optional description of the table. Example: Table for user data.
         schema (TableSchema | Unset): Schema definition for a table with multiple document types
         migration (TableMigration | Unset): Describes an in-progress schema migration. The table serves reads from
@@ -43,6 +45,7 @@ class Table:
     name: str
     indexes: TableIndexes
     shards: TableShards
+    storage: TableStorageSettings | Unset = UNSET
     description: str | Unset = UNSET
     schema: TableSchema | Unset = UNSET
     migration: TableMigration | Unset = UNSET
@@ -56,6 +59,10 @@ class Table:
         indexes = self.indexes.to_dict()
 
         shards = self.shards.to_dict()
+
+        storage: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.storage, Unset):
+            storage = self.storage.to_dict()
 
         description = self.description
 
@@ -90,6 +97,8 @@ class Table:
                 "shards": shards,
             }
         )
+        if storage is not UNSET:
+            field_dict["storage"] = storage
         if description is not UNSET:
             field_dict["description"] = description
         if schema is not UNSET:
@@ -111,6 +120,7 @@ class Table:
         from ..models.table_migration import TableMigration
         from ..models.table_schema import TableSchema
         from ..models.table_shards import TableShards
+        from ..models.table_storage_settings import TableStorageSettings
 
         d = dict(src_dict)
         name = d.pop("name")
@@ -118,6 +128,13 @@ class Table:
         indexes = TableIndexes.from_dict(d.pop("indexes"))
 
         shards = TableShards.from_dict(d.pop("shards"))
+
+        _storage = d.pop("storage", UNSET)
+        storage: TableStorageSettings | Unset
+        if isinstance(_storage, Unset):
+            storage = UNSET
+        else:
+            storage = TableStorageSettings.from_dict(_storage)
 
         description = d.pop("description", UNSET)
 
@@ -157,6 +174,7 @@ class Table:
             name=name,
             indexes=indexes,
             shards=shards,
+            storage=storage,
             description=description,
             schema=schema,
             migration=migration,

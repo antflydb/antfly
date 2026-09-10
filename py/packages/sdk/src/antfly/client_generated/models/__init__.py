@@ -161,6 +161,7 @@ from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
 from .date_range_string_query import DateRangeStringQuery
 from .delete_artifact_enrichment_response_201 import DeleteArtifactEnrichmentResponse201
+from .dense_native_storage_phase import DenseNativeStoragePhase
 from .dense_repair_backpressure_error import DenseRepairBackpressureError
 from .dense_repair_backpressure_error_code import DenseRepairBackpressureErrorCode
 from .dense_vector_publication_status import DenseVectorPublicationStatus
@@ -924,6 +925,8 @@ from .table_shards import TableShards
 from .table_statistics import TableStatistics
 from .table_statistics_field_stats import TableStatisticsFieldStats
 from .table_status import TableStatus
+from .table_storage_settings import TableStorageSettings
+from .table_storage_settings_dense_embeddings import TableStorageSettingsDenseEmbeddings
 from .table_storage_unreadable_error import TableStorageUnreadableError
 from .table_storage_unreadable_error_code import TableStorageUnreadableErrorCode
 from .tavily_search_config import TavilySearchConfig
@@ -997,6 +1000,7 @@ from .update_password_request import UpdatePasswordRequest
 from .user import User
 from .user_metadata_type_0 import UserMetadataType0
 from .vad_options import VADOptions
+from .vector_source_storage_status import VectorSourceStorageStatus
 from .vertex_embedder_config import VertexEmbedderConfig
 from .vertex_embedder_config_provider import VertexEmbedderConfigProvider
 from .vertex_generator_config import VertexGeneratorConfig
@@ -1173,6 +1177,7 @@ __all__ = (
     "DataShapeKind",
     "DateRangeStringQuery",
     "DeleteArtifactEnrichmentResponse201",
+    "DenseNativeStoragePhase",
     "DenseRepairBackpressureError",
     "DenseRepairBackpressureErrorCode",
     "DenseVectorPublicationStatus",
@@ -1930,6 +1935,8 @@ __all__ = (
     "TableStatistics",
     "TableStatisticsFieldStats",
     "TableStatus",
+    "TableStorageSettings",
+    "TableStorageSettingsDenseEmbeddings",
     "TableStorageUnreadableError",
     "TableStorageUnreadableErrorCode",
     "TavilySearchConfig",
@@ -2003,6 +2010,7 @@ __all__ = (
     "User",
     "UserMetadataType0",
     "VADOptions",
+    "VectorSourceStorageStatus",
     "VertexEmbedderConfig",
     "VertexEmbedderConfigProvider",
     "VertexGeneratorConfig",

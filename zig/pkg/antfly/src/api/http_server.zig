@@ -5398,6 +5398,8 @@ pub const ApiHttpServer = struct {
                 .replay_applied_sequence = index.replay_applied_sequence,
                 .replay_target_sequence = index.replay_target_sequence,
                 .replay_catch_up_required = index.replay_catch_up_required,
+                .dense_vector_projection_pending = index.dense_vector_projection_pending,
+                .dense_native_storage_phase = index.dense_native_storage_phase,
                 // Metadata already applied its incarnation-scoped TTL cache
                 // before producing this report. Preserve the observation bit
                 // and ordering token together; dropping either makes the API
@@ -5722,7 +5724,18 @@ pub const ApiHttpServer = struct {
             // backfill and turns a supposedly best-effort field into an
             // unbounded GET /tables stall.
             .lsm = liveLsmStorageStatusFromRuntimeStatuses(local_statuses.items),
+            .source_vectors = liveSourceVectorStatus(local_statuses.items),
         };
+    }
+
+    fn liveSourceVectorStatus(statuses: []const runtime_status.LocalTableRuntimeStatus) ?@import("../storage/artifact_payload.zig").Stats {
+        // Source mode is admitted only for one shard. Read its resident-owner
+        // observation; do not open files or trigger maintenance from status.
+        for (statuses) |status| {
+            if (!runtime_status.statusRuntimeFresh(status)) continue;
+            if (status.source_vectors) |source| return source;
+        }
+        return null;
     }
 
     fn liveLsmStorageStatusFromRuntimeStatuses(
@@ -14925,6 +14938,7 @@ pub const ApiHttpServer = struct {
         self.source.createTable(self.alloc, table_name, request) catch |err| return switch (err) {
             error.TableAlreadyExists => try contextual_operations.textAlloc(self.alloc, 409, "table already exists"),
             error.InvalidCreateTableRequest, error.InvalidTableName => try contextual_operations.textAlloc(self.alloc, 400, "invalid table configuration"),
+            error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => try contextual_operations.textAlloc(self.alloc, 400, "vector_store requires a fresh local single-shard standalone table without replication"),
             error.CreateTableShardCountOutOfRange => try contextual_operations.textAlloc(self.alloc, 400, tables_api.table_initial_ranges_error_message),
             error.CreateTableRequestTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "create table request too large"),
             error.TableTopologyProtocolUpgradeRequired => try contextualRetryableTextResponse(self.alloc, 503, "metadata cluster upgrade in progress; retry later"),
@@ -39337,6 +39351,7 @@ test "remote runtime status reports replay debt separately from active catch-up"
             .lifecycle_work_class = .repair,
             .repair_status = .waiting,
             .repair_active_generation_serviceable = false,
+            .dense_vector_projection_pending = true,
             .embedding_activity_observed = true,
             .embedding_activity = .{
                 .epoch = 7,
@@ -39357,6 +39372,7 @@ test "remote runtime status reports replay debt separately from active catch-up"
     try std.testing.expectEqual(true, index.replay_catch_up_required);
     try std.testing.expectEqual(db_mod.types.IndexRepairStatus.waiting, index.index_repair_status.?);
     try std.testing.expect(!index.index_repair_active_generation_serviceable);
+    try std.testing.expect(index.dense_vector_projection_pending);
     try std.testing.expectEqual(false, index.catch_up_active);
     try std.testing.expectEqual(@as(u64, 225), index.catch_up_applied_sequence);
     try std.testing.expectEqual(@as(u64, 300), index.catch_up_target_sequence);
@@ -43539,7 +43555,7 @@ test "api http server restore metadata spec uses range-scoped restore intent" {
     try std.testing.expectEqualStrings(shards[0].artifact_sha256, spec.ranges[0].restore_artifact_sha256);
 }
 
-test "distributed restore binds Go portable artifact bytes before metadata publication" {
+test "distributed restore verifies Go portable artifact bytes before metadata publication" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -43550,7 +43566,7 @@ test "distributed restore binds Go portable artifact bytes before metadata publi
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{
         .sub_path = metadata_path,
         .data =
-        \\{"version":1,"format":"portable","table":{"name":"docs","shards":{"1":{"byte_range":["",""]}}}}
+        \\{"version":2,"format":"portable","artifacts":[{"name":"go-cluster-1.afb","size_bytes":17,"sha256":"2042f5c3b5166c9f5cca6eb5c16a9d84c0df1dc673088ebe971e5f20e0e326a6"}],"table":{"name":"docs","shards":{"1":{"byte_range":["",""]}}}}
         ,
     });
     const artifact_path = try std.fmt.allocPrint(alloc, "{s}/go-cluster-1.afb", .{root});
@@ -43568,7 +43584,7 @@ test "distributed restore binds Go portable artifact bytes before metadata publi
         "go-cluster",
     );
     defer manifest.deinit(alloc);
-    try std.testing.expectEqual(backups_api.ArtifactIntegrityMode.derive_after_materialization, manifest.artifact_integrity_mode);
+    try std.testing.expectEqual(backups_api.ArtifactIntegrityMode.declared, manifest.artifact_integrity_mode);
 
     const Fake = struct {
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
@@ -43591,6 +43607,17 @@ test "distributed restore binds Go portable artifact bytes before metadata publi
     try std.testing.expectEqual(backups_api.ArtifactIntegrityMode.declared, manifest.artifact_integrity_mode);
     try std.testing.expectEqual(@as(u64, "portable-artifact".len), manifest.shards[0].artifact_size_bytes);
     try std.testing.expectEqual(@as(usize, 64), manifest.shards[0].artifact_sha256.len);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = artifact_path,
+        .data = "corrupt!-artifact",
+    });
+    try std.testing.expectError(error.BackupArtifactIntegrityMismatch, server.admitExternalRestoreArtifactIntegrity(
+        std.testing.io,
+        std.testing.io,
+        &location,
+        &manifest,
+        null,
+    ));
 }
 
 test "owned restore verifies declared artifact identity instead of accepting staged bytes" {
