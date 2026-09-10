@@ -15684,7 +15684,7 @@ pub const ApiHttpServer = struct {
             error.RerankRateLimited => try contextualQueryDependencyErrorResponse(self.alloc, 429, "reranker_rate_limited", "reranker rate limited", true),
             error.RerankTransientFailure => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .reranker_temporarily_unavailable),
             error.RerankUpstreamFailure => try contextualQueryDependencyErrorResponse(self.alloc, 502, "reranker_upstream_failure", "reranker provider failed", false),
-            error.Timeout => try contextualQueryDependencyErrorResponse(self.alloc, 504, "query_timeout", "query timed out", true),
+            error.Timeout, error.DeadlineExceeded => try contextualQueryDependencyErrorResponse(self.alloc, 504, "query_timeout", "query timed out", true),
             error.Cancelled, error.Canceled => try contextual_operations.textAlloc(self.alloc, 499, "client closed request"),
             error.NotFound, error.TableNotFound => try contextual_operations.textAlloc(self.alloc, 404, "not found"),
             error.ModelNotFound => contextual_operations.json(try self.alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}"), false),
@@ -35273,6 +35273,19 @@ test "shared application admission covers MCP query and write operations" {
     try std.testing.expectEqualStrings("write capacity exhausted", write.body);
     try std.testing.expectEqual(@as(u64, 3), server.queryAdmissionStats().rejected_total);
     try std.testing.expectEqual(@as(u64, 1), server.writeAdmissionStats().rejected_total);
+}
+
+test "system catalog query binding deadline maps to gateway timeout" {
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, .{ .ptr = undefined, .vtable = &.{ .status = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.UnexpectedStatusRead;
+        }
+    }.status } }, null, null);
+    defer server.deinit();
+    var response = try server.publicQueryOperationErrorResponse("docs", "{}", error.DeadlineExceeded);
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 504), response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "query_timeout") != null);
 }
 
 test "api http server maps cancelled NDJSON multi-query to client closed response" {

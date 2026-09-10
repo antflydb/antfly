@@ -2285,7 +2285,7 @@ pub fn build(b: *std.Build) void {
     const system_catalog_api_step = b.step("antfly-system-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
     system_catalog_api_step.dependOn(&b.addRunArtifact(system_catalog_api_tests).step);
     const system_catalog_bench = b.addExecutable(.{
-        .name = "system-catalog-bench",
+        .name = "antfly-system-catalog-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("pkg/antfly/benchmarks/system_catalog.zig"),
             .target = target,
@@ -5134,6 +5134,7 @@ pub fn build(b: *std.Build) void {
         "data raft batch forwarding bounds routing campaigns deadlines and deterministic fallback",
         "internal batch forwarding headers are all-or-none and strictly parsed",
         "metadata http client shares deadline and cancellation across retries",
+        "system catalog remote reads survive elections without skipping peers or extending budgets",
         "metadata capability client distinguishes advertised routing from N-1 absence",
         "data server wires configured HA executors into API server",
         "data server mirrors managed primary writes into HA replication log",

@@ -20791,32 +20791,45 @@ const RemoteMetadataSource = struct {
             budget_ns = @min(budget_ns, deadline -| now);
         }
         const deadline = started +| budget_ns;
-        var last_err: anyerror = error.MissingMetadataApi;
-        for (0..self.base_uris.len) |attempt| {
+        // Pin the endpoint order for each pass. Concurrent successful calls
+        // may change affinity, but must not cause this read to skip a peer.
+        while (true) {
+            const first = self.metadataApiIndexForAttempt(0);
+            var terminal_error: ?anyerror = null;
+            for (0..self.base_uris.len) |attempt| {
+                try request.ensureActive();
+                const remaining_ns = deadline -| self.awakeNs();
+                if (remaining_ns == 0) return error.DeadlineExceeded;
+                const index = (first + attempt) % self.base_uris.len;
+                var client = self.metadataClient(alloc);
+                var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(request.cancellation);
+                const read = client.readSystemCatalog(self.base_uris[index], input, @intCast(@max(1, remaining_ns / std.time.ns_per_ms)), &cancellation) catch |err| {
+                    switch (err) {
+                        error.InvalidCatalogName, error.CatalogNotFound, error.CatalogGenerationChanged, error.CatalogCommandTooLarge, error.OutOfMemory, error.Cancelled, error.Canceled => return err,
+                        else => {
+                            if (!antfly.metadata.authority.isRetryableError(err) and
+                                !isRetryableControlPlaneTransportError(err) and err != error.RemoteUnavailable)
+                                terminal_error = err;
+                            continue;
+                        },
+                    }
+                };
+                self.acceptMetadataIdentity(read.metadata_group_id, read.metadata_incarnation) catch |err| {
+                    read.deinit(alloc);
+                    terminal_error = err;
+                    continue;
+                };
+                self.noteMetadataAuthoritySuccess(index);
+                return read.body;
+            }
+            if (terminal_error) |err| return err;
+            // Reads can safely cross an election, unlike ambiguous mutations.
+            // Keep one absolute budget and a short cancellation-bounded pause.
             try request.ensureActive();
             const remaining_ns = deadline -| self.awakeNs();
             if (remaining_ns == 0) return error.DeadlineExceeded;
-            const index = self.metadataApiIndexForAttempt(attempt);
-            var client = self.metadataClient(alloc);
-            var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(request.cancellation);
-            const read = client.readSystemCatalog(self.base_uris[index], input, @intCast(@max(1, remaining_ns / std.time.ns_per_ms)), &cancellation) catch |err| {
-                switch (err) {
-                    error.InvalidCatalogName, error.CatalogNotFound, error.CatalogGenerationChanged, error.CatalogCommandTooLarge, error.OutOfMemory => return err,
-                    else => {
-                        last_err = err;
-                        continue;
-                    },
-                }
-            };
-            self.acceptMetadataIdentity(read.metadata_group_id, read.metadata_incarnation) catch |err| {
-                read.deinit(alloc);
-                last_err = err;
-                continue;
-            };
-            self.noteMetadataAuthoritySuccess(index);
-            return read.body;
+            try self.io.sleep(.fromNanoseconds(@intCast(@min(remaining_ns, 10 * std.time.ns_per_ms))), .awake);
         }
-        return last_err;
     }
 
     fn remoteSystemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.public_api.operation.RequestContext, input: @import("../system_catalog/domain.zig").Call) ![]u8 {
@@ -40100,6 +40113,57 @@ test "data runtime background maintenance is due for dense posting cadence witho
     try std.testing.expect(server.backgroundMaintenanceDue(100));
     try std.testing.expect(server.backgroundMaintenanceDue(101));
     try std.testing.expect(!server.backgroundMaintenanceDue(99));
+}
+
+test "system catalog remote reads survive elections without skipping peers or extending budgets" {
+    const alloc = std.testing.allocator;
+    const Http = antfly.common.http;
+    const Fake = struct {
+        source: ?*RemoteMetadataSource = null,
+        calls: usize = 0,
+        unavailable: usize = 3,
+        status: u16 = 200,
+        cancel: ?*antfly.raft.transport.http_common.RequestCancellation = null,
+
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: Http.HttpRequest) !Http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const expected = [_][]const u8{ "http://one.invalid/", "http://two.invalid/", "http://three.invalid/", "http://two.invalid/" };
+            if (self.source) |source| {
+                try std.testing.expect(std.mem.startsWith(u8, request.uri, expected[self.calls]));
+                if (self.calls == 0) source.noteMetadataAuthoritySuccess(1);
+            }
+            self.calls += 1;
+            if (self.cancel) |signal| signal.cancel();
+            if (self.calls <= self.unavailable) return .{ .status = 503 };
+            if (self.status != 200) return .{ .status = self.status };
+            const headers = try a.alloc(Http.Header, 2);
+            headers[0] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-group"), .value = try a.dupe(u8, "9") };
+            headers[1] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-incarnation"), .value = try a.dupe(u8, "11111111111111111111111111111111") };
+            return .{ .status = 200, .headers = headers, .body = try a.dupe(u8, "null") };
+        }
+    };
+    var fake = Fake{};
+    var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{ "http://one.invalid", "http://two.invalid", "http://three.invalid" }, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, std.testing.io);
+    defer source.deinit();
+    fake.source = &source;
+    const body = try source.readSystemCatalog(alloc, .{}, .{ .resolve = .{ .table = "docs" } });
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings("null", body);
+    try std.testing.expectEqual(@as(usize, 4), fake.calls);
+
+    // A generation conflict cannot restart binding against a new revision.
+    fake = .{ .unavailable = 0, .status = 409 };
+    try std.testing.expectError(error.CatalogGenerationChanged, source.readSystemCatalog(alloc, .{}, .snapshot));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+
+    fake = .{ .unavailable = std.math.maxInt(usize) };
+    try std.testing.expectError(error.DeadlineExceeded, source.readSystemCatalog(alloc, .{ .deadline_ns = platform_time.monotonicNs() +| 20 * std.time.ns_per_ms }, .snapshot));
+    try std.testing.expect(fake.calls > 0);
+
+    var cancellation = antfly.raft.transport.http_common.RequestCancellation{};
+    fake = .{ .unavailable = std.math.maxInt(usize), .cancel = &cancellation };
+    try std.testing.expectError(error.Canceled, source.readSystemCatalog(alloc, .{ .cancellation = cancellation.token() }, .snapshot));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }
 
 test "remote metadata source pins one cluster incarnation across cache invalidation" {

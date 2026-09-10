@@ -30,8 +30,8 @@ import math
 import platform
 import statistics
 import sys
-import time
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -40,9 +40,9 @@ import requests
 
 ZIG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ZIG_ROOT / "e2e" / "antfly"))
-from conftest import StandaloneAntflyServer, antfly_public_api_url  # noqa: E402
-from test_resolution import DOCUMENTS_INDEXES  # noqa: E402
-from test_scaling import MultiNodeScalingCluster  # noqa: E402
+from conftest import StandaloneAntflyServer, antfly_public_api_url
+from test_resolution import DOCUMENTS_INDEXES
+from test_scaling import MultiNodeScalingCluster
 
 
 def positive(value: str) -> int:
@@ -199,6 +199,17 @@ def catalog_scenario(args, binary: Path) -> dict:
                     "sync_level": "full_index",
                 },
             )
+            # A stable second table models enriching events with a customer
+            # record and exercises binding distinct join destinations.
+            if count > 1:
+                api.request(
+                    "POST",
+                    scope + "/tables/events_0/batch",
+                    {
+                        "inserts": {"doc": {"body": "customer benchmark"}},
+                        "sync_level": "full_index",
+                    },
+                )
             target = {"database": "benchmark", "namespace": "serving", "table": table}
             query = {
                 "table_target": target,
@@ -208,26 +219,33 @@ def catalog_scenario(args, binary: Path) -> dict:
             joined = {
                 **query,
                 "join": {
-                    "right_target": target,
+                    "right_target": {**target, "table": "events_0"},
                     "on": {"left_field": "customer_id", "right_field": "_id"},
                     "right_fields": ["body"],
                 },
             }
             wire = "\n".join(json.dumps(query) for _ in range(args.ndjson_lines)) + "\n"
 
-            def lookup():
+            def lookup(path=path):
                 value = api.request("GET", path + "/documents/doc")
                 if value.get("body") != "catalog benchmark":
                     raise RuntimeError(f"lookup mismatch: {value}")
 
-            def run_query(body):
+            def run_query(body, count=count):
                 value = api.request(
                     "POST", "/query", json.dumps(body) + "\n", ndjson=True
                 )[0]
                 if len(value["responses"][0]["hits"]["hits"]) != 1:
                     raise RuntimeError(f"query count mismatch: {value}")
+                if "join" in body and count > 1:
+                    source = value["responses"][0]["hits"]["hits"][0]["_source"]
+                    if (
+                        source.get("benchmark.serving.events_0.body")
+                        != "customer benchmark"
+                    ):
+                        raise RuntimeError(f"join result mismatch: {source}")
 
-            def run_ndjson():
+            def run_ndjson(wire=wire):
                 responses = api.request("POST", "/query", wire, ndjson=True)
                 rows = [row for envelope in responses for row in envelope["responses"]]
                 if len(rows) != args.ndjson_lines or any(
@@ -235,29 +253,29 @@ def catalog_scenario(args, binary: Path) -> dict:
                 ):
                     raise RuntimeError("NDJSON response count mismatch")
 
-            def listing():
+            def listing(count=count):
                 rows = api.request("GET", scope + "/tables?prefix=events_")
                 if len(rows) != count:
                     raise RuntimeError(f"listing count mismatch: {len(rows)}/{count}")
 
             operations = {
                 "qualified_lookup": lookup,
-                "qualified_query": lambda: run_query(query),
-                "qualified_join": lambda: run_query(joined),
+                "qualified_query": lambda query=query: run_query(query),
+                "qualified_join": lambda joined=joined: run_query(joined),
                 "ndjson_repeated_target": run_ndjson,
                 "scoped_listing": listing,
             }
-            measured = {
-                name: api.measure(fn, args.samples, args.warmup)
-                for name, fn in operations.items()
-            }
+            measured = {}
+            for name, fn in operations.items():
+                print(f"catalog: {count} tables, {name}", file=sys.stderr)
+                measured[name] = api.measure(fn, args.samples, args.warmup)
             measured["concurrent_qualified_lookup"] = concurrent_lookups(
                 api.base, path + "/documents/doc", args
             )
             identity = api.request("GET", path)["table_id"]
             current = [table]
 
-            def rename():
+            def rename(table=table, current=current):
                 name = table + "_renamed" if current[0] == table else table
                 api.request(
                     "POST", f"{scope}/tables/{current[0]}/rename", {"name": name}
@@ -393,14 +411,16 @@ def resolution_scenario(args, binary: Path) -> dict:
                     "write_to_hydrated_graph": summary(latencies),
                     "readiness_poll_counts": polls,
                     "graph_topology_only": api.measure(
-                        lambda: api.request(
+                        lambda graph_only=graph_only: api.request(
                             "POST", "/tables/documents/query", graph_only
                         ),
                         args.samples,
                         args.warmup,
                     ),
                     "graph_with_documents": api.measure(
-                        lambda: api.request("POST", "/tables/documents/query", query),
+                        lambda query=query: api.request(
+                            "POST", "/tables/documents/query", query
+                        ),
                         args.samples,
                         args.warmup,
                     ),
