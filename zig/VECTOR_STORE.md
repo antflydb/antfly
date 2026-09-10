@@ -27,18 +27,49 @@ can use stale classifications. All-live verification skips density work unless a
 post-cut preparation prevents the fast path. Final copy planning uses direct
 reader indices, but copy-set construction and sorting still run under the lock.
 
-The [new qualification ledger](../.benchmark-results/vector-store-planning-targets-v2/README.md)
-records separate planner and sparse-policy comparisons. Qualification is in
-progress; neither setting is promoted. Density visits contribute to marking
-counters in the treatment, so compare marking plus planning rather than treating
-a lower planning counter alone as less work. The preceding results below apply
-to the earlier, more eager sparse policy and remain preserved.
+The [qualification ledger](../.benchmark-results/vector-store-planning-targets-v2/RESULTS.md)
+records eight fresh 50K arms, separately comparing the planner and sparse policy
+in A/B then B/A order. Source/native tests in default and combined modes, 13 cache
+tests, 10 API checks, eight reclamation checks and four independent inventories
+passed. Neither source setting is promoted; this follow-up has not run at 1M.
+
+| 50K comparison | Ready time | Mixed writes/s | Mixed p99 | Fixed churn time | Sampled physical footprint |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Bounded planner versus compact bitmap control | -3.9% | -0.1% | +2.9% | -3.0% | +20.5% |
+| Sparse-only batches versus matched debt scheduler | -7.0% | -3.6% | +2.0% | +1.0% | +32.6% |
+
+These are median paired observations on the available host. Planner churn
+intervals reduce locked planning about 94% and total source-lock time about 34%.
+Density visits contribute to marking counters in the treatment; marking plus
+planning falls about 16.5%, with different layouts and copy volumes between arms.
+Sparse-only fallback still allows extra copying during foreground work when only
+sparse garbage exists. Separate foreground and idle copy budgets remain future
+work. Copy-set construction and sorting also remain locked.
+
+A [matched-input cleanup check](../.benchmark-results/vector-store-planning-targets-v2/matched-planning/RESULTS.md)
+holds 64 MiB sparse batching constant and changes only bounded planning. Four
+clones of the same saved database retain exactly 50,000 payloads and copy exactly
+15,490,108 bytes in two collections. Median paired source-lock time falls 16.9%,
+but marking plus planning rises 5.5%; settling remains about 8.44 seconds. This
+confirms less locked work, without a cleanup-throughput win on that layout.
+
+Nine query rejections at concurrency 30 occurred across three fresh arms: planner
+pair-1 control and both sparse pair-2 arms. Successful lifecycle gates do not make
+those runs error-free performance qualifications. The memory/foreground tradeoffs
+and query rejections gate default promotion, combined foreground qualification,
+and the next 1M run. Earlier results below describe the prior sparse policy and
+remain preserved.
 
 The first current-integration control exposed a separate cold-restart cost in
 ANN metadata admission. CLOCK removal already swap-compacts its slots, but
 insertion still scanned the full array for holes. That obsolete scan is removed
 in the common control/candidate baseline. The sampled control and its cold
 restart result remain diagnostic evidence, excluded from the fresh comparison.
+A separate [same-data cache replay](../.benchmark-results/vector-store-planning-targets-v2/cache-replay/RESULTS.md)
+compares the old and corrected binaries in ABBA order: mean query latency falls
+about 65% with identical hits, scores and distances. Each process receives ten
+warmup queries followed by 100 measured queries; this is not an OS-cache-flushed
+cold benchmark. This cache gain is separate from the source-store treatments.
 
 ## Bitmap locator and sparse reclamation follow-up
 
@@ -110,11 +141,10 @@ counter intervals are unavailable. All four ordinary 1M idle drains settle in
 matched 50K diagnostic.
 
 Keep both settings opt-in. These results motivated sparse batching only
-when no denser reclaimable work is selected, with separate foreground and idle
-copy budgets. This would target the proven sparse-only cleanup case without
-opportunistically adding cold-segment copying to useful dense work. The follow-up implementation and its separate qualification are recorded above.
-For the locator, bounded metadata planning and snapshot-safe segment liveness
-summaries are evaluated before combining treatments. All twenty timed 50K/1M arms, twenty
+when no denser reclaimable work is selected, plus bounded metadata planning with
+snapshot-safe segment liveness summaries. The follow-up implementation and its
+separate qualification are recorded above. Separate foreground and idle copy
+budgets remain unimplemented; combined foreground use is not yet qualified. All twenty timed 50K/1M arms, twenty
 reclamation checks, ten independent inventories, and four matched-layout runs
 passed; the frozen runtime and harness identities remain pinned in the ledger.
 
