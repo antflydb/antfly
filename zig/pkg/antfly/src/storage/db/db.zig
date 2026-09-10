@@ -7248,6 +7248,12 @@ pub const DB = struct {
         const range: types.ByteRange = .{ .start = start, .end = end };
         const range_value = try range_state_mod.encodeRangeAlloc(self.alloc, range);
         defer self.alloc.free(range_value);
+        // Private graph stores/counters do not inherit the primary range
+        // filter. Retire split-off source topology (including reverse edges
+        // and metric dependency epochs) before persisting the Raft receipt.
+        // Pruning is bounded, durable, and replayable: a failed page must leave
+        // this entry unapplied so retry can finish the remaining ownership work.
+        try self.core.index_manager.pruneGraphSplitRange(transition.split_key, current.end);
         var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
         try rebaseRangeCoverageMetadata(self.alloc, self.core.store, self.core.index_manager, range, &.{
             .{ .key = range_state_mod.range_key, .value = range_value },
