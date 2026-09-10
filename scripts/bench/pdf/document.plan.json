@@ -1,0 +1,52 @@
+{
+  "schema": "antfly.pdf.qualification_plan.v1",
+  "artifacts": {
+    "binary": "${binary}",
+    "models": "${models}",
+    "corpus": "${work_dir}/corpus.json"
+  },
+  "limitations": [
+    "The existing document harness currently pins Florence/BGE and Metal; this is not a universal PDF model gate.",
+    "Model directory must match WORK_DIR/models used by the existing harness.",
+    "Profiled reuse/admission diagnostics are separate from unprofiled completed-indexing performance."
+  ],
+  "gates": [
+    {
+      "id": "pdf-reuse-pressure",
+      "layer": "document",
+      "kind": "hardware",
+      "scope": "Real remote-PDF completed indexing, exact retained content/page/vector parity, physical render reuse and tracked admission at two memory caps across precommit/replay.",
+      "artifacts": [
+        "binary",
+        "models",
+        "corpus"
+      ],
+      "command": [
+        "${python}",
+        "${repo}/scripts/bench/pdf/qualify_documents.py",
+        "--binary",
+        "${binary}",
+        "--revision",
+        "${revision}",
+        "--work-dir",
+        "${work_dir}",
+        "--circus-dir",
+        "${circus_dir}",
+        "--name",
+        "${name}-reuse",
+        "--output",
+        "${run}/document",
+        "--suite",
+        "text",
+        "--trials",
+        "2"
+      ],
+      "report": {
+        "path": "${run}/document/summary.json",
+        "schema": "antfly.pdf.document_qualification.v1",
+        "pass_field": "pass"
+      },
+      "timeout_seconds": 3600
+    }
+  ]
+}

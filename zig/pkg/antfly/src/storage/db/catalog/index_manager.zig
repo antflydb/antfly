@@ -7354,11 +7354,14 @@ pub const IndexManager = struct {
             if (!std.mem.eql(u8, entry.resolution_artifact, cfg.resolution_artifact)) return error.ResolverArtifactImmutable;
             if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, cfg.name)) return error.ResolverArtifactAlreadyExists;
             const material_changed = resolverMaterialConfigChanged(entry.*, cfg);
-            var replacement = try resolver_catalog.ResolverConfig.clone(self.alloc, cfg);
-            errdefer replacement.deinit(self.alloc);
-            entry.deinit(self.alloc);
-            entry.* = replacement;
-            try self.persistResolverCatalog(store, if (material_changed) .mark_reresolve_dirty else .catalog_only);
+            var previous = entry.*;
+            entry.* = try resolver_catalog.ResolverConfig.clone(self.alloc, cfg);
+            self.persistResolverCatalog(store, if (material_changed) .mark_reresolve_dirty else .catalog_only) catch |err| {
+                entry.deinit(self.alloc);
+                entry.* = previous;
+                return err;
+            };
+            previous.deinit(self.alloc);
             return if (material_changed) .updated_backfill_required else .updated_no_backfill;
         }
         if (self.resolverResolutionArtifactInUse(cfg.resolution_artifact, null)) return error.ResolverArtifactAlreadyExists;
@@ -7374,9 +7377,12 @@ pub const IndexManager = struct {
         defer self.catalog_mutex.unlockExclusive();
         for (self.resolvers.items, 0..) |*entry, i| {
             if (!std.mem.eql(u8, entry.name, name)) continue;
-            entry.deinit(self.alloc);
-            _ = self.resolvers.orderedRemove(i);
-            try self.persistResolverCatalog(store, .catalog_only);
+            var removed = self.resolvers.orderedRemove(i);
+            self.persistResolverCatalog(store, .catalog_only) catch |err| {
+                self.resolvers.insertAssumeCapacity(i, removed);
+                return err;
+            };
+            removed.deinit(self.alloc);
             return true;
         }
         return false;
@@ -14691,14 +14697,8 @@ pub const IndexManager = struct {
         errdefer txn.abort();
         try txn.put(resolver_catalog_key, data);
         if (mode == .mark_reresolve_dirty) {
-            _ = txn.get(resolver_catalog.reresolve_resume_key) catch |err| switch (err) {
-                error.NotFound => try txn.put(resolver_catalog.reresolve_resume_key, ""),
-                else => return err,
-            };
-            _ = txn.get(resolver_catalog.reresolve_repair_resume_key) catch |err| switch (err) {
-                error.NotFound => try txn.put(resolver_catalog.reresolve_repair_resume_key, ""),
-                else => return err,
-            };
+            try txn.put(resolver_catalog.reresolve_resume_key, "");
+            try txn.put(resolver_catalog.reresolve_repair_resume_key, "");
         }
         try txn.commit();
     }
