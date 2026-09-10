@@ -55,6 +55,37 @@ its readiness, maintenance-cycle, query, and restart checks and takes about
 Linux reproduction and soak results are recorded in the
 [E2E history](e2e/FLAKES.md#completed-cli-readiness-regresses-after-publication-696).
 
+## Coverage reads straddle the first atomic outcome commit (#694)
+
+The `70e0b11869` Linux soak failed the retry test's initial healthy seed once,
+before provider failures were enabled. The derived worker reported
+`InvalidDerivedCoverageCounter` at `target_advance`. Later diagnostics showed
+one posting boundary at 4 and the shared vector generation at 5, leaving
+initial readiness pending. The shared base contained two artifact families;
+its total count of two is not evidence of duplicate vectors in either index.
+
+The producer commits produced/skipped/terminal-failed counters atomically, but
+target validation read each key through a separate latest-value lookup. A
+first commit between those reads can return a missing first counter and present
+later counters, manufacturing a partial tuple that fails the worker. Outcome
+transitions and source deletion can similarly mix incompatible cardinalities.
+
+Target validation, repair certification, query admission, and status tuple
+reads now hold one MVCC read transaction. Certification reads the range-local
+source count and any legacy artifact-counter fallback through that same
+transaction. The normal path remains a fixed number of point lookups, with no
+write lock, retry loop, or corpus scan added. Legacy missing range counters
+retain their existing scan fallback, now within the same snapshot. Persisted
+partial tuples and counter overflow remain errors.
+
+The deterministic regression commits the complete outcome tuple and source
+count after the first counter is read. That call observes the old empty state;
+the next sees the complete new state. Removing a persisted counter still
+returns `InvalidDerivedCoverageCounter`. The focused dense lifecycle suite
+passes 77 checks without skips or leaks. The posting/vector lag is an observed
+consequence, not independent proof that every native publication stall has
+this cause; Linux acceptance remains required.
+
 ## Partial-source replay and stale follower restore-job observations (#694)
 
 The `70e0b11869` Linux soak also reproduced an independently seeded retry case

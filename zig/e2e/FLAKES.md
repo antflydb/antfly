@@ -57,6 +57,10 @@ Final acceptance requires **100/100 for each affected test**, using the branch
 with the native-storage main merge and all fixes, without failure retries.
 
 The follow-up Linux soak of `70e0b11869` is **not a passing acceptance run**.
+It finished **292/300 passed**: quickstart **98/100**, backup/restore **96/100**,
+and independent retry exhaustion **98/100** (the four backup non-passes include
+one fixture setup error). The final retry failure occurred during its healthy
+seed and exposed [coverage reads across an atomic commit](../FLAKES.md#coverage-reads-straddle-the-first-atomic-outcome-commit-694).
 It exposed thumbnail activation without a runtime owner observation, two
 metadata exits after slow successful WAL sync, and a seed batch with unknown
 write outcome. Failure roots and raw worker logs were retained. See the

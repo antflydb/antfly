@@ -8090,6 +8090,7 @@ pub fn build(b: *std.Build) void {
             "db online vector publication",
             "db multi-source dense target",
             "db artifact dense target prefers current incarnation outcomes over stale name counter",
+            "db dense target reads atomic outcome and source coverage snapshot",
             "index repair state root-generation reset atomically rebinds replacement debt",
             "index repair state persists through backend storage",
             "index repair state persists intent and provisional replay pin atomically",

@@ -15,12 +15,17 @@ pub fn decode(raw: []const u8) !u64 {
     return std.mem.readInt(u64, raw[0..8], .little);
 }
 
-pub fn load(alloc: Allocator, store: *docstore_mod.DocStore) !?u64 {
-    const raw = store.get(alloc, &internal_keys.range_document_count_key) catch |err| switch (err) {
+pub fn load(_: Allocator, store: *docstore_mod.DocStore) !?u64 {
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    return try loadFromTxn(&txn);
+}
+
+pub fn loadFromTxn(txn: *docstore_mod.DocStore.Txn) !?u64 {
+    const raw = txn.get(&internal_keys.range_document_count_key) catch |err| switch (err) {
         error.NotFound => return null,
         else => return err,
     };
-    defer alloc.free(raw);
     return try decode(raw);
 }
 
@@ -54,6 +59,17 @@ pub fn countPrimaryDocuments(
     store: *docstore_mod.DocStore,
     byte_range: types.ByteRange,
 ) !u64 {
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    return try countPrimaryDocumentsFromTxn(alloc, store, &txn, byte_range);
+}
+
+fn countPrimaryDocumentsFromTxn(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    txn: *docstore_mod.DocStore.Txn,
+    byte_range: types.ByteRange,
+) !u64 {
     const lower = try internal_keys.documentRangeLowerAlloc(alloc, byte_range.start);
     defer alloc.free(lower);
     const upper = if (byte_range.end.len == 0)
@@ -74,7 +90,7 @@ pub fn countPrimaryDocuments(
     };
 
     var state = CountState{};
-    try store.scanWithContext(lower, if (upper) |key| key else "", .{}, &state, CountState.scanEntry);
+    try store.scanReadTxnWithContext(txn, lower, if (upper) |key| key else "", .{}, &state, CountState.scanEntry);
     return state.count;
 }
 
@@ -83,7 +99,18 @@ pub fn loadOrCount(
     store: *docstore_mod.DocStore,
     byte_range: types.ByteRange,
 ) !u64 {
-    return (try load(alloc, store)) orelse try countPrimaryDocuments(alloc, store, byte_range);
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    return try loadOrCountFromTxn(alloc, store, &txn, byte_range);
+}
+
+pub fn loadOrCountFromTxn(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    txn: *docstore_mod.DocStore.Txn,
+    byte_range: types.ByteRange,
+) !u64 {
+    return (try loadFromTxn(txn)) orelse try countPrimaryDocumentsFromTxn(alloc, store, txn, byte_range);
 }
 
 /// Appends the range-local cardinality transition to the caller's atomic
