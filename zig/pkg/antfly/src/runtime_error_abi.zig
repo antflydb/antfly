@@ -354,6 +354,8 @@ pub const Detail = enum(c_int) {
     immutable_table_storage_settings,
     vector_store_lifecycle_unsupported,
     vector_store_reference_format_required,
+    // An ambiguous remote backup cannot authorize rollback at its caller.
+    backup_outcome_ambiguous,
 };
 
 pub const Status = extern struct {
@@ -580,6 +582,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.BackupStagingUnavailable => status(.unavailable, .backup_staging_unavailable),
         error.BackupArtifactMissing => status(.not_found, .backup_artifact_missing),
         error.BackupIntegrityMissing => status(.corrupt, .backup_integrity_missing),
+        error.BackupOutcomeAmbiguous => status(.conflict, .backup_outcome_ambiguous),
         error.BackupAttemptLeaseLost => status(.conflict, .backup_attempt_lease_lost),
         error.BackgroundOwnerClosed => status(.unavailable, .background_owner_closed),
         error.RestoreSchedulingCapacity => status(.retryable, .restore_scheduling_capacity),
@@ -900,6 +903,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .backup_staging_unavailable => "BackupStagingUnavailable",
         .backup_artifact_missing => "BackupArtifactMissing",
         .backup_integrity_missing => "BackupIntegrityMissing",
+        .backup_outcome_ambiguous => "BackupOutcomeAmbiguous",
         .backup_attempt_lease_lost => "BackupAttemptLeaseLost",
         .background_owner_closed => "BackgroundOwnerClosed",
         .restore_scheduling_capacity => "RestoreSchedulingCapacity",
@@ -1147,4 +1151,10 @@ test "generation capacity retains retryability across the runtime boundary" {
     const result = statusFromError(error.GenerationCapacityUnavailable);
     try std.testing.expectEqual(@intFromEnum(Code.retryable), result.code);
     try std.testing.expectEqual(error.GenerationCapacityUnavailable, errorFromStatus(result));
+}
+
+test "ambiguous backup outcome survives runtime transport without rollback authorization" {
+    const wire = statusFromError(error.BackupOutcomeAmbiguous);
+    try std.testing.expectEqual(@intFromEnum(Code.conflict), wire.code);
+    try std.testing.expectEqual(error.BackupOutcomeAmbiguous, errorFromStatus(wire));
 }

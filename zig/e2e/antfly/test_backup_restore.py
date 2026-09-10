@@ -711,9 +711,9 @@ class ThreeByThreeBackupCluster:
             command = self._metadata_command(i + 1)
             proc = self.port_reservations.handoff_to(
                 (self.metadata_raft_ports[i], self.metadata_admin_ports[i]),
-                lambda: subprocess.Popen(
+                lambda command=command, log_file=self.metadata_log_files[i]: subprocess.Popen(
                     debuggable_command(command),
-                    stdout=self.metadata_log_files[i],
+                    stdout=log_file,
                     stderr=subprocess.STDOUT,
                     cwd=REPO_ROOT,
                 ),
@@ -1475,8 +1475,8 @@ def test_cluster_backup_restore_round_trip(backup_api):
         )
         assert batch["inserted"] == 1
         assert wait_until(
-            lambda tn=table_name, q=title.lower(), doc_id="doc:1": _top_hit(
-                backup_api, tn, q, doc_id
+            lambda tn=table_name, title=title, doc_id="doc:1": _top_hit(
+                backup_api, tn, title.lower(), doc_id
             ),
             timeout_s=60.0,
             interval_s=1.0,
@@ -1582,201 +1582,201 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
         interval_s=0.5,
     ), cluster.debug_logs()
 
-    with tempfile.TemporaryDirectory(
-        prefix="antfly-metadata-leader-cluster-backup-"
-    ) as backup_dir:
-        backup = None
-        last_response: requests.Response | None = None
-        for _ in range(3):
-            leader_public_url = cluster.metadata_leader_public_url(timeout_s=30.0)
-            try:
-                response = session.post(
-                    f"{leader_public_url}/backup",
-                    json={
-                        "backup_id": backup_id,
-                        "location": _file_location(backup_dir),
-                        "connection": BACKUP_CONNECTION,
-                        "table_names": [table_name],
-                    },
-                    timeout=30,
-                )
-            except requests.RequestException as exc:
-                cluster.metadata_snapshots()
-                raise AssertionError(
-                    f"metadata backup request failed: {exc}\n{cluster.debug_logs()}"
-                ) from exc
-            if _is_metadata_not_leader_response(response):
-                last_response = response
-                continue
-            backup = _check_response(response)
-            break
-        assert backup is not None, (
-            f"metadata leader stayed unavailable for backup after retries; "
-            f"last_response={last_response.text if last_response is not None else None}\n{cluster.debug_logs()}"
-        )
-
-        assert backup["backup_id"] == backup_id
-        assert backup["status"] == "completed", (
-            f"backup={backup}\n{cluster.debug_logs()}"
-        )
-        assert [table["name"] for table in backup["tables"]] == [table_name]
-        table_manifests = [
-            path
-            for path in Path(backup_dir).glob("*-metadata.json")
-            if not path.name.endswith("-cluster-metadata.json")
-        ]
-        assert len(table_manifests) == 1
-        table_manifest = json.loads(table_manifests[0].read_text(encoding="utf-8"))
-        assert len(table_manifest["shards"]) == 3
-        assert len({int(shard["group_id"]) for shard in table_manifest["shards"]}) == 3
-        routed_source_groups = set()
-        for key in source_docs:
-            matching_shards = [
-                shard
-                for shard in table_manifest["shards"]
-                if key >= shard["start_key"]
-                and (shard.get("end_key") is None or key < shard["end_key"])
-            ]
-            assert len(matching_shards) == 1, (
-                f"source key {key!r} did not resolve to exactly one backup shard: "
-                f"{matching_shards!r}"
-            )
-            routed_source_groups.add(int(matching_shards[0]["group_id"]))
-        assert len(routed_source_groups) == len(source_docs), (
-            "3x3 acceptance documents must exercise a non-empty payload in every shard"
-        )
-        assert all(
-            (Path(backup_dir) / shard["snapshot_path"]).is_file()
-            for shard in table_manifest["shards"]
-        )
-
-        original_topology = cluster.table_topology(table_name)
-        assert original_topology is not None
-        original_table_id, original_group_ids = original_topology
-        assert len(original_group_ids) == 3
-
-        deleted = session.delete(f"{data_api_url}/tables/{table_name}", timeout=30)
-        deleted.raise_for_status()
-        assert deleted.status_code == 204
-        assert wait_until(
-            lambda: (
-                cluster.table_absent_on_all_metadata_nodes(
-                    table_name, original_table_id, original_group_ids
-                )
-                or None
-            ),
-            timeout_s=30.0,
-            interval_s=0.5,
-        ), f"table remained in metadata after delete\n{cluster.debug_logs()}"
-
-        restore_response = None
-        restore_coordinator_url = None
-        last_response = None
-        restore_payload = {
-            "backup_id": backup_id,
-            "location": _file_location(backup_dir),
-            "connection": BACKUP_CONNECTION,
-            "restore_mode": "fail_if_exists",
-        }
-        for _ in range(3):
-            leader_public_url = cluster.metadata_leader_public_url(timeout_s=30.0)
+    # The registered repository remains owned by the live cluster: its
+    # background reclaimer can publish a cursor even after restore completes.
+    # Cluster teardown stops every process before deleting this directory.
+    backup_dir = tempfile.mkdtemp(prefix="backup-repository-", dir=cluster.root)
+    backup = None
+    last_response: requests.Response | None = None
+    for _ in range(3):
+        leader_public_url = cluster.metadata_leader_public_url(timeout_s=30.0)
+        try:
             response = session.post(
-                f"{leader_public_url}/restore",
-                json=restore_payload,
+                f"{leader_public_url}/backup",
+                json={
+                    "backup_id": backup_id,
+                    "location": _file_location(backup_dir),
+                    "connection": BACKUP_CONNECTION,
+                    "table_names": [table_name],
+                },
                 timeout=30,
             )
-            if _is_metadata_not_leader_response(response):
-                last_response = response
-                continue
-            restore_response = response
-            restore_coordinator_url = leader_public_url
-            break
-        assert restore_response is not None, (
-            "metadata leader stayed unavailable for restore after retries; "
-            f"last_response={last_response.text if last_response is not None else None}\n"
-            f"{cluster.debug_logs()}"
-        )
-        assert restore_coordinator_url is not None
-        assert restore_response.status_code == 202, restore_response.text
-        accepted = _check_response(restore_response)
-        job_id = accepted.get("job_id")
-        assert isinstance(job_id, str) and job_id
+        except requests.RequestException as exc:
+            cluster.metadata_snapshots()
+            raise AssertionError(
+                f"metadata backup request failed: {exc}\n{cluster.debug_logs()}"
+            ) from exc
+        if _is_metadata_not_leader_response(response):
+            last_response = response
+            continue
+        backup = _check_response(response)
+        break
+    assert backup is not None, (
+        f"metadata leader stayed unavailable for backup after retries; "
+        f"last_response={last_response.text if last_response is not None else None}\n{cluster.debug_logs()}"
+    )
 
-        def terminal_restore() -> dict | None:
-            cluster.assert_processes_alive()
-            candidate_urls = [
-                restore_coordinator_url,
-                *(
-                    url
-                    for url in cluster.metadata_public_urls
-                    if url != restore_coordinator_url
-                ),
-            ]
-            for api_url in candidate_urls:
-                try:
-                    response = session.get(
-                        f"{api_url}/restore/jobs/{job_id}", timeout=1
-                    )
-                except requests.RequestException:
-                    continue
-                if response.status_code == 503:
-                    continue
-                job = _check_response(response)
-                return (
-                    job
-                    if job.get("phase") in {"succeeded", "failed", "cancelled"}
-                    else None
+    assert backup["backup_id"] == backup_id
+    assert backup["status"] == "completed", (
+        f"backup={backup}\n{cluster.debug_logs()}"
+    )
+    assert [table["name"] for table in backup["tables"]] == [table_name]
+    table_manifests = [
+        path
+        for path in Path(backup_dir).glob("*-metadata.json")
+        if not path.name.endswith("-cluster-metadata.json")
+    ]
+    assert len(table_manifests) == 1
+    table_manifest = json.loads(table_manifests[0].read_text(encoding="utf-8"))
+    assert len(table_manifest["shards"]) == 3
+    assert len({int(shard["group_id"]) for shard in table_manifest["shards"]}) == 3
+    routed_source_groups = set()
+    for key in source_docs:
+        matching_shards = [
+            shard
+            for shard in table_manifest["shards"]
+            if key >= shard["start_key"]
+            and (shard.get("end_key") is None or key < shard["end_key"])
+        ]
+        assert len(matching_shards) == 1, (
+            f"source key {key!r} did not resolve to exactly one backup shard: "
+            f"{matching_shards!r}"
+        )
+        routed_source_groups.add(int(matching_shards[0]["group_id"]))
+    assert len(routed_source_groups) == len(source_docs), (
+        "3x3 acceptance documents must exercise a non-empty payload in every shard"
+    )
+    assert all(
+        (Path(backup_dir) / shard["snapshot_path"]).is_file()
+        for shard in table_manifest["shards"]
+    )
+
+    original_topology = cluster.table_topology(table_name)
+    assert original_topology is not None
+    original_table_id, original_group_ids = original_topology
+    assert len(original_group_ids) == 3
+
+    deleted = session.delete(f"{data_api_url}/tables/{table_name}", timeout=30)
+    assert deleted.status_code == 204, f"delete={deleted.text}\n{cluster.debug_logs()}"
+    assert wait_until(
+        lambda: (
+            cluster.table_absent_on_all_metadata_nodes(
+                table_name, original_table_id, original_group_ids
+            )
+            or None
+        ),
+        timeout_s=30.0,
+        interval_s=0.5,
+    ), f"table remained in metadata after delete\n{cluster.debug_logs()}"
+
+    restore_response = None
+    restore_coordinator_url = None
+    last_response = None
+    restore_payload = {
+        "backup_id": backup_id,
+        "location": _file_location(backup_dir),
+        "connection": BACKUP_CONNECTION,
+        "restore_mode": "fail_if_exists",
+    }
+    for _ in range(3):
+        leader_public_url = cluster.metadata_leader_public_url(timeout_s=30.0)
+        response = session.post(
+            f"{leader_public_url}/restore",
+            json=restore_payload,
+            timeout=30,
+        )
+        if _is_metadata_not_leader_response(response):
+            last_response = response
+            continue
+        restore_response = response
+        restore_coordinator_url = leader_public_url
+        break
+    assert restore_response is not None, (
+        "metadata leader stayed unavailable for restore after retries; "
+        f"last_response={last_response.text if last_response is not None else None}\n"
+        f"{cluster.debug_logs()}"
+    )
+    assert restore_coordinator_url is not None
+    assert restore_response.status_code == 202, restore_response.text
+    accepted = _check_response(restore_response)
+    job_id = accepted.get("job_id")
+    assert isinstance(job_id, str) and job_id
+
+    def terminal_restore() -> dict | None:
+        cluster.assert_processes_alive()
+        candidate_urls = [
+            restore_coordinator_url,
+            *(
+                url
+                for url in cluster.metadata_public_urls
+                if url != restore_coordinator_url
+            ),
+        ]
+        for api_url in candidate_urls:
+            try:
+                response = session.get(
+                    f"{api_url}/restore/jobs/{job_id}", timeout=1
                 )
-            return None
+            except requests.RequestException:
+                continue
+            if response.status_code == 503:
+                continue
+            job = _check_response(response)
+            return (
+                job
+                if job.get("phase") in {"succeeded", "failed", "cancelled"}
+                else None
+            )
+        return None
 
-        restore_job = wait_until(terminal_restore, timeout_s=120.0, interval_s=0.1)
-        assert restore_job is not None, (
-            f"restore job {job_id} did not finish\n{cluster.debug_logs()}"
-        )
-        assert restore_job["phase"] == "succeeded", (
-            f"restore={restore_job}\n{cluster.debug_logs()}"
-        )
-        restore = restore_job["result"]
-        assert restore["status"] == "completed"
-        assert restore["committed_table_count"] == 1
-        assert restore["failed_table_count"] == 0
+    restore_job = wait_until(terminal_restore, timeout_s=120.0, interval_s=0.1)
+    assert restore_job is not None, (
+        f"restore job {job_id} did not finish\n{cluster.debug_logs()}"
+    )
+    assert restore_job["phase"] == "succeeded", (
+        f"restore={restore_job}\n{cluster.debug_logs()}"
+    )
+    restore = restore_job["result"]
+    assert restore["status"] == "completed"
+    assert restore["committed_table_count"] == 1
+    assert restore["failed_table_count"] == 0
 
-        assert wait_until(
-            lambda: cluster.table_is_fully_replicated(table_name) or None,
-            timeout_s=90.0,
-            interval_s=0.5,
-        ), f"restored table did not converge to 3x3 replication\n{cluster.debug_logs()}"
-        restored_topology = cluster.table_topology(table_name)
-        assert restored_topology is not None
-        restored_table_id, restored_group_ids = restored_topology
-        assert restored_table_id == original_table_id
-        assert len(restored_group_ids) == 3
-        assert restored_group_ids.isdisjoint(original_group_ids), (
-            "restore reused source physical Raft groups instead of allocating "
-            f"a fresh incarnation: source={original_group_ids}, restored={restored_group_ids}"
-        )
+    assert wait_until(
+        lambda: cluster.table_is_fully_replicated(table_name) or None,
+        timeout_s=90.0,
+        interval_s=0.5,
+    ), f"restored table did not converge to 3x3 replication\n{cluster.debug_logs()}"
+    restored_topology = cluster.table_topology(table_name)
+    assert restored_topology is not None
+    restored_table_id, restored_group_ids = restored_topology
+    assert restored_table_id == original_table_id
+    assert len(restored_group_ids) == 3
+    assert restored_group_ids.isdisjoint(original_group_ids), (
+        "restore reused source physical Raft groups instead of allocating "
+        f"a fresh incarnation: source={original_group_ids}, restored={restored_group_ids}"
+    )
 
-        def restored_docs_visible_from_every_data_node() -> bool | None:
-            for api_url in cluster.data_api_urls:
-                for key, expected in source_docs.items():
-                    doc = _lookup_doc_from_url(session, api_url, table_name, key)
-                    if doc is None or doc.get("title") != expected["title"]:
-                        return None
-            return True
+    def restored_docs_visible_from_every_data_node() -> bool | None:
+        for api_url in cluster.data_api_urls:
+            for key, expected in source_docs.items():
+                doc = _lookup_doc_from_url(session, api_url, table_name, key)
+                if doc is None or doc.get("title") != expected["title"]:
+                    return None
+        return True
 
-        assert wait_until(
-            restored_docs_visible_from_every_data_node,
-            timeout_s=60.0,
-            interval_s=0.5,
-        ), (
-            f"restored documents were not readable through every data node\n{cluster.debug_logs()}"
-        )
+    assert wait_until(
+        restored_docs_visible_from_every_data_node,
+        timeout_s=60.0,
+        interval_s=0.5,
+    ), (
+        f"restored documents were not readable through every data node\n{cluster.debug_logs()}"
+    )
 
-        assert wait_until(
-            lambda: cluster.restore_progress_cleared(table_name) or None,
-            timeout_s=30.0,
-            interval_s=0.25,
-        ), f"completed restore progress was not retired\n{cluster.debug_logs()}"
+    assert wait_until(
+        lambda: cluster.restore_progress_cleared(table_name) or None,
+        timeout_s=30.0,
+        interval_s=0.25,
+    ), f"completed restore progress was not retired\n{cluster.debug_logs()}"
 
 
 @pytest.mark.objectstore_integration
@@ -1807,8 +1807,8 @@ def test_cluster_backup_restore_round_trip_remote_backend(backup_api, backend: s
         )
         assert batch["inserted"] == 1
         assert wait_until(
-            lambda tn=table_name, q=title.lower(), doc_id="doc:1": _top_hit(
-                backup_api, tn, q, doc_id
+            lambda tn=table_name, title=title, doc_id="doc:1": _top_hit(
+                backup_api, tn, title.lower(), doc_id
             ),
             timeout_s=60.0,
             interval_s=1.0,
@@ -1876,8 +1876,8 @@ def test_cluster_restore_modes(backup_api):
             content=f"{title} backup source",
         )
         assert wait_until(
-            lambda tn=table_name, q=title.lower(), doc_id="doc:1": _top_hit(
-                backup_api, tn, q, doc_id
+            lambda tn=table_name, title=title, doc_id="doc:1": _top_hit(
+                backup_api, tn, title.lower(), doc_id
             ),
             timeout_s=60.0,
             interval_s=1.0,

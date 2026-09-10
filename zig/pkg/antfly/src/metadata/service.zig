@@ -20,6 +20,7 @@ const common_secrets = @import("../common/secrets.zig");
 const metadata_mod = @import("domain.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const metadata_api = @import("api.zig");
+const metadata_authority = @import("authority.zig");
 const catalog_projection_reader = @import("catalog_projection_reader.zig");
 const metadata_http_client = @import("http_client.zig");
 const raft_engine = @import("raft_engine");
@@ -11803,10 +11804,42 @@ fn syncLocalSchemaProgress(
 }
 
 fn runReplicationBackfillIfLeaseHeld(service: anytype) !bool {
-    const has_reconcile_lease = try service.ensureReconcileLease();
+    const has_reconcile_lease = service.ensureReconcileLease() catch |err| {
+        // This is scheduling admission, before any CDC work is enqueued.
+        // Losing leadership while acquiring/observing the lease closes this
+        // turn's admission; the next tick re-reads authoritative lease state.
+        // It must not terminate a healthy metadata follower.
+        if (metadata_authority.isRetryableError(err) or err == error.MetadataMutationOutcomeUnknown) return false;
+        return err;
+    };
     if (!has_reconcile_lease) return false;
     try service.runReplicationBackfillRound();
     return true;
+}
+
+test "metadata CDC scheduling defers lease authority loss before enqueue" {
+    const FakeService = struct {
+        failure: ?anyerror = error.NotLeader,
+        scheduled: usize = 0,
+        fn ensureReconcileLease(self: *@This()) !bool {
+            if (self.failure) |err| return err;
+            return true;
+        }
+        fn runReplicationBackfillRound(self: *@This()) !void {
+            self.scheduled += 1;
+        }
+    };
+    var service = FakeService{};
+    for ([_]anyerror{ error.NotLeader, error.ProposalDropped, error.MetadataMutationOutcomeUnknown }) |err| {
+        service.failure = err;
+        try std.testing.expect(!try runReplicationBackfillIfLeaseHeld(&service));
+        try std.testing.expectEqual(@as(usize, 0), service.scheduled);
+    }
+    service.failure = error.Corrupted;
+    try std.testing.expectError(error.Corrupted, runReplicationBackfillIfLeaseHeld(&service));
+    service.failure = null;
+    try std.testing.expect(try runReplicationBackfillIfLeaseHeld(&service));
+    try std.testing.expectEqual(@as(usize, 1), service.scheduled);
 }
 
 fn syncLocalRestoreProgress(

@@ -1,5 +1,31 @@
 # Zig E2E flakes
 
+## 2026-09-10: bounded coverage follow-up acceptance (#694)
+
+The `00dd1e4aef` Linux ReleaseFast executable
+(`7ef883c0c2928ece1562e62f6518b57316cd0a66628988ec59ae883ce3e3a033`)
+ran 100 of each split scenario with four workers and no failed-case retries.
+The run ended at 20:42 UTC with **294/300**, not passing acceptance:
+quickstart 99/100, 3x3 backup/restore 95/100, retry exhaustion 100/100.
+Failures: post-restart RAG resident availability, fatal restore apply conflict,
+fatal metadata `NotLeader`, backup timeout, repository teardown collision, and
+DELETE conflict. Preserved archive:
+`/private/tmp/ci694-bounded-soak-failures.tar.gz`; extracted state:
+`/private/tmp/ci694-bounded-soak-state/`.
+
+The next diagnostic run retained that runtime and used the corrected repository
+lifetime and native stack capture. It completed **57/60** backup cases. Failures
+were metadata `NotLeader`, metadata outbound Ready growth past its hard ceiling
+followed by `GroupLeaderUnavailable`, and a seed write with an unknown outcome.
+All three native stack captures succeeded. Archive:
+`/private/tmp/ci694-diagnostic-failures.tar.gz`; extracted state:
+`/private/tmp/ci694-diagnostic-state/`. These diagnostic runs are not combined
+with acceptance for subsequent production changes.
+
+Cold repair ownership, CDC scheduling admission, and backup ambiguity transport
+have deterministic regressions and fixes recorded in `../FLAKES.md`. Fresh
+100/100 acceptance for the complete implementation remains outstanding.
+
 Track intermittent failures with their original evidence, the contract being
 tested, and repeated validation. A passing soak reduces uncertainty; it does not
 establish the cause of a failure that was not reproduced locally. Keep resolved

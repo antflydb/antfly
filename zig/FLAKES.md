@@ -4,6 +4,60 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## Cold repair completion evicts its newly resident writer (#694)
+
+The `00dd1e4aef` Linux mixed soak passed 294/300; quickstart failed once
+immediately after restart with `StorageReadTemporarilyUnavailable` during RAG.
+Cold repair selected the normal writer cache and completed repair, but its
+completion cleanup tested whether a writer existed at entry rather than the
+actual admitted owner. It retired the newly installed serving DB under a
+read-compatible operation and published completion with no resident writer.
+Completion now uses `managed_owner_is_live_writer`, preserving both preexisting
+and newly promoted resident writers. Isolated restore owners still retire.
+The structural-repair regression forces every quantum through cold admission
+and immediately leases the resident DB after completion. It failed before the
+fix with `ResidentDbRetryRequired`; all 222 lifecycle checks passed after the
+fix without skips or leaks (`/private/tmp/ci694-owner-lifecycle-final.log`).
+
+## CDC scheduling authority loss and backup ambiguity transport (#694)
+
+The same soak terminated a metadata follower with `NotLeader`. CDC scheduling
+acquired its reconcile lease outside the control round's authority-error policy.
+Expected authority loss now defers scheduling before any CDC work is enqueued;
+the next tick rereads the lease. Corruption still propagates. The focused
+regression verifies no enqueue on leadership/proposal/ambiguous lease outcomes,
+then successful scheduling after recovery (1/1 passed).
+
+A separate backup timeout logged an untransportable `BackupOutcomeAmbiguous`.
+That outcome must reach the coordinator intact: only this classification
+prevents rollback of work whose remote completion is unknown. Append its stable
+runtime ABI detail and preserve its conflict class. The regression failed with
+an internal classification before the fix; all 10 error-ABI tests pass afterward.
+Neither change extends deadlines or authorizes retry of an ambiguous mutation.
+
+## Backup repository lifetime and usable bounded native diagnostics (#694)
+
+One 3x3 case completed its assertions but failed deleting its temporary backup
+repository while the running cluster's reclaimer created
+`.antfly-backup-reclaim-cursor.publish.lock`. The repository now lives below the
+cluster fixture root and is removed only after every process stops. This also
+preserves repository evidence on failure. DELETE failures include their response
+body so a future conflict is attributable.
+
+Default GDB symbol loading exhausted the 10-second capture budget on the 520 MB
+release executable. `--readnever -q -nx` retains minimal symbols/native unwinding;
+timeouts retain partial output. A live Linux attach completed in 0.29 seconds
+with thread stacks. All 73 Python harness checks and pinned Ruff checks passed.
+Fatal data apply conflicts now emit bounded group/index/term/type/digest evidence
+without document payloads; the conflict guard remains strict.
+
+These fixes are not full acceptance. The 100-per-scenario soak remains
+99/100 quickstart, 95/100 backup/restore, 100/100 retry exhaustion. A subsequent
+60-case diagnostic backup run on the old runtime passed 57/60 and exposed
+metadata authority loss, outbound Ready growth/quarantine, and an ambiguous seed
+write. The restore apply conflict and remaining request/consensus progress
+failures are still being investigated. See `e2e/FLAKES.md` for artifact paths.
+
 ## Dense reset fixture bypasses the catalog lifetime barrier (#694)
 
 [Run 34520726158, job 103018251656](https://github.com/antflydb/antfly/actions/runs/34520726158/job/103018251656?pr=694)

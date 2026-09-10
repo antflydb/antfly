@@ -48,6 +48,9 @@ def native_stack_dumps(
             result = subprocess.run(
                 [
                     "gdb",
+                    "--readnever",
+                    "-q",
+                    "-nx",
                     "-p",
                     str(proc.pid),
                     "-batch",
@@ -56,6 +59,7 @@ def native_stack_dumps(
                     "-ex",
                     "thread apply all bt 30",
                 ],
+                check=False,
                 capture_output=True,
                 text=True,
                 timeout=per_process_timeout_s,
@@ -64,7 +68,17 @@ def native_stack_dumps(
             if result.returncode != 0:
                 body += f"\n<gdb rc={result.returncode}>\n{result.stderr[-2000:]}"
             parts.append(f"[{label} pid {proc.pid}]\n{body}")
-        except Exception as exc:
+        except subprocess.TimeoutExpired as exc:
+            # Preserve any frames emitted before the deadline. Loading full
+            # release DWARF can exceed this budget before printing a frame;
+            # --readnever retains minimal symbols and native unwind tables.
+            partial = exc.stdout or b""
+            if isinstance(partial, bytes):
+                partial = partial.decode(errors="replace")
+            parts.append(
+                f"[{label} pid {proc.pid}] gdb timed out\n{partial[-250000:]}"
+            )
+        except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
             parts.append(f"[{label} pid {proc.pid}] gdb failed: {exc!r}")
     return "\n".join(parts)
 

@@ -15046,7 +15046,10 @@ pub const ProvisionedTableWriteSource = struct {
             if (result.index_repair_paused) result.had_debt = true;
             repair_handoff_publication = self.authorizeRepairHandoffOwnerPublicationBestEffort(table_name, group_id);
         }
-        self.retireCachesAfterIndexRepairCompletion(table_name, result, !use_live_owner);
+        // A cold repair can promote its DB into the normal writer cache.
+        // Completion must follow current ownership, not whether that writer
+        // was already resident when this quantum began.
+        self.retireCachesAfterIndexRepairCompletion(table_name, result, !managed_owner_is_live_writer);
         if (result.terminalDegraded()) {
             // The terminal observation was published from the final durable
             // audit above. Do not relabel it as a fresh live-writer snapshot.
@@ -47335,6 +47338,13 @@ test "structural reconcile publishes durable index repair debt once per group" {
 
             fn run(self: *@This()) void {
                 for (0..16) |_| {
+                    // Every quantum must also work after eviction. In
+                    // particular, a cold completion installs a resident
+                    // writer and must keep that same owner serving reads.
+                    self.source.clearWriteCache() catch |err| {
+                        self.err = err;
+                        return;
+                    };
                     const repair = self.source.catchUpTableGroupBestEffortWithMetadata(std.testing.allocator, 7001, "docs", .{
                         .indexes_json = self.indexes_json,
                         .identity_namespace = self.namespace,
@@ -47343,6 +47353,24 @@ test "structural reconcile publishes durable index repair debt once per group" {
                         self.err = err;
                         return;
                     };
+                    if (repair.index_repair_repaired or repair.cleared_debt) {
+                        var resident = self.source.residentDbSource().leaseGroup(
+                            std.testing.allocator,
+                            "docs",
+                            7001,
+                            self.source.visibleRootGeneration(7001),
+                            .{},
+                        ) catch |err| {
+                            self.err = err;
+                            return;
+                        };
+                        if (resident) |*lease| {
+                            lease.release(std.testing.allocator);
+                        } else {
+                            self.err = error.TestUnexpectedResult;
+                            return;
+                        }
+                    }
                     if (repair.busy) {
                         self.err = error.TestUnexpectedResult;
                         return;
