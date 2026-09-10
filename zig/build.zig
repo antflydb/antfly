@@ -346,6 +346,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     });
     vectorindex_mod.addImport("antfly_vector", vector_mod);
     vectorindex_mod.addImport("antfly_platform", platform_mod);
+    vectorindex_mod.addImport("antfly_hash", hash_mod);
     if (target.result.os.tag == .macos) {
         addMacosSdkPaths(b, vectorindex_mod, target);
         vectorindex_mod.linkFramework("Foundation", .{});
@@ -983,10 +984,40 @@ pub fn create(b: *std.Build) ?Artifacts {
 
     const lib_vectorindex_tests = b.addTest(.{
         .root_module = vectorindex_mod,
+        .filters = b.args orelse &.{},
     });
     const run_lib_vectorindex_tests = b.addRunArtifact(lib_vectorindex_tests);
     const lib_vectorindex_test_step = b.step("lib-vectorindex-test", "Run standalone lib/vectorindex tests");
     lib_vectorindex_test_step.dependOn(&run_lib_vectorindex_tests.step);
+
+    const vector_kernel_mod = b.createModule(.{ .root_source_file = b.path("lib/vector/src/quantizer.zig"), .target = target, .optimize = optimize });
+    vector_kernel_mod.addImport("protobuf", protobuf_mod);
+    const vector_kernel_tests = b.addTest(.{ .root_module = vector_kernel_mod, .filters = b.args orelse &.{} });
+    const run_vector_kernel_tests = b.addRunArtifact(vector_kernel_tests);
+    b.step("lib-vector-kernel-test", "Run standalone quantizer kernel tests (no external recall fixtures)").dependOn(&run_vector_kernel_tests.step);
+
+    const subgroup_scan_mod = b.createModule(.{ .root_source_file = b.path("tools/bench_subgroup_scan.zig"), .target = target, .optimize = optimize });
+    subgroup_scan_mod.addImport("antfly_vector", vector_mod);
+    subgroup_scan_mod.addImport("antfly_vector_index", vectorindex_mod);
+    const subgroup_scan_bench = b.addExecutable(.{ .name = "bench-subgroup-scan", .root_module = subgroup_scan_mod });
+    const install_subgroup_scan_bench = b.addInstallArtifact(subgroup_scan_bench, .{});
+    b.step("bench-subgroup-scan", "Build offline weighted selection and native range scan benchmark").dependOn(&install_subgroup_scan_bench.step);
+
+    const vector_projection_bounds_mod = b.createModule(.{
+        .root_source_file = b.path("bench/vectors/vector_projection_bounds_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    vector_projection_bounds_mod.addImport("antfly_vector", vector_mod);
+    vector_projection_bounds_mod.addImport("antfly_vector_index", vectorindex_mod);
+    vector_projection_bounds_mod.addImport("antfly_platform", platform_mod);
+    const vector_projection_bounds_bench = b.addExecutable(.{
+        .name = "vector_projection_bounds_bench",
+        .root_module = vector_projection_bounds_mod,
+    });
+    b.step("vector-projection-bounds-bench", "Build and install persisted projection bounds benchmark")
+        .dependOn(&b.addInstallArtifact(vector_projection_bounds_bench, .{}).step);
 
     const vector_cancellation_tests = b.addTest(.{
         .root_module = vector_mod,
@@ -1330,7 +1361,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     assignDefaultAggregateMaxRss(
         b,
         unit_test_step,
-        7 * 1024 * 1024 * 1024,
+        @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
         6 * 1024 * 1024 * 1024,
     );
 
@@ -1432,7 +1463,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     assignDefaultAggregateMaxRss(
         b,
         test_step,
-        7 * 1024 * 1024 * 1024,
+        @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
         6 * 1024 * 1024 * 1024,
     );
 

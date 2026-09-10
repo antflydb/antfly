@@ -23,6 +23,8 @@ The commands below preserve the former workload defaults. Replace the arguments 
 | `antfly-storage-bench` | `./zig-out/bin/batch_bench` |
 | `bench` | `./zig-out/bin/bench` |
 | `bench-tokenizer` | `./zig-out/bin/tokenizer_benchmark` |
+| `bench-subgroup-scan` | `./zig-out/bin/bench-subgroup-scan` |
+| `vector-projection-bounds-bench` | `./zig-out/bin/vector_projection_bounds_bench` |
 | `db-split-bench` | `./zig-out/bin/db_split_bench` |
 | `antfly-storage-bench` | `./zig-out/bin/storage_bench ingest --docs 5000 --dims 1536 --batch-size 500 --sync-level write --status-probe-every 1 --max-dense-lsm-run-bytes 1073741824 --max-dense-l0-runs 64 --max-status-probe-ns 500000000` |
 | `dense-profile-summary` | `./zig-out/bin/dense_profile_summary` |

@@ -10,6 +10,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.lsm_storage_status import LsmStorageStatus
+    from ..models.vector_source_storage_status import VectorSourceStorageStatus
 
 
 T = TypeVar("T", bound="StorageStatus")
@@ -19,18 +20,25 @@ T = TypeVar("T", bound="StorageStatus")
 class StorageStatus:
     """
     Attributes:
+        source_vectors (VectorSourceStorageStatus | Unset): Source vector payload counters and the last completed
+            reclamation observation. Counters reset on process reopen.
         disk_usage (int | Unset): Disk usage in bytes.
         empty (bool | Unset): Whether the table has received data.
         lsm (LsmStorageStatus | Unset): Compact LSM backend operational status. Detailed low-level counters are
             available through metrics.
     """
 
+    source_vectors: VectorSourceStorageStatus | Unset = UNSET
     disk_usage: int | Unset = UNSET
     empty: bool | Unset = UNSET
     lsm: LsmStorageStatus | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        source_vectors: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.source_vectors, Unset):
+            source_vectors = self.source_vectors.to_dict()
+
         disk_usage = self.disk_usage
 
         empty = self.empty
@@ -42,6 +50,8 @@ class StorageStatus:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if source_vectors is not UNSET:
+            field_dict["source_vectors"] = source_vectors
         if disk_usage is not UNSET:
             field_dict["disk_usage"] = disk_usage
         if empty is not UNSET:
@@ -54,8 +64,16 @@ class StorageStatus:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.lsm_storage_status import LsmStorageStatus
+        from ..models.vector_source_storage_status import VectorSourceStorageStatus
 
         d = dict(src_dict)
+        _source_vectors = d.pop("source_vectors", UNSET)
+        source_vectors: VectorSourceStorageStatus | Unset
+        if isinstance(_source_vectors, Unset):
+            source_vectors = UNSET
+        else:
+            source_vectors = VectorSourceStorageStatus.from_dict(_source_vectors)
+
         disk_usage = d.pop("disk_usage", UNSET)
 
         empty = d.pop("empty", UNSET)
@@ -68,6 +86,7 @@ class StorageStatus:
             lsm = LsmStorageStatus.from_dict(_lsm)
 
         storage_status = cls(
+            source_vectors=source_vectors,
             disk_usage=disk_usage,
             empty=empty,
             lsm=lsm,

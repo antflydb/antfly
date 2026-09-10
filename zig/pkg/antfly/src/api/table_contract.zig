@@ -37,6 +37,10 @@ pub const CreateTableRequestErrorDisposition = enum {
 pub fn classifyCreateTableRequestError(err: anyerror) CreateTableRequestErrorDisposition {
     return switch (err) {
         error.InvalidCreateTableRequest,
+        error.InvalidTableStorageSettings,
+        error.VectorStoreRequiresLocalSingleShardTable,
+        error.ImmutableTableStorageSettings,
+        error.VectorStoreRequiresEmptyTable,
         error.CreateTableShardCountOutOfRange,
         error.InvalidCreateTableSchemaRequest,
         error.TableEnrichmentsRequireArtifactEndpoint,
@@ -85,6 +89,11 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         if (schema_value != .null) try tables_api.validateCreateSchemaVersion(schema_value, false);
     }
 
+    const storage_settings = if (raw_root.get("storage")) |value|
+        try @import("../common/table_storage.zig").Settings.parse(value)
+    else
+        @import("../common/table_storage.zig").Settings{};
+
     // Use typed OpenAPI parsing for scalar fields (num_shards, description, schema,
     // replication_sources). For indexes, parse from the raw body to preserve
     // type-specific fields (external, dimension, edge_types, etc.) that the
@@ -105,6 +114,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     defer parsed.deinit();
 
     var req: tables_api.CreateTableRequest = .{};
+    req.storage = storage_settings;
     errdefer req.deinit(alloc);
 
     if (parsed.value.num_shards) |num_shards| {

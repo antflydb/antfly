@@ -385,6 +385,11 @@ jobs:
       - name: Check generated sources
         run: make zig-generated-check
 
+      - name: Compile consolidated storage benchmark contracts
+        if: needs.changes.outputs.zig_tests == 'true'
+        working-directory: zig
+        run: zig build antfly-storage-bench -Doptimize=Debug
+
       # Runtime cache checks compile registered finetune commands and execute
       # actual bounded data-tool and CPU benchmark workloads.
       - name: Test bounded-build tooling

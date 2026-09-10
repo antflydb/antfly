@@ -5399,6 +5399,8 @@ pub const ApiHttpServer = struct {
                 .replay_applied_sequence = index.replay_applied_sequence,
                 .replay_target_sequence = index.replay_target_sequence,
                 .replay_catch_up_required = index.replay_catch_up_required,
+                .dense_vector_projection_pending = index.dense_vector_projection_pending,
+                .dense_native_storage_phase = index.dense_native_storage_phase,
                 // Metadata already applied its incarnation-scoped TTL cache
                 // before producing this report. Preserve the observation bit
                 // and ordering token together; dropping either makes the API
@@ -5723,7 +5725,18 @@ pub const ApiHttpServer = struct {
             // backfill and turns a supposedly best-effort field into an
             // unbounded GET /tables stall.
             .lsm = liveLsmStorageStatusFromRuntimeStatuses(local_statuses.items),
+            .source_vectors = liveSourceVectorStatus(local_statuses.items),
         };
+    }
+
+    fn liveSourceVectorStatus(statuses: []const runtime_status.LocalTableRuntimeStatus) ?@import("../storage/artifact_payload.zig").Stats {
+        // Source mode is admitted only for one shard. Read its resident-owner
+        // observation; do not open files or trigger maintenance from status.
+        for (statuses) |status| {
+            if (!runtime_status.statusRuntimeFresh(status)) continue;
+            if (status.source_vectors) |source| return source;
+        }
+        return null;
     }
 
     fn liveLsmStorageStatusFromRuntimeStatuses(
@@ -14915,6 +14928,7 @@ pub const ApiHttpServer = struct {
         self.source.createTable(self.alloc, table_name, request) catch |err| return switch (err) {
             error.TableAlreadyExists => try contextual_operations.textAlloc(self.alloc, 409, "table already exists"),
             error.InvalidCreateTableRequest, error.InvalidTableName => try contextual_operations.textAlloc(self.alloc, 400, "invalid table configuration"),
+            error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => try contextual_operations.textAlloc(self.alloc, 400, "vector_store requires a fresh local single-shard standalone table without replication"),
             error.CreateTableShardCountOutOfRange => try contextual_operations.textAlloc(self.alloc, 400, tables_api.table_initial_ranges_error_message),
             error.CreateTableRequestTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "create table request too large"),
             error.TableTopologyProtocolUpgradeRequired => try contextualRetryableTextResponse(self.alloc, 503, "metadata cluster upgrade in progress; retry later"),
@@ -39310,6 +39324,7 @@ test "remote runtime status reports replay debt separately from active catch-up"
             .lifecycle_work_class = .repair,
             .repair_status = .waiting,
             .repair_active_generation_serviceable = false,
+            .dense_vector_projection_pending = true,
             .embedding_activity_observed = true,
             .embedding_activity = .{
                 .epoch = 7,
@@ -39330,6 +39345,7 @@ test "remote runtime status reports replay debt separately from active catch-up"
     try std.testing.expectEqual(true, index.replay_catch_up_required);
     try std.testing.expectEqual(db_mod.types.IndexRepairStatus.waiting, index.index_repair_status.?);
     try std.testing.expect(!index.index_repair_active_generation_serviceable);
+    try std.testing.expect(index.dense_vector_projection_pending);
     try std.testing.expectEqual(false, index.catch_up_active);
     try std.testing.expectEqual(@as(u64, 225), index.catch_up_applied_sequence);
     try std.testing.expectEqual(@as(u64, 300), index.catch_up_target_sequence);

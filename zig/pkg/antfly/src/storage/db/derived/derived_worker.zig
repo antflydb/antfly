@@ -121,6 +121,9 @@ pub const CatchUpOptions = struct {
     max_chunk_bytes: u64 = catch_up_max_chunk_bytes_default,
     max_items_per_window: usize = 0,
     max_windows_per_call: usize = 0,
+    /// Cooperative publication quantum; expires only between complete chunks.
+    max_call_ns: u64 = 0,
+    max_call_bytes: u64 = 0,
     estimated_dense_vector_bytes: u64 = 0,
     target_sequence: u64 = 0,
     /// Optional absolute monotonic deadline. Collection stops before opening a
@@ -247,11 +250,15 @@ pub fn catchUpIndexFromMatchingCursor(
 ) !CatchUpStats {
     var stats = CatchUpStats{};
     var completed_windows: usize = 0;
+    const call_started_ns = monotonicTimeNs();
+    var call_bytes: u64 = 0;
     while (true) {
         if (options.deadline_ns) |deadline| {
             if (monotonicTimeNs() >= deadline) return error.CatchUpDeadlineExceeded;
         }
         var builder = ReplayChunkBuilder.init(alloc, index_ref, options.resource_manager, options.max_chunk_bytes);
+        if (options.max_call_bytes != 0)
+            builder.max_chunk_bytes = @min(builder.max_chunk_bytes, options.max_call_bytes -| call_bytes);
         builder.max_items = options.max_items_per_window;
         builder.estimated_dense_vector_bytes = options.estimated_dense_vector_bytes;
         builder.target_sequence = options.target_sequence;
@@ -345,6 +352,14 @@ pub fn catchUpIndexFromMatchingCursor(
         }
         derived_types.deinitDerivedBatch(alloc, &batch);
         completed_windows += 1;
+        call_bytes +|= builder.tracked_bytes;
+        // Oversized single records retain the existing one-record progress
+        // exception, but cannot multiply it across coalesced chunks.
+        if (options.max_call_bytes != 0 and call_bytes >= options.max_call_bytes) break;
+        if (options.max_call_ns != 0) {
+            if (monotonicTimeNs() - call_started_ns >= options.max_call_ns) break;
+            if (options.resource_manager) |manager| if (manager.shouldDeferOptionalMaintenanceForForegroundTraffic()) break;
+        }
         if (options.deadline_ns) |deadline| {
             if (monotonicTimeNs() >= deadline) break;
         }
@@ -1084,6 +1099,35 @@ test "catchUpIndex can stop after bounded replay windows" {
     try std.testing.expectEqual(@as(usize, 1), hooks.begin_calls);
     try std.testing.expectEqual(@as(usize, 1), hooks.finish_calls);
     try std.testing.expectEqual(@as(usize, 1), hooks.successful_finishes);
+}
+
+test "coalesced replay byte and time quanta stop only after a complete record" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/coalesced-quanta", .{tmp.sub_path}, 0);
+    defer alloc.free(path);
+    var journal = try change_journal_mod.Journal.open(path, testInMemoryJournalOpenOptions());
+    defer journal.close();
+    for (1..4) |sequence| try appendChangeJournalRecord(&journal, alloc, .{
+        .sequence = sequence,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{.dense_vector},
+    });
+    for ([_]CatchUpOptions{
+        .{ .max_records_per_window = 1, .max_call_bytes = 1 },
+        .{ .max_records_per_window = 1, .max_call_ns = 1 },
+    }) |options| {
+        var capture = TestApplyCapture{ .alloc = alloc };
+        defer capture.deinit();
+        var sequence: u64 = 0;
+        for (1..4) |expected| {
+            const stats = try catchUpIndexWithOptions(alloc, replay_source_mod.Source.fromJournal(&journal), .{ .name = "dv_v1", .kind = .dense_vector }, sequence, &capture, testApplyCapture, options);
+            try std.testing.expectEqual(@as(u64, expected), stats.last_sequence);
+            try std.testing.expectEqual(@as(usize, 1), stats.scanned_entries);
+            sequence = stats.last_sequence;
+        }
+    }
 }
 
 test "catchUpIndex catch-up hooks fire once per replay run" {

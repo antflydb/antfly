@@ -852,7 +852,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "enrichment index status encodes worker lifecycle diagnostics",
         "compact index repair status keeps corrupt terminal state actionable",
         "data runtime report preserves compact managed repair admission state",
-        "metadata status JSON preserves compact managed repair admission state",
+        "metadata status JSON preserves compact managed index admission state",
         "catalog sources without compact routing fail closed",
         "span routing uses compact catalog snapshot when available",
         "span routing confirms eventual misses with a linearizable compact snapshot",
@@ -893,8 +893,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "managed startup catch-up advances counterless incomplete dense repair",
         "db completed partial managed admission serves and retires redundant repair",
         "db status cannot reopen a quarantined generation from an older publication certificate",
-        "db status cannot reopen managed admission after shadow build handoff",
-        "db initial replay repair cannot reopen admission during shadow reconstruction",
+        "db status retains certified canonical admission during shadow build handoff",
+        "db initial replay repair retains certified canonical admission during shadow reconstruction",
         "db empty managed index does not invent generated coverage recovery debt",
         "db repair preflight retains a canonical generation completed after scheduler selection",
         "db coverage recovery admits a published generation after its admission marker retires",
@@ -1285,6 +1285,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "created graph index response projects closed nested schemas",
         "index encoders expose graph sources once in normalized config",
         "api http client round-trips public status and internal capability routes",
+        "api http client requires explicit not-proposed marker and tracks delivery phase",
         "index activation client preserves progress and transport classifications",
         "api http retryable embedding failures provide retry guidance",
         "api http server obtains query embedding policy from resource manager",
@@ -1319,6 +1320,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http server exposes ambiguous index mutations without a replay signal",
         "routed table mutation preserves hop budget for provably unsent request",
         "api http server create index installs exact visible config and defers lagging projection",
+        "table-wide native vector work does not block an independently ready index",
         "api http server drop table observes metadata absence before local cleanup",
         "status source reports an absent linearizable read capability without failing",
         "status source rejects every partial routing capability",
@@ -2115,9 +2117,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "cache falls back to a transient handle when retention exceeds the resource envelope",
         "cache transfers existing usage when resource manager changes",
         "shared LSM cache yields to foreground aggregate admission",
+        "shared LSM resource reclaimer never waits for active accounting",
         "lsm backend resource manager throttles projected immutable state",
-        "lsm backend resource manager rejects before wal apply",
-        "derived backlog tracker accounts and releases payload bytes",
+        "lsm backend resource manager reclaims local durable state before rejecting",
+        "derived backlog tracker accounts payload and sequence ownership",
         "derived backlog tracker fails closed when sequence accounting allocation fails",
         "derived backlog tracker bounds sequence-only admission drain window",
         "hbc shared cache namespaces entries",
@@ -2129,6 +2132,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "hbc shared detached leases remain physically accounted until release",
         "hbc standalone detached leases remain physically accounted until release",
         "hbc standalone cache yields to foreground aggregate admission",
+        "hbc resource reclaimer never waits for an active cache owner",
         "hbc concurrent vector admission samples at a full steady target",
         "hbc exact-route vector admission samples outside the search epoch",
         "hbc decoded residency lease reserves a complete query and bypasses mid-query sampling",
@@ -2146,6 +2150,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "hbc vector artifact reads avoid duplicate LSM block residency only with retained vectors",
         "searchWithRequest applies filter prefix and distance bounds",
         "hbc cache reports byte usage to resource manager",
+        "hbc search charges estimated quantized scan bytes to node admission",
+        "dense search bandwidth admission is FIFO and work weighted",
+        "dense search bandwidth admission removes cancelled waiters",
         "hbc resource manager reattachment is idempotent and transfers local cache usage",
         "hbc cache shrinks to resource budget under pressure",
         "resource manager derives elastic HBC cache-class policy from pressure",
@@ -2157,11 +2164,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "classified batch chooses foreground requester when cache slice is first",
         "resource-managed mapped residency evicts cold segments and preserves hot mappings",
         "provisioned group storage derives all resource budgets",
+        "provisioned dense native authority gate is fail-closed and monotonic",
         "provisioned lsm cache is an elastic share of the node envelope",
         "provisioned HBC cache is an elastic share of the node envelope",
         "standalone resource manager derives elastic storage cache envelopes",
         "effective process memory limit preserves source and clamps explicit requests",
         "resource manager capacity source is immutable after composition",
+        "capacity percentage safety floor is capped on large volumes",
         "capacity reservation revalidation fails closed when available space falls",
         "resource manager background deferral follows slice policy",
         "budgeted allocator admits before allocation and releases exact live bytes",
@@ -2207,6 +2216,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const dense_index_lifecycle_regression_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{
+            "posting WAL capacity",
+            "native posting initial acceleration",
+            "db online vector publication",
+            "db multi-source dense target",
             "index repair state root-generation reset atomically rebinds replacement debt",
             "index repair state persists through backend storage",
             "index repair state persists intent and provisional replay pin atomically",
@@ -2247,8 +2260,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "db malformed quarantined dense config does not block healthy artifact counters",
             "db query repair gate revalidates stale debt",
             "db status cannot reopen a quarantined generation from an older publication certificate",
-            "db status cannot reopen managed admission after shadow build handoff",
-            "db initial replay repair cannot reopen admission during shadow reconstruction",
+            "db status retains certified canonical admission during shadow build handoff",
+            "db initial replay repair retains certified canonical admission during shadow reconstruction",
             "db empty managed index does not invent generated coverage recovery debt",
             "db repair preflight retains a canonical generation completed after scheduler selection",
             "db coverage recovery admits a published generation after its admission marker retires",
@@ -3879,12 +3892,41 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     docstore_test_mod.addImport("bloom", bloom_mod);
     const docstore_unit_tests = b.addTest(.{
         .root_module = docstore_test_mod,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     const run_docstore_unit_tests = b.addRunArtifact(docstore_unit_tests);
 
     const docstore_test_step = b.step("docstore-test", "Run storage/docstore unit tests");
     docstore_test_step.dependOn(&run_docstore_unit_tests.step);
 
+    const vector_payload_test_mod = makeLmdbModule(b, "pkg/antfly/src/vector_payload_store_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    vector_payload_test_mod.addImport("bloom", bloom_mod);
+    vector_payload_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
+    vector_payload_test_mod.addImport("antfly-json", json_mod);
+    vector_payload_test_mod.addImport("structlog", structlog_mod);
+    const vector_payload_tests = b.addTest(.{
+        .root_module = vector_payload_test_mod,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .filters = &.{ "source vector payloads", "vector references", "table storage settings" },
+    });
+    const run_vector_payload_tests = b.addRunArtifact(vector_payload_tests);
+    const vector_payload_test_step = b.step("vector-payload-test", "Run source vector payload ownership and recovery tests");
+    vector_payload_test_step.dependOn(&run_vector_payload_tests.step);
+    unit_test_step.dependOn(&run_vector_payload_tests.step);
+
+    const native_vector_store_test_mod = makeLmdbModule(b, "pkg/antfly/src/native_vector_store_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    native_vector_store_test_mod.addImport("bloom", bloom_mod);
+    native_vector_store_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
+    native_vector_store_test_mod.addImport("antfly-json", json_mod);
+    native_vector_store_test_mod.addImport("structlog", structlog_mod);
+    const native_vector_store_tests = b.addTest(.{
+        .root_module = native_vector_store_test_mod,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .filters = &.{ "storage.vector_block_store", "vector block", "vector WAL", "native compaction", "sealed vector", "empty vector authority", "owned staged base", "cold projection workers", "source vector payloads adaptive" },
+    });
+    const run_native_vector_store_tests = b.addRunArtifact(native_vector_store_tests);
+    const native_vector_store_test_step = b.step("vector-block-store-test", "Run native vector segment publication and recovery tests");
+    native_vector_store_test_step.dependOn(&run_native_vector_store_tests.step);
     const shard_test_mod = makeLmdbModule(b, "pkg/antfly/src/shard_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     shard_test_mod.addImport("bloom", bloom_mod);
     const shard_unit_tests = b.addTest(.{
@@ -4203,6 +4245,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const db_unit_tests = b.addTest(.{
         .root_module = db_test_mod,
+        .filters = selectTestFilters(b, &.{}),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4227,7 +4270,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "dense index manager accepts external embedding indexes without enrichments",
         "production external scorers use bounded cache-first artifact batches",
         "progressive filtered l2 traversal preserves exact top k without bound stops",
-        "flat rabitq filtered traversal advances past its initial probe wave safely",
+        "flat rabitq filtered traversal advances then stops on a certified bound",
         "sorted unique vector id subtraction handles sparse and dense exclusions",
     };
     const release_blocker_regression_tests = b.addTest(.{
@@ -4472,6 +4515,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
         &.{
             "storage.backend_adapter.",
+            "storage.artifact_payload.",
+            "storage.admission_waiter.",
+            "storage.dense_work_admission.",
+            "storage.maintenance_signal.",
+            "storage.projection_page_cache.",
+            "storage.projection_read_trace.",
+            "storage.vector_payload_store.",
+            "storage.vector_wal_view.",
             "storage.backend_conformance_test.",
             "storage.backend_erased.",
             "storage.backend_types.",
@@ -4486,6 +4537,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.docstore.",
             "storage.enrichment.",
             "storage.filesystem_capacity.",
+            "storage.generation_publication.",
             "storage.hbc_adapter.",
             "storage.hierarchy_navigation.",
             "storage.index_manager_vopr.",
@@ -4500,6 +4552,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.persistent.",
             "storage.persistent_vopr.",
             "storage.portable_backup.",
+            "storage.posting_segment_store.",
             "storage.resource_manager.",
             "storage.rowsource.",
             "storage.schema.",
@@ -4508,6 +4561,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.transactions.",
             "storage.transaction_vopr.",
             "storage.ttl.",
+            "storage.vector_block_store.",
             "storage.vopr_durable_job_lane.",
             "storage.wal.",
             "storage.wal_vopr.",
@@ -4590,7 +4644,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
-        .max_rss = 8 * 1024 * 1024 * 1024,
+        // The consolidated ReleaseFast support artifact now peaks just over
+        // 10 GiB on macOS Zig 0.16. This is a compiler scheduler reservation,
+        // not a runtime memory allowance for Antfly.
+        .max_rss = 12 * 1024 * 1024 * 1024,
     });
     unit_storage_support_tests.step.dependOn(&unit_storage_shard_audit.step);
     const run_unit_storage_support_tests = b.addRunArtifact(unit_storage_support_tests);
@@ -4615,7 +4672,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
-        .max_rss = 8 * 1024 * 1024 * 1024,
+        // The consolidated ReleaseFast engine artifact reaches about 9.1 GiB
+        // on current macOS Zig 0.16 builds. Reserve the measured envelope so
+        // the scheduler can keep independent artifacts parallel without
+        // rejecting this compiler after it crosses the stale 8 GiB estimate.
+        .max_rss = 10 * 1024 * 1024 * 1024,
     });
     unit_storage_engine_tests.step.dependOn(&unit_storage_shard_audit.step);
     const run_unit_storage_engine_tests = b.addRunArtifact(unit_storage_engine_tests);
@@ -4645,7 +4706,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
-        .max_rss = 8 * 1024 * 1024 * 1024,
+        // The consolidated ReleaseFast DB-core artifact now peaks just over
+        // 10 GiB on macOS Zig 0.16. This reserves compiler scheduling capacity;
+        // it does not raise Antfly's runtime memory budget.
+        .max_rss = 12 * 1024 * 1024 * 1024,
     });
     unit_storage_db_core_tests.step.dependOn(&unit_storage_shard_audit.step);
     const unit_storage_compile_step = b.step(
@@ -4873,7 +4937,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
                 .path = b.path("pkg/antfly/src/test_runner.zig"),
                 .mode = .simple,
             },
-            .max_rss = 8 * 1024 * 1024 * 1024,
+            // The consolidated service/HTTP lane reaches roughly 9.3 GiB on
+            // macOS Zig 0.16. This is compiler scheduling capacity, not an
+            // Antfly runtime budget; retain headroom for codegen variance.
+            .max_rss = 12 * 1024 * 1024 * 1024,
         });
     }
     const unit_metadata_compile_step = b.step(

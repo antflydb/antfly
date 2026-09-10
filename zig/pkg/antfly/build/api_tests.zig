@@ -256,10 +256,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const public_api_parity_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, public_api_parity_runtime_filters),
-        // The macOS debug root includes the complete public transport and
-        // generated-contract surface; current measured compilation peaks a
-        // little above the aggregate's generic 7 GiB scheduler claim.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
+        // The macOS debug root includes the complete public transport,
+        // generated-contract, and native-index surface. ReleaseSafe test
+        // compilation currently peaks above 13 GiB; reserve the measured
+        // envelope so the scheduler does not reject a successful compile.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -1290,6 +1291,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "publication stamps order revisions and require recovery across owners",
             "db vector status revalidates stale repair admission without a query",
             "owner publication stamps order all index kinds independently of counts and callbacks",
+            "source coverage observation is independent of artifact replay progress",
+            "retained source coverage is fenced after every publication merge",
             "target and reducing watermarks commute across every callback permutation",
             "runtime status group batches reject duplicate group ids before publication",
             "table runtime snapshot cache clones stored status",
@@ -1327,6 +1330,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "synthetic refresh preserves post-fence target facts before serving handoff",
             "table runtime snapshot cache lifecycle transition replaces and fences observations",
             "table runtime snapshot cache batch preserves newer group observations",
+            "consistent boundary publication supersedes later-reserved stale observation",
+            "table runtime snapshot cache missed refresh retains counts without renewing freshness",
             "runtime status cache stable absence removal retires the old table epoch",
             "runtime status snapshots never wait for mutable cache ownership",
             "group read payload preparation and retirement stay off the global cache mutex",
@@ -1584,6 +1589,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "managed repair visibility edges retire cached readers and runtime status",
             "repair visibility progress does not churn readers without an admission edge",
             "table runtime snapshot cache invalidation fences a stale observed publisher",
+            "maintenance runtime status preserves source observation without inventing targets",
             "targeted structural publication cannot regress an untouched sibling generation",
             "runtime status hook orders completed observation without crossing invalidation",
             "provisioned owner publication advances exact index replay target",
@@ -1629,6 +1635,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "HA seed request admission drains accepted writes and closes the preflight race",
             "startup cache clear retires dirty identity without a serving owner",
             "dirty auto bulk writer publishes runtime status without closing the cached writer",
+            "auto bulk max-window request waits for idle finish",
             "split transition auto bulk publication retries while a writer lease is active",
             "median key lookup reuses startup writer instead of reopening its root",
             "write cache retirement is allocation-free after entry installation",

@@ -520,6 +520,11 @@ const QueryBenchStats = struct {
     profile_rerank_artifact_distance_ns: u64 = 0,
     profile_rerank_lsm_cache_hits: u64 = 0,
     profile_rerank_lsm_cache_misses: u64 = 0,
+    profile_rerank_vector_projection_reads: u64 = 0,
+    profile_rerank_vector_projection_bytes: u64 = 0,
+    profile_rerank_vector_residual_reads: u64 = 0,
+    profile_rerank_vector_residual_bytes: u64 = 0,
+    profile_rerank_vector_location_reuses: u64 = 0,
     profile_rerank_artifact_cache_hits: u64 = 0,
     profile_rerank_artifact_vectors_loaded: u64 = 0,
     profile_rerank_distance_ns: u64 = 0,
@@ -780,6 +785,11 @@ const QueryResponseWire = struct {
                 hbc_rerank_artifact_distance_ns: u64 = 0,
                 hbc_rerank_lsm_cache_hits: u64 = 0,
                 hbc_rerank_lsm_cache_misses: u64 = 0,
+                hbc_rerank_vector_projection_reads: u64 = 0,
+                hbc_rerank_vector_projection_bytes: u64 = 0,
+                hbc_rerank_vector_residual_reads: u64 = 0,
+                hbc_rerank_vector_residual_bytes: u64 = 0,
+                hbc_rerank_vector_location_reuses: u64 = 0,
                 hbc_rerank_artifact_cache_hits: u64 = 0,
                 hbc_rerank_artifact_vectors_loaded: u64 = 0,
                 hbc_rerank_distance_ns: u64 = 0,
@@ -1208,7 +1218,7 @@ pub fn main(init: std.process.Init) !void {
         if (cfg.mode != .standalone) return error.InvalidArgument;
         const cwd = try std.process.currentPathAlloc(init.io, alloc);
         defer alloc.free(cwd);
-        try runStandaloneBench(alloc, init.io, cwd, cfg, dataset, query_bodies);
+        try runStandaloneBench(alloc, init.io, init.minimal.environ, cwd, cfg, dataset, query_bodies);
     } else {
         switch (cfg.mode) {
             .handler => try runHandlerBench(alloc, init.io, cfg, dataset, queries, query_bodies),
@@ -1216,7 +1226,7 @@ pub fn main(init: std.process.Init) !void {
             .standalone => {
                 const cwd = try std.process.currentPathAlloc(init.io, alloc);
                 defer alloc.free(cwd);
-                try runStandaloneBench(alloc, init.io, cwd, cfg, dataset, query_bodies);
+                try runStandaloneBench(alloc, init.io, init.minimal.environ, cwd, cfg, dataset, query_bodies);
             },
         }
     }
@@ -1513,6 +1523,7 @@ fn runLocalBench(
     try enforceGuardrails(cfg, concurrent.polls);
     try validateSampledExactDenseRecall(alloc, dataset, concurrent.exact_recall_responses, cfg, &http_stats);
     try maybeRunHttpSearchThreadSweep(alloc, io, base_uri, query_bodies, health_uri, metrics_uri, null, cfg, null);
+    try validateSampledExactDenseRecall(alloc, base_uri, dataset, query_bodies, cfg, &http_stats);
 
     const avg_db_ns = db_stats.avgNs();
     const avg_handler_ns = handler_stats.avgNs();
@@ -2612,6 +2623,11 @@ fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, 
             stats.profile_rerank_artifact_distance_ns += dense.hbc_rerank_artifact_distance_ns;
             stats.profile_rerank_lsm_cache_hits += dense.hbc_rerank_lsm_cache_hits;
             stats.profile_rerank_lsm_cache_misses += dense.hbc_rerank_lsm_cache_misses;
+            stats.profile_rerank_vector_projection_reads += dense.hbc_rerank_vector_projection_reads;
+            stats.profile_rerank_vector_projection_bytes += dense.hbc_rerank_vector_projection_bytes;
+            stats.profile_rerank_vector_residual_reads += dense.hbc_rerank_vector_residual_reads;
+            stats.profile_rerank_vector_residual_bytes += dense.hbc_rerank_vector_residual_bytes;
+            stats.profile_rerank_vector_location_reuses += dense.hbc_rerank_vector_location_reuses;
             stats.profile_rerank_artifact_cache_hits += dense.hbc_rerank_artifact_cache_hits;
             stats.profile_rerank_artifact_vectors_loaded += dense.hbc_rerank_artifact_vectors_loaded;
             stats.profile_rerank_distance_ns += dense.hbc_rerank_distance_ns;
@@ -2915,6 +2931,11 @@ fn accumulateDenseProfile(stats: *QueryBenchStats, dense: anytype, raw_body: []c
     stats.profile_rerank_artifact_distance_ns += dense.hbc_rerank_artifact_distance_ns;
     stats.profile_rerank_lsm_cache_hits += dense.hbc_rerank_lsm_cache_hits;
     stats.profile_rerank_lsm_cache_misses += dense.hbc_rerank_lsm_cache_misses;
+    stats.profile_rerank_vector_projection_reads += dense.hbc_rerank_vector_projection_reads;
+    stats.profile_rerank_vector_projection_bytes += dense.hbc_rerank_vector_projection_bytes;
+    stats.profile_rerank_vector_residual_reads += dense.hbc_rerank_vector_residual_reads;
+    stats.profile_rerank_vector_residual_bytes += dense.hbc_rerank_vector_residual_bytes;
+    stats.profile_rerank_vector_location_reuses += dense.hbc_rerank_vector_location_reuses;
     stats.profile_rerank_artifact_cache_hits += dense.hbc_rerank_artifact_cache_hits;
     stats.profile_rerank_artifact_vectors_loaded += dense.hbc_rerank_artifact_vectors_loaded;
     stats.profile_rerank_distance_ns += dense.hbc_rerank_distance_ns;
@@ -3276,6 +3297,7 @@ fn makeQueryBodies(alloc: std.mem.Allocator, queries: []const f32, cfg: Config) 
 fn runStandaloneBench(
     alloc: std.mem.Allocator,
     io: std.Io,
+    parent_environ: std.process.Environ,
     cwd: []const u8,
     cfg: Config,
     dataset: []const f32,
@@ -3307,7 +3329,7 @@ fn runStandaloneBench(
     const metadata_admin_port = ports[3];
     const store_raft_port = ports[4];
 
-    var child = try spawnStandalone(alloc, io, cwd, cfg, root_path[0..root_path.len], bind_port, health_port, metadata_port, metadata_admin_port, store_raft_port);
+    var child = try spawnStandalone(alloc, io, parent_environ, cwd, cfg, root_path[0..root_path.len], bind_port, health_port, metadata_port, metadata_admin_port, store_raft_port);
     defer child.kill(io);
 
     const base_uri = try std.fmt.allocPrint(alloc, "http://{s}:{d}/db/v1", .{ cfg.bind_host, bind_port });
@@ -3514,6 +3536,7 @@ fn runStandaloneBench(
 fn spawnStandalone(
     alloc: std.mem.Allocator,
     io: std.Io,
+    parent_environ: std.process.Environ,
     cwd: []const u8,
     cfg: Config,
     root_path: []const u8,
@@ -3599,7 +3622,7 @@ fn spawnStandalone(
             defer alloc.free(store_raft);
             const metadata_cluster = try std.fmt.allocPrint(alloc, "{{\"1\":\"{s}\"}}", .{metadata_raft});
             defer alloc.free(metadata_cluster);
-            var env_map = std.process.Environ.Map.init(alloc);
+            var env_map = try std.process.Environ.createMap(parent_environ, alloc);
             defer env_map.deinit();
             try env_map.put("ANTFLY_DATA_DIR", root_path);
             try env_map.put("ANTFLY_STORAGE_LOCAL_BASE_DIR", root_path);
@@ -4735,7 +4758,7 @@ fn printPublicQueryGuardrailSummaryJson(
         },
     );
     std.debug.print(
-        ",\"load_health_max_ms\":{d:.3},\"load_metrics_max_ms\":{d:.3},\"load_status_max_ms\":{d:.3},\"search_health_max_ms\":{d:.3},\"search_metrics_max_ms\":{d:.3},\"search_status_max_ms\":{d:.3},\"source_recall_at_k\":{d:.6},\"source_top1_recall\":{d:.6},\"exact_recall_at_k\":{d:.6},\"exact_recall_samples\":{d},\"exact_recall_strata\":{d},\"exact_recall_lane\":\"{s}\",\"exact_artifact_cache_hits_avg\":{d:.3},\"exact_artifact_vectors_loaded_avg\":{d:.3},\"rerank_metadata_vectors_loaded_avg\":{d:.3},\"rerank_artifact_cache_hits_avg\":{d:.3},\"rerank_artifact_vectors_loaded_avg\":{d:.3}",
+        ",\"load_health_max_ms\":{d:.3},\"load_metrics_max_ms\":{d:.3},\"load_status_max_ms\":{d:.3},\"search_health_max_ms\":{d:.3},\"search_metrics_max_ms\":{d:.3},\"search_status_max_ms\":{d:.3},\"source_recall_at_k\":{d:.6},\"source_top1_recall\":{d:.6},\"exact_recall_at_k\":{d:.6},\"exact_recall_samples\":{d},\"exact_recall_strata\":{d},\"exact_recall_lane\":\"{s}\",\"exact_artifact_cache_hits_avg\":{d:.3},\"exact_artifact_vectors_loaded_avg\":{d:.3},\"rerank_metadata_vectors_loaded_avg\":{d:.3},\"rerank_artifact_cache_hits_avg\":{d:.3},\"rerank_artifact_vectors_loaded_avg\":{d:.3},\"rerank_vector_projection_reads_avg\":{d:.3},\"rerank_vector_projection_bytes_avg\":{d:.3},\"rerank_vector_residual_reads_avg\":{d:.3},\"rerank_vector_residual_bytes_avg\":{d:.3},\"rerank_vector_location_reuses_avg\":{d:.3}",
         .{
             nsToMs(load.polls.health_max_latency_ns),
             nsToMs(load.polls.metrics_max_latency_ns),
@@ -4754,6 +4777,11 @@ fn printPublicQueryGuardrailSummaryJson(
             avgPerQuery(profile_stats, profile_stats.profile_rerank_metadata_vectors_loaded),
             avgPerQuery(profile_stats, profile_stats.profile_rerank_artifact_cache_hits),
             avgPerQuery(profile_stats, profile_stats.profile_rerank_artifact_vectors_loaded),
+            avgPerQuery(profile_stats, profile_stats.profile_rerank_vector_projection_reads),
+            avgPerQuery(profile_stats, profile_stats.profile_rerank_vector_projection_bytes),
+            avgPerQuery(profile_stats, profile_stats.profile_rerank_vector_residual_reads),
+            avgPerQuery(profile_stats, profile_stats.profile_rerank_vector_residual_bytes),
+            avgPerQuery(profile_stats, profile_stats.profile_rerank_vector_location_reuses),
         },
     );
     std.debug.print(

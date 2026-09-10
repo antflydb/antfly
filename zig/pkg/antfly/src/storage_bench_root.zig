@@ -43,6 +43,7 @@ pub const db = struct {
 };
 
 pub const hbc = @import("storage/hbc_adapter.zig");
+pub const vectorindex = @import("antfly_vectorindex");
 pub const vector = @import("antfly_vector").vector;
 pub const storage_lsm = @import("storage/lsm/mod.zig");
 pub const metadata_api = @import("metadata/api.zig");

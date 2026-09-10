@@ -116,6 +116,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     wasm_vector_mod.addImport("protobuf", wasm_protobuf_mod);
     wasm_vectorindex_mod.addImport("antfly_vector", wasm_vector_mod);
     wasm_vectorindex_mod.addImport("antfly_platform", wasm_platform_mod);
+    wasm_vectorindex_mod.addImport("antfly_hash", wasm_hash_mod);
     const vellum_mod = b.createModule(.{ .root_source_file = b.path("lib/vellum/src/mod.zig"), .target = wasm_target, .optimize = optimize });
     const regex_mod = b.createModule(.{ .root_source_file = b.path("lib/regex/src/mod.zig"), .target = wasm_target, .optimize = optimize });
     regex_mod.addImport("antfly_vellum", vellum_mod);

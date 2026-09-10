@@ -182,6 +182,7 @@ pub fn provisioningFingerprint(
         hasher.update(&range.completed_restore_fingerprint);
         hasher.update(std.mem.asBytes(&table.table_id));
         hashBytes(&hasher, table.name);
+        if (table.storage.dense_embeddings != .primary_lsm) hashBytes(&hasher, @tagName(table.storage.dense_embeddings));
         hashBytes(&hasher, table.schema_json);
         hashBytes(&hasher, table.read_schema_json);
         hashBytes(&hasher, table.indexes_json);
@@ -250,6 +251,7 @@ pub fn reconcileReplicaRootWithOptions(
         open_options.start_resolver_workers = options.drain_resolver_backfill;
         open_options.backend_runtime = options.backend_runtime;
         open_options.schema_before_index_load = runtime_schema;
+        open_options.table_storage = table.storage;
         var db = try db_mod.DB.open(alloc, path, open_options);
         defer db.close();
         summary.dbs_opened += 1;
@@ -3574,6 +3576,12 @@ test "table provisioner reconcile does not replay pending derived batches" {
     defer reopened.close();
     const applied = try reopened.core.loadAppliedSequence(std.testing.allocator, "embed_idx");
     try std.testing.expect(applied > 0);
+    const dense = reopened.core.index_manager.denseIndex("embed_idx") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(
+        @as(?u64, applied),
+        dense.index.experimentalPostingDurableAppliedSequence(),
+    );
 }
 
 test "table provisioner reports local schema progress once all local shards have the target full-text index" {

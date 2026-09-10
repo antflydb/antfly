@@ -134,6 +134,7 @@ pub const ClientConfig = struct {
 
 /// Per-request options.
 pub const RequestOptions = struct {
+    delivery_observer: ?Request.DeliveryObserver = null,
     attempt_observer: ?AttemptObserver = null,
     headers: ?[]const [2][]const u8 = null,
     body: ?[]const u8 = null,
@@ -945,6 +946,7 @@ pub const Client = struct {
         defer req.deinit();
         req.max_response_size = reqOpts.max_response_size;
         req.attempt_observer = reqOpts.attempt_observer orelse self.config.attempt_observer;
+        req.delivery_observer = reqOpts.delivery_observer;
 
         try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
 
@@ -1059,6 +1061,7 @@ pub const Client = struct {
         defer req.deinit();
         req.max_response_size = reqOpts.max_response_size;
         req.attempt_observer = reqOpts.attempt_observer orelse self.config.attempt_observer;
+        req.delivery_observer = reqOpts.delivery_observer;
 
         try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
 
@@ -1192,13 +1195,15 @@ pub const Client = struct {
         var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
         var watchdog_stop = std.atomic.Value(u32).init(0);
-        try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, &interrupt });
         // The watchdog must own concurrency. `Io.async` is allowed to run it
         // eagerly once the async pool is saturated; an eager watchdog cannot
         // observe request completion because this caller has not reached
         // `select.await` yet, turning a fast request into a full timeout.
-        select.concurrent(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, timeout_ms }) catch |err| {
-            interrupt.cancel(self.io);
+        // Admit the watchdog first: failure to reserve the network task must
+        // happen before any bytes are sent, not cancel an accepted mutation.
+        try select.concurrent(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, timeout_ms });
+        select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, &interrupt }) catch |err| {
+            stopRequestWatchdog(self.io, &watchdog_stop, null);
             while (select.cancel()) |late| Task.drainLateResult(late);
             return err;
         };
@@ -1268,9 +1273,9 @@ pub const Client = struct {
         var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
         var watchdog_stop = std.atomic.Value(u32).init(0);
-        try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, &interrupt });
-        select.concurrent(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, cancellation, timeout_ms }) catch |err| {
-            interrupt.cancel(self.io);
+        try select.concurrent(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, cancellation, timeout_ms });
+        select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, &interrupt }) catch |err| {
+            stopRequestWatchdog(self.io, &watchdog_stop, cancellation);
             while (select.cancel()) |late| Task.drainLateResult(late);
             return err;
         };
@@ -1405,9 +1410,9 @@ pub const Client = struct {
         var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
         var watchdog_stop = std.atomic.Value(u32).init(0);
-        try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, &interrupt });
-        select.concurrent(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, timeout_ms }) catch |err| {
-            interrupt.cancel(self.io);
+        try select.concurrent(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, timeout_ms });
+        select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, &interrupt }) catch |err| {
+            stopRequestWatchdog(self.io, &watchdog_stop, null);
             while (select.cancel()) |late| Task.drainLateResult(late);
             return err;
         };
@@ -1477,9 +1482,9 @@ pub const Client = struct {
         var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
         var watchdog_stop = std.atomic.Value(u32).init(0);
-        try select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, &interrupt });
-        select.concurrent(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, cancellation, timeout_ms }) catch |err| {
-            interrupt.cancel(self.io);
+        try select.concurrent(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, cancellation, timeout_ms });
+        select.concurrent(.request, Task.requestTask, .{ self, req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, &interrupt }) catch |err| {
+            stopRequestWatchdog(self.io, &watchdog_stop, cancellation);
             while (select.cancel()) |late| Task.drainLateResult(late);
             return err;
         };
@@ -1566,8 +1571,17 @@ pub const Client = struct {
         socket.setRequestDeadline(null);
     }
 
-    fn connectHost(self: *Self, host: []const u8, port: u16) !Socket {
+    fn connectHost(self: *Self, host: []const u8, port: u16, deadline_ms: ?i64) !Socket {
         const timeout_ms = self.config.timeouts.connect_ms;
+        // The whole-request task already owns cancellation of DNS/connect.
+        // When its deadline is tighter, a nested connect task/watchdog adds
+        // concurrency demand without providing an additional timeout bound.
+        if (deadline_ms) |deadline| {
+            try ensureRequestDeadline(self.io, deadline);
+            const remaining_ms: u64 = @intCast(@max(0, deadline - common.milliTimestamp(self.io)));
+            if (timeout_ms == 0 or remaining_ms <= timeout_ms)
+                return self.connectHostDirect(host, port);
+        }
         if (timeout_ms == 0) return self.connectHostDirect(host, port);
 
         const ConnectResult = anyerror!Socket;
@@ -1598,8 +1612,9 @@ pub const Client = struct {
         var select_buffer: [2]SelectResult = undefined;
         var select = Io.Select(SelectResult).init(self.io, &select_buffer);
         var watchdog_stop = std.atomic.Value(u32).init(0);
-        try select.concurrent(.connect, Task.connectTask, .{ self, host, port });
-        select.concurrent(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, timeout_ms }) catch |err| {
+        try select.concurrent(.watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, timeout_ms });
+        select.concurrent(.connect, Task.connectTask, .{ self, host, port }) catch |err| {
+            stopRequestWatchdog(self.io, &watchdog_stop, null);
             while (select.cancel()) |late| Task.drainLateResult(late);
             return err;
         };
@@ -1792,7 +1807,7 @@ pub const Client = struct {
             }
 
             // Non-pooled TLS fallback (keep_alive disabled).
-            var socket = try self.connectHost(host, port);
+            var socket = try self.connectHost(host, port, deadline_ms);
             defer socket.close();
             try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
             interrupt.publish(&socket, self.io);
@@ -1813,7 +1828,7 @@ pub const Client = struct {
             return self.executeOnSocket(&conn.socket, req, &ok);
         }
 
-        var socket = try self.connectHost(host, port);
+        var socket = try self.connectHost(host, port, deadline_ms);
         defer socket.close();
         try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
         interrupt.publish(&socket, self.io);
@@ -1889,7 +1904,7 @@ pub const Client = struct {
                 return self.executeOnTlsToWriter(&tls_conn.session, req, writer, progress_cb, progress_ctx, &ok);
             }
 
-            var socket = try self.connectHost(host, port);
+            var socket = try self.connectHost(host, port, deadline_ms);
             defer socket.close();
             try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
             interrupt.publish(&socket, self.io);
@@ -1910,7 +1925,7 @@ pub const Client = struct {
             return self.executeOnSocketToWriter(&conn.socket, req, writer, progress_cb, progress_ctx, &ok);
         }
 
-        var socket = try self.connectHost(host, port);
+        var socket = try self.connectHost(host, port, deadline_ms);
         defer socket.close();
         try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
         interrupt.publish(&socket, self.io);
@@ -1923,6 +1938,7 @@ pub const Client = struct {
     fn executeOnSocket(self: *Self, socket: *Socket, req: *Request, keep_alive_out: ?*bool) !Response {
         const request_head = try serializeRequestHeadAlloc(self.allocator, req);
         defer self.allocator.free(request_head);
+        req.notifySend();
         try socket.sendAll(request_head);
         try req.writeBody(socket);
         const result = try self.readResponse(socket, req.method, self.responseSizeLimit(req));
@@ -1943,6 +1959,7 @@ pub const Client = struct {
     ) !Response {
         const request_head = try serializeRequestHeadAlloc(self.allocator, req);
         defer self.allocator.free(request_head);
+        req.notifySend();
         try socket.sendAll(request_head);
         try req.writeBody(socket);
         const result = try self.readResponseToWriter(
@@ -1965,6 +1982,7 @@ pub const Client = struct {
         const request_head = try serializeRequestHeadAlloc(self.allocator, req);
         defer self.allocator.free(request_head);
         const w = try session.getWriter();
+        req.notifySend();
         try w.writeAll(request_head);
         try req.writeBody(w);
         try session.flush();
@@ -1987,6 +2005,7 @@ pub const Client = struct {
         const request_head = try serializeRequestHeadAlloc(self.allocator, req);
         defer self.allocator.free(request_head);
         const w = try session.getWriter();
+        req.notifySend();
         try w.writeAll(request_head);
         try req.writeBody(w);
         try session.flush();
@@ -2064,7 +2083,7 @@ pub const Client = struct {
         entry.recv_running = false;
         errdefer self.allocator.destroy(entry);
 
-        entry.socket = try self.connectHost(host, port);
+        entry.socket = try self.connectHost(host, port, null);
         // Guard socket close only until fibers take ownership (recv_running).
         // After fibers start, the errdefer at line ~521 handles shutdown.
         errdefer if (!entry.recv_running) entry.socket.close();
@@ -2396,8 +2415,10 @@ pub const Client = struct {
                 if (published.completed) return error.ConnectionClosed;
                 if (entry.is_tls) {
                     const w = try entry.session.getWriter();
+                    req.notifySend();
                     try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
                 } else {
+                    req.notifySend();
                     try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
                 }
             }
@@ -2426,6 +2447,7 @@ pub const Client = struct {
             if (entry.is_tls) {
                 const r = try entry.session.getReader();
                 const w = try entry.session.getWriter();
+                req.notifySend();
                 try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
                 interrupt.publishH2(entry, stream_id, self.io);
                 if (has_body) {
@@ -2438,6 +2460,7 @@ pub const Client = struct {
                     return err;
                 };
             } else {
+                req.notifySend();
                 try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
                 interrupt.publishH2(entry, stream_id, self.io);
                 if (has_body) {
@@ -2730,10 +2753,12 @@ pub const Client = struct {
             published.data_event = data_event;
             if (entry.is_tls) {
                 const w = try entry.session.getWriter();
+                req.notifySend();
                 try h2.sendHeaders(w, stream_id, h2_headers, !has_body);
                 headers_sent = true;
                 if (has_body) try writeRequestBodyH2Blocking(h2, w, stream_id, req);
             } else {
+                req.notifySend();
                 try h2.sendHeaders(&entry.socket, stream_id, h2_headers, !has_body);
                 headers_sent = true;
                 if (has_body) try writeRequestBodyH2Blocking(h2, &entry.socket, stream_id, req);
@@ -4772,7 +4797,7 @@ test "successful H1 requests do not wait for their timeout deadline" {
     // Reproduce a saturated async pool deterministically. A watchdog submitted
     // with `Io.async` runs eagerly in this configuration and blocks its caller
     // before the completed request result can be observed.
-    var io_impl = std.Io.Threaded.init(allocator, .{ .async_limit = .nothing });
+    var io_impl = std.Io.Threaded.init(allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) });
     defer io_impl.deinit();
     const io = io_impl.io();
     const fixture_io = std.testing.io;
@@ -4800,20 +4825,30 @@ test "successful H1 requests do not wait for their timeout deadline" {
     var client = Client.initWithConfig(allocator, io, .{
         .keep_alive = false,
         .retry_policy = .{ .max_retries = 0 },
-        .timeouts = .{ .request_ms = 30_000, .read_ms = 30_000, .write_ms = 30_000 },
+        .timeouts = .{ .connect_ms = 30_000, .request_ms = 30_000, .read_ms = 30_000, .write_ms = 30_000 },
     });
     defer client.deinit();
     var cancellation = std.atomic.Value(bool).init(false);
+    var sends = std.atomic.Value(usize).init(0);
+    const observer: Request.DeliveryObserver = .{
+        .context = &sends,
+        .before_send = struct {
+            fn observe(context: *anyopaque) void {
+                const count: *std.atomic.Value(usize) = @ptrCast(@alignCast(context));
+                _ = count.fetchAdd(1, .monotonic);
+            }
+        }.observe,
+    };
 
     const started_ms = common.milliTimestamp(io);
-    var ordinary_response = try client.get(url, .{});
+    var ordinary_response = try client.get(url, .{ .delivery_observer = observer });
     ordinary_response.deinit();
 
     var ordinary_streamed = std.ArrayListUnmanaged(u8).empty;
     defer ordinary_streamed.deinit(allocator);
     var ordinary_streamed_response = try client.getToWriter(
         url,
-        .{},
+        .{ .delivery_observer = observer },
         arrayListWriter(&ordinary_streamed, allocator),
         null,
         null,
@@ -4821,7 +4856,7 @@ test "successful H1 requests do not wait for their timeout deadline" {
     ordinary_streamed_response.deinit();
     try std.testing.expectEqual(@as(usize, 32), ordinary_streamed.items.len);
 
-    var response = try client.get(url, .{ .cancellation = .fromAtomic(&cancellation) });
+    var response = try client.get(url, .{ .cancellation = .fromAtomic(&cancellation), .delivery_observer = observer });
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 200), response.status.code);
 
@@ -4829,13 +4864,14 @@ test "successful H1 requests do not wait for their timeout deadline" {
     defer streamed.deinit(allocator);
     var streamed_response = try client.getToWriter(
         url,
-        .{ .cancellation = .fromAtomic(&cancellation) },
+        .{ .cancellation = .fromAtomic(&cancellation), .delivery_observer = observer },
         arrayListWriter(&streamed, allocator),
         null,
         null,
     );
     defer streamed_response.deinit();
     try std.testing.expectEqual(@as(usize, 32), streamed.items.len);
+    try std.testing.expectEqual(@as(usize, 4), sends.load(.acquire));
     try std.testing.expect(common.milliTimestamp(io) - started_ms < 2_000);
 }
 
