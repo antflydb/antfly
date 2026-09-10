@@ -4841,7 +4841,8 @@ test "stored create table encoding round-trips a normalized public request" {
 test "stored create table encoding preserves empty requests" {
     const encoded = try encodeStoredCreateTableRequestAlloc(std.testing.allocator, .{});
     defer std.testing.allocator.free(encoded);
-    try std.testing.expectEqualStrings("{}", encoded);
+    // Store the default ownership explicitly so replay does not depend on future defaults.
+    try std.testing.expectEqualStrings("{\"storage\":{\"dense_embeddings\":\"primary_lsm\"}}", encoded);
 
     var decoded = try parseStoredCreateTableRequest(std.testing.allocator, encoded);
     defer decoded.deinit(std.testing.allocator);
@@ -5790,4 +5791,17 @@ test "metadata.query routing selects read schema text index for vector-only stru
     try routeQueryRequestToActiveReadIndex(std.testing.allocator, &table, &req);
     try std.testing.expectEqualStrings("dense_idx", req.index_name.?);
     try std.testing.expectEqualStrings("full_text_index_v0", req.primary_text_index_name.?);
+}
+
+test "system catalog stored create preserves tablespace and storage ownership together" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseCreateTableRequest(alloc, "{\"tablespace_name\":\"serving\",\"num_shards\":1,\"storage\":{\"dense_embeddings\":\"vector_store\"}}");
+    defer parsed.deinit(alloc);
+    const encoded = try encodeStoredCreateTableRequestAlloc(alloc, parsed);
+    defer alloc.free(encoded);
+    var decoded = try parseStoredCreateTableRequest(alloc, encoded);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualStrings("serving", decoded.tablespace_name.?);
+    try std.testing.expectEqual(@as(?u32, 1), decoded.num_shards);
+    try std.testing.expectEqual(@import("../common/table_storage.zig").DenseEmbeddings.vector_store, decoded.storage.dense_embeddings);
 }

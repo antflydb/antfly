@@ -108,6 +108,9 @@ pub const CandidateSource = struct {
         return null;
     }
     pub const VTable = struct {
+        /// Bulk point candidates. Missing keys are omitted. Values are borrowed
+        /// during consume; this optional capability must preserve point-read semantics.
+        get_many: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const []const u8, *anyopaque, Consume) anyerror!void = null,
         /// A work-unit-owned binding; never shared between background workers.
         begin_batch: ?*const fn (*anyopaque, std.mem.Allocator, []const []const u8) anyerror!Batch = null,
         /// Borrowed immutable destination, retained through batch deinit.
@@ -806,7 +809,48 @@ const SourceCandidateProvider = struct {
     fn provider(self: *SourceCandidateProvider) resolver_lib.CandidateProvider {
         return .{ .ptr = self, .vtable = &vtable };
     }
-    const vtable = resolver_lib.CandidateProvider.VTable{ .candidates_for = candidatesFor };
+    const vtable = resolver_lib.CandidateProvider.VTable{ .candidates_for = candidatesFor, .candidates_for_batch = candidatesForBatch };
+
+    fn candidatesForBatch(ptr: *anyopaque, alloc: std.mem.Allocator, entities: []const resolver_lib.ExtractedEntity, lists: [][]const resolver_lib.Candidate) anyerror!void {
+        const self: *SourceCandidateProvider = @ptrCast(@alignCast(ptr));
+        if (self.mode != .exact_key or self.source.vtable.get_many == null) {
+            for (entities, lists) |entity, *list| {
+                var candidates = std.ArrayListUnmanaged(resolver_lib.Candidate).empty;
+                try candidatesFor(ptr, alloc, entity, &candidates);
+                list.* = candidates.items;
+            }
+            return;
+        }
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const keys = try a.alloc([]const u8, entities.len);
+        for (entities, keys) |entity, *key| key.* = try self.resolver.renderKeyAlloc(a, entity);
+        const Collected = struct {
+            alloc: std.mem.Allocator,
+            docs: std.StringHashMapUnmanaged([]const u8) = .empty,
+            fn consume(ctx: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
+                const collection: *@This() = @ptrCast(@alignCast(ctx));
+                try collection.docs.put(collection.alloc, try collection.alloc.dupe(u8, key), try collection.alloc.dupe(u8, value));
+            }
+        };
+        var collected = Collected{ .alloc = a };
+        try self.source.vtable.get_many.?(self.source.ptr, a, self.table, keys, &collected, Collected.consume);
+        for (keys, lists) |key, *list| {
+            var candidates = std.ArrayListUnmanaged(resolver_lib.Candidate).empty;
+            if (collected.docs.get(key)) |raw| {
+                const resolved_key = try jsonStringFieldAlloc(a, raw, "merged_into");
+                // Curated merge chains retain the existing one-hop semantics.
+                const resolved_raw = if (resolved_key) |rk| collected.docs.get(rk) orelse blk: {
+                    const raw_target = (try self.source.get(a, self.table, rk)) orelse break :blk null;
+                    try collected.docs.put(a, rk, raw_target);
+                    break :blk raw_target;
+                } else null;
+                try appendEntityCandidateWithResolved(alloc, self.table, key, raw, resolved_key, resolved_raw, &candidates);
+            }
+            list.* = candidates.items;
+        }
+    }
 
     const ScanCtx = struct {
         allocator: std.mem.Allocator,
@@ -3635,6 +3679,54 @@ const FakeCandidateSource = struct {
         }
     }
 };
+
+test "SourceCandidateProvider bulk exact keys retain duplicates missing candidates and merge destinations" {
+    const alloc = testing.allocator;
+    const Bulk = struct {
+        calls: usize = 0,
+        gets: usize = 0,
+        fn get(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, key: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.gets += 1;
+            try testing.expectEqualStrings("person/canonical", key);
+            return try a.dupe(u8, "{\"canonical_name\":\"Canonical\",\"label\":\"person\"}");
+        }
+        fn getMany(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, keys: []const []const u8, ctx: *anyopaque, consume: CandidateSource.Consume) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try testing.expectEqual(@as(usize, 3), keys.len);
+            try consume(ctx, "person/ada", "{\"canonical_name\":\"Ada\",\"label\":\"person\",\"merged_into\":\"person/canonical\"}");
+        }
+    };
+    var fake: Bulk = .{};
+    var resolver = try resolver_lib.Resolver.initFromParts(alloc, "entities", "{{ lower _entity.label }}/{{ slug _entity.text }}", false, "");
+    defer resolver.deinit();
+    var provider = SourceCandidateProvider{
+        .source = .{ .ptr = &fake, .vtable = &.{ .get = Bulk.get, .get_many = Bulk.getMany } },
+        .resolver = &resolver,
+        .table = "entities",
+        .mode = .exact_key,
+        .ann_index_name = "",
+        .candidate_limit = 25,
+    };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const entities = [_]resolver_lib.ExtractedEntity{
+        .{ .local_id = "one", .label = "person", .text = "Ada" },
+        .{ .local_id = "two", .label = "person", .text = "Missing" },
+        .{ .local_id = "three", .label = "person", .text = "Ada" },
+    };
+    var lists: [3][]const resolver_lib.Candidate = undefined;
+    try provider.provider().candidatesForBatch(arena.allocator(), &entities, &lists);
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+    try testing.expectEqual(@as(usize, 1), fake.gets);
+    try testing.expectEqual(@as(usize, 0), lists[1].len);
+    for ([_]usize{ 0, 2 }) |i| {
+        try testing.expectEqual(@as(usize, 1), lists[i].len);
+        try testing.expectEqualStrings("person/ada", lists[i][0].doc_ref.key);
+        try testing.expectEqualStrings("person/canonical", lists[i][0].resolved_doc_ref.?.key);
+    }
+}
 
 test "SourceCandidateProvider links via an injected cross-shard exact_key source" {
     const alloc = testing.allocator;

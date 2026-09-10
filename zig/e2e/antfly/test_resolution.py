@@ -108,6 +108,23 @@ DOCUMENTS_INDEXES = {
                 "resolution_artifact": "resolution_v1",
                 "key_template": "{{ lower _entity.label }}/{{ slug _entity.text }}",
                 "candidate_search": "prefix",
+                "scorer_json": json.dumps(
+                    {
+                        "comparisons": [
+                            {
+                                "name": "name",
+                                "left": "canonical_text",
+                                "right": "canonical_name",
+                                "levels": [
+                                    {"when": "exact", "weight": 8.0},
+                                    {"else": True, "weight": -6.0},
+                                ],
+                            }
+                        ],
+                        "combine": {"bias": -3.0},
+                        "decision": {"match": 0.9},
+                    }
+                ),
                 "config_generation": 1,
             }
         ],
@@ -788,9 +805,34 @@ def _exercise_autograph(resolution_cluster, candidate_search):
         finally:
             node_api.s.close()
 
-    # A second document mentioning the same person resolves (prefix blocking) to
-    # the existing entity rather than minting a new one; the entity persists with
-    # its canonical name.
+    # A curated redirect makes exact-key candidate reads observable: minting
+    # without reading the existing candidate would choose the old key.
+    second_entity_key = "person/ada_lovelace"
+    if candidate_search == "exact_key":
+        second_entity_key = "person/ada_curated"
+        api.insert(
+            "entities",
+            second_entity_key,
+            {
+                "canonical_name": "Ada Lovelace",
+                "entity_type": "person",
+            },
+            sync_level="full_index",
+            deadline=_new_e2e_deadline(),
+        )
+        api.insert(
+            "entities",
+            "person/ada_lovelace",
+            {
+                "canonical_name": "Ada Lovelace",
+                "entity_type": "person",
+                "merged_into": second_entity_key,
+            },
+            sync_level="full_index",
+            deadline=_new_e2e_deadline(),
+        )
+
+    # A second document links to the existing entity's canonical destination.
     api.insert(
         "documents",
         "doc:b",
@@ -817,11 +859,11 @@ def _exercise_autograph(resolution_cluster, candidate_search):
     second_mentions = _wait_for_mention_hydration(
         api,
         start_node="doc:b",
-        expected_names={"person/ada_lovelace": "Ada Lovelace"},
+        expected_names={second_entity_key: "Ada Lovelace"},
         deadline=_new_e2e_deadline(),
     )
     second_node_keys = {node["key"] for node in second_mentions["nodes"]}
-    assert "person/ada_lovelace" in second_node_keys
+    assert second_entity_key in second_node_keys
 
 
 def test_multinode_autograph_deleted_target_does_not_fail_surviving_graph(

@@ -6265,6 +6265,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_http_runtime_test_mod,
         .filters = &.{
             "DistributedCandidateSource",
+            "SourceCandidateProvider",
             "prefixUpperBoundAlloc",
             "DistributedEntitySink",
         },

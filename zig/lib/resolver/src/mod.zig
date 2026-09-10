@@ -764,6 +764,9 @@ pub const CandidateProvider = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Optional work-unit bulk path. Candidate lists borrow the caller's
+        /// scratch allocator and retain one list per input mention.
+        candidates_for_batch: ?*const fn (*anyopaque, std.mem.Allocator, []const ExtractedEntity, [][]const Candidate) anyerror!void = null,
         /// Append candidates for `entity` into `out`, allocating any candidate
         /// memory with `allocator` (valid until the stage finishes one mention).
         candidates_for: *const fn (
@@ -773,6 +776,15 @@ pub const CandidateProvider = struct {
             out: *std.ArrayListUnmanaged(Candidate),
         ) anyerror!void,
     };
+
+    pub fn candidatesForBatch(self: CandidateProvider, alloc: std.mem.Allocator, entities: []const ExtractedEntity, lists: [][]const Candidate) !void {
+        if (self.vtable.candidates_for_batch) |f| return f(self.ptr, alloc, entities, lists);
+        for (entities, lists) |entity, *list| {
+            var candidates = std.ArrayListUnmanaged(Candidate).empty;
+            try self.candidatesFor(alloc, entity, &candidates);
+            list.* = candidates.items;
+        }
+    }
 
     pub fn candidatesFor(
         self: CandidateProvider,
@@ -840,7 +852,7 @@ pub const ResolutionStage = struct {
         // Backfill name embeddings for mentions that arrived without one, using
         // the parse arena so the vectors outlive scoring. Embedding failures are
         // non-fatal: the mention simply scores without a vector.
-        if (self.embedder) |embedder| {
+        if (if (self.resolver.scorer != null) self.embedder else null) |embedder| {
             const arena = parsed.arena.allocator();
             for (parsed.entities) |*entity| {
                 if (entity.embedding != null or entity.text.len == 0) continue;
@@ -853,12 +865,8 @@ pub const ResolutionStage = struct {
         const a = scratch.allocator();
 
         const lists = try a.alloc([]const Candidate, parsed.entities.len);
-        if (provider) |p| {
-            for (parsed.entities, 0..) |entity, i| {
-                var candidates = std.ArrayListUnmanaged(Candidate).empty;
-                try p.candidatesFor(a, entity, &candidates);
-                lists[i] = candidates.items;
-            }
+        if (if (self.resolver.scorer != null) provider else null) |p| {
+            try p.candidatesForBatch(a, parsed.entities, lists);
         } else {
             for (lists) |*l| l.* = &.{};
         }
@@ -1528,4 +1536,48 @@ test "resolution durable doc ref binding round trips without changing its logica
     var replay = try parseResolution(alloc, encoded);
     defer replay.deinit();
     try testing.expectEqualStrings("table:original", replay.entities[0].doc_ref.storage_table.?);
+}
+
+test "deterministic resolution skips candidate and embedding IO but retains destination binding" {
+    const alloc = testing.allocator;
+    const Ports = struct {
+        reads: usize = 0,
+        embeddings: usize = 0,
+        bindings: usize = 0,
+        fn candidates(ptr: *anyopaque, _: std.mem.Allocator, _: ExtractedEntity, _: *std.ArrayListUnmanaged(Candidate)) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reads += 1;
+            return error.TestUnexpectedRead;
+        }
+        fn embed(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!?[]const f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.embeddings += 1;
+            return error.TestUnexpectedEmbedding;
+        }
+        fn bind(ptr: *anyopaque, _: []const u8) anyerror!?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.bindings += 1;
+            return "table:original";
+        }
+    };
+    var ports: Ports = .{};
+    var resolver = try Resolver.initFromParts(alloc, "entities", "{{ slug _entity.text }}", false, "");
+    defer resolver.deinit();
+    var store = MapStore{ .alloc = alloc };
+    defer store.deinit();
+    try store.store().put("extraction", "{\"entities\":[{\"id\":\"one\",\"label\":\"person\",\"text\":\"Ada\"}]}");
+    const stage = ResolutionStage{
+        .resolver = &resolver,
+        .config_generation = 1,
+        .embedder = .{ .ptr = &ports, .embed_fn = Ports.embed },
+        .doc_ref_binding = .{ .ptr = &ports, .bind = Ports.bind },
+    };
+    const result = (try stage.computeAlloc(alloc, store.store(), .{ .ptr = &ports, .vtable = &.{ .candidates_for = Ports.candidates } }, "extraction")).?;
+    defer alloc.free(result);
+    try testing.expectEqual(@as(usize, 0), ports.reads);
+    try testing.expectEqual(@as(usize, 0), ports.embeddings);
+    try testing.expectEqual(@as(usize, 1), ports.bindings);
+    var parsed = try parseResolution(alloc, result);
+    defer parsed.deinit();
+    try testing.expectEqualStrings("table:original", parsed.entities[0].doc_ref.storage_table.?);
 }

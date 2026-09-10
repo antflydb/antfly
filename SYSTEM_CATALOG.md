@@ -56,7 +56,13 @@ are protected. Rename requires authority on both the old and new names.
 HTTP and A2A retrieval use the same query binding boundary. Background entity
 resolution owns a lazy binding per changed extraction artifact and resolver
 configuration. All mentions in that work unit reuse the same immutable candidate
-table destination. Resolution artifacts persist that destination alongside the
+table destination. Exact-key resolution reads up to 256 candidate IDs at a time
+through the existing fenced document-value query path. It preserves duplicate
+mentions and missing candidates; a work-unit cache reuses curated merge targets.
+Deterministic mint-only configurations skip candidate and embedding I/O while
+still retaining the destination binding. Malformed candidate responses fail the
+work unit instead of silently minting
+entities. Resolution artifacts persist the destination alongside the
 logical `doc_ref.table`, so deferred promotion and replay cannot redirect writes
 to a replacement table. Older artifacts without a destination bind every distinct
 logical target in one catalog read before submitting their atomic write batch.
@@ -225,3 +231,13 @@ request-local authorization projections. Client checks use `cmd-test` and
 in the storage enrichment lane and protects the Lite timeout fix.
 
 These contracts and optimizations do not depend on the optional M1–M3 refactors.
+
+
+## Benchmark workloads
+
+[System catalog benchmarks](zig/pkg/antfly/benchmarks/SYSTEM_CATALOG.md) document
+the ReleaseFast catalog-scale target and disposable live-server workloads.
+They cover tenant provisioning, scoped reads and joins, NDJSON reuse, concurrent
+lookups, table listing and rename, tenant offboarding, and multi-node ingestion
+through entity promotion and graph hydration. Measurements include workload and
+binary provenance; timing thresholds are not part of correctness tests.

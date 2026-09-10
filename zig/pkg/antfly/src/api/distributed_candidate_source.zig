@@ -50,6 +50,7 @@ pub const DistributedCandidateSource = struct {
 
     const vtable = CandidateSource.VTable{
         .begin_batch = beginBatch,
+        .get_many = getManyFn,
         .get = getFn,
         .scan_prefix = scanPrefixFn,
         .nearest = nearestFn,
@@ -80,6 +81,10 @@ pub const DistributedCandidateSource = struct {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return getFn(&self.raw, alloc, (try self.resolve(table)) orelse return error.TableNotFound, key);
         }
+        fn getMany(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, keys: []const []const u8, ctx: *anyopaque, consume: CandidateSource.Consume) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return getManyFn(&self.raw, alloc, (try self.resolve(table)) orelse return error.TableNotFound, keys, ctx, consume);
+        }
         fn scan(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, prefix: []const u8, opts: CandidateSource.ScanOptions, ctx: *anyopaque, consume: CandidateSource.Consume) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return scanPrefixFn(&self.raw, alloc, (try self.resolve(table)) orelse return error.TableNotFound, prefix, opts, ctx, consume);
@@ -93,7 +98,7 @@ pub const DistributedCandidateSource = struct {
             self.arena.deinit();
             alloc.destroy(self);
         }
-        const vtable: CandidateSource.VTable = .{ .get = get, .scan_prefix = scan, .nearest = nearest, .bound_table = boundTable };
+        const vtable: CandidateSource.VTable = .{ .get = get, .get_many = getMany, .scan_prefix = scan, .nearest = nearest, .bound_table = boundTable };
     };
 
     fn beginBatch(ptr: *anyopaque, alloc: std.mem.Allocator, names: []const []const u8) anyerror!CandidateSource.Batch {
@@ -121,6 +126,31 @@ pub const DistributedCandidateSource = struct {
         var resp = (try self.reads.lookup(allocator, physical, key, .{}, self.consistency)) orelse return null;
         defer resp.deinit(allocator);
         return try allocator.dupe(u8, resp.json);
+    }
+
+    fn getManyFn(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, keys: []const []const u8, ctx: *anyopaque, consume: CandidateSource.Consume) anyerror!void {
+        if (keys.len == 0) return;
+        const self: *DistributedCandidateSource = @ptrCast(@alignCast(ptr));
+        const physical = if (self.catalog_binding) |binding| try binding.bindOne(alloc, table) else table;
+        defer if (self.catalog_binding != null) alloc.free(physical);
+        // A bounded exact-ID query reuses the routing layer's fenced fanout and
+        // document-value path. It requires no text or embedding index and avoids
+        // a separate metadata/read-index round trip for every mention.
+        const max_keys = 256;
+        var start: usize = 0;
+        while (start < keys.len) {
+            const end = @min(start + max_keys, keys.len);
+            var response = (try self.reads.query(alloc, physical, .{
+                .filter_doc_ids = keys[start..end],
+                .filter_doc_ids_positive = true,
+                .limit = @intCast(end - start),
+                .include_stored = true,
+                .include_all_fields = true,
+            }, self.consistency)) orelse return error.TableNotFound;
+            defer response.deinit(alloc);
+            try consumeQueryHits(alloc, response.json, ctx, consume);
+            start = end;
+        }
     }
 
     fn scanPrefixFn(
@@ -228,32 +258,35 @@ fn consumeQueryHits(
     ctx: *anyopaque,
     consume: CandidateSource.Consume,
 ) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.InvalidCandidateResponse;
     defer parsed.deinit();
-    if (parsed.value != .object) return;
-    const responses = switch (parsed.value.object.get("responses") orelse return) {
+    if (parsed.value != .object) return error.InvalidCandidateResponse;
+    const responses = switch (parsed.value.object.get("responses") orelse return error.InvalidCandidateResponse) {
         .array => |a| a,
-        else => return,
+        else => return error.InvalidCandidateResponse,
     };
-    if (responses.items.len == 0) return;
+    if (responses.items.len != 1) return error.InvalidCandidateResponse;
     const first = responses.items[0];
-    if (first != .object) return;
-    const hits_obj = switch (first.object.get("hits") orelse return) {
+    if (first != .object) return error.InvalidCandidateResponse;
+    if (first.object.get("status")) |status| {
+        if (status != .integer or status.integer >= 400) return error.InvalidCandidateResponse;
+    }
+    const hits_obj = switch (first.object.get("hits") orelse return error.InvalidCandidateResponse) {
         .object => |o| o,
-        else => return,
+        else => return error.InvalidCandidateResponse,
     };
-    const hits = switch (hits_obj.get("hits") orelse return) {
+    const hits = switch (hits_obj.get("hits") orelse return error.InvalidCandidateResponse) {
         .array => |a| a,
-        else => return,
+        else => return error.InvalidCandidateResponse,
     };
     for (hits.items) |hit| {
-        if (hit != .object) continue;
-        const id = switch (hit.object.get("_id") orelse continue) {
+        if (hit != .object) return error.InvalidCandidateResponse;
+        const id = switch (hit.object.get("_id") orelse return error.InvalidCandidateResponse) {
             .string => |s| s,
-            else => continue,
+            else => return error.InvalidCandidateResponse,
         };
-        const source = hit.object.get("_source") orelse continue;
-        if (source == .null) continue;
+        const source = hit.object.get("_source") orelse return error.InvalidCandidateResponse;
+        if (source != .object) return error.InvalidCandidateResponse;
         const value = try std.json.Stringify.valueAlloc(allocator, source, .{});
         defer allocator.free(value);
         try consume(ctx, id, value);
@@ -271,6 +304,7 @@ const FakeTableReadSource = struct {
     /// Canned query envelope returned by `query` (the vector path).
     query_body: []const u8 = "",
     last_query_k: u32 = 0,
+    point_query_calls: usize = 0,
     last_query_index: []const u8 = "",
 
     fn source(self: *FakeTableReadSource) table_reads.TableReadSource {
@@ -345,6 +379,22 @@ const FakeTableReadSource = struct {
         _ = consistency;
         const self: *FakeTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table)) return null;
+        if (req.filter_doc_ids_positive) {
+            try testing.expect(req.filter_doc_ids.len <= 256);
+            try testing.expectEqual(@as(u32, @intCast(req.filter_doc_ids.len)), req.limit);
+            self.point_query_calls += 1;
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            try out.writer.writeAll("{\"responses\":[{\"hits\":{\"hits\":[");
+            var first = true;
+            for (req.filter_doc_ids) |key| if (self.docs.get(key)) |value| {
+                if (!first) try out.writer.writeByte(',');
+                first = false;
+                try out.writer.print("{{\"_id\":{f},\"_source\":{s}}}", .{ std.json.fmt(key, .{}), value });
+            };
+            try out.writer.writeAll("]}}]}");
+            return .{ .json = try out.toOwnedSlice() };
+        }
         if (req.dense_queries.len > 0) {
             self.last_query_k = req.dense_queries[0].query.k;
             self.last_query_index = req.dense_queries[0].index_name;
@@ -501,4 +551,24 @@ test "DistributedCandidateSource system catalog batch binds once and retains the
     defer next.deinit(alloc);
     try testing.expectEqualStrings("table:replacement", (try next.source.boundTable("entities")).?);
     try testing.expectEqual(@as(usize, 2), binding.calls);
+}
+
+test "DistributedCandidateSource system catalog bulk reads are bounded and preserve missing keys" {
+    const alloc = testing.allocator;
+    var fake = FakeTableReadSource{ .alloc = alloc, .table = "table:old" };
+    defer fake.docs.deinit(alloc);
+    try fake.docs.put(alloc, "first", "{\"canonical_name\":\"First\"}");
+    try fake.docs.put(alloc, "last", "{\"canonical_name\":\"Last\"}");
+    var adapter = DistributedCandidateSource{ .reads = fake.source() };
+    var keys: [257][]const u8 = @splat("missing");
+    keys[0] = "first";
+    keys[256] = "last";
+    var collected = CollectCtx{ .alloc = alloc };
+    defer collected.deinit();
+    try DistributedCandidateSource.getManyFn(&adapter, alloc, "table:old", &keys, &collected, CollectCtx.consume);
+    try testing.expectEqual(@as(usize, 2), fake.point_query_calls);
+    try testing.expectEqual(@as(usize, 2), collected.keys.items.len);
+    try testing.expectEqualStrings("first", collected.keys.items[0]);
+    try testing.expectEqualStrings("last", collected.keys.items[1]);
+    try testing.expectError(error.InvalidCandidateResponse, consumeQueryHits(alloc, "{\"responses\":[{\"status\":503}]}", &collected, CollectCtx.consume));
 }

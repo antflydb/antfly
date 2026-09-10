@@ -50,8 +50,9 @@ The resolution workload models document ingestion into an entity knowledge
 graph on three metadata and three data nodes:
 
 - Use three document shards and one entity shard, with 10 and 100 mentions per
-  document. Exact-key candidate search exercises cross-shard document reads
-  without an inference service. Half the entities already exist; the other
+  document. Keys alternate across the three initial document key ranges.
+  Exact-key candidate search exercises cross-shard document reads
+  with an explicit exact-name scoring policy and no inference service. Half the entities already exist; the other
   half must be created by atomic promotion. Each document uses new keys.
 - Measure from source write to a graph containing every hydrated entity. This
   includes resolution, promotion, graph publication, and polling overhead;

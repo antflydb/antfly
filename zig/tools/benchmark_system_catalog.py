@@ -304,28 +304,29 @@ def resolution_scenario(args, binary: Path) -> dict:
             latencies = []
             polls = []
             for document in range(args.documents + args.warmup):
-                key = f"doc:{mentions}:{document}"
+                key = f"{('1', '7', 'e')[document % 3]}:{mentions}:{document}"
                 names = [f"Entity {mentions} {document} {i}" for i in range(mentions)]
                 expected = {
                     "person/" + name.lower().replace(" ", "_") for name in names
                 }
                 # Half the mentions resolve existing entities; the rest mint new
                 # ones. New keys per document make hydration prove promotion.
-                api.request(
-                    "POST",
-                    "/tables/entities/batch",
-                    {
-                        "inserts": {
-                            "person/" + name.lower().replace(" ", "_"): {
-                                "entity_type": "person",
-                                "canonical_name": name,
-                                "aliases": [name],
-                            }
-                            for name in names[: mentions // 2]
+                if mentions // 2:
+                    api.request(
+                        "POST",
+                        "/tables/entities/batch",
+                        {
+                            "inserts": {
+                                "person/" + name.lower().replace(" ", "_"): {
+                                    "entity_type": "person",
+                                    "canonical_name": name,
+                                    "aliases": [name],
+                                }
+                                for name in names[: mentions // 2]
+                            },
+                            "sync_level": "full_index",
                         },
-                        "sync_level": "full_index",
-                    },
-                )
+                    )
                 query = {
                     "query": {"match_all": {}},
                     "limit": 1,
