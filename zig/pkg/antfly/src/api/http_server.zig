@@ -48312,10 +48312,11 @@ test "system catalog row filter path decoding preserves exact star and escaped p
     try std.testing.expect(!system_catalog.tableResourceMatches(star, escaped));
 }
 
-test "system catalog graph retries retain destination identity" {
+test "system catalog plain retries and joined graph reads reuse request identity" {
     const alloc = std.testing.allocator;
     const Fake = struct {
         queries: usize = 0,
+        retry_first: bool = true,
         bindings: usize = 0,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
@@ -48342,21 +48343,38 @@ test "system catalog graph retries retain destination identity" {
             var binding = try req.graph_table_read_authorizer.?.authorize(a, "entities");
             defer binding.deinit(a);
             try std.testing.expectEqualStrings("table:original", binding.physical_table_name.?);
-            if (self.queries == 1) return error.StorageReadTemporarilyUnavailable;
-            return .{ .json = try a.dupe(u8, "{\"responses\":[]}") };
+            if (self.retry_first and self.queries == 1) return error.StorageReadTemporarilyUnavailable;
+            return .{ .json = try a.dupe(u8, "{\"responses\":[{\"hits\":{\"hits\":[]}}]}") };
         }
     };
-    var fake = Fake{};
-    const reads: table_reads.TableReadSource = .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = Fake.scan, .query = Fake.query } };
-    const writes: table_writes.TableWriteSource = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch } };
-    var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.catalog } }, reads, writes);
-    defer server.deinit();
-    var response = try server.executePublicTableQueryDispatchWithReadinessRetry(alloc, reads, "docs",
-        \\{"query":{"match_all":{}},"graph_queries":{"mentions":{"index":"relations_graph","traverse":{"start":{"keys":["doc"]},"edge_types":["mentions"],"max_depth":1,"limit":10,"include_documents":true}}},"limit":10}
-    , null, null, null, null, null, null);
-    defer response.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), fake.queries);
-    try std.testing.expectEqual(@as(usize, 1), fake.bindings);
+    for ([_]bool{ false, true }) |joined| {
+        var fake = Fake{ .retry_first = !joined };
+        const reads: table_reads.TableReadSource = .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = Fake.scan, .query = Fake.query } };
+        const writes: table_writes.TableWriteSource = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch } };
+        var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.catalog } }, reads, writes);
+        defer server.deinit();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var resolver = ApiHttpServer.CatalogQueryResolver{ .arena = arena.allocator() };
+        _ = try server.resolveQueryCatalog(&resolver, .{}, &.{.{ .table = "entities" }}, false);
+        const base =
+            \\{"query":{"match_all":{}},"graph_queries":{"mentions":{"index":"relations_graph","traverse":{"start":{"keys":["doc"]},"edge_types":["mentions"],"max_depth":1,"limit":10,"include_documents":true}}},"limit":10
+        ;
+        const body = try std.mem.concat(alloc, u8, &.{
+            base,
+            if (joined)
+                \\,"join":{"right_table":"other","on":{"left_field":"customer_id","right_field":"_id"}}
+            else
+                "",
+            "}",
+        });
+        defer alloc.free(body);
+        var response = try server.executePublicTableQueryDispatchWithReadinessRetry(alloc, reads, "docs", body, null, null, null, null, null, &resolver);
+        defer response.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, if (joined) 1 else 2), fake.queries);
+        try std.testing.expectEqual(@as(usize, 1), fake.bindings);
+        if (joined) try std.testing.expect(server.join_job_store.ctx.?.query_execution == null);
+    }
 }
 
 test "system catalog NDJSON reuses one query definition without administrative snapshots" {
