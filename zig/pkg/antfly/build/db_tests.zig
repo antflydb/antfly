@@ -30,6 +30,8 @@ pub const AddTestsResult = struct {
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
     const db_enrichment_filters: []const []const u8 = &.{
+        "db resolver worker resumes durable backfill after deferred activation and reopen",
+        "db managed resolver changes fence in-flight replay and reset durable cursors",
         "storage.db.db.test.db batch marks generated enrichment replay",
         "storage.db.db.test.db computeEnrichments",
         "storage.db.db.test.db leased enrichment",

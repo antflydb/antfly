@@ -1579,7 +1579,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "table provisioner admits algebraic index on a non-empty table through generation repair",
             "target index reconciliation never mutates sibling indexes",
             "target index reconciliation retires orphaned inline enrichments after deletion retry",
-            "managed db open modes never drain resolver backfill on raft apply",
             "replica root reconcile enqueues newly admitted managed full text repair",
             "managed repair visibility edges retire cached readers and runtime status",
             "repair visibility progress does not churn readers without an admission edge",
