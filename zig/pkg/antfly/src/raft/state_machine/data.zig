@@ -30,6 +30,7 @@ pub const DataStateMachine = struct {
                 .prepare_snapshot = prepareSnapshot,
                 .build_snapshot = buildSnapshot,
                 .apply_ready = applyReady,
+                .is_apply_retryable = isApplyRetryable,
                 .retire_group = retireGroup,
             },
         };
@@ -93,6 +94,12 @@ pub const DataStateMachine = struct {
         else
             0;
         if (applied_index > 0) try self.applied_sink.setAppliedIndex(group_id, applied_index);
+    }
+
+    fn isApplyRetryable(_: *anyopaque, _: u64, err: anyerror) bool {
+        // Both durable projection admission and the document delegate normalize
+        // replay-safe capacity/owner contention to this boundary.
+        return err == error.RaftApplyWriterUnavailable;
     }
 
     fn retireGroup(ptr: *anyopaque, group_id: raft_engine.core.types.GroupId) void {

@@ -75,6 +75,7 @@ pub const ProvisionSummary = struct {
 };
 
 pub const ReconcileReplicaRootOptions = struct {
+    drain_resolver_backfill: bool = true,
     io: std.Io = std.Options.debug_io,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     shard_db_adapter: ?shard_db_adapter_mod.ShardDbAdapter = null,
@@ -246,6 +247,7 @@ pub fn reconcileReplicaRootWithOptions(
         const runtime_schema = try runtimeTableSchemaFromJson(alloc, table.schema_json);
         defer if (runtime_schema) |schema| @import("../storage/schema.zig").freeSchema(alloc, schema);
         var open_options = provisioningDbOpenOptions();
+        open_options.start_resolver_workers = options.drain_resolver_backfill;
         open_options.backend_runtime = options.backend_runtime;
         open_options.schema_before_index_load = if (runtime_schema) |schema| .{
             .runtime_schema = schema,
@@ -255,6 +257,7 @@ pub fn reconcileReplicaRootWithOptions(
         defer db.close();
         summary.dbs_opened += 1;
         const index_summary = try reconcileDbIndexesWithOptions(alloc, &db, table.indexes_json, .{
+            .drain_resolver_backfill = options.drain_resolver_backfill,
             .embedding_options = options.embedding_options,
             .source_table = table.name,
             .destination_authorizer = options.destination_authorizer,
@@ -1380,7 +1383,11 @@ pub fn ensureResolversWithOptions(
     }
     for (existing) |cfg| {
         if (desiredResolverContains(desired.items, cfg.name)) continue;
-        if (try db.removeResolver(cfg.name)) summary.removed += 1;
+        const removed = if (options.drain_backfill)
+            try db.removeResolver(cfg.name)
+        else
+            try db.removeResolverWithoutDrain(cfg.name);
+        if (removed) summary.removed += 1;
     }
     return summary;
 }
