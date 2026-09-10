@@ -102,6 +102,11 @@ fn compareBounds(a: Entry, b: Entry) std.math.Order {
     return if (key != .eq) key else compare(a, b);
 }
 
+fn compareEnds(a: Entry, b: Entry) std.math.Order {
+    const order = compareBound(a.run.largest_namespace_name, a.run.largest_key, b.run.largest_namespace_name, b.run.largest_key);
+    return if (order != .eq) order else compare(a, b);
+}
+
 pub const LevelAggregate = struct {
     level: u32,
     count: usize = 0,
@@ -152,10 +157,12 @@ pub const Directory = struct {
     const Tree = @import("ordered_index.zig").Index(Entry, compare);
     const IdTree = @import("ordered_index.zig").SummarizedIndex(Entry, compareId, void);
     const BoundsTree = @import("ordered_index.zig").SummarizedIndex(Entry, compareBounds, BoundsSummary);
+    const EndsTree = @import("ordered_index.zig").SummarizedIndex(Entry, compareEnds, void);
     const LevelTree = @import("ordered_index.zig").Index(LevelAggregate, compareLevel);
     tree: Tree = .{},
     ids: IdTree = .{},
     bounds: BoundsTree = .{},
+    ends: EndsTree = .{},
     levels: LevelTree = .{},
     total_run_bytes: u64 = 0,
     memory_run_count: usize = 0,
@@ -171,6 +178,7 @@ pub const Directory = struct {
         out.tree = self.tree.fork();
         out.ids = self.ids.fork();
         out.bounds = self.bounds.fork();
+        out.ends = self.ends.fork();
         out.levels = self.levels.fork();
         out.total_run_bytes = self.total_run_bytes;
         out.memory_run_count = self.memory_run_count;
@@ -186,14 +194,15 @@ pub const Directory = struct {
         tree: Tree.Reclaimer,
         ids: IdTree.Reclaimer,
         bounds: BoundsTree.Reclaimer,
+        ends: EndsTree.Reclaimer,
         levels: LevelTree.Reclaimer,
 
         pub fn init(directory: *Directory) @This() {
             directory.retainAccounting();
-            return .{ .directory = directory, .tree = .init(directory.tree), .ids = .init(directory.ids), .bounds = .init(directory.bounds), .levels = .init(directory.levels) };
+            return .{ .directory = directory, .tree = .init(directory.tree), .ids = .init(directory.ids), .bounds = .init(directory.bounds), .ends = .init(directory.ends), .levels = .init(directory.levels) };
         }
         pub fn step(self: *@This(), allocator: std.mem.Allocator, credits: *usize) bool {
-            return self.tree.step(allocator, credits) and self.ids.step(allocator, credits) and self.bounds.step(allocator, credits) and self.levels.step(allocator, credits);
+            return self.tree.step(allocator, credits) and self.ids.step(allocator, credits) and self.bounds.step(allocator, credits) and self.ends.step(allocator, credits) and self.levels.step(allocator, credits);
         }
         /// Only after step reports completion, back under the accounting lock.
         pub fn finish(self: *@This(), allocator: std.mem.Allocator) void {
@@ -210,6 +219,8 @@ pub const Directory = struct {
         ids.deinit(allocator);
         var bounds = self.bounds;
         bounds.deinit(allocator);
+        var ends = self.ends;
+        ends.deinit(allocator);
         var levels = self.levels;
         levels.deinit(allocator);
     }
@@ -218,6 +229,7 @@ pub const Directory = struct {
         if (self.tree.account) |account| _ = account.retain();
         if (self.ids.account) |account| _ = account.retain();
         if (self.bounds.account) |account| _ = account.retain();
+        if (self.ends.account) |account| _ = account.retain();
         if (self.levels.account) |account| _ = account.retain();
     }
 
@@ -225,13 +237,16 @@ pub const Directory = struct {
         if (self.tree.account) |account| account.release();
         if (self.ids.account) |account| account.release();
         if (self.bounds.account) |account| account.release();
+        if (self.ends.account) |account| account.release();
         if (self.levels.account) |account| account.release();
     }
     pub fn put(self: *Directory, backend: anytype, run: Run) !void {
         const allocator = backend.allocator;
+        const previous = find(self.tree.root, .{ .run = &run });
         try self.tree.prepare(allocator);
         try self.ids.prepare(allocator);
         try self.bounds.prepare(allocator);
+        try self.ends.prepareEdits(allocator, if (previous) |node| if (compareEnds(node.entry, .{ .run = &run }) != .eq) 2 else 1 else 1);
         try self.levels.prepare(allocator);
         const payload = try allocator.create(Payload);
         errdefer allocator.destroy(payload);
@@ -264,7 +279,6 @@ pub const Directory = struct {
         } else "";
         const entry = Entry{ .run = &payload.run, .payload = payload, .domain = domain };
         defer entry.deinit(allocator);
-        const previous = find(self.tree.root, entry);
         self.memory_run_count += @intFromBool(run.path == null);
         if (previous) |node| self.memory_run_count -= @intFromBool(node.entry.run.path == null);
         const old_bytes = if (previous) |node| node.entry.run.size_bytes else 0;
@@ -274,18 +288,23 @@ pub const Directory = struct {
         level.tombstone_runs += @intFromBool((run.tombstone_count orelse 0) != 0);
         if (previous) |node| level.tombstone_runs -= @intFromBool((node.entry.run.tombstone_count orelse 0) != 0);
         self.total_run_bytes = self.total_run_bytes - old_bytes + run.size_bytes;
+        // Replacing metadata may also change an upper endpoint without
+        // changing the read-order key. Remove its old secondary key first.
+        if (previous) |node| if (compareEnds(node.entry, entry) != .eq) self.ends.removePrepared(allocator, node.entry);
         self.levels.putPrepared(allocator, level);
         self.tree.putPrepared(allocator, entry);
         self.ids.putPrepared(allocator, entry);
         self.bounds.putPrepared(allocator, entry);
+        self.ends.putPrepared(allocator, entry);
     }
     pub fn remove(self: *Directory, allocator: std.mem.Allocator, run: *const Run) !void {
         try self.tree.prepare(allocator);
         try self.ids.prepare(allocator);
         try self.bounds.prepare(allocator);
+        try self.ends.prepare(allocator);
         try self.levels.prepare(allocator);
         const existing = find(self.tree.root, .{ .run = run }) orelse return;
-        // All three trees own this payload until their prepared edits finish.
+        // All run indexes own this payload until their prepared edits finish.
         const entry = existing.entry.retainShared();
         defer entry.deinit(allocator);
         self.memory_run_count -= @intFromBool(entry.run.path == null);
@@ -298,6 +317,7 @@ pub const Directory = struct {
         self.tree.removePrepared(allocator, entry);
         self.ids.removePrepared(allocator, entry);
         self.bounds.removePrepared(allocator, entry);
+        self.ends.removePrepared(allocator, entry);
     }
     pub fn count(self: *const Directory) usize {
         return if (self.tree.root) |root| root.count else 0;
@@ -430,6 +450,62 @@ pub const Directory = struct {
             cursor.len = 1;
         }
         return cursor;
+    }
+
+    /// After the initial overlap query, every unseen interval lies strictly
+    /// left (end < initial lower) or right (start > initial upper). Walk those
+    /// endpoints once as the closure expands. A separate end index prevents
+    /// rescanning long/nested intervals on leftward expansion. Both indexes
+    /// share immutable payloads; the cursors allocate nothing and charge each
+    /// seek/descent to the caller's quantum.
+    pub fn FrontierCursor(comptime reverse: bool) type {
+        return struct {
+            const Node = if (reverse) EndsTree.Node else BoundsTree.Node;
+            path: [2 * @bitSizeOf(usize)]*const Node = undefined,
+            len: usize = 0,
+            descend: ?*const Node,
+            seeking: bool = true,
+            initial_ns: ?[]const u8,
+            initial: []const u8,
+            caught_up: bool = false,
+
+            pub fn init(directory: *const Directory, namespace: ?[]const u8, key: []const u8) @This() {
+                return .{ .descend = if (reverse) directory.ends.root else directory.bounds.root, .initial_ns = namespace, .initial = key };
+            }
+
+            pub fn next(self: *@This(), namespace: ?[]const u8, key: []const u8, credits: *usize) ?Handle {
+                self.caught_up = false;
+                while (credits.* != 0) {
+                    credits.* -= 1;
+                    if (self.descend) |node| {
+                        const run = node.entry.run;
+                        const qualifies = !self.seeking or compareBound(if (reverse) run.largest_namespace_name else run.smallest_namespace_name, if (reverse) run.largest_key else run.smallest_key, self.initial_ns, self.initial) == (if (reverse) std.math.Order.lt else .gt);
+                        if (qualifies) {
+                            self.path[self.len] = node;
+                            self.len += 1;
+                            self.descend = if (reverse) node.right else node.left;
+                        } else self.descend = if (reverse) node.left else node.right;
+                        continue;
+                    }
+                    self.seeking = false;
+                    if (self.len == 0) {
+                        self.caught_up = true;
+                        return null;
+                    }
+                    const node = self.path[self.len - 1];
+                    const run = node.entry.run;
+                    const order = compareBound(if (reverse) run.largest_namespace_name else run.smallest_namespace_name, if (reverse) run.largest_key else run.smallest_key, namespace, key);
+                    if (order == (if (reverse) std.math.Order.lt else .gt)) {
+                        self.caught_up = true;
+                        return null;
+                    }
+                    self.len -= 1;
+                    self.descend = if (reverse) node.left else node.right;
+                    return .{ .run = run, .revision = node.entry.payload.? };
+                }
+                return null;
+            }
+        };
     }
 
     pub fn levelStats(self: *const Directory, number: u32) LevelAggregate {
@@ -584,10 +660,11 @@ pub const Directory = struct {
         return runs;
     }
     pub fn accountedMemoryBytes(self: *const Directory, pass: u64) u64 {
-        return @sizeOf(Directory) + (self.tree.spare.capacity + self.ids.spare.capacity + self.bounds.spare.capacity + self.levels.spare.capacity) * @sizeOf(*Tree.Node) +
+        return @sizeOf(Directory) + (self.tree.spare.capacity + self.ids.spare.capacity + self.bounds.spare.capacity + self.ends.spare.capacity + self.levels.spare.capacity) * @sizeOf(*Tree.Node) +
             (if (self.tree.account) |account| account.chargeOnce(pass) else 0) +
             (if (self.ids.account) |account| account.chargeOnce(pass) else 0) +
             (if (self.bounds.account) |account| account.chargeOnce(pass) else 0) +
+            (if (self.ends.account) |account| account.chargeOnce(pass) else 0) +
             (if (self.levels.account) |account| account.chargeOnce(pass) else 0);
     }
 
@@ -689,6 +766,36 @@ pub const Directory = struct {
         return .{ .domain = domain, .bounds = ordered_bounds };
     }
 };
+
+test "run directory endpoint replacement preserves old cursors and removes old secondary keys" {
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        pub fn retainRunSnapshotRef(_: *@This(), _: *Run) !void {}
+        pub fn releaseRunSnapshotRef(_: *@This(), _: *Run) void {}
+        fn check(allocator: std.mem.Allocator) !void {
+            var fixture = @This(){ .allocator = allocator };
+            const original = try Directory.create(allocator);
+            defer original.destroy(allocator);
+            var run = Run{ .id = 1, .level = 1, .size_bytes = 1, .path = @constCast("end.sst"), .smallest_namespace_name = null, .smallest_key = @constCast("a"), .largest_namespace_name = null, .largest_key = @constCast("b"), .entry_count = 1, .bloom_filter = null, .state = null };
+            try original.put(&fixture, run);
+            const changed = try original.fork(allocator);
+            defer changed.destroy(allocator);
+            var old_cursor = Directory.FrontierCursor(true).init(original, null, "e");
+            run.largest_key = @constCast("d");
+            try changed.put(&fixture, run);
+            try std.testing.expectEqual(@as(usize, 1), changed.ends.root.?.count);
+            var cursor = Directory.FrontierCursor(true).init(changed, null, "e");
+            var credits: usize = 100;
+            try std.testing.expectEqualStrings("d", cursor.next(null, "a", &credits).?.run.largest_key);
+            try std.testing.expect(cursor.next(null, "a", &credits) == null);
+            try std.testing.expectEqualStrings("b", old_cursor.next(null, "a", &credits).?.run.largest_key);
+            try changed.remove(allocator, &run);
+            try std.testing.expect(changed.ends.root == null);
+            try std.testing.expectEqual(@as(usize, 1), original.count());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{});
+}
 
 test "run directory path copies preserve pinned epochs through inserts removals and OOM" {
     const Fixture = struct {

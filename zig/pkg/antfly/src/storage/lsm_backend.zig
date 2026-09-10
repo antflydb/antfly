@@ -19526,6 +19526,7 @@ test "lsm persistent directory and lazy cursor scaling benchmark" {
         try std.testing.expectEqual(@as(usize, 2), cursor.positions.len);
         try std.testing.expectEqual(count, fixture.pins);
         std.debug.print("\nLSM directory runs={d} directory_bytes={d} pin_ns={any} one_run_update_ns={any} off_lock_projection_ns={any} cursor_bytes={d} cursor_setup_ns={d}\n", .{ count, directory.accountedMemoryBytes(1), pin_ns, update_ns, projection_ns, cursor.cursor_storage.len, setup_ns });
+        std.debug.print("LSM endpoint index runs={d} bytes={d} node_bytes={d}\n", .{ count, directory.ends.memoryBytes(), @sizeOf(@TypeOf(directory.ends).Node) });
         // One wide L0 source intersects the entire disjoint lower level.
         // This exercises resumable closure traversal, not just point pruning.
         try directory.put(&fixture, .{ .id = count + 1, .level = 0, .size_bytes = 1024, .path = @constCast("/benchmark/wide.sst"), .smallest_namespace_name = @constCast("docs"), .smallest_key = runs[0].smallest_key, .largest_namespace_name = @constCast("docs"), .largest_key = runs[count - 1].largest_key, .entry_count = 10, .bloom_filter = null, .state = null });

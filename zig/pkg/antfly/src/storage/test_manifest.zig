@@ -212,6 +212,7 @@ comptime {
     _ = @import("lsm_backend.zig");
     _ = @import("lsm_backend/background.zig");
     _ = @import("lsm_backend/cache.zig");
+    _ = @import("lsm_backend/closure_job.zig");
     _ = @import("lsm_backend/compaction.zig");
     _ = @import("lsm_backend/compaction_scheduler.zig");
     _ = @import("lsm_backend/mod.zig");

@@ -18,6 +18,7 @@
 const std = @import("std");
 const Directory = @import("run_directory.zig").Directory;
 const Closure = @import("closure_job.zig").Job;
+const ResourceManager = @import("../resource_manager.zig").ResourceManager;
 const Seen = struct {
     id: u64,
     pub fn retainShared(self: @This()) @This() {
@@ -42,8 +43,15 @@ test "GC objective discovery and cleanup resume within bounded credits" {
         pub fn releaseRunSnapshotRef(self: *@This(), _: *@import("repository.zig").Run) void {
             self.pins -= 1;
         }
-        fn check(allocator: std.mem.Allocator, directory: *Directory) !void {
-            var job = Job.init(directory, 0, 0, 0, 100, 0);
+        fn check(allocator: std.mem.Allocator, directory: *Directory, limit: u64) !void {
+            const resources = @import("../resource_manager.zig");
+            var manager = ResourceManager.init(.{});
+            defer std.debug.assert(manager.sliceStats(.lsm_table_builder_working_set).used_bytes == 0);
+            var scratch = resources.BudgetedAllocator.init(&manager, .lsm_table_builder_working_set, allocator, 1);
+            defer scratch.deinit();
+            var job = Job.init(directory, 0, 0, 0, 100, limit);
+            job.scratch_allocator = scratch.allocator();
+            job.output_manager = &manager;
             defer job.deinit(allocator);
             try std.testing.expect(!try job.step(allocator, 0, std.math.maxInt(u64)));
             try std.testing.expect(!try job.step(allocator, 17, 0));
@@ -73,7 +81,7 @@ test "GC objective discovery and cleanup resume within bounded credits" {
         std.mem.writeInt(u64, &upper, if (i == 0) 33 else i, .big);
         try directory.put(&fixture, .{ .id = i + 1, .level = if (i == 0) 0 else 1, .size_bytes = 1, .path = @constCast("gc.sst"), .smallest_namespace_name = null, .smallest_key = &key, .largest_namespace_name = null, .largest_key = &upper, .entry_count = 1, .tombstone_count = if (i == 0) 1 else 0, .bloom_filter = null, .state = null });
     }
-    try std.testing.checkAllAllocationFailures(allocator, Fixture.check, .{directory});
+    for ([_]u64{ 0, 8 }) |limit| try std.testing.checkAllAllocationFailures(allocator, Fixture.check, .{ directory, limit });
     var reclaim = Directory.Reclaimer.init(directory);
     var slices: usize = 0;
     while (true) {
@@ -89,6 +97,8 @@ test "GC objective discovery and cleanup resume within bounded credits" {
 const SeenTree = @import("ordered_index.zig").SummarizedIndex(Seen, Seen.compare, void);
 
 pub const Job = struct {
+    scratch_allocator: ?std.mem.Allocator = null,
+    output_manager: ?*ResourceManager = null,
     directory: *const Directory,
     cursor: Directory.TombstoneCursor,
     start_rank: usize,
@@ -114,7 +124,7 @@ pub const Job = struct {
     now: u64,
     limit: u64,
     valid_until: u64 = std.math.maxInt(u64),
-    phase: enum { scan, component, measure, discard, progress, retry, done } = .scan,
+    phase: enum { scan, component, measure, discard, prepare_progress, progress, retry, done } = .scan,
 
     pub fn init(directory: *const Directory, start: usize, age: u64, percent: u8, now: u64, limit: u64) Job {
         const rank = if (start < directory.count()) start else 0;
@@ -143,7 +153,7 @@ pub const Job = struct {
                     if (SeenTree.find(self.seen.root, .{ .id = anchor.run.id }) != null) continue;
                     self.anchor = anchor;
                     self.oldest = anchor;
-                    self.component = try Closure.init(allocator, self.directory, &.{anchor}, 0, true);
+                    self.component = try self.initClosure(allocator, anchor, 0, true);
                     self.phase = .component;
                 },
                 .component, .progress => {
@@ -187,8 +197,8 @@ pub const Job = struct {
                             self.intent_wire_bytes +|= 192 +| names;
                             self.intent_data_bytes +|= names +| (if (run.state) |*present| present.estimatedMemoryBytes() else 0);
                         }
-                        try self.seen.prepare(allocator);
-                        self.seen.putPrepared(allocator, .{ .id = run.id });
+                        try self.seen.prepare(self.scratch_allocator orelse allocator);
+                        self.seen.putPrepared(self.scratch_allocator orelse allocator, .{ .id = run.id });
                         self.deletes +|= deletes;
                         const due = run.oldest_tombstone_unix_ns +| self.age;
                         const aged = self.age != 0 and (run.oldest_tombstone_unix_ns == 0 or run.oldest_tombstone_unix_ns > self.now or due <= self.now);
@@ -205,20 +215,29 @@ pub const Job = struct {
                         self.phase = .done;
                         continue;
                     }
-                    self.progress = try Closure.init(allocator, self.directory, &.{self.anchor}, self.limit, false);
+                    self.phase = .prepare_progress;
+                },
+                .prepare_progress => {
+                    var quantum: usize = @min(credits + 1, 64);
+                    credits = credits + 1 - quantum;
+                    if (!self.component.?.reclaimScratchStep(&quantum)) continue;
+                    if (!self.reclaimSeenStep(allocator, &quantum)) continue;
+                    self.progress = try self.initClosure(allocator, self.anchor, self.limit, false);
                     self.phase = .progress;
                 },
                 .discard => {
-                    credits += 1;
-                    if (!self.component.?.deinitStep(allocator, &credits)) continue;
+                    var quantum: usize = @min(credits + 1, 64);
+                    credits = credits + 1 - quantum;
+                    if (!self.component.?.deinitStep(allocator, &quantum)) continue;
                     self.component = null;
                     self.phase = .scan;
                 },
                 .retry => {
-                    credits += 1;
-                    if (!self.progress.?.deinitStep(allocator, &credits)) continue;
+                    var quantum: usize = @min(credits + 1, 64);
+                    credits = credits + 1 - quantum;
+                    if (!self.progress.?.deinitStep(allocator, &quantum)) continue;
                     self.progress = null;
-                    self.progress = try Closure.init(allocator, self.directory, &.{self.oldest}, self.limit, false);
+                    self.progress = try self.initClosure(allocator, self.oldest, self.limit, false);
                     self.phase = .progress;
                 },
                 .done => unreachable,
@@ -226,6 +245,20 @@ pub const Job = struct {
         }
         return self.phase == .done;
     }
+    fn initClosure(self: *Job, allocator: std.mem.Allocator, anchor: Directory.Handle, limit: u64, all_levels: bool) !Closure {
+        var closure = try Closure.init(self.scratch_allocator orelse allocator, self.directory, &.{anchor}, limit, all_levels);
+        closure.output_manager = self.output_manager;
+        return closure;
+    }
+
+    fn reclaimSeenStep(self: *Job, allocator: std.mem.Allocator, credits: *usize) bool {
+        if (self.seen_reclaimer == null) {
+            self.seen_reclaimer = .init(self.seen);
+            self.seen = .{};
+        }
+        return self.seen_reclaimer.?.step(self.scratch_allocator orelse allocator, credits);
+    }
+
     pub fn deinitStep(self: *Job, allocator: std.mem.Allocator, credits: *usize) bool {
         if (self.component) |*closure| {
             if (!closure.deinitStep(allocator, credits)) return false;
@@ -235,11 +268,7 @@ pub const Job = struct {
             if (!closure.deinitStep(allocator, credits)) return false;
             self.progress = null;
         }
-        if (self.seen_reclaimer == null) {
-            self.seen_reclaimer = .init(self.seen);
-            self.seen = .{};
-        }
-        return self.seen_reclaimer.?.step(allocator, credits);
+        return self.reclaimSeenStep(allocator, credits);
     }
     pub fn deinit(self: *Job, allocator: std.mem.Allocator) void {
         var credits: usize = std.math.maxInt(usize);

@@ -196,6 +196,7 @@ const SelectedPlan = struct {
     reservation: ?resource_manager_mod.Reservation = null,
     gc_objective_handles: ?[]const Directory.Handle = null,
     gc_objective_indices: ?[]const usize = null,
+    objective_reservation: ?resource_manager_mod.Reservation = null,
     released_inputs: usize = 0,
     released_objectives: usize = 0,
     fn deinit(self: @This(), allocator: std.mem.Allocator) void {
@@ -265,6 +266,8 @@ const SelectedPlan = struct {
         self.gc_objective_indices = null;
         if (self.reservation) |*lease| lease.release();
         self.reservation = null;
+        if (self.objective_reservation) |*lease| lease.release();
+        self.objective_reservation = null;
         return true;
     }
 };
@@ -1155,6 +1158,9 @@ pub const PendingGc = struct {
     selected: ?SelectedPlan = null,
     intent: ?Intent = null,
     validation: ?DependencyValidation = null,
+    scratch: ?resource_manager_mod.BudgetedAllocator = null,
+    phase: enum { discover, reclaim_discovery, validate } = .discover,
+    objective_bounds: struct { lower_ns: ?[]const u8, lower: []const u8, upper_ns: ?[]const u8, upper: []const u8 } = undefined,
 
     const Intent = struct {
         base: *Directory,
@@ -1192,7 +1198,7 @@ pub const PendingGc = struct {
             self.rebase = null;
         }
 
-        fn stepRebase(self: *Intent, backend: anytype, component: *const ClosureJob, selected: *const SelectedPlan, credits_arg: usize, deadline: u64) !bool {
+        fn stepRebase(self: *Intent, backend: anytype, component: anytype, selected: *const SelectedPlan, credits_arg: usize, deadline: u64) !bool {
             var credits = credits_arg;
             const rebase = &self.rebase.?;
             const objectives = selected.gc_objective_handles orelse selected.plan.input_handles.?;
@@ -1249,10 +1255,11 @@ pub const PendingGc = struct {
             const height: u64 = @max(
                 @max(if (current.tree.root) |root| root.height else 1, if (current.ids.root) |root| root.height else 1),
                 @max(if (current.bounds.root) |root| root.height else 1, if (current.levels.root) |root| root.height else 1),
+                if (current.ends.root) |root| root.height else 1,
                 if (backend.runs.tree.root) |root| root.height else 1,
             );
             const nodes = @min(current.count(), changes *| height);
-            const node_bytes = @sizeOf(@TypeOf(current.tree).Node) + @sizeOf(@TypeOf(current.ids).Node) + @sizeOf(@TypeOf(current.bounds).Node) + @sizeOf(@TypeOf(current.levels).Node) + @sizeOf(run_store.Store.Tree.Node);
+            const node_bytes = @sizeOf(@TypeOf(current.tree).Node) + @sizeOf(@TypeOf(current.ids).Node) + @sizeOf(@TypeOf(current.bounds).Node) + @sizeOf(@TypeOf(current.ends).Node) + @sizeOf(@TypeOf(current.levels).Node) + @sizeOf(run_store.Store.Tree.Node);
             const scratch = 8192 +| (nodes +| height * 8 +| 64) *| node_bytes +| changes *| (2 * @sizeOf(Run) + 256) +| pending.job.intent_data_bytes;
             var reservation: ?resource_manager_mod.Reservation = null;
             errdefer if (reservation) |*lease| lease.release();
@@ -1265,7 +1272,7 @@ pub const PendingGc = struct {
             errdefer directory.destroy(allocator);
             const store = try allocator.create(run_store.Store);
             store.* = backend.runs.fork();
-            return .{ .base = base, .directory = directory, .store = store, .wire = wire, .reservation = reservation, .header_bytes = 3 * @sizeOf(Directory) + 2 * @sizeOf(run_store.Store) + (2 * @bitSizeOf(usize) * 8 + 128) * 5 * @sizeOf(usize) };
+            return .{ .base = base, .directory = directory, .store = store, .wire = wire, .reservation = reservation, .header_bytes = 3 * @sizeOf(Directory) + 2 * @sizeOf(run_store.Store) + (2 * @bitSizeOf(usize) * 8 + 128) * 6 * @sizeOf(usize) };
         }
 
         fn step(self: *Intent, backend: anytype, selected: *SelectedPlan, credits_arg: usize, deadline: u64) !bool {
@@ -1337,6 +1344,7 @@ pub const PendingGc = struct {
         if (self.validation) |*validation| validation.deinit(backend);
         if (self.selected) |selected| selected.deinit(backend.allocator);
         self.job.deinit(backend.allocator);
+        if (self.scratch) |*scratch| scratch.deinit();
         backend.retireCheckpointDirectory(self.directory);
         if (self.reservation) |*lease| lease.release();
         backend.allocator.destroy(self);
@@ -1344,17 +1352,23 @@ pub const PendingGc = struct {
     fn take(self: *@This(), allocator: std.mem.Allocator) !?SelectedPlan {
         if (!self.job.eligible) return null;
         const component = &self.job.component.?;
+        self.objective_bounds = .{ .lower_ns = component.lower_ns, .lower = component.lower, .upper_ns = component.upper_ns, .upper = component.upper };
         var result = SelectedPlan{ .plan = .{ .source_level = 0, .source_start = 0, .source_len = 0, .target_start = 0, .target_len = 0, .output_level = 0 } };
         if (self.job.progress == null) {
             const handles = component.handles.?;
             result.plan = .{ .source_level = handles[0].run.level, .source_start = 0, .source_len = handles.len, .target_start = handles.len, .target_len = 0, .output_level = @max(@as(u32, 1), handles[handles.len - 1].run.level), .run_indices = component.indices, .input_handles = handles, .tombstone_gc = true };
+            result.reservation = component.output_reservation;
         } else {
             if (self.job.progress.?.phase == .done) {
                 const progress = &self.job.progress.?;
                 result.plan = .{ .source_level = progress.source_level, .source_start = 0, .source_len = progress.source_len, .target_start = progress.source_len, .target_len = progress.handles.?.len - progress.source_len, .output_level = progress.source_level +| 1, .run_indices = progress.indices, .input_handles = progress.handles };
                 progress.indices = null;
                 progress.handles = null;
+                result.reservation = progress.output_reservation;
+                progress.output_reservation = null;
             } else if (self.job.split) {
+                if (self.job.output_manager) |manager| result.reservation = try manager.reserve(.lsm_table_builder_working_set, @sizeOf(Directory.Handle) + @sizeOf(usize));
+                errdefer if (result.reservation) |*lease| lease.release();
                 const handles = try allocator.alloc(Directory.Handle, 1);
                 errdefer allocator.free(handles);
                 const indices = try allocator.alloc(usize, 1);
@@ -1365,9 +1379,11 @@ pub const PendingGc = struct {
             }
             result.gc_objective_handles = component.handles;
             result.gc_objective_indices = component.indices;
+            result.objective_reservation = component.output_reservation;
         }
         component.handles = null;
         component.indices = null;
+        component.output_reservation = null;
         return result;
     }
 };
@@ -1376,6 +1392,114 @@ fn handleBytes(handles: []const Directory.Handle) u64 {
     var bytes: u64 = 0;
     for (handles) |handle| bytes +|= handle.run.size_bytes;
     return bytes;
+}
+
+test "GC phase admission ignores unrelated runs and releases discovery before validation" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const allocator = std.testing.allocator;
+    for ([_]usize{ 10000, 30000 }) |count| {
+        var budgets = resource_manager_mod.Options.defaultBudgets();
+        const cap = 3 * 1024 * 1024;
+        budgets[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = cap };
+        var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+        defer std.debug.assert(manager.sliceStats(.lsm_table_builder_working_set).used_bytes == 0);
+        var backend = Backend.init(allocator, .{});
+        defer backend.close();
+        try populateClosureDirectoryWithInputsForTest(&backend, count, 2);
+        const changed = try (try backend.planningDirectory()).fork(allocator);
+        var deleted = changed.at(count - 1).run.*;
+        deleted.tombstone_count = 1;
+        try changed.put(&backend, deleted);
+        backend.publishRunDirectory(changed);
+        backend.options.resource_manager = &manager;
+        const locked = runtime_mod.lockBackend(Backend, &backend);
+        defer runtime_mod.unlockBackend(Backend, &backend, locked);
+        const started = @import("antfly_platform").time.monotonicNs();
+        var saw_handoff = false;
+        var accepted = false;
+        for (0..4096) |_| {
+            if (try selectDirectoryGc(&backend, 0)) |selected| {
+                try std.testing.expectEqual(@as(usize, 1), selected.plan.input_handles.?.len);
+                try std.testing.expect(selected.reservation != null);
+                selected.release(&backend);
+                accepted = true;
+                break;
+            }
+            if (backend.pending_gc) |pending| {
+                if (pending.phase == .reclaim_discovery) {
+                    saw_handoff = true;
+                    try std.testing.expect(pending.validation == null);
+                    try std.testing.expect(pending.scratch.?.live_bytes > 0);
+                }
+                if (pending.phase == .validate) try std.testing.expectEqual(@as(u64, 0), pending.scratch.?.live_bytes);
+            }
+        }
+        try std.testing.expect(accepted and saw_handoff);
+        const peak = manager.sliceStats(.lsm_table_builder_working_set).peak_bytes;
+        try std.testing.expect(peak < cap);
+        if (@import("builtin").mode == .ReleaseFast) std.debug.print("\nLSM GC phase inputs=1 runs={d} peak_bytes={d} elapsed_ns={d}\n", .{ count, peak, @import("antfly_platform").time.monotonicNs() - started });
+    }
+}
+
+test "GC phase handoff preserves epochs and drains partial cleanup or admission denial" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const allocator = std.testing.allocator;
+    for (0..4) |mode| {
+        var budgets = resource_manager_mod.Options.defaultBudgets();
+        const cap: u64 = if (mode == 3) @sizeOf(PendingGc) + @sizeOf(Directory) + 1 else 1024 * 1024;
+        budgets[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = cap };
+        var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+        defer std.debug.assert(manager.sliceStats(.lsm_table_builder_working_set).used_bytes == 0);
+        var backend = Backend.init(allocator, .{});
+        defer backend.close();
+        try populateClosureDirectoryWithInputsForTest(&backend, 6000, 5001);
+        const initial = try (try backend.planningDirectory()).fork(allocator);
+        var deleted = initial.at(0).run.*;
+        deleted.tombstone_count = 1;
+        deleted.gc_requested = true;
+        try initial.put(&backend, deleted);
+        backend.publishRunDirectory(initial);
+        backend.options.resource_manager = &manager;
+        const locked = runtime_mod.lockBackend(Backend, &backend);
+        defer runtime_mod.unlockBackend(Backend, &backend, locked);
+        if (mode == 3) {
+            try std.testing.expectError(error.ResourceBudgetExceeded, selectDirectoryGc(&backend, 0));
+            try std.testing.expect(backend.pending_gc == null);
+            continue;
+        }
+        for (0..4096) |_| {
+            try std.testing.expect(try selectDirectoryGc(&backend, 0) == null);
+            if (backend.pending_gc.?.phase == .reclaim_discovery) break;
+        }
+        const pending = backend.pending_gc.?;
+        try std.testing.expect(pending.phase == .reclaim_discovery);
+        try std.testing.expect(pending.selected.?.reservation != null);
+        const ranks = pending.selected.?.plan.run_indices.?.ptr;
+        if (mode == 2) {
+            var credit: usize = 1;
+            try std.testing.expect(!pending.job.deinitStep(allocator, &credit));
+            continue; // close owns all remaining arena/handle cleanup.
+        }
+        const changed = try (try backend.planningDirectory()).fork(allocator);
+        var replacement = changed.at(if (mode == 0) 5999 else 1).run.*;
+        replacement.gc_requested = true;
+        try changed.put(&backend, replacement);
+        backend.publishRunDirectory(changed);
+        var accepted = false;
+        for (0..4096) |_| {
+            if (backend.pending_gc == null) break;
+            if (try selectDirectoryGc(&backend, 0)) |selected| {
+                try std.testing.expectEqual(@as(usize, 5001), selected.plan.input_handles.?.len);
+                try std.testing.expectEqual(ranks, selected.plan.run_indices.?.ptr);
+                selected.release(&backend);
+                accepted = true;
+                break;
+            }
+        }
+        try std.testing.expectEqual(mode == 0, accepted);
+        try std.testing.expect(backend.pending_gc == null);
+        try std.testing.expect(manager.sliceStats(.lsm_table_builder_working_set).peak_bytes <= cap);
+    }
 }
 
 test "GC intent rebases writes between slices without restarting or dropping newer rows" {
@@ -1464,7 +1588,7 @@ fn resumeGcIntent(backend: anytype, pending: *PendingGc) !?SelectedPlan {
         // before unlock can starve intent work under continuous publication.
         if (deadline == 0) deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
         const result = if (intent.rebase != null)
-            intent.stepRebase(backend, &pending.job.component.?, &pending.selected.?, 512, deadline)
+            intent.stepRebase(backend, &pending.objective_bounds, &pending.selected.?, 512, deadline)
         else
             intent.step(backend, &pending.selected.?, 512, deadline);
         _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
@@ -1485,13 +1609,6 @@ fn resumeGcIntent(backend: anytype, pending: *PendingGc) !?SelectedPlan {
         if (turns == 4 or @import("antfly_platform").time.monotonicNs() >= deadline) return null;
     }
     retire = true;
-    var result_reservation: ?resource_manager_mod.Reservation = null;
-    errdefer if (result_reservation) |*lease| lease.release();
-    if (pending.selected.?.plan.source_len != 0) if (backend.options.resource_manager) |manager| {
-        const inputs = pending.selected.?.plan.input_handles.?.len;
-        const objectives = if (pending.selected.?.gc_objective_handles) |handles| handles.len else 0;
-        result_reservation = try manager.reserve(.lsm_table_builder_working_set, 1024 + (inputs + objectives) * (@sizeOf(Directory.Handle) + @sizeOf(usize)));
-    };
     // All record revisions, metadata clones and handle refreshes are prepared.
     // Publication changes two roots and the durable-metadata obligation only.
     std.mem.swap(run_store.Store, &backend.runs, intent.store.?);
@@ -1505,7 +1622,6 @@ fn resumeGcIntent(backend: anytype, pending: *PendingGc) !?SelectedPlan {
     var selected = pending.selected.?;
     pending.selected = null;
     selected.plan.partition_key = backend.options.run_partition_key;
-    selected.reservation = result_reservation;
     return selected;
 }
 
@@ -1570,10 +1686,15 @@ fn selectDirectoryGc(backend: anytype, max_bytes: u64) !?SelectedPlan {
         errdefer backend.retireCheckpointDirectory(directory);
         var reservation: ?resource_manager_mod.Reservation = null;
         errdefer if (reservation) |*lease| lease.release();
-        if (backend.options.resource_manager) |manager| reservation = try manager.reserve(.lsm_table_builder_working_set, 64 * 1024 + directory.count() * 384);
+        if (backend.options.resource_manager) |manager| reservation = try manager.reserve(.lsm_table_builder_working_set, @sizeOf(PendingGc) + @sizeOf(Directory));
         const pending = try allocator.create(PendingGc);
         const cache = GcDebtCache{ .generation = backend.run_directory_generation, .age = backend.options.tombstone_gc_max_age_ns, .percent = backend.options.tombstone_gc_min_percent, .checked_at = gcNowNs() };
         pending.* = .{ .directory = directory, .job = .init(directory, backend.gc_planning_next_rank, cache.age, cache.percent, cache.checked_at, limit), .cache = cache, .reservation = reservation };
+        if (backend.options.resource_manager) |manager| {
+            pending.scratch = .init(manager, .lsm_table_builder_working_set, allocator, 1);
+            pending.job.scratch_allocator = pending.scratch.?.allocator();
+            pending.job.output_manager = manager;
+        }
         backend.pending_gc = pending;
     }
     const pending = backend.pending_gc.?;
@@ -1591,6 +1712,7 @@ fn selectDirectoryGc(backend: anytype, max_bytes: u64) !?SelectedPlan {
     backend.directory_planning_slices +|= 1;
     const done = result catch |err| {
         retire = true;
+        if (err == error.OutOfMemory) if (pending.scratch) |*scratch| if (scratch.denied()) return error.ResourceBudgetExceeded;
         return err;
     };
     if (!done) return null;
@@ -1600,6 +1722,7 @@ fn selectDirectoryGc(backend: anytype, max_bytes: u64) !?SelectedPlan {
     pending.cache.valid_until = pending.job.valid_until;
     if (pending.cache.generation == backend.run_directory_generation) backend.gc_debt_cache = pending.cache;
     pending.selected = try pending.take(allocator) orelse return null;
+    pending.phase = .reclaim_discovery;
     retire = false;
     return null;
 }
@@ -1611,6 +1734,29 @@ fn resumeGcValidation(backend: anytype, pending: *PendingGc) !?SelectedPlan {
         backend.retireGcPlanning(pending);
     };
     errdefer retire = true;
+    if (pending.phase == .reclaim_discovery) {
+        if (backend.manifestCoordinationIo()) |io| try io.checkCancel();
+        backend.retainReaderKind(.compaction);
+        defer backend.releaseReaderKind(.compaction);
+        runtime_mod.unlockBackend(@TypeOf(backend.*), backend, true);
+        var credits: usize = 2048;
+        const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        var done = false;
+        while (credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
+            var quantum: usize = @min(credits, 64);
+            const before = quantum;
+            done = pending.job.deinitStep(backend.allocator, &quantum);
+            credits -= before - quantum;
+            if (done) break;
+        }
+        _ = runtime_mod.lockBackend(@TypeOf(backend.*), backend);
+        backend.directory_planning_slices +|= 1;
+        if (done) {
+            if (pending.scratch) |*scratch| std.debug.assert(scratch.live_bytes == 0);
+            pending.phase = .validate;
+        }
+        return null;
+    }
     if (pending.validation == null) {
         const selected = &pending.selected.?;
         const objectives = selected.gc_objective_handles orelse selected.plan.input_handles.?;
@@ -1620,6 +1766,9 @@ fn resumeGcValidation(backend: anytype, pending: *PendingGc) !?SelectedPlan {
         objective.split_gc = false;
         objective.tombstone_gc = true;
         pending.validation = try DependencyValidation.init(backend, objective);
+        const ranks = if (selected.gc_objective_handles != null) &selected.gc_objective_indices else &selected.plan.run_indices;
+        pending.validation.?.job.indices = @constCast(ranks.*.?);
+        ranks.* = null;
     }
     const result = try pending.validation.?.advanceLocked(backend);
     backend.directory_planning_slices +|= 1;
@@ -1628,6 +1777,9 @@ fn resumeGcValidation(backend: anytype, pending: *PendingGc) !?SelectedPlan {
         retire = true;
         return null;
     }
+    const selected = &pending.selected.?;
+    const ranks = if (selected.gc_objective_handles != null) &selected.gc_objective_indices else &selected.plan.run_indices;
+    ranks.* = pending.validation.?.takeIndices();
     // The complete objective is certified against the live root. Capture the
     // intent roots before unlocking; intent's own continuation rebases later
     // publications without retaining validation scratch.

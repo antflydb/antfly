@@ -21,6 +21,101 @@ const Run = @import("repository.zig").Run;
 const state = @import("state.zig");
 const resource_manager = @import("../resource_manager.zig");
 
+const TestFixture = struct {
+    allocator: std.mem.Allocator,
+    pub fn retainRunSnapshotRef(_: *@This(), _: *Run) !void {}
+    pub fn releaseRunSnapshotRef(_: *@This(), _: *Run) void {}
+
+    fn put(self: *@This(), directory: *Directory, id: usize, level: u32, lower_ns: ?[]const u8, lower: u64, upper_ns: ?[]const u8, upper: u64) !void {
+        var first: [8]u8 = undefined;
+        var last: [8]u8 = undefined;
+        std.mem.writeInt(u64, &first, lower, .big);
+        std.mem.writeInt(u64, &last, upper, .big);
+        try directory.put(self, .{ .id = id, .visibility_id = 1, .level = level, .size_bytes = 1, .path = @constCast("frontier.sst"), .smallest_namespace_name = @constCast(lower_ns), .smallest_key = &first, .largest_namespace_name = @constCast(upper_ns), .largest_key = &last, .entry_count = 1, .bloom_filter = null, .state = null });
+    }
+};
+
+test "closure frontier visits chained overlaps once in both directions" {
+    const allocator = std.testing.allocator;
+    var fixture = TestFixture{ .allocator = allocator };
+    for ([_]usize{ 1000, 2000, 4000 }) |count| {
+        const directory = try Directory.create(allocator);
+        defer directory.destroy(allocator);
+        for (0..count) |i| try fixture.put(directory, i + 1, 0, null, i, null, i + 1);
+        for ([_]usize{ 0, count / 2, count - 1 }) |seed| {
+            const handle = directory.at(directory.rankOf(directory.byId(seed + 1).?).?);
+            var job = try Job.init(allocator, directory, &.{handle}, 0, seed == count / 2);
+            defer job.deinit(allocator);
+            try std.testing.expect(!try job.step(allocator, 0));
+            try std.testing.expect(!try job.stepUntil(allocator, 100, 0));
+            try std.testing.expectEqual(@as(usize, 0), job.visits);
+            const started = @import("antfly_platform").time.monotonicNs();
+            var turns: usize = 0;
+            const credits: usize = if (@import("builtin").mode == .ReleaseFast) 2048 else 1;
+            while (!try job.step(allocator, credits)) {
+                turns += 1;
+                if (turns > 16 * count) return error.FrontierDidNotConverge;
+            }
+            try std.testing.expectEqual(count, job.count);
+            try std.testing.expect(job.visits < 8 * count + 256);
+            if (@import("builtin").mode == .ReleaseFast) std.debug.print("\nLSM frontier inputs={d} seed={d} visits={d} elapsed_ns={d}\n", .{ count, seed, job.visits, @import("antfly_platform").time.monotonicNs() - started });
+        }
+    }
+}
+
+test "closure frontier matches fixed point oracle across nested ranges namespaces and levels" {
+    const allocator = std.testing.allocator;
+    var fixture = TestFixture{ .allocator = allocator };
+    for (0..24) |variant| {
+        const directory = try Directory.create(allocator);
+        defer directory.destroy(allocator);
+        for (0..64) |i| {
+            const namespace: ?[]const u8 = if (i % 3 == 0) null else if (i % 3 == 1) "" else "docs";
+            const start = (i * 37 + variant * 13) % 256;
+            const end = start + (i * 17 + variant) % 48;
+            try fixture.put(directory, i + 1, @intCast(i % 4), namespace, start, if (i % 11 == 0) "docs" else namespace, end);
+        }
+        const all_levels = variant % 2 == 0;
+        const handle = directory.at(variant);
+        var job = try Job.init(allocator, directory, &.{handle}, 0, all_levels);
+        defer job.deinit(allocator);
+        var expected: [64]bool = @splat(false);
+        expected[variant] = true;
+        var lower_ns = job.lower_ns;
+        var lower = job.lower;
+        var upper_ns = job.upper_ns;
+        var upper = job.upper;
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (0..64) |i| {
+                if (expected[i]) continue;
+                const run = directory.at(i).run;
+                if (!all_levels and !(run.level == 0 and job.source_level == 0) and run.level != job.source_level + 1) continue;
+                if (Job.bound(run.smallest_namespace_name, run.smallest_key, upper_ns, upper) == .gt or Job.bound(run.largest_namespace_name, run.largest_key, lower_ns, lower) == .lt) continue;
+                expected[i] = true;
+                changed = true;
+                if (Job.bound(run.smallest_namespace_name, run.smallest_key, lower_ns, lower) == .lt) {
+                    lower_ns = run.smallest_namespace_name;
+                    lower = run.smallest_key;
+                }
+                if (Job.bound(run.largest_namespace_name, run.largest_key, upper_ns, upper) == .gt) {
+                    upper_ns = run.largest_namespace_name;
+                    upper = run.largest_key;
+                }
+            }
+        }
+        var turns: usize = 0;
+        while (!try job.step(allocator, 1)) {
+            turns += 1;
+            if (turns > 4096) return error.FrontierDidNotConverge;
+        }
+        var actual: [64]bool = @splat(false);
+        for (job.indices.?) |rank| actual[rank] = true;
+        try std.testing.expectEqualSlices(bool, &expected, &actual);
+    }
+}
+
 pub const Job = struct {
     const Node = struct {
         handle: Directory.Handle,
@@ -42,8 +137,10 @@ pub const Job = struct {
     upper_ns: ?[]const u8,
     upper: []const u8,
     cursor: ?Directory.OverlapCursor = null,
-    changed: bool = true,
-    phase: enum { discover, emit, done, oversized } = .discover,
+    left: ?Directory.FrontierCursor(true) = null,
+    right: ?Directory.FrontierCursor(false) = null,
+    frontier_right: bool = false,
+    phase: enum { discover, frontier, emit, done, oversized } = .discover,
     path: [2 * @bitSizeOf(usize)]*Node = undefined,
     depth: usize = 0,
     emitted: usize = 0,
@@ -101,6 +198,12 @@ pub const Job = struct {
         self.indices = null;
         if (self.output_reservation) |*lease| lease.release();
         self.output_reservation = null;
+        return self.reclaimScratchStep(credits);
+    }
+
+    /// Retain emitted handles/ranks but retire the discovery-only arena.
+    /// No discovery/emit operation may run after this handoff starts.
+    pub fn reclaimScratchStep(self: *Job, credits: *usize) bool {
         // Reclaim one arena allocation per credit using the arena's own
         // destructor, without depending on its private allocation header.
         for ([_]*@TypeOf(self.arena.state.used_list){ &self.arena.state.used_list, &self.arena.state.free_list }) |list| {
@@ -179,12 +282,10 @@ pub const Job = struct {
         if (bound(run.smallest_namespace_name, run.smallest_key, self.lower_ns, self.lower) == .lt) {
             self.lower_ns = run.smallest_namespace_name;
             self.lower = run.smallest_key;
-            self.changed = true;
         }
         if (bound(run.largest_namespace_name, run.largest_key, self.upper_ns, self.upper) == .gt) {
             self.upper_ns = run.largest_namespace_name;
             self.upper = run.largest_key;
-            self.changed = true;
         }
     }
     fn descend(self: *Job, root: ?*Node) void {
@@ -194,6 +295,24 @@ pub const Job = struct {
             self.depth += 1;
             current = node.left[1];
         }
+    }
+
+    fn consider(self: *Job, handle: Directory.Handle) !void {
+        const run = handle.run;
+        const older = self.source_level == 0 and run.level == 0 and visibilityOf(run) <= self.visibility;
+        if (self.all_levels or older or (self.source_level != std.math.maxInt(u32) and run.level == self.source_level + 1)) try self.add(handle);
+    }
+
+    fn beginEmission(self: *Job, allocator: std.mem.Allocator) !void {
+        if (self.output_manager) |manager| self.output_reservation = try manager.reserve(
+            .lsm_table_builder_working_set,
+            self.count * (@sizeOf(Directory.Handle) + @sizeOf(usize)),
+        );
+        self.handles = try allocator.alloc(Directory.Handle, self.count);
+        self.indices = try allocator.alloc(usize, self.count);
+        if (self.count > self.directory.count() / 4) self.projection_cursor = self.directory.readCursor();
+        self.descend(self.roots[1]);
+        self.phase = .emit;
     }
 
     /// Each credit visits one directory node or emits one selected handle.
@@ -210,40 +329,49 @@ pub const Job = struct {
         var remaining = credits;
         while (remaining != 0) {
             if (deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return false;
+            if ((self.phase == .discover or self.phase == .frontier) and self.max_bytes != 0 and self.bytes > self.max_bytes) {
+                self.phase = .oversized;
+                return true;
+            }
             switch (self.phase) {
                 .done, .oversized => return true,
                 .discover => {
-                    if (self.max_bytes != 0 and self.bytes > self.max_bytes) {
-                        self.phase = .oversized;
-                        return true;
-                    }
                     if (self.cursor == null) {
-                        self.changed = false;
                         self.cursor = self.directory.overlaps(self.lower_ns, self.lower, self.upper_ns, self.upper);
+                        self.left = .init(self.directory, self.lower_ns, self.lower);
+                        self.right = .init(self.directory, self.upper_ns, self.upper);
                     }
                     const before = remaining;
                     const next = self.cursor.?.next(&remaining);
                     self.visits += before - remaining;
                     if (next) |handle| {
-                        const run = handle.run;
-                        const older = self.source_level == 0 and run.level == 0 and visibilityOf(run) <= self.visibility;
-                        if (self.all_levels or older or (self.source_level != std.math.maxInt(u32) and run.level == self.source_level + 1)) try self.add(handle);
+                        try self.consider(handle);
                     } else if (self.cursor.?.done()) {
                         self.cursor = null;
-                        if (self.changed) continue;
-                        if (self.output_manager) |manager| self.output_reservation = try manager.reserve(
-                            .lsm_table_builder_working_set,
-                            self.count * (@sizeOf(Directory.Handle) + @sizeOf(usize)),
-                        );
-                        self.handles = try allocator.alloc(Directory.Handle, self.count);
-                        self.indices = try allocator.alloc(usize, self.count);
-                        // Dense selections can resolve positions with one
-                        // resumable merge walk (N <= 4K), avoiding K rank
-                        // searches. Sparse selections retain O(K log N) work.
-                        if (self.count > self.directory.count() / 4) self.projection_cursor = self.directory.readCursor();
-                        self.descend(self.roots[1]);
-                        self.phase = .emit;
+                        self.phase = .frontier;
                     }
+                },
+                .frontier => {
+                    if (!self.frontier_right) {
+                        const before = remaining;
+                        const left = self.left.?.next(self.lower_ns, self.lower, &remaining);
+                        self.visits += before - remaining;
+                        if (left) |handle| {
+                            try self.consider(handle);
+                            continue;
+                        }
+                        if (self.left.?.caught_up) self.frontier_right = true;
+                        continue;
+                    }
+                    const before_right = remaining;
+                    const right = self.right.?.next(self.upper_ns, self.upper, &remaining);
+                    self.visits += before_right - remaining;
+                    if (right) |handle| {
+                        try self.consider(handle);
+                        self.frontier_right = false;
+                        continue;
+                    }
+                    if (self.right.?.caught_up) try self.beginEmission(allocator);
                 },
                 .emit => {
                     if (self.depth == 0) {

@@ -27,7 +27,7 @@ retains every tree's accounting handle until it reacquires that mutex.
 ## Incrementally maintained planning indexes
 
 Each immutable directory owns persistent indexes for read precedence,
-stable run IDs, augmented key-range ordering, and per-level
+stable run IDs, augmented start-key ordering, end-key ordering, and per-level
 counts/bytes/tombstone-run counts.
 Payload ownership and SST pins are shared across indexes. A publication stages
 all allocations, then updates only changed paths. Level moves, split outputs,
@@ -62,6 +62,76 @@ The full positional/domain planner remains only as an oracle/diagnostic adapter.
 Planning builds are single-flight and memory-admitted. Plans are revalidated
 against live inputs before installation. GC intent is merged from those live
 inputs, including requests made while ordinary compaction was building.
+
+### Monotonic overlap frontiers and phase-owned GC memory
+
+Resumable closure discovery performs one initial overlap query. Every interval
+outside that query is either strictly to its left (end before the initial lower
+bound) or strictly to its right (start after the initial upper bound). Two
+allocation-free endpoint cursors walk these disjoint sets as the closure grows.
+They retain their traversal stacks across one-credit turns, including the initial
+seek, and stop without consuming the next out-of-range interval. Newly selected
+runs may extend either frontier; already visited ranges are never rescanned.
+Inclusive endpoint equality and namespace ordering match the overlap query.
+Ineligible levels and newer L0 runs are visited once but never extend coverage.
+The selected-run AVL indexes still impose O(K log K) insertion work; the new
+frontier traversal removes the quadratic repeated-query cost, not that cost.
+
+The end-key index shares immutable run payloads and is maintained, forked,
+accounted, and reclaimed with the other directory indexes. Endpoint-changing
+replacements reserve both removal and insertion before mutation; old readers
+retain the old endpoint. This deliberately spends one additional metadata-only
+tree node per run to avoid building a job-local global projection or repeatedly
+visiting nested ranges. No persisted format or legacy compatibility is added.
+
+GC admission now reserves only its fixed owner/epoch headers initially. A
+stable-address budgeted allocator charges membership nodes and closure arenas
+before allocation. Component/progress arrays receive independent exact-size
+reservations; both reservations follow a partial-progress plan and its larger GC
+objective through validation, intent publication, execution, and cleanup.
+There is no directory-count reservation and no second admission for those same
+arrays at publication. The existing rank buffer is reused by validation.
+
+Before starting bounded progress on an oversized GC objective, GC reclaims the
+finished component arena and membership scratch in bounded chunks while retaining
+its objective arrays. Before validation, another explicit handoff drains all
+remaining discovery scratch off-lock (2,048 credits / two milliseconds per turn,
+checking time between at-most-64-credit cleanup chunks). Only scalar intent
+totals, pinned range bounds, and owned result buffers survive that handoff.
+Cancellation, allocation denial, stale inputs, and close use the same ownership
+cleanup. These bounds are cooperative, not hard real-time guarantees.
+
+Local ReleaseFast metadata probes on macOS arm64 measured:
+
+| Chained inputs | Previous directory visits | Frontier visits | Previous time | Frontier time |
+| --- | ---: | ---: | ---: | ---: |
+| 1,000 | 506,517 | 3,018 | 13.3 ms | 0.186 ms |
+| 2,000 | 2,014,051 | 6,020 | 55.9 ms | 0.744 ms |
+| 4,000 | 8,030,121 | 12,022 | 229.4 ms | 1.157 ms |
+
+These single-sample rightward-chain timings include selection materialization,
+not SST reads/builds. Leftward and two-sided chains are also covered by the
+regression, along with a fixed-point oracle for nested ranges, namespaces and
+mixed levels. At 100,000 runs the new end-key index accounts for 8,805,536 bytes
+(88 bytes per node plus spare capacity); directory metadata totals 95,425,608
+bytes in the existing directory fixture. One-run pinned metadata replacement
+took 9–18 microseconds in the initial follow-up sample, and cold cursor storage
+remained 1,488 bytes. These are measured costs, not a claim of free publication
+or an end-to-end write-throughput improvement.
+
+A one-input GC objective in 10,000 / 30,000 total runs peaked at 147,200 /
+152,312 builder-budget bytes and completed under a 3 MiB cap. The old admission
+formula alone requested 3,905,536 / 11,585,536 bytes. A 5,001-input regression
+also fits a 1 MiB cap, accepts unrelated publication across the cleanup handoff,
+rejects input replacement, preserves the rank buffer, and drains partial cleanup
+and budget-denied jobs on close. Allocation-failure tests cover both full GC
+and its oversized-component-to-progress handoff.
+
+Reproduce from `zig/`:
+
+```sh
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'closure frontier' --test-filter 'GC phase' --test-filter 'persistent directory and lazy cursor scaling benchmark'
+```
 
 ### Policy-bound continuation admission
 
