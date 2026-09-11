@@ -124,6 +124,10 @@ pub const ListConnectionsParams = struct {
 pub const ListNamespaceTablesParams = struct {
     /// Filter tables by name prefix.
     prefix: ?[]const u8 = null,
+    /// Maximum catalog rows examined per page (1-1000). Omit for the complete list. Authorization may return fewer rows; follow X-Antfly-Next-Cursor even for an empty page.
+    limit: ?[]const u8 = null,
+    /// Opaque continuation from X-Antfly-Next-Cursor, bound to the same scope and prefix. Defaults to 100 rows when limit is omitted. Catalog DDL invalidates the cursor with 409; restart the listing.
+    cursor: ?[]const u8 = null,
 };
 
 pub const LookupNamespaceTableDocumentParams = struct {
@@ -146,6 +150,10 @@ pub const ListTablesParams = struct {
     prefix: ?[]const u8 = null,
     /// Filter tables by regex pattern (e.g., "^prod_.*_v[0-9]+$")
     pattern: ?[]const u8 = null,
+    /// Maximum catalog rows examined per page (1-1000). Omit for the complete list. Authorization may return fewer rows; follow X-Antfly-Next-Cursor even for an empty page.
+    limit: ?[]const u8 = null,
+    /// Opaque continuation from X-Antfly-Next-Cursor, bound to the same scope and prefix. Defaults to 100 rows when limit is omitted. Catalog DDL invalidates the cursor with 409; restart the listing.
+    cursor: ?[]const u8 = null,
 };
 
 pub const LookupKeyParams = struct {
@@ -1150,6 +1158,22 @@ pub const Client = struct {
             try query_buf.appendSlice(self.allocator, encoded_query_value);
             sep = '&';
         }
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
         if (query_buf.items.len > 0) {
             const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
             self.allocator.free(url);
@@ -1672,6 +1696,22 @@ pub const Client = struct {
             defer self.allocator.free(encoded_query_value);
             try query_buf.appendSlice(self.allocator, &.{sep});
             try query_buf.appendSlice(self.allocator, "pattern=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
             try query_buf.appendSlice(self.allocator, encoded_query_value);
             sep = '&';
         }

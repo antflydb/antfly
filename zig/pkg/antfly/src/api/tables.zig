@@ -699,6 +699,26 @@ pub fn encodeSingleTableStatusWithStorageStatuses(
     return try projectSingleTableStatusJson(alloc, encoded, table.indexes_json);
 }
 
+pub fn encodeSingleTableStatusWithDefinitions(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    table_name: []const u8,
+    label: []const u8,
+    storage_statuses: ?[]const TableStorageStatus,
+    definitions: *DefinitionCache.Leases,
+) !?[]u8 {
+    const table = findTableByName(snapshot, table_name) orelse return null;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ranges: std.ArrayListUnmanaged(*const metadata_table_manager.RangeRecord) = .empty;
+    for (snapshot.ranges) |*range| if (range.table_id == table.table_id) try ranges.append(a, range);
+    var status = try buildTableStatusWithRanges(a, snapshot, table, findTableStorageStatus(storage_statuses, table_name), true, ranges.items, try definitions.get(table));
+    status.name = label;
+    const bytes = try std.json.Stringify.valueAlloc(a, status, .{ .emit_null_optional_fields = false });
+    return try projectSingleTableStatusJson(alloc, bytes, table.indexes_json);
+}
+
 /// Content-addressed immutable definition projections. Runtime coverage and
 /// counters are deliberately excluded and merged from each fresh observation.
 // Clone only the final wire projection into its owning arena. Generated JSON
@@ -744,6 +764,29 @@ pub const DefinitionCache = struct {
     entries: [max_entries]?*Entry = @splat(null),
     bytes: usize = 0,
     clock: u64 = 0,
+    frequency: [4][1024]u8 = @splat(@splat(0)),
+    flights: std.AutoHashMapUnmanaged([32]u8, *Flight) = .empty,
+    const Flight = struct {
+        done: std.atomic.Value(bool) = .init(false),
+        users: usize = 1,
+        result: anyerror!*Entry = error.OutOfMemory,
+    };
+
+    fn recordAccess(self: *DefinitionCache, key: [32]u8) void {
+        self.clock +%= 1;
+        if (self.clock % 4096 == 0) for (&self.frequency) |*row| {
+            for (row) |*count| count.* >>= 1;
+        };
+        for (&self.frequency, 0..) |*row, i| {
+            const bucket = std.mem.readInt(u16, key[i * 2 ..][0..2], .little) % row.len;
+            row[bucket] +|= 1;
+        }
+    }
+    fn estimate(self: *DefinitionCache, key: [32]u8) u64 {
+        var count: u8 = 255;
+        for (self.frequency, 0..) |row, i| count = @min(count, row[std.mem.readInt(u16, key[i * 2 ..][0..2], .little) % row.len]);
+        return count;
+    }
 
     const Entry = struct {
         alloc: std.mem.Allocator,
@@ -806,6 +849,8 @@ pub const DefinitionCache = struct {
 
     pub fn deinit(self: *DefinitionCache) void {
         for (self.entries) |entry| if (entry) |value| value.release();
+        std.debug.assert(self.flights.count() == 0);
+        // Flights remove their map storage when the last compiler completes.
         self.* = .{};
     }
     fn acquire(self: *DefinitionCache, alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord) !*Entry {
@@ -817,8 +862,9 @@ pub const DefinitionCache = struct {
             hash.update(value);
         }
         const key = hash.finalResult();
-        @import("antfly_platform").sync.lockYielding(&self.mutex);
-        self.clock +%= 1;
+        const sync = @import("antfly_platform").sync;
+        sync.lockYielding(&self.mutex);
+        self.recordAccess(key);
         for (self.entries) |slot| if (slot) |entry| {
             if (std.mem.eql(u8, &entry.key, &key)) {
                 entry.touched = self.clock;
@@ -827,45 +873,91 @@ pub const DefinitionCache = struct {
                 return entry;
             }
         };
+        const found = self.flights.get(key);
+        const flight = found orelse alloc.create(Flight) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        if (found != null) {
+            flight.users += 1;
+        } else {
+            flight.* = .{};
+            self.flights.put(alloc, key, flight) catch |err| {
+                alloc.destroy(flight);
+                self.mutex.unlock();
+                return err;
+            };
+        }
         self.mutex.unlock();
-        const prepared = try Entry.create(alloc, key, table);
-        // Oversized definitions are request-owned, never retained globally.
-        if (prepared.size() > max_bytes) return prepared;
-        var retired: [max_entries + 1]*Entry = undefined;
+        if (found == null) {
+            flight.result = Entry.create(alloc, key, table);
+            if (flight.result) |prepared| self.admit(prepared) else |_| {}
+            flight.done.store(true, .release);
+        } else {
+            while (!flight.done.load(.acquire)) @import("antfly_platform").time.yieldBriefly();
+        }
+        const result = flight.result;
+        if (result) |entry| entry.retain() else |_| {}
+        sync.lockYielding(&self.mutex);
+        flight.users -= 1;
+        const last = flight.users == 0;
+        if (last) {
+            _ = self.flights.remove(key);
+            if (self.flights.count() == 0) {
+                self.flights.deinit(alloc);
+                self.flights = .empty;
+            }
+        }
+        self.mutex.unlock();
+        if (last) {
+            if (result) |entry| entry.release() else |_| {}
+            alloc.destroy(flight);
+        }
+        return result;
+    }
+
+    fn admit(self: *DefinitionCache, prepared: *Entry) void {
+        if (prepared.size() > max_bytes) return;
+        var retired: [max_entries]*Entry = undefined;
         var retired_count: usize = 0;
         defer for (retired[0..retired_count]) |entry| entry.release();
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
-        self.clock +%= 1;
-        for (self.entries) |slot| if (slot) |entry| {
-            if (std.mem.eql(u8, &entry.key, &key)) {
-                retired[retired_count] = prepared;
-                retired_count += 1;
-                entry.touched = self.clock;
-                entry.retain();
-                return entry;
-            }
-        };
+        var candidates = self.entries;
+        var remaining_bytes = self.bytes;
         while (true) {
             var vacant: ?usize = null;
-            var oldest: ?usize = null;
-            for (self.entries, 0..) |slot, i| {
+            var victim: ?usize = null;
+            for (candidates, 0..) |slot, i| {
                 if (slot) |entry| {
-                    if (oldest == null or entry.touched < self.entries[oldest.?].?.touched) oldest = i;
+                    if (victim == null) {
+                        victim = i;
+                    } else {
+                        const previous = candidates[victim.?].?;
+                        const left = self.estimate(entry.key) * previous.size();
+                        const right = self.estimate(previous.key) * entry.size();
+                        if (left < right or (left == right and entry.touched < previous.touched)) victim = i;
+                    }
                 } else vacant = i;
             }
-            if (vacant != null and self.bytes + prepared.size() <= max_bytes) {
+            if (vacant != null and remaining_bytes + prepared.size() <= max_bytes) {
+                for (self.entries, candidates) |before, after| if (before != null and after == null) {
+                    retired[retired_count] = before.?;
+                    retired_count += 1;
+                };
                 prepared.touched = self.clock;
-                self.entries[vacant.?] = prepared;
-                self.bytes += prepared.size();
+                candidates[vacant.?] = prepared;
+                self.entries = candidates;
+                self.bytes = remaining_bytes + prepared.size();
                 prepared.retain();
-                return prepared;
+                return;
             }
-            const victim = self.entries[oldest.?].?;
-            self.entries[oldest.?] = null;
-            self.bytes -= victim.size();
-            retired[retired_count] = victim;
-            retired_count += 1;
+            const entry = candidates[victim.?].?;
+            // Equal-frequency scan entries cannot evict residents. Weight by
+            // retained bytes so one large schema must justify all its victims.
+            if (self.estimate(prepared.key) * entry.size() <= self.estimate(entry.key) * prepared.size()) return;
+            candidates[victim.?] = null;
+            remaining_bytes -= entry.size();
         }
     }
     pub const Leases = struct {
@@ -6034,7 +6126,7 @@ test "system catalog stored create preserves tablespace and storage ownership to
     try std.testing.expectEqual(@import("../common/table_storage.zig").DenseEmbeddings.vector_store, decoded.storage.dense_embeddings);
 }
 
-test "system catalog definition cache shares immutable content and retains evicted generations" {
+test "system catalog definition cache shares immutable content and protects hot entries from scans" {
     const alloc = std.testing.allocator;
     var cache: DefinitionCache = .{};
     defer cache.deinit();
@@ -6061,7 +6153,7 @@ test "system catalog definition cache shares immutable content and retains evict
     try std.testing.expectEqual(@as(i64, 1), first.schema.?.version.?);
     const rebuilt = try cache.acquire(alloc, &table);
     defer rebuilt.release();
-    try std.testing.expect(rebuilt != first);
+    try std.testing.expect(rebuilt == first);
     var migrating = table;
     migrating.read_schema_json = "{\"version\":0}";
     const migration = try cache.acquire(alloc, &migrating);
@@ -6105,4 +6197,64 @@ test "system catalog wide schema cache retained budget" {
     // Leave room for at least 100 independently evolved 200-field schemas
     // within the retained budget; parser scratch must not count as cache data.
     try std.testing.expect(entry.size() <= 512 * 1024);
+}
+
+test "system catalog cache concurrent cold reads share one compiled definition" {
+    const Worker = struct {
+        cache: *DefinitionCache,
+        start: *std.atomic.Value(bool),
+        result: ?*DefinitionCache.Entry = null,
+        fn run(self: *@This()) void {
+            while (!self.start.load(.acquire)) @import("antfly_platform").time.yieldBriefly();
+            self.result = self.cache.acquire(std.testing.allocator, &.{ .table_id = 1, .name = "shared", .schema_json = "{\"version\":1}" }) catch unreachable;
+        }
+    };
+    var cache: DefinitionCache = .{};
+    defer cache.deinit();
+    var start: std.atomic.Value(bool) = .init(false);
+    var workers: [8]Worker = undefined;
+    var threads: [8]std.Thread = undefined;
+    var started: usize = 0;
+    defer {
+        start.store(true, .release);
+        for (threads[0..started]) |thread| thread.join();
+        for (workers[0..started]) |worker| if (worker.result) |entry| entry.release();
+    }
+    for (&workers, &threads) |*worker, *thread| {
+        worker.* = .{ .cache = &cache, .start = &start };
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+        started += 1;
+    }
+    start.store(true, .release);
+    for (threads) |thread| thread.join();
+    started = 0;
+    defer for (workers) |worker| worker.result.?.release();
+    for (workers) |worker| try std.testing.expect(worker.result.? == workers[0].result.?);
+    try std.testing.expectEqual(@as(usize, 0), cache.flights.count());
+}
+
+test "system catalog cache admits recurring demand and keeps evicted leases valid" {
+    const alloc = std.testing.allocator;
+    var cache: DefinitionCache = .{};
+    defer cache.deinit();
+    const original = try cache.acquire(alloc, &.{ .table_id = 1, .name = "first", .schema_json = "{\"version\":1}" });
+    defer original.release();
+    for (0..DefinitionCache.max_entries - 1) |i| {
+        const schema = try std.fmt.allocPrint(alloc, "{{\"version\":{d}}}", .{i + 2});
+        defer alloc.free(schema);
+        const entry = try cache.acquire(alloc, &.{ .table_id = 2, .name = "filler", .schema_json = schema });
+        entry.release();
+    }
+    const candidate: metadata_table_manager.TableRecord = .{ .table_id = 3, .name = "hot", .schema_json = "{\"version\":9999}" };
+    for (0..4) |_| (try cache.acquire(alloc, &candidate)).release();
+    var resident = false;
+    var old_resident = false;
+    for (cache.entries) |slot| if (slot) |entry| {
+        if (entry.schema.?.version.? == 9999) resident = true;
+        if (entry == original) old_resident = true;
+    };
+    try std.testing.expect(resident);
+    try std.testing.expect(!old_resident);
+    try std.testing.expectEqual(@as(i64, 1), original.schema.?.version.?);
+    try std.testing.expect(cache.bytes <= DefinitionCache.max_bytes);
 }

@@ -1,5 +1,5 @@
 from http import HTTPStatus
-from typing import Any
+from typing import Any, cast
 from urllib.parse import quote
 
 import httpx
@@ -16,11 +16,17 @@ def _get_kwargs(
     namespace_name: str,
     *,
     prefix: str | Unset = UNSET,
+    limit: int | Unset = UNSET,
+    cursor: str | Unset = UNSET,
 ) -> dict[str, Any]:
 
     params: dict[str, Any] = {}
 
     params["prefix"] = prefix
+
+    params["limit"] = limit
+
+    params["cursor"] = cursor
 
     params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
@@ -38,7 +44,7 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Error | list[TableStatus] | None:
+) -> Any | Error | list[TableStatus] | None:
     if response.status_code == 200:
         response_200 = []
         _response_200 = response.json()
@@ -59,6 +65,10 @@ def _parse_response(
 
         return response_404
 
+    if response.status_code == 409:
+        response_409 = cast(Any, None)
+        return response_409
+
     if response.status_code == 500:
         response_500 = Error.from_dict(response.json())
 
@@ -72,7 +82,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Error | list[TableStatus]]:
+) -> Response[Any | Error | list[TableStatus]]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -87,7 +97,9 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     prefix: str | Unset = UNSET,
-) -> Response[Error | list[TableStatus]]:
+    limit: int | Unset = UNSET,
+    cursor: str | Unset = UNSET,
+) -> Response[Any | Error | list[TableStatus]]:
     """List tables in namespace
 
      Lists table catalog objects under an explicit database and namespace.
@@ -96,19 +108,23 @@ def sync_detailed(
         database_name (str):
         namespace_name (str):
         prefix (str | Unset):
+        limit (int | Unset):
+        cursor (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | list[TableStatus]]
+        Response[Any | Error | list[TableStatus]]
     """
 
     kwargs = _get_kwargs(
         database_name=database_name,
         namespace_name=namespace_name,
         prefix=prefix,
+        limit=limit,
+        cursor=cursor,
     )
 
     response = client.get_httpx_client().request(
@@ -124,7 +140,9 @@ def sync(
     *,
     client: AuthenticatedClient,
     prefix: str | Unset = UNSET,
-) -> Error | list[TableStatus] | None:
+    limit: int | Unset = UNSET,
+    cursor: str | Unset = UNSET,
+) -> Any | Error | list[TableStatus] | None:
     """List tables in namespace
 
      Lists table catalog objects under an explicit database and namespace.
@@ -133,13 +151,15 @@ def sync(
         database_name (str):
         namespace_name (str):
         prefix (str | Unset):
+        limit (int | Unset):
+        cursor (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | list[TableStatus]
+        Any | Error | list[TableStatus]
     """
 
     return sync_detailed(
@@ -147,6 +167,8 @@ def sync(
         namespace_name=namespace_name,
         client=client,
         prefix=prefix,
+        limit=limit,
+        cursor=cursor,
     ).parsed
 
 
@@ -156,7 +178,9 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     prefix: str | Unset = UNSET,
-) -> Response[Error | list[TableStatus]]:
+    limit: int | Unset = UNSET,
+    cursor: str | Unset = UNSET,
+) -> Response[Any | Error | list[TableStatus]]:
     """List tables in namespace
 
      Lists table catalog objects under an explicit database and namespace.
@@ -165,19 +189,23 @@ async def asyncio_detailed(
         database_name (str):
         namespace_name (str):
         prefix (str | Unset):
+        limit (int | Unset):
+        cursor (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | list[TableStatus]]
+        Response[Any | Error | list[TableStatus]]
     """
 
     kwargs = _get_kwargs(
         database_name=database_name,
         namespace_name=namespace_name,
         prefix=prefix,
+        limit=limit,
+        cursor=cursor,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -191,7 +219,9 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     prefix: str | Unset = UNSET,
-) -> Error | list[TableStatus] | None:
+    limit: int | Unset = UNSET,
+    cursor: str | Unset = UNSET,
+) -> Any | Error | list[TableStatus] | None:
     """List tables in namespace
 
      Lists table catalog objects under an explicit database and namespace.
@@ -200,13 +230,15 @@ async def asyncio(
         database_name (str):
         namespace_name (str):
         prefix (str | Unset):
+        limit (int | Unset):
+        cursor (str | Unset):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | list[TableStatus]
+        Any | Error | list[TableStatus]
     """
 
     return (
@@ -215,5 +247,7 @@ async def asyncio(
             namespace_name=namespace_name,
             client=client,
             prefix=prefix,
+            limit=limit,
+            cursor=cursor,
         )
     ).parsed

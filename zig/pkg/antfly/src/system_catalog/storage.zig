@@ -130,16 +130,22 @@ pub const View = struct {
         return (domain.State{}).find(kind, parent, name);
     }
     pub fn children(self: View, kind: domain.Kind, parent: u64, limit: usize) ![]const domain.Resource {
-        const prefix = try std.fmt.allocPrint(self.alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:children:{s}:{d}:", .{ self.group_id, @tagName(kind), parent });
+        return self.childrenPage(kind, parent, limit, "", null);
+    }
+    pub fn childrenPage(self: View, kind: domain.Kind, parent: u64, limit: usize, name_prefix: []const u8, after: ?[]const u8) ![]const domain.Resource {
+        const base = try std.fmt.allocPrint(self.alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:children:{s}:{d}:", .{ self.group_id, @tagName(kind), parent });
+        const prefix = try std.mem.concat(self.alloc, u8, &.{ base, name_prefix });
+        const seek = if (after) |name| try std.mem.concat(self.alloc, u8, &.{ base, name }) else prefix;
         var cursor = try self.txn.openCursor();
         defer cursor.close();
         var out: std.ArrayListUnmanaged(domain.Resource) = .empty;
-        var entry = try cursor.seekAtOrAfter(prefix);
+        var entry = try cursor.seekAtOrAfter(if (std.mem.lessThan(u8, seek, prefix)) prefix else seek);
         while (entry) |kv| : (entry = try cursor.next()) {
             if (!std.mem.startsWith(u8, kv.key, prefix)) break;
             const record = try std.json.parseFromSliceLeaky(domain.Resource, self.alloc, kv.value, .{ .allocate = .alloc_always });
             if (record.kind != kind or record.parent_id != parent or record.id == 0 or !std.mem.eql(u8, kv.key, try childKey(self.alloc, self.group_id, record))) return error.InvalidCatalogRecord;
             try domain.validateResourceName(record.kind, record.name);
+            if (after) |name| if (!std.mem.lessThan(u8, name, record.name)) continue;
             try out.append(self.alloc, record);
             if (limit != 0 and out.items.len >= limit) break;
         }

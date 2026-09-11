@@ -149,7 +149,7 @@ pub const TableDropProjection = struct {
     }
 };
 
-const derived_catalog_index_version = "5";
+const derived_catalog_index_version = "6";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -2656,7 +2656,8 @@ pub const RaftApplyStore = struct {
         }, .{});
     }
 
-    pub fn listSystemCatalogTables(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.TableList) ![]u8 {
+    pub fn listSystemCatalogTables(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, input: system_catalog.TableList) ![]u8 {
+        var request = input;
         const projection = @import("../../system_catalog/projection.zig");
         try system_catalog.validateName(request.database);
         try system_catalog.validateName(request.namespace);
@@ -2666,30 +2667,68 @@ pub const RaftApplyStore = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const view: system_catalog_storage.View = .{ .alloc = a, .txn = &txn, .group_id = group_id, .meta = try system_catalog_storage.readMeta(a, &txn, group_id) };
-        const namespace = try view.namespaceFor(request.database, request.namespace);
+        const membership = if (std.mem.eql(u8, request.database, "default") and std.mem.eql(u8, request.namespace, "public")) try legacyMembershipTxn(a, &txn, group_id) else @as([32]u8, @splat(0));
+        try projection.checkMembership(request, membership);
+        if (request.revision) |revision| if (revision != view.meta.revision) return error.CatalogGenerationChanged;
+        if (request.limit) |limit| if (limit == 0 or limit > 1000) return error.InvalidCatalogName;
         var entries: std.ArrayListUnmanaged(projection.TableEntry) = .empty;
-        for (try view.children(.table, namespace.id, 0)) |binding| {
-            if (request.prefix) |prefix| if (!std.mem.startsWith(u8, binding.name, prefix)) continue;
-            var buf: [160]u8 = undefined;
-            const table = try decodeTableRecord(a, try txn.get(try tableKeyForGroup(&buf, group_id, binding.id)));
-            if (table.table_id != binding.id or !std.mem.eql(u8, table.name, binding.storage_name)) return error.InvalidCatalogRecord;
-            try entries.append(a, .{ .name = binding.name, .table = table });
-        }
-        if (namespace.id == system_catalog.default_namespace_id) {
-            // Legacy absence is checked in this transaction, never inferred
-            // by comparing an old topology snapshot with a newer binding list.
-            var buf: [160]u8 = undefined;
-            const rows = try docstore.DocStore.scanPrefixTxn(a, &txn, try tablePrefixForGroup(&buf, group_id));
-            for (rows) |row| {
-                const identity = try decodeTableIdentity(a, row.value);
-                if (try view.byId(.table, identity.table_id) != null) continue;
-                if (request.prefix) |prefix| if (!std.mem.startsWith(u8, identity.name, prefix)) continue;
-                try entries.append(a, .{ .name = identity.name, .table = try decodeTableRecord(a, row.value) });
+        if (request.physical_name) |name| {
+            const table = (try self.getTableByNameTxn(a, &txn, group_id, name)) orelse return error.TableNotFound;
+            try entries.append(a, .{ .name = table.name, .table = table });
+        } else {
+            const namespace = try view.namespaceFor(request.database, request.namespace);
+            if (request.after_table_id) |id| {
+                if (try view.byId(.table, id)) |binding| {
+                    if (binding.parent_id != namespace.id) return error.InvalidCatalogName;
+                    request.after = binding.name;
+                } else {
+                    if (namespace.id != system_catalog.default_namespace_id) return error.CatalogGenerationChanged;
+                    var buf: [160]u8 = undefined;
+                    const bytes = txn.get(try tableKeyForGroup(&buf, group_id, id)) catch |err| switch (err) {
+                        error.NotFound => return error.CatalogGenerationChanged,
+                        else => return err,
+                    };
+                    request.after = (try decodeTableIdentity(a, bytes)).name;
+                }
+                if (!std.mem.startsWith(u8, request.after.?, request.prefix orelse "")) return error.InvalidCatalogName;
             }
+            const count: usize = if (request.limit) |limit| limit + 1 else 0;
+            for (try view.childrenPage(.table, namespace.id, count, request.prefix orelse "", request.after)) |binding| {
+                try entries.append(a, .{ .name = binding.name, .table = .{ .table_id = binding.id, .name = binding.storage_name } });
+            }
+            if (namespace.id == system_catalog.default_namespace_id) {
+                const base = try legacyListingPrefix(a, group_id);
+                const prefix = try std.mem.concat(a, u8, &.{ base, request.prefix orelse "" });
+                const after = if (request.after) |name| try std.mem.concat(a, u8, &.{ base, name }) else prefix;
+                var cursor = try txn.openCursor();
+                defer cursor.close();
+                var row = try cursor.seekAtOrAfter(if (std.mem.lessThan(u8, after, prefix)) prefix else after);
+                var found: usize = 0;
+                while (row) |kv| : (row = try cursor.next()) {
+                    if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+                    const name = kv.key[base.len..];
+                    if (request.after) |previous| if (!std.mem.lessThan(u8, previous, name)) continue;
+                    if (kv.value.len != 8) return error.InvalidDerivedCatalogIndex;
+                    const id = std.mem.readInt(u64, kv.value[0..8], .little);
+                    if (try view.byId(.table, id) != null) return error.InvalidDerivedCatalogIndex;
+                    const owned_name = try a.dupe(u8, name);
+                    try entries.append(a, .{ .name = owned_name, .table = .{ .table_id = id, .name = owned_name } });
+                    found += 1;
+                    if (count != 0 and found >= count) break;
+                }
+            }
+        }
+        const page = try projection.selectPage(entries.items, request, view.meta.revision);
+        for (page.entries) |*entry| {
+            if (request.physical_name != null) continue;
+            var buf: [160]u8 = undefined;
+            const table = try decodeTableRecord(a, try txn.get(try tableKeyForGroup(&buf, group_id, entry.table.table_id)));
+            if (table.table_id != entry.table.table_id or !std.mem.eql(u8, table.name, entry.table.name)) return error.InvalidCatalogRecord;
+            entry.table = table;
         }
         var ranges: std.ArrayListUnmanaged(metadata.RangeRecord) = .empty;
         var intents: std.ArrayListUnmanaged(raft_reconciler.PlacementIntent) = .empty;
-        for (entries.items) |entry| {
+        for (page.entries) |entry| {
             for (try self.indexedTableRangeIdsTxn(a, &txn, group_id, entry.table.table_id)) |id| {
                 var buf: [192]u8 = undefined;
                 const range = try decodeRangeRecord(a, try txn.get(try rangeKeyForGroup(&buf, group_id, id)));
@@ -2699,15 +2738,32 @@ pub const RaftApplyStore = struct {
                 for (try docstore.DocStore.scanPrefixTxn(a, &txn, prefix)) |row| try intents.append(a, try decodePlacementIntent(a, row.value));
             }
         }
-        const stores = try catalogRowsTxn(metadata.StoreRecord, a, &txn, group_id, storePrefixForGroup, decodeStoreRecord);
-        var selected_groups: std.AutoHashMapUnmanaged(u64, void) = .empty;
-        for (ranges.items) |range| try selected_groups.put(a, range.group_id, {});
-        for (stores) |*store| {
+        const store_rows = try docstore.DocStore.scanPrefixTxn(a, &txn, try listingStorePrefix(a, group_id));
+        const stores = try a.alloc(metadata.StoreRecord, store_rows.len);
+        for (store_rows, stores) |row, *store| {
+            const compact = try std.json.parseFromSliceLeaky(ListingStore, a, row.value, .{});
+            store.* = compact.store;
             var reports: std.ArrayListUnmanaged(metadata.RuntimeGroupStatusReport) = .empty;
-            for (store.runtime_statuses) |report| if (selected_groups.contains(report.group_id)) try reports.append(a, report);
+            var group_statuses: std.ArrayListUnmanaged(metadata.GroupStatusReport) = .empty;
+            for (ranges.items) |range| {
+                const bytes = txn.get(try listingReportKey(a, group_id, store.store_id, range.group_id)) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                const report = try std.json.parseFromSliceLeaky(ListingReport, a, bytes, .{});
+                if (report.runtime_status) |runtime| {
+                    if (runtime.group_id != range.group_id) return error.InvalidDerivedCatalogIndex;
+                    try reports.append(a, runtime);
+                }
+                if (report.group_status) |status| {
+                    if (status.group_id != range.group_id) return error.InvalidDerivedCatalogIndex;
+                    try group_statuses.append(a, status);
+                }
+            }
             store.runtime_statuses = reports.items;
+            store.group_statuses = group_statuses.items;
         }
-        return std.json.Stringify.valueAlloc(alloc, projection.TableListing{ .revision = view.meta.revision, .entries = entries.items, .ranges = ranges.items, .stores = stores, .placement_intents = intents.items }, .{});
+        return std.json.Stringify.valueAlloc(alloc, projection.TableListing{ .revision = view.meta.revision, .entries = page.entries, .legacy_membership = membership, .next_after = page.next, .next_table_id = if (page.next != null) page.entries[page.entries.len - 1].table.table_id else null, .ranges = ranges.items, .stores = stores, .placement_intents = intents.items }, .{});
     }
 
     pub fn systemCatalogSnapshot(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !system_catalog_storage.OwnedState {
@@ -2931,6 +2987,7 @@ pub const RaftApplyStore = struct {
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
         try system_catalog_storage.applyDelta(self.alloc, txn, group_id, delta, meta, hash);
+        for (delta.upserts) |resource| if (resource.kind == .table) try self.deleteLegacyListingTxn(txn, group_id, resource.storage_name);
         // Invalidate metadata readers through the existing catalog event path.
         self.notifyProjectionListeners(.{ .kind = .table, .metadata_group_id = group_id });
     }
@@ -4054,6 +4111,133 @@ pub const RaftApplyStore = struct {
         };
     }
 
+    fn legacyListingPrefix(alloc: std.mem.Allocator, group_id: u64) ![]u8 {
+        return std.fmt.allocPrint(alloc, "\x00\x00__metadata_derived__:catalog_legacy:{d}:", .{group_id});
+    }
+    fn deleteLegacyListingTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, name: []const u8) !void {
+        const prefix = try legacyListingPrefix(self.alloc, group_id);
+        defer self.alloc.free(prefix);
+        const key = try std.mem.concat(self.alloc, u8, &.{ prefix, name });
+        defer self.alloc.free(key);
+        if (txn.get(key)) |bytes| {
+            if (bytes.len != 8) return error.InvalidDerivedCatalogIndex;
+            try self.toggleLegacyMembershipTxn(txn, group_id, std.mem.readInt(u64, bytes[0..8], .little), name);
+            try txn.delete(key);
+        } else |err| if (err != error.NotFound) return err;
+    }
+    fn putLegacyListingTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, name: []const u8, id: u64) !void {
+        if (try system_catalog_storage.getById(self.alloc, txn, group_id, .table, id)) |binding| {
+            var owned = binding;
+            defer owned.deinit();
+            return self.deleteLegacyListingTxn(txn, group_id, name);
+        }
+        const prefix = try legacyListingPrefix(self.alloc, group_id);
+        defer self.alloc.free(prefix);
+        const key = try std.mem.concat(self.alloc, u8, &.{ prefix, name });
+        defer self.alloc.free(key);
+        var value: [8]u8 = undefined;
+        std.mem.writeInt(u64, &value, id, .little);
+        if (txn.get(key)) |previous| {
+            if (previous.len != 8) return error.InvalidDerivedCatalogIndex;
+            if (std.mem.eql(u8, previous, &value)) return;
+            try self.toggleLegacyMembershipTxn(txn, group_id, std.mem.readInt(u64, previous[0..8], .little), name);
+        } else |err| if (err != error.NotFound) return err;
+        try self.toggleLegacyMembershipTxn(txn, group_id, id, name);
+        try txn.put(key, &value);
+    }
+
+    fn legacyMembershipKey(alloc: std.mem.Allocator, group_id: u64) ![]u8 {
+        return std.fmt.allocPrint(alloc, "\x00\x00__metadata_derived__:catalog_legacy_membership:{d}", .{group_id});
+    }
+    fn legacyMembershipTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) ![32]u8 {
+        const bytes = txn.get(try legacyMembershipKey(alloc, group_id)) catch |err| switch (err) {
+            error.NotFound => return @splat(0),
+            else => return err,
+        };
+        if (bytes.len != 32) return error.InvalidDerivedCatalogIndex;
+        return bytes[0..32].*;
+    }
+    fn toggleLegacyMembershipTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, id: u64, name: []const u8) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var fingerprint = try legacyMembershipTxn(a, txn, group_id);
+        for (&fingerprint, @import("../../system_catalog/projection.zig").legacyIdentity(id, name)) |*byte, identity_byte| byte.* ^= identity_byte;
+        try txn.put(try legacyMembershipKey(a, group_id), &fingerprint);
+    }
+
+    const ListingStore = struct { store: metadata.StoreRecord };
+    const ListingReport = struct {
+        group_status: ?metadata.GroupStatusReport = null,
+        runtime_status: ?metadata.RuntimeGroupStatusReport = null,
+    };
+    fn listingStorePrefix(alloc: std.mem.Allocator, group_id: u64) ![]u8 {
+        return std.fmt.allocPrint(alloc, "\x00\x00__metadata_derived__:catalog_store:{d}:", .{group_id});
+    }
+    fn listingReportKey(alloc: std.mem.Allocator, group_id: u64, store_id: u64, range_id: u64) ![]u8 {
+        return std.fmt.allocPrint(alloc, "\x00\x00__metadata_derived__:catalog_report:{d}:{d}:{d}", .{ group_id, store_id, range_id });
+    }
+    fn updateListingStoreTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, store_id: u64, replacement: ?metadata.StoreRecord) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const key = try std.fmt.allocPrint(a, "{s}{d}", .{ try listingStorePrefix(a, group_id), store_id });
+        const old = txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const membership_key = try std.fmt.allocPrint(a, "\x00\x00__metadata_derived__:catalog_store_groups:{d}:{d}", .{ group_id, store_id });
+        const old_membership = txn.get(membership_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        var reports_by_id: std.AutoHashMapUnmanaged(u64, ListingReport) = .empty;
+        if (replacement) |record| {
+            for (record.group_statuses) |report| {
+                const entry = try reports_by_id.getOrPut(a, report.group_id);
+                if (!entry.found_existing) entry.value_ptr.* = .{};
+                entry.value_ptr.group_status = report;
+            }
+            for (record.runtime_statuses) |report| {
+                const entry = try reports_by_id.getOrPut(a, report.group_id);
+                if (!entry.found_existing) entry.value_ptr.* = .{};
+                entry.value_ptr.runtime_status = report;
+            }
+        }
+        if (old_membership) |bytes| {
+            const previous = try std.json.parseFromSliceLeaky([]const u64, a, bytes, .{});
+            for (previous) |id| if (!reports_by_id.contains(id)) {
+                txn.delete(try listingReportKey(a, group_id, store_id, id)) catch |err| if (err != error.NotFound) return err;
+            };
+        }
+        if (replacement) |record| {
+            var compact = record;
+            compact.runtime_statuses = &.{};
+            compact.group_statuses = &.{};
+            const groups = try a.alloc(u64, reports_by_id.count());
+            var it = reports_by_id.keyIterator();
+            var n: usize = 0;
+            while (it.next()) |id| : (n += 1) groups[n] = id.*;
+            std.mem.sort(u64, groups, {}, std.sort.asc(u64));
+            for (groups) |id| {
+                const report_key = try listingReportKey(a, group_id, store_id, id);
+                const bytes = try std.json.Stringify.valueAlloc(a, reports_by_id.get(id).?, .{});
+                const previous = txn.get(report_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (previous == null or !std.mem.eql(u8, previous.?, bytes)) try txn.put(report_key, bytes);
+            }
+            const membership = try std.json.Stringify.valueAlloc(a, groups, .{});
+            if (old_membership == null or !std.mem.eql(u8, old_membership.?, membership)) try txn.put(membership_key, membership);
+            const bytes = try std.json.Stringify.valueAlloc(a, ListingStore{ .store = compact }, .{});
+            if (old == null or !std.mem.eql(u8, old.?, bytes)) try txn.put(key, bytes);
+        } else {
+            txn.delete(key) catch |err| if (err != error.NotFound) return err;
+            txn.delete(membership_key) catch |err| if (err != error.NotFound) return err;
+        }
+    }
+
     fn putTableNameIndexTxn(
         self: *RaftApplyStore,
         txn: *docstore.DocStore.Txn,
@@ -4061,12 +4245,12 @@ pub const RaftApplyStore = struct {
         table_name: []const u8,
         table_id: u64,
     ) !void {
-        _ = self;
         var key_buf: [640]u8 = undefined;
         const key = try tableNameIndexKey(&key_buf, group_id, table_name);
         var value: [@sizeOf(u64)]u8 = undefined;
         std.mem.writeInt(u64, &value, table_id, .little);
         try txn.put(key, &value);
+        try self.putLegacyListingTxn(txn, group_id, table_name, table_id);
     }
 
     fn deleteTableNameIndexTxn(
@@ -4075,9 +4259,9 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         table_name: []const u8,
     ) !void {
-        _ = self;
         var key_buf: [640]u8 = undefined;
         const key = try tableNameIndexKey(&key_buf, group_id, table_name);
+        try self.deleteLegacyListingTxn(txn, group_id, table_name);
         txn.delete(key) catch |err| switch (err) {
             error.NotFound => {},
             else => return err,
@@ -4170,6 +4354,15 @@ pub const RaftApplyStore = struct {
         }
 
         try system_catalog_storage.rebuildNameIndex(self.alloc, txn, group_id);
+        var listing_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer listing_arena.deinit();
+        const listing_alloc = listing_arena.allocator();
+        try txn.put(try legacyMembershipKey(listing_alloc, group_id), &@as([32]u8, @splat(0)));
+        try self.deleteDerivedPrefixTxn(txn, try legacyListingPrefix(listing_alloc, group_id));
+        try self.deleteDerivedPrefixTxn(txn, try listingStorePrefix(listing_alloc, group_id));
+        try self.deleteDerivedPrefixTxn(txn, try std.fmt.allocPrint(listing_alloc, "\x00\x00__metadata_derived__:catalog_store_groups:{d}:", .{group_id}));
+        try self.deleteDerivedPrefixTxn(txn, try std.fmt.allocPrint(listing_alloc, "\x00\x00__metadata_derived__:catalog_report:{d}:", .{group_id}));
+        for (try catalogRowsTxn(metadata.StoreRecord, listing_alloc, txn, group_id, storePrefixForGroup, decodeStoreRecord)) |record| try self.updateListingStoreTxn(txn, group_id, record.store_id, record);
 
         var range_index_prefix_buf: [128]u8 = undefined;
         try self.deleteDerivedPrefixTxn(
@@ -4946,6 +5139,7 @@ pub const RaftApplyStore = struct {
                     try activateRuntimeStatusProtocolTxn(txn, group_id, version);
                 }
                 try txn.put(key, value);
+                try self.updateListingStoreTxn(txn, group_id, record.store_id, applied);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
                 self.notifyProjectionListeners(.{
                     .kind = .store,
@@ -4966,6 +5160,7 @@ pub const RaftApplyStore = struct {
                     try activateRuntimeStatusProtocolTxn(txn, group_id, version);
                 }
                 try txn.put(key, value);
+                try self.updateListingStoreTxn(txn, group_id, record.store_id, applied);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
                 self.notifyProjectionListeners(.{
                     .kind = .store,
@@ -4977,6 +5172,7 @@ pub const RaftApplyStore = struct {
             },
             .remove_store => |record| {
                 var key_buf: [160]u8 = undefined;
+                try self.updateListingStoreTxn(txn, group_id, record.store_id, null);
                 const key = try storeKeyForGroup(&key_buf, group_id, record.store_id);
                 const existing = try self.loadStoreRecordTxn(txn, group_id, record.store_id);
                 defer if (existing) |store| metadata_table_manager.freeStore(self.alloc, store);
@@ -6734,6 +6930,7 @@ pub const RaftApplyStore = struct {
         for (stores_to_delete.items) |store| {
             var key_buf: [160]u8 = undefined;
             const key = try storeKeyForGroup(&key_buf, group_id, store.store_id);
+            try self.updateListingStoreTxn(txn, group_id, store.store_id, null);
             txn.delete(key) catch |err| switch (err) {
                 error.NotFound => {},
                 else => return err,
@@ -6858,6 +7055,7 @@ pub const RaftApplyStore = struct {
             const value = try encodeStoreRecord(self.alloc, record);
             defer self.alloc.free(value);
             try txn.put(key, value);
+            try self.updateListingStoreTxn(txn, group_id, record.store_id, record);
             self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
             self.notifyProjectionListeners(.{
                 .kind = .store,
@@ -16532,6 +16730,9 @@ test "system catalog publishes names and table topology atomically and fences st
         var bounded = std.heap.FixedBufferAllocator.init(&buffer);
         const empty = try store.listSystemCatalogTables(bounded.allocator(), 21, .{ .database = "reports", .prefix = "absent" });
         try std.testing.expect(std.mem.indexOf(u8, empty, "events") == null);
+        bounded.reset();
+        const default_empty = try store.listSystemCatalogTables(bounded.allocator(), 21, .{});
+        try std.testing.expect(std.mem.indexOf(u8, default_empty, "table:42") == null);
     }
     // The predecessor catalog revision cannot admit a destructive mutation.
     try applySystemCatalogTestCommand(&store, 4, .{ .expected_revision = 2, .mutation = .{ .action = .create, .kind = .database, .name = "stale" } });
@@ -16665,4 +16866,79 @@ test "system catalog indexed management reads and mutation planning ignore unrel
     defer alloc.free(response);
     try std.testing.expect(std.mem.indexOf(u8, response, "database_999") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "database_998") == null);
+}
+
+test "system catalog listing indexes bound legacy pages and runtime reports across rebuild" {
+    const alloc = std.testing.allocator;
+    const projection = @import("../../system_catalog/projection.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog-pages", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
+    const huge = [_]u8{'x'} ** (256 * 1024);
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try store.ensureDerivedCatalogIndexesTxn(&txn, 21);
+        for ([_][]const u8{ "a", "b", "z" }, 1..) |name, id| try store.applyTransitionCommandTxn(&txn, 21, .{ .upsert_table = .{ .table_id = id, .name = name, .description = if (id == 3) &huge else "" } });
+        try store.applyTransitionCommandTxn(&txn, 21, .{ .upsert_range = .{ .table_id = 1, .group_id = 301, .range_id = 301, .start_key = "" } });
+        var reports = [_]metadata.RuntimeGroupStatusReport{
+            .{ .table_id = 1, .table_name = "a", .group_id = 301, .store_id = 20 },
+            .{ .table_id = 3, .table_name = &huge, .group_id = 303, .store_id = 20 },
+        };
+        var group_statuses: [2000]metadata.GroupStatusReport = undefined;
+        for (&group_statuses, 301..) |*status, id| status.* = .{ .group_id = id };
+        try store.applyTransitionCommandTxn(&txn, 21, .{ .upsert_store = .{ .store_id = 20, .node_id = 30, .runtime_statuses = &reports, .group_statuses = &group_statuses } });
+        try txn.commit();
+    }
+    var fingerprint: [32]u8 = undefined;
+    for (0..2) |round| {
+        if (round == 1) {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            var buf: [160]u8 = undefined;
+            try txn.delete(try derivedCatalogIndexVersionKey(&buf, 21));
+            _ = try store.ensureDerivedCatalogIndexesTxn(&txn, 21);
+            try txn.commit();
+        }
+        var buffer: [128 * 1024]u8 = undefined;
+        var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+        const bytes = try store.listSystemCatalogTables(bounded.allocator(), 21, .{ .limit = 1 });
+        var parsed = try std.json.parseFromSlice(projection.TableListing, alloc, bytes, .{});
+        defer parsed.deinit();
+        const first = parsed.value;
+        try std.testing.expectEqualStrings("a", first.entries[0].name);
+        try std.testing.expectEqual(@as(?u64, 1), first.next_table_id);
+        try std.testing.expectEqual(@as(usize, 1), first.stores[0].runtime_statuses.len);
+        try std.testing.expectEqual(@as(usize, 1), first.stores[0].group_statuses.len);
+        try std.testing.expectEqual(@as(u64, 301), first.stores[0].runtime_statuses[0].group_id);
+        if (round == 0) fingerprint = first.legacy_membership else try std.testing.expectEqualSlices(u8, &fingerprint, &first.legacy_membership);
+        bounded.reset();
+        const second = try store.listSystemCatalogTables(bounded.allocator(), 21, .{ .limit = 1, .after_table_id = first.next_table_id, .revision = first.revision, .legacy_membership = fingerprint });
+        var page = try std.json.parseFromSlice(projection.TableListing, alloc, second, .{});
+        defer page.deinit();
+        try std.testing.expectEqualStrings("b", page.value.entries[0].name);
+        try std.testing.expectEqual(@as(usize, 0), page.value.stores[0].runtime_statuses.len);
+    }
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        // Heartbeat replacement removes old report rows without changing cursors.
+        try store.applyTransitionCommandTxn(&txn, 21, .{ .upsert_store = .{ .store_id = 20, .node_id = 30 } });
+        const removed_key = try RaftApplyStore.listingReportKey(alloc, 21, 20, 301);
+        defer alloc.free(removed_key);
+        try std.testing.expectError(error.NotFound, txn.get(removed_key));
+        try txn.commit();
+    }
+    const unchanged = try store.listSystemCatalogTables(alloc, 21, .{ .limit = 1, .legacy_membership = fingerprint });
+    alloc.free(unchanged);
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try store.applyTransitionCommandTxn(&txn, 21, .{ .upsert_table = .{ .table_id = 4, .name = "new" } });
+        try txn.commit();
+    }
+    try std.testing.expectError(error.CatalogGenerationChanged, store.listSystemCatalogTables(alloc, 21, .{ .limit = 1, .legacy_membership = fingerprint }));
 }

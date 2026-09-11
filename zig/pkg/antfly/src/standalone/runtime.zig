@@ -1316,7 +1316,8 @@ const LocalStandaloneMetadata = struct {
         return systemCatalog(ptr, alloc, .{}, .export_snapshot);
     }
 
-    fn listCatalogTablesLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, request: system_catalog.TableList) ![]u8 {
+    fn listCatalogTablesLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, input: system_catalog.TableList) ![]u8 {
+        var request = input;
         const projection = @import("../system_catalog/projection.zig");
         try system_catalog.validateName(request.database);
         try system_catalog.validateName(request.namespace);
@@ -1324,29 +1325,47 @@ const LocalStandaloneMetadata = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const index = &self.system_catalog_state.?.index;
-        const namespace = try index.namespaceFor(request.database, request.namespace);
         var entries: std.ArrayListUnmanaged(projection.TableEntry) = .empty;
         var selected: std.AutoHashMapUnmanaged(u64, void) = .empty;
-        for (index.list(.table, namespace.id)) |binding| {
-            try context.ensureActive();
-            if (request.prefix) |prefix| if (!std.mem.startsWith(u8, binding.name, prefix)) continue;
-            const table = self.manager.tables.get(binding.id) orelse return error.InvalidCatalogRecord;
-            if (!std.mem.eql(u8, table.name, binding.storage_name)) return error.InvalidCatalogRecord;
-            try entries.append(a, .{ .name = binding.name, .table = table });
-            try selected.put(a, table.table_id, {});
-        }
-        // Unbound pre-catalog tables belong to default.public only. Resolve
-        // absence against the same locked state as the physical record.
-        if (namespace.id == system_catalog.default_namespace_id) {
-            var tables = self.manager.tables.valueIterator();
-            while (tables.next()) |table| {
+        var membership: [32]u8 = @splat(0);
+        if (request.physical_name) |name| {
+            const table = self.findTableByNameLocked(name) orelse return error.TableNotFound;
+            try entries.append(a, .{ .name = table.name, .table = table.* });
+        } else {
+            const namespace = try index.namespaceFor(request.database, request.namespace);
+            if (request.after_table_id) |id| {
+                if (index.byId(.table, id)) |binding| {
+                    if (binding.parent_id != namespace.id) return error.InvalidCatalogName;
+                    request.after = binding.name;
+                } else {
+                    if (namespace.id != system_catalog.default_namespace_id) return error.CatalogGenerationChanged;
+                    request.after = (self.manager.tables.get(id) orelse return error.CatalogGenerationChanged).name;
+                }
+                if (!std.mem.startsWith(u8, request.after.?, request.prefix orelse "")) return error.InvalidCatalogName;
+            }
+            for (index.list(.table, namespace.id)) |binding| {
                 try context.ensureActive();
-                if (index.byId(.table, table.table_id) != null) continue;
-                if (request.prefix) |prefix| if (!std.mem.startsWith(u8, table.name, prefix)) continue;
-                try entries.append(a, .{ .name = table.name, .table = table.* });
-                try selected.put(a, table.table_id, {});
+                if (request.prefix) |prefix| if (!std.mem.startsWith(u8, binding.name, prefix)) continue;
+                const table = self.manager.tables.get(binding.id) orelse return error.InvalidCatalogRecord;
+                if (!std.mem.eql(u8, table.name, binding.storage_name)) return error.InvalidCatalogRecord;
+                try entries.append(a, .{ .name = binding.name, .table = table });
+            }
+            // Unbound pre-catalog tables belong to default.public only. Resolve
+            // absence against the same locked state as the physical record.
+            if (namespace.id == system_catalog.default_namespace_id) {
+                var tables = self.manager.tables.valueIterator();
+                while (tables.next()) |table| {
+                    try context.ensureActive();
+                    if (index.byId(.table, table.table_id) != null) continue;
+                    for (&membership, projection.legacyIdentity(table.table_id, table.name)) |*byte, identity_byte| byte.* ^= identity_byte;
+                    if (request.prefix) |prefix| if (!std.mem.startsWith(u8, table.name, prefix)) continue;
+                    try entries.append(a, .{ .name = table.name, .table = table.* });
+                }
             }
         }
+        try projection.checkMembership(request, membership);
+        const page = try projection.selectPage(entries.items, request, self.systemCatalogState().revision);
+        for (page.entries) |entry| try selected.put(a, entry.table.table_id, {});
         var ranges: std.ArrayListUnmanaged(antfly.metadata.RangeRecord) = .empty;
         var intents: std.ArrayListUnmanaged(antfly.raft.PlacementIntent) = .empty;
         var it = self.manager.ranges.valueIterator();
@@ -1357,7 +1376,7 @@ const LocalStandaloneMetadata = struct {
         }
         var stores = [_]antfly.metadata.StoreRecord{.{ .store_id = self.store_id, .node_id = self.local_node_id, .api_url = self.api_url, .role = "data", .health_class = "healthy", .live = true }};
         try context.ensureActive();
-        return std.json.Stringify.valueAlloc(alloc, projection.TableListing{ .revision = self.systemCatalogState().revision, .entries = entries.items, .ranges = ranges.items, .stores = &stores, .placement_intents = intents.items }, .{});
+        return std.json.Stringify.valueAlloc(alloc, projection.TableListing{ .revision = self.systemCatalogState().revision, .entries = page.entries, .legacy_membership = membership, .next_after = page.next, .next_table_id = if (page.next != null) page.entries[page.entries.len - 1].table.table_id else null, .ranges = ranges.items, .stores = &stores, .placement_intents = intents.items }, .{});
     }
 
     fn systemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: system_catalog.Call) ![]u8 {

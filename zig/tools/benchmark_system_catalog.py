@@ -717,6 +717,60 @@ def resolution_scenario(args, binary: Path) -> dict:
         }
 
 
+def paged_inventory(api, path, expected, page_size):
+    names = []
+    cursor = None
+    cursors = set()
+    while True:
+        params = {"limit": page_size}
+        if cursor:
+            params["cursor"] = cursor
+        response = api.session.get(api.base + path, params=params, timeout=30)
+        response.raise_for_status()
+        rows = response.json()
+        if len(rows) > page_size:
+            raise RuntimeError("server did not bound the page")
+        names.extend(row["name"] for row in rows)
+        cursor = response.headers.get("X-Antfly-Next-Cursor")
+        if not cursor:
+            break
+        if cursor in cursors:
+            raise RuntimeError("cursor did not advance")
+        cursors.add(cursor)
+    if len(names) != expected or len(set(names)) != expected or names != sorted(names):
+        raise RuntimeError("paged inventory omitted, duplicated, or reordered tables")
+
+
+def inventory_with_readers(api, path, count, args):
+    """One inventory scanner alongside concurrent schema-detail readers."""
+    barrier = threading.Barrier(args.concurrency + 1, timeout=30)
+
+    def worker(scanner):
+        client = Api(api.base)
+        timings = []
+        try:
+            barrier.wait()
+            for _ in range(args.samples):
+                start = time.perf_counter_ns()
+                value = client.request("GET", path if scanner else path + "/needle")
+                if scanner and len(value) != count:
+                    raise RuntimeError("concurrent inventory mismatch")
+                if not scanner and value["name"] != "needle":
+                    raise RuntimeError("concurrent detail mismatch")
+                timings.append((time.perf_counter_ns() - start) / 1e6)
+            return timings
+        finally:
+            client.session.close()
+
+    with ThreadPoolExecutor(max_workers=args.concurrency + 1) as pool:
+        results = list(pool.map(worker, [True] + [False] * args.concurrency))
+    return {
+        "inventory": summary(results[0]),
+        "detail": summary([t for result in results[1:] for t in result]),
+        "readers": args.concurrency,
+    }
+
+
 def listing_scenario(args, binary: Path) -> dict:
     """Tenant discovery alongside unrelated, wide application schemas."""
     with server(binary, args.deployment) as (api, startup, instance):
@@ -767,8 +821,36 @@ def listing_scenario(args, binary: Path) -> dict:
                         args.samples,
                         args.warmup,
                     ),
+                    "single_table_status": api.measure(
+                        lambda: api.request("GET", large + "/tables/needle"),
+                        args.samples,
+                        args.warmup,
+                    ),
+                    "empty_default_namespace": api.measure(
+                        lambda: listing("/tables", 0), args.samples, args.warmup
+                    ),
                 }
             )
+            if args.listing_page_size:
+                checkpoints[-1]["first_page"] = api.measure(
+                    lambda count=count: listing(
+                        large + f"/tables?limit={args.listing_page_size}",
+                        min(count, args.listing_page_size),
+                    ),
+                    args.samples,
+                    args.warmup,
+                )
+                checkpoints[-1]["paged_inventory"] = api.measure(
+                    lambda count=count: paged_inventory(
+                        api, large + "/tables", count, args.listing_page_size
+                    ),
+                    args.samples,
+                    args.warmup,
+                )
+            if args.listing_concurrent:
+                checkpoints[-1]["inventory_with_readers"] = inventory_with_readers(
+                    api, large + "/tables", count, args
+                )
         return {
             "deployment": args.deployment,
             "startup_ms": startup,
@@ -800,6 +882,17 @@ def main():
         action="store_true",
         help="Use distinct definitions in the scoped listing workload",
     )
+    parser.add_argument(
+        "--listing-page-size",
+        type=int,
+        default=0,
+        help="Also measure bounded pages and a validated complete keyset walk (0 disables)",
+    )
+    parser.add_argument(
+        "--listing-concurrent",
+        action="store_true",
+        help="Run an inventory scanner alongside --concurrency detail readers",
+    )
     parser.add_argument("--table-counts", nargs="+", type=positive, default=[10, 100])
     parser.add_argument(
         "--resolution-workload",
@@ -829,6 +922,8 @@ def main():
     args = parser.parse_args()
     if args.restart_after_ddl and args.deployment != "standalone":
         parser.error("--restart-after-ddl requires --deployment standalone")
+    if args.listing_page_size < 0 or args.listing_page_size > 1000:
+        parser.error("--listing-page-size must be between 0 and 1000")
     if args.schema_fields < 0:
         parser.error("--schema-fields must be nonnegative")
     binary = args.binary.resolve(strict=True)

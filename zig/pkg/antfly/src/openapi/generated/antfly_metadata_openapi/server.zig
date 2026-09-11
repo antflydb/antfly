@@ -123,6 +123,10 @@ pub const ListNamespaceTablesPathParams = struct {
 pub const ListNamespaceTablesParams = struct {
     /// Filter tables by name prefix.
     prefix: ?[]const u8 = null,
+    /// Maximum catalog rows examined per page (1-1000). Omit for the complete list. Authorization may return fewer rows; follow X-Antfly-Next-Cursor even for an empty page.
+    limit: ?[]const u8 = null,
+    /// Opaque continuation from X-Antfly-Next-Cursor, bound to the same scope and prefix. Defaults to 100 rows when limit is omitted. Catalog DDL invalidates the cursor with 409; restart the listing.
+    cursor: ?[]const u8 = null,
 };
 
 /// Get namespace table details
@@ -428,6 +432,10 @@ pub const ListTablesParams = struct {
     prefix: ?[]const u8 = null,
     /// Filter tables by regex pattern (e.g., "^prod_.*_v[0-9]+$")
     pattern: ?[]const u8 = null,
+    /// Maximum catalog rows examined per page (1-1000). Omit for the complete list. Authorization may return fewer rows; follow X-Antfly-Next-Cursor even for an empty page.
+    limit: ?[]const u8 = null,
+    /// Opaque continuation from X-Antfly-Next-Cursor, bound to the same scope and prefix. Defaults to 100 rows when limit is omitted. Catalog DDL invalidates the cursor with 409; restart the listing.
+    cursor: ?[]const u8 = null,
 };
 
 /// Get table details
@@ -1357,6 +1365,8 @@ pub fn ServerRouter(comptime Impl: type) type {
             const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
             const query_params = ListNamespaceTablesParams{
                 .prefix = try ctx.queryDecoded("prefix"),
+                .limit = try ctx.queryDecoded("limit"),
+                .cursor = try ctx.queryDecoded("cursor"),
             };
             return impl.listNamespaceTables(ctx, database_name, namespace_name, query_params);
         }
@@ -1617,6 +1627,8 @@ pub fn ServerRouter(comptime Impl: type) type {
             const query_params = ListTablesParams{
                 .prefix = try ctx.queryDecoded("prefix"),
                 .pattern = try ctx.queryDecoded("pattern"),
+                .limit = try ctx.queryDecoded("limit"),
+                .cursor = try ctx.queryDecoded("cursor"),
             };
             return impl.listTables(ctx, query_params);
         }

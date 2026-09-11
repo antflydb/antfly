@@ -3602,9 +3602,36 @@ paths:
             maxLength: 500
           description: Filter tables by regex pattern (e.g., "^prod_.*_v[0-9]+$")
           example: ^user_.*
+        - name: limit
+          in: query
+          required: false
+          description: Maximum catalog rows examined per page (1-1000). Omit for the complete list. Authorization
+            may return fewer rows; follow X-Antfly-Next-Cursor even for an empty page.
+          schema:
+            type: integer
+            format: int32
+            x-go-type-skip-optional-pointer: false
+            minimum: 1
+            maximum: 1000
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque continuation from X-Antfly-Next-Cursor, bound to the same scope and prefix.
+            Defaults to 100 rows when limit is omitted. Catalog DDL invalidates the cursor with 409; restart
+            the listing.
+          schema:
+            type: string
+            x-go-type-skip-optional-pointer: false
+            maxLength: 4096
       responses:
         '200':
           description: A list of tables
+          headers:
+            X-Antfly-Next-Cursor:
+              description: Continue with this cursor until the header is absent. Pages may contain no
+                authorized rows.
+              schema:
+                type: string
           content:
             application/json:
               schema:
@@ -3613,6 +3640,8 @@ paths:
                   $ref: '#/components/schemas/TableStatus'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Catalog changed during pagination. Restart without a cursor.
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -5915,9 +5944,36 @@ paths:
             type: string
             maxLength: 128
           description: Filter tables by name prefix.
+        - name: limit
+          in: query
+          required: false
+          description: Maximum catalog rows examined per page (1-1000). Omit for the complete list. Authorization
+            may return fewer rows; follow X-Antfly-Next-Cursor even for an empty page.
+          schema:
+            type: integer
+            format: int32
+            x-go-type-skip-optional-pointer: false
+            minimum: 1
+            maximum: 1000
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque continuation from X-Antfly-Next-Cursor, bound to the same scope and prefix.
+            Defaults to 100 rows when limit is omitted. Catalog DDL invalidates the cursor with 409; restart
+            the listing.
+          schema:
+            type: string
+            x-go-type-skip-optional-pointer: false
+            maxLength: 4096
       responses:
         '200':
           description: A list of tables in the namespace
+          headers:
+            X-Antfly-Next-Cursor:
+              description: Continue with this cursor until the header is absent. Pages may contain no
+                authorized rows.
+              schema:
+                type: string
           content:
             application/json:
               schema:
@@ -5928,6 +5984,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          description: Catalog changed during pagination. Restart without a cursor.
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:

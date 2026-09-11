@@ -366,6 +366,10 @@ pub const ListNamespaceTablesPathParams = struct {
 pub const ListNamespaceTablesParams = struct {
     /// Filter tables by name prefix.
     prefix: ?[]const u8 = null,
+    /// Maximum catalog rows examined per page (1-1000). Omit for the complete list. Authorization may return fewer rows; follow X-Antfly-Next-Cursor even for an empty page.
+    limit: ?[]const u8 = null,
+    /// Opaque continuation from X-Antfly-Next-Cursor, bound to the same scope and prefix. Defaults to 100 rows when limit is omitted. Catalog DDL invalidates the cursor with 409; restart the listing.
+    cursor: ?[]const u8 = null,
 };
 
 /// Get namespace table details
@@ -671,6 +675,10 @@ pub const ListTablesParams = struct {
     prefix: ?[]const u8 = null,
     /// Filter tables by regex pattern (e.g., "^prod_.*_v[0-9]+$")
     pattern: ?[]const u8 = null,
+    /// Maximum catalog rows examined per page (1-1000). Omit for the complete list. Authorization may return fewer rows; follow X-Antfly-Next-Cursor even for an empty page.
+    limit: ?[]const u8 = null,
+    /// Opaque continuation from X-Antfly-Next-Cursor, bound to the same scope and prefix. Defaults to 100 rows when limit is omitted. Catalog DDL invalidates the cursor with 409; restart the listing.
+    cursor: ?[]const u8 = null,
 };
 
 /// Get table details

@@ -17600,6 +17600,10 @@ export interface operations {
                  * @example ^user_.*
                  */
                 pattern?: string;
+                /** @description Maximum catalog rows examined per page (1-1000). Omit for the complete list. Authorization may return fewer rows; follow X-Antfly-Next-Cursor even for an empty page. */
+                limit?: number;
+                /** @description Opaque continuation from X-Antfly-Next-Cursor, bound to the same scope and prefix. Defaults to 100 rows when limit is omitted. Catalog DDL invalidates the cursor with 409; restart the listing. */
+                cursor?: string;
             };
             header?: never;
             path?: never;
@@ -17610,6 +17614,8 @@ export interface operations {
             /** @description A list of tables */
             200: {
                 headers: {
+                    /** @description Continue with this cursor until the header is absent. Pages may contain no authorized rows. */
+                    "X-Antfly-Next-Cursor"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -17617,6 +17623,13 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            /** @description Catalog changed during pagination. Restart without a cursor. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             500: components["responses"]["InternalServerError"];
         };
     };
@@ -19265,6 +19278,10 @@ export interface operations {
             query?: {
                 /** @description Filter tables by name prefix. */
                 prefix?: string;
+                /** @description Maximum catalog rows examined per page (1-1000). Omit for the complete list. Authorization may return fewer rows; follow X-Antfly-Next-Cursor even for an empty page. */
+                limit?: number;
+                /** @description Opaque continuation from X-Antfly-Next-Cursor, bound to the same scope and prefix. Defaults to 100 rows when limit is omitted. Catalog DDL invalidates the cursor with 409; restart the listing. */
+                cursor?: string;
             };
             header?: never;
             path: {
@@ -19280,6 +19297,8 @@ export interface operations {
             /** @description A list of tables in the namespace */
             200: {
                 headers: {
+                    /** @description Continue with this cursor until the header is absent. Pages may contain no authorized rows. */
+                    "X-Antfly-Next-Cursor"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -19288,6 +19307,13 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            /** @description Catalog changed during pagination. Restart without a cursor. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             500: components["responses"]["InternalServerError"];
         };
     };

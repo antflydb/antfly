@@ -457,3 +457,58 @@ def test_concurrent_catalog_drop_never_reclassifies_private_tables(stateful_api)
                     reader.result()
     finally:
         api.delete(f"/databases/{database}")
+
+
+def test_catalog_pagination_preserves_scope_order_and_detects_ddl(stateful_api):
+    api = stateful_api
+    database = "pages_" + uuid.uuid4().hex[:12]
+    api.post(f"/databases/{database}", {})
+    path = f"/databases/{database}/namespaces/public/tables"
+    names = [
+        "item_" + name for name in ("z", "a/b", "a*", "a.b", "one", "two", "three")
+    ]
+    try:
+        for name in names:
+            api.post(path + "/" + quote(name, safe=""), {"num_shards": 1})
+        seen = []
+        cursor = None
+        first_cursor = None
+        for _ in range(len(names) + 1):
+            params = {"limit": 2, "prefix": "item_"}
+            if cursor:
+                params["cursor"] = cursor
+            response = api.s.get(api.url + path, params=params, timeout=30)
+            assert response.status_code == 200, response.text
+            rows = response.json()
+            assert len(rows) <= 2
+            seen.extend(row["name"] for row in rows)
+            cursor = response.headers.get("X-Antfly-Next-Cursor")
+            first_cursor = first_cursor or cursor
+            if not cursor:
+                break
+        else:
+            pytest.fail("pagination failed to terminate")
+        assert seen == sorted(names)
+        assert len({row["table_id"] for row in api.get(path)}) == len(names)
+        assert first_cursor
+        for params in (
+            {"limit": 0},
+            {"limit": 1001},
+            {"limit": "bad"},
+            {"cursor": "!!!"},
+            {"cursor": first_cursor, "prefix": "other"},
+        ):
+            response = api.s.get(api.url + path, params=params, timeout=30)
+            assert response.status_code == 400, response.text
+        api.post(path + "/new", {"num_shards": 1})
+        response = api.s.get(
+            api.url + path,
+            params={"cursor": first_cursor, "prefix": "item_"},
+            timeout=30,
+        )
+        assert response.status_code == 409, response.text
+        assert len(api.get(path)) == len(names) + 1
+    finally:
+        for row in api.get(path):
+            api.delete(path + "/" + quote(row["name"], safe=""))
+        api.delete(f"/databases/{database}")

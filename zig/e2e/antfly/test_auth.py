@@ -27,12 +27,11 @@ from pathlib import Path
 
 import pytest
 import requests
-
 from conftest import (
     DEFAULT_ANTFLY_BIN,
     StatefulAntflyServer,
-    _standalone_stateful_command,
     _read_log_tail,
+    _standalone_stateful_command,
     antfly_public_api_url,
     lookup_key_path,
     maybe_preserve_tempdir,
@@ -49,7 +48,7 @@ AUTH_SETUP_RETRY_TIMEOUT_SECONDS = 30.0
 
 
 def _basic_auth(username: str, password: str) -> str:
-    raw = f"{username}:{password}".encode("utf-8")
+    raw = f"{username}:{password}".encode()
     return "Basic " + base64.b64encode(raw).decode("ascii")
 
 
@@ -98,7 +97,7 @@ def _wait_until(predicate, timeout: float = 30.0, interval: float = 0.25):
     return None
 
 
-def _try_lookup(api: "AuthApi", table_name: str, key: str):
+def _try_lookup(api: AuthApi, table_name: str, key: str):
     try:
         return api.lookup_key(table_name, key)
     except requests.HTTPError as err:
@@ -111,7 +110,7 @@ def _try_lookup(api: "AuthApi", table_name: str, key: str):
 
 class AuthApi:
     def __init__(
-        self, base_url: str, server_ref: "StandaloneAuthServer | SplitAuthServer"
+        self, base_url: str, server_ref: StandaloneAuthServer | SplitAuthServer
     ):
         self.url = base_url.rstrip("/")
         self.auth_url = self._auth_url_from_db_url(self.url)
@@ -882,6 +881,7 @@ def test_system_catalog_scoped_permissions_and_row_filters(request, fixture_name
 def test_system_catalog_exact_star_grant_is_not_global(auth_api):
     api = auth_api
     api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    api.post("/tables/%21", {"num_shards": 1})
     for name in ("%2A", "other"):
         api.post("/tables/" + name, {"num_shards": 1})
         api.post(
@@ -919,6 +919,25 @@ def test_system_catalog_exact_star_grant_is_not_global(auth_api):
         == 403
     )
     assert [table["name"] for table in api.get("/tables")] == ["*"]
+    # A bounded page can contain only denied rows. Its cursor must advance
+    # without exposing private names or granting access on the next request.
+    response = api.s.get(api.url + "/tables", params={"limit": 1}, timeout=30)
+    assert response.status_code == 200, response.text
+    assert response.json() == []
+    cursor = response.headers["X-Antfly-Next-Cursor"]
+    response = api.s.get(
+        api.url + "/tables", params={"limit": 1, "cursor": cursor}, timeout=30
+    )
+    assert response.status_code == 200, response.text
+    assert [table["name"] for table in response.json()] == ["*"]
+    cursor = response.headers["X-Antfly-Next-Cursor"]
+    response = api.s.get(
+        api.url + "/tables", params={"limit": 1, "cursor": cursor}, timeout=30
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == []
+    assert "X-Antfly-Next-Cursor" not in response.headers
     api.s.headers["Authorization"] = _basic_auth("admin", "admin")
     api.delete("/tables/%2A")
     api.delete("/tables/other")
+    api.delete("/tables/%21")

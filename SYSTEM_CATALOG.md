@@ -345,3 +345,41 @@ They cover tenant provisioning, scoped reads and joins, NDJSON reuse, concurrent
 lookups, table listing and rename, tenant offboarding, and multi-node ingestion
 through entity promotion and graph hydration. Measurements include workload and
 binary provenance; timing thresholds are not part of correctness tests.
+
+
+## Bounded inventory and schema definitions
+
+Public table lists retain the array response and complete-list behavior when
+`limit` is absent. Clients can request 1–1,000 catalog rows and follow
+`X-Antfly-Next-Cursor` with `cursor`, using the same database, namespace and
+prefix. A continuation without an explicit limit defaults to 100. Pages use
+bytewise logical-name order. Authorization is checked on every page; an empty
+page can still carry a continuation. Cursors contain an opaque table identity,
+not the private name of a filtered row. They confer no authorization.
+
+Each page captures definitions, ranges, placements, store headers and selected
+group reports in one metadata transaction (or the standalone metadata lock).
+Catalog DDL invalidates a continuation with HTTP 409. An order-independent SHA-256
+membership fingerprint also detects unbound legacy table creation, deletion or
+rename and is rebuilt from primary identities after restore. Runtime counters
+can change between pages; pagination is not a retained historical snapshot.
+
+Metadata uses ordered logical-child and legacy-identity indexes to seek directly
+to the requested prefix/keyset boundary. It loads full definitions only after
+merging and truncating those candidate streams. Compact store headers exclude
+both group-summary and detailed-runtime arrays; selected groups are point reads.
+The derived indexes are updated in the same transaction as primary records,
+compare report bytes to avoid rewriting unchanged rows, and rebuild atomically
+when their version marker changes. Standalone selects pages from borrowed
+identity/definition references under its lock before projecting runtime state.
+
+Single-table reads and create acknowledgements use this same coherent projection
+and shared immutable schema cache. Labels are applied before encoding. Fresh
+runtime evidence is merged on reads; acknowledgements do not wait for runtime
+coverage. Cache admission weighs recent frequency against retained bytes, so
+one-pass inventories cannot replace equally useful residents. Concurrent misses
+for the same definition share one compilation. Retention remains limited to
+256 entries and 64 MiB, excluding active leases and compilation scratch. Access
+frequencies decay to allow the working set to change. Inventories wider than the
+cache still pay for nonresident schemas and response serialization; bounded pages
+control individual response work, not total inventory cost.

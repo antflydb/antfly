@@ -24,6 +24,9 @@ const raft = @import("../raft/reconciler.zig");
 pub const TableEntry = struct { name: []const u8, table: metadata.TableRecord };
 pub const TableListing = struct {
     revision: u64,
+    next_after: ?[]const u8 = null,
+    next_table_id: ?u64 = null,
+    legacy_membership: [32]u8 = @splat(0),
     entries: []const TableEntry,
     ranges: []metadata.RangeRecord = &.{},
     stores: []metadata.StoreRecord = &.{},
@@ -49,3 +52,50 @@ pub const Export = struct {
     extension_members: []extensions.ExtensionMember = &.{},
     extension_dependencies: []extensions.ExtensionDependency = &.{},
 };
+
+/// Keyset pagination concerns logical membership, not changing runtime counters.
+pub fn selectPage(entries: []TableEntry, request: domain.TableList, revision: u64) !struct { entries: []TableEntry, next: ?[]const u8 } {
+    if (request.revision) |expected| if (expected != revision) return error.CatalogGenerationChanged;
+    if (request.limit) |limit| if (limit == 0 or limit > 1000) return error.InvalidCatalogName;
+    std.mem.sort(TableEntry, entries, {}, struct {
+        fn less(_: void, left: TableEntry, right: TableEntry) bool {
+            return std.mem.lessThan(u8, left.name, right.name);
+        }
+    }.less);
+    var start: usize = 0;
+    if (request.after) |after| while (start < entries.len and !std.mem.lessThan(u8, after, entries[start].name)) : (start += 1) {};
+    const count = @min(entries.len - start, request.limit orelse std.math.maxInt(u32));
+    const page = entries[start..][0..count];
+    return .{ .entries = page, .next = if (start + count < entries.len and count != 0) page[count - 1].name else null };
+}
+
+/// Order-independent fingerprint of unbound physical table identities. Unlike
+/// runtime epochs this survives heartbeats and can be rebuilt after restore.
+pub fn legacyIdentity(id: u64, name: []const u8) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, id, .little);
+    hash.update(&bytes);
+    hash.update(name);
+    return hash.finalResult();
+}
+pub fn checkMembership(request: domain.TableList, current: [32]u8) !void {
+    if (request.legacy_membership) |expected| if (!std.mem.eql(u8, &expected, &current)) return error.CatalogGenerationChanged;
+}
+
+test "system catalog pages sort literal names and fence membership independently of runtime" {
+    var entries = [_]TableEntry{
+        .{ .name = "z", .table = .{ .table_id = 1, .name = "one" } },
+        .{ .name = "a/b", .table = .{ .table_id = 2, .name = "two" } },
+        .{ .name = "a*", .table = .{ .table_id = 3, .name = "three" } },
+    };
+    const first = try selectPage(&entries, .{ .limit = 2 }, 7);
+    try std.testing.expectEqualStrings("a*", first.entries[0].name);
+    try std.testing.expectEqualStrings("a/b", first.next.?);
+    const last = try selectPage(&entries, .{ .limit = 2, .after = first.next, .revision = 7 }, 7);
+    try std.testing.expectEqualStrings("z", last.entries[0].name);
+    try std.testing.expect(last.next == null);
+    try std.testing.expectError(error.CatalogGenerationChanged, selectPage(&entries, .{ .revision = 6 }, 7));
+    try std.testing.expectError(error.InvalidCatalogName, selectPage(&entries, .{ .limit = 0 }, 7));
+    try std.testing.expectError(error.CatalogGenerationChanged, checkMembership(.{ .legacy_membership = legacyIdentity(1, "old") }, legacyIdentity(1, "new")));
+}

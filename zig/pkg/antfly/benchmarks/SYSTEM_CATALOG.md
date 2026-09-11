@@ -176,3 +176,26 @@ and 10,000 tenant create/drop cycles. This counts array capacity in the parent
 index, excluding hash-table capacity, row storage, allocator overhead, and RSS.
 It complements the public management workload and the commit/rollback regression
 without treating memory counters as elapsed-time assertions.
+
+
+### Large inventory alongside application reads
+
+```sh
+uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
+  --scenario listing --schema-fields 200 --listing-distinct-schemas \
+  --table-counts 100 200 --listing-page-size 25 --listing-concurrent \
+  --samples 10 --warmup 2 --output /tmp/catalog-capacity.json
+uv run --project e2e/antfly python tools/benchmark_system_catalog.py \
+  --scenario listing --schema-fields 200 --table-counts 1 100 1000 \
+  --samples 5 --warmup 2 --output /tmp/catalog-detail-scale.json
+```
+
+The first workload crosses the 64 MiB schema cache budget with independently
+evolved wide schemas. It measures complete inventory, first-page latency and a
+validated complete cursor walk separately. It also runs one inventory scanner
+alongside concurrent detail readers, reporting both latency distributions.
+The second models a schema browser opening one table while unrelated tenant
+inventory grows. Both include a one-table prefix control and an empty default
+namespace. Add `--deployment cluster` to exercise durable metadata projections
+and per-group runtime report selection. Page and concurrent workloads are opt-in
+so the same harness can measure an older binary that lacks pagination.

@@ -5030,7 +5030,7 @@ pub const AntflyApiHandler = struct {
     pub fn listNamespaceTables(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, params: metadata_openapi.server.ListNamespaceTablesParams) !httpx.Response {
         _ = database_name;
         _ = namespace_name;
-        return self.listTables(ctx, .{ .prefix = params.prefix });
+        return self.listTables(ctx, .{ .prefix = params.prefix, .limit = params.limit, .cursor = params.cursor });
     }
 
     pub fn getNamespaceTable(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
@@ -5183,13 +5183,30 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         if (params.pattern != null) return textResponse(ctx, 400, "unsupported table pattern");
         const route = try system_catalog_routes.parseAlloc(ctx.allocator, http_server_mod.stripApiPrefix(ctx.request.uri.path));
-        const body = try self.api_server.encodeCatalogTableList(operationContext(ctx, authenticated_identity), .{
+        var request: @import("../system_catalog/domain.zig").TableList = .{
             .database = if (route) |value| value.database else "default",
             .namespace = if (route) |value| value.namespace else "public",
             .prefix = params.prefix,
-        }, authenticated_identity);
-        defer self.api_server.alloc.free(body);
-        return jsonResponse(ctx, 200, body);
+        };
+        if (params.limit) |limit| {
+            request.limit = std.fmt.parseInt(u32, limit, 10) catch return textResponse(ctx, 400, "invalid page limit");
+            if (request.limit.? == 0 or request.limit.? > 1000) return textResponse(ctx, 400, "page limit must be between 1 and 1000");
+        }
+        if (params.cursor) |cursor| @import("system_catalog_pagination.zig").apply(ctx.allocator, &request, cursor) catch |err| switch (err) {
+            error.InvalidCatalogName => return textResponse(ctx, 400, "invalid catalog cursor"),
+            else => return err,
+        };
+        const page = self.api_server.encodeCatalogTablePage(operationContext(ctx, authenticated_identity), request, authenticated_identity) catch |err| switch (err) {
+            error.CatalogGenerationChanged => return textResponse(ctx, 409, "catalog changed; restart pagination"),
+            error.InvalidCatalogName => return textResponse(ctx, 400, "invalid catalog cursor"),
+            else => return err,
+        };
+        defer page.deinit(self.api_server.alloc);
+        if (page.cursor) |cursor| {
+            try ctx.setHeader("X-Antfly-Next-Cursor", cursor);
+            try ctx.setHeader("Access-Control-Expose-Headers", "X-Antfly-Next-Cursor");
+        }
+        return jsonResponse(ctx, 200, page.body);
     }
 
     pub fn getTable(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
@@ -5206,22 +5223,11 @@ pub const AntflyApiHandler = struct {
             defer alloc.free(debug_body);
             return jsonResponse(ctx, 200, debug_body);
         }
-        // Use the shared status encoder so the public table response includes
-        // the same runtime doc-value evidence used by exact-sort admission.
-        // A schema declaration alone must remain "declared" until every local
-        // shard reports compatible physical coverage.
-        const body = (try self.api_server.maybeEncodeTableStatus(decoded_table_name)) orelse {
-            _ = ctx.status(404);
-            return ctx.text("not found");
-        };
-        defer self.api_server.alloc.free(body);
-        const parsed = try std.json.parseFromSlice(metadata_openapi.TableStatus, alloc, body, .{ .allocate = .alloc_always });
-        defer parsed.deinit();
-        var response = parsed.value;
         const logical_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return textResponse(ctx, 400, "invalid table name");
         defer alloc.free(logical_name);
-        response.name = logical_name;
-        return ctx.openApiJson(response);
+        const body = (try self.api_server.encodeProjectedTableStatus(operationContext(ctx, authenticated_identity), decoded_table_name, logical_name, true)) orelse return textResponse(ctx, 404, "not found");
+        defer self.api_server.alloc.free(body);
+        return jsonResponse(ctx, 200, body);
     }
 
     pub fn createTable(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
@@ -5501,18 +5507,12 @@ pub const AntflyApiHandler = struct {
         }
         std.log.info("public create table visible table={s}", .{decoded_table_name});
 
-        var snapshot = (try self.api_server.source.adminSnapshot()) orelse {
+        const body = (try self.api_server.encodeProjectedTableStatus(operationContext(ctx, authenticated_identity), decoded_table_name, logical_table_name, false)) orelse {
             return committedCreateOutcomeResponse(ctx, .visibility_pending);
         };
-        defer self.api_server.source.freeAdminSnapshot(&snapshot);
-        var arena_impl = std.heap.ArenaAllocator.init(alloc);
-        defer arena_impl.deinit();
-        var response = (try tables_api.buildSingleTableStatusWithStorageStatuses(arena_impl.allocator(), &snapshot, decoded_table_name, null)) orelse {
-            return committedCreateOutcomeResponse(ctx, .visibility_pending);
-        };
-        response.name = logical_table_name;
-        if (std.mem.startsWith(u8, http_server_mod.stripApiPrefix(ctx.request.uri.path), "/databases/")) _ = ctx.status(201);
-        return ctx.openApiJson(response);
+        defer self.api_server.alloc.free(body);
+        const status: u16 = if (std.mem.startsWith(u8, http_server_mod.stripApiPrefix(ctx.request.uri.path), "/databases/")) 201 else 200;
+        return jsonResponse(ctx, status, body);
     }
 
     pub fn dropTable(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {

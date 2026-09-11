@@ -7381,24 +7381,41 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn maybeEncodeTableStatus(self: *ApiHttpServer, table_name: []const u8) !?[]u8 {
-        var snapshot = (try self.source.adminSnapshot()) orelse return null;
-        defer self.source.freeAdminSnapshot(&snapshot);
+        return self.maybeEncodeLabeledTableStatus(table_name, table_name);
+    }
+    pub fn maybeEncodeLabeledTableStatus(self: *ApiHttpServer, table_name: []const u8, label: []const u8) !?[]u8 {
+        return self.encodeProjectedTableStatus(.{}, table_name, label, true);
+    }
+    pub fn encodeProjectedTableStatus(self: *ApiHttpServer, context: api_operation.RequestContext, table_name: []const u8, label: []const u8, include_runtime: bool) !?[]u8 {
+        try context.ensureActive();
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        var legacy: ?metadata_api.AdminSnapshot = null;
+        defer if (legacy) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+        var snapshot: metadata_api.AdminSnapshot = undefined;
+        if (self.source.vtable.system_catalog != null) {
+            const bytes = self.source.systemCatalog(arena.allocator(), context, .{ .list_tables = .{ .physical_name = table_name } }) catch |err| switch (err) {
+                error.TableNotFound => return null,
+                else => return err,
+            };
+            const listing = try std.json.parseFromSliceLeaky(@import("../system_catalog/projection.zig").TableListing, arena.allocator(), bytes, .{});
+            snapshot = try listing.adminSnapshot(arena.allocator());
+        } else {
+            legacy = (try self.source.adminSnapshot()) orelse return null;
+            snapshot = legacy.?;
+        }
         if (tables_api.findTableByName(&snapshot, table_name) == null) return null;
         var storage_status_buf: [1]tables_api.TableStorageStatus = undefined;
-        const storage_statuses = try self.bestEffortSingleTableStorageStatuses(table_name, &snapshot, &storage_status_buf);
-        if (storage_statuses) |_| {
-            const observed = self.bestEffortObservedDynamicFieldCapabilitySets(table_name) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => {
-                    std.log.debug("runtime field capability observation unavailable table={s} err={s}", .{ table_name, @errorName(err) });
-                    return try tables_api.encodeSingleTableStatusWithStorageStatuses(self.alloc, &snapshot, table_name, storage_statuses);
-                },
-            };
-            defer self.freeObservedDynamicFieldCapabilitySets(observed);
-            storage_status_buf[0].observed_dynamic_field_capability_sets = observed;
-            return try tables_api.encodeSingleTableStatusWithStorageStatuses(self.alloc, &snapshot, table_name, storage_statuses);
-        }
-        return try tables_api.encodeSingleTableStatusWithStorageStatuses(self.alloc, &snapshot, table_name, storage_statuses);
+        const storage_statuses = if (include_runtime) try self.bestEffortSingleTableStorageStatuses(table_name, &snapshot, &storage_status_buf) else null;
+        const observed: []table_reads.ObservedDynamicFieldCapabilitySet = if (storage_statuses != null) self.bestEffortObservedDynamicFieldCapabilitySets(table_name) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => &.{},
+        } else &.{};
+        defer self.freeObservedDynamicFieldCapabilitySets(observed);
+        if (storage_statuses != null) storage_status_buf[0].observed_dynamic_field_capability_sets = observed;
+        var definitions: tables_api.DefinitionCache.Leases = .{ .cache = &self.table_definition_cache, .alloc = self.alloc };
+        defer definitions.deinit();
+        return tables_api.encodeSingleTableStatusWithDefinitions(self.alloc, &snapshot, table_name, label, storage_statuses, &definitions);
     }
 
     pub fn encodeSchemaUpdateResponse(self: *ApiHttpServer, table_name: []const u8, schema_json: []const u8) ![]u8 {
@@ -15104,7 +15121,20 @@ pub const ApiHttpServer = struct {
 
     /// Select borrowed physical records before collecting per-table status or
     /// materializing public schemas. The arena owns the index and selection.
+    pub const EncodedCatalogPage = struct {
+        body: []u8,
+        cursor: ?[]u8 = null,
+        pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.body);
+            if (self.cursor) |cursor| alloc.free(cursor);
+        }
+    };
     pub fn encodeCatalogTableList(self: *ApiHttpServer, context: api_operation.RequestContext, request: system_catalog.TableList, identity: ?AuthenticatedIdentity) ![]u8 {
+        const result = try self.encodeCatalogTablePage(context, request, identity);
+        if (result.cursor) |cursor| self.alloc.free(cursor);
+        return result.body;
+    }
+    pub fn encodeCatalogTablePage(self: *ApiHttpServer, context: api_operation.RequestContext, request: system_catalog.TableList, identity: ?AuthenticatedIdentity) !EncodedCatalogPage {
         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_impl.deinit();
         const arena = arena_impl.allocator();
@@ -15112,10 +15142,13 @@ pub const ApiHttpServer = struct {
         defer if (legacy) |*snapshot| self.source.freeAdminSnapshot(snapshot);
         var labels: std.StringHashMapUnmanaged([]const u8) = .empty;
         var snapshot: metadata_api.AdminSnapshot = undefined;
+        var next_cursor: ?[]u8 = null;
+        errdefer if (next_cursor) |cursor| self.alloc.free(cursor);
         if (self.source.vtable.system_catalog != null) {
             const bytes = try self.source.systemCatalog(arena, context, .{ .list_tables = request });
             const listing = try std.json.parseFromSliceLeaky(@import("../system_catalog/projection.zig").TableListing, arena, bytes, .{});
             snapshot = try listing.adminSnapshot(arena);
+            if (listing.next_table_id) |after| next_cursor = try @import("system_catalog_pagination.zig").encode(self.alloc, request, listing.revision, listing.legacy_membership, after);
             var selected: std.ArrayListUnmanaged(metadata_table_manager.TableRecord) = .empty;
             for (listing.entries) |entry| {
                 const key = try (system_catalog.Target{ .database = request.database, .namespace = request.namespace, .table = entry.name }).resourceNameAlloc(arena);
@@ -15127,6 +15160,7 @@ pub const ApiHttpServer = struct {
         } else {
             // Compatibility is explicit: only sources without a logical
             // catalog may interpret an unbound physical table as legacy.
+            if (request.limit != null or request.after != null or request.revision != null) return error.UnsupportedOperation;
             legacy = (try self.source.adminSnapshot()) orelse return error.TableNotFound;
             const selected = try selectCatalogTables(arena, legacy.?, .{}, request.database, request.namespace, request.prefix, identity);
             snapshot = selected.snapshot;
@@ -15144,7 +15178,7 @@ pub const ApiHttpServer = struct {
             }
         }.less);
         try context.ensureActive();
-        return std.json.Stringify.valueAlloc(self.alloc, listed, .{});
+        return .{ .body = try std.json.Stringify.valueAlloc(self.alloc, listed, .{}), .cursor = next_cursor };
     }
 
     pub fn selectCatalogTables(arena: std.mem.Allocator, snapshot: metadata_api.AdminSnapshot, state: system_catalog.State, database: []const u8, namespace_name: []const u8, prefix: ?[]const u8, identity: ?AuthenticatedIdentity) !struct { snapshot: metadata_api.AdminSnapshot, labels: std.StringHashMapUnmanaged([]const u8) } {

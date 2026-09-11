@@ -794,6 +794,13 @@ pub fn projectRead(alloc: std.mem.Allocator, index: *const StateIndex, request: 
 }
 
 pub const TableList = struct {
+    // Internal physical selection is used only after public name authorization.
+    physical_name: ?[]const u8 = null,
+    after: ?[]const u8 = null,
+    after_table_id: ?u64 = null,
+    limit: ?u32 = null,
+    revision: ?u64 = null,
+    legacy_membership: ?[32]u8 = null,
     database: []const u8 = default_database_name,
     namespace: []const u8 = default_namespace_name,
     prefix: ?[]const u8 = null,

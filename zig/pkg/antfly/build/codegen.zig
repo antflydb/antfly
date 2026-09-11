@@ -76,12 +76,14 @@ pub fn addOpenApiRootCheckStep(b: *std.Build) *std.Build.Step.Run {
 fn addJoinedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
     const join = addScriptsPythonCommand(b, "../scripts/join_openapi.py", &.{"--joined-only"});
     addOpenApiJoinInputs(b, join, false);
+    join.addArg("--output");
     return join.addOutputFileArg("openapi.public.joined.yaml");
 }
 
 fn addPrefixedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
     const join = addScriptsPythonCommand(b, "../scripts/join_public_openapi.py", &.{});
     addOpenApiJoinInputs(b, join, true);
+    join.addArg("--output");
     return join.addOutputFileArg("openapi.public.prefixed.yaml");
 }
 
