@@ -6,6 +6,13 @@ a passing soak alone does not establish a failure's cause.
 
 ## Delayed Raft responses amplify replication and exhaust outbound admission (#694)
 
+The `42cb81c6a` run ultimately finished **297/300**: quickstart 99/100,
+backup/restore 98/100, retry exhaustion 100/100. The second restore failure
+(`yiezk7ry`) retained completed progress on metadata node 1 while nodes 2 and 3
+had retired it; node 2 logged up to 2,377 messages / 642,867,360 bytes in a Ready
+batch. Both failures and the CLI failure below are preserved in
+`/private/tmp/ci694-durable-complete-results.tar.gz`.
+
 The fresh Linux mixed soak on `42cb81c6a` failed backup/restore in worker 1,
 iteration 1. Metadata node 1 accumulated a Ready batch of **1,144,753,225 bytes**,
 exceeding the unchanged 1,140,850,688-byte hard ceiling, and quarantined its
@@ -52,6 +59,34 @@ difference at seed 3, step 25; the pre-fix revision reproduces it as well
 not counted as passing acceptance. Repeated compaction actions now have the
 same idempotent storage semantics in both harnesses. Fresh Linux
 100-per-scenario acceptance remains required for this revision.
+
+Isolated-cache validation of the complete Raft and data-runtime integration
+targets passes **1,045 tests**, with one existing opt-in external wrong-route
+endpoint check skipped (`/private/tmp/ci694-replication-fresh-integration.log`).
+The optimized Linux build on `05f96814e` passed all 27 steps, using a fresh
+compiler cache; executable SHA-256:
+`dfdbe000a2712b11d0919a4dc66888c51f905030d3d14a8a360bee4d5cbc3265`.
+
+## Exact semantic ranking requires complete source publication (#694)
+
+Worker 4, iteration 23 of the `42cb81c6a` soak returned an empty semantic result
+after `searchable-artifacts=1`, then indexed directly into the empty hit list.
+The test expected Alpha to rank first across two source documents even though
+that milestone guarantees only the first searchable artifact, not which source
+has published. A controlled Linux probe holds Alpha's embedding while Beta is
+published: the partial wait succeeds and returns only Beta; after releasing
+Alpha and waiting for `complete`, Alpha ranks first and both documents appear
+(`/private/tmp/ci694-partial-cli-probe.log`). This proves the ranking assumption
+invalid; it does not independently reproduce the original empty result.
+
+The quickstart retains its partial milestone assertion, then waits for the
+existing `complete` milestone before asserting exact corpus ranking, matching
+its image-query contract. The existing 20-second wait bound is unchanged, and
+no query is retried to pass. A failed complete query now reports both wait
+results, query output/stderr, and current index status instead of an unhelpful
+IndexError. The original standalone log/root is retained in
+`/private/tmp/ci694-durable-cli-failure.tar.gz`. Fresh acceptance includes this
+test contract correction alongside the production replication fixes.
 
 ## Provider-restart regression races an independent index consumer (#694)
 

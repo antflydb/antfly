@@ -30,6 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+
 from conftest import (
     DEFAULT_ANTFLY_BIN,
     InferenceEmbeddingServer,
@@ -41,7 +42,6 @@ from conftest import (
 )
 from helpers import wait_until
 from port_reservations import find_free_port
-
 
 # enrichment_runtime.zig permits six worker attempts, each containing six
 # provider attempts. Inline sleeps total 7.75s per worker attempt; the five
@@ -376,9 +376,9 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             "2",
             timeout_s=5.0,
         )
-        assert time.monotonic() - full_text_started < 3.0, (
-            "a ready full-text read queued behind generated-index backfill"
-        )
+        assert (
+            time.monotonic() - full_text_started < 3.0
+        ), "a ready full-text read queued behind generated-index backfill"
         full_text_hits = parse_json(full_text_query.stdout)["responses"][0]["hits"][
             "hits"
         ]
@@ -445,6 +445,27 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         assert "pending_reasons=" in text_wait.stdout
         assert "complete_blockers=" in text_wait.stdout
 
+        # The first searchable artifact may belong to either source. Exact
+        # ranking across the two-document corpus requires complete publication,
+        # just as the image query below waits for complete before asserting it.
+        # Retain the partial milestone above as its own CLI contract.
+        text_complete = cli(
+            "index",
+            "wait",
+            "--table",
+            table,
+            "--index",
+            "title_body",
+            "--until",
+            "complete",
+            "--timeout",
+            "20s",
+            "--poll-interval",
+            "25ms",
+            timeout_s=30.0,
+        )
+        assert "Index title_body (embeddings) reached complete:" in text_complete.stdout
+
         text_query = cli(
             "query",
             "--table",
@@ -458,7 +479,13 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         )
         assert_no_unexpected_semantic_warning(text_query, "title_body")
         text_hits = parse_json(text_query.stdout)["responses"][0]["hits"]["hits"]
-        assert text_hits[0]["_id"] == "doc:alpha"
+        assert text_hits and text_hits[0]["_id"] == "doc:alpha", (
+            f"complete semantic query did not return Alpha\n"
+            f"partial wait: {text_wait.stdout}\n"
+            f"complete wait: {text_complete.stdout}\n"
+            f"query: {text_query.stdout}\nstderr: {text_query.stderr}\n"
+            f"index: {cli('index', 'get', '--table', table, '--index', 'title_body').stdout}"
+        )
 
         # Reproduce the documented live-add path while another managed index
         # is actively awaiting inference. Activation/control work must bypass
@@ -503,9 +530,9 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             ),
             timeout_s=8.0,
         )
-        assert time.monotonic() - image_create_started < 5.0, (
-            "second-index activation queued behind provider execution"
-        )
+        assert (
+            time.monotonic() - image_create_started < 5.0
+        ), "second-index activation queued behind provider execution"
 
         def thumbnail_is_owned() -> dict | None:
             index = parse_json(
@@ -583,9 +610,9 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
                 status = parse_json(
                     cli("index", "get", "--table", table, "--index", name).stdout
                 )["status"]
-                assert status["readiness"]["state"] != "runtime_unavailable", (
-                    json.dumps(status, indent=2)
-                )
+                assert (
+                    status["readiness"]["state"] != "runtime_unavailable"
+                ), json.dumps(status, indent=2)
                 source_coverage = status["source_coverage"]
                 if source_coverage["observation_complete"]:
                     assert source_coverage["pending"] > 0, json.dumps(status, indent=2)
@@ -731,9 +758,9 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
                 listed_thumbnail, indent=2
             )
             time.sleep(0.025)
-        assert cli_media_server.request_count >= 1, (
-            "the image quickstart path did not exercise remoteMedia over HTTP"
-        )
+        assert (
+            cli_media_server.request_count >= 1
+        ), "the image quickstart path did not exercise remoteMedia over HTTP"
 
         image_query = cli(
             "query",
@@ -893,9 +920,9 @@ def test_cli_index_wait_survives_retry_exhaustion_and_restart(
                 }
             ),
         )
-        assert time.monotonic() - insert_started < 5.0, (
-            "the default point-mutation barrier waited for generated indexing"
-        )
+        assert (
+            time.monotonic() - insert_started < 5.0
+        ), "the default point-mutation barrier waited for generated indexing"
 
         def isolated_failure_is_settled() -> dict | None:
             status = parse_json(
@@ -950,9 +977,9 @@ def test_cli_index_wait_survives_retry_exhaustion_and_restart(
                 }
             ),
         )
-        assert time.monotonic() - insert_started < 5.0, (
-            "the default point-mutation barrier inherited provider latency"
-        )
+        assert (
+            time.monotonic() - insert_started < 5.0
+        ), "the default point-mutation barrier inherited provider latency"
         assert embedder_server.wait_for_embedding_request(10.0)
 
         def isolated_failure_is_pending() -> dict | None:

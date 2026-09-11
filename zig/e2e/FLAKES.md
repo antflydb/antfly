@@ -2,6 +2,11 @@
 
 ## 2026-09-11: delayed Raft responses amplify metadata replication (#694)
 
+The full `42cb81c6a` run completed **297/300**: quickstart 99/100,
+backup/restore 98/100, retry exhaustion 100/100. Complete preserved evidence is
+in `/private/tmp/ci694-durable-complete-results.tar.gz`. Its second restore
+timeout also showed amplified Raft batches and one lagging metadata replica.
+
 The new mixed Linux run on `42cb81c6a` failed backup/restore immediately in
 worker 1. Metadata node 1 quarantined its group after one Ready batch exceeded
 the existing hard outbound ceiling at 1,144,753,225 bytes. Preserved logs/state
@@ -16,6 +21,15 @@ Quorum commit also requires a current-term entry. All 401 Raft library tests
 pass; the corrected snapshot-abort history matches the etcd oracle. See
 `../FLAKES.md` for before/after evidence and protocol details. This is another
 failed acceptance run; a fresh 100/100 for all three scenarios is required.
+
+The standalone quickstart failure also exposed an invalid test assumption:
+one searchable artifact does not guarantee that Alpha has published ahead of
+Beta. A controlled provider gate proves the partial milestone can succeed with
+only Beta searchable; complete publication then returns Alpha first. The test
+retains its partial milestone check and uses `complete` before exact ranking,
+with unchanged wait bounds and no query retries. Complete-query failures now
+include readiness and query diagnostics. This probe does not reproduce the
+original empty-hit result itself; see `../FLAKES.md` for the evidence limits.
 
 ## 2026-09-11: unit CI retention assertion races legitimate consumer progress (#694)
 
