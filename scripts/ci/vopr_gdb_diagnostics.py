@@ -6,11 +6,15 @@ This intentionally runs with GDB's embedded Python, not the system interpreter.
 
 import gdb
 
+production_fixture = None
+inspection_failed = False
 
-def suspended_tasks(world):
+
+def suspended_tasks(fixture):
     """Read saved fiber stacks before teardown destroys the retained owners."""
-    state = world.dereference()["state"].dereference()
-    tasks = state["sim"]["tasks"]["tasks"]["items"]
+    runtime = fixture.dereference()["sim"].dereference()
+    gdb.write(f"VOPR cutoff monotonic_ns={runtime['monotonic_ns']}\n")
+    tasks = runtime["tasks"]["tasks"]["items"]
     for index in range(int(tasks["len"])):
         task = tasks["ptr"][index].dereference()
         status = str(task["status"])
@@ -42,17 +46,27 @@ def suspended_tasks(world):
 
 
 def boundary():
+    global production_fixture, inspection_failed
     frame = gdb.newest_frame()
     gdb.write(f"VOPR boundary: {frame.name()}\n")
     if frame.name() == "vopr.full_cluster.Scenario.deinit":
         try:
-            suspended_tasks(frame.read_var("world"))
+            if production_fixture is None:
+                gdb.write("  no production fixture reached before teardown\n")
+            else:
+                suspended_tasks(production_fixture)
         except (gdb.error, ValueError) as error:
+            inspection_failed = True
             gdb.write(f"  suspended task inspection unavailable: {error}\n")
         return
     try:
-        owner = frame.read_var("self").dereference()
+        pointer = frame.read_var("self")
+        owner = pointer.dereference()
         fields = {field.name for field in owner.type.fields()}
+        if "ha_scaling_stage" in fields:
+            # Preserve the pointer value while its frame is live. Reading World
+            # through optimized debug information at deinit is unreliable.
+            production_fixture = gdb.Value(int(pointer)).cast(pointer.type)
         for name in (
             "ha_scaling_stage",
             "phase",
@@ -95,4 +109,4 @@ if gdb.selected_inferior().pid:
     gdb.execute("thread apply all bt 12")
     gdb.execute("quit 1")
 else:
-    gdb.execute(f"quit {int(gdb.parse_and_eval('$_exitcode'))}")
+    gdb.execute(f"quit {int(gdb.parse_and_eval('$_exitcode')) or int(inspection_failed)}")

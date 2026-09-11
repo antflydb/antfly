@@ -57,6 +57,20 @@ const replayable_sources = [_]Source{
     .{ .path = "vopr/supervision.zig", .bytes = @embedFile("supervision.zig") },
     .{ .path = "vopr/upgrade_compatibility.zig", .bytes = @embedFile("upgrade_compatibility.zig") },
     .{ .path = "raft/vopr.zig", .bytes = @embedFile("../raft/vopr.zig") },
+    // These production retry/deadline consumers must use the same borrowed
+    // clock as their sleeps; host time can change an exact replay's timers.
+    .{
+        .path = "raft/transport/http_driver.zig#retry-queue",
+        .bytes = region(@embedFile("../raft/transport/http_driver.zig"), "    fn retryQueuedFrame(", "fn pseudoJitter("),
+    },
+    .{
+        .path = "raft/transport/http_snapshot.zig#transfer-deadline",
+        .bytes = region(@embedFile("../raft/transport/http_snapshot.zig"), "    fn transferDeadlineNs(", "    /// Completion-barrier transport"),
+    },
+    .{
+        .path = "raft/transport/http_snapshot.zig#retry-clock",
+        .bytes = region(@embedFile("../raft/transport/http_snapshot.zig"), "    fn nextSnapshotSendSleepMs(", "    fn snapshotRetryDelayMs("),
+    },
     .{ .path = "storage/lsm_vopr.zig", .bytes = @embedFile("../storage/lsm_vopr.zig") },
     .{ .path = "storage/lmdb_vopr.zig", .bytes = @embedFile("../storage/lmdb_vopr.zig") },
     .{ .path = "storage/ha/vopr.zig", .bytes = @embedFile("../storage/ha/vopr.zig") },
