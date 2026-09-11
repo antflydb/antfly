@@ -14,6 +14,7 @@ import type {
   EmbedResponse,
   EntityExtractionResult,
   ExtractRequest,
+  ExtractV2Request,
   ExtractResponse,
   GenerateChunk,
   GenerateRequest,
@@ -40,7 +41,9 @@ export class InferenceAPIError extends Error {
     readonly status: number,
     readonly code: string | undefined,
     detail: string,
-    readonly retryable: boolean | undefined
+    readonly retryable: boolean | undefined,
+    readonly inputIndex?: number,
+    readonly stage?: string
   ) {
     super(`inference request failed (${status}): ${detail}`);
     this.name = "InferenceAPIError";
@@ -426,12 +429,24 @@ export class InferenceClient {
    * Run the canonical schema-driven extraction API.
    */
   async extractRaw(request: ExtractRequest): Promise<ExtractResponse> {
+    const expectedModel = request.model;
+    const expectedIds = request.schema_version === 2
+      ? request.inputs.map((input) => input.id)
+      : undefined;
     const { data, error, response } = await this.client.POST("/ai/v1/extract", {
       body: request,
     });
     if (!response.ok) throw inferenceAPIError(response.status, error);
     if (!data) throw new Error("Extract failed: unexpected empty response");
+    if (expectedIds !== undefined) {
+      validateExtractionV2Response(data, expectedModel, expectedIds);
+    }
     return data;
+  }
+
+  /** Strict mixed-task extraction with complete per-input schema/options replacements. */
+  async extractV2(request: ExtractV2Request): Promise<ExtractResponse> {
+    return this.extractRaw({ ...request, schema_version: 2 });
   }
 
   /**
@@ -614,6 +629,37 @@ export class InferenceClient {
   }
 }
 
+function validateExtractionV2Response(
+  response: unknown,
+  expectedModel: string,
+  expectedIds: readonly (string | undefined)[]
+): void {
+  if (typeof response !== "object" || response === null || Array.isArray(response)) {
+    throw new Error("Invalid extraction v2 response: expected an extraction object");
+  }
+  const envelope = response as Record<string, unknown>;
+  if (envelope.object !== "extraction" || envelope.schema_version !== 2) {
+    throw new Error("Invalid extraction v2 response: object or schema version");
+  }
+  if (envelope.model !== expectedModel) {
+    throw new Error("Invalid extraction v2 response: model mismatch");
+  }
+  if (!Array.isArray(envelope.data) || envelope.data.length !== expectedIds.length) {
+    throw new Error("Invalid extraction v2 response: item cardinality");
+  }
+  for (let index = 0; index < expectedIds.length; index++) {
+    const row: unknown = envelope.data[index];
+    if (typeof row !== "object" || row === null || Array.isArray(row)) {
+      throw new Error(`Invalid extraction v2 response: item ${index} must be an object`);
+    }
+    const item = row as Record<string, unknown>;
+    const hasId = Object.prototype.hasOwnProperty.call(item, "id");
+    if ((hasId && typeof item.id !== "string") || item.id !== expectedIds[index]) {
+      throw new Error(`Invalid extraction v2 response: item ${index} id mismatch`);
+    }
+  }
+}
+
 function inferenceAPIError(status: number, error: InferenceError | unknown): InferenceAPIError {
   if (status === 503 && isTransientCapacityError(error)) {
     return new InferenceCapacityError(error);
@@ -627,7 +673,14 @@ function inferenceAPIError(status: number, error: InferenceError | unknown): Inf
     message && message !== code
       ? `${message}${code ? ` (${code})` : ""}`
       : message || code || "Unknown inference error";
-  return new InferenceAPIError(status, code, detail, retryable);
+  const inputIndex =
+    typeof payload.input_index === "number" &&
+    Number.isSafeInteger(payload.input_index) &&
+    payload.input_index >= 0
+      ? payload.input_index
+      : undefined;
+  const stage = typeof payload.stage === "string" ? payload.stage : undefined;
+  return new InferenceAPIError(status, code, detail, retryable, inputIndex, stage);
 }
 
 async function inferenceAPIErrorResponse(response: Response): Promise<InferenceAPIError> {

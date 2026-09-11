@@ -1,0 +1,1521 @@
+{
+  "assembler": {
+    "path": "helpers/stage_evidence.py",
+    "sha256": "31b212b660ecbf6d20ab7d0ad74e46202885b12134c24dc7000dffbd50c15b92",
+    "size_bytes": 21488
+  },
+  "checkpoints": [
+    {
+      "ancillary_build_tests": {
+        "is_main_selected_suite": false,
+        "passed": 23,
+        "total": 23
+      },
+      "command": [
+        "/opt/homebrew/Cellar/zig/0.16.0/bin/zig",
+        "build",
+        "inference-test",
+        "-Dmetal=true",
+        "-Dcuda=false",
+        "-j1",
+        "--",
+        "--test-filter",
+        "boundary qualification",
+        "--test-filter",
+        "seeded gradient trainer restore",
+        "--test-filter",
+        "boundary training dataset",
+        "--test-filter",
+        "boundary training export",
+        "--test-filter",
+        "boundary training job dataset open",
+        "--test-filter",
+        "gliner boundary cache pinned small Metal handle retention eviction and reload",
+        "--test-filter",
+        "gliner boundary manifests",
+        "--test-filter",
+        "gliner boundary detection keeps legacy",
+        "--test-filter",
+        "gliner boundary capabilities",
+        "--test-filter",
+        "taskMatchesModelListing",
+        "--test-filter",
+        "gliner boundary long executor",
+        "--test-filter",
+        "gliner boundary executor pinned small Metal window batch"
+      ],
+      "cwd": "/Users/timkaye/Documents/af/antfly/zig",
+      "elapsed_seconds": 17.51046520800446,
+      "environment": {
+        "ANTFLY_GLINER25_SMALL_MODEL_DIR": "/private/tmp/antfly-gliner25-models/small",
+        "ZIG_GLOBAL_CACHE_DIR": "/private/tmp/antfly-gliner25-zig-cache"
+      },
+      "failure": "RuntimeError: public CLI exited 1",
+      "failure_interpretation": {
+        "code": "unhandled_allow_enum",
+        "detail": "Extractor qualification options.overlap switch omitted enum .allow; main inference tests did not execute.",
+        "line": 94,
+        "source": "zig/pkg/inference/src/extractors/gliner_boundary_qualification.zig",
+        "source_line": "        result.insert(switch (options.overlap) {"
+      },
+      "failure_phase": "execution",
+      "guards": {
+        "kill_wait_seconds": 5,
+        "max_child_tree_rss_bytes": 6442450944,
+        "max_stderr_bytes": 8388608,
+        "max_stdout_bytes": 8388608,
+        "max_tracked_processes": 64,
+        "parent_grace_seconds": 5,
+        "rss_poll_seconds": 0.05,
+        "timeout_seconds": 1800,
+        "worker_parent_loss_grace_seconds": 2
+      },
+      "helper_pins": {
+        "supervisor": {
+          "sha256": "a937237975be2ed879f62afd285494ccb51a7c1d7cc1dff7160621fb26b87332",
+          "size_bytes": 12474
+        },
+        "wrapper": {
+          "sha256": "45a745b995f86432c89fa57bf8dd5b92dbc810f706a7989accc66c8bbddde3b1",
+          "size_bytes": 6752
+        }
+      },
+      "id": "v1",
+      "inspection_error_count": 0,
+      "main_executable": null,
+      "main_test_totals": null,
+      "observed_test_executables": [
+        {
+          "argv": [
+            "./.zig-cache/o/b40f2a5a4e0645287d901c3783dedf0d/test",
+            "--cache-dir=./.zig-cache",
+            "--seed=0x4988c24d",
+            "--listen=-"
+          ],
+          "create_time": 1789067197.785143,
+          "cwd": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference",
+          "executable": {
+            "path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/.zig-cache/o/b40f2a5a4e0645287d901c3783dedf0d/test",
+            "sha256": "40abd1047c221e78b87ef74f68be49d581e66fa112e3e99b57f1698cb5cad1a9",
+            "size_bytes": 4970984
+          },
+          "pid": 14732
+        }
+      ],
+      "optional_executable_identity_errors": [
+        "(pid=14532)"
+      ],
+      "original_directory": "/private/tmp/antfly-gliner25-qualification-lifecycle-metal-v1",
+      "original_source_archive": null,
+      "outcome": "compile_failure",
+      "peak_child_tree_rss_bytes": 1557250048,
+      "process_cleanup": {
+        "complete": true,
+        "direct_child_reaped": true,
+        "elapsed_seconds": 1.3790995581075549e-05,
+        "errors": [],
+        "grandchild_proof": "observed creation identities no longer exist; direct CLI parent is their normal waiter",
+        "inspection_errors": [],
+        "known_children_gone": true,
+        "survivors": []
+      },
+      "raw": {
+        "observed-test-1.json": {
+          "path": "runs/v1/observed-test-1.json",
+          "sha256": "f7f85b055728e96a6f72f1bff11fbebc2ff72898a957b05fe56e03527d5f6217",
+          "size_bytes": 521
+        },
+        "process.json": {
+          "path": "runs/v1/process.json",
+          "sha256": "b48d9efc99fb08b9559d0f59917777aa319f3add8d929b83a9e7c3cdc7fcbc23",
+          "size_bytes": 5881
+        },
+        "source_inventory.json": {
+          "path": "runs/v1/source_inventory.json",
+          "sha256": "58aa9063f8b723850f943ccb49cf3bd5dd1bed9436f890ef53b4e4516330d53d",
+          "size_bytes": 437855
+        },
+        "start.json": {
+          "path": "runs/v1/start.json",
+          "sha256": "4743117304891a4b7a4b14e65680e7479ce5e2abd70259b44f77f508c864f961",
+          "size_bytes": 1776
+        },
+        "stderr.log": {
+          "path": "runs/v1/stderr.log",
+          "sha256": "4400fbaecd14a533a8139d3daf1f244c155f7d30ab39b939a9cfd9cab7e4b5c5",
+          "size_bytes": 11642
+        },
+        "stdout.log": {
+          "path": "runs/v1/stdout.log",
+          "sha256": "3459fccabd4b57aaca0e53c7a3da704caee13562a6d2854a5b3bf4a459753ae8",
+          "size_bytes": 203
+        }
+      },
+      "returncode": 1,
+      "rss_measurement": "sampled sum of RSS for still-matching known child creation identities; shared pages can be counted twice",
+      "selected_sources": [
+        {
+          "artifact": {
+            "path": "sources/af593906d27ce57037e74b464960d55039d3afb7654545a14880399ed2501b76/gliner_boundary_qualification.zig",
+            "sha256": "af593906d27ce57037e74b464960d55039d3afb7654545a14880399ed2501b76",
+            "size_bytes": 28762
+          },
+          "recovery": {
+            "method": "pre-existing private proposed source",
+            "original_path": "/private/tmp/gliner25-runtime-qualification-integration-v1/proposed/zig/pkg/inference/src/extractors/gliner_boundary_qualification.zig"
+          },
+          "repo_path": "zig/pkg/inference/src/extractors/gliner_boundary_qualification.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/610477e3664f4772c762757b251369e9b05c96c80d63e6e0c358ace86dd5520e/gliner_boundary_qualification.zig",
+            "sha256": "610477e3664f4772c762757b251369e9b05c96c80d63e6e0c358ace86dd5520e",
+            "size_bytes": 22433
+          },
+          "recovery": {
+            "method": "unchanged Add File payload recovered from pre-existing private patch",
+            "original_path": "/private/tmp/gliner25-runtime-qualification-policy-v1.patch",
+            "patch": {
+              "path": "source_recovery/v1_model_policy.patch",
+              "sha256": "e9e4e1d2b2b3e3378767a6b05f75b1df7cc3f2fda52cae6470002fe67a1e5174",
+              "size_bytes": 22987
+            }
+          },
+          "repo_path": "zig/pkg/inference/src/models/gliner_boundary_qualification.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/f6e4b05af7c9edb181a45f2cc9e5606feeb92fe7e7f09dde75d14e1c946a4c80/gliner_boundary_cache_lifecycle_test.zig",
+            "sha256": "f6e4b05af7c9edb181a45f2cc9e5606feeb92fe7e7f09dde75d14e1c946a4c80",
+            "size_bytes": 17941
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/server/gliner_boundary_cache_lifecycle_test.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/server/gliner_boundary_cache_lifecycle_test.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/87841d5edbf2e650441642b468f3858229817df0d48ed4ee93698893531df849/model_manager.zig",
+            "sha256": "87841d5edbf2e650441642b468f3858229817df0d48ed4ee93698893531df849",
+            "size_bytes": 523677
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/server/model_manager.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/server/model_manager.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/1f4dd8800429250d2c61a218aeef862ac68b13ea51924d56fee9b6503d9e79fb/session.zig",
+            "sha256": "1f4dd8800429250d2c61a218aeef862ac68b13ea51924d56fee9b6503d9e79fb",
+            "size_bytes": 73938
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/backends/session.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/backends/session.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/88f5411f6f810458d4128ebf0a0cd7e5e037908b3d2f307aed230d77143dbca0/session_factory.zig",
+            "sha256": "88f5411f6f810458d4128ebf0a0cd7e5e037908b3d2f307aed230d77143dbca0",
+            "size_bytes": 416265
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/architectures/session_factory.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/architectures/session_factory.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/f9ceadafddc97d56667f8dea0f263bc516a9d3b5e56584ec21ba05baee2fe89a/execution_control.zig",
+            "sha256": "f9ceadafddc97d56667f8dea0f263bc516a9d3b5e56584ec21ba05baee2fe89a",
+            "size_bytes": 8805
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/execution_control.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/execution_control.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/ee1157c51c00baabd6c66c0cd4c584342192bb4369039c4cbaf2c307252624d2/hard_cancellation_watchdog.zig",
+            "sha256": "ee1157c51c00baabd6c66c0cd4c584342192bb4369039c4cbaf2c307252624d2",
+            "size_bytes": 4823
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/hard_cancellation_watchdog.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/hard_cancellation_watchdog.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/2bc4419b7130cc2fd32845e9abf3acbe788e864e963076f5b3fd9653bf5b0567/gliner_boundary_decode.zig",
+            "sha256": "2bc4419b7130cc2fd32845e9abf3acbe788e864e963076f5b3fd9653bf5b0567",
+            "size_bytes": 20078
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/pipelines/gliner_boundary_decode.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/pipelines/gliner_boundary_decode.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/3cd53a38e3b9a5ba0208a5f2568d69d04e0ef07ed1f140df2d54e6d00cfc753d/gliner_boundary_dataset.zig",
+            "sha256": "3cd53a38e3b9a5ba0208a5f2568d69d04e0ef07ed1f140df2d54e6d00cfc753d",
+            "size_bytes": 34000
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/finetune/gliner_boundary_dataset.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/finetune/gliner_boundary_dataset.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/28101ec590833502b1aa74b0c627ee8d4c40877ca13c2d9593b5cbb5a4141cb0/gliner_boundary_training_export.zig",
+            "sha256": "28101ec590833502b1aa74b0c627ee8d4c40877ca13c2d9593b5cbb5a4141cb0",
+            "size_bytes": 56115
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/finetune/gliner_boundary_training_export.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/finetune/gliner_boundary_training_export.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/46242701eaf61d39a4d287dbe0da667bdc99c1dc7f3a9eb08eed9ba7ccd14671/gliner_boundary_training_job.zig",
+            "sha256": "46242701eaf61d39a4d287dbe0da667bdc99c1dc7f3a9eb08eed9ba7ccd14671",
+            "size_bytes": 40300
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/finetune/gliner_boundary_training_job.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/finetune/gliner_boundary_training_job.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/ef0af87691ad971fd67d750c4ccce1633ba3352211afd161a2f97817edd42cf6/seeded_gradient_trainer.zig",
+            "sha256": "ef0af87691ad971fd67d750c4ccce1633ba3352211afd161a2f97817edd42cf6",
+            "size_bytes": 84556
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/finetune/seeded_gradient_trainer.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/finetune/seeded_gradient_trainer.zig"
+        }
+      ],
+      "source_count": 2587,
+      "source_inventory": {
+        "sha256": "58aa9063f8b723850f943ccb49cf3bd5dd1bed9436f890ef53b4e4516330d53d",
+        "size_bytes": 437855
+      },
+      "source_selection": "rg --files zig; suffixes .zig .zon .metal .m .mm .c .h; this is not a complete dependency closure",
+      "source_unchanged_after_run": true
+    },
+    {
+      "ancillary_build_tests": {
+        "is_main_selected_suite": false,
+        "passed": 23,
+        "total": 23
+      },
+      "archive_receipt": {
+        "path": "runs/v2/archive.json",
+        "sha256": "9050483cea4e4f7b53ef575da138be14869bed8340226e1964ab214f2bf32380",
+        "size_bytes": 2493
+      },
+      "archivist_failure_interpretation": "Actual TTL fixture assumes per-request MetalTensor buffers remain owned after HTTP completion; failure retained, correction pending.",
+      "command": [
+        "/opt/homebrew/Cellar/zig/0.16.0/bin/zig",
+        "build",
+        "inference-test",
+        "-Dmetal=true",
+        "-Dcuda=false",
+        "-j1",
+        "--",
+        "--test-filter",
+        "boundary qualification",
+        "--test-filter",
+        "seeded gradient trainer restore",
+        "--test-filter",
+        "boundary training dataset",
+        "--test-filter",
+        "boundary training export",
+        "--test-filter",
+        "boundary training job dataset open",
+        "--test-filter",
+        "gliner boundary cache pinned small Metal handle retention eviction and reload",
+        "--test-filter",
+        "gliner boundary manifests",
+        "--test-filter",
+        "gliner boundary detection keeps legacy",
+        "--test-filter",
+        "gliner boundary capabilities",
+        "--test-filter",
+        "taskMatchesModelListing",
+        "--test-filter",
+        "gliner boundary long executor",
+        "--test-filter",
+        "gliner boundary executor pinned small Metal window batch"
+      ],
+      "cwd": "/Users/timkaye/Documents/af/antfly/zig",
+      "elapsed_seconds": 194.88731737498892,
+      "environment": {
+        "ANTFLY_GLINER25_SMALL_MODEL_DIR": "/private/tmp/antfly-gliner25-models/small",
+        "ZIG_GLOBAL_CACHE_DIR": "/private/tmp/antfly-gliner25-zig-cache"
+      },
+      "failure": "RuntimeError: public CLI exited 1",
+      "failure_interpretation": {
+        "code": "warm_device_counter_assumption",
+        "detail": "Test expected request MetalTensor buffers to remain owned after HTTP completion; failed assertion is preserved.",
+        "line": 240,
+        "source": "zig/pkg/inference/src/server/gliner_boundary_cache_lifecycle_test.zig",
+        "source_line": "        try std.testing.expect(warm_physical.device_owned_live_bytes > initial_physical.device_owned_live_bytes);"
+      },
+      "failure_phase": "execution",
+      "guards": {
+        "kill_wait_seconds": 5,
+        "max_child_tree_rss_bytes": 6442450944,
+        "max_stderr_bytes": 8388608,
+        "max_stdout_bytes": 8388608,
+        "max_tracked_processes": 64,
+        "parent_grace_seconds": 5,
+        "rss_poll_seconds": 0.05,
+        "timeout_seconds": 1800,
+        "worker_parent_loss_grace_seconds": 2
+      },
+      "helper_pins": {
+        "supervisor": {
+          "sha256": "a937237975be2ed879f62afd285494ccb51a7c1d7cc1dff7160621fb26b87332",
+          "size_bytes": 12474
+        },
+        "wrapper": {
+          "sha256": "45a745b995f86432c89fa57bf8dd5b92dbc810f706a7989accc66c8bbddde3b1",
+          "size_bytes": 6752
+        }
+      },
+      "id": "v2",
+      "inspection_error_count": 0,
+      "main_executable": {
+        "bytes_included": false,
+        "original_path": "/private/tmp/antfly-gliner25-qualification-lifecycle-metal-v2-archive/test",
+        "rehashed": true,
+        "sha256": "ddc9797781b4e98bf8b8f88613aa209f3fbf283124e2b326090a9b0e84406415",
+        "size_bytes": 83606552
+      },
+      "main_test_totals": {
+        "failed": 1,
+        "leaked": 0,
+        "passed": 47,
+        "selected": 49,
+        "skipped": 1
+      },
+      "observed_test_executables": [
+        {
+          "argv": [
+            "./.zig-cache/o/d93233285d1d62c43d4408acbe770aa5/test",
+            "--cache-dir=./.zig-cache",
+            "--seed=0xa2205c7e",
+            "--listen=-"
+          ],
+          "create_time": 1789067359.388721,
+          "cwd": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference",
+          "executable": {
+            "path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/.zig-cache/o/d93233285d1d62c43d4408acbe770aa5/test",
+            "sha256": "650c1f87eb88d96c111d05f81135ab22eaee3e21a4be655bdb9fac24752da79e",
+            "size_bytes": 4970984
+          },
+          "pid": 15193
+        },
+        {
+          "argv": [
+            "./.zig-cache/o/7b1fa3efb9bebccfbc7a89f0beb18b7f/test",
+            "--test-filter",
+            "boundary qualification",
+            "--test-filter",
+            "seeded gradient trainer restore",
+            "--test-filter",
+            "boundary training dataset",
+            "--test-filter",
+            "boundary training export",
+            "--test-filter",
+            "boundary training job dataset open",
+            "--test-filter",
+            "gliner boundary cache pinned small Metal handle retention eviction and reload",
+            "--test-filter",
+            "gliner boundary manifests",
+            "--test-filter",
+            "gliner boundary detection keeps legacy",
+            "--test-filter",
+            "gliner boundary capabilities",
+            "--test-filter",
+            "taskMatchesModelListing",
+            "--test-filter",
+            "gliner boundary long executor",
+            "--test-filter",
+            "gliner boundary executor pinned small Metal window batch"
+          ],
+          "create_time": 1789067410.738922,
+          "cwd": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference",
+          "executable": {
+            "path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/.zig-cache/o/7b1fa3efb9bebccfbc7a89f0beb18b7f/test",
+            "sha256": "ddc9797781b4e98bf8b8f88613aa209f3fbf283124e2b326090a9b0e84406415",
+            "size_bytes": 83606552
+          },
+          "pid": 15232
+        }
+      ],
+      "optional_executable_identity_errors": [
+        "(pid=15164)",
+        "(pid=15164)",
+        "(pid=15186)",
+        "(pid=15186)",
+        "(pid=15186)",
+        "(pid=15186)",
+        "(pid=15186)"
+      ],
+      "original_directory": "/private/tmp/antfly-gliner25-qualification-lifecycle-metal-v2",
+      "original_source_archive": {
+        "bytes_included": false,
+        "original_path": "/private/tmp/antfly-gliner25-qualification-lifecycle-metal-v2-archive/recorded-source-selection.tar.gz",
+        "rehashed": true,
+        "sha256": "91230afa7e2fc8dcd5f098dc13f420570cbbc9236b12bc47f6539d72fac53624",
+        "size_bytes": 26042804
+      },
+      "outcome": "test_failure",
+      "peak_child_tree_rss_bytes": 4508696576,
+      "process_cleanup": {
+        "complete": true,
+        "direct_child_reaped": true,
+        "elapsed_seconds": 5.179201252758503e-05,
+        "errors": [],
+        "grandchild_proof": "observed creation identities no longer exist; direct CLI parent is their normal waiter",
+        "inspection_errors": [],
+        "known_children_gone": true,
+        "survivors": []
+      },
+      "raw": {
+        "observed-test-1.json": {
+          "path": "runs/v2/observed-test-1.json",
+          "sha256": "7bcf5e0bd90341ccf614574784b57c01c5a5c4f149fee79c00add3fa0b6c8134",
+          "size_bytes": 521
+        },
+        "observed-test-2.json": {
+          "path": "runs/v2/observed-test-2.json",
+          "sha256": "9c8501d68c03141ff22295bb6bac0839a7c4012ac38aa717e55a15583dca86c0",
+          "size_bytes": 1207
+        },
+        "process.json": {
+          "path": "runs/v2/process.json",
+          "sha256": "7d57125e2c778691cee128ec1b4646662ea24bbbec04569f9137f2aa4bb3ab7b",
+          "size_bytes": 8668
+        },
+        "source_inventory.json": {
+          "path": "runs/v2/source_inventory.json",
+          "sha256": "6047ee7c164dca1a114af134331f74d5b49eb2eb23a10f1ae49e10925afdc0b9",
+          "size_bytes": 437855
+        },
+        "start.json": {
+          "path": "runs/v2/start.json",
+          "sha256": "cd3e97fee210dce320585667794b8f53a1e8bfabfcc0709f1130c1a1856effd8",
+          "size_bytes": 1776
+        },
+        "stderr.log": {
+          "path": "runs/v2/stderr.log",
+          "sha256": "52139fe9b286a51bc4a8fa7b40179851fc75921bc0e0c62ddff0918077182399",
+          "size_bytes": 11771
+        },
+        "stdout.log": {
+          "path": "runs/v2/stdout.log",
+          "sha256": "3459fccabd4b57aaca0e53c7a3da704caee13562a6d2854a5b3bf4a459753ae8",
+          "size_bytes": 203
+        }
+      },
+      "returncode": 1,
+      "rss_measurement": "sampled sum of RSS for still-matching known child creation identities; shared pages can be counted twice",
+      "selected_sources": [
+        {
+          "artifact": {
+            "path": "sources/181b09363540517b7f160b69f2d2dc49ff00a213c22f8e1c7b109c5880bccd5b/gliner_boundary_qualification.zig",
+            "sha256": "181b09363540517b7f160b69f2d2dc49ff00a213c22f8e1c7b109c5880bccd5b",
+            "size_bytes": 29541
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/extractors/gliner_boundary_qualification.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/extractors/gliner_boundary_qualification.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/28325b6340dcedef84c18b272b8767cc899a02b9dbe05ee92e4efff7d5f004fb/gliner_boundary_qualification.zig",
+            "sha256": "28325b6340dcedef84c18b272b8767cc899a02b9dbe05ee92e4efff7d5f004fb",
+            "size_bytes": 22452
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/models/gliner_boundary_qualification.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/models/gliner_boundary_qualification.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/f6e4b05af7c9edb181a45f2cc9e5606feeb92fe7e7f09dde75d14e1c946a4c80/gliner_boundary_cache_lifecycle_test.zig",
+            "sha256": "f6e4b05af7c9edb181a45f2cc9e5606feeb92fe7e7f09dde75d14e1c946a4c80",
+            "size_bytes": 17941
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/server/gliner_boundary_cache_lifecycle_test.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/server/gliner_boundary_cache_lifecycle_test.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/87841d5edbf2e650441642b468f3858229817df0d48ed4ee93698893531df849/model_manager.zig",
+            "sha256": "87841d5edbf2e650441642b468f3858229817df0d48ed4ee93698893531df849",
+            "size_bytes": 523677
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/server/model_manager.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/server/model_manager.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/1f4dd8800429250d2c61a218aeef862ac68b13ea51924d56fee9b6503d9e79fb/session.zig",
+            "sha256": "1f4dd8800429250d2c61a218aeef862ac68b13ea51924d56fee9b6503d9e79fb",
+            "size_bytes": 73938
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/backends/session.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/backends/session.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/88f5411f6f810458d4128ebf0a0cd7e5e037908b3d2f307aed230d77143dbca0/session_factory.zig",
+            "sha256": "88f5411f6f810458d4128ebf0a0cd7e5e037908b3d2f307aed230d77143dbca0",
+            "size_bytes": 416265
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/architectures/session_factory.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/architectures/session_factory.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/f9ceadafddc97d56667f8dea0f263bc516a9d3b5e56584ec21ba05baee2fe89a/execution_control.zig",
+            "sha256": "f9ceadafddc97d56667f8dea0f263bc516a9d3b5e56584ec21ba05baee2fe89a",
+            "size_bytes": 8805
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/execution_control.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/execution_control.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/ee1157c51c00baabd6c66c0cd4c584342192bb4369039c4cbaf2c307252624d2/hard_cancellation_watchdog.zig",
+            "sha256": "ee1157c51c00baabd6c66c0cd4c584342192bb4369039c4cbaf2c307252624d2",
+            "size_bytes": 4823
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/hard_cancellation_watchdog.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/hard_cancellation_watchdog.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/2bc4419b7130cc2fd32845e9abf3acbe788e864e963076f5b3fd9653bf5b0567/gliner_boundary_decode.zig",
+            "sha256": "2bc4419b7130cc2fd32845e9abf3acbe788e864e963076f5b3fd9653bf5b0567",
+            "size_bytes": 20078
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/pipelines/gliner_boundary_decode.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/pipelines/gliner_boundary_decode.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/3cd53a38e3b9a5ba0208a5f2568d69d04e0ef07ed1f140df2d54e6d00cfc753d/gliner_boundary_dataset.zig",
+            "sha256": "3cd53a38e3b9a5ba0208a5f2568d69d04e0ef07ed1f140df2d54e6d00cfc753d",
+            "size_bytes": 34000
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/finetune/gliner_boundary_dataset.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/finetune/gliner_boundary_dataset.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/28101ec590833502b1aa74b0c627ee8d4c40877ca13c2d9593b5cbb5a4141cb0/gliner_boundary_training_export.zig",
+            "sha256": "28101ec590833502b1aa74b0c627ee8d4c40877ca13c2d9593b5cbb5a4141cb0",
+            "size_bytes": 56115
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/finetune/gliner_boundary_training_export.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/finetune/gliner_boundary_training_export.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/46242701eaf61d39a4d287dbe0da667bdc99c1dc7f3a9eb08eed9ba7ccd14671/gliner_boundary_training_job.zig",
+            "sha256": "46242701eaf61d39a4d287dbe0da667bdc99c1dc7f3a9eb08eed9ba7ccd14671",
+            "size_bytes": 40300
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/finetune/gliner_boundary_training_job.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/finetune/gliner_boundary_training_job.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/ef0af87691ad971fd67d750c4ccce1633ba3352211afd161a2f97817edd42cf6/seeded_gradient_trainer.zig",
+            "sha256": "ef0af87691ad971fd67d750c4ccce1633ba3352211afd161a2f97817edd42cf6",
+            "size_bytes": 84556
+          },
+          "recovery": {
+            "archive_version": 2,
+            "member": "zig/pkg/inference/src/finetune/seeded_gradient_trainer.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/finetune/seeded_gradient_trainer.zig"
+        }
+      ],
+      "source_count": 2587,
+      "source_inventory": {
+        "sha256": "6047ee7c164dca1a114af134331f74d5b49eb2eb23a10f1ae49e10925afdc0b9",
+        "size_bytes": 437855
+      },
+      "source_selection": "rg --files zig; suffixes .zig .zon .metal .m .mm .c .h; this is not a complete dependency closure",
+      "source_unchanged_after_run": true
+    },
+    {
+      "ancillary_build_tests": {
+        "is_main_selected_suite": false,
+        "passed": 23,
+        "total": 23
+      },
+      "archive_receipt": {
+        "path": "runs/v3/archive.json",
+        "sha256": "6bafc460e0e26d5a3ce8454dfc8731d60b397ab9a841a3f50a6b3eacddc64be9",
+        "size_bytes": 2633
+      },
+      "archivist_failure_interpretation": "Actual Metal TTL eviction returned but exceeded fixture five-second observation control;30-second production teardown ticket did not expire. Warm/retained owner observations passed. Correction requires diagnosis.",
+      "command": [
+        "zig",
+        "build",
+        "inference-test",
+        "-Dmetal=true",
+        "-Dcuda=false",
+        "-j1",
+        "--",
+        "--test-filter",
+        "boundary qualification",
+        "--test-filter",
+        "seeded gradient trainer restore",
+        "--test-filter",
+        "boundary training dataset",
+        "--test-filter",
+        "boundary training export",
+        "--test-filter",
+        "boundary training job dataset open",
+        "--test-filter",
+        "gliner boundary persistent Metal owner observation",
+        "--test-filter",
+        "gliner boundary cache pinned small Metal handle retention eviction and reload",
+        "--test-filter",
+        "gliner boundary manifests",
+        "--test-filter",
+        "gliner boundary detection keeps legacy",
+        "--test-filter",
+        "gliner boundary capabilities",
+        "--test-filter",
+        "taskMatchesModelListing",
+        "--test-filter",
+        "gliner boundary long executor",
+        "--test-filter",
+        "gliner boundary executor pinned small Metal window batch"
+      ],
+      "cwd": "/Users/timkaye/Documents/af/antfly/zig",
+      "elapsed_seconds": 201.64491400000406,
+      "environment": {
+        "ANTFLY_GLINER25_SMALL_MODEL_DIR": "/private/tmp/antfly-gliner25-models/small",
+        "ZIG_GLOBAL_CACHE_DIR": "/private/tmp/antfly-gliner25-zig-cache"
+      },
+      "failure": "RuntimeError: public CLI exited 1",
+      "failure_interpretation": {
+        "code": "five_second_fixture_deadline",
+        "detail": "TTL eviction returned but the fixture observation control exceeded five seconds. The thirty-second production teardown ticket did not expire; this was not watchdog exit 86.",
+        "line": 179,
+        "source": "zig/pkg/inference/src/server/gliner_boundary_cache_lifecycle_test.zig",
+        "source_line": "    try active.check();"
+      },
+      "failure_phase": "execution",
+      "guards": {
+        "kill_wait_seconds": 5,
+        "max_child_tree_rss_bytes": 6442450944,
+        "max_stderr_bytes": 8388608,
+        "max_stdout_bytes": 8388608,
+        "max_tracked_processes": 64,
+        "parent_grace_seconds": 5,
+        "rss_poll_seconds": 0.05,
+        "timeout_seconds": 1800,
+        "worker_parent_loss_grace_seconds": 2
+      },
+      "helper_pins": {
+        "supervisor": {
+          "sha256": "a937237975be2ed879f62afd285494ccb51a7c1d7cc1dff7160621fb26b87332",
+          "size_bytes": 12474
+        },
+        "wrapper": {
+          "sha256": "45a745b995f86432c89fa57bf8dd5b92dbc810f706a7989accc66c8bbddde3b1",
+          "size_bytes": 6752
+        }
+      },
+      "id": "v3",
+      "inspection_error_count": 0,
+      "main_executable": {
+        "bytes_included": false,
+        "original_path": "/private/tmp/antfly-gliner25-qualification-lifecycle-metal-v3-archive/test",
+        "rehashed": true,
+        "sha256": "13d9487cc46e99945be9b5f813bc8660fe1d45c341dccf092126a19cc8745c83",
+        "size_bytes": 83660296
+      },
+      "main_test_totals": {
+        "failed": 1,
+        "leaked": 0,
+        "passed": 48,
+        "selected": 50,
+        "skipped": 1
+      },
+      "observed_test_executables": [
+        {
+          "argv": [
+            "./.zig-cache/o/d93233285d1d62c43d4408acbe770aa5/test",
+            "--cache-dir=./.zig-cache",
+            "--seed=0x8522ea26",
+            "--listen=-"
+          ],
+          "create_time": 1789068739.786374,
+          "cwd": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference",
+          "executable": {
+            "path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/.zig-cache/o/d93233285d1d62c43d4408acbe770aa5/test",
+            "sha256": "650c1f87eb88d96c111d05f81135ab22eaee3e21a4be655bdb9fac24752da79e",
+            "size_bytes": 4970984
+          },
+          "pid": 17001
+        },
+        {
+          "argv": [
+            "./.zig-cache/o/00be7143e2aa21820a79429693b27711/test",
+            "--test-filter",
+            "boundary qualification",
+            "--test-filter",
+            "seeded gradient trainer restore",
+            "--test-filter",
+            "boundary training dataset",
+            "--test-filter",
+            "boundary training export",
+            "--test-filter",
+            "boundary training job dataset open",
+            "--test-filter",
+            "gliner boundary persistent Metal owner observation",
+            "--test-filter",
+            "gliner boundary cache pinned small Metal handle retention eviction and reload",
+            "--test-filter",
+            "gliner boundary manifests",
+            "--test-filter",
+            "gliner boundary detection keeps legacy",
+            "--test-filter",
+            "gliner boundary capabilities",
+            "--test-filter",
+            "taskMatchesModelListing",
+            "--test-filter",
+            "gliner boundary long executor",
+            "--test-filter",
+            "gliner boundary executor pinned small Metal window batch"
+          ],
+          "create_time": 1789068798.9111,
+          "cwd": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference",
+          "executable": {
+            "path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/.zig-cache/o/00be7143e2aa21820a79429693b27711/test",
+            "sha256": "13d9487cc46e99945be9b5f813bc8660fe1d45c341dccf092126a19cc8745c83",
+            "size_bytes": 83660296
+          },
+          "pid": 17111
+        }
+      ],
+      "optional_executable_identity_errors": [
+        "(pid=16973)",
+        "(pid=16975)",
+        "(pid=16999)",
+        "(pid=16999)",
+        "(pid=16999)",
+        "(pid=16999)",
+        "(pid=16999)",
+        "(pid=16999)",
+        "(pid=17111)"
+      ],
+      "original_directory": "/private/tmp/antfly-gliner25-qualification-lifecycle-metal-v3",
+      "original_source_archive": {
+        "bytes_included": false,
+        "original_path": "/private/tmp/antfly-gliner25-qualification-lifecycle-metal-v3-archive/recorded-source-selection.tar.gz",
+        "rehashed": true,
+        "sha256": "e18598ddf04be59fd37f5c99602c28dd84e2413aa00160f371d587a2720d8300",
+        "size_bytes": 21899228
+      },
+      "outcome": "test_failure",
+      "peak_child_tree_rss_bytes": 4653301760,
+      "process_cleanup": {
+        "complete": true,
+        "direct_child_reaped": true,
+        "elapsed_seconds": 4.25000034738332e-05,
+        "errors": [],
+        "grandchild_proof": "observed creation identities no longer exist; direct CLI parent is their normal waiter",
+        "inspection_errors": [],
+        "known_children_gone": true,
+        "survivors": []
+      },
+      "raw": {
+        "observed-test-1.json": {
+          "path": "runs/v3/observed-test-1.json",
+          "sha256": "3d07d778612ee70772584eeb9a79ff3b75dce1731be7eaee9047d8da054f24d2",
+          "size_bytes": 521
+        },
+        "observed-test-2.json": {
+          "path": "runs/v3/observed-test-2.json",
+          "sha256": "9feaa4dff91da717842c6a2b24973842ab12dd28249ae01aac027b22c06595b8",
+          "size_bytes": 1284
+        },
+        "process.json": {
+          "path": "runs/v3/process.json",
+          "sha256": "14ff88ff7f11151ffe2297ce7bac7b7028705c7f85cceb133eef5387b93f8a9f",
+          "size_bytes": 7854
+        },
+        "source_inventory.json": {
+          "path": "runs/v3/source_inventory.json",
+          "sha256": "9702432df97c5ddf55c730b60def46a194f64fb8d2521a591f91f4d2cef6d933",
+          "size_bytes": 437855
+        },
+        "start.json": {
+          "path": "runs/v3/start.json",
+          "sha256": "da43d90d4d1c850a8a8d24ad25c146c79e20b078487fe0ce34165baa2a972e8e",
+          "size_bytes": 1819
+        },
+        "stderr.log": {
+          "path": "runs/v3/stderr.log",
+          "sha256": "dde99e889d111752c334fd72d4313c02ade318f1ef16011afc699553f8201696",
+          "size_bytes": 12383
+        },
+        "stdout.log": {
+          "path": "runs/v3/stdout.log",
+          "sha256": "3459fccabd4b57aaca0e53c7a3da704caee13562a6d2854a5b3bf4a459753ae8",
+          "size_bytes": 203
+        }
+      },
+      "returncode": 1,
+      "rss_measurement": "sampled sum of RSS for still-matching known child creation identities; shared pages can be counted twice",
+      "selected_sources": [
+        {
+          "artifact": {
+            "path": "sources/181b09363540517b7f160b69f2d2dc49ff00a213c22f8e1c7b109c5880bccd5b/gliner_boundary_qualification.zig",
+            "sha256": "181b09363540517b7f160b69f2d2dc49ff00a213c22f8e1c7b109c5880bccd5b",
+            "size_bytes": 29541
+          },
+          "recovery": {
+            "archive_version": 3,
+            "member": "zig/pkg/inference/src/extractors/gliner_boundary_qualification.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/extractors/gliner_boundary_qualification.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/28325b6340dcedef84c18b272b8767cc899a02b9dbe05ee92e4efff7d5f004fb/gliner_boundary_qualification.zig",
+            "sha256": "28325b6340dcedef84c18b272b8767cc899a02b9dbe05ee92e4efff7d5f004fb",
+            "size_bytes": 22452
+          },
+          "recovery": {
+            "archive_version": 3,
+            "member": "zig/pkg/inference/src/models/gliner_boundary_qualification.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/models/gliner_boundary_qualification.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/a57dec7f5935582f1a23741c80e3fbceda9a8bf8218fa506ce107c1bfa2e54b1/gliner_boundary_cache_lifecycle_test.zig",
+            "sha256": "a57dec7f5935582f1a23741c80e3fbceda9a8bf8218fa506ce107c1bfa2e54b1",
+            "size_bytes": 20641
+          },
+          "recovery": {
+            "archive_version": 3,
+            "member": "zig/pkg/inference/src/server/gliner_boundary_cache_lifecycle_test.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/server/gliner_boundary_cache_lifecycle_test.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/87841d5edbf2e650441642b468f3858229817df0d48ed4ee93698893531df849/model_manager.zig",
+            "sha256": "87841d5edbf2e650441642b468f3858229817df0d48ed4ee93698893531df849",
+            "size_bytes": 523677
+          },
+          "recovery": {
+            "archive_version": 3,
+            "member": "zig/pkg/inference/src/server/model_manager.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/server/model_manager.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/1f4dd8800429250d2c61a218aeef862ac68b13ea51924d56fee9b6503d9e79fb/session.zig",
+            "sha256": "1f4dd8800429250d2c61a218aeef862ac68b13ea51924d56fee9b6503d9e79fb",
+            "size_bytes": 73938
+          },
+          "recovery": {
+            "archive_version": 3,
+            "member": "zig/pkg/inference/src/backends/session.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/backends/session.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/4b8063c71ee2f0f767015e623937dc2585789b8d99b6723b204c070ed5c099da/session_factory.zig",
+            "sha256": "4b8063c71ee2f0f767015e623937dc2585789b8d99b6723b204c070ed5c099da",
+            "size_bytes": 422817
+          },
+          "recovery": {
+            "archive_version": 3,
+            "member": "zig/pkg/inference/src/architectures/session_factory.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/architectures/session_factory.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/f9ceadafddc97d56667f8dea0f263bc516a9d3b5e56584ec21ba05baee2fe89a/execution_control.zig",
+            "sha256": "f9ceadafddc97d56667f8dea0f263bc516a9d3b5e56584ec21ba05baee2fe89a",
+            "size_bytes": 8805
+          },
+          "recovery": {
+            "archive_version": 3,
+            "member": "zig/pkg/inference/src/execution_control.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/execution_control.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/ee1157c51c00baabd6c66c0cd4c584342192bb4369039c4cbaf2c307252624d2/hard_cancellation_watchdog.zig",
+            "sha256": "ee1157c51c00baabd6c66c0cd4c584342192bb4369039c4cbaf2c307252624d2",
+            "size_bytes": 4823
+          },
+          "recovery": {
+            "archive_version": 3,
+            "member": "zig/pkg/inference/src/hard_cancellation_watchdog.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/hard_cancellation_watchdog.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/2bc4419b7130cc2fd32845e9abf3acbe788e864e963076f5b3fd9653bf5b0567/gliner_boundary_decode.zig",
+            "sha256": "2bc4419b7130cc2fd32845e9abf3acbe788e864e963076f5b3fd9653bf5b0567",
+            "size_bytes": 20078
+          },
+          "recovery": {
+            "archive_version": 3,
+            "member": "zig/pkg/inference/src/pipelines/gliner_boundary_decode.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/pipelines/gliner_boundary_decode.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/3cd53a38e3b9a5ba0208a5f2568d69d04e0ef07ed1f140df2d54e6d00cfc753d/gliner_boundary_dataset.zig",
+            "sha256": "3cd53a38e3b9a5ba0208a5f2568d69d04e0ef07ed1f140df2d54e6d00cfc753d",
+            "size_bytes": 34000
+          },
+          "recovery": {
+            "archive_version": 3,
+            "member": "zig/pkg/inference/src/finetune/gliner_boundary_dataset.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/finetune/gliner_boundary_dataset.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/28101ec590833502b1aa74b0c627ee8d4c40877ca13c2d9593b5cbb5a4141cb0/gliner_boundary_training_export.zig",
+            "sha256": "28101ec590833502b1aa74b0c627ee8d4c40877ca13c2d9593b5cbb5a4141cb0",
+            "size_bytes": 56115
+          },
+          "recovery": {
+            "archive_version": 3,
+            "member": "zig/pkg/inference/src/finetune/gliner_boundary_training_export.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/finetune/gliner_boundary_training_export.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/46242701eaf61d39a4d287dbe0da667bdc99c1dc7f3a9eb08eed9ba7ccd14671/gliner_boundary_training_job.zig",
+            "sha256": "46242701eaf61d39a4d287dbe0da667bdc99c1dc7f3a9eb08eed9ba7ccd14671",
+            "size_bytes": 40300
+          },
+          "recovery": {
+            "archive_version": 3,
+            "member": "zig/pkg/inference/src/finetune/gliner_boundary_training_job.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/finetune/gliner_boundary_training_job.zig"
+        },
+        {
+          "artifact": {
+            "path": "sources/ef0af87691ad971fd67d750c4ccce1633ba3352211afd161a2f97817edd42cf6/seeded_gradient_trainer.zig",
+            "sha256": "ef0af87691ad971fd67d750c4ccce1633ba3352211afd161a2f97817edd42cf6",
+            "size_bytes": 84556
+          },
+          "recovery": {
+            "archive_version": 3,
+            "member": "zig/pkg/inference/src/finetune/seeded_gradient_trainer.zig",
+            "method": "selected regular tar member; hash matched this checkpoint inventory"
+          },
+          "repo_path": "zig/pkg/inference/src/finetune/seeded_gradient_trainer.zig"
+        }
+      ],
+      "source_count": 2587,
+      "source_inventory": {
+        "sha256": "9702432df97c5ddf55c730b60def46a194f64fb8d2521a591f91f4d2cef6d933",
+        "size_bytes": 437855
+      },
+      "source_selection": "rg --files zig; suffixes .zig .zon .metal .m .mm .c .h; this is not a complete dependency closure",
+      "source_unchanged_after_run": true
+    }
+  ],
+  "contracts": {
+    "current_diff": {
+      "path": "contracts/ci_changes_from_head.patch",
+      "sha256": "c128d14c259d6e8e4f1cc880b228236c89b5a793651e4c27770f71f0093ba92a",
+      "size_bytes": 2345
+    },
+    "current_head": "aa44bddd1dd8befb5d0aec8bdb6c304054b89149",
+    "exact_minimal_dependencies": [
+      "iniconfig==2.3.0",
+      "packaging==25.0",
+      "pluggy==1.6.0",
+      "psutil==7.1.3",
+      "Pygments==2.19.2",
+      "pytest==9.0.2"
+    ],
+    "limits": "Logs prove the stated local test outcomes, not an independently pinned interpreter environment or remote CI run. CI snapshots preserve current proposed invocation and dependency pins.",
+    "remote_ci_executed": false,
+    "runs": [
+      {
+        "context": "Parent identifies oracle environment handoff run.",
+        "errors": 0,
+        "exact_runtime_command_recorded": false,
+        "id": "handoff",
+        "interpreter_identity_recorded": false,
+        "original_path": "/private/tmp/gliner25-contracts-pr-handoff-v1.log",
+        "outcome": "OK",
+        "raw": {
+          "path": "contracts/gliner25-contracts-pr-handoff-v1.log",
+          "sha256": "07d779b415050beb27348bbc85f209b0835b7eb408409b0742270a147a04cf31",
+          "size_bytes": 36083
+        },
+        "reported_seconds": 4.487,
+        "skips_reported": 0,
+        "tests_run": 203
+      },
+      {
+        "context": "Parent reports this was the clean python -S reproduction; the raw log does not record its argv.",
+        "errors": 25,
+        "exact_runtime_command_recorded": false,
+        "id": "clean-imports",
+        "interpreter_identity_recorded": false,
+        "missing_modules": [
+          "packaging",
+          "psutil",
+          "pytest"
+        ],
+        "original_path": "/private/tmp/gliner25-contracts-pr-clean-imports-v1.log",
+        "outcome": "FAILED (errors=25)",
+        "raw": {
+          "path": "contracts/gliner25-contracts-pr-clean-imports-v1.log",
+          "sha256": "f2cdad11ad1ace24dd417276711f9413e7f0d8155f2736f2782cfe6712707b06",
+          "size_bytes": 83914
+        },
+        "reported_seconds": 3.35,
+        "skips_reported": 0,
+        "tests_run": 201
+      },
+      {
+        "context": "Parent identifies isolated minimal dependency run; raw log records six installed packages.",
+        "errors": 0,
+        "exact_runtime_command_recorded": false,
+        "id": "isolated",
+        "interpreter_identity_recorded": false,
+        "original_path": "/private/tmp/gliner25-contracts-pr-isolated-v1.log",
+        "outcome": "OK",
+        "raw": {
+          "path": "contracts/gliner25-contracts-pr-isolated-v1.log",
+          "sha256": "95e98a1e74854468d891ea5b056f2e3ba4553d7d4e1931588185e9ea3ca870e2",
+          "size_bytes": 36162
+        },
+        "reported_seconds": 4.602,
+        "skips_reported": 0,
+        "tests_run": 203
+      }
+    ],
+    "source_snapshots": {
+      ".github/workflows/zig-tests.yml": {
+        "path": "contracts/current/.github/workflows/zig-tests.yml",
+        "sha256": "cf6f1a8b1ff64a8ea4a1d12d0cd00d2858e7370509283c6d36f91c6e8f8eeb79",
+        "size_bytes": 50598
+      },
+      "zig/pkg/inference/scripts/gliner25/bootstrap_monitoring.py": {
+        "path": "contracts/current/zig/pkg/inference/scripts/gliner25/bootstrap_monitoring.py",
+        "sha256": "0582efad0c6c9d3c9042710f7e83ab8be1372547c946a9c2b788307609750280",
+        "size_bytes": 12314
+      },
+      "zig/pkg/inference/scripts/gliner25/requirements-contract.txt": {
+        "path": "contracts/current/zig/pkg/inference/scripts/gliner25/requirements-contract.txt",
+        "sha256": "0a93beb18c765e3f5fdb7a0a28b53d387710fec2ca72a6886ee069acb730900b",
+        "size_bytes": 249
+      },
+      "zig/pkg/inference/scripts/gliner25/requirements.txt": {
+        "path": "contracts/current/zig/pkg/inference/scripts/gliner25/requirements.txt",
+        "sha256": "505573dea5eebb11930c50c65bff8e8c55deb9a287239a949231dc7d37748432",
+        "size_bytes": 414
+      },
+      "zig/pkg/inference/scripts/run_model_contract_tests.py": {
+        "path": "contracts/current/zig/pkg/inference/scripts/run_model_contract_tests.py",
+        "sha256": "666edbb782e32e5d44af55f47b9ac21fa299c098bfc576c47bd094c48f8fad7e",
+        "size_bytes": 1209
+      }
+    },
+    "workflow_jobs": [
+      "zig-base-tests",
+      "zig-full-tests"
+    ]
+  },
+  "files": {
+    "README.md": {
+      "sha256": "ebb937b86b828debd0a657f27f726fdc3c9e5159495bbe7d29066332dcc9f7f2",
+      "size_bytes": 4658
+    },
+    "contracts/base/.github/workflows/zig-tests.yml": {
+      "sha256": "92533c44faead9970c202d4fc135b8d593849fc76270f28effa7d13e5e79842b",
+      "size_bytes": 49714
+    },
+    "contracts/base/zig/pkg/inference/scripts/run_model_contract_tests.py": {
+      "sha256": "7fe6a75416acf3038c647fb6500a395d87028a2fd22d218012fb9c3b61b18818",
+      "size_bytes": 1197
+    },
+    "contracts/ci_changes_from_head.patch": {
+      "sha256": "c128d14c259d6e8e4f1cc880b228236c89b5a793651e4c27770f71f0093ba92a",
+      "size_bytes": 2345
+    },
+    "contracts/current/.github/workflows/zig-tests.yml": {
+      "sha256": "cf6f1a8b1ff64a8ea4a1d12d0cd00d2858e7370509283c6d36f91c6e8f8eeb79",
+      "size_bytes": 50598
+    },
+    "contracts/current/zig/pkg/inference/scripts/gliner25/bootstrap_monitoring.py": {
+      "sha256": "0582efad0c6c9d3c9042710f7e83ab8be1372547c946a9c2b788307609750280",
+      "size_bytes": 12314
+    },
+    "contracts/current/zig/pkg/inference/scripts/gliner25/requirements-contract.txt": {
+      "sha256": "0a93beb18c765e3f5fdb7a0a28b53d387710fec2ca72a6886ee069acb730900b",
+      "size_bytes": 249
+    },
+    "contracts/current/zig/pkg/inference/scripts/gliner25/requirements.txt": {
+      "sha256": "505573dea5eebb11930c50c65bff8e8c55deb9a287239a949231dc7d37748432",
+      "size_bytes": 414
+    },
+    "contracts/current/zig/pkg/inference/scripts/run_model_contract_tests.py": {
+      "sha256": "666edbb782e32e5d44af55f47b9ac21fa299c098bfc576c47bd094c48f8fad7e",
+      "size_bytes": 1209
+    },
+    "contracts/gliner25-contracts-pr-clean-imports-v1.log": {
+      "sha256": "f2cdad11ad1ace24dd417276711f9413e7f0d8155f2736f2782cfe6712707b06",
+      "size_bytes": 83914
+    },
+    "contracts/gliner25-contracts-pr-handoff-v1.log": {
+      "sha256": "07d779b415050beb27348bbc85f209b0835b7eb408409b0742270a147a04cf31",
+      "size_bytes": 36083
+    },
+    "contracts/gliner25-contracts-pr-isolated-v1.log": {
+      "sha256": "95e98a1e74854468d891ea5b056f2e3ba4553d7d4e1931588185e9ea3ca870e2",
+      "size_bytes": 36162
+    },
+    "helpers/run.py": {
+      "sha256": "45a745b995f86432c89fa57bf8dd5b92dbc810f706a7989accc66c8bbddde3b1",
+      "size_bytes": 6752
+    },
+    "helpers/stage_evidence.py": {
+      "sha256": "31b212b660ecbf6d20ab7d0ad74e46202885b12134c24dc7000dffbd50c15b92",
+      "size_bytes": 21488
+    },
+    "helpers/supervision.py": {
+      "sha256": "a937237975be2ed879f62afd285494ccb51a7c1d7cc1dff7160621fb26b87332",
+      "size_bytes": 12474
+    },
+    "runs/v1/observed-test-1.json": {
+      "sha256": "f7f85b055728e96a6f72f1bff11fbebc2ff72898a957b05fe56e03527d5f6217",
+      "size_bytes": 521
+    },
+    "runs/v1/process.json": {
+      "sha256": "b48d9efc99fb08b9559d0f59917777aa319f3add8d929b83a9e7c3cdc7fcbc23",
+      "size_bytes": 5881
+    },
+    "runs/v1/source_inventory.json": {
+      "sha256": "58aa9063f8b723850f943ccb49cf3bd5dd1bed9436f890ef53b4e4516330d53d",
+      "size_bytes": 437855
+    },
+    "runs/v1/start.json": {
+      "sha256": "4743117304891a4b7a4b14e65680e7479ce5e2abd70259b44f77f508c864f961",
+      "size_bytes": 1776
+    },
+    "runs/v1/stderr.log": {
+      "sha256": "4400fbaecd14a533a8139d3daf1f244c155f7d30ab39b939a9cfd9cab7e4b5c5",
+      "size_bytes": 11642
+    },
+    "runs/v1/stdout.log": {
+      "sha256": "3459fccabd4b57aaca0e53c7a3da704caee13562a6d2854a5b3bf4a459753ae8",
+      "size_bytes": 203
+    },
+    "runs/v2/archive.json": {
+      "sha256": "9050483cea4e4f7b53ef575da138be14869bed8340226e1964ab214f2bf32380",
+      "size_bytes": 2493
+    },
+    "runs/v2/observed-test-1.json": {
+      "sha256": "7bcf5e0bd90341ccf614574784b57c01c5a5c4f149fee79c00add3fa0b6c8134",
+      "size_bytes": 521
+    },
+    "runs/v2/observed-test-2.json": {
+      "sha256": "9c8501d68c03141ff22295bb6bac0839a7c4012ac38aa717e55a15583dca86c0",
+      "size_bytes": 1207
+    },
+    "runs/v2/process.json": {
+      "sha256": "7d57125e2c778691cee128ec1b4646662ea24bbbec04569f9137f2aa4bb3ab7b",
+      "size_bytes": 8668
+    },
+    "runs/v2/source_inventory.json": {
+      "sha256": "6047ee7c164dca1a114af134331f74d5b49eb2eb23a10f1ae49e10925afdc0b9",
+      "size_bytes": 437855
+    },
+    "runs/v2/start.json": {
+      "sha256": "cd3e97fee210dce320585667794b8f53a1e8bfabfcc0709f1130c1a1856effd8",
+      "size_bytes": 1776
+    },
+    "runs/v2/stderr.log": {
+      "sha256": "52139fe9b286a51bc4a8fa7b40179851fc75921bc0e0c62ddff0918077182399",
+      "size_bytes": 11771
+    },
+    "runs/v2/stdout.log": {
+      "sha256": "3459fccabd4b57aaca0e53c7a3da704caee13562a6d2854a5b3bf4a459753ae8",
+      "size_bytes": 203
+    },
+    "runs/v3/archive.json": {
+      "sha256": "6bafc460e0e26d5a3ce8454dfc8731d60b397ab9a841a3f50a6b3eacddc64be9",
+      "size_bytes": 2633
+    },
+    "runs/v3/observed-test-1.json": {
+      "sha256": "3d07d778612ee70772584eeb9a79ff3b75dce1731be7eaee9047d8da054f24d2",
+      "size_bytes": 521
+    },
+    "runs/v3/observed-test-2.json": {
+      "sha256": "9feaa4dff91da717842c6a2b24973842ab12dd28249ae01aac027b22c06595b8",
+      "size_bytes": 1284
+    },
+    "runs/v3/process.json": {
+      "sha256": "14ff88ff7f11151ffe2297ce7bac7b7028705c7f85cceb133eef5387b93f8a9f",
+      "size_bytes": 7854
+    },
+    "runs/v3/source_inventory.json": {
+      "sha256": "9702432df97c5ddf55c730b60def46a194f64fb8d2521a591f91f4d2cef6d933",
+      "size_bytes": 437855
+    },
+    "runs/v3/start.json": {
+      "sha256": "da43d90d4d1c850a8a8d24ad25c146c79e20b078487fe0ce34165baa2a972e8e",
+      "size_bytes": 1819
+    },
+    "runs/v3/stderr.log": {
+      "sha256": "dde99e889d111752c334fd72d4313c02ade318f1ef16011afc699553f8201696",
+      "size_bytes": 12383
+    },
+    "runs/v3/stdout.log": {
+      "sha256": "3459fccabd4b57aaca0e53c7a3da704caee13562a6d2854a5b3bf4a459753ae8",
+      "size_bytes": 203
+    },
+    "source_recovery/v1_model_policy.patch": {
+      "sha256": "e9e4e1d2b2b3e3378767a6b05f75b1df7cc3f2fda52cae6470002fe67a1e5174",
+      "size_bytes": 22987
+    },
+    "sources/181b09363540517b7f160b69f2d2dc49ff00a213c22f8e1c7b109c5880bccd5b/gliner_boundary_qualification.zig": {
+      "sha256": "181b09363540517b7f160b69f2d2dc49ff00a213c22f8e1c7b109c5880bccd5b",
+      "size_bytes": 29541
+    },
+    "sources/1f4dd8800429250d2c61a218aeef862ac68b13ea51924d56fee9b6503d9e79fb/session.zig": {
+      "sha256": "1f4dd8800429250d2c61a218aeef862ac68b13ea51924d56fee9b6503d9e79fb",
+      "size_bytes": 73938
+    },
+    "sources/28101ec590833502b1aa74b0c627ee8d4c40877ca13c2d9593b5cbb5a4141cb0/gliner_boundary_training_export.zig": {
+      "sha256": "28101ec590833502b1aa74b0c627ee8d4c40877ca13c2d9593b5cbb5a4141cb0",
+      "size_bytes": 56115
+    },
+    "sources/28325b6340dcedef84c18b272b8767cc899a02b9dbe05ee92e4efff7d5f004fb/gliner_boundary_qualification.zig": {
+      "sha256": "28325b6340dcedef84c18b272b8767cc899a02b9dbe05ee92e4efff7d5f004fb",
+      "size_bytes": 22452
+    },
+    "sources/2bc4419b7130cc2fd32845e9abf3acbe788e864e963076f5b3fd9653bf5b0567/gliner_boundary_decode.zig": {
+      "sha256": "2bc4419b7130cc2fd32845e9abf3acbe788e864e963076f5b3fd9653bf5b0567",
+      "size_bytes": 20078
+    },
+    "sources/3cd53a38e3b9a5ba0208a5f2568d69d04e0ef07ed1f140df2d54e6d00cfc753d/gliner_boundary_dataset.zig": {
+      "sha256": "3cd53a38e3b9a5ba0208a5f2568d69d04e0ef07ed1f140df2d54e6d00cfc753d",
+      "size_bytes": 34000
+    },
+    "sources/46242701eaf61d39a4d287dbe0da667bdc99c1dc7f3a9eb08eed9ba7ccd14671/gliner_boundary_training_job.zig": {
+      "sha256": "46242701eaf61d39a4d287dbe0da667bdc99c1dc7f3a9eb08eed9ba7ccd14671",
+      "size_bytes": 40300
+    },
+    "sources/4b8063c71ee2f0f767015e623937dc2585789b8d99b6723b204c070ed5c099da/session_factory.zig": {
+      "sha256": "4b8063c71ee2f0f767015e623937dc2585789b8d99b6723b204c070ed5c099da",
+      "size_bytes": 422817
+    },
+    "sources/610477e3664f4772c762757b251369e9b05c96c80d63e6e0c358ace86dd5520e/gliner_boundary_qualification.zig": {
+      "sha256": "610477e3664f4772c762757b251369e9b05c96c80d63e6e0c358ace86dd5520e",
+      "size_bytes": 22433
+    },
+    "sources/87841d5edbf2e650441642b468f3858229817df0d48ed4ee93698893531df849/model_manager.zig": {
+      "sha256": "87841d5edbf2e650441642b468f3858229817df0d48ed4ee93698893531df849",
+      "size_bytes": 523677
+    },
+    "sources/88f5411f6f810458d4128ebf0a0cd7e5e037908b3d2f307aed230d77143dbca0/session_factory.zig": {
+      "sha256": "88f5411f6f810458d4128ebf0a0cd7e5e037908b3d2f307aed230d77143dbca0",
+      "size_bytes": 416265
+    },
+    "sources/a57dec7f5935582f1a23741c80e3fbceda9a8bf8218fa506ce107c1bfa2e54b1/gliner_boundary_cache_lifecycle_test.zig": {
+      "sha256": "a57dec7f5935582f1a23741c80e3fbceda9a8bf8218fa506ce107c1bfa2e54b1",
+      "size_bytes": 20641
+    },
+    "sources/af593906d27ce57037e74b464960d55039d3afb7654545a14880399ed2501b76/gliner_boundary_qualification.zig": {
+      "sha256": "af593906d27ce57037e74b464960d55039d3afb7654545a14880399ed2501b76",
+      "size_bytes": 28762
+    },
+    "sources/ee1157c51c00baabd6c66c0cd4c584342192bb4369039c4cbaf2c307252624d2/hard_cancellation_watchdog.zig": {
+      "sha256": "ee1157c51c00baabd6c66c0cd4c584342192bb4369039c4cbaf2c307252624d2",
+      "size_bytes": 4823
+    },
+    "sources/ef0af87691ad971fd67d750c4ccce1633ba3352211afd161a2f97817edd42cf6/seeded_gradient_trainer.zig": {
+      "sha256": "ef0af87691ad971fd67d750c4ccce1633ba3352211afd161a2f97817edd42cf6",
+      "size_bytes": 84556
+    },
+    "sources/f6e4b05af7c9edb181a45f2cc9e5606feeb92fe7e7f09dde75d14e1c946a4c80/gliner_boundary_cache_lifecycle_test.zig": {
+      "sha256": "f6e4b05af7c9edb181a45f2cc9e5606feeb92fe7e7f09dde75d14e1c946a4c80",
+      "size_bytes": 17941
+    },
+    "sources/f9ceadafddc97d56667f8dea0f263bc516a9d3b5e56584ec21ba05baee2fe89a/execution_control.zig": {
+      "sha256": "f9ceadafddc97d56667f8dea0f263bc516a9d3b5e56584ec21ba05baee2fe89a",
+      "size_bytes": 8805
+    },
+    "verify.py": {
+      "sha256": "9735f15a8f01844e85ff350c5ac340dfd8c02e6aa5f34f69e6c9f002152f2f72",
+      "size_bytes": 11949
+    }
+  },
+  "helper_sources": {
+    "supervisor": {
+      "path": "helpers/supervision.py",
+      "sha256": "a937237975be2ed879f62afd285494ccb51a7c1d7cc1dff7160621fb26b87332",
+      "size_bytes": 12474
+    },
+    "wrapper": {
+      "path": "helpers/run.py",
+      "sha256": "45a745b995f86432c89fa57bf8dd5b92dbc810f706a7989accc66c8bbddde3b1",
+      "size_bytes": 6752
+    }
+  },
+  "interpretation_limits": [
+    "All three Zig build commands failed. Passing selected tests do not make a failed aggregate pass.",
+    "The ancillary 23-test build results are separate from the main inference selection; v1 has no main selected-suite result.",
+    "The full 2587-entry inventories are recorded source selections, not complete dependency closures or proof every source was imported.",
+    "Selected historical source bytes are hash-verified against each checkpoint; v1 model policy is the exact prior patch payload, not a reconstructed current implementation.",
+    "Main v2/v3 executables and original tar archives were rehashed from their archives, but only their identities are stored here.",
+    "Process RSS and elapsed times are diagnostic supervisor evidence, not a performance benchmark.",
+    "No new model, numerical fixture, Zig build, process-lifecycle test, commit, push, or remote CI execution occurred while preparing this ledger.",
+    "A corrected later run must be appended as new evidence; these failed histories remain unchanged."
+  ],
+  "local_only": true,
+  "qualification": false,
+  "readme": {
+    "path": "README.md",
+    "sha256": "ebb937b86b828debd0a657f27f726fdc3c9e5159495bbe7d29066332dcc9f7f2",
+    "size_bytes": 4658
+  },
+  "scope": "gliner25_qualification_lifecycle_evidence/v1",
+  "status": "historical_failed_checkpoints_preserved_corrected_run_pending",
+  "storage": {
+    "binaries_included": false,
+    "full_source_archives_included": false,
+    "maximum_bytes": 8388608,
+    "payload_bytes_excluding_ledger": 3568575,
+    "selected_sources_per_checkpoint": 13,
+    "source_inventory_is_dependency_closure": false
+  },
+  "verifier": {
+    "path": "verify.py",
+    "sha256": "9735f15a8f01844e85ff350c5ac340dfd8c02e6aa5f34f69e6c9f002152f2f72",
+    "size_bytes": 11949
+  },
+  "version": 1
+}

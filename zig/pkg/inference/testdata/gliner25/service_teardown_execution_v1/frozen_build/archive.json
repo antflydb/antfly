@@ -1,0 +1,46 @@
+{
+  "scope": "manager_teardown_native_source_and_executable/v1",
+  "qualification": false,
+  "live_observation": {
+    "argv": [
+      "./.zig-cache/o/a8b8f9c855bec3194b029c363035e85e/test",
+      "--test-filter",
+      "model manager teardown",
+      "--test-filter",
+      "offline load runtime supplies",
+      "--test-filter",
+      "managed constructors retain cooperative",
+      "--test-filter",
+      "raw tokenizer budget capability pins",
+      "--test-filter",
+      "session vtable layout"
+    ],
+    "create_time": 1789066309.833051,
+    "cwd": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference",
+    "executable": {
+      "path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/.zig-cache/o/a8b8f9c855bec3194b029c363035e85e/test",
+      "sha256": "05d650b47cd67804ac7d16e3308b0e0bda8ad501730142408115acf98afc7590",
+      "size_bytes": 36647768
+    },
+    "pid": 13723
+  },
+  "frozen_executable": {
+    "size_bytes": 36647768,
+    "sha256": "05d650b47cd67804ac7d16e3308b0e0bda8ad501730142408115acf98afc7590",
+    "path": "/private/tmp/antfly-gliner25-manager-teardown-native-v3-archive/test"
+  },
+  "source_files": 2583,
+  "source_archive": {
+    "size_bytes": 25897695,
+    "sha256": "bf784c5f7454cd4b6d6a5c7fd89d8694694bc9b9a33907d9c3d3d8cafa28ef1a"
+  },
+  "process_receipt": {
+    "size_bytes": 6719,
+    "sha256": "60a64f40e5f998f3768bfbbb1bdf8e75111cd6961d03a67a1efd226a2c97ed8a"
+  },
+  "source_inventory": {
+    "size_bytes": 436906,
+    "sha256": "b010d467c1fe9772fd142d421bd2b0be1821e3a7eeda63c4882e4f5b5eb5400f"
+  },
+  "limits": "Selection is not a dependency closure or proof every archived file was imported or exercised."
+}

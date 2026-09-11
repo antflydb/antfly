@@ -35,6 +35,9 @@ const ml = @import("ml");
 /// (native CPU uses f32 slices, device backends use opaque handles). Tensors are always
 /// freed via the ComputeBackend that created them.
 pub const CT = backend_contracts.CT;
+pub const gliner_boundary_device = @import("gliner_boundary_device_ops.zig");
+pub const resident_training = @import("resident_training_ops.zig");
+pub const deberta_training_attention = @import("deberta_training_attention.zig");
 
 pub const UnaryConsumeOp = enum {
     gelu,
@@ -137,10 +140,8 @@ pub const TrainingAdamWBatchOptions = struct {
     grad_scale: f32 = 1.0,
 };
 
-pub const TrainingSumSquaresInput = struct {
-    tensor: CT,
-    elem_count: usize,
-};
+pub const TrainingSumSquaresInput = resident_training.NormInput;
+pub const resident_program = @import("resident_program_ops.zig");
 
 pub const MaskedBceWithLogitsRequest = struct {
     logits: CT,
@@ -1331,6 +1332,68 @@ pub const ComputeBackend = struct {
         if (self.execution_control) |control| try control.check();
     }
 
+    /// Executes only a resident implementation. This contract intentionally has
+    /// no generic/host fallback and is safe to use with request-local budgets.
+    pub fn glinerBoundaryDevice(self: *const ComputeBackend, request: *const gliner_boundary_device.Request) !CT {
+        errdefer self.cancelGlinerBoundaryOwnedScope();
+        try self.checkExecutionControl();
+        const op = self.vtable.glinerBoundaryDevice orelse return error.UnsupportedGlinerBoundaryDevice;
+        const output = try op(self.ptr, request);
+        errdefer self.free(output);
+        try self.checkExecutionControl();
+        return output;
+    }
+
+    pub fn glinerBoundaryDownload(self: *const ComputeBackend, tensor: CT, output: []f32) !void {
+        errdefer self.cancelGlinerBoundaryOwnedScope();
+        try self.checkExecutionControl();
+        const op = self.vtable.glinerBoundaryDownload orelse return error.UnsupportedGlinerBoundaryDevice;
+        try op(self.ptr, tensor, output);
+        try self.checkExecutionControl();
+    }
+
+    fn cancelGlinerBoundaryOwnedScope(self: *const ComputeBackend) void {
+        const op = self.vtable.glinerBoundaryScope orelse return;
+        const state = op(self.ptr, &.{ .snapshot = {} }) catch return;
+        if (state.active) _ = op(self.ptr, &.{ .cancel = .{ .generation = state.generation } }) catch {};
+    }
+
+    /// Explicit ownership of the existing serial Metal frame. Cleanup and
+    /// snapshots must remain available after a request's control is cancelled.
+    pub fn glinerBoundaryScope(self: *const ComputeBackend, request: *const gliner_boundary_device.ScopeRequest) !gliner_boundary_device.ScopeStats {
+        const op = self.vtable.glinerBoundaryScope orelse return error.UnsupportedGlinerBoundaryScope;
+        switch (request.*) {
+            .snapshot, .cancel => return op(self.ptr, request),
+            .begin => {
+                try self.checkExecutionControl();
+                const result = try op(self.ptr, request);
+                errdefer _ = op(self.ptr, &.{ .cancel = .{ .generation = result.generation } }) catch {};
+                try self.checkExecutionControl();
+                return result;
+            },
+            .finish => |finish| {
+                self.checkExecutionControl() catch |err| {
+                    _ = op(self.ptr, &.{ .cancel = .{ .generation = finish.generation } }) catch {};
+                    return err;
+                };
+                const result = try op(self.ptr, request);
+                try self.checkExecutionControl();
+                return result;
+            },
+        }
+    }
+
+    /// Private session preparation grant on a freshly leased request wrapper.
+    /// It never persists request controls or CT handles in the physical owner.
+    pub fn glinerBoundaryResidentPreparation(self: *const ComputeBackend, enabled: bool) !void {
+        const op = self.vtable.glinerBoundaryResidentPreparation orelse return error.UnsupportedGlinerBoundaryResidentWeights;
+        if (!enabled) return op(self.ptr, false);
+        try self.checkExecutionControl();
+        try op(self.ptr, true);
+        errdefer op(self.ptr, false) catch {};
+        try self.checkExecutionControl();
+    }
+
     pub fn kind(self: *const ComputeBackend) BackendKind {
         return self.vtable.backendKind(self.ptr);
     }
@@ -1490,6 +1553,10 @@ pub const ComputeBackend = struct {
         decoderRuntimePopPlannedComputeBarrierSuppression: ?*const fn (ctx: *anyopaque) anyerror!void = null,
 
         convertDType: ?*const fn (ctx: *anyopaque, tensor: CT, target: GraphDType) anyerror!?CT = null,
+        glinerBoundaryDevice: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.Request) anyerror!CT = null,
+        glinerBoundaryScope: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.ScopeRequest) anyerror!gliner_boundary_device.ScopeStats = null,
+        glinerBoundaryResidentPreparation: ?*const fn (ctx: *anyopaque, enabled: bool) anyerror!void = null,
+        glinerBoundaryDownload: ?*const fn (ctx: *anyopaque, tensor: CT, output: []f32) anyerror!void = null,
 
         debugCudaGraphCaptureBegin: ?*const fn (ctx: *anyopaque, label: []const u8) anyerror!bool = null,
         debugCudaGraphPrepareDecodeScalars: ?*const fn (ctx: *anyopaque, position_offset: usize, query_position_offset: usize, kv_seq_len: usize, total_sequence_len: usize, kv_position_offset: usize) anyerror!bool = null,
@@ -2012,6 +2079,11 @@ pub const ComputeBackend = struct {
         /// Returns [batch*seq_len, num_heads*head_dim].
         disentangledRelativeAttention: *const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, Q_r: CT, K_r: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT,
 
+        /// Optional cooperative form. The control is borrowed synchronously;
+        /// tiled native kernels check it between bounded GEMM calls. Backends
+        /// without this form retain the pre/post-checked legacy operation.
+        disentangledRelativeAttentionWithControl: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, Q_r: CT, K_r: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize, control: ?InferenceExecutionControl) anyerror!CT = null,
+
         /// Optional accelerator-native packed form. This avoids materializing
         /// five slices and downloading the additive attention bias merely to
         /// reconstruct a padding mask. qkv is [Q;K;V], qr_kr is [Qr;Kr], and
@@ -2031,6 +2103,13 @@ pub const ComputeBackend = struct {
         /// Packed/mask counterpart of disentangledRelativeAttentionBackward;
         /// attn_bias has the same mask-only threshold contract as the forward op.
         disentangledRelativeAttentionBackwardPacked: ?*const fn (ctx: *anyopaque, qkv: CT, qr_kr: CT, attn_bias: CT, dO: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT = null,
+
+        /// Versioned training attention with source query-and-key masking,
+        /// compact relative buckets, and counter-based probability dropout.
+        /// The integer control tensor is a physical i32 leaf. These operations
+        /// must not fall back to the inference attention mask or host execution.
+        debertaTrainingAttentionV1: ?*const fn (ctx: *anyopaque, qkv: CT, relative: CT, control_i32: CT, attrs: ml.graph.DebertaTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
+        debertaTrainingAttentionBackwardV1: ?*const fn (ctx: *anyopaque, qkv: CT, relative: CT, control_i32: CT, dO: CT, attrs: ml.graph.DebertaTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
 
         /// Optional destructive softmax over the last dimension. When this
         /// returns a tensor, the backend may have reused `input`'s storage, so
@@ -2177,6 +2256,16 @@ pub const ComputeBackend = struct {
         /// shape without requiring host materialization. Backends may alias
         /// immutable device storage when lifetime/refcounting makes that safe.
         cloneTensorShape: ?*const fn (ctx: *anyopaque, tensor: CT, shape: []const i32) anyerror!?CT = null,
+
+        /// Strict retained-training operations. Unsupported geometry or
+        /// storage must return an error, never execute a host fallback.
+        residentTrainingPrimitive: ?*const fn (ctx: *anyopaque, request: *const resident_training.Request, limits: resident_training.Limits, control: ?InferenceExecutionControl) anyerror!CT = null,
+
+        /// Physically independent resident capture. A retained alias is not
+        /// sufficient because a later graph operation may donate its input.
+        snapshotTensorShape: ?*const fn (ctx: *anyopaque, tensor: CT, shape: []const i32) anyerror!CT = null,
+        residentTrainingNorm: ?*const fn (ctx: *anyopaque, inputs: []const resident_training.NormInput, limits: resident_training.NormLimits, control: ?InferenceExecutionControl) anyerror!resident_training.NormSummary = null,
+        residentTrainingInstruction: ?*const fn (ctx: *anyopaque, instruction: *const resident_program.Instruction, inputs: []const CT, limits: resident_program.Limits, control: ?InferenceExecutionControl) anyerror!CT = null,
 
         /// Copy a tensor from another backend instance into this backend
         /// without host materialization when the two backends are compatible.
@@ -3648,12 +3737,39 @@ pub const ComputeBackend = struct {
     }
 
     pub fn disentangledRelativeAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, Q_r: CT, K_r: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
-        return self.vtable.disentangledRelativeAttention(self.ptr, Q, K, V, Q_r, K_r, mask, batch, seq_len, num_heads, head_dim);
+        try self.checkExecutionControl();
+        const output = if (self.vtable.disentangledRelativeAttentionWithControl) |op|
+            try op(self.ptr, Q, K, V, Q_r, K_r, mask, batch, seq_len, num_heads, head_dim, self.execution_control)
+        else
+            try self.vtable.disentangledRelativeAttention(self.ptr, Q, K, V, Q_r, K_r, mask, batch, seq_len, num_heads, head_dim);
+        errdefer self.free(output);
+        try self.checkExecutionControl();
+        return output;
     }
 
     pub fn disentangledRelativeAttentionPacked(self: *const ComputeBackend, qkv: CT, qr_kr: CT, attn_bias: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !?CT {
         const op = self.vtable.disentangledRelativeAttentionPacked orelse return null;
         return try op(self.ptr, qkv, qr_kr, attn_bias, batch, seq_len, num_heads, head_dim);
+    }
+
+    pub fn debertaTrainingAttentionV1(self: *const ComputeBackend, qkv: CT, relative: CT, control_i32: CT, attrs: ml.graph.DebertaTrainingAttentionAttrs) !CT {
+        _ = try attrs.layout();
+        try self.checkExecutionControl();
+        const op = self.vtable.debertaTrainingAttentionV1 orelse return error.DebertaTrainingAttentionProfileUnavailable;
+        const output = try op(self.ptr, qkv, relative, control_i32, attrs, self.execution_control);
+        errdefer self.free(output);
+        try self.checkExecutionControl();
+        return output;
+    }
+
+    pub fn debertaTrainingAttentionBackwardV1(self: *const ComputeBackend, qkv: CT, relative: CT, control_i32: CT, dO: CT, attrs: ml.graph.DebertaTrainingAttentionAttrs) !CT {
+        _ = try attrs.layout();
+        try self.checkExecutionControl();
+        const op = self.vtable.debertaTrainingAttentionBackwardV1 orelse return error.DebertaTrainingAttentionProfileUnavailable;
+        const output = try op(self.ptr, qkv, relative, control_i32, dO, attrs, self.execution_control);
+        errdefer self.free(output);
+        try self.checkExecutionControl();
+        return output;
     }
 
     pub fn softmaxConsume(self: *const ComputeBackend, input: CT, dim: u32) !?CT {
@@ -3978,6 +4094,43 @@ pub const ComputeBackend = struct {
             return clone_tensor_shape(self.ptr, tensor, shape);
         }
         return null;
+    }
+
+    pub fn residentTrainingPrimitive(self: *const ComputeBackend, request: *const resident_training.Request, limits: resident_training.Limits) !CT {
+        try self.checkExecutionControl();
+        const op = self.vtable.residentTrainingPrimitive orelse return error.UnsupportedResidentTrainingPrimitive;
+        const result = try op(self.ptr, request, limits, self.execution_control);
+        errdefer self.free(result);
+        try self.checkExecutionControl();
+        return result;
+    }
+
+    pub fn snapshotTensorShape(self: *const ComputeBackend, tensor: CT, shape: []const i32) !CT {
+        try self.checkExecutionControl();
+        const op = self.vtable.snapshotTensorShape orelse return error.UnsupportedResidentTrainingCapture;
+        const result = try op(self.ptr, tensor, shape);
+        errdefer self.free(result);
+        try self.checkExecutionControl();
+        return result;
+    }
+
+    /// Reads back only three bounded scalars per tensor. No gradient values
+    /// are copied to the host, and no implicit uploads are permitted.
+    pub fn residentTrainingNorm(self: *const ComputeBackend, inputs: []const resident_training.NormInput, limits: resident_training.NormLimits) !resident_training.NormSummary {
+        try self.checkExecutionControl();
+        const op = self.vtable.residentTrainingNorm orelse return error.UnsupportedResidentTrainingPrimitive;
+        const result = try op(self.ptr, inputs, limits, self.execution_control);
+        try self.checkExecutionControl();
+        return result;
+    }
+
+    pub fn residentTrainingInstruction(self: *const ComputeBackend, instruction: *const resident_program.Instruction, inputs: []const CT, limits: resident_program.Limits) !CT {
+        try self.checkExecutionControl();
+        const op = self.vtable.residentTrainingInstruction orelse return error.UnsupportedResidentProgramBackend;
+        const result = try op(self.ptr, instruction, inputs, limits, self.execution_control);
+        errdefer self.free(result);
+        try self.checkExecutionControl();
+        return result;
     }
 
     pub fn copyTensorFromBackend(self: *const ComputeBackend, src_backend: *const ComputeBackend, src_tensor: CT) !?CT {

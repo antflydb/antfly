@@ -1,0 +1,1406 @@
+{
+  "build": {
+    "backend_options": {
+      "cuda": false,
+      "metal": false,
+      "onnx": false,
+      "pjrt": false,
+      "system_blas": true
+    },
+    "compiler": "/opt/homebrew/Cellar/zig/0.16.0/bin/zig",
+    "host_architecture": "arm64",
+    "host_os": "Darwin",
+    "optimize": "Debug",
+    "parallel_build_jobs": 1,
+    "scope": "Historical CPU checkpoint defaults; integration_metal_v1 records its own Metal-enabled build options.",
+    "version": "0.16.0"
+  },
+  "claims": {
+    "long_context_numeric_execution": false,
+    "memory_or_performance_benchmark": false,
+    "published_model_regional_training": false,
+    "regional_metal_execution": true,
+    "regional_metal_execution_scope": "Tiny actual-Metal source Step cases and managed NativeTrainer fixtures only; no published-model regional job.",
+    "regional_peft_source_parity": true,
+    "regional_peft_source_parity_scope": "Eight tiny mixed Step profiles on CPU and actual Metal; separate NativeTrainer inactive-adapter source cases exercise all 8 LoRA/DoRA profiles per backend including native-owned updates and durable resume. GPU Step comparisons alone do not prove optimizer updates.",
+    "release_qualification": false,
+    "synthetic_cpu_regional_gradient_comparison": true,
+    "tiny_cpu_full_head_regional_resume": true,
+    "tiny_cpu_regional_pinned_source_profiles": 8,
+    "tiny_inactive_adapter_regional_profiles_per_backend": 8,
+    "tiny_metal_full_head_regional_resume": true,
+    "tiny_metal_regional_pinned_source_profiles": 8
+  },
+  "created_at_utc": "2026-09-10T17:44:20.388637+00:00",
+  "evidence_is_upstream_numerical_fixture": false,
+  "executions": [
+    {
+      "argv": [
+        "zig",
+        "build",
+        "inference-test",
+        "-Dmetal=false",
+        "-Dcuda=false",
+        "-j1",
+        "--",
+        "--test-filter",
+        "recomputed training",
+        "--test-filter",
+        "boundary recomputed graph",
+        "--test-filter",
+        "boundary regional replay"
+      ],
+      "command_provenance": "Root execution transcript; successful argv/environment confirmed to match preceding failed checkpoint except redirected log path. Failed build commands are preserved in the raw logs.",
+      "cwd": "zig",
+      "environment": {
+        "ZIG_GLOBAL_CACHE_DIR": "/private/tmp/antfly-gliner25-zig-cache"
+      },
+      "exact_test_executable": null,
+      "exact_test_executable_status": "Unrecorded; no identity inferred from cache paths or later artifacts.",
+      "exit_code": 1,
+      "failed": null,
+      "failure": "Invalid left-hand side to assignment in the regional epoch publication loop.",
+      "id": "core_native_v1",
+      "leaks_reported": null,
+      "log": {
+        "original_path": "/private/tmp/gliner25-recomputed-training-native-v1.log",
+        "path": "logs/gliner25-recomputed-training-native-v1.log",
+        "sha256": "9cc8c9383122e45687bcd47446d07a9ebbcf06ced8933f819bf0fb035c02669d",
+        "size_bytes": 8789
+      },
+      "passed": null,
+      "requested_tests_executed": false,
+      "selected": null,
+      "skipped": null,
+      "source_binding": "Historical checkpoint only. No full source snapshot was preserved then; the current workspace changed afterward.",
+      "source_snapshot": null,
+      "status": "failed_compile",
+      "test_case_start_lines": []
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "inference-test",
+        "-Dmetal=false",
+        "-Dcuda=false",
+        "-j1",
+        "--",
+        "--test-filter",
+        "recomputed training",
+        "--test-filter",
+        "boundary recomputed graph",
+        "--test-filter",
+        "boundary regional replay"
+      ],
+      "command_provenance": "Root execution transcript; successful argv/environment confirmed to match preceding failed checkpoint except redirected log path. Failed build commands are preserved in the raw logs.",
+      "cwd": "zig",
+      "environment": {
+        "ZIG_GLOBAL_CACHE_DIR": "/private/tmp/antfly-gliner25-zig-cache"
+      },
+      "exact_test_executable": null,
+      "exact_test_executable_status": "Unrecorded; no identity inferred from cache paths or later artifacts.",
+      "exit_code": 1,
+      "failed": 5,
+      "failure": "Five synthetic core tests rejected an UnsupportedResidentProgramInstruction; strict admission was not loosened.",
+      "id": "core_native_v2",
+      "leaks_reported": 0,
+      "log": {
+        "original_path": "/private/tmp/gliner25-recomputed-training-native-v2.log",
+        "path": "logs/gliner25-recomputed-training-native-v2.log",
+        "sha256": "b94950b10453818b8eb49c0f399c493c0c7f2dc2f4caba424d94579b76574cf3",
+        "size_bytes": 14124
+      },
+      "passed": 8,
+      "requested_tests_executed": true,
+      "runner_summary": "13 selected; 8 passed; 0 skipped; 5 failed; 0 leaked.",
+      "selected": 13,
+      "skipped": 0,
+      "source_binding": "Historical checkpoint only. No full source snapshot was preserved then; the current workspace changed afterward.",
+      "source_snapshot": null,
+      "status": "failed_fixture",
+      "test_case_start_lines": [
+        "1/45 graph.recomputed_training_test.test.recomputed training two encoder layers share relative cotangents and preserve a single detached head...FAIL (UnsupportedResidentProgramInstruction)",
+        "2/45 graph.recomputed_training_test.test.recomputed training compilation has bounded ownership at every allocation failure...FAIL (UnsupportedResidentProgramInstruction)",
+        "3/45 graph.recomputed_training_test.test.recomputed training admission charges checkpoints compilation head and complete optimizer before forward...FAIL (UnsupportedResidentProgramInstruction)",
+        "4/45 graph.recomputed_training_test.test.recomputed training runtime allocation failure consumes tapes preserves inputs and retries...FAIL (UnsupportedResidentProgramInstruction)",
+        "5/45 graph.recomputed_training_test.test.recomputed training seals identity recipes and both controls with no-gradient cleanup...FAIL (UnsupportedResidentProgramInstruction)",
+        "6/45 finetune.gliner_boundary_replay_bindings.test.boundary regional replay recipes use encoder ordinary and alternate closure with copied identities...OK",
+        "7/45 finetune.gliner_boundary_replay_bindings.test.boundary regional replay refuses missing duplicate cyclic and over-budget recipes...OK",
+        "8/45 finetune.gliner_boundary_replay_bindings.test.boundary regional replay generated masks preserve all counter bits and free host staging before return...OK",
+        "9/45 finetune.gliner_boundary_replay_bindings.test.boundary regional replay generated setup and materialization unwind every allocation failure...OK",
+        "10/45 finetune.gliner_boundary_replay_bindings.test.boundary regional replay explicit mask pins reject mutation cancellation missing and duplicate names...OK",
+        "11/45 finetune.gliner_boundary_replay_bindings.test.boundary regional replay explicit mask metadata unwinds every allocation failure...OK",
+        "12/45 finetune.gliner_boundary_recomputed_graph.test.boundary recomputed graph cuts before staged head differentiation and preserves original optimizer IDs...OK",
+        "13/45 finetune.gliner_boundary_recomputed_graph.test.boundary recomputed graph regional and staged head ownership releases every allocation failure...OK"
+      ]
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "inference-test",
+        "-Dmetal=false",
+        "-Dcuda=false",
+        "-j1",
+        "--",
+        "--test-filter",
+        "recomputed training",
+        "--test-filter",
+        "boundary recomputed graph",
+        "--test-filter",
+        "boundary regional replay"
+      ],
+      "command_provenance": "Root execution transcript; successful argv/environment confirmed to match preceding failed checkpoint except redirected log path. Failed build commands are preserved in the raw logs.",
+      "cwd": "zig",
+      "environment": {
+        "ZIG_GLOBAL_CACHE_DIR": "/private/tmp/antfly-gliner25-zig-cache"
+      },
+      "exact_test_executable": null,
+      "exact_test_executable_status": "Unrecorded; no identity inferred from cache paths or later artifacts.",
+      "exit_code": 0,
+      "failed": 0,
+      "failure": null,
+      "id": "core_native_v3",
+      "leaks_reported": 0,
+      "log": {
+        "original_path": "/private/tmp/gliner25-recomputed-training-native-v3.log",
+        "path": "logs/gliner25-recomputed-training-native-v3.log",
+        "sha256": "8fea2be9588950387da2fcc1f4a6629728aae4409bf6c643f9d24fb0a284c8b5",
+        "size_bytes": 70191
+      },
+      "passed": 13,
+      "requested_tests_executed": true,
+      "runner_summary": "13 selected; 13 passed; 0 skipped.",
+      "scope": [
+        "Synthetic full-versus-regional forward and gradient comparison with shared relative/parameter cotangents and one separately differentiated head.",
+        "Compiled owner, tape, no-gradient, epoch, cancellation, input immutability, bounded admission and every allocation-failure unwind.",
+        "Semantic encoder cut/head wrapper and typed explicit/generated dropout recipe ownership."
+      ],
+      "selected": 13,
+      "skipped": 0,
+      "source_binding": "Historical checkpoint only. No full source snapshot was preserved then; the current workspace changed afterward.",
+      "source_snapshot": null,
+      "status": "passed",
+      "test_case_start_lines": [
+        "1/45 graph.recomputed_training_test.test.recomputed training two encoder layers share relative cotangents and preserve a single detached head...OK",
+        "2/45 graph.recomputed_training_test.test.recomputed training compilation has bounded ownership at every allocation failure...OK",
+        "3/45 graph.recomputed_training_test.test.recomputed training admission charges checkpoints compilation head and complete optimizer before forward...OK",
+        "4/45 graph.recomputed_training_test.test.recomputed training runtime allocation failure consumes tapes preserves inputs and retries...[default] (warn): binary op failed node_id=3 op=mul lhs_id=0 rhs_id=1 lhs_op=parameter rhs_op=parameter lhs_declared=.{ .dtype = .f32, .dims = { 2, 0, 0, 0, 0, 0, 0, 0 }, .rank_ = 1, .bounds = { 0, 0, 0, 0, 0, 0, 0, 0 } } rhs_declared=.{ .dtype = .f32, .dims = { 2, 0, 0, 0, 0, 0, 0, 0 }, .rank_ = 1, .bounds = { 0, 0, 0, 0, 0, 0, 0, 0 } } lhs_actual={ 2 } rhs_actual={ 2 } err=OutOfMemory",
+        "5/45 graph.recomputed_training_test.test.recomputed training seals identity recipes and both controls with no-gradient cleanup...OK",
+        "6/45 finetune.gliner_boundary_replay_bindings.test.boundary regional replay recipes use encoder ordinary and alternate closure with copied identities...OK",
+        "7/45 finetune.gliner_boundary_replay_bindings.test.boundary regional replay refuses missing duplicate cyclic and over-budget recipes...OK",
+        "8/45 finetune.gliner_boundary_replay_bindings.test.boundary regional replay generated masks preserve all counter bits and free host staging before return...OK",
+        "9/45 finetune.gliner_boundary_replay_bindings.test.boundary regional replay generated setup and materialization unwind every allocation failure...OK",
+        "10/45 finetune.gliner_boundary_replay_bindings.test.boundary regional replay explicit mask pins reject mutation cancellation missing and duplicate names...OK",
+        "11/45 finetune.gliner_boundary_replay_bindings.test.boundary regional replay explicit mask metadata unwinds every allocation failure...OK",
+        "12/45 finetune.gliner_boundary_recomputed_graph.test.boundary recomputed graph cuts before staged head differentiation and preserves original optimizer IDs...OK",
+        "13/45 finetune.gliner_boundary_recomputed_graph.test.boundary recomputed graph regional and staged head ownership releases every allocation failure...OK"
+      ]
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "inference-test",
+        "-Dmetal=false",
+        "-Dcuda=false",
+        "-j1",
+        "--",
+        "--test-filter",
+        "regional recomputation",
+        "--test-filter",
+        "boundary recomputed head admission",
+        "--test-filter",
+        "boundary recomputed execution",
+        "--test-filter",
+        "boundary regional replay",
+        "--test-filter",
+        "seeded gradient trainer native transaction admission",
+        "--test-filter",
+        "seeded gradient trainer preserves groups",
+        "--test-filter",
+        "seeded gradient trainer allocation failures",
+        "--test-filter",
+        "seeded gradient trainer matches pinned Torch AdamW",
+        "--test-filter",
+        "seeded device transaction"
+      ],
+      "command_provenance": "Root execution transcript; successful argv/environment confirmed to match preceding failed checkpoint except redirected log path. Failed build commands are preserved in the raw logs.",
+      "cwd": "zig",
+      "environment": {
+        "ZIG_GLOBAL_CACHE_DIR": "/private/tmp/antfly-gliner25-zig-cache"
+      },
+      "exact_test_executable": null,
+      "exact_test_executable_status": "Unrecorded; no identity inferred from cache paths or later artifacts.",
+      "exit_code": 1,
+      "failed": null,
+      "failure": "New canonical merge test supplied a const one-element array where its generic API required a mutable slice.",
+      "id": "integration_native_v1",
+      "leaks_reported": null,
+      "log": {
+        "original_path": "/private/tmp/gliner25-recomputed-integration-native-v1.log",
+        "path": "logs/gliner25-recomputed-integration-native-v1.log",
+        "sha256": "e508d610a26978acd654902d5116dda69b4ad708498bb77f5b9c8ae5a4f5fb9f",
+        "size_bytes": 10852
+      },
+      "passed": null,
+      "requested_tests_executed": false,
+      "selected": null,
+      "skipped": null,
+      "source_binding": "Historical checkpoint only. No full source snapshot was preserved then; the current workspace changed afterward.",
+      "source_snapshot": null,
+      "status": "failed_compile",
+      "test_case_start_lines": []
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "inference-test",
+        "-Dmetal=false",
+        "-Dcuda=false",
+        "-j1",
+        "--",
+        "--test-filter",
+        "regional recomputation",
+        "--test-filter",
+        "boundary recomputed head admission",
+        "--test-filter",
+        "boundary recomputed execution",
+        "--test-filter",
+        "boundary regional replay",
+        "--test-filter",
+        "seeded gradient trainer native transaction admission",
+        "--test-filter",
+        "seeded gradient trainer preserves groups",
+        "--test-filter",
+        "seeded gradient trainer allocation failures",
+        "--test-filter",
+        "seeded gradient trainer matches pinned Torch AdamW",
+        "--test-filter",
+        "seeded device transaction"
+      ],
+      "command_provenance": "Root execution transcript; successful argv/environment confirmed to match preceding failed checkpoint except redirected log path. Failed build commands are preserved in the raw logs.",
+      "cwd": "zig",
+      "environment": {
+        "ZIG_GLOBAL_CACHE_DIR": "/private/tmp/antfly-gliner25-zig-cache"
+      },
+      "exact_test_executable": null,
+      "exact_test_executable_status": "Unrecorded; no identity inferred from cache paths or later artifacts.",
+      "exit_code": 0,
+      "expected_skips": [
+        "seeded device transaction actual Metal matches pinned Torch with only scalar training readbacks",
+        "boundary native trainer regional recomputation resident Metal two layers full and heads preserve exact partial resume"
+      ],
+      "failed": 0,
+      "failure": null,
+      "id": "integration_native_v2",
+      "leaks_reported": 0,
+      "log": {
+        "original_path": "/private/tmp/gliner25-recomputed-integration-native-v2.log",
+        "path": "logs/gliner25-recomputed-integration-native-v2.log",
+        "sha256": "9bf2893e810559409bbd1ce91cb4a57562966e0f5daac9cac782e7fd17ad2ce7",
+        "size_bytes": 6956
+      },
+      "passed": 34,
+      "requested_tests_executed": true,
+      "runner_summary": "36 selected; 34 passed; 2 skipped.",
+      "scope": [
+        "Tiny deterministic NativeTrainer with two encoder layers: full/head-only modes, six microbatches/four optimizer updates per mode, exact fresh-owner partial resume and rejection/retry.",
+        "Canonical head/encoder gradient merge and absent-versus-zero semantics.",
+        "Reclaimed native optimizer staging, measured allocator bounds, every allocation-failure unwind, resident optimizer metadata/work admission and existing pinned Torch AdamW contract.",
+        "Replay recipes, mutation/cancellation/stale construction control, full-width counter identity and typed allocation attribution."
+      ],
+      "selected": 36,
+      "skipped": 2,
+      "source_binding": "Historical checkpoint only. No full source snapshot was preserved then; the current workspace changed afterward.",
+      "source_snapshot": null,
+      "status": "passed",
+      "test_case_start_lines": [
+        "1/68 finetune.gliner_boundary_replay_bindings.test.boundary regional replay recipes use encoder ordinary and alternate closure with copied identities...OK",
+        "2/68 finetune.gliner_boundary_replay_bindings.test.boundary regional replay refuses missing duplicate cyclic and over-budget recipes...OK",
+        "3/68 finetune.gliner_boundary_replay_bindings.test.boundary regional replay generated masks preserve all counter bits and free host staging before return...OK",
+        "4/68 finetune.gliner_boundary_replay_bindings.test.boundary regional replay generated setup and materialization unwind every allocation failure...OK",
+        "5/68 finetune.gliner_boundary_replay_bindings.test.boundary regional replay explicit mask pins reject mutation cancellation missing and duplicate names...OK",
+        "6/68 finetune.gliner_boundary_replay_bindings.test.boundary regional replay explicit mask metadata unwinds every allocation failure...OK",
+        "7/68 finetune.gliner_boundary_replay_bindings.test.boundary regional replay cached recipes forget construction control and honor current request cancellation...OK",
+        "8/68 finetune.gliner_boundary_replay_bindings.test.boundary regional replay terminal backing OOM is independent of earlier resize limit miss...OK",
+        "9/68 finetune.gliner_boundary_recomputed_admission.test.boundary recomputed head admission accounts staged programs bindings gradients and pending sums...OK",
+        "10/68 finetune.gliner_boundary_recomputed_admission.test.boundary recomputed head admission compilation unwinds every allocation failure...OK",
+        "11/68 finetune.gliner_boundary_recomputed_admission.test.boundary recomputed head admission handles direct no-gradient sessions and compile denials...OK",
+        "12/68 finetune.gliner_boundary_recomputed_execution.test.boundary recomputed execution merges canonical shared parameters and preserves zero None and independent lifetime...OK",
+        "13/68 finetune.gliner_boundary_recomputed_execution.test.boundary recomputed execution numerical ownership unwinds every allocation failure...OK",
+        "14/68 finetune.gliner_boundary_recomputed_execution.test.boundary recomputed execution admission counts pending shared sums and native operand copies...OK",
+        "15/68 finetune.gliner_boundary_recomputed_execution.test.boundary recomputed execution rejects duplicate unselected malformed shape and mismatched loss without consuming inputs...OK",
+        "16/68 finetune.gliner_boundary_recomputed_execution.test.boundary recomputed execution absent dEL permits head only and empty results while explicit zero stays present...OK",
+        "17/68 finetune.gliner_boundary_recomputed_execution.test.boundary recomputed execution preserves both controls and retries after every cancellation boundary...OK",
+        "18/68 finetune.seeded_device_transaction_test.test.seeded device transaction admission rejects shapes identities limits and duplicate gradients before work...OK",
+        "19/68 finetune.seeded_device_transaction_test.test.seeded device transaction preserves absent versus zero partial windows and exact counters...OK",
+        "20/68 finetune.seeded_device_transaction_test.test.seeded device transaction failures after mutation and every dispatch preserve the old epoch...OK",
+        "21/68 finetune.seeded_device_transaction_test.test.seeded device transaction cancellation checks both controls and releases all private buffers...OK",
+        "22/68 finetune.seeded_device_transaction_test.test.seeded device transaction rejects foreign physical shapes nonfinite values and dirty absent accumulators...OK",
+        "23/68 finetune.seeded_device_transaction_test.test.seeded device transaction caps mutating batches and leaves all-absent slots untouched...OK",
+        "24/68 finetune.seeded_device_transaction_test.test.seeded device transaction contract matches pinned Torch groups clipping and partial flush...OK",
+        "25/68 finetune.seeded_device_transaction_test.test.seeded device transaction actual Metal matches pinned Torch with only scalar training readbacks...SKIP",
+        "26/68 finetune.gliner_boundary_encoder_graph.test.GLiNER2.5 regional recomputation planning retains boundaries and admits four attention sweeps...OK",
+        "27/68 finetune.seeded_gradient_trainer.test.seeded gradient trainer native transaction admission checks full-width totals without allocating...OK",
+        "28/68 finetune.seeded_gradient_trainer.test.seeded gradient trainer native transaction admission bounds measured accumulation flush and atomic retry...OK",
+        "29/68 finetune.seeded_gradient_trainer.test.seeded gradient trainer native transaction admission ownership survives every allocation failure...OK",
+        "30/68 finetune.seeded_gradient_trainer.test.seeded gradient trainer preserves groups absent gradients and partial window normalization...OK",
+        "31/68 finetune.seeded_gradient_trainer.test.seeded gradient trainer allocation failures preserve parameter and moment ownership...OK",
+        "32/68 finetune.seeded_gradient_trainer.test.seeded gradient trainer matches pinned Torch AdamW groups clipping moments and partial flush...OK",
+        "33/68 finetune.gliner_boundary_native_trainer_test.test.boundary native trainer regional recomputation two layers full and heads preserve cancellation and exact partial resume...[default] (warn): GLiNER2.5 training allocation failed: phase=forward_backward domain=backend reason=declared_limit requested_bytes=8192 live_bytes=608 peak_bytes=608 limit_bytes=1",
+        "34/68 finetune.gliner_boundary_native_trainer_test.test.boundary native trainer regional recomputation resident Metal two layers full and heads preserve exact partial resume...SKIP",
+        "35/68 finetune.seeded_device_transaction.test.seeded device transaction work admission covers tensor gradients partial flush and reduction tails without dispatch...OK",
+        "36/68 finetune.seeded_device_transaction.test.seeded device transaction work admission rejects integer overflow...OK"
+      ]
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "inference-test",
+        "-Dmetal=false",
+        "-Dcuda=false",
+        "-j1",
+        "--",
+        "--test-filter",
+        "regional recomputation",
+        "--test-filter",
+        "recomputed training",
+        "--test-filter",
+        "boundary recomputed",
+        "--test-filter",
+        "boundary regional replay",
+        "--test-filter",
+        "boundary training step control",
+        "--test-filter",
+        "boundary training step terminal allocation",
+        "--test-filter",
+        "boundary training step cached plan",
+        "--test-filter",
+        "boundary training step construction methods",
+        "--test-filter",
+        "seeded gradient trainer native transaction admission",
+        "--test-filter",
+        "seeded gradient trainer binding control preserves",
+        "--test-filter",
+        "seeded gradient trainer preserves groups",
+        "--test-filter",
+        "seeded gradient trainer allocation failures",
+        "--test-filter",
+        "seeded gradient trainer matches pinned Torch AdamW",
+        "--test-filter",
+        "seeded device transaction"
+      ],
+      "command_provenance": "Root execution transcript and exact argv/environment confirmation; stdout and stderr redirected to the original log path. No model directory or source-refresh environment was added.",
+      "cwd": "zig",
+      "cwd_at_execution": "/Users/timkaye/Documents/af/antfly/zig",
+      "environment": {
+        "ZIG_GLOBAL_CACHE_DIR": "/private/tmp/antfly-gliner25-zig-cache"
+      },
+      "exact_test_executable": null,
+      "exact_test_executable_status": "Unrecorded; no identity inferred from cache paths or later artifacts.",
+      "exit_code": 0,
+      "expected_skips": [
+        "seeded device transaction actual Metal matches pinned Torch with only scalar training readbacks",
+        "boundary native trainer regional recomputation resident Metal two layers full and heads preserve exact partial resume"
+      ],
+      "failed": 0,
+      "failure": null,
+      "id": "integration_native_v3",
+      "leaks_reported": 0,
+      "log": {
+        "original_path": "/private/tmp/gliner25-recomputed-integration-native-v3.log",
+        "path": "logs/gliner25-recomputed-integration-native-v3.log",
+        "sha256": "ccaa953f325aa0117299e3f1519a073ff64276900ba9899bd47f5c81e3af80c7",
+        "size_bytes": 79544
+      },
+      "numeric_tolerances": {
+        "absence_parameter_steps_and_resume": "Exact assertions; unchanged existing fixture tolerances.",
+        "first_moments": {
+          "absolute": 2e-05,
+          "relative": 0.001
+        },
+        "gradient_norm": {
+          "absolute": 0.002,
+          "relative": 0.0005
+        },
+        "gradients": {
+          "absolute": 0.0005,
+          "relative": 0.0008
+        },
+        "loss_terms": {
+          "absolute": 0.001,
+          "relative": 2e-05
+        },
+        "second_moments": {
+          "absolute": 1e-07,
+          "relative": 0.002
+        },
+        "weights": {
+          "absolute": 2e-05,
+          "relative": 2e-05
+        }
+      },
+      "passed": 61,
+      "requested_tests_executed": true,
+      "runner_summary": "63 selected; 61 passed; 2 skipped.",
+      "scope": [
+        "Eight tiny pinned-source regional CPU profiles: full, heads, LoRA and DoRA with zero dropout using replay_tiled_v1 attention, plus all four with explicit dropout using materialized_v1 attention.",
+        "Each regional source case executes three native microbatches, compares all objective terms and every selected parameter gradient including absence, checks two native AdamW flushes, and restores a fresh Controller from a durable mid-window checkpoint.",
+        "Four retained/materialized controlled-source-dropout profiles pass unchanged as regression coverage.",
+        "The two-layer full/head-only NativeTrainer fixture completes six microbatches/four updates per mode, with exact partial resume and caller scratch, cache-hit host, backend, cancellation, epoch and restored-flush admission rejection/retry.",
+        "Core, canonical merge, single-head, recipes, None-versus-zero, allocation ownership, strict failure attribution and request/watchdog carrier regressions pass.",
+        "No actual regional Metal execution, published model, TTL hardware exercise, long-context or performance qualification is claimed."
+      ],
+      "selected": 63,
+      "skipped": 2,
+      "source_binding": "The 30 named relevant source files were copied under the root source freeze before compilation; this partial archive is not the entire dependency closure. Later default/resource-wire changes are excluded.",
+      "source_profiles": {
+        "microbatches_per_case": 3,
+        "modes": [
+          "full",
+          "heads",
+          "lora",
+          "dora"
+        ],
+        "optimizer_flushes_per_case": 2,
+        "regional_explicit_dropout": {
+          "activation_profile": "layer_recompute_v1",
+          "attention_profile": "materialized_v1",
+          "count": 4,
+          "probability": 0.125
+        },
+        "regional_zero_dropout": {
+          "activation_profile": "layer_recompute_v1",
+          "attention_profile": "replay_tiled_v1",
+          "count": 4
+        },
+        "retained_explicit_dropout_regressions": {
+          "activation_profile": "retained_v1",
+          "attention_profile": "materialized_v1",
+          "count": 4,
+          "probability": 0.125
+        },
+        "trainable_parameter_counts": [
+          168,
+          130,
+          24,
+          36
+        ]
+      },
+      "source_snapshot": "integration_native_v3",
+      "status": "passed",
+      "test_case_start_lines": [
+        "1/95 graph.recomputed_training_test.test.recomputed training two encoder layers share relative cotangents and preserve a single detached head...OK",
+        "2/95 graph.recomputed_training_test.test.recomputed training compilation has bounded ownership at every allocation failure...OK",
+        "3/95 graph.recomputed_training_test.test.recomputed training admission charges checkpoints compilation head and complete optimizer before forward...OK",
+        "4/95 graph.recomputed_training_test.test.recomputed training runtime allocation failure consumes tapes preserves inputs and retries...[default] (warn): binary op failed node_id=3 op=mul lhs_id=0 rhs_id=1 lhs_op=parameter rhs_op=parameter lhs_declared=.{ .dtype = .f32, .dims = { 2, 0, 0, 0, 0, 0, 0, 0 }, .rank_ = 1, .bounds = { 0, 0, 0, 0, 0, 0, 0, 0 } } rhs_declared=.{ .dtype = .f32, .dims = { 2, 0, 0, 0, 0, 0, 0, 0 }, .rank_ = 1, .bounds = { 0, 0, 0, 0, 0, 0, 0, 0 } } lhs_actual={ 2 } rhs_actual={ 2 } err=OutOfMemory",
+        "5/95 graph.recomputed_training_test.test.recomputed training seals identity recipes and both controls with no-gradient cleanup...OK",
+        "6/95 graph.recomputed_training_test.test.recomputed training replay summary counts region occurrences and excludes absent reverse passes...OK",
+        "7/95 graph.recomputed_training_test.test.recomputed training auxiliary stopped and predicate parameters remain absent instead of zero...OK",
+        "8/95 finetune.gliner_boundary_replay_bindings.test.boundary regional replay recipes use encoder ordinary and alternate closure with copied identities...OK",
+        "9/95 finetune.gliner_boundary_replay_bindings.test.boundary regional replay refuses missing duplicate cyclic and over-budget recipes...OK",
+        "10/95 finetune.gliner_boundary_replay_bindings.test.boundary regional replay generated masks preserve all counter bits and free host staging before return...OK",
+        "11/95 finetune.gliner_boundary_replay_bindings.test.boundary regional replay generated setup and materialization unwind every allocation failure...OK",
+        "12/95 finetune.gliner_boundary_replay_bindings.test.boundary regional replay explicit mask pins reject mutation cancellation missing and duplicate names...OK",
+        "13/95 finetune.gliner_boundary_replay_bindings.test.boundary regional replay explicit mask metadata unwinds every allocation failure...OK",
+        "14/95 finetune.gliner_boundary_replay_bindings.test.boundary regional replay cached recipes forget construction control and honor current request cancellation...OK",
+        "15/95 finetune.gliner_boundary_replay_bindings.test.boundary regional replay terminal backing OOM is independent of earlier resize limit miss...OK",
+        "16/95 finetune.gliner_boundary_recomputed_graph.test.boundary recomputed graph cuts before staged head differentiation and preserves original optimizer IDs...OK",
+        "17/95 finetune.gliner_boundary_recomputed_graph.test.boundary recomputed graph regional and staged head ownership releases every allocation failure...OK",
+        "18/95 finetune.gliner_boundary_recomputed_admission.test.boundary recomputed head admission accounts staged programs bindings gradients and pending sums...OK",
+        "19/95 finetune.gliner_boundary_recomputed_admission.test.boundary recomputed head admission compilation unwinds every allocation failure...OK",
+        "20/95 finetune.gliner_boundary_recomputed_admission.test.boundary recomputed head admission handles direct no-gradient sessions and compile denials...OK",
+        "21/95 finetune.gliner_boundary_recomputed_execution.test.boundary recomputed execution merges canonical shared parameters and preserves zero None and independent lifetime...OK",
+        "22/95 finetune.gliner_boundary_recomputed_execution.test.boundary recomputed execution numerical ownership unwinds every allocation failure...OK",
+        "23/95 finetune.gliner_boundary_recomputed_execution.test.boundary recomputed execution admission counts pending shared sums and native operand copies...OK",
+        "24/95 finetune.gliner_boundary_recomputed_execution.test.boundary recomputed execution rejects duplicate unselected malformed shape and mismatched loss without consuming inputs...OK",
+        "25/95 finetune.gliner_boundary_recomputed_execution.test.boundary recomputed execution absent dEL permits head only and empty results while explicit zero stays present...OK",
+        "26/95 finetune.gliner_boundary_recomputed_execution.test.boundary recomputed execution preserves both controls and retries after every cancellation boundary...OK",
+        "27/95 finetune.seeded_device_transaction_test.test.seeded device transaction admission rejects shapes identities limits and duplicate gradients before work...OK",
+        "28/95 finetune.seeded_device_transaction_test.test.seeded device transaction preserves absent versus zero partial windows and exact counters...OK",
+        "29/95 finetune.seeded_device_transaction_test.test.seeded device transaction failures after mutation and every dispatch preserve the old epoch...OK",
+        "30/95 finetune.seeded_device_transaction_test.test.seeded device transaction cancellation checks both controls and releases all private buffers...OK",
+        "31/95 finetune.seeded_device_transaction_test.test.seeded device transaction rejects foreign physical shapes nonfinite values and dirty absent accumulators...OK",
+        "32/95 finetune.seeded_device_transaction_test.test.seeded device transaction caps mutating batches and leaves all-absent slots untouched...OK",
+        "33/95 finetune.seeded_device_transaction_test.test.seeded device transaction contract matches pinned Torch groups clipping and partial flush...OK",
+        "34/95 finetune.seeded_device_transaction_test.test.seeded device transaction actual Metal matches pinned Torch with only scalar training readbacks...SKIP",
+        "35/95 finetune.gliner_boundary_encoder_graph.test.GLiNER2.5 regional recomputation planning retains boundaries and admits four attention sweeps...OK",
+        "36/95 finetune.gliner_boundary_train_step.test.boundary training step control preserves independent callbacks cancellation deadlines and worker carriers...OK",
+        "37/95 finetune.gliner_boundary_train_step.test.boundary training step terminal allocation cause survives resize misses and nested owner limits...OK",
+        "38/95 finetune.gliner_boundary_train_step.test.boundary training step cached plan runs compose host checks and reset terminal allocation history...OK",
+        "39/95 finetune.gliner_boundary_train_step.test.boundary training step construction methods classify terminal causes and preserve invalidation...OK",
+        "40/95 finetune.seeded_gradient_trainer.test.seeded gradient trainer binding control preserves worker carrier both cancellation sources and earliest deadline...OK",
+        "41/95 finetune.seeded_gradient_trainer.test.seeded gradient trainer native transaction admission checks full-width totals without allocating...OK",
+        "42/95 finetune.seeded_gradient_trainer.test.seeded gradient trainer native transaction admission bounds measured accumulation flush and atomic retry...OK",
+        "43/95 finetune.seeded_gradient_trainer.test.seeded gradient trainer native transaction admission ownership survives every allocation failure...OK",
+        "44/95 finetune.seeded_gradient_trainer.test.seeded gradient trainer preserves groups absent gradients and partial window normalization...OK",
+        "45/95 finetune.seeded_gradient_trainer.test.seeded gradient trainer allocation failures preserve parameter and moment ownership...OK",
+        "46/95 finetune.seeded_gradient_trainer.test.seeded gradient trainer matches pinned Torch AdamW groups clipping moments and partial flush...OK",
+        "47/95 finetune.gliner_boundary_native_trainer_test.test.boundary native trainer regional recomputation two layers full and heads preserve cancellation and exact partial resume...[default] (warn): GLiNER2.5 training allocation failed: phase=forward_backward domain=backend reason=declared_limit requested_bytes=8192 live_bytes=608 peak_bytes=608 limit_bytes=1",
+        "48/95 finetune.gliner_boundary_native_trainer_test.test.boundary native trainer regional recomputation resident Metal two layers full and heads preserve exact partial resume...SKIP",
+        "49/95 finetune.seeded_device_transaction.test.seeded device transaction work admission covers tensor gradients partial flush and reduction tails without dispatch...OK",
+        "50/95 finetune.seeded_device_transaction.test.seeded device transaction work admission rejects integer overflow...OK",
+        "51/95 finetune.seeded_device_transaction.test.seeded device transaction control preserves worker carrier both cancellation sources and earliest deadline...OK",
+        "52/95 finetune.gliner_boundary_train_step_oracle_test.test.boundary training step controlled source dropout full objectives gradients durable resume and AdamW...OK",
+        "53/95 finetune.gliner_boundary_train_step_oracle_test.test.boundary training step controlled source dropout heads objectives gradients durable resume and AdamW...OK",
+        "54/95 finetune.gliner_boundary_train_step_oracle_test.test.boundary training step controlled source dropout LoRA objectives gradients durable resume and AdamW...OK",
+        "55/95 finetune.gliner_boundary_train_step_oracle_test.test.boundary training step controlled source dropout DoRA objectives gradients durable resume and AdamW...OK",
+        "56/95 finetune.gliner_boundary_train_step_oracle_test.test.boundary training step regional recomputation pinned full objectives gradients durable resume and AdamW...OK",
+        "57/95 finetune.gliner_boundary_train_step_oracle_test.test.boundary training step regional recomputation pinned heads objectives gradients durable resume and AdamW...OK",
+        "58/95 finetune.gliner_boundary_train_step_oracle_test.test.boundary training step regional recomputation pinned LoRA objectives gradients durable resume and AdamW...OK",
+        "59/95 finetune.gliner_boundary_train_step_oracle_test.test.boundary training step regional recomputation pinned DoRA objectives gradients durable resume and AdamW...OK",
+        "60/95 finetune.gliner_boundary_train_step_oracle_test.test.boundary training step regional recomputation controlled dropout full objectives gradients durable resume and AdamW...OK",
+        "61/95 finetune.gliner_boundary_train_step_oracle_test.test.boundary training step regional recomputation controlled dropout heads objectives gradients durable resume and AdamW...OK",
+        "62/95 finetune.gliner_boundary_train_step_oracle_test.test.boundary training step regional recomputation controlled dropout LoRA objectives gradients durable resume and AdamW...OK",
+        "63/95 finetune.gliner_boundary_train_step_oracle_test.test.boundary training step regional recomputation controlled dropout DoRA objectives gradients durable resume and AdamW...OK"
+      ],
+      "tested_resource_settings": {
+        "default_native_caller_scratch_bytes": 268435456,
+        "default_step_recomputation_max_host_bytes": 1073741824,
+        "native_trainer_fixture": {
+          "max_backend_bytes": 268435456,
+          "max_combined_bytes": 1073741824,
+          "max_host_bytes": 268435456,
+          "max_recomputed_batch_scratch_bytes": 16777216,
+          "source_reserved_bytes": 16777216,
+          "step_max_step_host_bytes": 33554432,
+          "step_recomputation_max_plan_host_bytes": 33554432
+        },
+        "source_oracle": "Uses the frozen Step defaults with separately bounded host/backend owners and sealed aggregate admission; it is a direct Step/Controller consumer, not a published-model job."
+      }
+    },
+    {
+      "argv": [
+        "/opt/homebrew/Cellar/zig/0.16.0/bin/zig",
+        "build",
+        "inference-test",
+        "-Dmetal=false",
+        "-Dcuda=false",
+        "-j1",
+        "--",
+        "--test-filter",
+        "boundary training limits",
+        "--test-filter",
+        "boundary training job regional numeric limits"
+      ],
+      "command_provenance": "Raw start/process receipts from the bounded wrapper.",
+      "cwd_at_execution": "/Users/timkaye/Documents/af/antfly/zig",
+      "environment": {
+        "ZIG_GLOBAL_CACHE_DIR": "/private/tmp/antfly-gliner25-zig-cache"
+      },
+      "exact_test_executable": null,
+      "exit_code": -15,
+      "failure": "Optional cmdline capture raised AccessDenied for a transient Apple compiler process. Product tests did not run. Known tracked creation identities were gone and the direct child was reaped, but cleanup inspection errors leave cleanup.complete false.",
+      "id": "limits_native_v1",
+      "passed": 0,
+      "receipts": {
+        "process.json": {
+          "path": "receipts/limits_native_v1/process.json",
+          "sha256": "b291a72394541c26e5eb450918386d1f83e9345c82c78f4d9c21b053eb410217",
+          "size_bytes": 6018
+        },
+        "source_inventory.json": {
+          "path": "receipts/limits_native_v1/source_inventory.json",
+          "sha256": "43acfc80a959c37e256c867835a9163716dcd9df78ce9ce19a64cf332de3b4b3",
+          "size_bytes": 425868
+        },
+        "start.json": {
+          "path": "receipts/limits_native_v1/start.json",
+          "sha256": "ab2e2c54c6c51a843f6d4fe9f979cc9499be6a8c2887009effe1f764d7ef8a73",
+          "size_bytes": 1060
+        },
+        "stderr.log": {
+          "path": "receipts/limits_native_v1/stderr.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0
+        },
+        "stdout.log": {
+          "path": "receipts/limits_native_v1/stdout.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0
+        }
+      },
+      "requested_tests_executed": false,
+      "scope": [
+        "No product validation result is inferred.",
+        "Source inventory reports 2,544 unchanged files; no later wrapper bytes are attributed to this run."
+      ],
+      "selected": 0,
+      "skipped": 0,
+      "status": "failed_optional_executable_observer_before_tests",
+      "wrapper": {
+        "path": "helpers/regional_wrapper_v1_reconstructed.py",
+        "sha256": "3a0eac638652fcd45318894019db3cd9e711783ae5ddb59a70efb6d2c40c87ff",
+        "size_bytes": 5910
+      },
+      "wrapper_provenance": "Reconstructed by removing only the later optional argv AccessDenied observer fields/handler; bytes match this failed run start.wrapper SHA256 exactly."
+    },
+    {
+      "argv": [
+        "/opt/homebrew/Cellar/zig/0.16.0/bin/zig",
+        "build",
+        "inference-test",
+        "-Dmetal=true",
+        "-Dcuda=false",
+        "-j1",
+        "--",
+        "--test-filter",
+        "resident regional composed step Metal",
+        "--test-filter",
+        "regional recomputation",
+        "--test-filter",
+        "boundary training limits",
+        "--test-filter",
+        "boundary training job regional numeric limits",
+        "--test-filter",
+        "boundary training step control composition",
+        "--test-filter",
+        "seeded gradient trainer binding control preserves",
+        "--test-filter",
+        "seeded gradient trainer resident Metal",
+        "--test-filter",
+        "seeded device transaction"
+      ],
+      "build": {
+        "backend_options": {
+          "cuda": false,
+          "metal": true,
+          "onnx": false,
+          "pjrt": false,
+          "system_blas": true
+        },
+        "compiler": "/opt/homebrew/Cellar/zig/0.16.0/bin/zig",
+        "host_architecture": "arm64",
+        "host_os": "Darwin",
+        "optimize": "Debug",
+        "parallel_build_jobs": 1,
+        "version": "0.16.0"
+      },
+      "cleanup": {
+        "complete": true,
+        "direct_child_reaped": true,
+        "elapsed_seconds": 9.304200648330152e-05,
+        "errors": [],
+        "grandchild_proof": "observed creation identities no longer exist; direct CLI parent is their normal waiter",
+        "inspection_errors": [],
+        "known_children_gone": true,
+        "survivors": []
+      },
+      "command_provenance": "Raw start/process receipts with a separate live-owned-process executable observation.",
+      "cwd_at_execution": "/Users/timkaye/Documents/af/antfly/zig",
+      "environment": {
+        "ZIG_GLOBAL_CACHE_DIR": "/private/tmp/antfly-gliner25-zig-cache"
+      },
+      "exact_test_executable": {
+        "path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/.zig-cache/o/7c3502932c6768be207394a4b97d0f64/test",
+        "sha256": "f366f03f65ec494a00c3f385d7c182b324f2b3957469d4f8d007ff82e8918b83",
+        "size_bytes": 52470600
+      },
+      "exact_test_executable_status": "Observed from the specific live owned test process with PID, creation time, argv and stat; executable copied and digest-verified into the private archive. Not inferred from a later cache entry.",
+      "exit_code": 0,
+      "failed": 0,
+      "id": "integration_metal_v1",
+      "leaks_reported": 0,
+      "measured": {
+        "benchmark": false,
+        "compile_and_test_elapsed_seconds": 602.3900690829905,
+        "rss_measurement": "sampled sum of RSS for still-matching known child creation identities; shared pages can be counted twice",
+        "sampled_child_tree_peak_rss_bytes": 2544402432
+      },
+      "passed": 43,
+      "private_archive": {
+        "limitations": "The complete recorded source tar and 52,470,600-byte executable are local archival artifacts, not replicated in this compact repository ledger.",
+        "path": "/private/tmp/antfly-gliner25-recomputed-integration-metal-v1-archive",
+        "receipt": {
+          "path": "receipts/integration_metal_v1/archive-receipt.json",
+          "sha256": "0222f9116c8cdc2387ece5902d67cb043f77f82061f07b07a0758f4f5ef0775b",
+          "size_bytes": 19185
+        }
+      },
+      "process_bounds": {
+        "kill_wait_seconds": 5,
+        "max_child_tree_rss_bytes": 6442450944,
+        "max_stderr_bytes": 8388608,
+        "max_stdout_bytes": 8388608,
+        "max_tracked_processes": 64,
+        "parent_grace_seconds": 5,
+        "rss_poll_seconds": 0.05,
+        "timeout_seconds": 1800,
+        "worker_parent_loss_grace_seconds": 2
+      },
+      "receipts": {
+        "archive-receipt.json": {
+          "path": "receipts/integration_metal_v1/archive-receipt.json",
+          "sha256": "0222f9116c8cdc2387ece5902d67cb043f77f82061f07b07a0758f4f5ef0775b",
+          "size_bytes": 19185
+        },
+        "live-test-executable.json": {
+          "path": "receipts/integration_metal_v1/live-test-executable.json",
+          "sha256": "fa9b32e534cebcf2bce57132ef55ab59d6d701e72b62e24404fa48e0cf7eef35",
+          "size_bytes": 1330
+        },
+        "process.json": {
+          "path": "receipts/integration_metal_v1/process.json",
+          "sha256": "99f59d187d397eadde36b5adf1109f87be7fc0c2b7dfaa1d2392059338a632f8",
+          "size_bytes": 7846
+        },
+        "source_inventory.json": {
+          "path": "receipts/integration_metal_v1/source_inventory.json",
+          "sha256": "92afed39f0fc80b88169c1f0d1dfd82cf8de4649e0ef38af634a11b814de56ea",
+          "size_bytes": 425868
+        },
+        "start.json": {
+          "path": "receipts/integration_metal_v1/start.json",
+          "sha256": "da6523019d9caca98febac03f62b943a2a199293cd2d4e852e06664a9fe6bcd2",
+          "size_bytes": 1446
+        },
+        "stderr.log": {
+          "path": "receipts/integration_metal_v1/stderr.log",
+          "sha256": "de2e7572851369d3cc9c5c859da651b9733462f8e72d4a411529e7dd1f3a53f1",
+          "size_bytes": 16718
+        },
+        "stdout.log": {
+          "path": "receipts/integration_metal_v1/stdout.log",
+          "sha256": "3459fccabd4b57aaca0e53c7a3da704caee13562a6d2854a5b3bf4a459753ae8",
+          "size_bytes": 203
+        }
+      },
+      "requested_tests_executed": true,
+      "runner_summary": "43 selected; 43 passed; 0 skipped. The /75 progress denominator is not the selected count.",
+      "scope": [
+        "Eight regional resident-Metal Step source cases: full, heads, LoRA and DoRA with zero dropout/replay_tiled_v1, plus all four with explicit 0.125 dropout/materialized_v1. Exact decisions and unchanged loss/gradient tolerances are checked. These Step consumers bind captured initial/post-update weights; they do not themselves execute resident optimizer updates.",
+        "Eight regional CPU Step source cases rerun at the existing tolerances with native AdamW updates and durable Controller resume.",
+        "Two tiny full/head-only NativeTrainer cases cover CPU and actual resident Metal, six microbatches/four updates per mode, cancellation/admission and fresh-owner partial resume.",
+        "The inactive NativeTrainer source consumer runs all 8 LoRA/DoRA profiles on CPU and all 8 on resident Metal using replay_tiled_v1+layer_recompute_v1. Classifier-only, encoder+classifier, record-only and relation-only cases compare source tokens/losses/VJPs/presence and actual native-owned optimizer updates and durable resume.",
+        "Seven numeric resource-wire tests, job mapping, optimizer ownership/control and actual-Metal pinned Torch transaction tests pass.",
+        "No published-model regional job, actual TTL model lifecycle, long-context execution, quality/performance campaign or release promotion is claimed."
+      ],
+      "selected": 43,
+      "skipped": 0,
+      "source_binding": "All 2,544 selected source bytes were verified against the recorded pre-build inventory before private archival. The durable named subset has 38 matching files. Neither selection claims external dependency closure.",
+      "source_inventory_files": 2544,
+      "source_inventory_unchanged": true,
+      "source_snapshot": "integration_metal_v1",
+      "status": "passed",
+      "supervisor": {
+        "path": "helpers/supervision.py",
+        "sha256": "a937237975be2ed879f62afd285494ccb51a7c1d7cc1dff7160621fb26b87332",
+        "size_bytes": 12474
+      },
+      "test_case_start_lines": [
+        "1/75 finetune.seeded_device_transaction_test.test.seeded device transaction admission rejects shapes identities limits and duplicate gradients before work...OK",
+        "2/75 finetune.seeded_device_transaction_test.test.seeded device transaction preserves absent versus zero partial windows and exact counters...OK",
+        "3/75 finetune.seeded_device_transaction_test.test.seeded device transaction failures after mutation and every dispatch preserve the old epoch...OK",
+        "4/75 finetune.seeded_device_transaction_test.test.seeded device transaction cancellation checks both controls and releases all private buffers...OK",
+        "5/75 finetune.seeded_device_transaction_test.test.seeded device transaction rejects foreign physical shapes nonfinite values and dirty absent accumulators...OK",
+        "6/75 finetune.seeded_device_transaction_test.test.seeded device transaction caps mutating batches and leaves all-absent slots untouched...OK",
+        "7/75 finetune.seeded_device_transaction_test.test.seeded device transaction contract matches pinned Torch groups clipping and partial flush...OK",
+        "8/75 finetune.seeded_device_transaction_test.test.seeded device transaction actual Metal matches pinned Torch with only scalar training readbacks...OK",
+        "9/75 finetune.gliner_boundary_encoder_graph.test.GLiNER2.5 regional recomputation planning retains boundaries and admits four attention sweeps...OK",
+        "10/75 finetune.seeded_gradient_trainer.test.seeded gradient trainer binding control preserves worker carrier both cancellation sources and earliest deadline...OK",
+        "11/75 finetune.seeded_gradient_trainer_device_test.test.seeded gradient trainer resident Metal matches pinned Torch AdamW and exact durable partial resume...OK",
+        "12/75 finetune.seeded_gradient_trainer_device_test.test.seeded gradient trainer resident Metal failures preserve authoritative epoch and mirror freshness...OK",
+        "13/75 finetune.gliner_boundary_native_trainer_test.test.boundary native trainer regional recomputation two layers full and heads preserve cancellation and exact partial resume...[default] (warn): GLiNER2.5 training allocation failed: phase=forward_backward domain=backend reason=declared_limit requested_bytes=8192 live_bytes=608 peak_bytes=608 limit_bytes=1",
+        "14/75 finetune.gliner_boundary_native_trainer_test.test.boundary native trainer regional recomputation resident Metal two layers full and heads preserve exact partial resume...[default] (warn): GLiNER2.5 training allocation failed: phase=forward_backward domain=backend reason=declared_limit requested_bytes=576 live_bytes=666248 peak_bytes=666248 limit_bytes=1",
+        "15/75 finetune.gliner_boundary_inactive_native_oracle_test.test.boundary inactive NativeTrainer regional recomputation CPU source fallback VJPs optimizer and durable resume...[default] (warn): GLiNER2.5 training allocation failed: phase=batch_preparation domain=host reason=declared_limit requested_bytes=84 live_bytes=0 peak_bytes=0 limit_bytes=1",
+        "16/75 finetune.gliner_boundary_inactive_native_oracle_test.test.boundary inactive NativeTrainer regional recomputation Metal source fallback VJPs optimizer and durable resume...[default] (warn): GLiNER2.5 training allocation failed: phase=batch_preparation domain=host reason=declared_limit requested_bytes=84 live_bytes=0 peak_bytes=0 limit_bytes=1",
+        "17/75 finetune.gliner_boundary_training_limits.test.boundary training limits preserve defaults and only map numeric resources...OK",
+        "18/75 finetune.gliner_boundary_training_limits.test.boundary training limits bound every numeric field and reject unsupported versions...OK",
+        "19/75 finetune.gliner_boundary_training_limits.test.boundary training limits JSON rejects unknown noninteger negative and overflow values...OK",
+        "20/75 finetune.gliner_boundary_training_limits.test.boundary training limits parser cleans every allocation failure...OK",
+        "21/75 finetune.gliner_boundary_training_limits.test.boundary training limits regional groups map exact integers and unwind every parse allocation failure...OK",
+        "22/75 finetune.gliner_boundary_training_limits.test.boundary training limits regional JSON rejects invalid types bounds and integer overflow...OK",
+        "23/75 finetune.gliner_boundary_training_limits.test.boundary training limits omitted regional fields preserve the version one native defaults...OK",
+        "24/75 finetune.gliner_boundary_training_job_test.test.boundary training job regional numeric limits preserve semantics and enclosing admission...OK",
+        "25/75 finetune.seeded_device_transaction.test.seeded device transaction work admission covers tensor gradients partial flush and reduction tails without dispatch...OK",
+        "26/75 finetune.seeded_device_transaction.test.seeded device transaction work admission rejects integer overflow...OK",
+        "27/75 finetune.seeded_device_transaction.test.seeded device transaction control preserves worker carrier both cancellation sources and earliest deadline...OK",
+        "28/75 finetune.gliner_boundary_train_step_oracle_test.test.boundary training step regional recomputation pinned full objectives gradients durable resume and AdamW...OK",
+        "29/75 finetune.gliner_boundary_train_step_oracle_test.test.boundary training step regional recomputation pinned heads objectives gradients durable resume and AdamW...OK",
+        "30/75 finetune.gliner_boundary_train_step_oracle_test.test.boundary training step regional recomputation pinned LoRA objectives gradients durable resume and AdamW...OK",
+        "31/75 finetune.gliner_boundary_train_step_oracle_test.test.boundary training step regional recomputation pinned DoRA objectives gradients durable resume and AdamW...OK",
+        "32/75 finetune.gliner_boundary_train_step_oracle_test.test.boundary training step regional recomputation controlled dropout full objectives gradients durable resume and AdamW...OK",
+        "33/75 finetune.gliner_boundary_train_step_oracle_test.test.boundary training step regional recomputation controlled dropout heads objectives gradients durable resume and AdamW...OK",
+        "34/75 finetune.gliner_boundary_train_step_oracle_test.test.boundary training step regional recomputation controlled dropout LoRA objectives gradients durable resume and AdamW...OK",
+        "35/75 finetune.gliner_boundary_train_step_oracle_test.test.boundary training step regional recomputation controlled dropout DoRA objectives gradients durable resume and AdamW...OK",
+        "36/75 finetune.gliner_boundary_train_step_device_test.test.resident regional composed step Metal replay tiled full pinned losses gradients and single head decisions...resident composed training_step/full micro0: parameter_upload=64080 step_upload=34676 proposal_logits=7176 proposal_features=2304 loss_logits=15288 finite_control=228 attention=replay_tiled_v1 activation=layer_recompute_v1",
+        "37/75 finetune.gliner_boundary_train_step_device_test.test.resident regional composed step Metal replay tiled heads pinned losses gradients and single head decisions...resident composed training_step/heads micro0: parameter_upload=64080 step_upload=34676 proposal_logits=7176 proposal_features=2304 loss_logits=15288 finite_control=180 attention=replay_tiled_v1 activation=layer_recompute_v1",
+        "38/75 finetune.gliner_boundary_train_step_device_test.test.resident regional composed step Metal replay tiled LoRA pinned losses gradients and single head decisions...resident composed training_step/lora micro0: parameter_upload=67664 step_upload=34676 proposal_logits=7176 proposal_features=2304 loss_logits=15288 finite_control=204 attention=replay_tiled_v1 activation=layer_recompute_v1",
+        "39/75 finetune.gliner_boundary_train_step_device_test.test.resident regional composed step Metal replay tiled DoRA pinned losses gradients and single head decisions...resident composed training_step/dora micro0: parameter_upload=68560 step_upload=34676 proposal_logits=7176 proposal_features=2304 loss_logits=15288 finite_control=204 attention=replay_tiled_v1 activation=layer_recompute_v1",
+        "40/75 finetune.gliner_boundary_train_step_device_test.test.resident regional composed step Metal controlled dropout full pinned gradients and single head decisions...resident composed training_step_dropout/full micro0: parameter_upload=64080 step_upload=2557600 proposal_logits=7176 proposal_features=2304 loss_logits=15288 finite_control=228 attention=materialized_v1 activation=layer_recompute_v1",
+        "41/75 finetune.gliner_boundary_train_step_device_test.test.resident regional composed step Metal controlled dropout heads pinned gradients and single head decisions...resident composed training_step_dropout/heads micro0: parameter_upload=64080 step_upload=1737888 proposal_logits=7176 proposal_features=2304 loss_logits=15288 finite_control=180 attention=materialized_v1 activation=layer_recompute_v1",
+        "42/75 finetune.gliner_boundary_train_step_device_test.test.resident regional composed step Metal controlled dropout LoRA pinned gradients and single head decisions...resident composed training_step_dropout/lora micro0: parameter_upload=67664 step_upload=2947232 proposal_logits=7176 proposal_features=2304 loss_logits=15288 finite_control=204 attention=materialized_v1 activation=layer_recompute_v1",
+        "43/75 finetune.gliner_boundary_train_step_device_test.test.resident regional composed step Metal controlled dropout DoRA pinned gradients and single head decisions...resident composed training_step_dropout/dora micro0: parameter_upload=68560 step_upload=2947232 proposal_logits=7176 proposal_features=2304 loss_logits=15288 finite_control=204 attention=materialized_v1 activation=layer_recompute_v1"
+      ],
+      "wrapper": {
+        "path": "helpers/regional_wrapper_v2.py",
+        "sha256": "6316537500ec72a9366255278e333d8c24ca160b9233134f8c077c8b862cb590",
+        "size_bytes": 6458
+      }
+    }
+  ],
+  "format_version": 1,
+  "kind": "gliner25_regional_training_local_execution",
+  "pending": {
+    "changes": [
+      "Step recomputation aggregate max_host_bytes default raised from 1 GiB to 6 GiB; generic graph core remains 1 GiB.",
+      "NativeTrainer caller scratch default raised from 256 MiB to 512 MiB; explicit tiny test cap remains 16 MiB.",
+      "Version-1 training_limits adds caller scratch plus step.recomputation and step.replay numeric mappings."
+    ],
+    "execution": "integration_metal_v1",
+    "id": "post_integration_native_v3",
+    "scope": "Corrects new opt-in resource defaults/wiring only; enclosing host/backend/combined admission and retained-path defaults are unchanged.",
+    "source_capture": "integration_metal_v1",
+    "status": "validated_by_integration_metal_v1"
+  },
+  "related_evidence": {
+    "attention": "../training_attention_execution_v1/manifest.json",
+    "contract": "../../../../../../docs/GLINER25_RECOMPUTED_TRAINING.md"
+  },
+  "runtime_available": false,
+  "scope_notes": [
+    "Results belong to each named checkpoint; overlapping tests are not added together.",
+    "Auxiliary build-step test counts inside failed compilation logs are not requested-suite success.",
+    "Synthetic/tiny fixture tensors only; pinned source fixtures qualify the eight regional CPU comparisons in integration v3, and no published checkpoint was loaded.",
+    "The native integration fixture uses hidden width 4, two encoder layers, batch size 2, five authored rows, two epochs, accumulation 2 and zero dropout.",
+    "Later watchdog-carrier and aggregate caller-scratch/flush admission changes are not attributed retroactively to integration v2.",
+    "Integration Metal v1 resolves actual tiny regional Metal execution and numeric-wire validation. It does not replace historical native receipts or grant their later source/executable identity."
+  ],
+  "source_fixtures": [
+    {
+      "directory": "zig/pkg/inference/testdata/gliner25/training_step",
+      "files": [
+        {
+          "sha256": "b408c21f99c08b55b5d2148025ad19c47c09803628f1551a26028a59c312a59b",
+          "size_bytes": 1989406,
+          "source_path": "zig/pkg/inference/testdata/gliner25/training_step/capture.json"
+        },
+        {
+          "sha256": "407c25d629f1fe2752d3ed3f73045cc972b00c09753856d70f011d777d5271db",
+          "size_bytes": 2685776,
+          "source_path": "zig/pkg/inference/testdata/gliner25/training_step/tensors.safetensors"
+        },
+        {
+          "sha256": "ee7f0d2f277c34191fe76227371cc95d7b55e0f7a10f1a153eec36b5d5865cc8",
+          "size_bytes": 6561,
+          "source_path": "zig/pkg/inference/testdata/gliner25/training_step/tokenizer.json"
+        },
+        {
+          "sha256": "2ea7f1b38011a9f3f7b4c895bd876160e8672cfe62f26d8303fa875e3eaa5f80",
+          "size_bytes": 588,
+          "source_path": "zig/pkg/inference/testdata/gliner25/training_step/tokenizer_config.json"
+        }
+      ],
+      "scope": "synthetic_zero_dropout_mixed_task_training_step",
+      "source_commit": "3c913c7369301133d3b7699252074c4303ada50e"
+    },
+    {
+      "directory": "zig/pkg/inference/testdata/gliner25/training_step_dropout",
+      "files": [
+        {
+          "sha256": "5b2ce5ceee254002bea98bdf63024395be14cb53328d6d6d89bbb7e9d43d43e7",
+          "size_bytes": 2574918,
+          "source_path": "zig/pkg/inference/testdata/gliner25/training_step_dropout/capture.json"
+        },
+        {
+          "sha256": "bbc1c28c5fd7ba0925068a6063492ece2392800fe031e61060ae360eb998da60",
+          "size_bytes": 7684320,
+          "source_path": "zig/pkg/inference/testdata/gliner25/training_step_dropout/tensors.safetensors"
+        },
+        {
+          "sha256": "ee7f0d2f277c34191fe76227371cc95d7b55e0f7a10f1a153eec36b5d5865cc8",
+          "size_bytes": 6561,
+          "source_path": "zig/pkg/inference/testdata/gliner25/training_step_dropout/tokenizer.json"
+        },
+        {
+          "sha256": "2ea7f1b38011a9f3f7b4c895bd876160e8672cfe62f26d8303fa875e3eaa5f80",
+          "size_bytes": 588,
+          "source_path": "zig/pkg/inference/testdata/gliner25/training_step_dropout/tokenizer_config.json"
+        }
+      ],
+      "scope": "synthetic_explicit_dropout_mixed_task_training_step",
+      "source_commit": "3c913c7369301133d3b7699252074c4303ada50e"
+    },
+    {
+      "directory": "zig/pkg/inference/testdata/gliner25/training_inactive_native_epoch",
+      "execution_pin_contract": "Native consumer checks fixed SHA256 values for capture/tensors/settings/each JSONL/tokenizer before execution.",
+      "files": [
+        {
+          "sha256": "9947cc37d6adc8b209c7769b2cd61f239738c3583646747444e655bb1afa44f1",
+          "size_bytes": 867431,
+          "source_path": "zig/pkg/inference/testdata/gliner25/training_inactive_native_epoch/capture.json"
+        },
+        {
+          "sha256": "377177ee889c4e426eeeccc4dc551437999aa702b8a5055c233aaee8936c54c7",
+          "size_bytes": 1122,
+          "source_path": "zig/pkg/inference/testdata/gliner25/training_inactive_native_epoch/classifier_only.jsonl"
+        },
+        {
+          "sha256": "9bdaab9a4f11555e50ec40ec02b068a086754b57c30d6fe0c0cb4a66c6e53f3e",
+          "size_bytes": 480,
+          "source_path": "zig/pkg/inference/testdata/gliner25/training_inactive_native_epoch/encoder_classifier.jsonl"
+        },
+        {
+          "sha256": "0c041c7f9123e507cebc7d85860b03380a7f413a54427c1bcc068c9241443fd6",
+          "size_bytes": 1394,
+          "source_path": "zig/pkg/inference/testdata/gliner25/training_inactive_native_epoch/native_settings.json"
+        },
+        {
+          "sha256": "81243bcde2488b7560b15c1d5bd29efa2f963a1f707792b6b6681387bfdaa37d",
+          "size_bytes": 171,
+          "source_path": "zig/pkg/inference/testdata/gliner25/training_inactive_native_epoch/record_only.jsonl"
+        },
+        {
+          "sha256": "629d2d22484654cb41e169bf744b019229109dcfd5d4869907140a0034d36a4f",
+          "size_bytes": 173,
+          "source_path": "zig/pkg/inference/testdata/gliner25/training_inactive_native_epoch/relation_only.jsonl"
+        },
+        {
+          "sha256": "374658ee67127b2f81ec597a65eabe72ee52263d88a718ebf4ef7e9b246741e9",
+          "size_bytes": 591162,
+          "source_path": "zig/pkg/inference/testdata/gliner25/training_inactive_native_epoch/tensors.safetensors"
+        }
+      ],
+      "scope": "gliner25_inactive_adapter_native_epoch/v1",
+      "source_commit": "3c913c7369301133d3b7699252074c4303ada50e",
+      "tokenizer": "Uses the separately pinned training_step tokenizer/config files already listed above."
+    }
+  ],
+  "source_snapshots": [
+    {
+      "captured_at_utc": "2026-09-10T17:46:51.924767+00:00",
+      "execution": "integration_native_v3",
+      "file_count": 30,
+      "files": [
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/graph/recomputed_training.zig",
+          "sha256": "b9298282921d18872bcf331341ed7b7e373f98826650cc148769064c13b0948b",
+          "size_bytes": 62599,
+          "source_path": "zig/pkg/inference/src/graph/recomputed_training.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/graph/recomputed_training_test.zig",
+          "sha256": "66f756c3e86f49ff5c2dc0dcefcb2948c53b0f9bae996237d0ae08425c2bd100",
+          "size_bytes": 26777,
+          "source_path": "zig/pkg/inference/src/graph/recomputed_training_test.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/finetune/gliner_boundary_recomputed_graph.zig",
+          "sha256": "848bee63a476c68784f2a0f110c196e6bee27956c6341732f72de15a48171fdf",
+          "size_bytes": 11689,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_recomputed_graph.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/finetune/gliner_boundary_recomputed_admission.zig",
+          "sha256": "f68d0f633eccd5bb6992a8411b3c0d5b236fa114088ff643e1a1e3a27df45290",
+          "size_bytes": 13590,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_recomputed_admission.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/finetune/gliner_boundary_recomputed_execution.zig",
+          "sha256": "28ae818b056927878139ea12a82423103a8ffcd224a22e13caa08b58d5b54a95",
+          "size_bytes": 32833,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_recomputed_execution.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/finetune/gliner_boundary_replay_bindings.zig",
+          "sha256": "2856ccce6669c6204235e35510f137f23e4f668d92ec17a750205b97adbecc49",
+          "size_bytes": 40027,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_replay_bindings.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/architectures/deberta_graph.zig",
+          "sha256": "11edcfb00d4bd2a1dc205a1830047a145c617f27827fe916ec6b12a20c79824d",
+          "size_bytes": 56652,
+          "source_path": "zig/pkg/inference/src/architectures/deberta_graph.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/finetune/gliner_boundary_encoder_graph.zig",
+          "sha256": "02652dfaa8b84366081077de24554128c682693cb87274e8b6a6ffbe8546ac94",
+          "size_bytes": 51576,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_encoder_graph.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/finetune/gliner_boundary_encoder_graph_test.zig",
+          "sha256": "73a05f8ff61a4f49e50e0e3091e53d211052ec79fdb99f8645528049f1e8af10",
+          "size_bytes": 18678,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_encoder_graph_test.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/finetune/gliner_boundary_train_step.zig",
+          "sha256": "d0bbc1a15cc5229f8cd96c2204ab0e7656e00188c2238728fa4d0d54ef3da655",
+          "size_bytes": 113774,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_train_step.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/finetune/gliner_boundary_train_step_test.zig",
+          "sha256": "49d69280e621a3c605589b10ab7927b7f0a23856daf46d8eee0bf047cb2a887a",
+          "size_bytes": 18761,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_train_step_test.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/finetune/gliner_boundary_train_step_oracle_test.zig",
+          "sha256": "358057d9358da32b0ac4637fce3f4813689931913fbd480f0abb23aa82283605",
+          "size_bytes": 38127,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_train_step_oracle_test.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/finetune/gliner_boundary_train_step_device_test.zig",
+          "sha256": "547d83faa2fabf1a2891fe5debb900433f0ca9c9a935921a0bd34f7e3f8a9e30",
+          "size_bytes": 25211,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_train_step_device_test.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/finetune/gliner_boundary_native_trainer.zig",
+          "sha256": "7016e992cf38de49114333d66fe7ab9531ecc602a080a8a0d800ebb4b0f5696e",
+          "size_bytes": 51999,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_native_trainer.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/finetune/gliner_boundary_native_trainer_test.zig",
+          "sha256": "9df660dfa54a4dd13f1ac086a7c13f48dbe1e1be0247cefe7aca41ec14ba5773",
+          "size_bytes": 34625,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_native_trainer_test.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/finetune/gliner_boundary_training_backend.zig",
+          "sha256": "470f0ff821d1a1f16a9548259e870a7b7d3b3229e188e68803068e37979bf416",
+          "size_bytes": 18012,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_training_backend.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/finetune/gliner_boundary_training_backend_test.zig",
+          "sha256": "fe89947e66ea3e001fff805b467720896726aa3950b16478f6336b1f3764a2f4",
+          "size_bytes": 13863,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_training_backend_test.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/finetune/gliner_boundary_training_job.zig",
+          "sha256": "8c736fb226ac22e7740df9d1032279c8109130dfd1b6b069ad3d9d3afa0bc1e2",
+          "size_bytes": 38975,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_training_job.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/finetune/gliner_boundary_training_job_test.zig",
+          "sha256": "16869c33cd89ef3af65977b025ea3eacd6d46a062ca9f8c44e31f0e50c0daabe",
+          "size_bytes": 8004,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_training_job_test.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/finetune/gliner_boundary_training_limits.zig",
+          "sha256": "17e1b633d749c6d08696708c568622b45f86c667393d30af8487df78b1f58c67",
+          "size_bytes": 14798,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_training_limits.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/finetune/seeded_gradient_trainer.zig",
+          "sha256": "4b5ea8a7375c852014e74c66a20c8d3b487f8f3260b228e755cd71996386edd6",
+          "size_bytes": 83283,
+          "source_path": "zig/pkg/inference/src/finetune/seeded_gradient_trainer.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/finetune/seeded_gradient_trainer_device_test.zig",
+          "sha256": "b3a7410015606546ed99d75e30ba9531d9c10d1af39ba9169e1dd0645d585350",
+          "size_bytes": 18876,
+          "source_path": "zig/pkg/inference/src/finetune/seeded_gradient_trainer_device_test.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/finetune/seeded_device_transaction.zig",
+          "sha256": "cb5786f5a22009c81bcb2f82c2ed1ed6931c8ded84998ac230ff46d310bfc8ae",
+          "size_bytes": 38573,
+          "source_path": "zig/pkg/inference/src/finetune/seeded_device_transaction.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/finetune/seeded_device_transaction_test.zig",
+          "sha256": "2b472dbbe9ec8b17482666711d74d40a815a44d35fb70b8d3346c9de2a302ad3",
+          "size_bytes": 31235,
+          "source_path": "zig/pkg/inference/src/finetune/seeded_device_transaction_test.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/inference.zig",
+          "sha256": "f7575375f1ff81961295a9d80fe9677c0e1d3a91eb8221d61d67b776182f3184",
+          "size_bytes": 14188,
+          "source_path": "zig/pkg/inference/src/inference.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/inference_internal.zig",
+          "sha256": "11e5d16ba8d2ad38ed51724756285a2da826167ac2322e81eb70e83d9ff084db",
+          "size_bytes": 8211,
+          "source_path": "zig/pkg/inference/src/inference_internal.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/finetune/root.zig",
+          "sha256": "8d8a092c8e9115b23955d49a6ec90c960613eca50ce96fc9877555d51645c142",
+          "size_bytes": 7715,
+          "source_path": "zig/pkg/inference/src/finetune/root.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/graph/root.zig",
+          "sha256": "89de50a197e87060b740bff5f175e404f8edb8449b8bfa44a086dbd45cb7d294",
+          "size_bytes": 8401,
+          "source_path": "zig/pkg/inference/src/graph/root.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/server/model_manager.zig",
+          "sha256": "7df3bb3ee3ef69beca77de144a86e8e9fa675317ae65c812195c8a236b08ca2e",
+          "size_bytes": 498104,
+          "source_path": "zig/pkg/inference/src/server/model_manager.zig"
+        },
+        {
+          "path": "source_snapshots/integration_native_v3/zig/pkg/inference/src/server/gliner_boundary_cache_lifecycle_test.zig",
+          "sha256": "dca1e118a609e21300dbba66da41aa65d139914a38dd5c09acf5cad3e3c3a756",
+          "size_bytes": 17368,
+          "source_path": "zig/pkg/inference/src/server/gliner_boundary_cache_lifecycle_test.zig"
+        }
+      ],
+      "freeze_provenance": "Root source-freeze message for integration native v3; capture was read-only with respect to all original files while its serial compile began.",
+      "historical_binding": "Applies only to integration native v3; none of these current-source hashes is attributed retroactively to the earlier core/integration checkpoints.",
+      "id": "integration_native_v3",
+      "scope": "Exact named regional/head/merge/recipe/encoder/Step/Trainer/Job/optimizer/transaction implementations and tests, inference import roots and private TTL bridge/test. This is a partial relevant-source archive, not the entire build dependency closure. The TTL test is reserved for a separate future actual Metal run.",
+      "status": "captured_frozen_source_execution_completed",
+      "total_bytes": 1416524
+    },
+    {
+      "captured_at_utc": "2026-09-10T18:27:54.166383+00:00",
+      "execution": "integration_metal_v1",
+      "file_count": 38,
+      "files": [
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/graph/recomputed_training.zig",
+          "sha256": "b9298282921d18872bcf331341ed7b7e373f98826650cc148769064c13b0948b",
+          "size_bytes": 62599,
+          "source_path": "zig/pkg/inference/src/graph/recomputed_training.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/graph/recomputed_training_test.zig",
+          "sha256": "66f756c3e86f49ff5c2dc0dcefcb2948c53b0f9bae996237d0ae08425c2bd100",
+          "size_bytes": 26777,
+          "source_path": "zig/pkg/inference/src/graph/recomputed_training_test.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/gliner_boundary_recomputed_graph.zig",
+          "sha256": "848bee63a476c68784f2a0f110c196e6bee27956c6341732f72de15a48171fdf",
+          "size_bytes": 11689,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_recomputed_graph.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/gliner_boundary_recomputed_admission.zig",
+          "sha256": "f68d0f633eccd5bb6992a8411b3c0d5b236fa114088ff643e1a1e3a27df45290",
+          "size_bytes": 13590,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_recomputed_admission.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/gliner_boundary_recomputed_execution.zig",
+          "sha256": "28ae818b056927878139ea12a82423103a8ffcd224a22e13caa08b58d5b54a95",
+          "size_bytes": 32833,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_recomputed_execution.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/gliner_boundary_replay_bindings.zig",
+          "sha256": "2856ccce6669c6204235e35510f137f23e4f668d92ec17a750205b97adbecc49",
+          "size_bytes": 40027,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_replay_bindings.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/architectures/deberta_graph.zig",
+          "sha256": "11edcfb00d4bd2a1dc205a1830047a145c617f27827fe916ec6b12a20c79824d",
+          "size_bytes": 56652,
+          "source_path": "zig/pkg/inference/src/architectures/deberta_graph.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/gliner_boundary_encoder_graph.zig",
+          "sha256": "02652dfaa8b84366081077de24554128c682693cb87274e8b6a6ffbe8546ac94",
+          "size_bytes": 51576,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_encoder_graph.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/gliner_boundary_encoder_graph_test.zig",
+          "sha256": "73a05f8ff61a4f49e50e0e3091e53d211052ec79fdb99f8645528049f1e8af10",
+          "size_bytes": 18678,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_encoder_graph_test.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/gliner_boundary_train_step.zig",
+          "sha256": "51a4f9b7bdf31c4127ad079f6c705dda6a5aaf63228f0666f8c3a190cd298d04",
+          "size_bytes": 114045,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_train_step.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/gliner_boundary_train_step_test.zig",
+          "sha256": "49d69280e621a3c605589b10ab7927b7f0a23856daf46d8eee0bf047cb2a887a",
+          "size_bytes": 18761,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_train_step_test.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/gliner_boundary_train_step_oracle_test.zig",
+          "sha256": "358057d9358da32b0ac4637fce3f4813689931913fbd480f0abb23aa82283605",
+          "size_bytes": 38127,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_train_step_oracle_test.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/gliner_boundary_train_step_device_test.zig",
+          "sha256": "b2b12d7c9cefedd6afb64bac01a5d9a6a0f7aeee63bc606d69e2c321fc143377",
+          "size_bytes": 36797,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_train_step_device_test.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/gliner_boundary_native_trainer.zig",
+          "sha256": "7a9cf27a7d2ea10f3585ec705b58e88ce588320ca6968e06e47cae49a478d97b",
+          "size_bytes": 51999,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_native_trainer.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/gliner_boundary_native_trainer_test.zig",
+          "sha256": "9df660dfa54a4dd13f1ac086a7c13f48dbe1e1be0247cefe7aca41ec14ba5773",
+          "size_bytes": 34625,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_native_trainer_test.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/gliner_boundary_training_backend.zig",
+          "sha256": "470f0ff821d1a1f16a9548259e870a7b7d3b3229e188e68803068e37979bf416",
+          "size_bytes": 18012,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_training_backend.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/gliner_boundary_training_backend_test.zig",
+          "sha256": "fe89947e66ea3e001fff805b467720896726aa3950b16478f6336b1f3764a2f4",
+          "size_bytes": 13863,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_training_backend_test.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/gliner_boundary_training_job.zig",
+          "sha256": "8c736fb226ac22e7740df9d1032279c8109130dfd1b6b069ad3d9d3afa0bc1e2",
+          "size_bytes": 38975,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_training_job.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/gliner_boundary_training_job_test.zig",
+          "sha256": "fa85caf79d71accb8eeb39df01611e7e28473e0d30581ac5399c1c2028137dea",
+          "size_bytes": 10913,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_training_job_test.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/gliner_boundary_training_limits.zig",
+          "sha256": "2ad63bf41ecd4e07ab099436cc1623c1187c030437388197030f23327f2f254e",
+          "size_bytes": 21571,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_training_limits.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/seeded_gradient_trainer.zig",
+          "sha256": "4b5ea8a7375c852014e74c66a20c8d3b487f8f3260b228e755cd71996386edd6",
+          "size_bytes": 83283,
+          "source_path": "zig/pkg/inference/src/finetune/seeded_gradient_trainer.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/seeded_gradient_trainer_device_test.zig",
+          "sha256": "b3a7410015606546ed99d75e30ba9531d9c10d1af39ba9169e1dd0645d585350",
+          "size_bytes": 18876,
+          "source_path": "zig/pkg/inference/src/finetune/seeded_gradient_trainer_device_test.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/seeded_device_transaction.zig",
+          "sha256": "cb5786f5a22009c81bcb2f82c2ed1ed6931c8ded84998ac230ff46d310bfc8ae",
+          "size_bytes": 38573,
+          "source_path": "zig/pkg/inference/src/finetune/seeded_device_transaction.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/seeded_device_transaction_test.zig",
+          "sha256": "2b472dbbe9ec8b17482666711d74d40a815a44d35fb70b8d3346c9de2a302ad3",
+          "size_bytes": 31235,
+          "source_path": "zig/pkg/inference/src/finetune/seeded_device_transaction_test.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/inference.zig",
+          "sha256": "f7575375f1ff81961295a9d80fe9677c0e1d3a91eb8221d61d67b776182f3184",
+          "size_bytes": 14188,
+          "source_path": "zig/pkg/inference/src/inference.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/inference_internal.zig",
+          "sha256": "11e5d16ba8d2ad38ed51724756285a2da826167ac2322e81eb70e83d9ff084db",
+          "size_bytes": 8211,
+          "source_path": "zig/pkg/inference/src/inference_internal.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/root.zig",
+          "sha256": "8d8a092c8e9115b23955d49a6ec90c960613eca50ce96fc9877555d51645c142",
+          "size_bytes": 7715,
+          "source_path": "zig/pkg/inference/src/finetune/root.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/graph/root.zig",
+          "sha256": "89de50a197e87060b740bff5f175e404f8edb8449b8bfa44a086dbd45cb7d294",
+          "size_bytes": 8401,
+          "source_path": "zig/pkg/inference/src/graph/root.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/server/model_manager.zig",
+          "sha256": "7df3bb3ee3ef69beca77de144a86e8e9fa675317ae65c812195c8a236b08ca2e",
+          "size_bytes": 498104,
+          "source_path": "zig/pkg/inference/src/server/model_manager.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/server/gliner_boundary_cache_lifecycle_test.zig",
+          "sha256": "dca1e118a609e21300dbba66da41aa65d139914a38dd5c09acf5cad3e3c3a756",
+          "size_bytes": 17368,
+          "source_path": "zig/pkg/inference/src/server/gliner_boundary_cache_lifecycle_test.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/gliner_boundary_inactive_native_oracle_test.zig",
+          "sha256": "dfb4ee8556e2f79d94278ed2e97517713d7d039491fe32df5e03ea756048db30",
+          "size_bytes": 30524,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_inactive_native_oracle_test.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/finetune/gliner_boundary_synthetic_adapter_fixture.zig",
+          "sha256": "425542d362a40d095c2d0b07c59dc40cf26f02f1571c04030284424e8a2a3107",
+          "size_bytes": 16285,
+          "source_path": "zig/pkg/inference/src/finetune/gliner_boundary_synthetic_adapter_fixture.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/execution_control.zig",
+          "sha256": "f9ceadafddc97d56667f8dea0f263bc516a9d3b5e56584ec21ba05baee2fe89a",
+          "size_bytes": 8805,
+          "source_path": "zig/pkg/inference/src/execution_control.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/backends/metal_kernels.m",
+          "sha256": "cc09bd01701be5bd1b1451d4ac76ff63430f12e36629871a8592bfa3cb5d55e5",
+          "size_bytes": 4043164,
+          "source_path": "zig/pkg/inference/src/backends/metal_kernels.m"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/backends/metal_runtime.zig",
+          "sha256": "a8b7db6080ed4d66cc4450943a2d92ad4c19cf15855e8f082200bb4612c63de3",
+          "size_bytes": 1854761,
+          "source_path": "zig/pkg/inference/src/backends/metal_runtime.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/backends/metal_tensor.zig",
+          "sha256": "b113d47f8d7b3b3b0858916a65e140cb7a3bebc56d08936b34201c49ce904fb4",
+          "size_bytes": 45151,
+          "source_path": "zig/pkg/inference/src/backends/metal_tensor.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/ops/metal_compute.zig",
+          "sha256": "f592fcfb38b868cac47dab19abe2847c5ca0f2c4f713ce70f49b8ebc2b1f0c96",
+          "size_bytes": 1739509,
+          "source_path": "zig/pkg/inference/src/ops/metal_compute.zig"
+        },
+        {
+          "path": "source_snapshots/integration_metal_v1/zig/pkg/inference/src/ops/resident_training_ops.zig",
+          "sha256": "7e19858d3886ab7bf0fd7aebd716a8dabb9bf1f65d8d46be73237db86d59d4e4",
+          "size_bytes": 4882,
+          "source_path": "zig/pkg/inference/src/ops/resident_training_ops.zig"
+        }
+      ],
+      "scope": "Named relevant source subset; each file exactly matches the run source inventory. Full recorded selection is separately archived under /private/tmp, and neither is a complete external dependency closure.",
+      "total_bytes": 9181144
+    }
+  ],
+  "updated_at_utc": "2026-09-10T18:30:59.852485+00:00"
+}

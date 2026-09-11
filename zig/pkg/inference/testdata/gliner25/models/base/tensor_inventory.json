@@ -1,0 +1,2230 @@
+{
+  "format_version": 1,
+  "model": "base",
+  "provenance": {
+    "checkout": "/private/tmp/antfly-gliner25-upstream",
+    "commit": "3c913c7369301133d3b7699252074c4303ada50e",
+    "device": "cpu",
+    "dtype": "float32",
+    "imports": {
+      "gliner2": "/private/tmp/antfly-gliner25-upstream/gliner2/__init__.py",
+      "gliner2.api_client": "/private/tmp/antfly-gliner25-upstream/gliner2/api_client.py",
+      "gliner2.auto": "/private/tmp/antfly-gliner25-upstream/gliner2/auto.py",
+      "gliner2.configuration": "/private/tmp/antfly-gliner25-upstream/gliner2/configuration.py",
+      "gliner2.inference": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/__init__.py",
+      "gliner2.inference.candidate_decoder": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/candidate_decoder.py",
+      "gliner2.inference.chunking": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/chunking.py",
+      "gliner2.inference.engine": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/engine.py",
+      "gliner2.inference.overlap": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/overlap.py",
+      "gliner2.inference.runtime": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/runtime.py",
+      "gliner2.inference.schema": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/schema.py",
+      "gliner2.inference.schema_model": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/schema_model.py",
+      "gliner2.layers": "/private/tmp/antfly-gliner25-upstream/gliner2/layers.py",
+      "gliner2.models": "/private/tmp/antfly-gliner25-upstream/gliner2/models/__init__.py",
+      "gliner2.models.base": "/private/tmp/antfly-gliner25-upstream/gliner2/models/base.py",
+      "gliner2.models.boundary": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/__init__.py",
+      "gliner2.models.boundary.constants": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/constants.py",
+      "gliner2.models.boundary.content": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/content.py",
+      "gliner2.models.boundary.encoding": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/encoding.py",
+      "gliner2.models.boundary.engine": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/engine.py",
+      "gliner2.models.boundary.heads": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/heads.py",
+      "gliner2.models.boundary.indexing": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/indexing.py",
+      "gliner2.models.boundary.losses": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/losses.py",
+      "gliner2.models.boundary.model": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/model.py",
+      "gliner2.models.boundary.pool": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/pool.py",
+      "gliner2.models.boundary.proposal": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/proposal.py",
+      "gliner2.models.boundary.records": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/records.py",
+      "gliner2.models.boundary.relations": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/relations.py",
+      "gliner2.models.boundary.rotary": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/rotary.py",
+      "gliner2.models.boundary.scoring": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/scoring.py",
+      "gliner2.models.boundary.targets_device": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/targets_device.py",
+      "gliner2.models.boundary.validation": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/validation.py",
+      "gliner2.models.candidates": "/private/tmp/antfly-gliner25-upstream/gliner2/models/candidates.py",
+      "gliner2.models.loading": "/private/tmp/antfly-gliner25-upstream/gliner2/models/loading.py",
+      "gliner2.models.outputs": "/private/tmp/antfly-gliner25-upstream/gliner2/models/outputs.py",
+      "gliner2.models.span": "/private/tmp/antfly-gliner25-upstream/gliner2/models/span/__init__.py",
+      "gliner2.models.span.model": "/private/tmp/antfly-gliner25-upstream/gliner2/models/span/model.py",
+      "gliner2.processing": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/__init__.py",
+      "gliner2.processing.layouts": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/layouts.py",
+      "gliner2.processing.records": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/records.py",
+      "gliner2.processing.targets": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/targets.py",
+      "gliner2.processing.word_splitter": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/word_splitter.py",
+      "gliner2.processor": "/private/tmp/antfly-gliner25-upstream/gliner2/processor.py",
+      "gliner2.training": "/private/tmp/antfly-gliner25-upstream/gliner2/training/__init__.py",
+      "gliner2.training.data": "/private/tmp/antfly-gliner25-upstream/gliner2/training/data.py",
+      "gliner2.training.matching": "/private/tmp/antfly-gliner25-upstream/gliner2/training/matching.py",
+      "gliner2.training.sampler": "/private/tmp/antfly-gliner25-upstream/gliner2/training/sampler.py",
+      "gliner2.training.trainer": "/private/tmp/antfly-gliner25-upstream/gliner2/training/trainer.py",
+      "gliner2.utils": "namespace:/private/tmp/antfly-gliner25-upstream/gliner2/utils",
+      "gliner2.utils.device_errors": "/private/tmp/antfly-gliner25-upstream/gliner2/utils/device_errors.py",
+      "gliner2.utils.sync_probe": "/private/tmp/antfly-gliner25-upstream/gliner2/utils/sync_probe.py"
+    },
+    "platform": {
+      "machine": "arm64",
+      "system": "Darwin"
+    },
+    "runtime": {
+      "packages": {
+        "PyYAML": "6.0.3",
+        "accelerate": "1.10.1",
+        "huggingface-hub": "0.36.0",
+        "numpy": "2.3.5",
+        "packaging": "25.0",
+        "peft": "0.17.1",
+        "psutil": "7.1.3",
+        "pydantic": "2.12.3",
+        "requests": "2.32.5",
+        "safetensors": "0.7.0",
+        "scipy": "1.16.3",
+        "tokenizers": "0.21.4",
+        "torch": "2.9.1",
+        "transformers": "4.55.4",
+        "urllib3": "2.5.0"
+      },
+      "python": "3.12.3",
+      "unicode": "15.0.0"
+    },
+    "threads": 1
+  },
+  "source": "meta_constructed_schema",
+  "tensors": {
+    "boundary_head.boundary_encoder.attention_blocks.0.norm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.boundary_encoder.attention_blocks.0.norm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.boundary_encoder.attention_blocks.0.output_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.boundary_encoder.attention_blocks.0.output_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "boundary_head.boundary_encoder.attention_blocks.0.qkv_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        384
+      ]
+    },
+    "boundary_head.boundary_encoder.attention_blocks.0.qkv_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        384,
+        128
+      ]
+    },
+    "boundary_head.boundary_encoder.attention_blocks.1.norm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.boundary_encoder.attention_blocks.1.norm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.boundary_encoder.attention_blocks.1.output_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.boundary_encoder.attention_blocks.1.output_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "boundary_head.boundary_encoder.attention_blocks.1.qkv_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        384
+      ]
+    },
+    "boundary_head.boundary_encoder.attention_blocks.1.qkv_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        384,
+        128
+      ]
+    },
+    "boundary_head.boundary_encoder.bos_state": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "boundary_head.boundary_encoder.eos_state": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "boundary_head.boundary_encoder.layer_norm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.boundary_encoder.layer_norm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.boundary_encoder.left_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.boundary_encoder.left_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        768
+      ]
+    },
+    "boundary_head.boundary_encoder.output_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.boundary_encoder.output_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        256
+      ]
+    },
+    "boundary_head.boundary_encoder.refinement_blocks.0.input_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        512
+      ]
+    },
+    "boundary_head.boundary_encoder.refinement_blocks.0.input_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        512,
+        128
+      ]
+    },
+    "boundary_head.boundary_encoder.refinement_blocks.0.norm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.boundary_encoder.refinement_blocks.0.norm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.boundary_encoder.refinement_blocks.0.output_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.boundary_encoder.refinement_blocks.0.output_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        256
+      ]
+    },
+    "boundary_head.boundary_encoder.right_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.boundary_encoder.right_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        768
+      ]
+    },
+    "boundary_head.boundary_proposer.end_key_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.boundary_proposer.end_key_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "boundary_head.boundary_proposer.start_pair_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.boundary_proposer.start_pair_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "boundary_head.boundary_proposer.start_query_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        64
+      ]
+    },
+    "boundary_head.boundary_proposer.start_query_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        64,
+        768
+      ]
+    },
+    "boundary_head.boundary_query_head.end_boundary_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.boundary_query_head.end_boundary_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "boundary_head.boundary_query_head.end_query_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.boundary_query_head.end_query_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        768
+      ]
+    },
+    "boundary_head.boundary_query_head.inside_query_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.boundary_query_head.inside_query_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        768
+      ]
+    },
+    "boundary_head.boundary_query_head.inside_text_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.boundary_query_head.inside_text_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        768
+      ]
+    },
+    "boundary_head.boundary_query_head.start_boundary_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.boundary_query_head.start_boundary_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "boundary_head.boundary_query_head.start_query_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.boundary_query_head.start_query_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        768
+      ]
+    },
+    "boundary_head.candidate_encoder.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "boundary_head.candidate_encoder.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        256
+      ]
+    },
+    "boundary_head.count_head.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        1
+      ]
+    },
+    "boundary_head.count_head.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        1,
+        768
+      ]
+    },
+    "boundary_head.null_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        1
+      ]
+    },
+    "boundary_head.null_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        1,
+        768
+      ]
+    },
+    "boundary_head.pair_scorer.compat_mix.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        1
+      ]
+    },
+    "boundary_head.pair_scorer.compat_mix.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        1,
+        8
+      ]
+    },
+    "boundary_head.pair_scorer.content_bias.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        1
+      ]
+    },
+    "boundary_head.pair_scorer.content_bias.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        1,
+        64
+      ]
+    },
+    "boundary_head.pair_scorer.content_pooler.layer_norm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        64
+      ]
+    },
+    "boundary_head.pair_scorer.content_pooler.layer_norm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        64
+      ]
+    },
+    "boundary_head.pair_scorer.content_pooler.value_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        64
+      ]
+    },
+    "boundary_head.pair_scorer.content_pooler.value_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        64,
+        768
+      ]
+    },
+    "boundary_head.pair_scorer.content_query_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        64
+      ]
+    },
+    "boundary_head.pair_scorer.content_query_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        64,
+        768
+      ]
+    },
+    "boundary_head.pair_scorer.end_endpoint_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.pair_scorer.end_endpoint_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "boundary_head.pair_scorer.endpoint_difference_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        1
+      ]
+    },
+    "boundary_head.pair_scorer.endpoint_difference_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        1,
+        256
+      ]
+    },
+    "boundary_head.pair_scorer.inside_weight.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        1
+      ]
+    },
+    "boundary_head.pair_scorer.inside_weight.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        1,
+        768
+      ]
+    },
+    "boundary_head.pair_scorer.length_query_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        3
+      ]
+    },
+    "boundary_head.pair_scorer.length_query_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        3,
+        768
+      ]
+    },
+    "boundary_head.pair_scorer.query_gate.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        64
+      ]
+    },
+    "boundary_head.pair_scorer.query_gate.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        64,
+        768
+      ]
+    },
+    "boundary_head.pair_scorer.start_endpoint_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.pair_scorer.start_endpoint_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "boundary_head.shared_pool_builder.end_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.shared_pool_builder.end_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "boundary_head.shared_pool_builder.start_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.shared_pool_builder.start_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "boundary_head.shared_pool_scorer.candidate_norm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.shared_pool_scorer.candidate_norm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.shared_pool_scorer.content_pooler.layer_norm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        64
+      ]
+    },
+    "boundary_head.shared_pool_scorer.content_pooler.layer_norm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        64
+      ]
+    },
+    "boundary_head.shared_pool_scorer.content_pooler.value_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        64
+      ]
+    },
+    "boundary_head.shared_pool_scorer.content_pooler.value_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        64,
+        768
+      ]
+    },
+    "boundary_head.shared_pool_scorer.content_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.shared_pool_scorer.content_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        64
+      ]
+    },
+    "boundary_head.shared_pool_scorer.end_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.shared_pool_scorer.end_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "boundary_head.shared_pool_scorer.film.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        256
+      ]
+    },
+    "boundary_head.shared_pool_scorer.film.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        256,
+        128
+      ]
+    },
+    "boundary_head.shared_pool_scorer.film_output.0.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        64
+      ]
+    },
+    "boundary_head.shared_pool_scorer.film_output.0.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        64,
+        128
+      ]
+    },
+    "boundary_head.shared_pool_scorer.film_output.3.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        1
+      ]
+    },
+    "boundary_head.shared_pool_scorer.film_output.3.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        1,
+        64
+      ]
+    },
+    "boundary_head.shared_pool_scorer.length_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.shared_pool_scorer.length_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        3
+      ]
+    },
+    "boundary_head.shared_pool_scorer.prior_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.shared_pool_scorer.prior_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        1
+      ]
+    },
+    "boundary_head.shared_pool_scorer.query_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.shared_pool_scorer.query_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        768
+      ]
+    },
+    "boundary_head.shared_pool_scorer.start_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "boundary_head.shared_pool_scorer.start_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        128
+      ]
+    },
+    "classifier.0.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        1536
+      ]
+    },
+    "classifier.0.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        1536,
+        768
+      ]
+    },
+    "classifier.3.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        1
+      ]
+    },
+    "classifier.3.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        1,
+        1536
+      ]
+    },
+    "encoder.embeddings.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.embeddings.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.embeddings.word_embeddings.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128011,
+        768
+      ]
+    },
+    "encoder.encoder.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.0.attention.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.0.attention.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.0.attention.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.0.attention.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.0.attention.self.key_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.0.attention.self.key_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.0.attention.self.query_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.0.attention.self.query_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.0.attention.self.value_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.0.attention.self.value_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.0.intermediate.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072
+      ]
+    },
+    "encoder.encoder.layer.0.intermediate.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072,
+        768
+      ]
+    },
+    "encoder.encoder.layer.0.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.0.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.0.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.0.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        3072
+      ]
+    },
+    "encoder.encoder.layer.1.attention.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.1.attention.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.1.attention.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.1.attention.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.1.attention.self.key_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.1.attention.self.key_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.1.attention.self.query_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.1.attention.self.query_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.1.attention.self.value_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.1.attention.self.value_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.1.intermediate.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072
+      ]
+    },
+    "encoder.encoder.layer.1.intermediate.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072,
+        768
+      ]
+    },
+    "encoder.encoder.layer.1.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.1.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.1.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.1.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        3072
+      ]
+    },
+    "encoder.encoder.layer.10.attention.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.10.attention.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.10.attention.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.10.attention.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.10.attention.self.key_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.10.attention.self.key_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.10.attention.self.query_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.10.attention.self.query_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.10.attention.self.value_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.10.attention.self.value_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.10.intermediate.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072
+      ]
+    },
+    "encoder.encoder.layer.10.intermediate.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072,
+        768
+      ]
+    },
+    "encoder.encoder.layer.10.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.10.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.10.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.10.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        3072
+      ]
+    },
+    "encoder.encoder.layer.11.attention.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.11.attention.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.11.attention.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.11.attention.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.11.attention.self.key_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.11.attention.self.key_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.11.attention.self.query_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.11.attention.self.query_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.11.attention.self.value_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.11.attention.self.value_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.11.intermediate.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072
+      ]
+    },
+    "encoder.encoder.layer.11.intermediate.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072,
+        768
+      ]
+    },
+    "encoder.encoder.layer.11.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.11.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.11.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.11.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        3072
+      ]
+    },
+    "encoder.encoder.layer.2.attention.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.2.attention.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.2.attention.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.2.attention.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.2.attention.self.key_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.2.attention.self.key_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.2.attention.self.query_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.2.attention.self.query_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.2.attention.self.value_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.2.attention.self.value_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.2.intermediate.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072
+      ]
+    },
+    "encoder.encoder.layer.2.intermediate.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072,
+        768
+      ]
+    },
+    "encoder.encoder.layer.2.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.2.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.2.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.2.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        3072
+      ]
+    },
+    "encoder.encoder.layer.3.attention.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.3.attention.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.3.attention.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.3.attention.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.3.attention.self.key_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.3.attention.self.key_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.3.attention.self.query_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.3.attention.self.query_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.3.attention.self.value_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.3.attention.self.value_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.3.intermediate.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072
+      ]
+    },
+    "encoder.encoder.layer.3.intermediate.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072,
+        768
+      ]
+    },
+    "encoder.encoder.layer.3.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.3.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.3.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.3.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        3072
+      ]
+    },
+    "encoder.encoder.layer.4.attention.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.4.attention.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.4.attention.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.4.attention.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.4.attention.self.key_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.4.attention.self.key_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.4.attention.self.query_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.4.attention.self.query_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.4.attention.self.value_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.4.attention.self.value_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.4.intermediate.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072
+      ]
+    },
+    "encoder.encoder.layer.4.intermediate.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072,
+        768
+      ]
+    },
+    "encoder.encoder.layer.4.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.4.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.4.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.4.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        3072
+      ]
+    },
+    "encoder.encoder.layer.5.attention.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.5.attention.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.5.attention.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.5.attention.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.5.attention.self.key_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.5.attention.self.key_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.5.attention.self.query_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.5.attention.self.query_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.5.attention.self.value_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.5.attention.self.value_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.5.intermediate.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072
+      ]
+    },
+    "encoder.encoder.layer.5.intermediate.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072,
+        768
+      ]
+    },
+    "encoder.encoder.layer.5.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.5.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.5.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.5.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        3072
+      ]
+    },
+    "encoder.encoder.layer.6.attention.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.6.attention.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.6.attention.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.6.attention.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.6.attention.self.key_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.6.attention.self.key_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.6.attention.self.query_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.6.attention.self.query_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.6.attention.self.value_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.6.attention.self.value_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.6.intermediate.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072
+      ]
+    },
+    "encoder.encoder.layer.6.intermediate.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072,
+        768
+      ]
+    },
+    "encoder.encoder.layer.6.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.6.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.6.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.6.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        3072
+      ]
+    },
+    "encoder.encoder.layer.7.attention.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.7.attention.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.7.attention.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.7.attention.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.7.attention.self.key_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.7.attention.self.key_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.7.attention.self.query_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.7.attention.self.query_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.7.attention.self.value_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.7.attention.self.value_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.7.intermediate.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072
+      ]
+    },
+    "encoder.encoder.layer.7.intermediate.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072,
+        768
+      ]
+    },
+    "encoder.encoder.layer.7.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.7.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.7.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.7.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        3072
+      ]
+    },
+    "encoder.encoder.layer.8.attention.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.8.attention.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.8.attention.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.8.attention.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.8.attention.self.key_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.8.attention.self.key_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.8.attention.self.query_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.8.attention.self.query_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.8.attention.self.value_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.8.attention.self.value_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.8.intermediate.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072
+      ]
+    },
+    "encoder.encoder.layer.8.intermediate.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072,
+        768
+      ]
+    },
+    "encoder.encoder.layer.8.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.8.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.8.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.8.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        3072
+      ]
+    },
+    "encoder.encoder.layer.9.attention.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.9.attention.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.9.attention.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.9.attention.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.9.attention.self.key_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.9.attention.self.key_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.9.attention.self.query_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.9.attention.self.query_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.9.attention.self.value_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.9.attention.self.value_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "encoder.encoder.layer.9.intermediate.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072
+      ]
+    },
+    "encoder.encoder.layer.9.intermediate.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        3072,
+        768
+      ]
+    },
+    "encoder.encoder.layer.9.output.LayerNorm.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.9.output.LayerNorm.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.9.output.dense.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "encoder.encoder.layer.9.output.dense.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        3072
+      ]
+    },
+    "encoder.encoder.rel_embeddings.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        512,
+        768
+      ]
+    },
+    "record_decoder.cand_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "record_decoder.cand_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        768
+      ]
+    },
+    "record_decoder.field_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "record_decoder.field_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        768
+      ]
+    },
+    "record_decoder.inst_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "record_decoder.inst_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        768
+      ]
+    },
+    "record_decoder.instance_embed": {
+      "dtype": "torch.float32",
+      "shape": [
+        32,
+        768
+      ]
+    },
+    "record_decoder.k_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "record_decoder.k_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        768
+      ]
+    },
+    "record_decoder.latent_seed_head.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        1
+      ]
+    },
+    "record_decoder.latent_seed_head.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        1,
+        768
+      ]
+    },
+    "record_decoder.null_embed": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "record_decoder.object_head.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        1
+      ]
+    },
+    "record_decoder.object_head.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        1,
+        768
+      ]
+    },
+    "record_decoder.q_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        128
+      ]
+    },
+    "record_decoder.q_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        128,
+        768
+      ]
+    },
+    "record_decoder.v_proj.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "record_decoder.v_proj.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "relation_scorer.content_linear.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        1
+      ]
+    },
+    "relation_scorer.content_linear.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        1,
+        3072
+      ]
+    },
+    "relation_scorer.head_content_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "relation_scorer.head_content_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    },
+    "relation_scorer.mlp.0.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "relation_scorer.mlp.0.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        4610
+      ]
+    },
+    "relation_scorer.mlp.3.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        1
+      ]
+    },
+    "relation_scorer.mlp.3.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        1,
+        768
+      ]
+    },
+    "relation_scorer.relation_content_gate.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "relation_scorer.relation_content_gate.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        1536
+      ]
+    },
+    "relation_scorer.tail_content_projection.bias": {
+      "dtype": "torch.float32",
+      "shape": [
+        768
+      ]
+    },
+    "relation_scorer.tail_content_projection.weight": {
+      "dtype": "torch.float32",
+      "shape": [
+        768,
+        768
+      ]
+    }
+  }
+}

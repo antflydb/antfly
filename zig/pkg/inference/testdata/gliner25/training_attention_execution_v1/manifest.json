@@ -1,0 +1,744 @@
+{
+  "ancillary_contract_validation": [
+    {
+      "cwd": "repository root",
+      "elapsed_seconds": 3.125,
+      "errors": 25,
+      "exit_code": 1,
+      "failure": "Selected interpreter lacked psutil and packaging, causing 25 import/dependency errors. Full argv/environment were not retained in this ledger.",
+      "id": "python_contracts_v7",
+      "log": {
+        "original_path": "/private/tmp/gliner25-contracts-attention-massive-v7.log",
+        "path": "logs/gliner25-contracts-attention-massive-v7.log",
+        "sha256": "7dcb7f59ca09df777a6518873e596ab44ebdfae128d53eab93caac31d62d0ed8",
+        "size_bytes": 83914
+      },
+      "scope": "Resolved environment-selection checkpoint; no source or dependency changes were used to correct it.",
+      "selected_python": "scripts/.venv/bin/python",
+      "skipped": null,
+      "status": "failed_interpreter_environment",
+      "tests": 201
+    },
+    {
+      "argv": [
+        "/private/tmp/antfly-gliner25-oracle-venv/bin/python",
+        "-B",
+        "zig/pkg/inference/scripts/run_model_contract_tests.py",
+        "gliner25"
+      ],
+      "command_provenance": "Root execution transcript.",
+      "cwd": "repository root",
+      "elapsed_seconds": 3.879,
+      "environment": {
+        "ANTFLY_GLINER25_PROMTOOL": "/private/tmp/antfly-gliner25-promtool-3.14.0/promtool",
+        "GOMAXPROCS": "1"
+      },
+      "errors": 0,
+      "exit_code": 0,
+      "id": "python_contracts_v8",
+      "log": {
+        "original_path": "/private/tmp/gliner25-contracts-attention-massive-v8.log",
+        "path": "logs/gliner25-contracts-attention-massive-v8.log",
+        "sha256": "c85f8cccb892934f45395f1e11291eb17748f106ff71e08def42dec250541643",
+        "size_bytes": 36083
+      },
+      "scope": "Artifact/evaluation/training/process/monitoring contract tests; actual pinned native promtool checks, no model execution or remote CI claim.",
+      "skipped": 0,
+      "status": "passed",
+      "tests": 203
+    }
+  ],
+  "build": {
+    "backend_options": {
+      "cuda": false,
+      "onnx": false,
+      "pjrt": false,
+      "system_blas": true
+    },
+    "compiler": "/opt/homebrew/Cellar/zig/0.16.0/bin/zig",
+    "host_architecture": "arm64",
+    "host_os": "Darwin",
+    "optimize": "Debug",
+    "parallel_build_jobs": 1,
+    "version": "0.16.0"
+  },
+  "claims": {
+    "activation_recomputation": false,
+    "cpu_metal_wider_head_geometry": true,
+    "full_context_numeric_execution": false,
+    "metal_projected_attention": true,
+    "performance": false,
+    "pinned_source_cpu_projected_attention": true,
+    "published_model_training": false,
+    "release_qualification": false,
+    "tiny_cpu_full_head_replay_resume": true,
+    "tiny_metal_replay_resume": true
+  },
+  "evidence_is_upstream_numerical_fixture": false,
+  "executions": [
+    {
+      "argv": [
+        "zig",
+        "build",
+        "inference-test",
+        "-Dmetal=false",
+        "-Dcuda=false",
+        "-j1",
+        "--",
+        "--test-filter",
+        "replay DeBERTa training attention",
+        "--test-filter",
+        "GLiNER2.5 replay encoder",
+        "--test-filter",
+        "resident program replay attention",
+        "--test-filter",
+        "deberta training Metal",
+        "--test-filter",
+        "native dense view alias metadata failure",
+        "--test-filter",
+        "boundary native trainer replay attention"
+      ],
+      "command_provenance": "Root execution transcript; failed Metal command also retained in its compiler log.",
+      "cwd": "zig",
+      "environment": {
+        "ANTFLY_GLINER25_TRAINING_ATTENTION_FIXTURE_DIR": "/private/tmp/gliner25-training-attention-v1",
+        "ZIG_GLOBAL_CACHE_DIR": "/private/tmp/antfly-gliner25-zig-cache"
+      },
+      "exact_test_executable": null,
+      "exact_test_executable_status": "Not recorded; no inference from the latest cache entry.",
+      "exit_code": 0,
+      "expected_skips": [
+        "Projected-attention Metal source consumer",
+        "Metal buffer metadata and attention allocation failures",
+        "Metal control/finite/cancel/frame recovery",
+        "Resident Metal full/head NativeTrainer replay profile"
+      ],
+      "failed": 0,
+      "id": "cpu_v8",
+      "leaks_reported": 0,
+      "log": {
+        "original_path": "/private/tmp/gliner25-training-attention-native-v8.log",
+        "path": "logs/gliner25-training-attention-native-v8.log",
+        "sha256": "6334b2067e3f845fbd5a704c924a7ab114ae2535db6eecc410981acb061017b4",
+        "size_bytes": 4523
+      },
+      "passed": 18,
+      "scope": [
+        "Nine pinned Transformers projected-attention cases, context and Q/K/V/Qr/Kr VJPs at unchanged predeclared tolerances.",
+        "CPU scalar reference, finite differences, exact counter masks, malformed inputs, cancellation, bounded scratch and allocation-failure recovery.",
+        "Tiny full/head NativeTrainer replay profile: six microbatches/four optimizer updates per mode, partial resume and attention-profile mismatch rejection.",
+        "Pure long-context graph and device planner admission, including S4096/S16384; no numerical long-context execution."
+      ],
+      "selected": 22,
+      "skipped": 4,
+      "source_binding": "CPU primitive/test/source consumer and native OOM implementation are unchanged since this run, as confirmed by their source owners. The later semantic region capture/remap graph edits and Metal alignment correction are not attributed retroactively to CPU v8.",
+      "status": "passed"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "inference-test",
+        "-Dmetal=true",
+        "-Dcuda=false",
+        "-j1",
+        "--",
+        "--test-filter",
+        "replay DeBERTa training attention",
+        "--test-filter",
+        "GLiNER2.5 replay encoder",
+        "--test-filter",
+        "resident program replay attention",
+        "--test-filter",
+        "deberta training Metal",
+        "--test-filter",
+        "native dense view alias metadata failure",
+        "--test-filter",
+        "boundary native trainer replay attention"
+      ],
+      "attention_tests_executed": false,
+      "command_provenance": "Root execution transcript; failed Metal command also retained in its compiler log.",
+      "correction": "Use control_values[6 + admitted.batch_tokens ..] from the original aligned immutable input after validateControl validates exact length and values.",
+      "cwd": "zig",
+      "environment": {
+        "ANTFLY_GLINER25_TRAINING_ATTENTION_FIXTURE_DIR": "/private/tmp/gliner25-training-attention-v1",
+        "ZIG_GLOBAL_CACHE_DIR": "/private/tmp/antfly-gliner25-zig-cache"
+      },
+      "exact_test_executable": null,
+      "exact_test_executable_status": "Not recorded; no inference from the latest cache entry.",
+      "exit_code": 1,
+      "failed": null,
+      "failure": "metal_runtime.zig grouping builder passed a validated []align(1) const i32 view where []const i32 was required.",
+      "id": "metal_v1",
+      "leaks_reported": null,
+      "log": {
+        "original_path": "/private/tmp/gliner25-training-attention-metal-v1.log",
+        "path": "logs/gliner25-training-attention-metal-v1.log",
+        "sha256": "c770643cab0a7c404d2c5f2798a5012f57a16a1c8afe7f05e6e96c5909428ce6",
+        "size_bytes": 10462
+      },
+      "passed": null,
+      "scope": "Compile failure only. The auxiliary build summary is not Metal attention numerical evidence.",
+      "selected": null,
+      "skipped": null,
+      "status": "compile_failed"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "inference-test",
+        "-Dmetal=true",
+        "-Dcuda=false",
+        "-j1",
+        "--",
+        "--test-filter",
+        "replay DeBERTa training attention",
+        "--test-filter",
+        "GLiNER2.5 replay encoder",
+        "--test-filter",
+        "resident program replay attention",
+        "--test-filter",
+        "deberta training Metal",
+        "--test-filter",
+        "native dense view alias metadata failure",
+        "--test-filter",
+        "boundary native trainer replay attention"
+      ],
+      "attention_tests_executed": true,
+      "command_provenance": "Root execution transcript; failed Metal command also retained in its compiler log.",
+      "cwd": "zig",
+      "environment": {
+        "ANTFLY_GLINER25_TRAINING_ATTENTION_FIXTURE_DIR": "/private/tmp/gliner25-training-attention-v1",
+        "ZIG_GLOBAL_CACHE_DIR": "/private/tmp/antfly-gliner25-zig-cache"
+      },
+      "exact_test_executable": {
+        "argv": [
+          "./.zig-cache/o/f9c1f1e7ea5ffe159848f6ad0f83642c/test",
+          "--test-filter",
+          "replay DeBERTa training attention",
+          "--test-filter",
+          "GLiNER2.5 replay encoder",
+          "--test-filter",
+          "resident program replay attention",
+          "--test-filter",
+          "deberta training Metal",
+          "--test-filter",
+          "native dense view alias metadata failure",
+          "--test-filter",
+          "boundary native trainer replay attention"
+        ],
+        "bytes": 49006728,
+        "creation_time": 1789054358.440571,
+        "executable": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/.zig-cache/o/f9c1f1e7ea5ffe159848f6ad0f83642c/test",
+        "inode": 97605885,
+        "mtime_ns": 1789054358384732137,
+        "pid": 952,
+        "sha256": "80db1c2557dd336df188c2a7889ff1e5dd63fc2adffd2e190c6ffa9771d168ee"
+      },
+      "exact_test_executable_status": "Observed and hashed while the unique matching test process was live; receipt retains PID, creation time, argv, stat and thirteen source hashes.",
+      "exit_code": 0,
+      "failed": 0,
+      "id": "metal_v2",
+      "leaks_reported": 0,
+      "live_identity_receipt": {
+        "original_path": "/private/tmp/gliner25-training-attention-metal-v2-live-identity.json",
+        "path": "metal_v2_live_identity.json",
+        "sha256": "a76e8b4ce7c3e9040160e95e0191ae065dcb3589b831c291053f613a8a7128be",
+        "size_bytes": 3492
+      },
+      "log": {
+        "original_path": "/private/tmp/gliner25-training-attention-metal-v2.log",
+        "path": "logs/gliner25-training-attention-metal-v2.log",
+        "sha256": "c9a03585fd5bccf416355760eb546f88028cffc7b9e898641cb04cb8b39f36cd",
+        "size_bytes": 5809
+      },
+      "passed": 23,
+      "scope": [
+        "Nine pinned source cases pass on CPU and actual dedicated safe-math Metal; context and all five Q/K/V/Qr/Kr VJPs use the unchanged fixed gate.",
+        "All three dedicated Metal ownership tests pass: pre-device allocator failure, retained-view/allocation sweeps, strict control/finite/limit/cancel/external-frame rejection and recovery.",
+        "Tiny managed full/head replay jobs pass on both CPU and resident Metal with six microbatches/four updates per mode, exact fresh-owner partial resume and mismatch rejection.",
+        "Semantic encoder regions survive shared Q/K LoRA and DoRA rewriting; this is a graph metadata test, not activation-recomputation execution.",
+        "All CPU primitive and pure S4096/S16384 graph/device-plan admission cases pass in this Metal-enabled executable."
+      ],
+      "selected": 23,
+      "skipped": 0,
+      "source_binding": "The live identity receipt pins thirteen frozen sources, all matched to the twenty-file scoped checkpoint before any following test edits. This is not a complete build dependency closure.",
+      "status": "passed"
+    },
+    {
+      "argv": [
+        "zig",
+        "build",
+        "inference-test",
+        "-Dmetal=true",
+        "-Dcuda=false",
+        "-j1",
+        "--",
+        "--test-filter",
+        "deberta training Metal published width and wider tails",
+        "--test-filter",
+        "GLiNER2.5 replay encoder",
+        "--test-filter",
+        "GLiNER2.5 encoder training"
+      ],
+      "command_provenance": "Root execution transcript.",
+      "cwd": "zig",
+      "environment": {
+        "ZIG_GLOBAL_CACHE_DIR": "/private/tmp/antfly-gliner25-zig-cache"
+      },
+      "exact_test_executable": null,
+      "exact_test_executable_status": "A read-only live observer began after the short test execution ended; no executable identity was recorded or inferred from cache.",
+      "exit_code": 0,
+      "failed": 0,
+      "id": "metal_width_v1",
+      "leaks_reported": 0,
+      "log": {
+        "original_path": "/private/tmp/gliner25-training-attention-metal-width-v1.log",
+        "path": "logs/gliner25-training-attention-metal-width-v1.log",
+        "sha256": "537169734329000ea331a182466d1aa71ee70343699327a66445ff2a54ad1a1f",
+        "size_bytes": 1297
+      },
+      "passed": 7,
+      "profiles": {
+        "device_case_logical_upper_bound_bytes_exclusive": 16777216,
+        "host_owner_bytes": 67108864,
+        "metadata_cap_bytes": 4194304,
+        "per_tensor_cap_bytes": 4194304,
+        "scalar_work_cap": 268435456,
+        "scratch_cap_bytes": 4194304
+      },
+      "scope": [
+        "Eighteen actual CPU\u2013Metal context and Q/K/V/Qr/Kr VJP comparisons: D64/128/256, B1 with two heads, S1/17/65, R512, dropout0/.1, valid/ragged/fully masked cases.",
+        "The independently tested CPU primitive uses17x31 tiles; Metal uses64-key tiles. Fixed gate remains2e-5 +3e-5*abs(expected); no new upstream numerical fixture or published-model gradient claim.",
+        "Strict device uploads, no activation mirror before diagnostics, exact masked score-VJP zeros/nonzero value gradients, allocation bounds and complete per-case ownership cleanup.",
+        "Three existing encoder graph/binding/OOM cases and three replay encoder compact-control/region-remap/linear-admission cases pass; compact-control coverage includes bindFixedPrepared."
+      ],
+      "selected": 7,
+      "skipped": 0,
+      "source_checkpoint": {
+        "archived_files": [
+          {
+            "original_path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/src/ops/deberta_training_attention_device_test.zig",
+            "path": "source_snapshots/width_v1/deberta_training_attention_device_test.zig",
+            "sha256": "f5d734ee4dae281b61907af76ae65a8ee6eedc538fd3438ee5e3b51906f3b3b9",
+            "size_bytes": 17359
+          },
+          {
+            "original_path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/src/finetune/gliner_boundary_encoder_graph.zig",
+            "path": "source_snapshots/width_v1/gliner_boundary_encoder_graph.zig",
+            "sha256": "40ee5790426b5eb0a4cb6c6d43405234774605e184c7479463633bb9cf668ed7",
+            "size_bytes": 48298
+          }
+        ],
+        "scope": "Frozen scoped source files captured after root reported completion and before releasing the source freeze; not a complete build dependency closure.",
+        "sources": {
+          "zig/lib/ml/src/graph/node.zig": {
+            "sha256": "4e1ca5abc414b2ba9a14bfbf4f915392c8d415080e99e579144d8794a0d2535d",
+            "size_bytes": 16854
+          },
+          "zig/pkg/inference/scripts/gliner25/capture_training_attention.py": {
+            "sha256": "c67ee517899871b4ad36a11408ff321028ad10ab88f0941aa0c09ef48f6a1a6f",
+            "size_bytes": 20879
+          },
+          "zig/pkg/inference/scripts/gliner25/training_attention_contract_v1.json": {
+            "sha256": "7e512fe4418d006619088093ed7410ddd9a209dcb421954c9fbb14287bbecfcc",
+            "size_bytes": 12057
+          },
+          "zig/pkg/inference/src/architectures/deberta_graph.zig": {
+            "sha256": "11edcfb00d4bd2a1dc205a1830047a145c617f27827fe916ec6b12a20c79824d",
+            "size_bytes": 56652
+          },
+          "zig/pkg/inference/src/backends/metal_kernels.m": {
+            "sha256": "cc09bd01701be5bd1b1451d4ac76ff63430f12e36629871a8592bfa3cb5d55e5",
+            "size_bytes": 4043164
+          },
+          "zig/pkg/inference/src/backends/metal_runtime.zig": {
+            "sha256": "a8b7db6080ed4d66cc4450943a2d92ad4c19cf15855e8f082200bb4612c63de3",
+            "size_bytes": 1854761
+          },
+          "zig/pkg/inference/src/backends/metal_tensor.zig": {
+            "sha256": "b113d47f8d7b3b3b0858916a65e140cb7a3bebc56d08936b34201c49ce904fb4",
+            "size_bytes": 45151
+          },
+          "zig/pkg/inference/src/finetune/gliner_boundary_encoder_graph.zig": {
+            "sha256": "40ee5790426b5eb0a4cb6c6d43405234774605e184c7479463633bb9cf668ed7",
+            "size_bytes": 48298
+          },
+          "zig/pkg/inference/src/finetune/gliner_boundary_native_trainer_test.zig": {
+            "sha256": "8b30cec44b1459201c5b8c3b97c584ccac9fbb762357034cdd8e53e617574cd0",
+            "size_bytes": 30433
+          },
+          "zig/pkg/inference/src/finetune/gliner_boundary_train_step_test.zig": {
+            "sha256": "49d69280e621a3c605589b10ab7927b7f0a23856daf46d8eee0bf047cb2a887a",
+            "size_bytes": 18761
+          },
+          "zig/pkg/inference/src/ops/deberta_training_attention.zig": {
+            "sha256": "98e2c4c85ce92a8bfd64a197432ead1d4eaa8affef87c1fdaa54025fc26b644b",
+            "size_bytes": 29168
+          },
+          "zig/pkg/inference/src/ops/deberta_training_attention_device.zig": {
+            "sha256": "446ad46d26788168052bc49fafdab1c69eb5e10ff458527cd57ad83a3e8bc20c",
+            "size_bytes": 13116
+          },
+          "zig/pkg/inference/src/ops/deberta_training_attention_device_test.zig": {
+            "sha256": "f5d734ee4dae281b61907af76ae65a8ee6eedc538fd3438ee5e3b51906f3b3b9",
+            "size_bytes": 17359
+          },
+          "zig/pkg/inference/src/ops/deberta_training_attention_source_test.zig": {
+            "sha256": "831cd1534093dee68bde5264fbde1db2e05baebb72474f6b7b8dd2088b22a7f6",
+            "size_bytes": 20427
+          },
+          "zig/pkg/inference/src/ops/deberta_training_attention_test.zig": {
+            "sha256": "422c0cb465c1e73397ff7fca92ae4af6f70a7ea6d248ac51846a881133a10d3a",
+            "size_bytes": 27867
+          },
+          "zig/pkg/inference/src/ops/metal_compute.zig": {
+            "sha256": "f592fcfb38b868cac47dab19abe2847c5ca0f2c4f713ce70f49b8ebc2b1f0c96",
+            "size_bytes": 1739509
+          },
+          "zig/pkg/inference/src/ops/native_compute.zig": {
+            "sha256": "35a58df9c04c5dfdea513e2f9a63a5dac2b5834274ec2d543ad7e0a9def645b2",
+            "size_bytes": 2314949
+          },
+          "zig/pkg/inference/src/ops/ops.zig": {
+            "sha256": "750f60ad46f74bcec2106f757f9fcb9b979cdee7c8f0e629aebe27a57fbebfa8",
+            "size_bytes": 241809
+          },
+          "zig/pkg/inference/src/ops/resident_program_ops.zig": {
+            "sha256": "8db8d5747a4b6fd17f16d02389e0ad8a5fc4811fd9737bbaa28e12cddf8218b0",
+            "size_bytes": 22262
+          },
+          "zig/pkg/inference/src/ops/resident_training_groups.zig": {
+            "sha256": "647df6bd4508844d3e057451a29dee69e2ef08014684cb30b58716b20ef16395",
+            "size_bytes": 7390
+          }
+        }
+      },
+      "status": "passed"
+    }
+  ],
+  "fixture": {
+    "absolute_tolerance": 2e-05,
+    "archived_metadata": {
+      "original_path": "/private/tmp/gliner25-training-attention-v1/capture.json",
+      "path": "source_capture/capture.json",
+      "sha256": "6a536daec41bfd515d7e3fe5ae2522a4fdd2e67c15880071b732783f8cb59dc1",
+      "size_bytes": 29667
+    },
+    "batch": 2,
+    "case_count": 9,
+    "case_ids": [
+      "ragged7_p0",
+      "ragged7_p01",
+      "ragged7_p0125",
+      "fully_masked7_p0",
+      "fully_masked7_p01",
+      "fully_masked7_p0125",
+      "buckets512_p0",
+      "buckets512_p01",
+      "buckets512_p0125"
+    ],
+    "contract": {
+      "sha256": "7e512fe4418d006619088093ed7410ddd9a209dcb421954c9fbb14287bbecfcc",
+      "size_bytes": 12057
+    },
+    "dropout_probabilities": [
+      0,
+      0.1,
+      0.125
+    ],
+    "files": {
+      "capture.json": {
+        "path": "/private/tmp/gliner25-training-attention-v1/capture.json",
+        "sha256": "6a536daec41bfd515d7e3fe5ae2522a4fdd2e67c15880071b732783f8cb59dc1",
+        "size_bytes": 29667
+      },
+      "tensors.safetensors": {
+        "path": "/private/tmp/gliner25-training-attention-v1/tensors.safetensors",
+        "sha256": "45c7b042146132e9103807f61e49b7a44a7ef59e70c338e542e9de709d38b9e3",
+        "size_bytes": 40241300
+      },
+      "weights.safetensors": {
+        "path": "/private/tmp/gliner25-training-attention-v1/weights.safetensors",
+        "sha256": "715aa526fb9cc711352b2b57531d8648e76cba29972c1c04ecad720044d4fa54",
+        "size_bytes": 20560
+      }
+    },
+    "generator": {
+      "sha256": "c67ee517899871b4ad36a11408ff321028ad10ab88f0941aa0c09ef48f6a1a6f",
+      "size_bytes": 20879
+    },
+    "gradient_order": [
+      "q",
+      "k",
+      "v",
+      "qr",
+      "kr"
+    ],
+    "head_dim": 4,
+    "heads": 2,
+    "maximum_error_status": "Passing assertions; per-case observed maxima were not emitted.",
+    "measured_maximum_error": null,
+    "provenance": {
+      "checkout": "/private/tmp/antfly-gliner25-upstream",
+      "commit": "3c913c7369301133d3b7699252074c4303ada50e",
+      "device": "cpu",
+      "dtype": "float32",
+      "imports": {
+        "gliner2": "/private/tmp/antfly-gliner25-upstream/gliner2/__init__.py",
+        "gliner2.api_client": "/private/tmp/antfly-gliner25-upstream/gliner2/api_client.py",
+        "gliner2.auto": "/private/tmp/antfly-gliner25-upstream/gliner2/auto.py",
+        "gliner2.configuration": "/private/tmp/antfly-gliner25-upstream/gliner2/configuration.py",
+        "gliner2.inference": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/__init__.py",
+        "gliner2.inference.candidate_decoder": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/candidate_decoder.py",
+        "gliner2.inference.chunking": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/chunking.py",
+        "gliner2.inference.engine": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/engine.py",
+        "gliner2.inference.overlap": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/overlap.py",
+        "gliner2.inference.runtime": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/runtime.py",
+        "gliner2.inference.schema": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/schema.py",
+        "gliner2.inference.schema_model": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/schema_model.py",
+        "gliner2.layers": "/private/tmp/antfly-gliner25-upstream/gliner2/layers.py",
+        "gliner2.models": "/private/tmp/antfly-gliner25-upstream/gliner2/models/__init__.py",
+        "gliner2.models.base": "/private/tmp/antfly-gliner25-upstream/gliner2/models/base.py",
+        "gliner2.models.boundary": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/__init__.py",
+        "gliner2.models.boundary.constants": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/constants.py",
+        "gliner2.models.boundary.content": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/content.py",
+        "gliner2.models.boundary.encoding": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/encoding.py",
+        "gliner2.models.boundary.engine": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/engine.py",
+        "gliner2.models.boundary.heads": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/heads.py",
+        "gliner2.models.boundary.indexing": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/indexing.py",
+        "gliner2.models.boundary.losses": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/losses.py",
+        "gliner2.models.boundary.model": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/model.py",
+        "gliner2.models.boundary.pool": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/pool.py",
+        "gliner2.models.boundary.proposal": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/proposal.py",
+        "gliner2.models.boundary.records": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/records.py",
+        "gliner2.models.boundary.relations": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/relations.py",
+        "gliner2.models.boundary.rotary": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/rotary.py",
+        "gliner2.models.boundary.scoring": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/scoring.py",
+        "gliner2.models.boundary.targets_device": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/targets_device.py",
+        "gliner2.models.boundary.validation": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/validation.py",
+        "gliner2.models.candidates": "/private/tmp/antfly-gliner25-upstream/gliner2/models/candidates.py",
+        "gliner2.models.loading": "/private/tmp/antfly-gliner25-upstream/gliner2/models/loading.py",
+        "gliner2.models.outputs": "/private/tmp/antfly-gliner25-upstream/gliner2/models/outputs.py",
+        "gliner2.models.span": "/private/tmp/antfly-gliner25-upstream/gliner2/models/span/__init__.py",
+        "gliner2.models.span.model": "/private/tmp/antfly-gliner25-upstream/gliner2/models/span/model.py",
+        "gliner2.processing": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/__init__.py",
+        "gliner2.processing.layouts": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/layouts.py",
+        "gliner2.processing.records": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/records.py",
+        "gliner2.processing.targets": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/targets.py",
+        "gliner2.processing.word_splitter": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/word_splitter.py",
+        "gliner2.processor": "/private/tmp/antfly-gliner25-upstream/gliner2/processor.py",
+        "gliner2.training": "/private/tmp/antfly-gliner25-upstream/gliner2/training/__init__.py",
+        "gliner2.training.data": "/private/tmp/antfly-gliner25-upstream/gliner2/training/data.py",
+        "gliner2.training.matching": "/private/tmp/antfly-gliner25-upstream/gliner2/training/matching.py",
+        "gliner2.training.sampler": "/private/tmp/antfly-gliner25-upstream/gliner2/training/sampler.py",
+        "gliner2.training.trainer": "/private/tmp/antfly-gliner25-upstream/gliner2/training/trainer.py",
+        "gliner2.utils": "namespace:/private/tmp/antfly-gliner25-upstream/gliner2/utils",
+        "gliner2.utils.device_errors": "/private/tmp/antfly-gliner25-upstream/gliner2/utils/device_errors.py",
+        "gliner2.utils.sync_probe": "/private/tmp/antfly-gliner25-upstream/gliner2/utils/sync_probe.py"
+      },
+      "platform": {
+        "machine": "arm64",
+        "system": "Darwin"
+      },
+      "runtime": {
+        "packages": {
+          "PyYAML": "6.0.3",
+          "accelerate": "1.10.1",
+          "huggingface-hub": "0.36.0",
+          "numpy": "2.3.5",
+          "packaging": "25.0",
+          "peft": "0.17.1",
+          "psutil": "7.1.3",
+          "pydantic": "2.12.3",
+          "requests": "2.32.5",
+          "safetensors": "0.7.0",
+          "scipy": "1.16.3",
+          "tokenizers": "0.21.4",
+          "torch": "2.9.1",
+          "transformers": "4.55.4",
+          "urllib3": "2.5.0"
+        },
+        "python": "3.12.3",
+        "unicode": "15.0.0"
+      },
+      "threads": 1
+    },
+    "relative_rows": 512,
+    "relative_tolerance": 3e-05,
+    "scope": "gliner25_projected_training_attention/v1",
+    "sequence_lengths": [
+      7,
+      512
+    ],
+    "source_process_receipt": {
+      "original_path": "/private/tmp/gliner25-training-attention-probe-v1/process.json",
+      "path": "source_capture/process.json",
+      "sha256": "7f07386811d18a15b8ffb7d33d369d5366c2a593efccd97f951c5ab2581d7991",
+      "size_bytes": 5481
+    },
+    "source_reproducibility_status": "One supervised source capture; no second source capture is asserted here.",
+    "tolerance_formula": "abs(actual-expected) <= 2e-5 + 3e-5*abs(expected)",
+    "transformers_source": {
+      "sha256": "98fa398f62e446e1f6303ff67fa7aceddac4f746a1a6013226896c3fa4e6cdd6",
+      "size_bytes": 56783
+    }
+  },
+  "format_version": 1,
+  "kind": "local_training_attention_execution_ledger",
+  "limitations": [
+    "The source fixture uses projected leaves with H8, two heads and lengths7/512; it is not a published-checkpoint or long-context gradient comparison.",
+    "Tiny managed replay tests prove lifecycle and backend-local continuity on authored data, separately from the nine projected source cases.",
+    "Pure S4096/S16384 graph/planner tests prove bounded admission only, not numerical execution or runtime speed.",
+    "CPU v8 and Metal v1 exact test executable identities are unrecorded. Metal v2 has a directly observed live executable identity and a scoped frozen source inventory, not a full build dependency closure.",
+    "No model download, network service, benchmark, quality/convergence or release claim.",
+    "The external 40 MiB tensor capture stays in /private/tmp and is not enrolled in reference_manifest.json by this ledger."
+  ],
+  "profiles": {
+    "cpu_primitive_default": {
+      "key_tile": 128,
+      "max_work_items": 4294967296,
+      "query_tile": 128,
+      "scratch_bytes": 8388608,
+      "tensor_bytes": 1073741824,
+      "work_unit": "score pairs across forward plus two backward replay sweeps"
+    },
+    "metal_plan_default": {
+      "hard_max_work_items": 70368744177664,
+      "host_metadata_bytes": 134217728,
+      "key_tile": 64,
+      "max_dispatch_work_items": 134217728,
+      "max_head_dim": 256,
+      "max_work_items": 1099511627776,
+      "scalar_readback_bound": "Four bytes per admitted synchronous command; upper bound, not measured telemetry.",
+      "scratch_bytes": 134217728,
+      "tensor_bytes": 1073741824,
+      "threadgroup_bytes": 784,
+      "work_unit": "conservative scalar iterations including all replay and finite validation"
+    },
+    "source_consumer": {
+      "device_activation_readbacks_before_diagnostics": false,
+      "diagnostic_readbacks": "Final context and packed gradients only; no measured transfer-byte claim from a planned bound.",
+      "fixture_owner_bytes": 67108864
+    },
+    "tiny_managed_trainer": {
+      "accumulation": 2,
+      "backend_bytes": 268435456,
+      "batch_size": 2,
+      "combined_bytes": 1073741824,
+      "dropout": 0,
+      "epochs": 2,
+      "examples_per_epoch": 5,
+      "heads": 2,
+      "hidden_size": 4,
+      "host_bytes": 268435456,
+      "layers": 1,
+      "microbatches": 6,
+      "modes": [
+        "full",
+        "heads"
+      ],
+      "optimizer_updates": 4,
+      "source_reservation_bytes": 16777216
+    }
+  },
+  "qualification": false,
+  "source_checkpoint": {
+    "archived_files": [
+      {
+        "original_path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/src/ops/deberta_training_attention_device_test.zig",
+        "path": "source_snapshots/deberta_training_attention_device_test.zig",
+        "sha256": "094d4816b8c6d9c2f94b9bc6a23e7e57b794d5e444f8cc97cffeaa3f1b4ccb13",
+        "size_bytes": 9653
+      }
+    ],
+    "known_changes_after_cpu_v8": [
+      "architectures/deberta_graph.zig and finetune/gliner_boundary_encoder_graph.zig gained semantic region capture/remap metadata and a test; root reports no graph arithmetic change.",
+      "metal_runtime.zig takes the grouping slice from the original aligned control metadata."
+    ],
+    "sources": {
+      "zig/lib/ml/src/graph/node.zig": {
+        "sha256": "4e1ca5abc414b2ba9a14bfbf4f915392c8d415080e99e579144d8794a0d2535d",
+        "size_bytes": 16854
+      },
+      "zig/pkg/inference/scripts/gliner25/capture_training_attention.py": {
+        "sha256": "c67ee517899871b4ad36a11408ff321028ad10ab88f0941aa0c09ef48f6a1a6f",
+        "size_bytes": 20879
+      },
+      "zig/pkg/inference/scripts/gliner25/training_attention_contract_v1.json": {
+        "sha256": "7e512fe4418d006619088093ed7410ddd9a209dcb421954c9fbb14287bbecfcc",
+        "size_bytes": 12057
+      },
+      "zig/pkg/inference/src/architectures/deberta_graph.zig": {
+        "sha256": "11edcfb00d4bd2a1dc205a1830047a145c617f27827fe916ec6b12a20c79824d",
+        "size_bytes": 56652
+      },
+      "zig/pkg/inference/src/backends/metal_kernels.m": {
+        "sha256": "cc09bd01701be5bd1b1451d4ac76ff63430f12e36629871a8592bfa3cb5d55e5",
+        "size_bytes": 4043164
+      },
+      "zig/pkg/inference/src/backends/metal_runtime.zig": {
+        "sha256": "a8b7db6080ed4d66cc4450943a2d92ad4c19cf15855e8f082200bb4612c63de3",
+        "size_bytes": 1854761
+      },
+      "zig/pkg/inference/src/backends/metal_tensor.zig": {
+        "sha256": "b113d47f8d7b3b3b0858916a65e140cb7a3bebc56d08936b34201c49ce904fb4",
+        "size_bytes": 45151
+      },
+      "zig/pkg/inference/src/finetune/gliner_boundary_encoder_graph.zig": {
+        "sha256": "11f6924df5ede0cd8a1cbe254c66f7b9a06d4126aa35ad161d0821eda7d6f1f7",
+        "size_bytes": 46805
+      },
+      "zig/pkg/inference/src/finetune/gliner_boundary_native_trainer_test.zig": {
+        "sha256": "8b30cec44b1459201c5b8c3b97c584ccac9fbb762357034cdd8e53e617574cd0",
+        "size_bytes": 30433
+      },
+      "zig/pkg/inference/src/finetune/gliner_boundary_train_step_test.zig": {
+        "sha256": "49d69280e621a3c605589b10ab7927b7f0a23856daf46d8eee0bf047cb2a887a",
+        "size_bytes": 18761
+      },
+      "zig/pkg/inference/src/ops/deberta_training_attention.zig": {
+        "sha256": "98e2c4c85ce92a8bfd64a197432ead1d4eaa8affef87c1fdaa54025fc26b644b",
+        "size_bytes": 29168
+      },
+      "zig/pkg/inference/src/ops/deberta_training_attention_device.zig": {
+        "sha256": "446ad46d26788168052bc49fafdab1c69eb5e10ff458527cd57ad83a3e8bc20c",
+        "size_bytes": 13116
+      },
+      "zig/pkg/inference/src/ops/deberta_training_attention_device_test.zig": {
+        "sha256": "094d4816b8c6d9c2f94b9bc6a23e7e57b794d5e444f8cc97cffeaa3f1b4ccb13",
+        "size_bytes": 9653
+      },
+      "zig/pkg/inference/src/ops/deberta_training_attention_source_test.zig": {
+        "sha256": "831cd1534093dee68bde5264fbde1db2e05baebb72474f6b7b8dd2088b22a7f6",
+        "size_bytes": 20427
+      },
+      "zig/pkg/inference/src/ops/deberta_training_attention_test.zig": {
+        "sha256": "422c0cb465c1e73397ff7fca92ae4af6f70a7ea6d248ac51846a881133a10d3a",
+        "size_bytes": 27867
+      },
+      "zig/pkg/inference/src/ops/metal_compute.zig": {
+        "sha256": "f592fcfb38b868cac47dab19abe2847c5ca0f2c4f713ce70f49b8ebc2b1f0c96",
+        "size_bytes": 1739509
+      },
+      "zig/pkg/inference/src/ops/native_compute.zig": {
+        "sha256": "35a58df9c04c5dfdea513e2f9a63a5dac2b5834274ec2d543ad7e0a9def645b2",
+        "size_bytes": 2314949
+      },
+      "zig/pkg/inference/src/ops/ops.zig": {
+        "sha256": "750f60ad46f74bcec2106f757f9fcb9b979cdee7c8f0e629aebe27a57fbebfa8",
+        "size_bytes": 241809
+      },
+      "zig/pkg/inference/src/ops/resident_program_ops.zig": {
+        "sha256": "8db8d5747a4b6fd17f16d02389e0ad8a5fc4811fd9737bbaa28e12cddf8218b0",
+        "size_bytes": 22262
+      },
+      "zig/pkg/inference/src/ops/resident_training_groups.zig": {
+        "sha256": "647df6bd4508844d3e057451a29dee69e2ef08014684cb30b58716b20ef16395",
+        "size_bytes": 7390
+      }
+    },
+    "status": "Frozen Metal v2 execution checkpoint; thirteen files additionally verified by the live process receipt. This is a scoped source inventory, not a complete build dependency closure or a retroactive CPU v8 graph snapshot."
+  }
+}

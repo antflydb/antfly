@@ -1,0 +1,8 @@
+# Model-free contract tests only; no numerical model runtime is installed.
+# Exact versions validated separately from requirements.txt's oracle environment.
+iniconfig==2.3.0
+packaging==25.0
+pluggy==1.6.0
+psutil==7.1.3
+Pygments==2.19.2
+pytest==9.0.2

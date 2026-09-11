@@ -1,0 +1,16 @@
+{
+  "argv": [
+    "./.zig-cache/o/a940db83de49c9d87bf685e16272b151/test",
+    "--cache-dir=./.zig-cache",
+    "--seed=0x354c35fa",
+    "--listen=-"
+  ],
+  "create_time": 1789071010.831361,
+  "cwd": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference",
+  "executable": {
+    "path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/.zig-cache/o/a940db83de49c9d87bf685e16272b151/test",
+    "sha256": "085a9babbefd6903960eda752dce31b147c12a08f7be672950a87463c7468738",
+    "size_bytes": 4970984
+  },
+  "pid": 19329
+}

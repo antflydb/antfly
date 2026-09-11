@@ -1,0 +1,70 @@
+{
+  "numerical_modules_loaded": [],
+  "numerical_runtime_executed": false,
+  "plan": {
+    "sha256": "bb2a3e805ebf1fdb2ac79304c91b438a782f3c5dd9120f949bf04e7dae0b38b1",
+    "size_bytes": 26716
+  },
+  "profiles": [
+    {
+      "adapter_tensors": 4,
+      "files_verified": 39,
+      "numerical_runtime_executed": false,
+      "profile": "cpu-lora",
+      "runtime_copy_bytes": 305923317,
+      "source_tensors": 334,
+      "state_sha256": "c9117d337385f29ab2c0c6bd0f59d4435122137a5a8c02a1a51ed7b08070e4fc",
+      "status": "prepared"
+    },
+    {
+      "adapter_tensors": 6,
+      "files_verified": 39,
+      "numerical_runtime_executed": false,
+      "profile": "cpu-dora",
+      "runtime_copy_bytes": 305926614,
+      "source_tensors": 334,
+      "state_sha256": "c4244228f5e7c25d2e0c939a9e951df0f01c79bf5c41365988587f92f3d8f881",
+      "status": "prepared"
+    },
+    {
+      "adapter_tensors": 4,
+      "files_verified": 39,
+      "numerical_runtime_executed": false,
+      "profile": "metal-lora",
+      "runtime_copy_bytes": 305923321,
+      "source_tensors": 334,
+      "state_sha256": "b223f7d34a047d6dabb9677aa8a70656a60deb42c7d1b548ae38b4a83d2e580c",
+      "status": "prepared"
+    },
+    {
+      "adapter_tensors": 6,
+      "files_verified": 39,
+      "numerical_runtime_executed": false,
+      "profile": "metal-dora",
+      "runtime_copy_bytes": 305926616,
+      "source_tensors": 334,
+      "state_sha256": "0a48a8f696666bbcbe5037e773f5647df12260a7411596439f53c6e7837cbe07",
+      "status": "prepared"
+    }
+  ],
+  "qualification": false,
+  "scope": "gliner25_published_inactive_classifier_export_reload_preflight/v1",
+  "supervisor": {
+    "original": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/testdata/gliner25/published_inactive_classifier_cpu_v1/helpers/v2/supervision.py",
+    "sha256": "a937237975be2ed879f62afd285494ccb51a7c1d7cc1dff7160621fb26b87332",
+    "size_bytes": 12474,
+    "snapshot": "/private/tmp/antfly-gliner25-inactive-export-reload-v1/supervision.py"
+  },
+  "test_log": {
+    "sha256": "9a2863943526d98a5a21c8de1c1d94d77c56df03640f50aa6314ed7289ccdbd0",
+    "size_bytes": 1410
+  },
+  "tests": {
+    "sha256": "3e14058b87767fffe20037fa25e088307364c3c2903009ab2fca3dec86c10856",
+    "size_bytes": 7633
+  },
+  "wrapper": {
+    "sha256": "4a8560129f20f1b1f0a4d4c37b93fd091811c65abe6a7e3de90b11b4851b97d9",
+    "size_bytes": 19307
+  }
+}

@@ -10,6 +10,8 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.extraction_input_metadata import ExtractionInputMetadata
+    from ..models.extraction_options import ExtractionOptions
+    from ..models.extraction_schema import ExtractionSchema
     from ..models.extraction_token import ExtractionToken
     from ..models.image_url_content_part import ImageURLContentPart
     from ..models.media_content_part import MediaContentPart
@@ -30,12 +32,20 @@ class ExtractionInput:
         id (str | Unset):
         tokens (list[ExtractionToken] | Unset):
         metadata (ExtractionInputMetadata | Unset):
+        schema (ExtractionSchema | Unset): Version 1 selects one extraction family; entities may accompany relations.
+            With schema_version 2, entities, attributes, classifications, structures,
+            and ordinary relations may share one encoded input. joint_ie is a separate,
+            mutually exclusive typed graph schema. The version 2 compiler rejects
+            unknown fields and validates all references before model execution.
+        options (ExtractionOptions | Unset):
     """
 
     content: list[ImageURLContentPart | MediaContentPart | TextContentPart] | str
     id: str | Unset = UNSET
     tokens: list[ExtractionToken] | Unset = UNSET
     metadata: ExtractionInputMetadata | Unset = UNSET
+    schema: ExtractionSchema | Unset = UNSET
+    options: ExtractionOptions | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -78,6 +88,14 @@ class ExtractionInput:
         if not isinstance(self.metadata, Unset):
             metadata = self.metadata.to_dict()
 
+        schema: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.schema, Unset):
+            schema = self.schema.to_dict()
+
+        options: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.options, Unset):
+            options = self.options.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -91,12 +109,18 @@ class ExtractionInput:
             field_dict["tokens"] = tokens
         if metadata is not UNSET:
             field_dict["metadata"] = metadata
+        if schema is not UNSET:
+            field_dict["schema"] = schema
+        if options is not UNSET:
+            field_dict["options"] = options
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.extraction_input_metadata import ExtractionInputMetadata
+        from ..models.extraction_options import ExtractionOptions
+        from ..models.extraction_schema import ExtractionSchema
         from ..models.extraction_token import ExtractionToken
         from ..models.image_url_content_part import ImageURLContentPart
         from ..models.media_content_part import MediaContentPart
@@ -174,11 +198,27 @@ class ExtractionInput:
         else:
             metadata = ExtractionInputMetadata.from_dict(_metadata)
 
+        _schema = d.pop("schema", UNSET)
+        schema: ExtractionSchema | Unset
+        if isinstance(_schema, Unset):
+            schema = UNSET
+        else:
+            schema = ExtractionSchema.from_dict(_schema)
+
+        _options = d.pop("options", UNSET)
+        options: ExtractionOptions | Unset
+        if isinstance(_options, Unset):
+            options = UNSET
+        else:
+            options = ExtractionOptions.from_dict(_options)
+
         extraction_input = cls(
             content=content,
             id=id,
             tokens=tokens,
             metadata=metadata,
+            schema=schema,
+            options=options,
         )
 
         extraction_input.additional_properties = d

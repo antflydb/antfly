@@ -1,0 +1,40 @@
+{
+  "scope": "live_owned_test_executable_observation/v1",
+  "pid": 10342,
+  "create_time": 1789063791.127076,
+  "observed_unix_time": 1789064025.436482,
+  "argv": [
+    "./.zig-cache/o/7c3502932c6768be207394a4b97d0f64/test",
+    "--test-filter",
+    "resident regional composed step Metal",
+    "--test-filter",
+    "regional recomputation",
+    "--test-filter",
+    "boundary training limits",
+    "--test-filter",
+    "boundary training job regional numeric limits",
+    "--test-filter",
+    "boundary training step control composition",
+    "--test-filter",
+    "seeded gradient trainer binding control preserves",
+    "--test-filter",
+    "seeded gradient trainer resident Metal",
+    "--test-filter",
+    "seeded device transaction"
+  ],
+  "cwd": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference",
+  "executable": {
+    "path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/.zig-cache/o/7c3502932c6768be207394a4b97d0f64/test",
+    "size_bytes": 52470600,
+    "sha256": "f366f03f65ec494a00c3f385d7c182b324f2b3957469d4f8d007ff82e8918b83"
+  },
+  "stat": {
+    "device": 16777232,
+    "inode": 97665778,
+    "mtime_ns": 1789063791033232290
+  },
+  "source_inventory": "source_inventory.json",
+  "limits": [
+    "Specific live process and executable only; source inventory is not a complete dependency closure."
+  ]
+}

@@ -1,0 +1,3 @@
+1/42 server.model_manager.test.model manager teardown supervised child fixture...teardown-fixture operation-start:shutdown
+teardown-fixture close-entered lease-held64
+[default] (err): uninterruptible inference request expired; terminating supervised worker err=Timeout

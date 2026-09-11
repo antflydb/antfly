@@ -1,0 +1,892 @@
+{
+  "cases": [
+    {
+      "ids": [
+        14287
+      ],
+      "normalized": "é",
+      "text": "é",
+      "tiny_ids": [
+        2
+      ],
+      "tokens": [
+        "▁é"
+      ]
+    },
+    {
+      "ids": [
+        15924
+      ],
+      "normalized": "café",
+      "text": "café",
+      "tiny_ids": [
+        3
+      ],
+      "tokens": [
+        "▁café"
+      ]
+    },
+    {
+      "ids": [
+        14287,
+        1204
+      ],
+      "normalized": " é x",
+      "text": " é  x\t\n",
+      "tiny_ids": [
+        2,
+        8
+      ],
+      "tokens": [
+        "▁é",
+        "▁x"
+      ]
+    },
+    {
+      "ids": [
+        9681,
+        126299
+      ],
+      "normalized": "à̕",
+      "text": "à̕",
+      "tiny_ids": [
+        1,
+        0
+      ],
+      "tokens": [
+        "▁à",
+        "̕"
+      ]
+    },
+    {
+      "ids": [
+        37483
+      ],
+      "normalized": "Å",
+      "text": "Å",
+      "tiny_ids": [
+        1,
+        0
+      ],
+      "tokens": [
+        "▁Å"
+      ]
+    },
+    {
+      "ids": [
+        56509,
+        115650
+      ],
+      "normalized": "क़",
+      "text": "क़",
+      "tiny_ids": [
+        1,
+        0
+      ],
+      "tokens": [
+        "▁क",
+        "़"
+      ]
+    },
+    {
+      "ids": [
+        507,
+        90489
+      ],
+      "normalized": "각",
+      "text": "각",
+      "tiny_ids": [
+        1,
+        0
+      ],
+      "tokens": [
+        "▁",
+        "각"
+      ]
+    },
+    {
+      "ids": [
+        59070
+      ],
+      "normalized": "İ",
+      "text": "İ",
+      "tiny_ids": [
+        1,
+        0
+      ],
+      "tokens": [
+        "▁İ"
+      ]
+    },
+    {
+      "ids": [
+        584,
+        115544
+      ],
+      "normalized": "i̇",
+      "text": "i̇",
+      "tiny_ids": [
+        1,
+        0
+      ],
+      "tokens": [
+        "▁i",
+        "̇"
+      ]
+    },
+    {
+      "ids": [
+        507,
+        123769,
+        81229,
+        507,
+        30794
+      ],
+      "normalized": "ΌΣ ς",
+      "text": "ΌΣ ς",
+      "tiny_ids": [
+        1,
+        0,
+        1,
+        0
+      ],
+      "tokens": [
+        "▁",
+        "Ό",
+        "Σ",
+        "▁",
+        "ς"
+      ]
+    },
+    {
+      "ids": [
+        507,
+        105590,
+        118398,
+        126550
+      ],
+      "normalized": "東京🙂",
+      "text": "東京🙂",
+      "tiny_ids": [
+        1,
+        0
+      ],
+      "tokens": [
+        "▁",
+        "東",
+        "京",
+        "🙂"
+      ]
+    },
+    {
+      "ids": [
+        266,
+        3,
+        1285
+      ],
+      "normalized": "a🫨🫨b",
+      "text": "a🫨🫨b",
+      "tiny_ids": [
+        4,
+        0,
+        6
+      ],
+      "tokens": [
+        "▁a",
+        "🫨🫨",
+        "b"
+      ]
+    },
+    {
+      "ids": [
+        507,
+        3,
+        982
+      ],
+      "normalized": " x",
+      "text": " x ",
+      "tiny_ids": [
+        1,
+        0,
+        9
+      ],
+      "tokens": [
+        "▁",
+        " ",
+        "x"
+      ]
+    },
+    {
+      "ids": [
+        507,
+        3,
+        982
+      ],
+      "normalized": "\u000bx",
+      "text": "\u000bx\u000b",
+      "tiny_ids": [
+        1,
+        0,
+        9
+      ],
+      "tokens": [
+        "▁",
+        "\u000b",
+        "x"
+      ]
+    },
+    {
+      "ids": [
+        507,
+        3,
+        982
+      ],
+      "normalized": "x",
+      "text": "x",
+      "tiny_ids": [
+        1,
+        0,
+        9
+      ],
+      "tokens": [
+        "▁",
+        "",
+        "x"
+      ]
+    },
+    {
+      "ids": [
+        507,
+        3,
+        982,
+        3
+      ],
+      "normalized": "\u001cx\u001c",
+      "text": "\u001cx\u001c",
+      "tiny_ids": [
+        1,
+        0,
+        9,
+        0
+      ],
+      "tokens": [
+        "▁",
+        "\u001c",
+        "x",
+        "\u001c"
+      ]
+    },
+    {
+      "ids": [
+        266,
+        2165
+      ],
+      "normalized": "a b",
+      "text": "a\t\t b",
+      "tiny_ids": [
+        4,
+        7
+      ],
+      "tokens": [
+        "▁a",
+        "▁b"
+      ]
+    },
+    {
+      "ids": [
+        1204,
+        2165
+      ],
+      "normalized": "x b",
+      "text": "x  b",
+      "tiny_ids": [
+        8,
+        7
+      ],
+      "tokens": [
+        "▁x",
+        "▁b"
+      ]
+    },
+    {
+      "ids": [
+        14287,
+        128002,
+        1204
+      ],
+      "normalized": "é[SEP_TEXT]x",
+      "text": "é[SEP_TEXT]x",
+      "tiny_ids": [
+        2,
+        11,
+        8
+      ],
+      "tokens": [
+        "▁é",
+        "[SEP_TEXT]",
+        "▁x"
+      ]
+    },
+    {
+      "ids": [
+        266,
+        128002,
+        1204
+      ],
+      "normalized": "a [SEP_TEXT] x",
+      "text": "a [SEP_TEXT]  x ",
+      "tiny_ids": [
+        4,
+        11,
+        8
+      ],
+      "tokens": [
+        "▁a",
+        "[SEP_TEXT]",
+        "▁x"
+      ]
+    },
+    {
+      "ids": [
+        128002,
+        1204
+      ],
+      "normalized": "[SEP_TEXT]x",
+      "text": "[SEP_TEXT]x",
+      "tiny_ids": [
+        11,
+        8
+      ],
+      "tokens": [
+        "[SEP_TEXT]",
+        "▁x"
+      ]
+    },
+    {
+      "ids": [
+        266
+      ],
+      "normalized": "▁a",
+      "text": "▁a",
+      "tiny_ids": [
+        4
+      ],
+      "tokens": [
+        "▁a"
+      ]
+    },
+    {
+      "ids": [
+        266,
+        2165
+      ],
+      "normalized": "a▁b",
+      "text": "a▁b",
+      "tiny_ids": [
+        4,
+        7
+      ],
+      "tokens": [
+        "▁a",
+        "▁b"
+      ]
+    },
+    {
+      "ids": [],
+      "normalized": "",
+      "text": " ",
+      "tiny_ids": [],
+      "tokens": []
+    },
+    {
+      "ids": [],
+      "normalized": "",
+      "text": "",
+      "tiny_ids": [],
+      "tokens": []
+    },
+    {
+      "ids": [
+        11799,
+        126550,
+        452,
+        126550
+      ],
+      "normalized": "🙂🙂a🙂",
+      "text": "🙂🙂a🙂",
+      "tiny_ids": [
+        1,
+        0,
+        5,
+        0
+      ],
+      "tokens": [
+        "▁🙂",
+        "🙂",
+        "a",
+        "🙂"
+      ]
+    },
+    {
+      "ids": [
+        3597,
+        294,
+        320,
+        320,
+        28748,
+        260,
+        549,
+        320,
+        452,
+        1143,
+        1683,
+        28748,
+        260,
+        549,
+        1944,
+        26359
+      ],
+      "normalized": "https://example.com/a user@example.com @User",
+      "text": "https://example.com/a user@example.com @User",
+      "tiny_ids": [
+        1,
+        0,
+        9,
+        5,
+        0,
+        5,
+        1,
+        0,
+        9,
+        5,
+        0,
+        1,
+        0
+      ],
+      "tokens": [
+        "▁https",
+        ":",
+        "/",
+        "/",
+        "example",
+        ".",
+        "com",
+        "/",
+        "a",
+        "▁user",
+        "@",
+        "example",
+        ".",
+        "com",
+        "▁@",
+        "User"
+      ]
+    },
+    {
+      "ids": [
+        9681,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        122992,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299,
+        126299
+      ],
+      "normalized": "à̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕",
+      "text": "à̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̀̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕̕",
+      "tiny_ids": [
+        1,
+        0
+      ],
+      "tokens": [
+        "▁à",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̀",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕",
+        "̕"
+      ]
+    }
+  ],
+  "format_version": 1,
+  "generator_sha256": "a34764b728601a6e3c6603aa4fe0b50d1a3c6f779c609f604339741cb370eeab",
+  "model": {
+    "directory": "/private/tmp/antfly-gliner25-models/small",
+    "files": {
+      "config.json": {
+        "sha256": "0b7d9e1401ceeb83e992ec66d2f93bff7e5646428f1b4706ec527cf88f53578a",
+        "size_bytes": 3152
+      },
+      "encoder_config/config.json": {
+        "sha256": "db837d0dc587f5858687ef860c1f400de10f3c3e44f88daef8cbda80d74e4c9c",
+        "size_bytes": 856
+      },
+      "model.safetensors": {
+        "sha256": "4ee982787ace270d4bf15dbcb28ced38e0aa201372347114ceedd6336055de2b",
+        "size_bytes": 295567700
+      },
+      "tokenizer.json": {
+        "sha256": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3",
+        "size_bytes": 8341713
+      },
+      "tokenizer_config.json": {
+        "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1",
+        "size_bytes": 645
+      }
+    },
+    "model_id": "fastino/gliner2.5-small-v1",
+    "revision": "cab1bddfd30fda7b803a4691c41f90378a2d517a"
+  },
+  "native_runtime_qualified": false,
+  "normalizer": {
+    "normalizers": [
+      {
+        "content": " ",
+        "pattern": {
+          "Regex": "\\s{2,}|[\\n\\r\\t]"
+        },
+        "type": "Replace"
+      },
+      {
+        "type": "NFC"
+      },
+      {
+        "strip_left": false,
+        "strip_right": true,
+        "type": "Strip"
+      }
+    ],
+    "type": "Sequence"
+  },
+  "provenance": {
+    "checkout": "/private/tmp/antfly-gliner25-upstream",
+    "commit": "3c913c7369301133d3b7699252074c4303ada50e",
+    "device": "cpu",
+    "dtype": "float32",
+    "imports": {
+      "gliner2": "/private/tmp/antfly-gliner25-upstream/gliner2/__init__.py",
+      "gliner2.api_client": "/private/tmp/antfly-gliner25-upstream/gliner2/api_client.py",
+      "gliner2.auto": "/private/tmp/antfly-gliner25-upstream/gliner2/auto.py",
+      "gliner2.configuration": "/private/tmp/antfly-gliner25-upstream/gliner2/configuration.py",
+      "gliner2.inference": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/__init__.py",
+      "gliner2.inference.candidate_decoder": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/candidate_decoder.py",
+      "gliner2.inference.chunking": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/chunking.py",
+      "gliner2.inference.engine": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/engine.py",
+      "gliner2.inference.overlap": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/overlap.py",
+      "gliner2.inference.runtime": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/runtime.py",
+      "gliner2.inference.schema": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/schema.py",
+      "gliner2.inference.schema_model": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/schema_model.py",
+      "gliner2.layers": "/private/tmp/antfly-gliner25-upstream/gliner2/layers.py",
+      "gliner2.models": "/private/tmp/antfly-gliner25-upstream/gliner2/models/__init__.py",
+      "gliner2.models.base": "/private/tmp/antfly-gliner25-upstream/gliner2/models/base.py",
+      "gliner2.models.boundary": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/__init__.py",
+      "gliner2.models.boundary.constants": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/constants.py",
+      "gliner2.models.boundary.content": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/content.py",
+      "gliner2.models.boundary.encoding": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/encoding.py",
+      "gliner2.models.boundary.engine": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/engine.py",
+      "gliner2.models.boundary.heads": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/heads.py",
+      "gliner2.models.boundary.indexing": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/indexing.py",
+      "gliner2.models.boundary.losses": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/losses.py",
+      "gliner2.models.boundary.model": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/model.py",
+      "gliner2.models.boundary.pool": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/pool.py",
+      "gliner2.models.boundary.proposal": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/proposal.py",
+      "gliner2.models.boundary.records": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/records.py",
+      "gliner2.models.boundary.relations": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/relations.py",
+      "gliner2.models.boundary.rotary": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/rotary.py",
+      "gliner2.models.boundary.scoring": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/scoring.py",
+      "gliner2.models.boundary.targets_device": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/targets_device.py",
+      "gliner2.models.boundary.validation": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/validation.py",
+      "gliner2.models.candidates": "/private/tmp/antfly-gliner25-upstream/gliner2/models/candidates.py",
+      "gliner2.models.loading": "/private/tmp/antfly-gliner25-upstream/gliner2/models/loading.py",
+      "gliner2.models.outputs": "/private/tmp/antfly-gliner25-upstream/gliner2/models/outputs.py",
+      "gliner2.models.span": "/private/tmp/antfly-gliner25-upstream/gliner2/models/span/__init__.py",
+      "gliner2.models.span.model": "/private/tmp/antfly-gliner25-upstream/gliner2/models/span/model.py",
+      "gliner2.processing": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/__init__.py",
+      "gliner2.processing.layouts": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/layouts.py",
+      "gliner2.processing.records": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/records.py",
+      "gliner2.processing.targets": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/targets.py",
+      "gliner2.processing.word_splitter": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/word_splitter.py",
+      "gliner2.processor": "/private/tmp/antfly-gliner25-upstream/gliner2/processor.py",
+      "gliner2.training": "/private/tmp/antfly-gliner25-upstream/gliner2/training/__init__.py",
+      "gliner2.training.data": "/private/tmp/antfly-gliner25-upstream/gliner2/training/data.py",
+      "gliner2.training.matching": "/private/tmp/antfly-gliner25-upstream/gliner2/training/matching.py",
+      "gliner2.training.sampler": "/private/tmp/antfly-gliner25-upstream/gliner2/training/sampler.py",
+      "gliner2.training.trainer": "/private/tmp/antfly-gliner25-upstream/gliner2/training/trainer.py",
+      "gliner2.utils": "namespace:/private/tmp/antfly-gliner25-upstream/gliner2/utils",
+      "gliner2.utils.device_errors": "/private/tmp/antfly-gliner25-upstream/gliner2/utils/device_errors.py",
+      "gliner2.utils.sync_probe": "/private/tmp/antfly-gliner25-upstream/gliner2/utils/sync_probe.py"
+    },
+    "platform": {
+      "machine": "arm64",
+      "system": "Darwin"
+    },
+    "runtime": {
+      "packages": {
+        "PyYAML": "6.0.3",
+        "accelerate": "1.10.1",
+        "huggingface-hub": "0.36.0",
+        "numpy": "2.3.5",
+        "packaging": "25.0",
+        "peft": "0.17.1",
+        "psutil": "7.1.3",
+        "pydantic": "2.12.3",
+        "requests": "2.32.5",
+        "safetensors": "0.7.0",
+        "scipy": "1.16.3",
+        "tokenizers": "0.21.4",
+        "torch": "2.9.1",
+        "transformers": "4.55.4",
+        "urllib3": "2.5.0"
+      },
+      "python": "3.12.3",
+      "unicode": "15.0.0"
+    },
+    "threads": 1
+  },
+  "real_model_qualified": false,
+  "scope": "tokenizer_reference",
+  "training_qualified": false
+}

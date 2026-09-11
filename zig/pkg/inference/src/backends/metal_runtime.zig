@@ -2539,6 +2539,47 @@ pub fn decoderRuntimeQuantEmbeddingLookup(
     dim: usize,
     scale: f32,
 ) !?MetalTensor {
+    return decoderRuntimeQuantEmbeddingLookupBounded(self, storage, ids, total, dim, scale, false);
+}
+
+/// Disabling mapping keeps the prepared allocation equal to the charged raw
+/// table bytes, independent of the surrounding artifact's mapping extent.
+pub fn decoderRuntimeQuantEmbeddingLookupBounded(
+    self: anytype,
+    storage: *const QuantizedStorage,
+    ids: []const i64,
+    total: usize,
+    dim: usize,
+    scale: f32,
+    disable_mapping: bool,
+) !?MetalTensor {
+    return decoderRuntimeQuantEmbeddingLookupImpl(self, storage, ids, total, dim, scale, disable_mapping, null);
+}
+
+/// The strict caller owns both index metadata and output ownership records.
+pub fn decoderRuntimeQuantEmbeddingLookupWithAllocator(
+    self: anytype,
+    allocator: std.mem.Allocator,
+    storage: *const QuantizedStorage,
+    ids: []const i64,
+    total: usize,
+    dim: usize,
+    scale: f32,
+) !?MetalTensor {
+    try requireGlinerBoundaryReady(self.raw_decode_runtime);
+    return decoderRuntimeQuantEmbeddingLookupImpl(self, storage, ids, total, dim, scale, true, allocator);
+}
+
+fn decoderRuntimeQuantEmbeddingLookupImpl(
+    self: anytype,
+    storage: *const QuantizedStorage,
+    ids: []const i64,
+    total: usize,
+    dim: usize,
+    scale: f32,
+    disable_mapping: bool,
+    allocator: ?std.mem.Allocator,
+) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     const kind = quantizedRuntimeLinearKind(storage);
@@ -2549,8 +2590,9 @@ pub fn decoderRuntimeQuantEmbeddingLookup(
     const rows = quantizedEmbeddingRows(storage, dim) orelse return null;
     if (ids.len != total) return null;
 
-    const ids_u32 = try std.heap.c_allocator.alloc(u32, total);
-    defer std.heap.c_allocator.free(ids_u32);
+    const metadata_allocator = allocator orelse std.heap.c_allocator;
+    const ids_u32 = try metadata_allocator.alloc(u32, total);
+    defer metadata_allocator.free(ids_u32);
     for (ids, 0..) |id, i| {
         if (id < 0) return null;
         const idx: usize = @intCast(id);
@@ -2558,9 +2600,16 @@ pub fn decoderRuntimeQuantEmbeddingLookup(
         ids_u32[i] = @intCast(idx);
     }
 
+    const shape = [_]i32{ @intCast(total), @intCast(dim) };
+    var output: ?MetalTensor = if (allocator) |owner|
+        try MetalTensor.deviceAllocateWithAllocator(owner, runtime, total * dim * @sizeOf(f32), .private, &shape)
+    else
+        null;
+    defer if (output) |*owned| owned.deinit();
+
     const source_bytes = storage.raw_bytes;
-    const mapped_forced = quantMappedWeightsForced();
-    const mapped_span = if (!quantMappedWeightsDisabled()) mappedQuantRawSpan(storage, source_bytes, @alignOf(u16)) else null;
+    const mapped_forced = !disable_mapping and quantMappedWeightsForced();
+    const mapped_span = if (!disable_mapping and !quantMappedWeightsDisabled()) mappedQuantRawSpan(storage, source_bytes, @alignOf(u16)) else null;
     var prepared = false;
     if (mapped_span) |span| {
         incrementRuntimeQuantMappedAttempts(self);
@@ -2598,9 +2647,7 @@ pub fn decoderRuntimeQuantEmbeddingLookup(
         if (prep_rc != 0) return null;
     }
 
-    const shape = [_]i32{ @intCast(total), @intCast(dim) };
-    var output = try MetalTensor.deviceAllocate(runtime, total * dim * @sizeOf(f32), .private, &shape);
-    errdefer output.deinit();
+    if (output == null) output = try MetalTensor.deviceAllocate(runtime, total * dim * @sizeOf(f32), .private, &shape);
     const lookup_rc = termite_metal_decode_runtime_quant_embedding_lookup_prepared_device(
         runtime,
         @intFromEnum(format),
@@ -2608,10 +2655,13 @@ pub fn decoderRuntimeQuantEmbeddingLookup(
         total,
         dim,
         scale,
-        output.deviceHandle(),
-        output.deviceByteOffset(),
+        output.?.deviceHandle(),
+        output.?.deviceByteOffset(),
     );
-    return finishDeviceOutput(&output, lookup_rc);
+    if (lookup_rc != 0) return null;
+    const result = output.?;
+    output = null;
+    return result;
 }
 
 fn quantizedEmbeddingRows(storage: *const QuantizedStorage, dim: usize) ?usize {
@@ -2736,14 +2786,41 @@ pub fn decoderRuntimeNativeF16EmbeddingLookup(
     dim: usize,
     rows: usize,
 ) !?MetalTensor {
+    return decoderRuntimeNativeF16EmbeddingLookupImpl(self, bytes, mmap_source_bytes, ids, total, dim, rows, null);
+}
+
+pub fn decoderRuntimeNativeF16EmbeddingLookupWithAllocator(
+    self: anytype,
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    ids: []const i64,
+    total: usize,
+    dim: usize,
+    rows: usize,
+) !?MetalTensor {
+    try requireGlinerBoundaryReady(self.raw_decode_runtime);
+    return decoderRuntimeNativeF16EmbeddingLookupImpl(self, bytes, null, ids, total, dim, rows, allocator);
+}
+
+fn decoderRuntimeNativeF16EmbeddingLookupImpl(
+    self: anytype,
+    bytes: []const u8,
+    mmap_source_bytes: ?[]const u8,
+    ids: []const i64,
+    total: usize,
+    dim: usize,
+    rows: usize,
+    allocator: ?std.mem.Allocator,
+) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (total == 0 or dim == 0 or rows == 0 or ids.len != total) return null;
     const expected_bytes = std.math.mul(usize, try std.math.mul(usize, rows, dim), @sizeOf(u16)) catch return null;
     if (bytes.len < expected_bytes) return null;
 
-    const ids_u32 = try std.heap.c_allocator.alloc(u32, total);
-    defer std.heap.c_allocator.free(ids_u32);
+    const metadata_allocator = allocator orelse std.heap.c_allocator;
+    const ids_u32 = try metadata_allocator.alloc(u32, total);
+    defer metadata_allocator.free(ids_u32);
     for (ids, 0..) |id, i| {
         if (id < 0) return null;
         const idx: usize = @intCast(id);
@@ -2752,7 +2829,10 @@ pub fn decoderRuntimeNativeF16EmbeddingLookup(
     }
 
     const shape = [_]i32{ @intCast(total), @intCast(dim) };
-    var output = try MetalTensor.deviceAllocate(runtime, total * dim * @sizeOf(f32), .private, &shape);
+    var output = if (allocator) |owner|
+        try MetalTensor.deviceAllocateWithAllocator(owner, runtime, total * dim * @sizeOf(f32), .private, &shape)
+    else
+        try MetalTensor.deviceAllocate(runtime, total * dim * @sizeOf(f32), .private, &shape);
     errdefer output.deinit();
 
     var prepared = false;
@@ -6475,6 +6555,116 @@ pub fn decoderRuntimeGlinerWordEmbeddingsF32Device(
     return finishDeviceOutput(&output_device, rc);
 }
 
+/// GLiNER2.5 strict resident primitives. A rejected device dispatch returns
+/// null after releasing its output; this path never materializes host data.
+pub fn requireGlinerBoundaryReady(runtime: ?*anyopaque) !void {
+    if (comptime !build_options.enable_metal) return error.UnsupportedGlinerBoundaryDevice;
+    if (termite_metal_decode_runtime_gliner_boundary_ready(runtime) == 0)
+        return error.UnsupportedGlinerBoundaryDevice;
+}
+
+extern fn termite_metal_decode_runtime_gliner_boundary_ready(runtime: ?*anyopaque) c_int;
+
+extern fn termite_metal_gliner_boundary_safe_compile_failure_test(probe: *const fn (*anyopaque) callconv(.c) c_int) c_int;
+
+test "strict GLiNER boundary rejects failed safe compilation before dispatch allocation" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const Probe = struct {
+        fn strict(runtime: *anyopaque) callconv(.c) c_int {
+            const provider = .{ .raw_decode_runtime = @as(?*RawMetalDecodeRuntime, @ptrCast(runtime)) };
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+            var kernel = ops.gliner_boundary_device.Kernel{ .kind = .add };
+            kernel.dims[0] = 1;
+            const inputs: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
+            // A missing guard reaches the failing allocator instead of a
+            // real device. The injected runtime contains populated fallback
+            // pipeline slots, so checking for a nil pipeline cannot pass.
+            if (decoderRuntimeGlinerBoundaryDevice(&provider, failing.allocator(), kernel, inputs)) |_| {
+                return -11;
+            } else |err| if (err != error.UnsupportedGlinerBoundaryDevice) return -12;
+            var value = [_]f32{1};
+            const host = MetalTensor.borrowed(&value, 1, &.{1});
+            if (decoderRuntimeGlinerBoundaryIntoDevice(&provider, kernel, inputs, host)) |_| {
+                return -13;
+            } else |err| if (err != error.UnsupportedGlinerBoundaryDevice) return -14;
+            if (decoderRuntimeDotGeneral2DF32DeviceWithAllocator(&provider, failing.allocator(), host, host, 1, 1, 1, 1)) |_| {
+                return -15;
+            } else |err| if (err != error.UnsupportedGlinerBoundaryDevice) return -16;
+            if (failing.has_induced_failure) return -17;
+            return 0;
+        }
+    };
+    const before = metal_tensor.memoryStatsSnapshot();
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_gliner_boundary_safe_compile_failure_test(Probe.strict));
+    const after = metal_tensor.memoryStatsSnapshot();
+    try std.testing.expectEqual(before.device_owned_buffers_created, after.device_owned_buffers_created);
+    try std.testing.expectEqual(before.device_owned_live_bytes, after.device_owned_live_bytes);
+}
+
+pub fn decoderRuntimeGlinerBoundaryDevice(
+    self: anytype,
+    allocator: std.mem.Allocator,
+    request: ops.gliner_boundary_device.Kernel,
+    inputs: [ops.gliner_boundary_device.max_inputs]?MetalTensor,
+) !?MetalTensor {
+    try requireGlinerBoundaryReady(self.raw_decode_runtime);
+    const runtime = self.raw_decode_runtime orelse return null;
+    const layout = try request.layout();
+    const output_shape = [_]i32{@intCast(layout.output_elements)};
+    var output = try MetalTensor.deviceAllocateWithAllocator(allocator, runtime, try std.math.mul(usize, layout.output_elements, 4), .private, &output_shape);
+    errdefer output.deinit();
+    if (try decoderRuntimeGlinerBoundaryIntoDevice(self, request, inputs, output)) return output;
+    output.deinit();
+    return null;
+}
+
+/// Caller owns initialized output storage. This variant permits sparse
+/// disjoint writes and bounded scalar views without allocating a second copy.
+pub fn decoderRuntimeGlinerBoundaryIntoDevice(
+    self: anytype,
+    request: ops.gliner_boundary_device.Kernel,
+    inputs: [ops.gliner_boundary_device.max_inputs]?MetalTensor,
+    output: MetalTensor,
+) !bool {
+    try requireGlinerBoundaryReady(self.raw_decode_runtime);
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    const layout = try request.layout();
+    var handles: [ops.gliner_boundary_device.max_inputs]?*anyopaque = @splat(null);
+    var offsets: [ops.gliner_boundary_device.max_inputs]usize = @splat(0);
+    var bytes: [ops.gliner_boundary_device.max_inputs]usize = @splat(0);
+    for (layout.input_elements, 0..) |count, i| {
+        if (count == 0) {
+            if (inputs[i] != null) return error.InvalidBoundaryDeviceShape;
+            continue;
+        }
+        const tensor = inputs[i] orelse return error.InvalidBoundaryDeviceShape;
+        bytes[i] = try std.math.mul(usize, count, if (request.kind == .cast_half and i == 0) @as(usize, 2) else 4);
+        if (!tensor.isDevice() or tensor.elemCount() != count or tensor.deviceByteLen() != bytes[i])
+            return error.InvalidBoundaryDeviceShape;
+        handles[i] = tensor.deviceHandle();
+        offsets[i] = tensor.deviceByteOffset();
+    }
+    if (!output.isDevice() or output.dtype != .f32 or output.elemCount() != layout.output_elements)
+        return error.InvalidBoundaryDeviceShape;
+    const params = request.params();
+    const rc = termite_metal_decode_runtime_gliner_boundary_device(runtime, &handles, &offsets, &bytes, &params, output.deviceHandle(), output.deviceByteOffset(), layout.output_elements, layout.work_items, @intFromBool(layout.simd_groups));
+    return rc == 0;
+}
+
+extern fn termite_metal_decode_runtime_gliner_boundary_device(
+    runtime: ?*anyopaque,
+    input_handles: [*]const ?*anyopaque,
+    input_offsets: [*]const usize,
+    input_bytes: [*]const usize,
+    params: *const ops.gliner_boundary_device.Params,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+    output_elements: usize,
+    work_items: usize,
+    simd_groups: u32,
+) c_int;
+
 pub fn decoderRuntimeConcatLastDimF32_2DDevice(
     self: anytype,
     a: MetalTensor,
@@ -6858,6 +7048,266 @@ pub fn decoderRuntimeFlorenceChannelAttentionF32Device(
     return finishDeviceOutput(&output_device, rc);
 }
 
+const training_attention_device = @import("../ops/deberta_training_attention_device.zig");
+const TrainingAttentionControl = @import("../execution_control.zig").InferenceExecutionControl;
+
+/// Versioned POD ABI, mirrored in metal_kernels.m and its dedicated MSL source.
+/// Four input leaves, output, row scratch, three integer group descriptors,
+/// and a four-byte shared finite-status scalar. No activation host pointers.
+const DebertaTrainingAttentionV1Buffer = extern struct {
+    handle: ?*anyopaque = null,
+    offset: usize = 0,
+    bytes: usize = 0,
+
+    fn from(tensor: MetalTensor) DebertaTrainingAttentionV1Buffer {
+        return .{ .handle = tensor.deviceHandle(), .offset = tensor.deviceByteOffset(), .bytes = tensor.deviceByteLen() };
+    }
+};
+const DebertaTrainingAttentionV1Phase = enum(u32) { validate_f32, validate_control, zero, forward, rows, dq, dkdv, relative };
+const DebertaTrainingAttentionV1Params = extern struct {
+    batch: u32,
+    sequence: u32,
+    heads: u32,
+    dimension: u32,
+    relative_rows: u32,
+    phase: DebertaTrainingAttentionV1Phase = .validate_f32,
+    begin: u32 = 0,
+    count: u32 = 0,
+    batch_index: u32 = 0,
+    group_count: u32 = 0,
+    operand: u32 = 0,
+    threads: u32,
+    head_index: u32 = 0,
+    group_begin: u32 = 0,
+    order_begin: u32 = 0,
+    order_count: u32 = 0,
+    dropout_threshold: u32,
+    dropout_scale: f32,
+    attention_scale: f32,
+    backward: u32,
+    dropout_stream: u64,
+};
+comptime {
+    if (@sizeOf(DebertaTrainingAttentionV1Buffer) != 24 or @sizeOf(DebertaTrainingAttentionV1Params) != 88 or
+        @offsetOf(DebertaTrainingAttentionV1Params, "dropout_stream") != 80)
+        @compileError("DeBERTa training attention V1 Metal ABI mismatch");
+}
+
+fn trainingAttentionCheck(control: ?TrainingAttentionControl) !void {
+    if (control) |active| try active.check();
+}
+
+fn trainingAttentionTensor(tensor: MetalTensor, runtime: *RawMetalDecodeRuntime, dtype: metal_tensor.DType, shape: []const i32, elements: usize) !void {
+    const device = tensor.device orelse return error.ResidentTrainingRequiresDeviceTensor;
+    if (device.ref.runtime != @as(*anyopaque, @ptrCast(runtime))) return error.ForeignResidentTrainingTensor;
+    if (tensor.dtype != dtype or !std.mem.eql(i32, tensor.shape(), shape) or tensor.elemCount() != elements or
+        tensor.deviceByteLen() != elements * 4 or tensor.deviceHandle() == null)
+        return error.InvalidDebertaTrainingAttentionShape;
+}
+
+fn trainingAttentionDispatch(runtime: *RawMetalDecodeRuntime, refs: *const [10]DebertaTrainingAttentionV1Buffer, params: *const DebertaTrainingAttentionV1Params, control: ?TrainingAttentionControl) !void {
+    try trainingAttentionCheck(control);
+    // Every dispatch rejects external frames, owns its command buffer and
+    // waits for completion. Caller watchdog coverage is retained through this
+    // wait and cleanup; cancellation is observed between bounded waves.
+    switch (termite_metal_decode_runtime_deberta_training_attention_v1_dispatch(runtime, refs, params)) {
+        0 => {},
+        -1 => return error.InvalidDebertaTrainingAttentionShape,
+        -2 => return error.UnsupportedDebertaTrainingAttentionProfile,
+        -3 => return error.ResidentTrainingExternalFrame,
+        -5 => return error.MetalEncoderAllocationFailed,
+        -6 => return error.NonFiniteDebertaTrainingAttention,
+        -7 => return error.InvalidDebertaTrainingAttentionControl,
+        else => return error.MetalDebertaTrainingAttentionFailed,
+    }
+    try trainingAttentionCheck(control);
+}
+
+/// Strict resident attention: no optional return and no legacy/host fallback.
+/// The integer values are the immutable metadata retained by the same-owner
+/// physical i32 upload. All learned payloads remain on the device. `allocator`
+/// must belong to the backend's admitted host owner; the returned tensor is
+/// independent and all row/group scratch is released before returning.
+pub fn decoderRuntimeDebertaTrainingAttentionV1Device(
+    self: anytype,
+    allocator: std.mem.Allocator,
+    qkv: MetalTensor,
+    relative: MetalTensor,
+    control_tensor: MetalTensor,
+    control_values: []const i32,
+    d_out: ?MetalTensor,
+    attrs: training_attention_device.Attrs,
+    admitted: training_attention_device.Plan,
+    control: ?TrainingAttentionControl,
+) !MetalTensor {
+    if (!build_options.enable_metal) return error.UnsupportedDebertaTrainingAttentionProfile;
+    try trainingAttentionCheck(control);
+    const checked = try training_attention_device.plan(attrs, d_out != null, admitted.limits);
+    if (!std.meta.eql(admitted, checked)) return error.InvalidDebertaTrainingAttentionPlan;
+    const runtime = self.raw_decode_runtime orelse return error.UnsupportedDebertaTrainingAttentionProfile;
+    if (hasActiveFrame(runtime) or hasSubmittedFrame(runtime)) return error.ResidentTrainingExternalFrame;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return error.UnsupportedDebertaTrainingAttentionProfile;
+    const layout = try attrs.layout();
+    const qkv_shape = [_]i32{ @intCast(layout.qkv_rows), @intCast(layout.hidden) };
+    const relative_shape = [_]i32{ @intCast(layout.relative_packed_rows), @intCast(layout.hidden) };
+    const output_shape = [_]i32{ @intCast(if (d_out != null) layout.gradient_rows else layout.batch_tokens), @intCast(layout.hidden) };
+    const dout_shape = [_]i32{ @intCast(layout.batch_tokens), @intCast(layout.hidden) };
+    try trainingAttentionTensor(qkv, runtime, .f32, &qkv_shape, admitted.input_elements[0]);
+    try trainingAttentionTensor(relative, runtime, .f32, &relative_shape, admitted.input_elements[1]);
+    try trainingAttentionTensor(control_tensor, runtime, .i32, &.{@intCast(layout.control_elements)}, admitted.input_elements[2]);
+    if (d_out) |value| try trainingAttentionTensor(value, runtime, .f32, &dout_shape, admitted.input_elements[3]);
+    const decoded = try @import("../ops/deberta_training_attention.zig").validateControl(attrs, control_values, .{ .control = control });
+    // This compiles a separate safe-math library. Missing support fails before
+    // output/scratch allocation; it never retries the legacy fast library.
+    if (termite_metal_decode_runtime_deberta_training_attention_v1_ready(runtime) == 0)
+        return error.UnsupportedDebertaTrainingAttentionProfile;
+    try trainingAttentionCheck(control);
+
+    var grouped: ?@import("../ops/resident_training_groups.zig").Grouped = null;
+    defer if (grouped) |*owned| owned.deinit();
+    if (d_out != null) grouped = try @import("../ops/resident_training_groups.zig").build(
+        allocator,
+        control_values[6 + admitted.batch_tokens ..],
+        attrs.relative_rows,
+        admitted.grouping_limits,
+        control,
+    );
+    var descriptors: [3]?MetalTensor = @splat(null);
+    defer for (&descriptors) |*tensor| if (tensor.*) |*owned| owned.deinit();
+    if (grouped) |*groups| {
+        const values = [_][]const i32{ groups.rows, groups.offsets, groups.order };
+        var descriptor_bytes: usize = 0;
+        for (values, &descriptors) |words, *slot| {
+            try trainingAttentionCheck(control);
+            descriptor_bytes += words.len * 4;
+            if (descriptor_bytes > admitted.group_device_bytes or words.len * 4 > admitted.group_upload_bytes)
+                return error.InvalidDebertaTrainingAttentionPlan;
+            slot.* = try MetalTensor.deviceAllocateFreshWithAllocator(allocator, @ptrCast(runtime), words.len * 4, .private, &.{@intCast(words.len)});
+            slot.*.?.dtype = .i32;
+            try slot.*.?.uploadBytes(std.mem.sliceAsBytes(words));
+            try trainingAttentionCheck(control);
+        }
+    }
+    var rows: ?MetalTensor = null;
+    defer if (rows) |*owned| owned.deinit();
+    if (d_out != null) rows = try MetalTensor.deviceAllocateFreshWithAllocator(allocator, @ptrCast(runtime), admitted.row_scratch_bytes, .private, &.{@intCast(admitted.row_scratch_bytes / 4)});
+    var status = try MetalTensor.deviceAllocateFreshWithAllocator(allocator, @ptrCast(runtime), 4, .shared, &.{1});
+    defer status.deinit();
+    status.dtype = .i32;
+    // Shared upload is a four-byte direct write, with no private staging.
+    try status.uploadBytes(&.{ 0, 0, 0, 0 });
+    var output = try MetalTensor.deviceAllocateFreshWithAllocator(allocator, @ptrCast(runtime), admitted.output_bytes, .private, &output_shape);
+    errdefer output.deinit();
+    var refs: [10]DebertaTrainingAttentionV1Buffer = @splat(.{});
+    refs[0] = .from(qkv);
+    refs[1] = .from(relative);
+    refs[2] = .from(control_tensor);
+    if (d_out) |value| refs[3] = .from(value);
+    refs[4] = .from(output);
+    if (rows) |value| refs[5] = .from(value);
+    for (descriptors, 6..) |tensor, i| if (tensor) |value| {
+        refs[i] = .from(value);
+    };
+    refs[9] = .from(status);
+    var params = DebertaTrainingAttentionV1Params{
+        .batch = attrs.batch,
+        .sequence = attrs.seq_len,
+        .heads = attrs.num_heads,
+        .dimension = attrs.head_dim,
+        .relative_rows = attrs.relative_rows,
+        .threads = admitted.threads,
+        .dropout_threshold = @intCast(decoded.dropout.threshold),
+        .dropout_scale = decoded.dropout.scale,
+        .attention_scale = @sqrt(@as(f32, @floatFromInt(attrs.head_dim)) * 3.0),
+        .backward = @intFromBool(d_out != null),
+        .dropout_stream = decoded.dropout.stream,
+    };
+    // Validate the whole physical control and every floating input in bounded
+    // GPU scans, before any attention kernel can use them. CPU metadata has
+    // already passed the same strict control checks before allocation.
+    params.phase = .validate_control;
+    var begin: usize = 0;
+    while (begin < admitted.input_elements[2]) {
+        params.begin = @intCast(begin);
+        params.count = @intCast(@min(admitted.finite_chunk_elements, admitted.input_elements[2] - begin));
+        try trainingAttentionDispatch(runtime, &refs, &params, control);
+        begin += params.count;
+    }
+    params.phase = .validate_f32;
+    for ([_]usize{ 0, 1, 3 }) |operand| {
+        params.operand = @intCast(operand);
+        begin = 0;
+        while (begin < admitted.input_elements[operand]) {
+            params.begin = @intCast(begin);
+            params.count = @intCast(@min(admitted.finite_chunk_elements, admitted.input_elements[operand] - begin));
+            try trainingAttentionDispatch(runtime, &refs, &params, control);
+            begin += params.count;
+        }
+    }
+    if (d_out != null) {
+        params.phase = .zero;
+        begin = 0;
+        while (begin < admitted.output_elements) {
+            params.begin = @intCast(begin);
+            params.count = @intCast(@min(admitted.finite_chunk_elements, admitted.output_elements - begin));
+            try trainingAttentionDispatch(runtime, &refs, &params, control);
+            begin += params.count;
+        }
+    }
+    const backward_phases = [_]DebertaTrainingAttentionV1Phase{ .rows, .dq, .dkdv };
+    const forward_phases = [_]DebertaTrainingAttentionV1Phase{.forward};
+    const phases: []const DebertaTrainingAttentionV1Phase = if (d_out != null) &backward_phases else &forward_phases;
+    for (phases) |phase| {
+        params.phase = phase;
+        begin = 0;
+        while (begin < admitted.attention_rows) {
+            params.begin = @intCast(begin);
+            params.count = @intCast(@min(admitted.row_wave, admitted.attention_rows - begin));
+            try trainingAttentionDispatch(runtime, &refs, &params, control);
+            begin += params.count;
+        }
+    }
+    if (grouped) |*groups| {
+        params.phase = .relative;
+        for (0..attrs.batch) |batch| {
+            params.batch_index = @intCast(batch);
+            begin = 0;
+            while (begin < attrs.seq_len) {
+                params.begin = @intCast(begin);
+                params.count = @intCast(@min(admitted.relative_query_wave, attrs.seq_len - begin));
+                for (0..attrs.num_heads) |head| {
+                    params.head_index = @intCast(head);
+                    if (!admitted.relative_split_groups) {
+                        params.group_begin = 0;
+                        params.group_count = @intCast(groups.rows.len);
+                        params.order_begin = 0;
+                        // The MSL truncates this to each actual group length;
+                        // this value proves multi-query waves include all keys.
+                        params.order_count = @intCast(admitted.bucket_count);
+                        try trainingAttentionDispatch(runtime, &refs, &params, control);
+                    } else {
+                        for (0..groups.rows.len) |group| {
+                            params.group_begin = @intCast(group);
+                            params.group_count = 1;
+                            const count: usize = @intCast(groups.offsets[group + 1] - groups.offsets[group]);
+                            var ordinal: usize = 0;
+                            while (ordinal < count) {
+                                params.order_begin = @intCast(ordinal);
+                                params.order_count = @intCast(@min(admitted.relative_order_wave, count - ordinal));
+                                try trainingAttentionDispatch(runtime, &refs, &params, control);
+                                ordinal += params.order_count;
+                            }
+                        }
+                    }
+                }
+                begin += params.count;
+            }
+        }
+    }
+    try trainingAttentionCheck(control);
+    return output;
+}
+
 pub fn decoderRuntimeDisentangledRelativeAttentionF32Device(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -7111,7 +7561,23 @@ pub fn decoderRuntimeDotGeneral2DF32Device(
     k: usize,
     rhs_contract_axis: u32,
 ) !?MetalTensor {
-    return decoderRuntimeDotGeneral2DF32DeviceImpl(self, lhs, rhs, m, n, k, rhs_contract_axis, null);
+    return decoderRuntimeDotGeneral2DF32DeviceImpl(self, lhs, rhs, m, n, k, rhs_contract_axis, null, null);
+}
+
+/// Strict request-owned result; the legacy entry point retains its allocator
+/// contract. Both variants preserve runtime buffer reuse and identical math.
+pub fn decoderRuntimeDotGeneral2DF32DeviceWithAllocator(
+    self: anytype,
+    allocator: std.mem.Allocator,
+    lhs: MetalTensor,
+    rhs: MetalTensor,
+    m: usize,
+    n: usize,
+    k: usize,
+    rhs_contract_axis: u32,
+) !?MetalTensor {
+    try requireGlinerBoundaryReady(self.raw_decode_runtime);
+    return decoderRuntimeDotGeneral2DF32DeviceImpl(self, lhs, rhs, m, n, k, rhs_contract_axis, null, allocator);
 }
 
 pub fn decoderRuntimeDotGeneral2DF32DeviceInto(
@@ -7124,7 +7590,7 @@ pub fn decoderRuntimeDotGeneral2DF32DeviceInto(
     rhs_contract_axis: u32,
     output_override: MetalTensor,
 ) !?MetalTensor {
-    return decoderRuntimeDotGeneral2DF32DeviceImpl(self, lhs, rhs, m, n, k, rhs_contract_axis, output_override);
+    return decoderRuntimeDotGeneral2DF32DeviceImpl(self, lhs, rhs, m, n, k, rhs_contract_axis, output_override, null);
 }
 
 fn decoderRuntimeDotGeneral2DF32DeviceImpl(
@@ -7136,6 +7602,7 @@ fn decoderRuntimeDotGeneral2DF32DeviceImpl(
     k: usize,
     rhs_contract_axis: u32,
     output_override: ?MetalTensor,
+    allocator: ?std.mem.Allocator,
 ) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -7162,7 +7629,10 @@ fn decoderRuntimeDotGeneral2DF32DeviceImpl(
         if (rc != 0) return null;
         return override;
     }
-    var output_device = try MetalTensor.deviceAllocate(runtime, m * n * @sizeOf(f32), .private, &out_shape);
+    var output_device = if (allocator) |owner|
+        try MetalTensor.deviceAllocateWithAllocator(owner, runtime, m * n * @sizeOf(f32), .private, &out_shape)
+    else
+        try MetalTensor.deviceAllocate(runtime, m * n * @sizeOf(f32), .private, &out_shape);
     errdefer output_device.deinit();
     const rc = termite_metal_decode_runtime_dot_general_2d_f32_device(
         runtime,
@@ -20000,6 +20470,12 @@ pub extern fn termite_metal_decode_runtime_florence_channel_attention_f32_device
     dim: usize,
     groups: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_deberta_training_attention_v1_ready(runtime: ?*RawMetalDecodeRuntime) c_int;
+extern fn termite_metal_decode_runtime_deberta_training_attention_v1_dispatch(
+    runtime: ?*RawMetalDecodeRuntime,
+    buffers: *const [10]DebertaTrainingAttentionV1Buffer,
+    params: *const DebertaTrainingAttentionV1Params,
+) c_int;
 pub extern fn termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
     runtime: ?*RawMetalDecodeRuntime,
     q_handle: ?*anyopaque,
@@ -23965,6 +24441,65 @@ test "A4B Metal Q4_0 expert-id linear and routed scatter match host reference" {
     const scattered_host = try tensorHostSlice(&scattered);
     try std.testing.expectEqualSlices(f32, &.{ 3.5, 4.5, 5.5, 9.0, 10.0, 11.0 }, scattered_host);
 }
+
+/// GLiNER2.5's reduced encoder route has no host tail, debug reference branch,
+/// runtime requantization, or borrowed scratch output. Failure stays explicit.
+pub fn decoderRuntimeGlinerBoundaryLinearDevice(
+    self: anytype,
+    allocator: std.mem.Allocator,
+    slot: usize,
+    input: MetalTensor,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    precision: ops.gliner_boundary_device.WeightPrecision,
+) !?MetalTensor {
+    try requireGlinerBoundaryReady(self.raw_decode_runtime);
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (hasActiveFrame(runtime)) return error.GlinerBoundaryExternalFrame;
+    if (termite_metal_decode_runtime_ready(runtime) == 0 or !input.isDevice()) return null;
+    if (slot >= decoder_runtime_linear_slot_capacity or rows == 0 or rows > std.math.maxInt(i32)) return null;
+    _ = try precision.byteLen(out_dim, in_dim);
+    const input_elements = try std.math.mul(usize, rows, in_dim);
+    const output_elements = try std.math.mul(usize, rows, out_dim);
+    if (input_elements > std.math.maxInt(i32) or output_elements > std.math.maxInt(i32) or
+        input.elemCount() != input_elements or input.deviceByteLen() != try std.math.mul(usize, input_elements, 4)) return null;
+    if (!self.raw_linear_slots_prepared[slot] or self.raw_linear_slot_in_dims[slot] != in_dim or self.raw_linear_slot_out_dims[slot] != out_dim) return null;
+    const format: MetalQuantFormat = if (precision == .f16) blk: {
+        if (self.raw_linear_slot_kinds[slot] != .dense) return null;
+        break :blk .unsupported;
+    } else blk: {
+        const kind = ensureQuantizedRuntimeLinearSlotPrepared(self, slot, in_dim, out_dim);
+        const expected: RawQuantizedRuntimeLinearKind = switch (precision) {
+            .q8_0 => .q8_0,
+            .q4_0 => .q4_0,
+            .q4_k => .q4_k,
+            else => return null,
+        };
+        if (kind != expected) return null;
+        break :blk metalQuantFormatForKind(kind);
+    };
+    const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
+    var output = try MetalTensor.deviceAllocateWithAllocator(allocator, runtime, try std.math.mul(usize, output_elements, 4), .private, &shape);
+    errdefer output.deinit();
+    // This entry point fixes activation and accumulation precision for every
+    // row count. Generic quantized dispatch can select half-operand tiles.
+    const rc = termite_metal_decode_runtime_gliner_boundary_reduced_linear_device(runtime, slot, @intFromEnum(format), input.deviceHandle(), input.deviceByteOffset(), rows, in_dim, out_dim, output.deviceHandle(), output.deviceByteOffset());
+    return finishDeviceOutput(&output, rc);
+}
+
+extern fn termite_metal_decode_runtime_gliner_boundary_reduced_linear_device(
+    runtime: ?*anyopaque,
+    slot: usize,
+    format: u32,
+    input: ?*anyopaque,
+    input_offset: usize,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    output: ?*anyopaque,
+    output_offset: usize,
+) c_int;
 
 pub fn tryApplyQuantizedRuntimeLinear(
     self: anytype,

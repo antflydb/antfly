@@ -1,0 +1,53 @@
+{
+  "model_config": "capture.config_and_capture.encoder_config_unchanged_from_control_baseline",
+  "native_initialization": "copy_captured_initial_A_B_m_only_before_microbatch_zero",
+  "peft": {
+    "alpha": 3,
+    "dropout": 0.0,
+    "mode": "each_of_lora_and_dora",
+    "rank": 2,
+    "targets_by_profile": {
+      "classifier_only": [
+        "classification_head"
+      ],
+      "encoder_classifier": [
+        "encoder",
+        "classification_head"
+      ],
+      "record_only": [
+        "record_head"
+      ],
+      "relation_only": [
+        "relation_head"
+      ]
+    }
+  },
+  "qualification": false,
+  "run": {
+    "accumulation": 2,
+    "batch_size": 1,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "encoder_lr": 1e-05,
+    "epochs": 1,
+    "epsilon": 1e-08,
+    "max_grad_norm": 0.7,
+    "scheduler": "constant",
+    "seed": 257713,
+    "shuffle": false,
+    "task_lr": 0.0005,
+    "warmup_steps": 0,
+    "weight_decay": 0.01
+  },
+  "source_initialization": "strict_original_training_step_full_weights_then_source_peft_seed257713",
+  "source_step": {
+    "consistency_warmup_steps": 2000,
+    "explicit_dropout": false,
+    "gold_injection_end": 1.0,
+    "gold_injection_hold_frac": 0.0,
+    "gold_injection_start": 1.0,
+    "max_gold_per_query": 8,
+    "soft_iou_anneal_steps": 20000
+  },
+  "tokenizer": "training_step/tokenizer.json_and_tokenizer_config.json_bound_by_contract"
+}

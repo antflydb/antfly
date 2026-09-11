@@ -1,0 +1,47 @@
+diff --git a/.github/workflows/zig-tests.yml b/.github/workflows/zig-tests.yml
+index 39b4aac71..0031e19d6 100644
+--- a/.github/workflows/zig-tests.yml
++++ b/.github/workflows/zig-tests.yml
+@@ -365,6 +365,14 @@ jobs:
+           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
+           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
+ 
++      - name: Test GLiNER2.5 artifact evaluation and training contracts
++        working-directory: zig/pkg/inference
++        run: |
++          uv run --no-project --isolated --no-python-downloads --no-build \
++            --with-requirements scripts/gliner25/requirements-contract.txt \
++            python scripts/gliner25/bootstrap_monitoring.py --temp-dir "$RUNNER_TEMP" -- \
++            python3 scripts/run_model_contract_tests.py gliner25
++
+       - name: Check inference kernel generator
+         working-directory: zig/pkg/inference
+         run: zig build quant-kernel-local-check -Dmetal=false -Dcuda=false
+@@ -660,6 +668,14 @@ jobs:
+           python3 -m unittest discover -s scripts -p test_run_db_query_matrix.py
+           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
+ 
++      - name: Test GLiNER2.5 artifact evaluation and training contracts
++        working-directory: zig/pkg/inference
++        run: |
++          uv run --no-project --isolated --no-python-downloads --no-build \
++            --with-requirements scripts/gliner25/requirements-contract.txt \
++            python scripts/gliner25/bootstrap_monitoring.py --temp-dir "$RUNNER_TEMP" -- \
++            python3 scripts/run_model_contract_tests.py gliner25
++
+       # Keep normal build-step parallelism while bounding aggregate compiler
+       # memory to the pod's cgroup budget.
+       - name: Configure bounded parallel heavy tests
+diff --git a/zig/pkg/inference/scripts/run_model_contract_tests.py b/zig/pkg/inference/scripts/run_model_contract_tests.py
+index cba77d0e0..05b265d9a 100644
+--- a/zig/pkg/inference/scripts/run_model_contract_tests.py
++++ b/zig/pkg/inference/scripts/run_model_contract_tests.py
+@@ -10,7 +10,7 @@ from pathlib import Path
+ 
+ 
+ SCRIPT_ROOT = Path(__file__).resolve().parent
+-KNOWN_SUITES = ("qwen3_embedding", "qwen3vl")
++KNOWN_SUITES = ("qwen3_embedding", "qwen3vl", "gliner25")
+ 
+ 
+ def parse_args() -> argparse.Namespace:

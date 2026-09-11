@@ -1,0 +1,2 @@
+WARNING:gliner2.joint_ie.optimizers.greedy:greedy joint-IE decoding produced a constraint-violating assignment; returning empty solution
+WARNING:gliner2.joint_ie.optimizers.greedy:greedy joint-IE decoding produced a constraint-violating assignment; returning empty solution

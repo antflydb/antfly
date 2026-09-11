@@ -1,0 +1,690 @@
+{
+  "format": "antfly.gliner25-published-inactive-classifier-cpu-evidence/v1",
+  "runtime_available": false,
+  "release_ready": false,
+  "upstream_oracle": false,
+  "scope": "Normal production CLI small FP32 classifier-only rank2 LoRA/DoRA five-row training, inactive zero-loss policy, all-slot updates and exact fresh-owner resume/export continuity.",
+  "source": {
+    "backbone": "small",
+    "precision": "fp32",
+    "weight": {
+      "sha256": "4ee982787ace270d4bf15dbcb28ced38e0aa201372347114ceedd6336055de2b",
+      "size_bytes": 295567700
+    },
+    "sidecars": [
+      {
+        "sha256": "0b7d9e1401ceeb83e992ec66d2f93bff7e5646428f1b4706ec527cf88f53578a",
+        "size_bytes": 3152
+      },
+      {
+        "sha256": "db837d0dc587f5858687ef860c1f400de10f3c3e44f88daef8cbda80d74e4c9c",
+        "size_bytes": 856
+      },
+      {
+        "sha256": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3",
+        "size_bytes": 8341713
+      },
+      {
+        "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1",
+        "size_bytes": 645
+      }
+    ]
+  },
+  "binary": {
+    "path": "/private/tmp/antfly-gliner25-runtime-inactive-metal-v1/bin/antfly-inference",
+    "size_bytes": 32697376,
+    "sha256": "9f0d349efa3f33dd29b6c3dd26a12a8bcf2babf2bc78400c2b84d87d58d786f9"
+  },
+  "source_constructor": "ordinary production; no synthetic layout or source initial-parameter injection",
+  "recipe": {
+    "sequence": [
+      "active_good",
+      "inactive",
+      "active_bad",
+      "inactive",
+      "inactive"
+    ],
+    "flush_after": [
+      2,
+      4,
+      5
+    ],
+    "window_sizes": [
+      2,
+      2,
+      1
+    ],
+    "microbatches": 5,
+    "optimizer_steps": 3,
+    "fallback": [
+      false,
+      true,
+      false,
+      true,
+      true
+    ],
+    "pause_after": 1,
+    "initialization": "normal production seed257713; not source PEFT initial-byte equality",
+    "published_encoder_dropout": 0.1,
+    "published_head_dropout": 0.1,
+    "peft_dropout": 0,
+    "gold_injection": 1,
+    "source_consistency_warmup_steps": 2000,
+    "source_soft_iou_anneal_steps": 20000
+  },
+  "source_encoder_head_dropout": "published 0.1 retained; adapter dropout0",
+  "controller_partial_window": "actual_microbatches",
+  "expected_fallback": [
+    false,
+    true,
+    false,
+    true,
+    true
+  ],
+  "flush_after": [
+    2,
+    4,
+    5
+  ],
+  "microbatches": 5,
+  "optimizer_updates": 3,
+  "memory": {
+    "host_bytes": 134217728,
+    "backend_bytes": 134217728,
+    "backend_metadata_bytes": 67108864,
+    "combined_bytes": 1073741824,
+    "optimizer_state_bytes": 33554432,
+    "optimizer_transaction_bytes": 268435456,
+    "job_bytes": 16777216
+  },
+  "supervision": {
+    "child_tree_rss_limit_bytes": 2147483648,
+    "sample_interval_seconds": 0.05,
+    "psutil": "7.1.3",
+    "all_six_cleanly_exited_and_reaped": true,
+    "shared_RSS_pages_may_be_counted_twice": true
+  },
+  "checker_policy": "zig_job_declared_f32_roundtrip_exact_v1",
+  "checker_corrections": [
+    "Round only explicitly declared f32 expected configuration leaves; observed values and all integers/f64 remain exact",
+    "Convert fixed32byte executable snapshot digest to exact lowerhex",
+    "Derive Controller checkpoint fingerprint from run digest, exact original Zig numeric tokens, optimizer settings and ordered logical slot dimensions",
+    "Validate flat checkpoint payloads, independent full owned-state SHA256 and distinct global16bit/slot8bit counter limbs"
+  ],
+  "historical_first_phase": {
+    "process_exit": 0,
+    "original_driver_exit": 1,
+    "reason": "Offline checker configuration f32 representation mismatch",
+    "resolved_by": "receipts/lora-paused-validation-v2.json",
+    "model_rerun": false,
+    "original_process_config_outputs_preserved": true
+  },
+  "profiles": {
+    "lora": {
+      "validation": {
+        "size_bytes": 3955,
+        "sha256": "a0d46d07a1a1c8f55967c7193d5ec65c8117e523df5ac32edefa627c70336516"
+      },
+      "state_sha256": "c9117d337385f29ab2c0c6bd0f59d4435122137a5a8c02a1a51ed7b08070e4fc",
+      "run_fingerprint": "5ae4dc538d81b41b4aeb194f7b90f6ce536df20e8855e80147025c161bf913e1",
+      "phases": {
+        "uninterrupted": {
+          "process": {
+            "size_bytes": 2294,
+            "sha256": "7aa9213e1f892f4f370338925103a363ec2bddfaac443836dbd39530bc08e675"
+          },
+          "result": {
+            "size_bytes": 1121,
+            "sha256": "eb7538b8b5bf712c30034f975bf8edc1a9bdef162a46008617f62c4e6fc64523"
+          },
+          "checkpoint": {
+            "size_bytes": 64900,
+            "sha256": "0bf22c17af612735cf6d54d492c25576c63d8e20ce515bebc2d2dd2a71bf094f"
+          },
+          "controller_fingerprint": "43de2f979c7d0ab58179691c4b3f09e97df9b3f5f69b22c9eb744f5a8d1464cd",
+          "independent_checkpoint_state_sha256": "c9117d337385f29ab2c0c6bd0f59d4435122137a5a8c02a1a51ed7b08070e4fc",
+          "identity": {
+            "optimizer_step": 3,
+            "microbatch_step": 5
+          },
+          "slots": 4,
+          "cleanup_complete": true
+        },
+        "paused": {
+          "process": {
+            "size_bytes": 2327,
+            "sha256": "d77aa924b4996426e47be2ac26c92576a2851ffa1f9cffb2cec79dacc1e7abdb"
+          },
+          "result": {
+            "size_bytes": 765,
+            "sha256": "d5add1bc059b593cf09ddd66b36eb0a2221f2a7f4fb8d96fcde29dbf337e06f7"
+          },
+          "checkpoint": {
+            "size_bytes": 64900,
+            "sha256": "3f2dfdf303043044f01fc244cae9eb85607a058a4bfeb05e909533ac2537d98e"
+          },
+          "controller_fingerprint": "43de2f979c7d0ab58179691c4b3f09e97df9b3f5f69b22c9eb744f5a8d1464cd",
+          "independent_checkpoint_state_sha256": "389646ae849f46f5a2ee931e38f5315f5a1ae9d997cfd32f3c8edb321851a43d",
+          "identity": {
+            "optimizer_step": 0,
+            "microbatch_step": 1
+          },
+          "slots": 4,
+          "cleanup_complete": true
+        },
+        "resumed": {
+          "process": {
+            "size_bytes": 2286,
+            "sha256": "1a26f46a235f80b8a60263d3b26c6f9d92692d926f8bebcefccc99f8f0e7f374"
+          },
+          "result": {
+            "size_bytes": 1121,
+            "sha256": "eb7538b8b5bf712c30034f975bf8edc1a9bdef162a46008617f62c4e6fc64523"
+          },
+          "checkpoint": {
+            "size_bytes": 64900,
+            "sha256": "0bf22c17af612735cf6d54d492c25576c63d8e20ce515bebc2d2dd2a71bf094f"
+          },
+          "controller_fingerprint": "43de2f979c7d0ab58179691c4b3f09e97df9b3f5f69b22c9eb744f5a8d1464cd",
+          "independent_checkpoint_state_sha256": "c9117d337385f29ab2c0c6bd0f59d4435122137a5a8c02a1a51ed7b08070e4fc",
+          "identity": {
+            "optimizer_step": 3,
+            "microbatch_step": 5
+          },
+          "slots": 4,
+          "cleanup_complete": true
+        }
+      },
+      "resource_peaks": {
+        "uninterrupted": {
+          "host": 25589151,
+          "backend": 30631060,
+          "child_tree_rss": 466141184
+        },
+        "paused": {
+          "host": 25589151,
+          "backend": 30631060,
+          "child_tree_rss": 462258176
+        },
+        "resumed": {
+          "host": 25589151,
+          "backend": 30631060,
+          "child_tree_rss": 466141184
+        }
+      },
+      "exact_final_artifacts": {
+        "result.json": {
+          "size_bytes": 1121,
+          "sha256": "eb7538b8b5bf712c30034f975bf8edc1a9bdef162a46008617f62c4e6fc64523"
+        },
+        "latest.safetensors": {
+          "size_bytes": 64900,
+          "sha256": "0bf22c17af612735cf6d54d492c25576c63d8e20ce515bebc2d2dd2a71bf094f"
+        },
+        "model/adapter_config.json": {
+          "size_bytes": 348,
+          "sha256": "6f92d9b9199ef0a131d3fa1778e7fc4b468d98512ba7efaa44ae1329870c22d3"
+        },
+        "model/adapter_model.safetensors": {
+          "size_bytes": 15832,
+          "sha256": "3770e0516094895534612a448eab268c43c9f78ce16379b83e11e496b4daf1de"
+        },
+        "model/antfly_gliner25_adapter.json": {
+          "size_bytes": 2322,
+          "sha256": "1b713144c2a796c3e39c5a695f8ba5faec7455d459fa04ec1698c31b6b3e5bb8"
+        },
+        "model/antfly_gliner25_training.json": {
+          "size_bytes": 2873,
+          "sha256": "ce3053edeab59c617cfd958270194c64c2926294889fa261f86faec884357950"
+        }
+      }
+    },
+    "dora": {
+      "validation": {
+        "size_bytes": 3956,
+        "sha256": "81106db7aaf6eac4512d367ee29ea96e33c061173a8de253ffce7986d70348fe"
+      },
+      "state_sha256": "c4244228f5e7c25d2e0c939a9e951df0f01c79bf5c41365988587f92f3d8f881",
+      "run_fingerprint": "3b01f2fa614a1570f7e741e591ea74928ab25a9e5043f7d8209d4fed35131942",
+      "phases": {
+        "uninterrupted": {
+          "process": {
+            "size_bytes": 2294,
+            "sha256": "e959633b5a1f51f51389914769dc68bb0e1cbb47bb7bcbfecec6bf7c9544e996"
+          },
+          "result": {
+            "size_bytes": 1122,
+            "sha256": "e697dbc1e6cb510aaa527dd6f99b92052b17e3fb4cefcbee5e5b1cebec9de1e8"
+          },
+          "checkpoint": {
+            "size_bytes": 78796,
+            "sha256": "fcd76079a40d15065ca5fcc3f95d4b892709f4173f61368e7459400813027144"
+          },
+          "controller_fingerprint": "b9352b0206ce92bb9dd01251c99ed963d9c0363f84019b33630d4dbe6467a888",
+          "independent_checkpoint_state_sha256": "c4244228f5e7c25d2e0c939a9e951df0f01c79bf5c41365988587f92f3d8f881",
+          "identity": {
+            "optimizer_step": 3,
+            "microbatch_step": 5
+          },
+          "slots": 6,
+          "cleanup_complete": true
+        },
+        "paused": {
+          "process": {
+            "size_bytes": 2329,
+            "sha256": "e78e98f9dc5f2e9c942efa6001a317cb6bfccff781d395ba9b3543182643402e"
+          },
+          "result": {
+            "size_bytes": 769,
+            "sha256": "ff00f68fdc5f8b81d3ae8d63d797c83b7244ff3e56b7cb5a1052c12ccf7d62aa"
+          },
+          "checkpoint": {
+            "size_bytes": 78796,
+            "sha256": "8e376d7c6fa1ce564adc9362b9daaf647e9c55b1c932c780e9861b71e22d3148"
+          },
+          "controller_fingerprint": "b9352b0206ce92bb9dd01251c99ed963d9c0363f84019b33630d4dbe6467a888",
+          "independent_checkpoint_state_sha256": "c32357949142d1482e7aef31bdc8b8cf4934df57dc108d7fe26af53da96aaf04",
+          "identity": {
+            "optimizer_step": 0,
+            "microbatch_step": 1
+          },
+          "slots": 6,
+          "cleanup_complete": true
+        },
+        "resumed": {
+          "process": {
+            "size_bytes": 2287,
+            "sha256": "041300c407b4950fb5a34e9f231ec3509c98421e3c86ac6f05524497e06230aa"
+          },
+          "result": {
+            "size_bytes": 1122,
+            "sha256": "e697dbc1e6cb510aaa527dd6f99b92052b17e3fb4cefcbee5e5b1cebec9de1e8"
+          },
+          "checkpoint": {
+            "size_bytes": 78796,
+            "sha256": "fcd76079a40d15065ca5fcc3f95d4b892709f4173f61368e7459400813027144"
+          },
+          "controller_fingerprint": "b9352b0206ce92bb9dd01251c99ed963d9c0363f84019b33630d4dbe6467a888",
+          "independent_checkpoint_state_sha256": "c4244228f5e7c25d2e0c939a9e951df0f01c79bf5c41365988587f92f3d8f881",
+          "identity": {
+            "optimizer_step": 3,
+            "microbatch_step": 5
+          },
+          "slots": 6,
+          "cleanup_complete": true
+        }
+      },
+      "resource_peaks": {
+        "uninterrupted": {
+          "host": 25620123,
+          "backend": 30659864,
+          "child_tree_rss": 466305024
+        },
+        "paused": {
+          "host": 25620123,
+          "backend": 30659864,
+          "child_tree_rss": 462848000
+        },
+        "resumed": {
+          "host": 25620123,
+          "backend": 30659864,
+          "child_tree_rss": 466206720
+        }
+      },
+      "exact_final_artifacts": {
+        "result.json": {
+          "size_bytes": 1122,
+          "sha256": "e697dbc1e6cb510aaa527dd6f99b92052b17e3fb4cefcbee5e5b1cebec9de1e8"
+        },
+        "latest.safetensors": {
+          "size_bytes": 78796,
+          "sha256": "fcd76079a40d15065ca5fcc3f95d4b892709f4173f61368e7459400813027144"
+        },
+        "model/adapter_config.json": {
+          "size_bytes": 347,
+          "sha256": "c1d8161c29a828a1b05cddcc56197819d4226621af927884379898b7627b3414"
+        },
+        "model/adapter_model.safetensors": {
+          "size_bytes": 19132,
+          "sha256": "89905788c144bfc30bf4de4d1e78b543050a5d5e8a06e37b540a608624ab009b"
+        },
+        "model/antfly_gliner25_adapter.json": {
+          "size_bytes": 2308,
+          "sha256": "397d8d95b8b8e782d795a0b4f62a01b63ef6604e595d5458a2cbb6b4dcf30595"
+        },
+        "model/antfly_gliner25_training.json": {
+          "size_bytes": 2885,
+          "sha256": "2d444b016db418c2f25e68aca887c97b82b707152856cc2125879f17e2760592"
+        }
+      }
+    }
+  },
+  "limitations": [
+    "No published Fastino numerical loss/VJP comparison or quality/convergence/performance claim",
+    "No published Metal training, other backbone, rank or broader target qualification",
+    "Exact checkpoint/export payloads were audited at original private paths; this compact ledger archives their digests and reports, not raw tensor payloads",
+    "Build inventory records repository source files and unchanged pre/post verification, not system SDK/full transitive dependency bytes"
+  ],
+  "files": {
+    "preparation.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/preparation.json",
+      "size_bytes": 5083,
+      "sha256": "e49ca907daf093303dd3919b56ab61f36983eb9d9174e3d3ccd7993ac21e83b9"
+    },
+    "train.jsonl": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/train.jsonl",
+      "size_bytes": 1122,
+      "sha256": "377177ee889c4e426eeeccc4dc551437999aa702b8a5055c233aaee8936c54c7"
+    },
+    "driver-checkpoint.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/driver-checkpoint.json",
+      "size_bytes": 2064,
+      "sha256": "b4ec522c638315175b26935dee646430a302ea9a17054d680adb67f96490a1a5"
+    },
+    "driver-checkpoint-v2.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/driver-checkpoint-v2.json",
+      "size_bytes": 2072,
+      "sha256": "00f505dff0198b311a24f85cc384a2af5f2bfeef42d4bae452d5d0662499df9e"
+    },
+    "pure-tests-v2.log": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/pure-tests-v2.log",
+      "size_bytes": 118,
+      "sha256": "1b1ee5db8181fb75debfcbd2d86dfc39b719fea7ad5595189aba8abd3fa38860"
+    },
+    "lifetime-tests.log": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lifetime-tests.log",
+      "size_bytes": 118,
+      "sha256": "cc260adcb4e8b2752ec65e2bb63cb036115ef60407f01ffc9771628994be93e8"
+    },
+    "resource_analysis.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/resource_analysis.json",
+      "size_bytes": 3606,
+      "sha256": "9bd38498d59ff9c40500b921ff0ffc993322e7f33e151988fc473bad51b3465c"
+    },
+    "source_identity.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/source_identity.json",
+      "size_bytes": 687,
+      "sha256": "54c5df9eb69e7ee8a180e1db35f3b55694de9822a466d3c3f1b0c3d95a88a308"
+    },
+    "helpers/v1/validate.py": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/helper-archive/v1/validate.py",
+      "size_bytes": 24345,
+      "sha256": "b6fb928d4e60d6ec0867f30bea1f292470d28ef98d0d496606198d6333e3f058"
+    },
+    "helpers/v1/supervision.py": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/helper-archive/v1/supervision.py",
+      "size_bytes": 12474,
+      "sha256": "a937237975be2ed879f62afd285494ccb51a7c1d7cc1dff7160621fb26b87332"
+    },
+    "helpers/v1/manifest.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/helper-archive/v1/manifest.json",
+      "size_bytes": 426,
+      "sha256": "28e62dfd51a0f9a59aab939dd827b8dd7a6feea486cfdeac2310ae861ee150ed"
+    },
+    "helpers/v2/validate.py": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/helper-archive/v2/validate.py",
+      "size_bytes": 34287,
+      "sha256": "e0b67790bf99aee80f43d9ff7e752cc7b49dd6715ca629fdbf1767b1d658fabf"
+    },
+    "helpers/v2/supervision.py": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/helper-archive/v2/supervision.py",
+      "size_bytes": 12474,
+      "sha256": "a937237975be2ed879f62afd285494ccb51a7c1d7cc1dff7160621fb26b87332"
+    },
+    "helpers/v2/manifest.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/helper-archive/v2/manifest.json",
+      "size_bytes": 645,
+      "sha256": "f4e099ad061987f76a90938b01bb15e7b229ef3cf2e9a3e65cc768441b912dc1"
+    },
+    "helpers/v2/test_validate.py": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/helper-archive/v2/test_validate.py",
+      "size_bytes": 17219,
+      "sha256": "f3803b6586620f78c79af671055f707c9815a2f5ffc04adc318ca4b9f2c1aae2"
+    },
+    "helpers/v2/test_supervision.py": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/helper-archive/v2/test_supervision.py",
+      "size_bytes": 7627,
+      "sha256": "2be045ba112529f006727b8f47ece79f85ef0f89c605fdbaf79df175f6e67bf4"
+    },
+    "receipts/lora-paused-validation-v2.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/executions/lora-paused/validation-v2.json",
+      "size_bytes": 3927,
+      "sha256": "c5af9dcc1bb89762ccd85d277db8e00c67c8cb10e694d8ecc655cfc9b4853153"
+    },
+    "receipts/lora-validation.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-validation.json",
+      "size_bytes": 3955,
+      "sha256": "a0d46d07a1a1c8f55967c7193d5ec65c8117e523df5ac32edefa627c70336516"
+    },
+    "configs/lora-uninterrupted.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-uninterrupted.json",
+      "size_bytes": 2930,
+      "sha256": "8073cbbe6e020ffce67cc67b97d1bb166f5f91a2063afcb38d238e0e4dcbf014"
+    },
+    "executions/lora-uninterrupted/process.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/executions/lora-uninterrupted/process.json",
+      "size_bytes": 2294,
+      "sha256": "7aa9213e1f892f4f370338925103a363ec2bddfaac443836dbd39530bc08e675"
+    },
+    "executions/lora-uninterrupted/start.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/executions/lora-uninterrupted/start.json",
+      "size_bytes": 1131,
+      "sha256": "f07be0cdb61b80475bf5a02e6c1e7355f4ce4c67cbdd26de9b2c2ff7de3c9fe8"
+    },
+    "executions/lora-uninterrupted/stdout.jsonl": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/executions/lora-uninterrupted/stdout.jsonl",
+      "size_bytes": 7543,
+      "sha256": "27ec037143a9a85a84cb1fcc663dc0b0419840672b1abece20d3510dd3eed9cf"
+    },
+    "outputs/lora-uninterrupted/run.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-uninterrupted/run.json",
+      "size_bytes": 9208,
+      "sha256": "40cc17320d201182e4ac1916cb2fb6c1633271549f5de8619f4587d26bc1b4c3"
+    },
+    "outputs/lora-uninterrupted/result.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-uninterrupted/result.json",
+      "size_bytes": 1121,
+      "sha256": "eb7538b8b5bf712c30034f975bf8edc1a9bdef162a46008617f62c4e6fc64523"
+    },
+    "outputs/lora-uninterrupted/progress.jsonl": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-uninterrupted/progress.jsonl",
+      "size_bytes": 6583,
+      "sha256": "622a92e7f9afcb6584f85674f5c9ba0e42569efe2eee123ffc349676b3cd6c21"
+    },
+    "configs/lora-paused.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-paused.json",
+      "size_bytes": 2923,
+      "sha256": "bed94b2a3a524036fe713c01cc3f917c75f11021176741aa7a9bb56fb4ac4b8f"
+    },
+    "executions/lora-paused/process.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/executions/lora-paused/process.json",
+      "size_bytes": 2327,
+      "sha256": "d77aa924b4996426e47be2ac26c92576a2851ffa1f9cffb2cec79dacc1e7abdb"
+    },
+    "executions/lora-paused/start.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/executions/lora-paused/start.json",
+      "size_bytes": 1166,
+      "sha256": "4ce25e1e75984137a96f510a428b1d02f12c0f3ffd72223b297b4acceb0efe38"
+    },
+    "executions/lora-paused/stdout.jsonl": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/executions/lora-paused/stdout.jsonl",
+      "size_bytes": 1747,
+      "sha256": "9ea1af4c2f6d386d52d74b8871e6e67778d24178d35e197a3f1f753073dbce63"
+    },
+    "outputs/lora-paused/run.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-paused/run.json",
+      "size_bytes": 9201,
+      "sha256": "489bfad927225f925ac37e9c95b1daf7dd63b9f491de435d93761499d1bdf9a2"
+    },
+    "outputs/lora-paused/result.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-paused/result.json",
+      "size_bytes": 765,
+      "sha256": "d5add1bc059b593cf09ddd66b36eb0a2221f2a7f4fb8d96fcde29dbf337e06f7"
+    },
+    "outputs/lora-paused/progress.jsonl": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-paused/progress.jsonl",
+      "size_bytes": 1205,
+      "sha256": "2f3e896cd1763c50a042b7cfa812954ef19618142b7a77ea96079fe2446e15d7"
+    },
+    "configs/lora-resumed.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-resumed.json",
+      "size_bytes": 3355,
+      "sha256": "ad753dcaa6113bfbb3a393f9dc91d06a337b344de183890fb6ae893a7c3407cd"
+    },
+    "executions/lora-resumed/process.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/executions/lora-resumed/process.json",
+      "size_bytes": 2286,
+      "sha256": "1a26f46a235f80b8a60263d3b26c6f9d92692d926f8bebcefccc99f8f0e7f374"
+    },
+    "executions/lora-resumed/start.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/executions/lora-resumed/start.json",
+      "size_bytes": 1125,
+      "sha256": "a2e353f75b0fb428a37624882f8b590f21098df377285737a5be2b633d89f061"
+    },
+    "executions/lora-resumed/stdout.jsonl": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/executions/lora-resumed/stdout.jsonl",
+      "size_bytes": 6306,
+      "sha256": "bed4432411d58432f26fb6c3e8bb0fb547392798b992dbbf6bdddea08d92a329"
+    },
+    "outputs/lora-resumed/run.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-resumed/run.json",
+      "size_bytes": 10609,
+      "sha256": "2ec6db347a74f4f4fb9744fff8975f8c9829b314f3f5936c500ccda102b4659d"
+    },
+    "outputs/lora-resumed/result.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-resumed/result.json",
+      "size_bytes": 1121,
+      "sha256": "eb7538b8b5bf712c30034f975bf8edc1a9bdef162a46008617f62c4e6fc64523"
+    },
+    "outputs/lora-resumed/progress.jsonl": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-resumed/progress.jsonl",
+      "size_bytes": 5378,
+      "sha256": "3f2935a080d024b200c3f703f707f36a1c875c0f3eefc9c53a487fa8b29e2325"
+    },
+    "receipts/dora-validation.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-validation.json",
+      "size_bytes": 3956,
+      "sha256": "81106db7aaf6eac4512d367ee29ea96e33c061173a8de253ffce7986d70348fe"
+    },
+    "configs/dora-uninterrupted.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-uninterrupted.json",
+      "size_bytes": 2930,
+      "sha256": "c7079d5abc56f8c27e6449a1e0d50531a221dd3660c276367404014b62b3935f"
+    },
+    "executions/dora-uninterrupted/process.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/executions/dora-uninterrupted/process.json",
+      "size_bytes": 2294,
+      "sha256": "e959633b5a1f51f51389914769dc68bb0e1cbb47bb7bcbfecec6bf7c9544e996"
+    },
+    "executions/dora-uninterrupted/start.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/executions/dora-uninterrupted/start.json",
+      "size_bytes": 1131,
+      "sha256": "6b54dc5f36cab8737fba4dc76af673bd53a669d6099e4b98f010c7f40e067c3e"
+    },
+    "executions/dora-uninterrupted/stdout.jsonl": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/executions/dora-uninterrupted/stdout.jsonl",
+      "size_bytes": 7549,
+      "sha256": "9acf31f956832ca58ea4b1de46d6f9d4f32869f70420f5ca039e53c155b91fe0"
+    },
+    "outputs/dora-uninterrupted/run.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-uninterrupted/run.json",
+      "size_bytes": 9210,
+      "sha256": "20c697ca3d34cec5beb2bb631e749a804fe8f8433f72cc71ffac61d95a7c0ffe"
+    },
+    "outputs/dora-uninterrupted/result.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-uninterrupted/result.json",
+      "size_bytes": 1122,
+      "sha256": "e697dbc1e6cb510aaa527dd6f99b92052b17e3fb4cefcbee5e5b1cebec9de1e8"
+    },
+    "outputs/dora-uninterrupted/progress.jsonl": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-uninterrupted/progress.jsonl",
+      "size_bytes": 6588,
+      "sha256": "79a8872ebe932adbacc204001c30d147cbbfec09631d51f1ac137f218bc897bd"
+    },
+    "configs/dora-paused.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-paused.json",
+      "size_bytes": 2923,
+      "sha256": "db3a3d188a61df97842fdd72e6603028d07eb1ac07691c055303cdabff806154"
+    },
+    "executions/dora-paused/process.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/executions/dora-paused/process.json",
+      "size_bytes": 2329,
+      "sha256": "e78e98f9dc5f2e9c942efa6001a317cb6bfccff781d395ba9b3543182643402e"
+    },
+    "executions/dora-paused/start.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/executions/dora-paused/start.json",
+      "size_bytes": 1166,
+      "sha256": "f47956c6cc6608e86c7f24f6e618c2788e4ea1d5241e4f9ebb9a8d8e591a83c7"
+    },
+    "executions/dora-paused/stdout.jsonl": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/executions/dora-paused/stdout.jsonl",
+      "size_bytes": 1751,
+      "sha256": "fd9297d50fbcf542923df03da2f8417d812ef6400ea2782c0224ff94276caa7d"
+    },
+    "outputs/dora-paused/run.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-paused/run.json",
+      "size_bytes": 9203,
+      "sha256": "15ef0ad7464322098da1fefa6e4d84c0c7d534a14d598ea3f541fb371f2d5002"
+    },
+    "outputs/dora-paused/result.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-paused/result.json",
+      "size_bytes": 769,
+      "sha256": "ff00f68fdc5f8b81d3ae8d63d797c83b7244ff3e56b7cb5a1052c12ccf7d62aa"
+    },
+    "outputs/dora-paused/progress.jsonl": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-paused/progress.jsonl",
+      "size_bytes": 1205,
+      "sha256": "cbad6e891b18afe6b2fe57440bc8af5989c04fb897f8d9af488710014263854a"
+    },
+    "configs/dora-resumed.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-resumed.json",
+      "size_bytes": 3357,
+      "sha256": "f9ea658565476d94e3f036887fb87031dc54073a81c51a3fdf23d5138ba9b50b"
+    },
+    "executions/dora-resumed/process.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/executions/dora-resumed/process.json",
+      "size_bytes": 2287,
+      "sha256": "041300c407b4950fb5a34e9f231ec3509c98421e3c86ac6f05524497e06230aa"
+    },
+    "executions/dora-resumed/start.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/executions/dora-resumed/start.json",
+      "size_bytes": 1125,
+      "sha256": "a576d95758842b4e1540e101fcee101ec9a2d1f3178898fa93ae9bb26275cbc9"
+    },
+    "executions/dora-resumed/stdout.jsonl": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/executions/dora-resumed/stdout.jsonl",
+      "size_bytes": 6312,
+      "sha256": "e107f9edb942697645c8fece3d46839abcb7e718c55e42d70648d0c1093697bd"
+    },
+    "outputs/dora-resumed/run.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-resumed/run.json",
+      "size_bytes": 10623,
+      "sha256": "b6d70024129f722e5330a2f92e3e5d42f0e9cea7f4a3cef1d42ed6fe7ef8b1af"
+    },
+    "outputs/dora-resumed/result.json": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-resumed/result.json",
+      "size_bytes": 1122,
+      "sha256": "e697dbc1e6cb510aaa527dd6f99b92052b17e3fb4cefcbee5e5b1cebec9de1e8"
+    },
+    "outputs/dora-resumed/progress.jsonl": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-resumed/progress.jsonl",
+      "size_bytes": 5383,
+      "sha256": "370ebb60a81f89dfec13c305a8fe01f587fff28b5ffdd62b938cd31dadb94d39"
+    },
+    "build/receipt.json": {
+      "original_path": "/private/tmp/antfly-gliner25-runtime-inactive-metal-v1/build-receipt.json",
+      "size_bytes": 1567,
+      "sha256": "9f8c431f3fa90bba2852b25b6b63b3466a83e331547f223ce9141f54a147d072"
+    },
+    "build/source-inventory.json": {
+      "original_path": "/private/tmp/antfly-gliner25-runtime-inactive-metal-v1/build-sources-start.json",
+      "size_bytes": 499051,
+      "sha256": "18c153d3cc58003afec0949be0144dc1ed38f713f6bc766eda6ee0bde4c7ed60"
+    },
+    "logs/initial-paused-lora-checker-failure.log": {
+      "original_path": "/private/tmp/gliner25-training-inactive-small-lora-paused-v1.stderr.log",
+      "size_bytes": 1387,
+      "sha256": "d064944c13aaaab80a431db908b972763fbc703a3245fc27b7627da9ec91912b"
+    }
+  }
+}

@@ -1,0 +1,38 @@
+CUDA artifact source policy passes: /Users/timkaye/Documents/af/antfly/zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.cu (15 compiler-managed dev-only runtime-wired candidates included)
+quant kernel generated sources check: 67 files + Metal/CUDA runtime regions
+1/55 ops.deberta_training_attention_test.test.replay DeBERTa training attention scalar five VJPs tails and masked rows...OK
+2/55 ops.deberta_training_attention_test.test.replay DeBERTa training attention exact counter masks and high limbs...OK
+3/55 ops.deberta_training_attention_test.test.replay DeBERTa training attention independent central finite differences...OK
+4/55 ops.deberta_training_attention_test.test.replay DeBERTa training attention plan has no quadratic allocation...OK
+5/55 ops.deberta_training_attention_test.test.replay DeBERTa training attention malformed control alias and finite admission...OK
+6/55 ops.deberta_training_attention_test.test.replay DeBERTa training attention owned OOM cancellation exact scratch and retry...OK
+7/55 ops.deberta_training_attention_test.test.replay DeBERTa training attention native hooks retain physical i32 and views through OOM...OK
+8/55 ops.deberta_training_attention_test.test.replay DeBERTa training attention native hooks reject unsupported types and absent profile...OK
+9/55 ops.deberta_training_attention_source_test.test.replay DeBERTa training attention pinned source CPU nine cases forward and five VJPs...OK
+10/55 ops.deberta_training_attention_source_test.test.replay DeBERTa training attention pinned source Metal nine cases forward and five VJPs...OK
+11/55 ops.deberta_training_attention_device_test.test.deberta training Metal checked metadata fails before any device call...OK
+12/55 ops.deberta_training_attention_device_test.test.deberta training Metal owned metadata views and attention release all allocation failures...OK
+13/55 ops.deberta_training_attention_device_test.test.deberta training Metal control finite limits cancellation and frame rejections recover...OK
+14/55 ops.native_compute.test.native dense view alias metadata failure preserves owned and borrowed inputs...OK
+15/55 finetune.gliner_boundary_encoder_graph.test.GLiNER2.5 replay encoder uses compact integer control full relative tables and source dropout streams...OK
+16/55 finetune.gliner_boundary_encoder_graph.test.GLiNER2.5 replay encoder regional boundaries survive shared QK LoRA and DoRA rewriting...OK
+17/55 finetune.gliner_boundary_encoder_graph.test.GLiNER2.5 replay encoder long-context graph storage is linear and work admission includes replay...OK
+18/55 finetune.gliner_boundary_native_trainer_test.test.boundary native trainer replay attention full and heads jobs preserve cancellation and partial resume identity...[default] (warn): GLiNER2.5 training allocation failed: phase=forward_backward domain=backend reason=declared_limit requested_bytes=8192 live_bytes=608 peak_bytes=608 limit_bytes=1
+[default] (warn): GLiNER2.5 training allocation failed: phase=batch_preparation domain=host reason=declared_limit requested_bytes=1072 live_bytes=1973571 peak_bytes=2635429 limit_bytes=1973571
+[default] (warn): GLiNER2.5 training allocation failed: phase=forward_backward domain=backend reason=backing_allocator requested_bytes=8192 live_bytes=608 peak_bytes=608 limit_bytes=268435456
+[default] (warn): GLiNER2.5 training allocation failed: phase=forward_backward domain=backend reason=declared_limit requested_bytes=128 live_bytes=608 peak_bytes=608 limit_bytes=1
+[default] (warn): GLiNER2.5 training allocation failed: phase=batch_preparation domain=host reason=declared_limit requested_bytes=1072 live_bytes=1748841 peak_bytes=2331550 limit_bytes=1748841
+[default] (warn): GLiNER2.5 training allocation failed: phase=forward_backward domain=backend reason=backing_allocator requested_bytes=128 live_bytes=608 peak_bytes=608 limit_bytes=268435456
+OK
+19/55 finetune.gliner_boundary_native_trainer_test.test.boundary native trainer replay attention resident Metal full and heads jobs preserve partial resume identity...[default] (warn): GLiNER2.5 training allocation failed: phase=forward_backward domain=backend reason=declared_limit requested_bytes=576 live_bytes=627394 peak_bytes=627394 limit_bytes=1
+[default] (warn): GLiNER2.5 training allocation failed: phase=batch_preparation domain=host reason=declared_limit requested_bytes=1072 live_bytes=4170333 peak_bytes=4196461 limit_bytes=4170333
+[default] (warn): GLiNER2.5 training allocation failed: phase=forward_backward domain=backend reason=backing_allocator requested_bytes=576 live_bytes=627394 peak_bytes=627394 limit_bytes=134217728
+[default] (warn): GLiNER2.5 training allocation failed: phase=forward_backward domain=backend reason=declared_limit requested_bytes=576 live_bytes=588748 peak_bytes=588748 limit_bytes=1
+[default] (warn): GLiNER2.5 training allocation failed: phase=batch_preparation domain=host reason=declared_limit requested_bytes=1072 live_bytes=3531569 peak_bytes=3559733 limit_bytes=3531569
+[default] (warn): GLiNER2.5 training allocation failed: phase=forward_backward domain=backend reason=backing_allocator requested_bytes=576 live_bytes=588748 peak_bytes=588748 limit_bytes=134217728
+OK
+20/55 ops.resident_program_ops.test.resident program replay attention validates four physical inputs and exact device admission...OK
+21/55 ops.deberta_training_attention_device.test.deberta training Metal plan counts all replay work and bounded linear scratch...OK
+22/55 ops.deberta_training_attention_device.test.deberta training Metal plan rejects unsupported dimensions work bytes and scratch before dispatch...OK
+23/55 ops.deberta_training_attention_device.test.deberta training Metal plan admits published long contexts with explicit training work ceiling...OK
+23 selected; 23 passed; 0 skipped.

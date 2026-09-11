@@ -29,6 +29,8 @@ const ComputeBackend = ops.ComputeBackend;
 const CT = ops.CT;
 const native = @import("../backends/native.zig");
 const activations_mod = @import("../backends/activations.zig");
+const deberta_tiled = @import("deberta_tiled_attention.zig");
+const deberta_training = @import("deberta_training_attention.zig");
 const LoadedWeight = @import("../models/weight_source.zig").LoadedWeight;
 const QuantizedStorage = @import("../models/weight_source.zig").QuantizedStorage;
 const runtime = @import("../runtime/root.zig");
@@ -922,6 +924,11 @@ fn materializeViewData(buf: *Buf) !void {
         }
     }
 
+    // Publish only after every allocation succeeds. In particular, a failed
+    // refcount allocation must leave the original data, strides and shape
+    // alive so the caller can retry or release the view safely.
+    const refcount = try buf.allocator.create(usize);
+    refcount.* = 1;
     releaseOwnedDenseData(buf);
     if (replacement_shape) |shape| {
         releaseLogicalShape(buf);
@@ -929,8 +936,6 @@ fn materializeViewData(buf: *Buf) !void {
         buf.logical_shape_inline = false;
         replacement_shape = null;
     }
-    const refcount = try buf.allocator.create(usize);
-    refcount.* = 1;
     buf.data = output;
     buf.owned = true;
     buf.shared_data_refcount = refcount;
@@ -970,6 +975,90 @@ fn getData(ct: CT) []f32 {
         };
     }
     return buf.data;
+}
+
+/// Fallible access for materializing a logical view. Unlike the legacy
+/// non-fallible accessor, this preserves the tensor and the original error.
+fn getDataChecked(ct: CT) ![]f32 {
+    const buf = toBuf(ct);
+    if (buf.view_strides != null) try materializeViewData(buf);
+    return buf.data;
+}
+
+test "native tensor view readback preserves materialization OOM and nullable clone fallback" {
+    const a = std.testing.allocator;
+    const Budget = @import("../runtime/bounded_allocator.zig").BoundedAllocator;
+    // Both the payload and its ownership record can fail. Exercise borrowed
+    // storage and an owned tensor whose sibling must keep the original bytes.
+    for ([_]bool{ false, true }) |owned_source| {
+        for ([_]bool{ false, true }) |backing_failure| {
+            for (0..2) |failure_allocation| {
+                var failing = std.testing.FailingAllocator.init(a, .{});
+                var budget = Budget{ .backing = failing.allocator(), .limit = 64 * 1024 };
+                var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+                defer store.deinitOwned();
+                var compute = NativeCompute.init(budget.allocator(), &store, null);
+                defer compute.deinit();
+                const cb = compute.computeBackend();
+                var original = [_]f32{ 1, 2, 3, 4, 5, 6 };
+                const source = if (owned_source) try cb.fromFloat32Shape(&original, &.{ 2, 3 }) else borrowed: {
+                    const value = try compute.makeBuf(&original, false);
+                    errdefer cb.free(value);
+                    break :borrowed try compute.withLogicalShape(value, &.{ 2, 3 });
+                };
+                defer cb.free(source);
+                const view = try primTransposeOp(&compute, source, &.{ 1, 0 }, &.{ 2, 3 });
+                defer cb.free(view);
+                const before = toBuf(view).*;
+                try std.testing.expect(before.view_strides != null);
+                try std.testing.expectEqual(@as(?CT, null), try cb.cloneTensorShape(view, &.{ 3, 2 }));
+                const live = budget.live;
+                if (backing_failure) {
+                    failing.fail_index = failing.alloc_index + failure_allocation;
+                } else {
+                    budget.limit = live + if (failure_allocation == 0) @as(usize, 0) else @sizeOf(@TypeOf(original));
+                }
+                try std.testing.expectError(error.OutOfMemory, cb.toFloat32(view, a));
+                try std.testing.expectEqual(live, budget.live);
+                try std.testing.expectEqual(!backing_failure, budget.denied);
+                try std.testing.expectEqual(before.data.ptr, toBuf(view).data.ptr);
+                try std.testing.expectEqual(before.shared_data_refcount, toBuf(view).shared_data_refcount);
+                try std.testing.expectEqual(before.logical_shape.?.ptr, toBuf(view).logical_shape.?.ptr);
+                try std.testing.expectEqual(before.view_strides.?.ptr, toBuf(view).view_strides.?.ptr);
+                try std.testing.expectEqualSlices(f32, &original, toBuf(source).data);
+                try std.testing.expectEqualSlices(i64, &.{ 3, 2 }, toBuf(view).logical_shape.?);
+
+                failing.fail_index = std.math.maxInt(usize);
+                budget.limit = 64 * 1024;
+                const retry = try cb.toFloat32(view, a);
+                defer a.free(retry);
+                try std.testing.expectEqualSlices(f32, &.{ 1, 4, 2, 5, 3, 6 }, retry);
+                try std.testing.expectEqualSlices(f32, &original, toBuf(source).data);
+                try std.testing.expect(toBuf(view).view_strides == null);
+            }
+        }
+    }
+}
+
+test "native tensor view checked readback preserves genuine shape errors" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.deinitOwned();
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const source = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 2, 3 });
+    defer cb.free(source);
+    const view = try primTransposeOp(&compute, source, &.{ 1, 0 }, &.{ 2, 3 });
+    defer cb.free(view);
+    toBuf(view).view_base_offset = 6;
+    try std.testing.expectError(error.InvalidTensorShape, cb.toFloat32(view, a));
+    try std.testing.expect(toBuf(view).view_strides != null);
+    toBuf(view).view_base_offset = 0;
+    const retry = try cb.toFloat32(view, a);
+    defer a.free(retry);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 4, 2, 5, 3, 6 }, retry);
+    try std.testing.expectError(error.InvalidShape, cb.fromFloat32Shape(&.{1}, &.{2}));
 }
 
 fn ownedDenseBufWithMaxSharedRefs(ct: CT, max_shared_refs: usize) ?*Buf {
@@ -1063,37 +1152,21 @@ fn makeDenseViewAlias(
 
     const alias = try self.allocator.create(Buf);
     errdefer self.allocator.destroy(alias);
-
-    if (source.owned and source.shared_data_refcount != null) {
-        source.shared_data_refcount.?.* += 1;
-        errdefer source.shared_data_refcount.?.* -= 1;
-        alias.* = .{
-            .data = source.data,
-            .allocator = self.allocator,
-            .owned = true,
-            .shared_data_refcount = source.shared_data_refcount,
-            .logical_shape = try self.allocator.dupe(i64, shape),
-            .view_strides = try self.allocator.dupe(usize, strides),
-            .view_base_offset = base_offset,
-            .declared_dtype = source.declared_dtype,
-            .name = source.name,
-            .lazy_entry = null,
-            .quantized_storage = null,
-            .owned_quantized_storage = null,
-            .source_tensor = null,
-            .owned_source_tensor = null,
-            .reservation = null,
-        };
-        return alias;
-    }
-
+    const logical_shape = try self.allocator.dupe(i64, shape);
+    errdefer self.allocator.free(logical_shape);
+    const view_strides = try self.allocator.dupe(usize, strides);
+    errdefer self.allocator.free(view_strides);
+    // Stage every fallible metadata allocation before retaining the source
+    // and publishing the alias. This also covers non-owning borrowed input.
+    const shared = if (source.owned) source.shared_data_refcount else null;
+    if (shared) |refs| refs.* = try std.math.add(usize, refs.*, 1);
     alias.* = .{
         .data = source.data,
         .allocator = self.allocator,
-        .owned = false,
-        .shared_data_refcount = null,
-        .logical_shape = try self.allocator.dupe(i64, shape),
-        .view_strides = try self.allocator.dupe(usize, strides),
+        .owned = shared != null,
+        .shared_data_refcount = shared,
+        .logical_shape = logical_shape,
+        .view_strides = view_strides,
         .view_base_offset = base_offset,
         .declared_dtype = source.declared_dtype,
         .name = source.name,
@@ -1112,6 +1185,38 @@ const DenseReadPlan = struct {
     strides: []const usize,
     base_offset: usize,
 };
+
+test "native dense view alias metadata failure preserves owned and borrowed inputs" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |owned| {
+        for (0..3) |failure_offset| {
+            var failing = std.testing.FailingAllocator.init(a, .{});
+            {
+                var store = WeightStore{ .allocator = failing.allocator(), .resident_weights = .empty, .lazy_weights = .empty };
+                defer store.deinitOwned();
+                var compute = NativeCompute.init(failing.allocator(), &store, null);
+                defer compute.deinit();
+                var borrowed = [_]f32{ 1, 2, 3, 4, 5, 6 };
+                const input = if (owned)
+                    try fromFloat32ShapeOp(&compute, &borrowed, &.{ 2, 3 })
+                else
+                    try compute.withLogicalShape(try compute.makeBuf(&borrowed, false), &.{ 2, 3 });
+                defer freeTensor(&compute, input);
+                failing.fail_index = failing.alloc_index + failure_offset;
+                try std.testing.expectError(error.OutOfMemory, primTransposeOp(&compute, input, &.{ 1, 0 }, &.{ 2, 3 }));
+                try std.testing.expect(toBuf(input).view_strides == null);
+                if (owned) try std.testing.expectEqual(@as(usize, 1), toBuf(input).shared_data_refcount.?.*);
+                try std.testing.expectEqualSlices(f32, &borrowed, try getDataChecked(input));
+                failing.fail_index = std.math.maxInt(usize);
+                const retry = try primTransposeOp(&compute, input, &.{ 1, 0 }, &.{ 2, 3 });
+                defer freeTensor(&compute, retry);
+                try std.testing.expectEqualSlices(f32, &.{ 1, 4, 2, 5, 3, 6 }, try getDataChecked(retry));
+                try std.testing.expectEqualSlices(f32, &borrowed, try getDataChecked(input));
+            }
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        }
+    }
+}
 
 const BroadcastReadAccess = struct {
     plan: DenseReadPlan,
@@ -3761,12 +3866,12 @@ fn denseWeightView(self: *NativeCompute, weight: CT) !WeightF32View {
 
 fn denseTensorView(self: *NativeCompute, tensor: CT) !WeightF32View {
     const buf = toBuf(tensor);
-    if (buf.data.len != 0) return .{ .data = getData(tensor) };
+    if (buf.data.len != 0 or buf.view_strides != null) return .{ .data = try getDataChecked(tensor) };
     if (buf.source_tensor != null or buf.quantized_storage != null or buf.lazy_entry != null) {
         const converted = try toFloat32Op(self, tensor, self.allocator);
         return .{ .data = converted, .owned = converted };
     }
-    return .{ .data = getData(tensor) };
+    return .{ .data = try getDataChecked(tensor) };
 }
 
 fn borrowTensorF32IfAligned(tensor: *const tensor_mod.Tensor) ?[]const f32 {
@@ -3935,10 +4040,16 @@ fn loadEphemeralQuantizedLazyWeight(
     return self.makeBufWithOwnedQuantizedStorage(name, entry, storage);
 }
 
+/// Weight storage and activation arithmetic are independent contracts. The
+/// automatic profile preserves existing shape-selected Q8 activation kernels;
+/// strict_f32 never rounds activations before a quantized weight projection.
+pub const QuantizedActivationPolicy = enum { automatic, strict_f32 };
+
 pub const NativeCompute = struct {
     allocator: std.mem.Allocator,
     data: *WeightStore,
     run_budget: ?*run_memory.RunBudget = null,
+    quantized_activation_policy: QuantizedActivationPolicy = .automatic,
     weight_reservations: std.StringHashMapUnmanaged(ReservationState) = .empty,
     weight_handles: std.StringHashMapUnmanaged(CT) = .empty,
     /// Optional Io for parallel GEMM dispatch.  When non-null, sgemm calls
@@ -4041,6 +4152,7 @@ pub const NativeCompute = struct {
     }
 
     pub fn importHostTensor(self: *NativeCompute, tensor: *const tensor_mod.Tensor) !CT {
+        if (tensor.dtype == .i32 or tensor.dtype == .i64) return copyIntegerTensorWithShape(self, tensor, tensor.shape);
         const converted = try convertTensorToOwnedF32(self.allocator, tensor);
         errdefer self.allocator.free(converted);
         return self.importDenseTensor(tensor.name, tensor.dtype, tensor.shape, converted);
@@ -4048,8 +4160,8 @@ pub const NativeCompute = struct {
 
     pub fn importOwnedStaticTensor(self: *NativeCompute, tensor: tensor_mod.Tensor) !CT {
         const can_keep_typed =
-            tensor.shape.len == 2 and
-            (tensor.dtype == .f32 or tensor.dtype == .f16 or tensor.dtype == .bf16);
+            tensor.dtype == .i32 or tensor.dtype == .i64 or (tensor.shape.len == 2 and
+                (tensor.dtype == .f32 or tensor.dtype == .f16 or tensor.dtype == .bf16));
         if (can_keep_typed) {
             return self.makeBufWithOwnedSourceTensor(tensor);
         }
@@ -4078,6 +4190,16 @@ pub const NativeCompute = struct {
 
     fn freeImportedTensor(self: *NativeCompute, tensor: CT) void {
         self.computeBackend().free(tensor);
+    }
+
+    /// Exact integer inspection. Native integer payloads never pass through
+    /// getData/toFloat32; compatibility float-index tensors are checked first.
+    pub fn toInt64(_: *NativeCompute, tensor: CT, allocator: std.mem.Allocator) ![]i64 {
+        const indices = try IndexReader.init(tensor);
+        const output = try allocator.alloc(i64, indices.len);
+        errdefer allocator.free(output);
+        for (output, 0..) |*value, index| value.* = try indices.at(index);
+        return output;
     }
 
     fn withLogicalShape(self: *NativeCompute, tensor: CT, shape: []const i64) !CT {
@@ -4200,10 +4322,13 @@ pub const NativeCompute = struct {
     }
 
     fn makeBufWithOwnedSourceTensor(self: *NativeCompute, tensor: tensor_mod.Tensor) !CT {
+        // This function consumes tensor on both success and failure. Register
+        // its cleanup before the first ownership-container allocation.
+        var tensor_to_release = tensor;
+        errdefer tensor_to_release.deinit();
         const owned_tensor = try self.allocator.create(tensor_mod.Tensor);
         errdefer self.allocator.destroy(owned_tensor);
         owned_tensor.* = tensor;
-        errdefer owned_tensor.deinit();
 
         const b = try self.allocator.create(Buf);
         errdefer self.allocator.destroy(b);
@@ -4497,7 +4622,10 @@ pub const vtable_impl = ComputeBackend.VTable{
     .crossAttention = &crossAttentionOp,
     .relativePositionBias = &relativePositionBiasOp,
     .disentangledRelativeAttention = &disentangledRelativeAttentionOp,
+    .disentangledRelativeAttentionWithControl = &disentangledRelativeAttentionWithControlOp,
     .disentangledRelativeAttentionBackward = &disentangledRelativeAttentionBackwardOp,
+    .debertaTrainingAttentionV1 = &debertaTrainingAttentionV1Op,
+    .debertaTrainingAttentionBackwardV1 = &debertaTrainingAttentionBackwardV1Op,
     .windowedSelfAttention = &windowedSelfAttentionOp,
     .channelSelfAttention = &channelSelfAttentionOp,
     .tokenGridConv2d = &tokenGridConv2dOp,
@@ -4512,6 +4640,8 @@ pub const vtable_impl = ComputeBackend.VTable{
     .gqaPagedAttention = &gqaPagedAttentionOp,
     .fromFloat32 = &fromFloat32Op,
     .fromFloat32Shape = &fromFloat32ShapeOp,
+    .fromInt32Shape = &fromInt32ShapeOp,
+    .cloneTensorShape = &cloneTensorShapeOp,
     .toFloat32 = &toFloat32Op,
     .exportTensorData = &exportTensorDataOp,
     .tensorDType = &tensorDTypeOp,
@@ -5713,6 +5843,7 @@ fn dispatchQuantizedLinear(request: QuantLinearRequest) !bool {
         try validateQuantLinearPlan(plan, request.storage_a, request.rows, request.in_dim, request.out_dim);
     }
     const self = request.compute;
+    if (self.quantized_activation_policy == .strict_f32) return dispatchQuantizedLinearStrictF32(request);
     switch (request.kind) {
         .single_no_bias => {
             if (shouldUseQuantizedDequantSgemm(request.name_a, request.rows, request.out_dim, request.storage_a)) {
@@ -5797,6 +5928,44 @@ fn dispatchQuantizedLinear(request: QuantLinearRequest) !bool {
             return false;
         },
     }
+}
+
+/// All native single/pair/triple/planned/bias projection routes meet here.
+/// Keep this before automatic fused Q8/Q8_K activation preparation so a
+/// shape-specific optimization cannot silently change the instance policy.
+fn dispatchQuantizedLinearStrictF32(request: QuantLinearRequest) !bool {
+    const self = request.compute;
+    const projection_count: usize = switch (request.kind) {
+        .single_no_bias, .single_bias => 1,
+        .pair_no_bias, .pair_bias => 2,
+        .triple_bias => 3,
+    };
+    const has_bias = request.kind == .single_bias or request.kind == .pair_bias or request.kind == .triple_bias;
+    const storages = [_]?*const QuantizedStorage{ request.storage_a, request.storage_b, request.storage_c };
+    const outputs = [_]?[]f32{ request.output_a, request.output_b, request.output_c };
+    const biases = [_]?[]const f32{ request.bias_a, request.bias_b, request.bias_c };
+    const names = [_][]const u8{ request.name_a, request.name_b, request.name_c };
+    const input_count = try std.math.mul(usize, request.rows, request.in_dim);
+    const output_count = try std.math.mul(usize, request.rows, request.out_dim);
+    if (request.rows == 0 or request.in_dim == 0 or request.out_dim == 0 or request.input.len != input_count)
+        return error.InvalidQuantizedLinearShape;
+    for (0..projection_count) |index| {
+        _ = storages[index] orelse return false;
+        const output = outputs[index] orelse return false;
+        if (output.len != output_count) return error.InvalidQuantizedLinearShape;
+        if (has_bias and (biases[index] orelse return false).len != request.out_dim) return error.InvalidQuantizedLinearShape;
+    }
+    for (0..projection_count) |index| {
+        const storage = storages[index].?;
+        const output = outputs[index].?;
+        // This existing path uses F32 SGEMM and the bounded shared dense
+        // cache/scratch policy. It never creates a quantized activation.
+        const dense = shouldUseQuantizedDequantSgemm(names[index], request.rows, request.out_dim, storage) and
+            try tryLinearQuantizedDequantSgemmNoBias(self, storage, names[index], request.input, output, request.rows, request.in_dim, request.out_dim);
+        if (!dense and !try linearNoBiasQuantizedWithPolicy(.strict_f32, self.io, storage, request.input, output, request.rows, request.in_dim, request.out_dim)) return false;
+        if (has_bias) addLinearBiasRows(output, biases[index].?, request.rows, request.out_dim);
+    }
+    return true;
 }
 
 fn linearOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
@@ -6124,14 +6293,20 @@ fn linearLoRAOp(
 
     const lora_rank: usize = if (in_dim == 0) 0 else lora_a_data.len / in_dim;
 
-    // Base linear: Y = input @ W^T + bias.  Same path as `linearOp` (just
-    // inlined here so we can add the LoRA residual into the same buffer).
+    // Base linear: Y = input @ W^T + bias. Quantized bases must use the same
+    // instance policy as ordinary projections; a fused adapter cannot bypass
+    // strict activation precision or read an absent dense weight mirror.
     const output = try self.allocator.alloc(f32, rows * out_dim);
     errdefer self.allocator.free(output);
-    for (0..rows) |r| {
-        @memcpy(output[r * out_dim .. (r + 1) * out_dim], bias_data[0..out_dim]);
+    const base_buf = toBuf(base_weight);
+    if (base_buf.quantized_storage) |storage| {
+        if (!try dispatchQuantizedLinear(.{ .compute = self, .kind = .single_bias, .input = input_data, .rows = rows, .in_dim = in_dim, .out_dim = out_dim, .storage_a = storage, .name_a = base_buf.name, .bias_a = bias_data, .output_a = output })) return error.UnsupportedTensorType;
+    } else {
+        for (0..rows) |r| {
+            @memcpy(output[r * out_dim .. (r + 1) * out_dim], bias_data[0..out_dim]);
+        }
+        try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, input_data, base_w_data, 1.0, output);
     }
-    try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, input_data, base_w_data, 1.0, output);
 
     // LoRA residual: Y += alpha * (input @ A^T) @ B^T, where A is
     // [lora_rank, in_dim] and B is [out_dim, lora_rank].  The previous
@@ -7552,6 +7727,19 @@ pub fn linearNoBiasQuantized(
     in_dim: usize,
     out_dim: usize,
 ) !bool {
+    return linearNoBiasQuantizedWithPolicy(.automatic, io, storage, input, output, rows, in_dim, out_dim);
+}
+
+fn linearNoBiasQuantizedWithPolicy(
+    policy: QuantizedActivationPolicy,
+    io: ?std.Io,
+    storage: *const QuantizedStorage,
+    input: []const f32,
+    output: []f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
     if (storage.tensor_type.eql(.{ .known = .Q4_K }) or
         storage.tensor_type.eql(.{ .known = .Q5_K }) or
         storage.tensor_type.eql(.{ .known = .Q6_K }))
@@ -7563,7 +7751,7 @@ pub fn linearNoBiasQuantized(
             if (storage.shape.len == 2 and
                 storage.shape[0] == out_dim and
                 storage.shape[1] == in_dim and
-                shouldUseQ6_KQ8KActivationQuant(rows, out_dim, row_blocks) and
+                (policy == .automatic and shouldUseQ6_KQ8KActivationQuant(rows, out_dim, row_blocks)) and
                 storage.preparedBytes(.row_major_blocks) != null)
             {
                 const panel16_blocks = if (q6KPanel16SingleEnabledForShape(rows, out_dim, row_blocks)) storage.preparedBytes(.panel16) else null;
@@ -7578,7 +7766,7 @@ pub fn linearNoBiasQuantized(
             if (storage.shape.len == 2 and
                 storage.shape[0] == out_dim and
                 storage.shape[1] == in_dim and
-                shouldUseQ4_Q5_KQ8KActivationQuant(rows, out_dim, row_blocks) and
+                (policy == .automatic and shouldUseQ4_Q5_KQ8KActivationQuant(rows, out_dim, row_blocks)) and
                 storage.preparedBytes(.row_major_blocks) != null)
             {
                 try linearNoBiasQ4Q5KPreparedQ8KActivation(storage.allocator, io, input, storage.preparedBytes(.row_major_blocks).?, storage.preparedBytes(.panel4), storage.preparedBytes(.panel8), storage.preparedBytes(.panel16), null, output, rows, in_dim, out_dim, switch (storage.tensor_type) {
@@ -7621,7 +7809,7 @@ pub fn linearNoBiasQuantized(
             const values_per_block: usize = 128;
             if (in_dim % values_per_block != 0) return error.InvalidQuantizedLinearShape;
             const input_blocks = in_dim / 32;
-            if (shouldUseQ8_0ActivationQuant(rows, out_dim, input_blocks)) {
+            if ((policy == .automatic and shouldUseQ8_0ActivationQuant(rows, out_dim, input_blocks))) {
                 if (storage.preparedBytes(.row_major_blocks)) |prepared_blocks| {
                     try linearNoBiasQ1_0PreparedActivation(storage.allocator, io, input, prepared_blocks, storage.preparedBytes(.panel4), output, rows, in_dim, out_dim);
                     return true;
@@ -7639,7 +7827,7 @@ pub fn linearNoBiasQuantized(
             const values_per_block: usize = 256;
             if (in_dim % values_per_block != 0) return error.InvalidQuantizedLinearShape;
             const row_blocks = in_dim / values_per_block;
-            if (shouldUseQ4_Q5_KQ8KActivationQuant(rows, out_dim, row_blocks)) {
+            if ((policy == .automatic and shouldUseQ4_Q5_KQ8KActivationQuant(rows, out_dim, row_blocks))) {
                 if (known == .Q3_K and q3KNoDmnPanelSingleEnabledForShape(rows, out_dim, row_blocks)) {
                     if (storage.preparedBytes(.row_major_blocks)) |prepared_blocks| {
                         if (storage.preparedBytes(.panel4_k16_no_min)) |q3_panel_blocks| {
@@ -7690,7 +7878,7 @@ pub fn linearNoBiasQuantized(
             const values_per_block: usize = 32;
             if (in_dim % values_per_block != 0) return error.InvalidQuantizedLinearShape;
             const row_blocks = in_dim / values_per_block;
-            if (shouldUseQ8_0ActivationQuant(rows, out_dim, row_blocks)) {
+            if ((policy == .automatic and shouldUseQ8_0ActivationQuant(rows, out_dim, row_blocks))) {
                 if (storage.preparedBytes(.row_major_blocks)) |prepared_blocks| {
                     try linearNoBiasLegacyPreparedActivation(storage.allocator, io, input, prepared_blocks, storage.preparedBytes(.panel4), known != .Q4_0, output, rows, in_dim, out_dim);
                     noteNativeQuantDispatch(.legacy_activation);
@@ -7707,7 +7895,7 @@ pub fn linearNoBiasQuantized(
         const values_per_block: usize = 32;
         if (in_dim % values_per_block != 0) return error.InvalidQuantizedLinearShape;
         const row_blocks = in_dim / values_per_block;
-        if (shouldUseQ8_0ActivationQuant(rows, out_dim, row_blocks)) {
+        if ((policy == .automatic and shouldUseQ8_0ActivationQuant(rows, out_dim, row_blocks))) {
             if (storage.preparedBytes(.row_major_blocks)) |prepared_blocks| {
                 try linearNoBiasQ8_1PreparedActivation(storage.allocator, io, input, prepared_blocks, storage.preparedBytes(.panel4), output, rows, in_dim, out_dim);
                 return true;
@@ -7721,7 +7909,7 @@ pub fn linearNoBiasQuantized(
     if (storage.tensor_type.eql(.{ .known = .Q8_0 }) and storage.packed_expert == null) {
         if (storage.shape.len != 2) return false;
         if (storage.shape[0] != out_dim or storage.shape[1] != in_dim) return false;
-        try linearNoBiasQ8_0(storage.allocator, io, input, storage.raw_bytes, storage.preparedBytes(.row_major_blocks), storage.preparedBytes(.panel4), storage.preparedBytes(.panel8), output, rows, in_dim, out_dim);
+        try linearNoBiasQ8_0WithPolicy(policy, storage.allocator, io, input, storage.raw_bytes, storage.preparedBytes(.row_major_blocks), storage.preparedBytes(.panel4), storage.preparedBytes(.panel8), output, rows, in_dim, out_dim);
         noteNativeQuantDispatch(.q8_0_direct);
         return true;
     }
@@ -7733,7 +7921,7 @@ pub fn linearNoBiasQuantized(
         if (storage.shape.len == 2 and
             storage.shape[0] == out_dim and
             storage.shape[1] == in_dim and
-            shouldUseQ8_KQ8KActivationQuant(rows, out_dim, row_blocks))
+            (policy == .automatic and shouldUseQ8_KQ8KActivationQuant(rows, out_dim, row_blocks)))
         {
             const panel8_blocks = if (q8KPanel8DirectEnabled()) storage.preparedBytes(.panel8) else null;
             const panel16_blocks = if (q8KPanel16SingleEnabledForShape(rows, out_dim, row_blocks)) storage.preparedBytes(.panel16) else null;
@@ -7745,12 +7933,14 @@ pub fn linearNoBiasQuantized(
 
     switch (storage.tensor_type) {
         .known => |known| if (known == .I2_S) {
+            if (policy == .strict_f32) return false;
             if (storage.packed_expert != null) return false;
             if (storage.shape.len != 2) return false;
             if (storage.shape[0] != out_dim or storage.shape[1] != in_dim) return false;
             try linearNoBiasI2SActivationQuantized(storage.allocator, input, storage.raw_bytes, output, rows, in_dim, out_dim);
             return true;
         } else if (known == .TL1) {
+            if (policy == .strict_f32) return false;
             if (storage.packed_expert != null) return false;
             if (storage.shape.len != 2) return false;
             if (storage.shape[0] != out_dim or storage.shape[1] != in_dim) return false;
@@ -7758,6 +7948,7 @@ pub fn linearNoBiasQuantized(
             return true;
         },
         .bitnet_tl2 => {
+            if (policy == .strict_f32) return false;
             if (storage.packed_expert != null) return false;
             if (storage.shape.len != 2) return false;
             if (storage.shape[0] != out_dim or storage.shape[1] != in_dim) return false;
@@ -30029,6 +30220,23 @@ fn linearNoBiasQ8_0(
     in_dim: usize,
     out_dim: usize,
 ) !void {
+    return linearNoBiasQ8_0WithPolicy(.automatic, allocator, io, input, weight_raw, prepared_blocks, prepared_panel_blocks, prepared_panel8_blocks, output, rows, in_dim, out_dim);
+}
+
+fn linearNoBiasQ8_0WithPolicy(
+    policy: QuantizedActivationPolicy,
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    input: []const f32,
+    weight_raw: []const u8,
+    prepared_blocks: ?[]const u8,
+    prepared_panel_blocks: ?[]const u8,
+    prepared_panel8_blocks: ?[]const u8,
+    output: []f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !void {
     const block_size: usize = 34;
     const values_per_block: usize = 32;
     if (in_dim % values_per_block != 0) return error.InvalidQuantizedLinearShape;
@@ -30045,7 +30253,7 @@ fn linearNoBiasQ8_0(
         if (blocks.len != preparedQ8_0Panel8ByteSize(out_dim, row_blocks)) return error.InvalidQuantizedDataSize;
     }
 
-    if (shouldUseQ8_0ActivationQuant(rows, out_dim, row_blocks)) {
+    if (policy == .automatic and shouldUseQ8_0ActivationQuant(rows, out_dim, row_blocks)) {
         if (rows == 1 and in_dim <= small_row_q8_0_stack_max_in_dim) {
             var q_values_buf: [small_row_q8_0_stack_max_in_dim]u8 = undefined;
             var input_scales_buf: [small_row_q8_0_stack_max_in_dim / values_per_block]f32 = undefined;
@@ -35114,19 +35322,99 @@ fn relativePositionBiasOp(ctx: *anyopaque, weight: CT, q_len: usize, k_len: usiz
     return self.makeBuf(output, true);
 }
 
-fn disentangledRelativeAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q_r_ct: CT, k_r_ct: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
+fn debertaTrainingShape(tensor: CT, expected: @import("ml").graph.Shape) !void {
+    const actual = tensorStoredShape(tensor) orelse return error.InvalidDebertaTrainingAttentionShape;
+    if (!std.mem.eql(i64, actual, expected.dims[0..expected.rank_])) return error.InvalidDebertaTrainingAttentionShape;
+}
+
+fn debertaTrainingF32(self: *NativeCompute, tensor: CT, expected: @import("ml").graph.Shape) !WeightF32View {
+    try debertaTrainingShape(tensor, expected);
+    if (try tensorDTypeOp(self, tensor) != .f32) return error.InvalidDebertaTrainingAttentionDType;
+    const buf = toBuf(tensor);
+    // This dedicated execution profile consumes F32 activations. Quantized
+    // storage cannot be promoted implicitly through the generic view helper.
+    if (buf.quantized_storage != null or buf.owned_quantized_storage != null) return error.InvalidDebertaTrainingAttentionDType;
+    if (buf.view_strides != null) return .{ .data = try getDataChecked(tensor) };
+    if (buf.source_tensor) |source| {
+        if (source.dtype != .f32) return error.InvalidDebertaTrainingAttentionDType;
+        return tensorF32View(self, source);
+    }
+    return denseTensorView(self, tensor);
+}
+
+fn debertaTrainingControl(tensor: CT, expected: @import("ml").graph.Shape) ![]align(1) const i32 {
+    try debertaTrainingShape(tensor, expected);
+    const buf = toBuf(tensor);
+    const source = buf.source_tensor orelse return error.InvalidDebertaTrainingAttentionDType;
+    if (source.dtype != .i32 or buf.view_strides != null) return error.InvalidDebertaTrainingAttentionDType;
+    _ = try integerTensorCount(source);
+    // Retain align(1): mapped physical i32 bytes need neither an integer
+    // staging copy nor a lossy route through getData/toFloat32.
+    return std.mem.bytesAsSlice(i32, source.data);
+}
+
+fn debertaTrainingAttentionV1Op(ctx: *anyopaque, qkv: CT, relative: CT, control_i32: CT, attrs: deberta_training.Attrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (control) |c| try c.check();
+    _ = try deberta_training.plan(attrs, .{});
+    const layout = try attrs.layout();
+    const words = try debertaTrainingControl(control_i32, layout.controlShape());
+    _ = try deberta_training.validateControl(attrs, words, .{ .control = control, .io = self.io });
+    const qkv_data = try debertaTrainingF32(self, qkv, layout.qkvShape());
+    defer if (qkv_data.owned) |data| self.allocator.free(data);
+    const relative_data = try debertaTrainingF32(self, relative, layout.relativeShape());
+    defer if (relative_data.owned) |data| self.allocator.free(data);
+    const output = try deberta_training.forward(self.allocator, attrs, qkv_data.data, relative_data.data, words, .{ .control = control, .io = self.io });
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    const shape = layout.outputShape();
+    return self.withLogicalShape(result, shape.dims[0..shape.rank_]);
+}
+
+fn debertaTrainingAttentionBackwardV1Op(ctx: *anyopaque, qkv: CT, relative: CT, control_i32: CT, dout: CT, attrs: deberta_training.Attrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (control) |c| try c.check();
+    _ = try deberta_training.plan(attrs, .{});
+    const layout = try attrs.layout();
+    const words = try debertaTrainingControl(control_i32, layout.controlShape());
+    _ = try deberta_training.validateControl(attrs, words, .{ .control = control, .io = self.io });
+    const qkv_data = try debertaTrainingF32(self, qkv, layout.qkvShape());
+    defer if (qkv_data.owned) |data| self.allocator.free(data);
+    const relative_data = try debertaTrainingF32(self, relative, layout.relativeShape());
+    defer if (relative_data.owned) |data| self.allocator.free(data);
+    const cotangent = try debertaTrainingF32(self, dout, layout.outputShape());
+    defer if (cotangent.owned) |data| self.allocator.free(data);
+    const output = try deberta_training.backward(self.allocator, attrs, qkv_data.data, relative_data.data, words, cotangent.data, .{ .control = control, .io = self.io });
+    const result = try self.makeOwnedBuf(output);
+    errdefer freeTensor(self, result);
+    const shape = layout.gradientShape();
+    return self.withLogicalShape(result, shape.dims[0..shape.rank_]);
+}
+
+fn disentangledRelativeAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q_r_ct: CT, k_r_ct: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
+    return disentangledRelativeAttentionWithControlOp(ctx, q_ct, k_ct, v_ct, q_r_ct, k_r_ct, mask, batch, seq_len, num_heads, head_dim, null);
+}
+
+fn disentangledRelativeAttentionWithControlOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q_r_ct: CT, k_r_ct: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (control) |c| try c.check();
     const Q = getData(q_ct);
     const K = getData(k_ct);
     const V = getData(v_ct);
     const Q_r = getData(q_r_ct);
     const K_r = getData(k_r_ct);
+    // Long sequences use bounded workspace. A request carrying cancellation
+    // also uses tiled work so checks remain inside the attention operation.
+    if (seq_len >= 256 or control != null) {
+        const output = try deberta_tiled.forward(self.allocator, .{ .batch = batch, .sequence = seq_len, .heads = num_heads, .head_dim = head_dim }, .{ .q = Q, .k = K, .v = V, .qr = Q_r, .kr = K_r, .mask = mask }, .{ .control = control, .io = self.io });
+        return self.makeOwnedBuf(output);
+    }
     if (build_options.enable_system_blas and seq_len >= 64) {
         const output = try debertaDisentangledAttentionBlasMaterialized(self.allocator, Q, K, V, Q_r, K_r, mask, batch, seq_len, num_heads, head_dim);
-        return self.makeBuf(output, true);
+        return self.makeOwnedBuf(output);
     }
     const output = try linalg.debertaDisentangledAttentionHost(self.allocator, Q, K, V, Q_r, K_r, mask, batch, seq_len, num_heads, head_dim);
-    return self.makeBuf(output, true);
+    return self.makeOwnedBuf(output);
 }
 
 fn disentangledRelativeAttentionBackwardOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q_r_ct: CT, k_r_ct: CT, mask: []const i64, dO_ct: CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT {
@@ -35295,11 +35583,44 @@ test "materialized DeBERTa attention matches shared linalg reference" {
     defer allocator.free(want);
     const got = try debertaDisentangledAttentionBlasMaterialized(allocator, &q, &k, &v, &q_r, &k_r, &mask, batch, seq_len, num_heads, head_dim);
     defer allocator.free(got);
+    const tiled = try deberta_tiled.forward(allocator, .{ .batch = batch, .sequence = seq_len, .heads = num_heads, .head_dim = head_dim }, .{ .q = &q, .k = &k, .v = &v, .qr = &q_r, .kr = &k_r, .mask = &mask }, .{ .query_tile = 3, .key_tile = 2 });
+    defer allocator.free(tiled);
 
     try std.testing.expectEqual(want.len, got.len);
     for (want, got) |a, b| {
         try std.testing.expectApproxEqAbs(a, b, 1e-4);
     }
+    for (got, tiled) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-5);
+}
+
+test "native DeBERTa attention forwards request cancellation into bounded tiles" {
+    const allocator = std.testing.allocator;
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var backend = NativeCompute.init(allocator, &store, null);
+    defer backend.deinit();
+    var cb = backend.computeBackend();
+    const q = try cb.fromFloat32Shape(&(.{@as(f32, 0.1)} ** 20), &.{ 5, 4 });
+    defer cb.free(q);
+    const relative = try cb.fromFloat32Shape(&(.{@as(f32, 0.2)} ** 36), &.{ 9, 4 });
+    defer cb.free(relative);
+    const Cancel = struct {
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls >= 15) return error.Cancelled;
+        }
+    };
+    var cancel = Cancel{};
+    cb.execution_control = .{ .ptr = &cancel, .check_fn = Cancel.check };
+    const result = cb.disentangledRelativeAttention(q, q, q, relative, relative, &.{ 1, 1, 1, 1, 1 }, 1, 5, 1, 4) catch |err| {
+        try std.testing.expectEqual(error.Cancelled, err);
+        try std.testing.expect(cancel.calls >= 15);
+        return;
+    };
+    cb.free(result);
+    return error.ExpectedCancellation;
 }
 
 /// Host/CPU reference for the BACKWARD pass (VJP) of DeBERTa disentangled
@@ -37498,6 +37819,16 @@ fn primReduceOp(self: *NativeCompute, input: CT, axes: []const u8, input_shape: 
 
 fn primReshapeOp(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (integerSource(input)) |source| {
+        if (new_shape.len > 8) return error.UnsupportedShape;
+        const stored = tensorStoredShape(input) orelse return error.InvalidTensorShape;
+        const count = integerTensorCount(source) catch return error.InvalidTensorShape;
+        if (typedShapeNumel(new_shape)) |exact| {
+            if (exact == count) return copyIntegerTensorWithShape(self, source, new_shape);
+        }
+        const resolved = inferReshapeShapeWithNumel(stored, new_shape, count) orelse return error.ShapeMismatch;
+        return copyIntegerTensorWithShape(self, source, resolved[0..new_shape.len]);
+    }
     const in_data = getData(input);
     if (tensorStoredShape(input)) |shape| {
         if (inferReshapeShapeWithNumel(shape, new_shape, in_data.len)) |resolved| {
@@ -37615,7 +37946,10 @@ fn primTransposeOp(ctx: *anyopaque, input: CT, perm: []const u8, input_shape: []
     if (makeDenseViewAlias(self, input, out_shape[0..rank], view_strides[0..rank], 0)) |view| {
         if (!should_attach_shape) return view;
         return view;
-    } else |_| {}
+    } else |err| switch (err) {
+        error.UnsupportedTensorType => {},
+        else => return err,
+    }
 
     const in_view = try denseWeightView(self, input);
     defer if (in_view.owned) |owned| self.allocator.free(owned);
@@ -37739,7 +38073,10 @@ fn primBroadcastInDimOp(ctx: *anyopaque, input: CT, target_shape: []const i64, b
         if (can_view) {
             if (makeDenseViewAlias(self, input, resolved_target_shape[0..out_rank], view_strides[0..out_rank], 0)) |view| {
                 return view;
-            } else |_| {}
+            } else |err| switch (err) {
+                error.UnsupportedTensorType => {},
+                else => return err,
+            }
         }
     }
 
@@ -38459,11 +38796,246 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
     return error.UnsupportedPrimitiveOp;
 }
 
+fn integerSource(input: CT) ?*const tensor_mod.Tensor {
+    const source = toBuf(input).source_tensor orelse return null;
+    return if (source.dtype == .i32 or source.dtype == .i64) source else null;
+}
+
+fn integerTensorCount(tensor: *const tensor_mod.Tensor) !usize {
+    if (tensor.dtype != .i32 and tensor.dtype != .i64) return error.UnsupportedTensorType;
+    const expected = tensorExpectedDenseByteLen(tensor) orelse return error.InvalidTensorShape;
+    if (tensor.data.len != expected) return error.InvalidTensorShape;
+    return expected / tensor.dtype.byteSize();
+}
+
+fn typedShapeNumel(shape: []const i64) ?usize {
+    var count: usize = 1;
+    for (shape) |dim| {
+        if (dim < 0) return null;
+        count = std.math.mul(usize, count, @intCast(dim)) catch return null;
+    }
+    return count;
+}
+
+/// A non-owning exact reader. bytesAsSlice retains align(1), allowing safe
+/// reads from mapped or deliberately unaligned integer tensor payloads.
+const IndexReader = struct {
+    source: ?*const tensor_mod.Tensor,
+    legacy: []const f32,
+    len: usize,
+
+    fn init(indices: CT) !IndexReader {
+        if (integerSource(indices)) |source|
+            return .{ .source = source, .legacy = &.{}, .len = try integerTensorCount(source) };
+        const data = getData(indices);
+        return .{ .source = null, .legacy = data, .len = data.len };
+    }
+
+    fn at(self: IndexReader, index: usize) !i64 {
+        if (index >= self.len) return error.IndexOutOfBounds;
+        if (self.source) |source| return switch (source.dtype) {
+            .i32 => std.mem.bytesAsSlice(i32, source.data)[index],
+            .i64 => std.mem.bytesAsSlice(i64, source.data)[index],
+            else => unreachable,
+        };
+        const value: f64 = self.legacy[index];
+        if (!std.math.isFinite(value) or value < -9223372036854775808.0 or value >= 9223372036854775808.0)
+            return error.InvalidIndex;
+        return @intFromFloat(value);
+    }
+
+    fn normalized(self: IndexReader, index: usize, extent: usize) !usize {
+        const signed_extent = std.math.cast(i64, extent) orelse return error.InvalidTensorShape;
+        var value = try self.at(index);
+        if (value < 0) value += signed_extent;
+        if (value < 0 or value >= signed_extent) return error.IndexOutOfBounds;
+        return @intCast(value);
+    }
+};
+
+fn copyIntegerTensorWithShape(self: *NativeCompute, source: *const tensor_mod.Tensor, shape: []const i64) !CT {
+    const count = try integerTensorCount(source);
+    if ((typedShapeNumel(shape) orelse return error.InvalidTensorShape) != count) return error.ShapeMismatch;
+    const raw = try self.allocator.dupe(u8, source.data);
+    var transferred = false;
+    errdefer if (!transferred) self.allocator.free(raw);
+    const owned_shape = try self.allocator.dupe(i64, shape);
+    // makeBufWithOwnedSourceTensor takes ownership even if it fails.
+    transferred = true;
+    return self.makeBufWithOwnedSourceTensor(.{ .data = raw, .dtype = source.dtype, .shape = owned_shape, .name = "", .allocator = self.allocator, .owns_data = true, .owns_shape = true });
+}
+
+fn typedGather(self: *NativeCompute, input: CT, indices: CT, axis: u8, declared_shape: []const i64) !CT {
+    const index = try IndexReader.init(indices);
+    const source_shape = storedOrDeclaredShape(input, declared_shape);
+    const input_count = typedShapeNumel(source_shape) orelse return error.InvalidTensorShape;
+    if (source_shape.len == 0 or source_shape.len > 8 or axis >= source_shape.len) return error.UnsupportedShape;
+    const source = toBuf(input).source_tensor;
+    // Typed gather is a fallible strict interface. Materialize at most once,
+    // preserving the input view and the original error if allocation fails.
+    const dense = if (source == null) try getDataChecked(input) else &.{};
+    const actual_count = if (source) |tensor| tensor.elementCount() else dense.len;
+    if (input_count != actual_count) return error.ShapeMismatch;
+    const fallback_index_shape = [_]i64{@intCast(index.len)};
+    const index_shape = tensorStoredShape(indices) orelse &fallback_index_shape;
+    if ((typedShapeNumel(index_shape) orelse return error.InvalidTensorShape) != index.len) return error.ShapeMismatch;
+    const output_rank = source_shape.len - 1 + index_shape.len;
+    if (output_rank > 8) return error.UnsupportedShape;
+    const prefix = typedShapeNumel(source_shape[0..axis]) orelse return error.InvalidTensorShape;
+    const suffix = typedShapeNumel(source_shape[axis + 1 ..]) orelse return error.InvalidTensorShape;
+    const extent = std.math.cast(usize, source_shape[axis]) orelse return error.InvalidTensorShape;
+    const output_count = try std.math.mul(usize, try std.math.mul(usize, prefix, index.len), suffix);
+    // Validate every index before any output storage allocation, including
+    // empty suffixes and integer tables whose payload is never widened.
+    for (0..index.len) |i| _ = try index.normalized(i, extent);
+    var shape_buffer: [8]i64 = undefined;
+    @memcpy(shape_buffer[0..axis], source_shape[0..axis]);
+    @memcpy(shape_buffer[axis..][0..index_shape.len], index_shape);
+    @memcpy(shape_buffer[axis + index_shape.len ..][0 .. source_shape.len - axis - 1], source_shape[axis + 1 ..]);
+    const output_shape = shape_buffer[0..output_rank];
+    if (integerSource(input)) |integer| {
+        _ = try integerTensorCount(integer);
+        const width = integer.dtype.byteSize();
+        const raw = try self.allocator.alloc(u8, try std.math.mul(usize, output_count, width));
+        var transferred = false;
+        errdefer if (!transferred) self.allocator.free(raw);
+        for (0..prefix) |p| for (0..index.len) |i| {
+            const selected = try index.normalized(i, extent);
+            const from = (p * extent + selected) * suffix * width;
+            const to = (p * index.len + i) * suffix * width;
+            @memcpy(raw[to..][0 .. suffix * width], integer.data[from..][0 .. suffix * width]);
+        };
+        const owned_shape = try self.allocator.dupe(i64, output_shape);
+        transferred = true;
+        return self.makeBufWithOwnedSourceTensor(.{ .data = raw, .dtype = integer.dtype, .shape = owned_shape, .name = "", .allocator = self.allocator, .owns_data = true, .owns_shape = true });
+    }
+    const output = try self.allocator.alloc(f32, output_count);
+    errdefer self.allocator.free(output);
+    for (0..prefix) |p| for (0..index.len) |i| {
+        const selected = try index.normalized(i, extent);
+        const from = (p * extent + selected) * suffix;
+        const to = (p * index.len + i) * suffix;
+        if (source) |tensor| {
+            try convertTensorRowsToF32(tensor, p * extent + selected, 1, suffix, output[to..][0..suffix]);
+        } else @memcpy(output[to..][0..suffix], dense[from..][0..suffix]);
+    };
+    const result = try self.makeBuf(output, true);
+    return self.withLogicalShape(result, output_shape);
+}
+
+test "native typed gather preserves view materialization OOM and retry" {
+    const a = std.testing.allocator;
+    const Budget = @import("../runtime/bounded_allocator.zig").BoundedAllocator;
+    // Deny each materialization allocation with both an owned sibling and a
+    // borrowed source. The optional clone deliberately has no view fallback.
+    for ([_]bool{ false, true }) |owned_source| {
+        for ([_]bool{ false, true }) |backing_failure| {
+            for (0..2) |failure_allocation| {
+                var failing = std.testing.FailingAllocator.init(a, .{});
+                var budget = Budget{ .backing = failing.allocator(), .limit = 64 * 1024 };
+                var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+                defer store.deinitOwned();
+                var compute = NativeCompute.init(budget.allocator(), &store, null);
+                defer compute.deinit();
+                const cb = compute.computeBackend();
+                var original = [_]f32{ 1, 2, 3, 4, 5, 6 };
+                const source = if (owned_source) try cb.fromFloat32Shape(&original, &.{ 2, 3 }) else borrowed: {
+                    const value = try compute.makeBuf(&original, false);
+                    errdefer cb.free(value);
+                    break :borrowed try compute.withLogicalShape(value, &.{ 2, 3 });
+                };
+                defer cb.free(source);
+                const view = try cb.primTranspose(source, &.{ 1, 0 }, &.{ 2, 3 });
+                defer cb.free(view);
+                const indices = (try cb.fromInt32Shape(&.{ 2, 0 }, &.{2})).?;
+                defer cb.free(indices);
+                const before = toBuf(view).*;
+                try std.testing.expect(before.view_strides != null);
+                try std.testing.expectEqual(@as(?CT, null), try cb.cloneTensorShape(view, &.{ 3, 2 }));
+                const live = budget.live;
+                if (backing_failure) {
+                    failing.fail_index = failing.alloc_index + failure_allocation;
+                } else {
+                    budget.limit = live + if (failure_allocation == 0) @as(usize, 0) else @sizeOf(@TypeOf(original));
+                }
+                try std.testing.expectError(error.OutOfMemory, cb.primGather(view, indices, 0, &.{ 3, 2 }));
+                try std.testing.expectEqual(live, budget.live);
+                try std.testing.expectEqual(!backing_failure, budget.denied);
+                try std.testing.expectEqual(before.data.ptr, toBuf(view).data.ptr);
+                try std.testing.expectEqual(before.shared_data_refcount, toBuf(view).shared_data_refcount);
+                try std.testing.expectEqual(before.logical_shape.?.ptr, toBuf(view).logical_shape.?.ptr);
+                try std.testing.expectEqual(before.view_strides.?.ptr, toBuf(view).view_strides.?.ptr);
+                try std.testing.expectEqualSlices(f32, &original, toBuf(source).data);
+                try std.testing.expectEqualSlices(i64, &.{ 3, 2 }, toBuf(view).logical_shape.?);
+
+                failing.fail_index = std.math.maxInt(usize);
+                budget.limit = 64 * 1024;
+                const retry = try cb.primGather(view, indices, 0, &.{ 3, 2 });
+                defer cb.free(retry);
+                const actual = try cb.toFloat32(retry, a);
+                defer a.free(actual);
+                try std.testing.expectEqualSlices(f32, &.{ 3, 6, 1, 4 }, actual);
+                try std.testing.expectEqualSlices(f32, &original, toBuf(source).data);
+                try std.testing.expect(toBuf(view).view_strides == null);
+            }
+        }
+    }
+}
+
+test "native typed gather preserves genuine malformed view errors" {
+    const a = std.testing.allocator;
+    var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.deinitOwned();
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const source = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 2, 3 });
+    defer cb.free(source);
+    const view = try cb.primTranspose(source, &.{ 1, 0 }, &.{ 2, 3 });
+    defer cb.free(view);
+    const indices = (try cb.fromInt32Shape(&.{1}, &.{1})).?;
+    defer cb.free(indices);
+    toBuf(view).view_base_offset = 6;
+    try std.testing.expectError(error.InvalidTensorShape, cb.primGather(view, indices, 0, &.{ 3, 2 }));
+    try std.testing.expect(toBuf(view).view_strides != null);
+    toBuf(view).view_base_offset = 0;
+    const retry = try cb.primGather(view, indices, 0, &.{ 3, 2 });
+    defer cb.free(retry);
+    const actual = try cb.toFloat32(retry, a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 5 }, actual);
+}
+
+fn typedScatterAdd(self: *NativeCompute, input: CT, indices: CT, input_shape: []const i64, output_shape: []const i64, axis: u8) !CT {
+    if (axis != 0 or input_shape.len != 2 or output_shape.len != 2) return error.UnsupportedPrimitiveOp;
+    const index = try IndexReader.init(indices);
+    const count = typedShapeNumel(input_shape) orelse return error.InvalidTensorShape;
+    const output_count = typedShapeNumel(output_shape) orelse return error.InvalidTensorShape;
+    const n = std.math.cast(usize, input_shape[0]) orelse return error.InvalidTensorShape;
+    const width = std.math.cast(usize, input_shape[1]) orelse return error.InvalidTensorShape;
+    const out_rows = std.math.cast(usize, output_shape[0]) orelse return error.InvalidTensorShape;
+    if (width == 0 or input_shape[1] != output_shape[1] or index.len != n) return error.ShapeMismatch;
+    for (0..n) |i| _ = try index.normalized(i, out_rows);
+    const input_view = try denseTensorView(self, input);
+    defer if (input_view.owned) |owned| self.allocator.free(owned);
+    if (input_view.data.len != count) return error.ShapeMismatch;
+    const output = try self.allocator.alloc(f32, output_count);
+    errdefer self.allocator.free(output);
+    @memset(output, 0);
+    for (0..n) |i| {
+        const selected = try index.normalized(i, out_rows);
+        for (0..width) |column| output[selected * width + column] += input_view.data[i * width + column];
+    }
+    const result = try self.makeBuf(output, true);
+    return self.withLogicalShape(result, output_shape);
+}
+
 fn primScatterAddOp(ctx: *anyopaque, input: CT, indices: CT, input_shape: []const i64, indices_shape: []const i64, axis: u8) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (integerSource(indices) != null) return typedScatterAdd(self, input, indices, input_shape, indices_shape, axis);
     const in_data = getData(input);
     const idx_data = getData(indices);
-    _ = axis; // Currently only axis=0 supported for simple case.
+    // The compatibility float-index route retains its historical axis0 behavior.
 
     // Simple case: input is [N, D], indices is [N] (as f32-encoded ints).
     // Output rows come from indices_shape[0] (the graph's declared output dim),
@@ -38500,6 +39072,7 @@ fn primScatterAddOp(ctx: *anyopaque, input: CT, indices: CT, input_shape: []cons
 
 fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: []const i64) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (integerSource(indices) != null or integerSource(input) != null) return typedGather(self, input, indices, axis, input_shape);
     const idx_data = getData(indices);
     const effective_input_shape = storedOrDeclaredShape(input, input_shape);
     const source_tensor = toBuf(input).source_tensor;
@@ -39254,6 +39827,7 @@ fn logSoftmaxConsumeOp(_: *anyopaque, input: CT, dim: u32) anyerror!?CT {
 fn fromFloat32Op(ctx: *anyopaque, data: []const f32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const owned = try self.allocator.dupe(f32, data);
+    errdefer self.allocator.free(owned);
     return self.makeBuf(owned, true);
 }
 
@@ -39355,10 +39929,29 @@ fn fromFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) an
     return buf;
 }
 
+fn fromInt32ShapeOp(ctx: *anyopaque, data: []const i32, shape: []const i32) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (shape.len > 8) return error.InvalidShape;
+    var logical_shape: [8]i64 = undefined;
+    for (shape, 0..) |dim, index| logical_shape[index] = dim;
+    if ((typedShapeNumel(logical_shape[0..shape.len]) orelse return error.InvalidShape) != data.len) return error.InvalidShape;
+    const tensor = try tensor_mod.Tensor.initInt32(self.allocator, "", logical_shape[0..shape.len], data);
+    return try self.makeBufWithOwnedSourceTensor(tensor);
+}
+
+fn cloneTensorShapeOp(ctx: *anyopaque, input: CT, shape: []const i32) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const source = integerSource(input) orelse return null;
+    if (shape.len > 8) return error.InvalidShape;
+    var logical_shape: [8]i64 = undefined;
+    for (shape, 0..) |dim, index| logical_shape[index] = dim;
+    return try copyIntegerTensorWithShape(self, source, logical_shape[0..shape.len]);
+}
+
 fn toFloat32Op(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]f32 {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const buf = toBuf(tensor);
-    if (buf.data.len != 0) return allocator.dupe(f32, getData(tensor));
+    if (buf.data.len != 0 or buf.view_strides != null) return allocator.dupe(f32, try getDataChecked(tensor));
     if (buf.source_tensor) |source| return convertTensorToOwnedF32(allocator, source);
     if (buf.quantized_storage) |storage| {
         var elem_count: usize = 1;
@@ -39542,7 +40135,7 @@ fn exportTensorDataOp(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator)
     }
 
     if (buf.data.len > 0) {
-        const dense = getData(tensor);
+        const dense = try getDataChecked(tensor);
         return .{
             .dtype = .f32,
             .payload = .{ .bytes = try allocator.dupe(u8, std.mem.sliceAsBytes(dense)) },

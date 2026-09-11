@@ -1,0 +1,10 @@
+CUDA artifact source policy passes: /Users/timkaye/Documents/af/antfly/zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.cu (15 compiler-managed dev-only runtime-wired candidates included)
+quant kernel generated sources check: 67 files + Metal/CUDA runtime regions
+1/39 ops.deberta_training_attention_device_test.test.deberta training Metal published width and wider tails match CPU five VJPs...OK
+2/39 finetune.gliner_boundary_encoder_graph.test.GLiNER2.5 encoder training graph has typed routes and every replayable dropout site...OK
+3/39 finetune.gliner_boundary_encoder_graph.test.GLiNER2.5 encoder training bindings preserve padding and repeated route identities...OK
+4/39 finetune.gliner_boundary_encoder_graph.test.GLiNER2.5 encoder training graph and bindings clean up allocation failures...OK
+5/39 finetune.gliner_boundary_encoder_graph.test.GLiNER2.5 replay encoder uses compact integer control full relative tables and source dropout streams...OK
+6/39 finetune.gliner_boundary_encoder_graph.test.GLiNER2.5 replay encoder regional boundaries survive shared QK LoRA and DoRA rewriting...OK
+7/39 finetune.gliner_boundary_encoder_graph.test.GLiNER2.5 replay encoder long-context graph storage is linear and work admission includes replay...OK
+7 selected; 7 passed; 0 skipped.

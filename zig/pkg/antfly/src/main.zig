@@ -113,6 +113,16 @@ pub fn runRuntimeUnit(
     defer argument_views.deinit(init.gpa);
     while (args.next()) |arg| try argument_views.append(init.gpa, .init(arg));
 
+    if (comptime role == .inference) {
+        const one_shot = @import("antfly_platform").one_shot_process;
+        if (one_shot.isTrainingInvocation(init.minimal.args)) {
+            // RuntimeProcess reconstructs synthetic arguments across this ABI.
+            // A training worker must re-execute the actual public invocation.
+            const original = try one_shot.encodeOriginalArguments(init.gpa, init.minimal.args);
+            defer init.gpa.free(original);
+            try init.environ_map.put(one_shot.original_argv_env, original);
+        }
+    }
     const environment_names = init.environ_map.keys();
     const environment_values = init.environ_map.values();
     std.debug.assert(environment_names.len == environment_values.len);

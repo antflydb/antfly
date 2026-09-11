@@ -1,0 +1,912 @@
+{
+  "audit_receipts": {
+    "historical_metal": {
+      "path": "/private/tmp/gliner25-crossner-metal-all-independent-audit-v3.json",
+      "sha256": "b99c6d62525434d1c2f7ccf8509a0559a294bdd76dcad2427f6dab4502788fd3",
+      "size_bytes": 25044
+    },
+    "official_bio": {
+      "path": "/private/tmp/gliner25-crossner-official-bio-audit-v4.json",
+      "sha256": "67959d10aec3007ba3e3c915419d08a49d67d25da068bea6958a18ad83501b1e",
+      "size_bytes": 66728
+    },
+    "same_executable": {
+      "path": "/private/tmp/gliner25-crossner-same-executable-all-audit-v2.json",
+      "sha256": "13fafb8c9436d409b6daf12b8542969a7d5244fdea17f045012b7b935db45a0a",
+      "size_bytes": 761528
+    }
+  },
+  "audit_tools": {
+    "historical_metal": {
+      "path": "/private/tmp/gliner25-audit-crossner-metal-all-v3.py",
+      "sha256": "3d2e0194fd9f40567d7f2c32a13fcf297d521a324141120bd41245f52774f997",
+      "size_bytes": 12580
+    },
+    "official_bio": {
+      "path": "scripts/gliner25/audit_crossner_bio_scoring.py",
+      "sha256": "1597e430e846acaa5f45ec7b355bc1f309e350a75c5ecf7f135f0f3b47327b7f",
+      "size_bytes": 13121
+    },
+    "same_executable": {
+      "path": "/private/tmp/gliner25-crossner-same-executable-audit-v2.py",
+      "sha256": "1694771f014fd2fdf5af5d073906546b3ca8d7b32e903f863f1afafae159e713",
+      "size_bytes": 11845
+    }
+  },
+  "capture_tool": {
+    "path": "scripts/gliner25/capture_crossner_metal_evidence.py",
+    "sha256": "b7d615e348fc8b9b27cc3b0fe29b72427a6a2827dbd17ab9304aecd882dcb52b"
+  },
+  "claims": {
+    "benchmark": false,
+    "new_quality_floor": false,
+    "original_fp32_short_english_entity_parity": true,
+    "reduced_metal_holdout_qualification": false,
+    "release_qualification": false,
+    "same_executable_cpu_metal_parity": true
+  },
+  "contract_files": {
+    "benchmark_cpu.py": "277fd7f16371ff055be07142a9d32e10f54c4e4fa90aff6011c21995044b4b9d",
+    "check_bundles.py": "4c58f89ea38065223696752743aa5db89d4fa6f430fe21765e0d729c21dc8b74",
+    "evaluate.py": "28ba8c41a29b36bdbee8e708e96d73d91f0b6ed91384a19e7d5cad2919e50718",
+    "evaluation_contract.py": "8d6b137c55f64d7c13752c306246266a56d98796d349e9c301069bdafadb6927",
+    "oracle.py": "61bbf4544a21111dbfbd643ed2392b1d9723498493b3fa6832154d6e1dc42752",
+    "prepare_crossner_ai.py": "d09b050cc9ff4dab694c9a9282e9dc75df64f78606b0074982f1ef86abfc84c6"
+  },
+  "corpus_revision": "2e7ba2a7798c961e3f29fbc51252c5a8d40224bf",
+  "dataset": {
+    "documents": 431,
+    "gold_entities": 1809,
+    "gold_sha256": "8bc22529b257d805b4e1588dd72c10c1e6edf3339ab15ee367964d91c61139f1",
+    "id": "crossner_ai",
+    "lock_sha256": "a3ea7f513501af42db0030eb6557dd845dbcdf39483c7e8f23a2f7e636e4f144",
+    "offset_unit": "utf8_bytes",
+    "ontology": [
+      "field",
+      "task",
+      "product",
+      "algorithm",
+      "researcher",
+      "metrics",
+      "programlang",
+      "conference",
+      "university",
+      "country",
+      "person",
+      "organisation",
+      "location",
+      "misc"
+    ],
+    "policy": {
+      "max_encoded_tokens": 512,
+      "max_queries": 64,
+      "max_text_bytes": 1048576,
+      "max_words": 128,
+      "timeout_ms": 120000
+    },
+    "prepared_receipt_sha256": "486fe0bb41b9c9d4a1a0d847937b1862cd0803e320d926d639f8c6f808263712",
+    "request_options": {
+      "best_effort": false,
+      "overlap": "flat",
+      "threshold": 0.5
+    },
+    "requests_sha256": "8ad4bdcd0c4cd022e61b6514a7dbedae938ca516d1d6baf949c2eef9791f2296"
+  },
+  "evidence_limits": [
+    "One reconstructed short English entity corpus, fixed full fourteen-label ontology, 431 official rows including duplicates.",
+    "The compact ledger retains provenance and summaries; full raw-output replay still requires the pinned capture files or a new documented model campaign.",
+    "The historical CPU ledger and Metal report reference hashes remain unchanged; same-executable comparison is retrospective.",
+    "Corpus-specific source quality is unchanged by these backends. No absolute quality floor, performance, other-task/language, reduced-Metal or release claim."
+  ],
+  "format_version": 1,
+  "historical_ledger": {
+    "path": "scripts/gliner25/crossner_ai_execution.json",
+    "sha256": "1a663fe9a3d6b9c240285104f7a89ff310c29341bb67569b2e5b3231e2938506",
+    "size_bytes": 205694
+  },
+  "model_execution": false,
+  "models": [
+    {
+      "comparisons": {
+        "metal_historical_native": {
+          "aligned_confidences": 1620,
+          "confidence_absolute_tolerance": 0.0005,
+          "exact_ordered_decisions": 431,
+          "exact_token_sequences": 431,
+          "max_absolute_confidence_error": 3.874301910400391e-06,
+          "pass": true,
+          "requests": 431
+        },
+        "metal_native_same_executable": {
+          "aligned_confidences": 1620,
+          "confidence_absolute_tolerance": 0.0005,
+          "exact_ordered_decisions": 431,
+          "exact_token_sequences": 431,
+          "max_absolute_confidence_error": 3.874301910400391e-06,
+          "pass": true,
+          "requests": 431
+        },
+        "metal_python": {
+          "aligned_confidences": 1620,
+          "confidence_absolute_tolerance": 0.0005,
+          "exact_ordered_decisions": 431,
+          "exact_token_sequences": 431,
+          "max_absolute_confidence_error": 3.635883331298828e-06,
+          "pass": true,
+          "requests": 431
+        },
+        "native_python": {
+          "aligned_confidences": 1620,
+          "confidence_absolute_tolerance": 0.0005,
+          "exact_ordered_decisions": 431,
+          "exact_token_sequences": 431,
+          "max_absolute_confidence_error": 3.4570693969726562e-06,
+          "pass": true,
+          "requests": 431
+        }
+      },
+      "model": "small",
+      "quality": {
+        "all_four_phases_identical": true,
+        "entity_exact": {
+          "absent_query_false_positive_rate": 1.0,
+          "document_exact_match": 0.048723897911832945,
+          "documents": 431,
+          "exact_documents": 21,
+          "fn": 1117,
+          "fp": 928,
+          "micro_f1": 0.4036162146398367,
+          "precision": 0.4271604938271605,
+          "recall": 0.3825317855168601,
+          "support": 1809,
+          "tp": 692,
+          "zero_gold_documents": 1,
+          "zero_gold_predicted_documents": 1
+        },
+        "fixed_ontology_macro_f1": 0.41247020899338505,
+        "fresh_native_micro_f1_delta": 0,
+        "metal_micro_f1_delta": 0,
+        "metric_families": 15,
+        "metrics_sha256": "c555a1517c54f7207812124da480025adb097fceff5b794c7a7e2ff480f6088c"
+      },
+      "reports": {
+        "historical_native": {
+          "backend": "native",
+          "binary_sha256": "0069cdad6b8d3b1a97f00779c3de73d81125766ad832f5fc3cd9d9d076b77334",
+          "completed_results": 431,
+          "denominator": 431,
+          "errors": 0,
+          "files": {
+            "fixture": {
+              "path": "requests.fixture.json",
+              "sha256": "f096412212355365f440a821b3765b9456c9c3fed77d71864424918572f7bea0",
+              "size_bytes": 265276
+            },
+            "metrics": {
+              "path": "metrics.json",
+              "sha256": "4b8332ce7dc0871f7c55ff44215df3a1e5b74e399faf457eb948f628fe4cfd2a",
+              "size_bytes": 7224
+            },
+            "predictions": {
+              "path": "predictions.jsonl",
+              "sha256": "750cf070cc369d4a4d3b56cc28d038a70e4ecb526442e342b84ba5ac9f1be969",
+              "size_bytes": 478622
+            },
+            "responses": {
+              "path": "responses.jsonl",
+              "sha256": "57ff87b84dca182892a97774311698d57ec46176f6585d8543469df66df90dab",
+              "size_bytes": 931290
+            }
+          },
+          "max_worker_rss_bytes": 6442450944,
+          "model": "small",
+          "native_reference_report_sha256": null,
+          "peak_worker_rss_bytes": 430751744,
+          "pin": {
+            "path": "/private/tmp/gliner25-crossner-native-small-fp32/report.json",
+            "sha256": "a2afc301c64a383a52ee9b334da93675f2fe159c74d1c3cd48a77665c4d49f90",
+            "size_bytes": 255969
+          },
+          "source_reference_report_sha256": "2408716f8217f2b643da1198ef9b4a68b80adc19ff3f721a0473c804051d7ef1",
+          "unprocessed": 0
+        },
+        "metal": {
+          "backend": "metal",
+          "binary_sha256": "a43fcdee29931bcb67972ff002f3c1457e25f547cda24a60759cfed4a0f6880d",
+          "completed_results": 431,
+          "denominator": 431,
+          "errors": 0,
+          "files": {
+            "fixture": {
+              "path": "requests.fixture.json",
+              "sha256": "f096412212355365f440a821b3765b9456c9c3fed77d71864424918572f7bea0",
+              "size_bytes": 265276
+            },
+            "metrics": {
+              "path": "metrics.json",
+              "sha256": "4b8332ce7dc0871f7c55ff44215df3a1e5b74e399faf457eb948f628fe4cfd2a",
+              "size_bytes": 7224
+            },
+            "predictions": {
+              "path": "predictions.jsonl",
+              "sha256": "750cf070cc369d4a4d3b56cc28d038a70e4ecb526442e342b84ba5ac9f1be969",
+              "size_bytes": 478622
+            },
+            "responses": {
+              "path": "responses.jsonl",
+              "sha256": "43ff3d3077f193268a902dc2f5651ec779d3a77bae276143746f860c9ccdf8a0",
+              "size_bytes": 931293
+            }
+          },
+          "max_worker_rss_bytes": 6442450944,
+          "model": "small",
+          "native_reference_report_sha256": "a2afc301c64a383a52ee9b334da93675f2fe159c74d1c3cd48a77665c4d49f90",
+          "peak_worker_rss_bytes": 555106304,
+          "pin": {
+            "path": "/private/tmp/gliner25-crossner-metal-small-fp32-v1/report.json",
+            "sha256": "aff3ecf1a97aa4d72595f115d3246a3d6c984230b7b38b60f3034c7a3ad8a8d6",
+            "size_bytes": 414855
+          },
+          "source_reference_report_sha256": "2408716f8217f2b643da1198ef9b4a68b80adc19ff3f721a0473c804051d7ef1",
+          "unprocessed": 0
+        },
+        "native": {
+          "backend": "native",
+          "binary_sha256": "a43fcdee29931bcb67972ff002f3c1457e25f547cda24a60759cfed4a0f6880d",
+          "completed_results": 431,
+          "denominator": 431,
+          "errors": 0,
+          "files": {
+            "fixture": {
+              "path": "requests.fixture.json",
+              "sha256": "f096412212355365f440a821b3765b9456c9c3fed77d71864424918572f7bea0",
+              "size_bytes": 265276
+            },
+            "metrics": {
+              "path": "metrics.json",
+              "sha256": "4b8332ce7dc0871f7c55ff44215df3a1e5b74e399faf457eb948f628fe4cfd2a",
+              "size_bytes": 7224
+            },
+            "predictions": {
+              "path": "predictions.jsonl",
+              "sha256": "750cf070cc369d4a4d3b56cc28d038a70e4ecb526442e342b84ba5ac9f1be969",
+              "size_bytes": 478622
+            },
+            "responses": {
+              "path": "responses.jsonl",
+              "sha256": "57ff87b84dca182892a97774311698d57ec46176f6585d8543469df66df90dab",
+              "size_bytes": 931290
+            }
+          },
+          "max_worker_rss_bytes": 6442450944,
+          "model": "small",
+          "native_reference_report_sha256": null,
+          "peak_worker_rss_bytes": 431013888,
+          "pin": {
+            "path": "/private/tmp/gliner25-crossner-native-small-fp32-a43-v1/report.json",
+            "sha256": "e4ada68e4b13c05719a6a675fbae088e08a9108c293f8d9af22f4bbfcb0ce044",
+            "size_bytes": 255969
+          },
+          "source_reference_report_sha256": "2408716f8217f2b643da1198ef9b4a68b80adc19ff3f721a0473c804051d7ef1",
+          "unprocessed": 0
+        },
+        "python": {
+          "backend": "python",
+          "binary_sha256": "80ee2dd97bc26259d4e30853336f72ad38aa4aa0531bb196cc444d899422689d",
+          "completed_results": 431,
+          "denominator": 431,
+          "errors": 0,
+          "files": {
+            "fixture": {
+              "path": "requests.fixture.json",
+              "sha256": "f096412212355365f440a821b3765b9456c9c3fed77d71864424918572f7bea0",
+              "size_bytes": 265276
+            },
+            "metrics": {
+              "path": "metrics.json",
+              "sha256": "4b8332ce7dc0871f7c55ff44215df3a1e5b74e399faf457eb948f628fe4cfd2a",
+              "size_bytes": 7224
+            },
+            "predictions": {
+              "path": "predictions.jsonl",
+              "sha256": "750cf070cc369d4a4d3b56cc28d038a70e4ecb526442e342b84ba5ac9f1be969",
+              "size_bytes": 478622
+            },
+            "responses": {
+              "path": "responses.jsonl",
+              "sha256": "9f1470f5ff124d10d6e48e49aa3c43e965141f2ce3ef1760611ff3ac716123be",
+              "size_bytes": 463032
+            }
+          },
+          "max_worker_rss_bytes": 6442450944,
+          "model": "small",
+          "native_reference_report_sha256": null,
+          "peak_worker_rss_bytes": 1313865728,
+          "pin": {
+            "path": "/private/tmp/gliner25-crossner-python-small/report.json",
+            "sha256": "2408716f8217f2b643da1198ef9b4a68b80adc19ff3f721a0473c804051d7ef1",
+            "size_bytes": 103647
+          },
+          "source_reference_report_sha256": null,
+          "unprocessed": 0
+        }
+      },
+      "source": {
+        "model_id": "fastino/gliner2.5-small-v1",
+        "revision": "cab1bddfd30fda7b803a4691c41f90378a2d517a",
+        "source_files": [
+          {
+            "path": "config.json",
+            "sha256": "0b7d9e1401ceeb83e992ec66d2f93bff7e5646428f1b4706ec527cf88f53578a",
+            "size_bytes": 3152
+          },
+          {
+            "path": "encoder_config/config.json",
+            "sha256": "db837d0dc587f5858687ef860c1f400de10f3c3e44f88daef8cbda80d74e4c9c",
+            "size_bytes": 856
+          },
+          {
+            "path": "model.safetensors",
+            "sha256": "4ee982787ace270d4bf15dbcb28ced38e0aa201372347114ceedd6336055de2b",
+            "size_bytes": 295567700
+          },
+          {
+            "path": "tokenizer.json",
+            "sha256": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3",
+            "size_bytes": 8341713
+          },
+          {
+            "path": "tokenizer_config.json",
+            "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1",
+            "size_bytes": 645
+          }
+        ]
+      }
+    },
+    {
+      "comparisons": {
+        "metal_historical_native": {
+          "aligned_confidences": 2196,
+          "confidence_absolute_tolerance": 0.0005,
+          "exact_ordered_decisions": 431,
+          "exact_token_sequences": 431,
+          "max_absolute_confidence_error": 7.569789886474609e-06,
+          "pass": true,
+          "requests": 431
+        },
+        "metal_native_same_executable": {
+          "aligned_confidences": 2196,
+          "confidence_absolute_tolerance": 0.0005,
+          "exact_ordered_decisions": 431,
+          "exact_token_sequences": 431,
+          "max_absolute_confidence_error": 7.569789886474609e-06,
+          "pass": true,
+          "requests": 431
+        },
+        "metal_python": {
+          "aligned_confidences": 2196,
+          "confidence_absolute_tolerance": 0.0005,
+          "exact_ordered_decisions": 431,
+          "exact_token_sequences": 431,
+          "max_absolute_confidence_error": 9.119510650634766e-06,
+          "pass": true,
+          "requests": 431
+        },
+        "native_python": {
+          "aligned_confidences": 2196,
+          "confidence_absolute_tolerance": 0.0005,
+          "exact_ordered_decisions": 431,
+          "exact_token_sequences": 431,
+          "max_absolute_confidence_error": 6.079673767089844e-06,
+          "pass": true,
+          "requests": 431
+        }
+      },
+      "model": "base",
+      "quality": {
+        "all_four_phases_identical": true,
+        "entity_exact": {
+          "absent_query_false_positive_rate": 1.0,
+          "document_exact_match": 0.05336426914153132,
+          "documents": 431,
+          "exact_documents": 23,
+          "fn": 774,
+          "fp": 1161,
+          "micro_f1": 0.5168539325842697,
+          "precision": 0.4713114754098361,
+          "recall": 0.572139303482587,
+          "support": 1809,
+          "tp": 1035,
+          "zero_gold_documents": 1,
+          "zero_gold_predicted_documents": 1
+        },
+        "fixed_ontology_macro_f1": 0.5505409741375914,
+        "fresh_native_micro_f1_delta": 0,
+        "metal_micro_f1_delta": 0,
+        "metric_families": 15,
+        "metrics_sha256": "1965414d96ee21702971616d5dcba08588cae9e72279d79b4830a6dc9d393387"
+      },
+      "reports": {
+        "historical_native": {
+          "backend": "native",
+          "binary_sha256": "0069cdad6b8d3b1a97f00779c3de73d81125766ad832f5fc3cd9d9d076b77334",
+          "completed_results": 431,
+          "denominator": 431,
+          "errors": 0,
+          "files": {
+            "fixture": {
+              "path": "requests.fixture.json",
+              "sha256": "656a011a1f1d08911cfd1829aed9e936f38509c82532ccc30e6ffa892e9ddc27",
+              "size_bytes": 265275
+            },
+            "metrics": {
+              "path": "metrics.json",
+              "sha256": "ec98f87323ee410cd14882d245af4d6b760e6916f2383198f618a2342d20c01d",
+              "size_bytes": 7233
+            },
+            "predictions": {
+              "path": "predictions.jsonl",
+              "sha256": "1c34d418588f186e30ee06704cd57405d22bd3dc779b0bbadcbc2ec032a666dc",
+              "size_bytes": 561751
+            },
+            "responses": {
+              "path": "responses.jsonl",
+              "sha256": "232655291ef38f2f1ec0cf7d9fac9158b5786c7f37c99dc498982cd28c40161a",
+              "size_bytes": 1050150
+            }
+          },
+          "max_worker_rss_bytes": 6442450944,
+          "model": "base",
+          "native_reference_report_sha256": null,
+          "peak_worker_rss_bytes": 1519501312,
+          "pin": {
+            "path": "/private/tmp/gliner25-crossner-native-base-fp32/report.json",
+            "sha256": "ce3945b658425df0025badd1d8565e4ea6ae25bc7cdbcbfa50dafef296dcf871",
+            "size_bytes": 257336
+          },
+          "source_reference_report_sha256": "f389ed87936d70e048bb8cd978d472ff93672dc7c26a525c4f7c9a6e7e106c74",
+          "unprocessed": 0
+        },
+        "metal": {
+          "backend": "metal",
+          "binary_sha256": "a43fcdee29931bcb67972ff002f3c1457e25f547cda24a60759cfed4a0f6880d",
+          "completed_results": 431,
+          "denominator": 431,
+          "errors": 0,
+          "files": {
+            "fixture": {
+              "path": "requests.fixture.json",
+              "sha256": "656a011a1f1d08911cfd1829aed9e936f38509c82532ccc30e6ffa892e9ddc27",
+              "size_bytes": 265275
+            },
+            "metrics": {
+              "path": "metrics.json",
+              "sha256": "ec98f87323ee410cd14882d245af4d6b760e6916f2383198f618a2342d20c01d",
+              "size_bytes": 7233
+            },
+            "predictions": {
+              "path": "predictions.jsonl",
+              "sha256": "1c34d418588f186e30ee06704cd57405d22bd3dc779b0bbadcbc2ec032a666dc",
+              "size_bytes": 561751
+            },
+            "responses": {
+              "path": "responses.jsonl",
+              "sha256": "d19416daa4acf8741a9b9ce195f15d3ce344a8cc216b1cca60db7ff57de79f17",
+              "size_bytes": 1050137
+            }
+          },
+          "max_worker_rss_bytes": 6442450944,
+          "model": "base",
+          "native_reference_report_sha256": "ce3945b658425df0025badd1d8565e4ea6ae25bc7cdbcbfa50dafef296dcf871",
+          "peak_worker_rss_bytes": 1823080448,
+          "pin": {
+            "path": "/private/tmp/gliner25-crossner-metal-base-fp32-v1/report.json",
+            "sha256": "6623f3591370c4191079ca3213bf368baee61d85804e6df0382b6e1832c81ef4",
+            "size_bytes": 417118
+          },
+          "source_reference_report_sha256": "f389ed87936d70e048bb8cd978d472ff93672dc7c26a525c4f7c9a6e7e106c74",
+          "unprocessed": 0
+        },
+        "native": {
+          "backend": "native",
+          "binary_sha256": "a43fcdee29931bcb67972ff002f3c1457e25f547cda24a60759cfed4a0f6880d",
+          "completed_results": 431,
+          "denominator": 431,
+          "errors": 0,
+          "files": {
+            "fixture": {
+              "path": "requests.fixture.json",
+              "sha256": "656a011a1f1d08911cfd1829aed9e936f38509c82532ccc30e6ffa892e9ddc27",
+              "size_bytes": 265275
+            },
+            "metrics": {
+              "path": "metrics.json",
+              "sha256": "ec98f87323ee410cd14882d245af4d6b760e6916f2383198f618a2342d20c01d",
+              "size_bytes": 7233
+            },
+            "predictions": {
+              "path": "predictions.jsonl",
+              "sha256": "1c34d418588f186e30ee06704cd57405d22bd3dc779b0bbadcbc2ec032a666dc",
+              "size_bytes": 561751
+            },
+            "responses": {
+              "path": "responses.jsonl",
+              "sha256": "232655291ef38f2f1ec0cf7d9fac9158b5786c7f37c99dc498982cd28c40161a",
+              "size_bytes": 1050150
+            }
+          },
+          "max_worker_rss_bytes": 6442450944,
+          "model": "base",
+          "native_reference_report_sha256": null,
+          "peak_worker_rss_bytes": 1511981056,
+          "pin": {
+            "path": "/private/tmp/gliner25-crossner-native-base-fp32-a43-v1/report.json",
+            "sha256": "4d74d1cade977ef3e55f9eb4704a3509be71ade2cc4ae6d58fcd3b7866f02d07",
+            "size_bytes": 257336
+          },
+          "source_reference_report_sha256": "f389ed87936d70e048bb8cd978d472ff93672dc7c26a525c4f7c9a6e7e106c74",
+          "unprocessed": 0
+        },
+        "python": {
+          "backend": "python",
+          "binary_sha256": "80ee2dd97bc26259d4e30853336f72ad38aa4aa0531bb196cc444d899422689d",
+          "completed_results": 431,
+          "denominator": 431,
+          "errors": 0,
+          "files": {
+            "fixture": {
+              "path": "requests.fixture.json",
+              "sha256": "656a011a1f1d08911cfd1829aed9e936f38509c82532ccc30e6ffa892e9ddc27",
+              "size_bytes": 265275
+            },
+            "metrics": {
+              "path": "metrics.json",
+              "sha256": "ec98f87323ee410cd14882d245af4d6b760e6916f2383198f618a2342d20c01d",
+              "size_bytes": 7233
+            },
+            "predictions": {
+              "path": "predictions.jsonl",
+              "sha256": "1c34d418588f186e30ee06704cd57405d22bd3dc779b0bbadcbc2ec032a666dc",
+              "size_bytes": 561751
+            },
+            "responses": {
+              "path": "responses.jsonl",
+              "sha256": "69925e0fab3734f9ce2425b20352a102b772053f4ceefa6f037f95c28037e8a5",
+              "size_bytes": 507713
+            }
+          },
+          "max_worker_rss_bytes": 6442450944,
+          "model": "base",
+          "native_reference_report_sha256": null,
+          "peak_worker_rss_bytes": 2176942080,
+          "pin": {
+            "path": "/private/tmp/gliner25-crossner-python-base/report.json",
+            "sha256": "f389ed87936d70e048bb8cd978d472ff93672dc7c26a525c4f7c9a6e7e106c74",
+            "size_bytes": 103652
+          },
+          "source_reference_report_sha256": null,
+          "unprocessed": 0
+        }
+      },
+      "source": {
+        "model_id": "fastino/gliner2.5-base-v1",
+        "revision": "72ac19b486cd4557424c8d61114e7530c243e9b0",
+        "source_files": [
+          {
+            "path": "config.json",
+            "sha256": "0eb92d00584d613aab32b2178f84a85176b62c87ae3689ce9084e83f6eba64d1",
+            "size_bytes": 3150
+          },
+          {
+            "path": "encoder_config/config.json",
+            "sha256": "d36a845b9f25dcaf1ec45a1c4bdf65ea4ac20596537e14530ec9f660a63aeca4",
+            "size_bytes": 857
+          },
+          {
+            "path": "model.safetensors",
+            "sha256": "7274094de2e0c2a37a386f55fc4e23061a954da5bd7a335e7dfe56f2743c277a",
+            "size_bytes": 774366564
+          },
+          {
+            "path": "tokenizer.json",
+            "sha256": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3",
+            "size_bytes": 8341713
+          },
+          {
+            "path": "tokenizer_config.json",
+            "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1",
+            "size_bytes": 645
+          }
+        ]
+      }
+    },
+    {
+      "comparisons": {
+        "metal_historical_native": {
+          "aligned_confidences": 1845,
+          "confidence_absolute_tolerance": 0.0005,
+          "exact_ordered_decisions": 431,
+          "exact_token_sequences": 431,
+          "max_absolute_confidence_error": 1.5139579772949219e-05,
+          "pass": true,
+          "requests": 431
+        },
+        "metal_native_same_executable": {
+          "aligned_confidences": 1845,
+          "confidence_absolute_tolerance": 0.0005,
+          "exact_ordered_decisions": 431,
+          "exact_token_sequences": 431,
+          "max_absolute_confidence_error": 1.5139579772949219e-05,
+          "pass": true,
+          "requests": 431
+        },
+        "metal_python": {
+          "aligned_confidences": 1845,
+          "confidence_absolute_tolerance": 0.0005,
+          "exact_ordered_decisions": 431,
+          "exact_token_sequences": 431,
+          "max_absolute_confidence_error": 1.6510486602783203e-05,
+          "pass": true,
+          "requests": 431
+        },
+        "native_python": {
+          "aligned_confidences": 1845,
+          "confidence_absolute_tolerance": 0.0005,
+          "exact_ordered_decisions": 431,
+          "exact_token_sequences": 431,
+          "max_absolute_confidence_error": 1.6868114471435547e-05,
+          "pass": true,
+          "requests": 431
+        }
+      },
+      "model": "multi",
+      "quality": {
+        "all_four_phases_identical": true,
+        "entity_exact": {
+          "absent_query_false_positive_rate": 1.0,
+          "document_exact_match": 0.04640371229698376,
+          "documents": 431,
+          "exact_documents": 20,
+          "fn": 972,
+          "fp": 1008,
+          "micro_f1": 0.458128078817734,
+          "precision": 0.45365853658536587,
+          "recall": 0.4626865671641791,
+          "support": 1809,
+          "tp": 837,
+          "zero_gold_documents": 1,
+          "zero_gold_predicted_documents": 1
+        },
+        "fixed_ontology_macro_f1": 0.49316600151339735,
+        "fresh_native_micro_f1_delta": 0,
+        "metal_micro_f1_delta": 0,
+        "metric_families": 15,
+        "metrics_sha256": "ce2f86a0396ab0d7fade4bbe29319504abac274cc48eb2ea7fe7905618a6e450"
+      },
+      "reports": {
+        "historical_native": {
+          "backend": "native",
+          "binary_sha256": "0069cdad6b8d3b1a97f00779c3de73d81125766ad832f5fc3cd9d9d076b77334",
+          "completed_results": 431,
+          "denominator": 431,
+          "errors": 0,
+          "files": {
+            "fixture": {
+              "path": "requests.fixture.json",
+              "sha256": "515502cfae64e9497d208a2855cac4785cd26f7e19423aa313f7bded21256023",
+              "size_bytes": 265278
+            },
+            "metrics": {
+              "path": "metrics.json",
+              "sha256": "be780147e5f285b37b3a5774191914168b9c29e1ef17c219b9de1258f5da48a2",
+              "size_bytes": 7180
+            },
+            "predictions": {
+              "path": "predictions.jsonl",
+              "sha256": "c6af6ac89570b50fee1a7da1aa8a36908bdc9a1c29461de1c2e9bbea5b872824",
+              "size_bytes": 511330
+            },
+            "responses": {
+              "path": "responses.jsonl",
+              "sha256": "ebc1ada799c5acfb9cf26122b39de215c4d776df74b0d3c28d0373cf3f7e3691",
+              "size_bytes": 1027041
+            }
+          },
+          "max_worker_rss_bytes": 6442450944,
+          "model": "multi",
+          "native_reference_report_sha256": null,
+          "peak_worker_rss_bytes": 2282831872,
+          "pin": {
+            "path": "/private/tmp/gliner25-crossner-native-multi-fp32/report.json",
+            "sha256": "b9e7631314079e83defd07cdda70b65e29cecc6b2e06ae738a88f8b87935801c",
+            "size_bytes": 257388
+          },
+          "source_reference_report_sha256": "547b50479e59160c29fc9cb32b7afd3aa0a6c9f0a95727b6ee4dfde74c1723ed",
+          "unprocessed": 0
+        },
+        "metal": {
+          "backend": "metal",
+          "binary_sha256": "a43fcdee29931bcb67972ff002f3c1457e25f547cda24a60759cfed4a0f6880d",
+          "completed_results": 431,
+          "denominator": 431,
+          "errors": 0,
+          "files": {
+            "fixture": {
+              "path": "requests.fixture.json",
+              "sha256": "515502cfae64e9497d208a2855cac4785cd26f7e19423aa313f7bded21256023",
+              "size_bytes": 265278
+            },
+            "metrics": {
+              "path": "metrics.json",
+              "sha256": "be780147e5f285b37b3a5774191914168b9c29e1ef17c219b9de1258f5da48a2",
+              "size_bytes": 7180
+            },
+            "predictions": {
+              "path": "predictions.jsonl",
+              "sha256": "c6af6ac89570b50fee1a7da1aa8a36908bdc9a1c29461de1c2e9bbea5b872824",
+              "size_bytes": 511330
+            },
+            "responses": {
+              "path": "responses.jsonl",
+              "sha256": "45f0d271f3e706d6de1b6bc6bb2926ddde4fbcff8fffd8f8dc0d72807aa7b4bd",
+              "size_bytes": 1027039
+            }
+          },
+          "max_worker_rss_bytes": 6442450944,
+          "model": "multi",
+          "native_reference_report_sha256": "b9e7631314079e83defd07cdda70b65e29cecc6b2e06ae738a88f8b87935801c",
+          "peak_worker_rss_bytes": 2496200704,
+          "pin": {
+            "path": "/private/tmp/gliner25-crossner-metal-multi-fp32-v1/report.json",
+            "sha256": "645d2aa1de07e037dd06851f2527b196b232b34627dad633828d8919f2d10000",
+            "size_bytes": 417493
+          },
+          "source_reference_report_sha256": "547b50479e59160c29fc9cb32b7afd3aa0a6c9f0a95727b6ee4dfde74c1723ed",
+          "unprocessed": 0
+        },
+        "native": {
+          "backend": "native",
+          "binary_sha256": "a43fcdee29931bcb67972ff002f3c1457e25f547cda24a60759cfed4a0f6880d",
+          "completed_results": 431,
+          "denominator": 431,
+          "errors": 0,
+          "files": {
+            "fixture": {
+              "path": "requests.fixture.json",
+              "sha256": "515502cfae64e9497d208a2855cac4785cd26f7e19423aa313f7bded21256023",
+              "size_bytes": 265278
+            },
+            "metrics": {
+              "path": "metrics.json",
+              "sha256": "be780147e5f285b37b3a5774191914168b9c29e1ef17c219b9de1258f5da48a2",
+              "size_bytes": 7180
+            },
+            "predictions": {
+              "path": "predictions.jsonl",
+              "sha256": "c6af6ac89570b50fee1a7da1aa8a36908bdc9a1c29461de1c2e9bbea5b872824",
+              "size_bytes": 511330
+            },
+            "responses": {
+              "path": "responses.jsonl",
+              "sha256": "ebc1ada799c5acfb9cf26122b39de215c4d776df74b0d3c28d0373cf3f7e3691",
+              "size_bytes": 1027041
+            }
+          },
+          "max_worker_rss_bytes": 6442450944,
+          "model": "multi",
+          "native_reference_report_sha256": null,
+          "peak_worker_rss_bytes": 2240380928,
+          "pin": {
+            "path": "/private/tmp/gliner25-crossner-native-multi-fp32-a43-v1/report.json",
+            "sha256": "2c71554d0a3efbe6a3a7616ada89c29ca6db0d6d0c07f5d3715cc5ace2b96da0",
+            "size_bytes": 257388
+          },
+          "source_reference_report_sha256": "547b50479e59160c29fc9cb32b7afd3aa0a6c9f0a95727b6ee4dfde74c1723ed",
+          "unprocessed": 0
+        },
+        "python": {
+          "backend": "python",
+          "binary_sha256": "80ee2dd97bc26259d4e30853336f72ad38aa4aa0531bb196cc444d899422689d",
+          "completed_results": 431,
+          "denominator": 431,
+          "errors": 0,
+          "files": {
+            "fixture": {
+              "path": "requests.fixture.json",
+              "sha256": "515502cfae64e9497d208a2855cac4785cd26f7e19423aa313f7bded21256023",
+              "size_bytes": 265278
+            },
+            "metrics": {
+              "path": "metrics.json",
+              "sha256": "be780147e5f285b37b3a5774191914168b9c29e1ef17c219b9de1258f5da48a2",
+              "size_bytes": 7180
+            },
+            "predictions": {
+              "path": "predictions.jsonl",
+              "sha256": "c6af6ac89570b50fee1a7da1aa8a36908bdc9a1c29461de1c2e9bbea5b872824",
+              "size_bytes": 511330
+            },
+            "responses": {
+              "path": "responses.jsonl",
+              "sha256": "ffc8ff69e535801f313b8817f1c34adaffa833c0a5a480a59d60169054601c73",
+              "size_bytes": 529572
+            }
+          },
+          "max_worker_rss_bytes": 6442450944,
+          "model": "multi",
+          "native_reference_report_sha256": null,
+          "peak_worker_rss_bytes": 1669824512,
+          "pin": {
+            "path": "/private/tmp/gliner25-crossner-python-multi/report.json",
+            "sha256": "547b50479e59160c29fc9cb32b7afd3aa0a6c9f0a95727b6ee4dfde74c1723ed",
+            "size_bytes": 103606
+          },
+          "source_reference_report_sha256": null,
+          "unprocessed": 0
+        }
+      },
+      "source": {
+        "model_id": "fastino/gliner2.5-multi-v1",
+        "revision": "aaecfe45db1d828c963717054ccb868e8ad1f1d5",
+        "source_files": [
+          {
+            "path": "config.json",
+            "sha256": "8b59a0f426a65859c89cd1ea850c3529c09aa3be3a6fafd8eddfdd17b1bf0146",
+            "size_bytes": 3151
+          },
+          {
+            "path": "encoder_config/config.json",
+            "sha256": "fa4f9ef2903b5369ab172333aae4574e6a476511d7465845cf59f8360ee18716",
+            "size_bytes": 857
+          },
+          {
+            "path": "model.safetensors",
+            "sha256": "c1ff4ec0bc00031c15530b8f3c33d3677f27949e6a0cb52e1247a6224b6c5395",
+            "size_bytes": 1149461028
+          },
+          {
+            "path": "tokenizer.json",
+            "sha256": "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a",
+            "size_bytes": 16035853
+          },
+          {
+            "path": "tokenizer_config.json",
+            "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1",
+            "size_bytes": 645
+          }
+        ]
+      }
+    }
+  ],
+  "official_bio": {
+    "cpu_reports": 12,
+    "metal_reports": 3,
+    "metric_family_comparisons": 225,
+    "reports": 15,
+    "representation": "per_type_common_UTF8_boundary_refinement_with_explicit_type_and_document_sentinels",
+    "scored_document_instances": 6465,
+    "scorer_sha256": "45e1b96603d09e7abe9949092789592de37b9a7744631bb8fb36e81bf0baa2e4"
+  },
+  "qualification": false,
+  "scope": "gliner25_crossner_ai_fp32_metal_evidence/v1",
+  "source_commit": "3c913c7369301133d3b7699252074c4303ada50e",
+  "status": "audited",
+  "totals": {
+    "all_recorded_reference_comparisons": 5172,
+    "errors": 0,
+    "fresh_native_results": 1293,
+    "metal_results": 1293,
+    "same_executable_comparisons": 1293,
+    "unprocessed": 0
+  },
+  "worker": {
+    "accumulation_precision": "f32",
+    "activation_precision": "f32",
+    "build_mode": "ReleaseFast",
+    "head_precision": "f32",
+    "math_policy": "strict_f32_activations_v1",
+    "sha256": "a43fcdee29931bcb67972ff002f3c1457e25f547cda24a60759cfed4a0f6880d",
+    "size_bytes": 14600280,
+    "weight_precision": "fp32"
+  }
+}

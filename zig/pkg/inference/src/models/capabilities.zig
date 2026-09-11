@@ -15,6 +15,7 @@
 const std = @import("std");
 const manifest_mod = @import("manifest.zig");
 const compatibility_mod = @import("compatibility.zig");
+const gliner_boundary = @import("gliner_boundary.zig");
 
 pub fn hasCapability(capabilities: []const []const u8, capability: []const u8) bool {
     for (capabilities) |cap| {
@@ -29,6 +30,9 @@ pub fn modelSupportsCapability(
     capabilities: []const []const u8,
     capability: []const u8,
 ) bool {
+    // String-only listings do not carry a consumed artifact identity or an
+    // actual backend; even a future family flag/table cannot qualify them.
+    if (std.mem.eql(u8, gliner_model_type, gliner_boundary.model_type)) return false;
     if (hasCapability(capabilities, capability)) return true;
     if (std.mem.eql(u8, model_kind, "classifier")) {
         return std.mem.eql(u8, capability, "classification");
@@ -127,7 +131,17 @@ pub const CompatibilityLevel = compatibility_mod.Level;
 ///   ONNX seq2seq     the rewrite path panics on a rank assertion while importing the
 ///                    graph (lib/ml/src/graph/shape.zig `axis < self.rank_`).
 pub fn modelClassCompatibility(man: *const manifest_mod.ModelManifest) CompatibilityLevel {
+    if (!man.hasSupportedGlinerRuntime()) return .incompatible;
     return compatibility_mod.assess(man, man.config_model_arch).level;
+}
+
+test "gliner boundary capabilities wait for an implemented runtime" {
+    var boundary = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
+    boundary.gliner_architecture = .boundary;
+    try std.testing.expectEqual(CompatibilityLevel.incompatible, modelClassCompatibility(&boundary));
+    for ([_][]const u8{ "classification", "relations", "extraction", "labels" }) |capability| {
+        try std.testing.expect(!modelSupportsCapability("recognizer", "gliner2.5", &.{capability}, capability));
+    }
 }
 
 test "clipclap stays compatible while standalone clip and clap do not" {

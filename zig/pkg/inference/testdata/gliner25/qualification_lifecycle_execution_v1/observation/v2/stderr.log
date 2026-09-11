@@ -1,0 +1,24 @@
+1/44 server.server.test.loaded model listing uses model directories and safe relative identifiers...OK
+2/44 server.server.test.loaded model listing preserves managed variant identity without exposing cache leaves...OK
+3/44 server.server.test.OpenAI model listing deduplicates multi-task models...OK
+4/44 server.server.test.model listing reports registry discovery failures...OK
+5/44 server.server.test.model listing does not parse GGUF payloads during discovery...OK
+6/44 server.server.test.boundary qualification model listings reject raw explicit tasks and capabilities...OK
+7/44 server.model_manager.test.loaded model snapshot preserves TTL while ordinary inference release records use...OK
+8/44 server.model_manager.test.loaded model snapshot allocation failure preserves lifetime usage and retry...OK
+9/44 server.model_manager.test.loaded model snapshot final retired observation keeps protected cleanup and admission...[default] (warn): retiring failed inference model path=teardown-fixture backend=metal
+OK
+10/44 server.model_manager.test.failed loaded model retires from lookup while active handles unwind...[default] (warn): retiring failed inference model path=owner/model backend=metal
+OK
+11/44 server.model_manager.test.gliner boundary cache pinned small Metal handle retention eviction and reload...gliner-boundary-cache-maintenance begin phase=held_handle budget_ns=5000000000 expected_closes=0
+gliner-boundary-cache-maintenance returned phase=held_handle elapsed_ns=1000 budget_ns=5000000000
+gliner-boundary-cache-maintenance begin phase=before_expiry budget_ns=5000000000 expected_closes=0
+gliner-boundary-cache-maintenance returned phase=before_expiry elapsed_ns=1000 budget_ns=5000000000
+gliner-boundary-cache-maintenance begin phase=eligible_eviction budget_ns=30000000000 expected_closes=1
+gliner-boundary-cache-maintenance returned phase=eligible_eviction elapsed_ns=15871518000 budget_ns=30000000000
+gliner-boundary-cache-maintenance begin phase=empty_cache budget_ns=5000000000 expected_closes=0
+gliner-boundary-cache-maintenance returned phase=empty_cache elapsed_ns=1000 budget_ns=5000000000
+gliner-boundary-cache-maintenance begin phase=reload_eviction budget_ns=30000000000 expected_closes=1
+gliner-boundary-cache-maintenance returned phase=reload_eviction elapsed_ns=20680144000 budget_ns=30000000000
+OK
+11 selected; 11 passed; 0 skipped.

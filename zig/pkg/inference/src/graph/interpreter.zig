@@ -144,6 +144,12 @@ pub const ExecuteOptions = struct {
     /// must return before cleanup, but graph-scale work can no longer ignore a
     /// cancelled request for the remainder of the graph.
     execution_control: ?InferenceExecutionControl = null,
+    /// Strict training graphs use physical integer index tensors. Legacy
+    /// imported graphs retain their established numeric-constant behavior.
+    strict_integer_constants: bool = false,
+    /// Require independent resident capture allocations. This controls tape
+    /// snapshots only; it does not certify residency of other graph operations.
+    require_resident_capture: bool = false,
 
     /// Per-node CT overrides (e.g. pre-computed tensors).
     runtime_inputs: ?[]const RuntimeInput = null,
@@ -936,7 +942,9 @@ pub fn captureNodeValues(
     options: ExecuteOptions,
     capture_node_ids: []const NodeId,
 ) !CapturedValuesResult {
+    if (options.execution_control) |control| try control.check();
     const count = graph.nodeCount();
+    for (capture_node_ids) |node_id| if (node_id == null_node or node_id >= count) return error.MissingRuntimeInput;
 
     const have_cache = options.cached_analysis != null;
     const reachable = if (options.cached_analysis) |ca| ca.reachable else try computeReachable(allocator, graph);
@@ -1010,6 +1018,7 @@ pub fn captureNodeValues(
     defer exec_state.freeMoeState();
 
     for (0..count) |i| {
+        if (options.execution_control) |control| try control.check();
         if (!reachable[i]) continue;
 
         const node_id: NodeId = @intCast(i);
@@ -1018,7 +1027,7 @@ pub fn captureNodeValues(
             values[i] = rt_val;
             logNodeRuntimeShape(graph, cb, node_id, rt_val);
             try recordRuntimeShape(allocator, cb, runtime_shapes, shape_capture, node_id, rt_val);
-            try maybeCaptureNodeValue(allocator, graph, cb, capture_node_ids, captured, node_id, rt_val);
+            try maybeCaptureNodeValue(allocator, graph, cb, capture_node_ids, captured, node_id, rt_val, options.require_resident_capture);
             continue;
         }
 
@@ -1035,7 +1044,7 @@ pub fn captureNodeValues(
         };
         logNodeRuntimeShape(graph, cb, node_id, values[i].?);
         try recordRuntimeShape(allocator, cb, runtime_shapes, shape_capture, node_id, values[i].?);
-        try maybeCaptureNodeValue(allocator, graph, cb, capture_node_ids, captured, node_id, values[i].?);
+        try maybeCaptureNodeValue(allocator, graph, cb, capture_node_ids, captured, node_id, values[i].?, options.require_resident_capture);
         try cloneOutputIfAliasedInputWouldBeFreedFast(
             allocator,
             graph,
@@ -1067,6 +1076,7 @@ pub fn captureNodeValues(
         }
     }
 
+    if (options.execution_control) |control| try control.check();
     const out = try allocator.alloc(CT, capture_node_ids.len);
     errdefer allocator.free(out);
     for (capture_node_ids, 0..) |node_id, idx| {
@@ -1075,6 +1085,7 @@ pub fn captureNodeValues(
             return error.MissingRuntimeInput;
         };
     }
+    if (options.execution_control) |control| try control.check();
     return .{ .values = out, .allocator = allocator };
 }
 
@@ -1086,10 +1097,20 @@ fn maybeCaptureNodeValue(
     captured: []?CT,
     node_id: NodeId,
     value: CT,
+    require_resident: bool,
 ) !void {
     for (capture_node_ids, 0..) |capture_id, idx| {
         if (capture_id != node_id or captured[idx] != null) continue;
-        captured[idx] = try cloneTensorForShape(allocator, cb, value, graph.node(node_id).output_shape);
+        if (require_resident) {
+            const shape = graph.node(node_id).output_shape;
+            var dims: [8]i32 = undefined;
+            if (shape.rank_ > dims.len) return error.UnsupportedShape;
+            for (shape.dims[0..shape.rank_], dims[0..shape.rank_]) |dimension, *out| {
+                out.* = std.math.cast(i32, dimension) orelse return error.UnsupportedShape;
+                if (out.* < 0) return error.UnsupportedShape;
+            }
+            captured[idx] = try cb.snapshotTensorShape(value, dims[0..shape.rank_]);
+        } else captured[idx] = try cloneTensorForShape(allocator, cb, value, graph.node(node_id).output_shape);
     }
 }
 
@@ -1162,6 +1183,7 @@ fn cloneOutputIfAliasedInputWouldBeFreedFast(
 
 pub fn canKeepAliasedOutput(op: anytype) bool {
     return switch (op) {
+        .stop_gradient,
         .fused_gelu,
         .fused_gelu_exact,
         .fused_relu,
@@ -1209,7 +1231,10 @@ fn cloneTensorForShape(
     shape: Shape,
 ) !CT {
     var dims: [8]i32 = undefined;
-    const runtime_shape: ?[]i64 = cb.tensorShape(tensor, allocator) catch null;
+    const runtime_shape: ?[]i64 = cb.tensorShape(tensor, allocator) catch |err| switch (err) {
+        error.UnsupportedShape => null,
+        else => return err,
+    };
     defer if (runtime_shape) |actual| allocator.free(actual);
 
     // Dynamic imported graphs retain their exported/static dimensions in the
@@ -1229,6 +1254,60 @@ fn cloneTensorForShape(
     const data = try cb.toFloat32(tensor, allocator);
     defer allocator.free(data);
     return cb.fromFloat32Shape(data, dims[0..rank]);
+}
+
+test "interpreter tensor capture propagates shape failures and preserves unsupported fallback" {
+    const native_compute = @import("../ops/native_compute.zig");
+    const a = std.testing.allocator;
+    var store = native_compute.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.deinitOwned();
+    var compute = native_compute.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const original = compute.computeBackend();
+    const input = try original.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 2, 3 });
+    defer original.free(input);
+    const Failure = struct {
+        fn oom(_: *anyopaque, _: CT, _: std.mem.Allocator) anyerror![]i64 {
+            return error.OutOfMemory;
+        }
+        fn invalid(_: *anyopaque, _: CT, _: std.mem.Allocator) anyerror![]i64 {
+            return error.InvalidShape;
+        }
+        fn cancelled(_: *anyopaque, _: CT, _: std.mem.Allocator) anyerror![]i64 {
+            return error.Cancelled;
+        }
+        fn unsupported(_: *anyopaque, _: CT, _: std.mem.Allocator) anyerror![]i64 {
+            return error.UnsupportedShape;
+        }
+        fn rejectReadback(_: *anyopaque, _: CT, _: std.mem.Allocator) anyerror![]f32 {
+            return error.UnexpectedCaptureReadback;
+        }
+    };
+    var vtable = original.vtable.*;
+    var cb = original;
+    cb.vtable = &vtable;
+    vtable.toFloat32 = Failure.rejectReadback;
+    vtable.tensorShape = Failure.oom;
+    try std.testing.expectError(error.OutOfMemory, cloneTensorForShape(a, &cb, input, Shape.init(.f32, &.{ 2, 3 })));
+    vtable.tensorShape = Failure.invalid;
+    try std.testing.expectError(error.InvalidShape, cloneTensorForShape(a, &cb, input, Shape.init(.f32, &.{ 2, 3 })));
+    vtable.tensorShape = Failure.cancelled;
+    try std.testing.expectError(error.Cancelled, cloneTensorForShape(a, &cb, input, Shape.init(.f32, &.{ 2, 3 })));
+
+    // Unsupported shape metadata and a null clone callback remain a valid
+    // compatibility path. It must produce an independently owned snapshot.
+    vtable.tensorShape = Failure.unsupported;
+    vtable.cloneTensorShape = null;
+    vtable.toFloat32 = original.vtable.toFloat32;
+    const copied = try cloneTensorForShape(a, &cb, input, Shape.init(.f32, &.{ 2, 3 }));
+    defer original.free(copied);
+    try std.testing.expect(input != copied);
+    const actual = try original.toFloat32(copied, a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6 }, actual);
+    const copied_shape = try original.tensorShape(copied, a);
+    defer a.free(copied_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, copied_shape);
 }
 
 /// Grouped MoE routing data computed from a flat MoeRouteSelection.
@@ -1514,6 +1593,29 @@ fn executeScatterAdd(
     axis: u8,
 ) !CT {
     if (axis != 0) return error.UnsupportedPrimitiveOp;
+    const index_dtype = try cb.tensorDType(indices);
+    if (index_dtype == .i32 or index_dtype == .i64) {
+        // The compatibility host path below represents legacy indices as f32.
+        // Typed training indices must reach the backend without that cast.
+        if (dest_shape.len == 0 or dest_shape.len != values_shape.len or indices_shape.len == 0) return error.UnsupportedShape;
+        if (dest_shape[0] < 0 or values_shape[0] < 0) return error.UnsupportedShape;
+        var width: i64 = 1;
+        for (dest_shape[1..], values_shape[1..]) |dest_dim, value_dim| {
+            if (dest_dim <= 0 or dest_dim != value_dim) return error.UnsupportedShape;
+            width = std.math.mul(i64, width, dest_dim) catch return error.UnsupportedShape;
+        }
+        var index_count: i64 = 1;
+        for (indices_shape) |dimension| {
+            if (dimension < 0) return error.UnsupportedShape;
+            index_count = std.math.mul(i64, index_count, dimension) catch return error.UnsupportedShape;
+        }
+        if (index_count != values_shape[0]) return error.ShapeMismatch;
+        const accumulated = try cb.primScatterAdd(values, indices, &.{ values_shape[0], width }, &.{ dest_shape[0], width }, 0);
+        defer cb.free(accumulated);
+        const shaped = try cb.primReshape(accumulated, dest_shape);
+        defer if (shaped != accumulated) cb.free(shaped);
+        return cb.add(dest, shaped);
+    }
     if (dest_shape.len != 2 or values_shape.len != 2) return error.UnsupportedPrimitiveOp;
     if (dest_shape[0] < 0 or dest_shape[1] <= 0 or values_shape[0] < 0 or values_shape[1] != dest_shape[1]) return error.UnsupportedShape;
     if (indices_shape.len == 0) return error.UnsupportedShape;
@@ -2339,6 +2441,26 @@ pub fn executeNode(
         },
 
         .constant => |attrs| {
+            if (state.options.strict_integer_constants) switch (n.output_shape.dtype) {
+                .i32 => {
+                    const byte_count = std.math.mul(usize, attrs.data_len, @sizeOf(i32)) catch return error.UnsupportedShape;
+                    if (attrs.data_offset > graph.constant_pool.items.len or byte_count > graph.constant_pool.items.len - attrs.data_offset) return error.UnsupportedShape;
+                    const data = graph.constantDataAs(i32, attrs.data_offset, attrs.data_len);
+                    if (n.output_shape.rank() > 8) return error.UnsupportedShape;
+                    var dimensions: [8]i32 = undefined;
+                    var elements: usize = 1;
+                    for (0..n.output_shape.rank()) |axis| {
+                        const dimension = n.output_shape.dim(@intCast(axis));
+                        if (dimension < 0) return error.UnsupportedShape;
+                        dimensions[axis] = std.math.cast(i32, dimension) orelse return error.UnsupportedShape;
+                        elements = std.math.mul(usize, elements, @intCast(dimension)) catch return error.UnsupportedShape;
+                    }
+                    if (elements != data.len) return error.UnsupportedShape;
+                    return (try cb.fromInt32Shape(data, dimensions[0..n.output_shape.rank()])) orelse return error.UnsupportedIntegerTensor;
+                },
+                .i8, .i16, .i64, .u8, .bool_ => return error.UnsupportedIntegerTensor,
+                else => {},
+            };
             const constant = try graph.constantDataAsF32(
                 graph.allocator,
                 n.output_shape.dtype,
@@ -2679,6 +2801,16 @@ pub fn executeNode(
                 attrs.num_kv_heads,
                 attrs.head_dim,
             );
+        },
+
+        .fused_deberta_training_attention_v1 => |attrs| {
+            if (ins.len != 3) return error.InvalidDebertaTrainingAttentionShape;
+            return cb.debertaTrainingAttentionV1(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]), attrs);
+        },
+
+        .fused_deberta_training_attention_backward_v1 => |attrs| {
+            if (ins.len != 4) return error.InvalidDebertaTrainingAttentionShape;
+            return cb.debertaTrainingAttentionBackwardV1(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]), V.get(ins[3]), attrs);
         },
 
         .fused_disentangled_attention => |attrs| {
@@ -3050,6 +3182,9 @@ pub fn executeNode(
         // These appear in lowered/gradient graphs produced by autodiff.
         // Each dispatches to an optional VTable method on the backend.
 
+        // The ordinary alias/liveness machinery transfers or clones this
+        // identity exactly like other backend-consumed operation outputs.
+        .stop_gradient => return V.get(ins[0]),
         .neg => {
             if (state.isLastUseBy(ins[0], node_id) and !isNonDonatedRuntimeInput(state.options, ins[0])) {
                 if (try cb.unaryConsume(.negate, V.get(ins[0]))) |consumed| return consumed;

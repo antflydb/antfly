@@ -1,0 +1,247 @@
+{
+  "binary": {
+    "sha256": "05d650b47cd67804ac7d16e3308b0e0bda8ad501730142408115acf98afc7590",
+    "size_bytes": 36647768
+  },
+  "binary_unchanged": true,
+  "cases": [
+    {
+      "argv": [
+        "/private/tmp/antfly-gliner25-manager-teardown-native-v3-archive/test",
+        "--test-filter",
+        "model manager teardown supervised child fixture"
+      ],
+      "cache_destruction_entries": 1,
+      "cleanup_returned": false,
+      "elapsed_seconds": 0.6830504999961704,
+      "exit_code": 86,
+      "expected_admission_state": "lease_held64",
+      "expected_destructor_entered": true,
+      "lease_order_evidence": true,
+      "mode": "cache",
+      "operation_error": false,
+      "outer_failure": null,
+      "pass": true,
+      "reaped": true,
+      "session_close_entries": 0,
+      "session_close_lease_held64_entries": 0,
+      "session_close_no_lease_entries": 0,
+      "started_expected_operation": true,
+      "stderr": {
+        "sha256": "e9750737c6e7b9e4899f5d43146a6a4dba9ac52abdfa417256dd89095de30be4",
+        "size_bytes": 294
+      },
+      "stdout": {
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "size_bytes": 0
+      },
+      "watchdog_timeout_reported": true
+    },
+    {
+      "argv": [
+        "/private/tmp/antfly-gliner25-manager-teardown-native-v3-archive/test",
+        "--test-filter",
+        "model manager teardown supervised child fixture"
+      ],
+      "cache_destruction_entries": 0,
+      "cleanup_returned": false,
+      "elapsed_seconds": 0.11780050001107156,
+      "exit_code": 86,
+      "expected_admission_state": "lease_held64",
+      "expected_destructor_entered": true,
+      "lease_order_evidence": true,
+      "mode": "ttl",
+      "operation_error": false,
+      "outer_failure": null,
+      "pass": true,
+      "reaped": true,
+      "session_close_entries": 1,
+      "session_close_lease_held64_entries": 1,
+      "session_close_no_lease_entries": 0,
+      "started_expected_operation": true,
+      "stderr": {
+        "sha256": "1acaab56454c1c5f2ebb9b215395df950ad394065944ae250cf7cf05e18c6485",
+        "size_bytes": 264
+      },
+      "stdout": {
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "size_bytes": 0
+      },
+      "watchdog_timeout_reported": true
+    },
+    {
+      "argv": [
+        "/private/tmp/antfly-gliner25-manager-teardown-native-v3-archive/test",
+        "--test-filter",
+        "model manager teardown supervised child fixture"
+      ],
+      "cache_destruction_entries": 0,
+      "cleanup_returned": false,
+      "elapsed_seconds": 0.1298241250042338,
+      "exit_code": 86,
+      "expected_admission_state": "lease_held64",
+      "expected_destructor_entered": true,
+      "lease_order_evidence": true,
+      "mode": "admission",
+      "operation_error": false,
+      "outer_failure": null,
+      "pass": true,
+      "reaped": true,
+      "session_close_entries": 1,
+      "session_close_lease_held64_entries": 1,
+      "session_close_no_lease_entries": 0,
+      "started_expected_operation": true,
+      "stderr": {
+        "sha256": "7c6dd832fee512f3fcfbabad72bca087b3be42e1698ed3f740062aa98a7cc337",
+        "size_bytes": 270
+      },
+      "stdout": {
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "size_bytes": 0
+      },
+      "watchdog_timeout_reported": true
+    },
+    {
+      "argv": [
+        "/private/tmp/antfly-gliner25-manager-teardown-native-v3-archive/test",
+        "--test-filter",
+        "model manager teardown supervised child fixture"
+      ],
+      "cache_destruction_entries": 0,
+      "cleanup_returned": false,
+      "elapsed_seconds": 0.12103141599800438,
+      "exit_code": 86,
+      "expected_admission_state": "lease_held64",
+      "expected_destructor_entered": true,
+      "lease_order_evidence": true,
+      "mode": "retired",
+      "operation_error": false,
+      "outer_failure": null,
+      "pass": true,
+      "reaped": true,
+      "session_close_entries": 1,
+      "session_close_lease_held64_entries": 1,
+      "session_close_no_lease_entries": 0,
+      "started_expected_operation": true,
+      "stderr": {
+        "sha256": "97ce965fc9a1e370d609590b8550f4f5227c76f7af43aa9cd005296000c15db9",
+        "size_bytes": 354
+      },
+      "stdout": {
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "size_bytes": 0
+      },
+      "watchdog_timeout_reported": true
+    },
+    {
+      "argv": [
+        "/private/tmp/antfly-gliner25-manager-teardown-native-v3-archive/test",
+        "--test-filter",
+        "model manager teardown supervised child fixture"
+      ],
+      "cache_destruction_entries": 0,
+      "cleanup_returned": false,
+      "elapsed_seconds": 0.12104970897780731,
+      "exit_code": 86,
+      "expected_admission_state": "lease_held64",
+      "expected_destructor_entered": true,
+      "lease_order_evidence": true,
+      "mode": "shutdown",
+      "operation_error": false,
+      "outer_failure": null,
+      "pass": true,
+      "reaped": true,
+      "session_close_entries": 1,
+      "session_close_lease_held64_entries": 1,
+      "session_close_no_lease_entries": 0,
+      "started_expected_operation": true,
+      "stderr": {
+        "sha256": "9bca70e4e559ad4b6a8ce2816761bd851f76bbb796f859a14f897bbbb6e96030",
+        "size_bytes": 269
+      },
+      "stdout": {
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "size_bytes": 0
+      },
+      "watchdog_timeout_reported": true
+    },
+    {
+      "argv": [
+        "/private/tmp/antfly-gliner25-manager-teardown-native-v3-archive/test",
+        "--test-filter",
+        "model manager teardown supervised child fixture"
+      ],
+      "cache_destruction_entries": 0,
+      "cleanup_returned": false,
+      "elapsed_seconds": 0.10625533299753442,
+      "exit_code": 86,
+      "expected_admission_state": "lease_held64",
+      "expected_destructor_entered": true,
+      "lease_order_evidence": true,
+      "mode": "rollback",
+      "operation_error": false,
+      "outer_failure": null,
+      "pass": true,
+      "reaped": true,
+      "session_close_entries": 1,
+      "session_close_lease_held64_entries": 1,
+      "session_close_no_lease_entries": 0,
+      "started_expected_operation": true,
+      "stderr": {
+        "sha256": "8598d5660ec7317ef17c786a72eaa50e26147ef4fff4f9f1ea859f083969794b",
+        "size_bytes": 269
+      },
+      "stdout": {
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "size_bytes": 0
+      },
+      "watchdog_timeout_reported": true
+    },
+    {
+      "argv": [
+        "/private/tmp/antfly-gliner25-manager-teardown-native-v3-archive/test",
+        "--test-filter",
+        "model manager teardown supervised child fixture"
+      ],
+      "cache_destruction_entries": 0,
+      "cleanup_returned": false,
+      "elapsed_seconds": 0.12922795800841413,
+      "exit_code": 86,
+      "expected_admission_state": "no_lease",
+      "expected_destructor_entered": true,
+      "lease_order_evidence": false,
+      "mode": "escaped",
+      "operation_error": false,
+      "outer_failure": null,
+      "pass": true,
+      "reaped": true,
+      "session_close_entries": 1,
+      "session_close_lease_held64_entries": 0,
+      "session_close_no_lease_entries": 1,
+      "started_expected_operation": true,
+      "stderr": {
+        "sha256": "5fcf9d3626b7dfcbb7147ea608bf29481d1e92f35a5340d567ada83941fe886c",
+        "size_bytes": 264
+      },
+      "stdout": {
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "size_bytes": 0
+      },
+      "watchdog_timeout_reported": true
+    }
+  ],
+  "driver": {
+    "sha256": "337cbeb756dc6c6df0d0ffdae573bd13c3c8fc1057f9cd978296d68c0e6c64ac",
+    "size_bytes": 6426
+  },
+  "expected_watchdog_exit": 86,
+  "limits": {
+    "child_seconds": 5,
+    "reap_seconds": 5,
+    "stream_bytes": 1048576
+  },
+  "pass": true,
+  "qualification": false,
+  "scope": "model_manager_bounded_teardown/no_model_v1",
+  "version": 1
+}

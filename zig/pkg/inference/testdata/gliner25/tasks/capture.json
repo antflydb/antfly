@@ -1,0 +1,1720 @@
+{
+  "format_version": 1,
+  "generator_sha256": "5483e915dabb38e4aaab40ae72b2e9dbd0c2da25f80a1dce5611484d27cb14ec",
+  "hidden": 32,
+  "instance_queries": 4,
+  "native_runtime_qualified": false,
+  "oracle_sha256": "61bbf4544a21111dbfbd643ed2392b1d9723498493b3fa6832154d6e1dc42752",
+  "provenance": {
+    "checkout": "/private/tmp/antfly-gliner25-upstream",
+    "commit": "3c913c7369301133d3b7699252074c4303ada50e",
+    "device": "cpu",
+    "dtype": "float32",
+    "imports": {
+      "gliner2": "/private/tmp/antfly-gliner25-upstream/gliner2/__init__.py",
+      "gliner2.api_client": "/private/tmp/antfly-gliner25-upstream/gliner2/api_client.py",
+      "gliner2.auto": "/private/tmp/antfly-gliner25-upstream/gliner2/auto.py",
+      "gliner2.configuration": "/private/tmp/antfly-gliner25-upstream/gliner2/configuration.py",
+      "gliner2.inference": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/__init__.py",
+      "gliner2.inference.candidate_decoder": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/candidate_decoder.py",
+      "gliner2.inference.chunking": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/chunking.py",
+      "gliner2.inference.engine": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/engine.py",
+      "gliner2.inference.overlap": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/overlap.py",
+      "gliner2.inference.runtime": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/runtime.py",
+      "gliner2.inference.schema": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/schema.py",
+      "gliner2.inference.schema_model": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/schema_model.py",
+      "gliner2.layers": "/private/tmp/antfly-gliner25-upstream/gliner2/layers.py",
+      "gliner2.models": "/private/tmp/antfly-gliner25-upstream/gliner2/models/__init__.py",
+      "gliner2.models.base": "/private/tmp/antfly-gliner25-upstream/gliner2/models/base.py",
+      "gliner2.models.boundary": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/__init__.py",
+      "gliner2.models.boundary.constants": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/constants.py",
+      "gliner2.models.boundary.content": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/content.py",
+      "gliner2.models.boundary.encoding": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/encoding.py",
+      "gliner2.models.boundary.engine": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/engine.py",
+      "gliner2.models.boundary.heads": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/heads.py",
+      "gliner2.models.boundary.indexing": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/indexing.py",
+      "gliner2.models.boundary.losses": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/losses.py",
+      "gliner2.models.boundary.model": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/model.py",
+      "gliner2.models.boundary.pool": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/pool.py",
+      "gliner2.models.boundary.proposal": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/proposal.py",
+      "gliner2.models.boundary.records": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/records.py",
+      "gliner2.models.boundary.relations": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/relations.py",
+      "gliner2.models.boundary.rotary": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/rotary.py",
+      "gliner2.models.boundary.scoring": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/scoring.py",
+      "gliner2.models.boundary.targets_device": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/targets_device.py",
+      "gliner2.models.boundary.validation": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/validation.py",
+      "gliner2.models.candidates": "/private/tmp/antfly-gliner25-upstream/gliner2/models/candidates.py",
+      "gliner2.models.loading": "/private/tmp/antfly-gliner25-upstream/gliner2/models/loading.py",
+      "gliner2.models.outputs": "/private/tmp/antfly-gliner25-upstream/gliner2/models/outputs.py",
+      "gliner2.models.span": "/private/tmp/antfly-gliner25-upstream/gliner2/models/span/__init__.py",
+      "gliner2.models.span.model": "/private/tmp/antfly-gliner25-upstream/gliner2/models/span/model.py",
+      "gliner2.processing": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/__init__.py",
+      "gliner2.processing.layouts": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/layouts.py",
+      "gliner2.processing.records": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/records.py",
+      "gliner2.processing.targets": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/targets.py",
+      "gliner2.processing.word_splitter": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/word_splitter.py",
+      "gliner2.processor": "/private/tmp/antfly-gliner25-upstream/gliner2/processor.py",
+      "gliner2.training": "/private/tmp/antfly-gliner25-upstream/gliner2/training/__init__.py",
+      "gliner2.training.data": "/private/tmp/antfly-gliner25-upstream/gliner2/training/data.py",
+      "gliner2.training.matching": "/private/tmp/antfly-gliner25-upstream/gliner2/training/matching.py",
+      "gliner2.training.sampler": "/private/tmp/antfly-gliner25-upstream/gliner2/training/sampler.py",
+      "gliner2.training.trainer": "/private/tmp/antfly-gliner25-upstream/gliner2/training/trainer.py",
+      "gliner2.utils": "namespace:/private/tmp/antfly-gliner25-upstream/gliner2/utils",
+      "gliner2.utils.device_errors": "/private/tmp/antfly-gliner25-upstream/gliner2/utils/device_errors.py",
+      "gliner2.utils.sync_probe": "/private/tmp/antfly-gliner25-upstream/gliner2/utils/sync_probe.py"
+    },
+    "platform": {
+      "machine": "arm64",
+      "system": "Darwin"
+    },
+    "runtime": {
+      "packages": {
+        "PyYAML": "6.0.3",
+        "accelerate": "1.10.1",
+        "huggingface-hub": "0.36.0",
+        "numpy": "2.3.5",
+        "packaging": "25.0",
+        "peft": "0.17.1",
+        "psutil": "7.1.3",
+        "pydantic": "2.12.3",
+        "requests": "2.32.5",
+        "safetensors": "0.7.0",
+        "scipy": "1.16.3",
+        "tokenizers": "0.21.4",
+        "torch": "2.9.1",
+        "transformers": "4.55.4",
+        "urllib3": "2.5.0"
+      },
+      "python": "3.12.3",
+      "unicode": "15.0.0"
+    },
+    "threads": 1
+  },
+  "real_model_qualified": false,
+  "record_dim": 16,
+  "records": [
+    {
+      "fields": [
+        {
+          "cardinality": "required_one",
+          "is_anchor": true,
+          "name": "person",
+          "query_id": 0,
+          "tensor_prefix": "record.natural_0.field.0"
+        },
+        {
+          "cardinality": "zero_or_more",
+          "is_anchor": false,
+          "name": "organization",
+          "query_id": 1,
+          "tensor_prefix": "record.natural_0.field.1"
+        },
+        {
+          "cardinality": "optional_one",
+          "is_anchor": false,
+          "name": "location",
+          "query_id": 2,
+          "tensor_prefix": "record.natural_0.field.2"
+        }
+      ],
+      "id": "natural_0",
+      "instance_seed": [
+        [
+          0,
+          0
+        ],
+        [
+          0,
+          1
+        ],
+        [
+          0,
+          2
+        ]
+      ],
+      "instance_spans": [
+        [
+          0,
+          1
+        ],
+        [
+          1,
+          3
+        ],
+        [
+          0,
+          5
+        ]
+      ],
+      "instances": 3,
+      "mode": "natural",
+      "sample": 0,
+      "tensor_prefix": "record.natural_0"
+    },
+    {
+      "fields": [
+        {
+          "cardinality": "required_one",
+          "is_anchor": false,
+          "name": "person",
+          "query_id": 0,
+          "tensor_prefix": "record.latent_0.field.0"
+        },
+        {
+          "cardinality": "zero_or_more",
+          "is_anchor": false,
+          "name": "organization",
+          "query_id": 1,
+          "tensor_prefix": "record.latent_0.field.1"
+        },
+        {
+          "cardinality": "optional_one",
+          "is_anchor": false,
+          "name": "location",
+          "query_id": 2,
+          "tensor_prefix": "record.latent_0.field.2"
+        }
+      ],
+      "id": "latent_0",
+      "instance_seed": [
+        [
+          0,
+          0
+        ],
+        [
+          0,
+          1
+        ],
+        [
+          0,
+          2
+        ],
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ]
+      ],
+      "instance_spans": [
+        [
+          0,
+          1
+        ],
+        [
+          1,
+          3
+        ],
+        [
+          0,
+          5
+        ],
+        [
+          0,
+          1
+        ],
+        [
+          3,
+          5
+        ]
+      ],
+      "instances": 5,
+      "mode": "latent",
+      "sample": 0,
+      "tensor_prefix": "record.latent_0"
+    },
+    {
+      "fields": [
+        {
+          "cardinality": "required_one",
+          "is_anchor": false,
+          "name": "person",
+          "query_id": 0,
+          "tensor_prefix": "record.anchorless_0.field.0"
+        },
+        {
+          "cardinality": "zero_or_more",
+          "is_anchor": false,
+          "name": "organization",
+          "query_id": 1,
+          "tensor_prefix": "record.anchorless_0.field.1"
+        },
+        {
+          "cardinality": "optional_one",
+          "is_anchor": false,
+          "name": "location",
+          "query_id": 2,
+          "tensor_prefix": "record.anchorless_0.field.2"
+        }
+      ],
+      "id": "anchorless_0",
+      "instance_seed": [
+        null,
+        null,
+        null,
+        null
+      ],
+      "instance_spans": [
+        null,
+        null,
+        null,
+        null
+      ],
+      "instances": 4,
+      "mode": "anchorless",
+      "sample": 0,
+      "tensor_prefix": "record.anchorless_0"
+    },
+    {
+      "fields": [
+        {
+          "cardinality": "required_one",
+          "is_anchor": true,
+          "name": "person",
+          "query_id": 0,
+          "tensor_prefix": "record.natural_1.field.0"
+        },
+        {
+          "cardinality": "zero_or_more",
+          "is_anchor": false,
+          "name": "organization",
+          "query_id": 1,
+          "tensor_prefix": "record.natural_1.field.1"
+        },
+        {
+          "cardinality": "optional_one",
+          "is_anchor": false,
+          "name": "location",
+          "query_id": 2,
+          "tensor_prefix": "record.natural_1.field.2"
+        }
+      ],
+      "id": "natural_1",
+      "instance_seed": [
+        [
+          0,
+          0
+        ]
+      ],
+      "instance_spans": [
+        [
+          0,
+          1
+        ]
+      ],
+      "instances": 1,
+      "mode": "natural",
+      "sample": 1,
+      "tensor_prefix": "record.natural_1"
+    },
+    {
+      "fields": [
+        {
+          "cardinality": "required_one",
+          "is_anchor": false,
+          "name": "person",
+          "query_id": 0,
+          "tensor_prefix": "record.latent_1.field.0"
+        },
+        {
+          "cardinality": "zero_or_more",
+          "is_anchor": false,
+          "name": "organization",
+          "query_id": 1,
+          "tensor_prefix": "record.latent_1.field.1"
+        },
+        {
+          "cardinality": "optional_one",
+          "is_anchor": false,
+          "name": "location",
+          "query_id": 2,
+          "tensor_prefix": "record.latent_1.field.2"
+        }
+      ],
+      "id": "latent_1",
+      "instance_seed": [
+        [
+          0,
+          0
+        ],
+        [
+          1,
+          0
+        ],
+        [
+          1,
+          1
+        ]
+      ],
+      "instance_spans": [
+        [
+          0,
+          1
+        ],
+        [
+          1,
+          3
+        ],
+        [
+          0,
+          5
+        ]
+      ],
+      "instances": 3,
+      "mode": "latent",
+      "sample": 1,
+      "tensor_prefix": "record.latent_1"
+    },
+    {
+      "fields": [
+        {
+          "cardinality": "required_one",
+          "is_anchor": false,
+          "name": "person",
+          "query_id": 0,
+          "tensor_prefix": "record.anchorless_1.field.0"
+        },
+        {
+          "cardinality": "zero_or_more",
+          "is_anchor": false,
+          "name": "organization",
+          "query_id": 1,
+          "tensor_prefix": "record.anchorless_1.field.1"
+        },
+        {
+          "cardinality": "optional_one",
+          "is_anchor": false,
+          "name": "location",
+          "query_id": 2,
+          "tensor_prefix": "record.anchorless_1.field.2"
+        }
+      ],
+      "id": "anchorless_1",
+      "instance_seed": [
+        null,
+        null,
+        null,
+        null
+      ],
+      "instance_spans": [
+        null,
+        null,
+        null,
+        null
+      ],
+      "instances": 4,
+      "mode": "anchorless",
+      "sample": 1,
+      "tensor_prefix": "record.anchorless_1"
+    }
+  ],
+  "relation_biaffine_content": true,
+  "relation_query_dim": 64,
+  "scope": "task_head_reference",
+  "seed": 2509,
+  "tensors": {
+    "file": "tensors.safetensors",
+    "sha256": "a52c207eb3d3012abf3fc1e189eb38cb400fccb5e91ceb16c32713a13c36f2b7",
+    "size_bytes": 38389,
+    "tensors": {
+      "classification.expected.logits": {
+        "dtype": "float32",
+        "numel": 8,
+        "shape": [
+          2,
+          4
+        ]
+      },
+      "classification.input.mask": {
+        "dtype": "bool",
+        "numel": 8,
+        "shape": [
+          2,
+          4
+        ]
+      },
+      "classification.input.states": {
+        "dtype": "float32",
+        "numel": 256,
+        "shape": [
+          2,
+          4,
+          32
+        ]
+      },
+      "classification.intermediate.0": {
+        "dtype": "float32",
+        "numel": 512,
+        "shape": [
+          2,
+          4,
+          64
+        ]
+      },
+      "classification.intermediate.1": {
+        "dtype": "float32",
+        "numel": 512,
+        "shape": [
+          2,
+          4,
+          64
+        ]
+      },
+      "classification.intermediate.2": {
+        "dtype": "float32",
+        "numel": 8,
+        "shape": [
+          2,
+          4,
+          1
+        ]
+      },
+      "record.anchorless_0.expected.instance_states": {
+        "dtype": "float32",
+        "numel": 128,
+        "shape": [
+          4,
+          32
+        ]
+      },
+      "record.anchorless_0.expected.object_logits": {
+        "dtype": "float32",
+        "numel": 4,
+        "shape": [
+          4
+        ]
+      },
+      "record.anchorless_0.field.0.expected.assignment": {
+        "dtype": "float32",
+        "numel": 16,
+        "shape": [
+          4,
+          4
+        ]
+      },
+      "record.anchorless_0.field.0.input.candidate_states": {
+        "dtype": "float32",
+        "numel": 96,
+        "shape": [
+          3,
+          32
+        ]
+      },
+      "record.anchorless_0.field.0.input.logits": {
+        "dtype": "float32",
+        "numel": 3,
+        "shape": [
+          3
+        ]
+      },
+      "record.anchorless_0.field.0.input.query_state": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          32
+        ]
+      },
+      "record.anchorless_0.field.0.input.spans": {
+        "dtype": "int64",
+        "numel": 6,
+        "shape": [
+          3,
+          2
+        ]
+      },
+      "record.anchorless_0.field.1.expected.assignment": {
+        "dtype": "float32",
+        "numel": 12,
+        "shape": [
+          4,
+          3
+        ]
+      },
+      "record.anchorless_0.field.1.input.candidate_states": {
+        "dtype": "float32",
+        "numel": 64,
+        "shape": [
+          2,
+          32
+        ]
+      },
+      "record.anchorless_0.field.1.input.logits": {
+        "dtype": "float32",
+        "numel": 2,
+        "shape": [
+          2
+        ]
+      },
+      "record.anchorless_0.field.1.input.query_state": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          32
+        ]
+      },
+      "record.anchorless_0.field.1.input.spans": {
+        "dtype": "int64",
+        "numel": 4,
+        "shape": [
+          2,
+          2
+        ]
+      },
+      "record.anchorless_0.field.2.expected.assignment": {
+        "dtype": "float32",
+        "numel": 4,
+        "shape": [
+          4,
+          1
+        ]
+      },
+      "record.anchorless_0.field.2.input.candidate_states": {
+        "dtype": "float32",
+        "numel": 0,
+        "shape": [
+          0,
+          32
+        ]
+      },
+      "record.anchorless_0.field.2.input.logits": {
+        "dtype": "float32",
+        "numel": 0,
+        "shape": [
+          0
+        ]
+      },
+      "record.anchorless_0.field.2.input.query_state": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          32
+        ]
+      },
+      "record.anchorless_0.field.2.input.spans": {
+        "dtype": "int64",
+        "numel": 0,
+        "shape": [
+          0,
+          2
+        ]
+      },
+      "record.anchorless_1.expected.instance_states": {
+        "dtype": "float32",
+        "numel": 128,
+        "shape": [
+          4,
+          32
+        ]
+      },
+      "record.anchorless_1.expected.object_logits": {
+        "dtype": "float32",
+        "numel": 4,
+        "shape": [
+          4
+        ]
+      },
+      "record.anchorless_1.field.0.expected.assignment": {
+        "dtype": "float32",
+        "numel": 8,
+        "shape": [
+          4,
+          2
+        ]
+      },
+      "record.anchorless_1.field.0.input.candidate_states": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          1,
+          32
+        ]
+      },
+      "record.anchorless_1.field.0.input.logits": {
+        "dtype": "float32",
+        "numel": 1,
+        "shape": [
+          1
+        ]
+      },
+      "record.anchorless_1.field.0.input.query_state": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          32
+        ]
+      },
+      "record.anchorless_1.field.0.input.spans": {
+        "dtype": "int64",
+        "numel": 2,
+        "shape": [
+          1,
+          2
+        ]
+      },
+      "record.anchorless_1.field.1.expected.assignment": {
+        "dtype": "float32",
+        "numel": 12,
+        "shape": [
+          4,
+          3
+        ]
+      },
+      "record.anchorless_1.field.1.input.candidate_states": {
+        "dtype": "float32",
+        "numel": 64,
+        "shape": [
+          2,
+          32
+        ]
+      },
+      "record.anchorless_1.field.1.input.logits": {
+        "dtype": "float32",
+        "numel": 2,
+        "shape": [
+          2
+        ]
+      },
+      "record.anchorless_1.field.1.input.query_state": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          32
+        ]
+      },
+      "record.anchorless_1.field.1.input.spans": {
+        "dtype": "int64",
+        "numel": 4,
+        "shape": [
+          2,
+          2
+        ]
+      },
+      "record.anchorless_1.field.2.expected.assignment": {
+        "dtype": "float32",
+        "numel": 4,
+        "shape": [
+          4,
+          1
+        ]
+      },
+      "record.anchorless_1.field.2.input.candidate_states": {
+        "dtype": "float32",
+        "numel": 0,
+        "shape": [
+          0,
+          32
+        ]
+      },
+      "record.anchorless_1.field.2.input.logits": {
+        "dtype": "float32",
+        "numel": 0,
+        "shape": [
+          0
+        ]
+      },
+      "record.anchorless_1.field.2.input.query_state": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          32
+        ]
+      },
+      "record.anchorless_1.field.2.input.spans": {
+        "dtype": "int64",
+        "numel": 0,
+        "shape": [
+          0,
+          2
+        ]
+      },
+      "record.input.candidate_states": {
+        "dtype": "float32",
+        "numel": 768,
+        "shape": [
+          2,
+          3,
+          4,
+          32
+        ]
+      },
+      "record.input.indices": {
+        "dtype": "int64",
+        "numel": 48,
+        "shape": [
+          2,
+          3,
+          4,
+          2
+        ]
+      },
+      "record.input.pair_logits": {
+        "dtype": "float32",
+        "numel": 24,
+        "shape": [
+          2,
+          3,
+          4
+        ]
+      },
+      "record.input.query_states": {
+        "dtype": "float32",
+        "numel": 192,
+        "shape": [
+          2,
+          3,
+          32
+        ]
+      },
+      "record.input.valid_mask": {
+        "dtype": "bool",
+        "numel": 24,
+        "shape": [
+          2,
+          3,
+          4
+        ]
+      },
+      "record.latent_0.expected.instance_states": {
+        "dtype": "float32",
+        "numel": 160,
+        "shape": [
+          5,
+          32
+        ]
+      },
+      "record.latent_0.expected.object_logits": {
+        "dtype": "float32",
+        "numel": 5,
+        "shape": [
+          5
+        ]
+      },
+      "record.latent_0.field.0.expected.assignment": {
+        "dtype": "float32",
+        "numel": 20,
+        "shape": [
+          5,
+          4
+        ]
+      },
+      "record.latent_0.field.0.input.candidate_states": {
+        "dtype": "float32",
+        "numel": 96,
+        "shape": [
+          3,
+          32
+        ]
+      },
+      "record.latent_0.field.0.input.logits": {
+        "dtype": "float32",
+        "numel": 3,
+        "shape": [
+          3
+        ]
+      },
+      "record.latent_0.field.0.input.query_state": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          32
+        ]
+      },
+      "record.latent_0.field.0.input.spans": {
+        "dtype": "int64",
+        "numel": 6,
+        "shape": [
+          3,
+          2
+        ]
+      },
+      "record.latent_0.field.1.expected.assignment": {
+        "dtype": "float32",
+        "numel": 15,
+        "shape": [
+          5,
+          3
+        ]
+      },
+      "record.latent_0.field.1.input.candidate_states": {
+        "dtype": "float32",
+        "numel": 64,
+        "shape": [
+          2,
+          32
+        ]
+      },
+      "record.latent_0.field.1.input.logits": {
+        "dtype": "float32",
+        "numel": 2,
+        "shape": [
+          2
+        ]
+      },
+      "record.latent_0.field.1.input.query_state": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          32
+        ]
+      },
+      "record.latent_0.field.1.input.spans": {
+        "dtype": "int64",
+        "numel": 4,
+        "shape": [
+          2,
+          2
+        ]
+      },
+      "record.latent_0.field.2.expected.assignment": {
+        "dtype": "float32",
+        "numel": 5,
+        "shape": [
+          5,
+          1
+        ]
+      },
+      "record.latent_0.field.2.input.candidate_states": {
+        "dtype": "float32",
+        "numel": 0,
+        "shape": [
+          0,
+          32
+        ]
+      },
+      "record.latent_0.field.2.input.logits": {
+        "dtype": "float32",
+        "numel": 0,
+        "shape": [
+          0
+        ]
+      },
+      "record.latent_0.field.2.input.query_state": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          32
+        ]
+      },
+      "record.latent_0.field.2.input.spans": {
+        "dtype": "int64",
+        "numel": 0,
+        "shape": [
+          0,
+          2
+        ]
+      },
+      "record.latent_1.expected.instance_states": {
+        "dtype": "float32",
+        "numel": 96,
+        "shape": [
+          3,
+          32
+        ]
+      },
+      "record.latent_1.expected.object_logits": {
+        "dtype": "float32",
+        "numel": 3,
+        "shape": [
+          3
+        ]
+      },
+      "record.latent_1.field.0.expected.assignment": {
+        "dtype": "float32",
+        "numel": 6,
+        "shape": [
+          3,
+          2
+        ]
+      },
+      "record.latent_1.field.0.input.candidate_states": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          1,
+          32
+        ]
+      },
+      "record.latent_1.field.0.input.logits": {
+        "dtype": "float32",
+        "numel": 1,
+        "shape": [
+          1
+        ]
+      },
+      "record.latent_1.field.0.input.query_state": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          32
+        ]
+      },
+      "record.latent_1.field.0.input.spans": {
+        "dtype": "int64",
+        "numel": 2,
+        "shape": [
+          1,
+          2
+        ]
+      },
+      "record.latent_1.field.1.expected.assignment": {
+        "dtype": "float32",
+        "numel": 9,
+        "shape": [
+          3,
+          3
+        ]
+      },
+      "record.latent_1.field.1.input.candidate_states": {
+        "dtype": "float32",
+        "numel": 64,
+        "shape": [
+          2,
+          32
+        ]
+      },
+      "record.latent_1.field.1.input.logits": {
+        "dtype": "float32",
+        "numel": 2,
+        "shape": [
+          2
+        ]
+      },
+      "record.latent_1.field.1.input.query_state": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          32
+        ]
+      },
+      "record.latent_1.field.1.input.spans": {
+        "dtype": "int64",
+        "numel": 4,
+        "shape": [
+          2,
+          2
+        ]
+      },
+      "record.latent_1.field.2.expected.assignment": {
+        "dtype": "float32",
+        "numel": 3,
+        "shape": [
+          3,
+          1
+        ]
+      },
+      "record.latent_1.field.2.input.candidate_states": {
+        "dtype": "float32",
+        "numel": 0,
+        "shape": [
+          0,
+          32
+        ]
+      },
+      "record.latent_1.field.2.input.logits": {
+        "dtype": "float32",
+        "numel": 0,
+        "shape": [
+          0
+        ]
+      },
+      "record.latent_1.field.2.input.query_state": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          32
+        ]
+      },
+      "record.latent_1.field.2.input.spans": {
+        "dtype": "int64",
+        "numel": 0,
+        "shape": [
+          0,
+          2
+        ]
+      },
+      "record.natural_0.expected.instance_states": {
+        "dtype": "float32",
+        "numel": 96,
+        "shape": [
+          3,
+          32
+        ]
+      },
+      "record.natural_0.expected.object_logits": {
+        "dtype": "float32",
+        "numel": 3,
+        "shape": [
+          3
+        ]
+      },
+      "record.natural_0.field.0.expected.assignment": {
+        "dtype": "float32",
+        "numel": 12,
+        "shape": [
+          3,
+          4
+        ]
+      },
+      "record.natural_0.field.0.input.candidate_states": {
+        "dtype": "float32",
+        "numel": 96,
+        "shape": [
+          3,
+          32
+        ]
+      },
+      "record.natural_0.field.0.input.logits": {
+        "dtype": "float32",
+        "numel": 3,
+        "shape": [
+          3
+        ]
+      },
+      "record.natural_0.field.0.input.query_state": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          32
+        ]
+      },
+      "record.natural_0.field.0.input.spans": {
+        "dtype": "int64",
+        "numel": 6,
+        "shape": [
+          3,
+          2
+        ]
+      },
+      "record.natural_0.field.1.expected.assignment": {
+        "dtype": "float32",
+        "numel": 9,
+        "shape": [
+          3,
+          3
+        ]
+      },
+      "record.natural_0.field.1.input.candidate_states": {
+        "dtype": "float32",
+        "numel": 64,
+        "shape": [
+          2,
+          32
+        ]
+      },
+      "record.natural_0.field.1.input.logits": {
+        "dtype": "float32",
+        "numel": 2,
+        "shape": [
+          2
+        ]
+      },
+      "record.natural_0.field.1.input.query_state": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          32
+        ]
+      },
+      "record.natural_0.field.1.input.spans": {
+        "dtype": "int64",
+        "numel": 4,
+        "shape": [
+          2,
+          2
+        ]
+      },
+      "record.natural_0.field.2.expected.assignment": {
+        "dtype": "float32",
+        "numel": 3,
+        "shape": [
+          3,
+          1
+        ]
+      },
+      "record.natural_0.field.2.input.candidate_states": {
+        "dtype": "float32",
+        "numel": 0,
+        "shape": [
+          0,
+          32
+        ]
+      },
+      "record.natural_0.field.2.input.logits": {
+        "dtype": "float32",
+        "numel": 0,
+        "shape": [
+          0
+        ]
+      },
+      "record.natural_0.field.2.input.query_state": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          32
+        ]
+      },
+      "record.natural_0.field.2.input.spans": {
+        "dtype": "int64",
+        "numel": 0,
+        "shape": [
+          0,
+          2
+        ]
+      },
+      "record.natural_1.expected.instance_states": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          1,
+          32
+        ]
+      },
+      "record.natural_1.expected.object_logits": {
+        "dtype": "float32",
+        "numel": 1,
+        "shape": [
+          1
+        ]
+      },
+      "record.natural_1.field.0.expected.assignment": {
+        "dtype": "float32",
+        "numel": 2,
+        "shape": [
+          1,
+          2
+        ]
+      },
+      "record.natural_1.field.0.input.candidate_states": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          1,
+          32
+        ]
+      },
+      "record.natural_1.field.0.input.logits": {
+        "dtype": "float32",
+        "numel": 1,
+        "shape": [
+          1
+        ]
+      },
+      "record.natural_1.field.0.input.query_state": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          32
+        ]
+      },
+      "record.natural_1.field.0.input.spans": {
+        "dtype": "int64",
+        "numel": 2,
+        "shape": [
+          1,
+          2
+        ]
+      },
+      "record.natural_1.field.1.expected.assignment": {
+        "dtype": "float32",
+        "numel": 3,
+        "shape": [
+          1,
+          3
+        ]
+      },
+      "record.natural_1.field.1.input.candidate_states": {
+        "dtype": "float32",
+        "numel": 64,
+        "shape": [
+          2,
+          32
+        ]
+      },
+      "record.natural_1.field.1.input.logits": {
+        "dtype": "float32",
+        "numel": 2,
+        "shape": [
+          2
+        ]
+      },
+      "record.natural_1.field.1.input.query_state": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          32
+        ]
+      },
+      "record.natural_1.field.1.input.spans": {
+        "dtype": "int64",
+        "numel": 4,
+        "shape": [
+          2,
+          2
+        ]
+      },
+      "record.natural_1.field.2.expected.assignment": {
+        "dtype": "float32",
+        "numel": 1,
+        "shape": [
+          1,
+          1
+        ]
+      },
+      "record.natural_1.field.2.input.candidate_states": {
+        "dtype": "float32",
+        "numel": 0,
+        "shape": [
+          0,
+          32
+        ]
+      },
+      "record.natural_1.field.2.input.logits": {
+        "dtype": "float32",
+        "numel": 0,
+        "shape": [
+          0
+        ]
+      },
+      "record.natural_1.field.2.input.query_state": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          32
+        ]
+      },
+      "record.natural_1.field.2.input.spans": {
+        "dtype": "int64",
+        "numel": 0,
+        "shape": [
+          0,
+          2
+        ]
+      },
+      "relation.expected.logits": {
+        "dtype": "float32",
+        "numel": 5,
+        "shape": [
+          5
+        ]
+      },
+      "relation.input.batch_index": {
+        "dtype": "int64",
+        "numel": 5,
+        "shape": [
+          5
+        ]
+      },
+      "relation.input.head_end": {
+        "dtype": "int64",
+        "numel": 5,
+        "shape": [
+          5
+        ]
+      },
+      "relation.input.head_prob": {
+        "dtype": "float32",
+        "numel": 5,
+        "shape": [
+          5
+        ]
+      },
+      "relation.input.head_start": {
+        "dtype": "int64",
+        "numel": 5,
+        "shape": [
+          5
+        ]
+      },
+      "relation.input.pair_mask": {
+        "dtype": "bool",
+        "numel": 5,
+        "shape": [
+          5
+        ]
+      },
+      "relation.input.query_states": {
+        "dtype": "float32",
+        "numel": 256,
+        "shape": [
+          2,
+          2,
+          64
+        ]
+      },
+      "relation.input.relation_index": {
+        "dtype": "int64",
+        "numel": 5,
+        "shape": [
+          5
+        ]
+      },
+      "relation.input.tail_end": {
+        "dtype": "int64",
+        "numel": 5,
+        "shape": [
+          5
+        ]
+      },
+      "relation.input.tail_prob": {
+        "dtype": "float32",
+        "numel": 5,
+        "shape": [
+          5
+        ]
+      },
+      "relation.input.tail_start": {
+        "dtype": "int64",
+        "numel": 5,
+        "shape": [
+          5
+        ]
+      },
+      "relation.input.token_states": {
+        "dtype": "float32",
+        "numel": 320,
+        "shape": [
+          2,
+          5,
+          32
+        ]
+      },
+      "relation.intermediate.content_linear": {
+        "dtype": "float32",
+        "numel": 5,
+        "shape": [
+          5,
+          1
+        ]
+      },
+      "relation.intermediate.head_content_projection": {
+        "dtype": "float32",
+        "numel": 160,
+        "shape": [
+          5,
+          32
+        ]
+      },
+      "relation.intermediate.mlp": {
+        "dtype": "float32",
+        "numel": 5,
+        "shape": [
+          5,
+          1
+        ]
+      },
+      "relation.intermediate.mlp.0": {
+        "dtype": "float32",
+        "numel": 160,
+        "shape": [
+          5,
+          32
+        ]
+      },
+      "relation.intermediate.mlp.1": {
+        "dtype": "float32",
+        "numel": 160,
+        "shape": [
+          5,
+          32
+        ]
+      },
+      "relation.intermediate.mlp.2": {
+        "dtype": "float32",
+        "numel": 160,
+        "shape": [
+          5,
+          32
+        ]
+      },
+      "relation.intermediate.mlp.3": {
+        "dtype": "float32",
+        "numel": 5,
+        "shape": [
+          5,
+          1
+        ]
+      },
+      "relation.intermediate.relation_content_gate": {
+        "dtype": "float32",
+        "numel": 160,
+        "shape": [
+          5,
+          32
+        ]
+      },
+      "relation.intermediate.tail_content_projection": {
+        "dtype": "float32",
+        "numel": 160,
+        "shape": [
+          5,
+          32
+        ]
+      }
+    }
+  },
+  "training_qualified": false,
+  "weights": {
+    "file": "weights.safetensors",
+    "sha256": "67014250ba59b7a9b1dbeb44b2d4bc40cd4047bea7ce4b4603f484e1b1620dc2",
+    "size_bytes": 69876,
+    "tensors": {
+      "classifier.0.bias": {
+        "dtype": "float32",
+        "numel": 64,
+        "shape": [
+          64
+        ]
+      },
+      "classifier.0.weight": {
+        "dtype": "float32",
+        "numel": 2048,
+        "shape": [
+          64,
+          32
+        ]
+      },
+      "classifier.2.bias": {
+        "dtype": "float32",
+        "numel": 1,
+        "shape": [
+          1
+        ]
+      },
+      "classifier.2.weight": {
+        "dtype": "float32",
+        "numel": 64,
+        "shape": [
+          1,
+          64
+        ]
+      },
+      "record_decoder.cand_proj.bias": {
+        "dtype": "float32",
+        "numel": 16,
+        "shape": [
+          16
+        ]
+      },
+      "record_decoder.cand_proj.weight": {
+        "dtype": "float32",
+        "numel": 512,
+        "shape": [
+          16,
+          32
+        ]
+      },
+      "record_decoder.field_proj.bias": {
+        "dtype": "float32",
+        "numel": 16,
+        "shape": [
+          16
+        ]
+      },
+      "record_decoder.field_proj.weight": {
+        "dtype": "float32",
+        "numel": 512,
+        "shape": [
+          16,
+          32
+        ]
+      },
+      "record_decoder.inst_proj.bias": {
+        "dtype": "float32",
+        "numel": 16,
+        "shape": [
+          16
+        ]
+      },
+      "record_decoder.inst_proj.weight": {
+        "dtype": "float32",
+        "numel": 512,
+        "shape": [
+          16,
+          32
+        ]
+      },
+      "record_decoder.instance_embed": {
+        "dtype": "float32",
+        "numel": 128,
+        "shape": [
+          4,
+          32
+        ]
+      },
+      "record_decoder.k_proj.bias": {
+        "dtype": "float32",
+        "numel": 16,
+        "shape": [
+          16
+        ]
+      },
+      "record_decoder.k_proj.weight": {
+        "dtype": "float32",
+        "numel": 512,
+        "shape": [
+          16,
+          32
+        ]
+      },
+      "record_decoder.latent_seed_head.bias": {
+        "dtype": "float32",
+        "numel": 1,
+        "shape": [
+          1
+        ]
+      },
+      "record_decoder.latent_seed_head.weight": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          1,
+          32
+        ]
+      },
+      "record_decoder.null_embed": {
+        "dtype": "float32",
+        "numel": 16,
+        "shape": [
+          16
+        ]
+      },
+      "record_decoder.object_head.bias": {
+        "dtype": "float32",
+        "numel": 1,
+        "shape": [
+          1
+        ]
+      },
+      "record_decoder.object_head.weight": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          1,
+          32
+        ]
+      },
+      "record_decoder.q_proj.bias": {
+        "dtype": "float32",
+        "numel": 16,
+        "shape": [
+          16
+        ]
+      },
+      "record_decoder.q_proj.weight": {
+        "dtype": "float32",
+        "numel": 512,
+        "shape": [
+          16,
+          32
+        ]
+      },
+      "record_decoder.v_proj.bias": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          32
+        ]
+      },
+      "record_decoder.v_proj.weight": {
+        "dtype": "float32",
+        "numel": 1024,
+        "shape": [
+          32,
+          32
+        ]
+      },
+      "relation_scorer.content_linear.bias": {
+        "dtype": "float32",
+        "numel": 1,
+        "shape": [
+          1
+        ]
+      },
+      "relation_scorer.content_linear.weight": {
+        "dtype": "float32",
+        "numel": 128,
+        "shape": [
+          1,
+          128
+        ]
+      },
+      "relation_scorer.head_content_projection.bias": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          32
+        ]
+      },
+      "relation_scorer.head_content_projection.weight": {
+        "dtype": "float32",
+        "numel": 1024,
+        "shape": [
+          32,
+          32
+        ]
+      },
+      "relation_scorer.mlp.0.bias": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          32
+        ]
+      },
+      "relation_scorer.mlp.0.weight": {
+        "dtype": "float32",
+        "numel": 6208,
+        "shape": [
+          32,
+          194
+        ]
+      },
+      "relation_scorer.mlp.3.bias": {
+        "dtype": "float32",
+        "numel": 1,
+        "shape": [
+          1
+        ]
+      },
+      "relation_scorer.mlp.3.weight": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          1,
+          32
+        ]
+      },
+      "relation_scorer.relation_content_gate.bias": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          32
+        ]
+      },
+      "relation_scorer.relation_content_gate.weight": {
+        "dtype": "float32",
+        "numel": 2048,
+        "shape": [
+          32,
+          64
+        ]
+      },
+      "relation_scorer.tail_content_projection.bias": {
+        "dtype": "float32",
+        "numel": 32,
+        "shape": [
+          32
+        ]
+      },
+      "relation_scorer.tail_content_projection.weight": {
+        "dtype": "float32",
+        "numel": 1024,
+        "shape": [
+          32,
+          32
+        ]
+      }
+    }
+  }
+}

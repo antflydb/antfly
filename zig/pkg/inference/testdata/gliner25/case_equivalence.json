@@ -1,0 +1,363 @@
+{
+  "cases": [
+    {
+      "choices": [
+        "ipek"
+      ],
+      "matches": [
+        {
+          "choice": 0,
+          "end": 5,
+          "start": 0
+        },
+        {
+          "choice": 0,
+          "end": 11,
+          "start": 6
+        },
+        {
+          "choice": 0,
+          "end": 16,
+          "start": 12
+        },
+        {
+          "choice": 0,
+          "end": 21,
+          "start": 17
+        }
+      ],
+      "text": "İpek ıpek IPEK ipek"
+    },
+    {
+      "choices": [
+        "sale"
+      ],
+      "matches": [
+        {
+          "choice": 0,
+          "end": 5,
+          "start": 0
+        },
+        {
+          "choice": 0,
+          "end": 10,
+          "start": 6
+        },
+        {
+          "choice": 0,
+          "end": 15,
+          "start": 11
+        },
+        {
+          "choice": 0,
+          "end": 24,
+          "start": 20
+        }
+      ],
+      "text": "ſale sale SALE pre-sale sales"
+    },
+    {
+      "choices": [
+        "σ"
+      ],
+      "matches": [
+        {
+          "choice": 0,
+          "end": 2,
+          "start": 0
+        },
+        {
+          "choice": 0,
+          "end": 5,
+          "start": 3
+        },
+        {
+          "choice": 0,
+          "end": 8,
+          "start": 6
+        }
+      ],
+      "text": "Σ σ ς Σς"
+    },
+    {
+      "choices": [
+        "strasse",
+        "straße"
+      ],
+      "matches": [
+        {
+          "choice": 1,
+          "end": 7,
+          "start": 0
+        },
+        {
+          "choice": 0,
+          "end": 15,
+          "start": 8
+        },
+        {
+          "choice": 1,
+          "end": 23,
+          "start": 16
+        }
+      ],
+      "text": "Straße STRASSE straße"
+    },
+    {
+      "choices": [
+        "k"
+      ],
+      "matches": [
+        {
+          "choice": 0,
+          "end": 3,
+          "start": 0
+        },
+        {
+          "choice": 0,
+          "end": 5,
+          "start": 4
+        },
+        {
+          "choice": 0,
+          "end": 7,
+          "start": 6
+        }
+      ],
+      "text": "K K k Kelvin"
+    },
+    {
+      "choices": [
+        "positive",
+        "negative"
+      ],
+      "matches": [
+        {
+          "choice": 0,
+          "end": 9,
+          "start": 1
+        },
+        {
+          "choice": 0,
+          "end": 37,
+          "start": 29
+        }
+      ],
+      "text": "(positive) negative_positive positive!"
+    },
+    {
+      "choices": [
+        "東京"
+      ],
+      "matches": [
+        {
+          "choice": 0,
+          "end": 6,
+          "start": 0
+        }
+      ],
+      "text": "東京 東京駅 東京都"
+    },
+    {
+      "choices": [
+        "a.b"
+      ],
+      "matches": [
+        {
+          "choice": 0,
+          "end": 3,
+          "start": 0
+        },
+        {
+          "choice": 0,
+          "end": 11,
+          "start": 8
+        }
+      ],
+      "text": "a.b aXb a.b.c"
+    },
+    {
+      "choices": [
+        "é",
+        "é"
+      ],
+      "matches": [
+        {
+          "choice": 1,
+          "end": 3,
+          "start": 0
+        },
+        {
+          "choice": 0,
+          "end": 6,
+          "start": 4
+        },
+        {
+          "choice": 0,
+          "end": 9,
+          "start": 7
+        }
+      ],
+      "text": "é é É"
+    },
+    {
+      "choices": [
+        "positive",
+        "neutral",
+        "negative"
+      ],
+      "matches": [
+        {
+          "choice": 0,
+          "end": 12,
+          "start": 4
+        },
+        {
+          "choice": 1,
+          "end": 24,
+          "start": 17
+        },
+        {
+          "choice": 2,
+          "end": 33,
+          "start": 25
+        }
+      ],
+      "text": "🙂positive🙂 neutral\nnegative"
+    },
+    {
+      "choices": [
+        "books",
+        "toys"
+      ],
+      "matches": [
+        {
+          "choice": 0,
+          "end": 5,
+          "start": 0
+        },
+        {
+          "choice": 0,
+          "end": 11,
+          "start": 6
+        },
+        {
+          "choice": 1,
+          "end": 16,
+          "start": 12
+        },
+        {
+          "choice": 1,
+          "end": 21,
+          "start": 17
+        }
+      ],
+      "text": "books books\ttoys TOYS"
+    },
+    {
+      "choices": [
+        "𐐨"
+      ],
+      "matches": [
+        {
+          "choice": 0,
+          "end": 4,
+          "start": 0
+        },
+        {
+          "choice": 0,
+          "end": 9,
+          "start": 5
+        }
+      ],
+      "text": "𐐀 𐐨"
+    }
+  ],
+  "format_version": 1,
+  "pairs": 1459,
+  "provenance": {
+    "checkout": "/private/tmp/antfly-gliner25-upstream",
+    "commit": "3c913c7369301133d3b7699252074c4303ada50e",
+    "device": "cpu",
+    "dtype": "float32",
+    "imports": {
+      "gliner2": "/private/tmp/antfly-gliner25-upstream/gliner2/__init__.py",
+      "gliner2.api_client": "/private/tmp/antfly-gliner25-upstream/gliner2/api_client.py",
+      "gliner2.auto": "/private/tmp/antfly-gliner25-upstream/gliner2/auto.py",
+      "gliner2.configuration": "/private/tmp/antfly-gliner25-upstream/gliner2/configuration.py",
+      "gliner2.inference": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/__init__.py",
+      "gliner2.inference.candidate_decoder": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/candidate_decoder.py",
+      "gliner2.inference.chunking": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/chunking.py",
+      "gliner2.inference.engine": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/engine.py",
+      "gliner2.inference.overlap": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/overlap.py",
+      "gliner2.inference.runtime": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/runtime.py",
+      "gliner2.inference.schema": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/schema.py",
+      "gliner2.inference.schema_model": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/schema_model.py",
+      "gliner2.layers": "/private/tmp/antfly-gliner25-upstream/gliner2/layers.py",
+      "gliner2.models": "/private/tmp/antfly-gliner25-upstream/gliner2/models/__init__.py",
+      "gliner2.models.base": "/private/tmp/antfly-gliner25-upstream/gliner2/models/base.py",
+      "gliner2.models.boundary": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/__init__.py",
+      "gliner2.models.boundary.constants": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/constants.py",
+      "gliner2.models.boundary.content": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/content.py",
+      "gliner2.models.boundary.encoding": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/encoding.py",
+      "gliner2.models.boundary.engine": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/engine.py",
+      "gliner2.models.boundary.heads": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/heads.py",
+      "gliner2.models.boundary.indexing": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/indexing.py",
+      "gliner2.models.boundary.losses": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/losses.py",
+      "gliner2.models.boundary.model": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/model.py",
+      "gliner2.models.boundary.pool": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/pool.py",
+      "gliner2.models.boundary.proposal": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/proposal.py",
+      "gliner2.models.boundary.records": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/records.py",
+      "gliner2.models.boundary.relations": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/relations.py",
+      "gliner2.models.boundary.rotary": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/rotary.py",
+      "gliner2.models.boundary.scoring": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/scoring.py",
+      "gliner2.models.boundary.targets_device": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/targets_device.py",
+      "gliner2.models.boundary.validation": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/validation.py",
+      "gliner2.models.candidates": "/private/tmp/antfly-gliner25-upstream/gliner2/models/candidates.py",
+      "gliner2.models.loading": "/private/tmp/antfly-gliner25-upstream/gliner2/models/loading.py",
+      "gliner2.models.outputs": "/private/tmp/antfly-gliner25-upstream/gliner2/models/outputs.py",
+      "gliner2.models.span": "/private/tmp/antfly-gliner25-upstream/gliner2/models/span/__init__.py",
+      "gliner2.models.span.model": "/private/tmp/antfly-gliner25-upstream/gliner2/models/span/model.py",
+      "gliner2.processing": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/__init__.py",
+      "gliner2.processing.layouts": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/layouts.py",
+      "gliner2.processing.records": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/records.py",
+      "gliner2.processing.targets": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/targets.py",
+      "gliner2.processing.word_splitter": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/word_splitter.py",
+      "gliner2.processor": "/private/tmp/antfly-gliner25-upstream/gliner2/processor.py",
+      "gliner2.training": "/private/tmp/antfly-gliner25-upstream/gliner2/training/__init__.py",
+      "gliner2.training.data": "/private/tmp/antfly-gliner25-upstream/gliner2/training/data.py",
+      "gliner2.training.matching": "/private/tmp/antfly-gliner25-upstream/gliner2/training/matching.py",
+      "gliner2.training.sampler": "/private/tmp/antfly-gliner25-upstream/gliner2/training/sampler.py",
+      "gliner2.training.trainer": "/private/tmp/antfly-gliner25-upstream/gliner2/training/trainer.py",
+      "gliner2.utils": "namespace:/private/tmp/antfly-gliner25-upstream/gliner2/utils",
+      "gliner2.utils.device_errors": "/private/tmp/antfly-gliner25-upstream/gliner2/utils/device_errors.py",
+      "gliner2.utils.sync_probe": "/private/tmp/antfly-gliner25-upstream/gliner2/utils/sync_probe.py"
+    },
+    "platform": {
+      "machine": "arm64",
+      "system": "Darwin"
+    },
+    "runtime": {
+      "packages": {
+        "PyYAML": "6.0.3",
+        "accelerate": "1.10.1",
+        "huggingface-hub": "0.36.0",
+        "numpy": "2.3.5",
+        "packaging": "25.0",
+        "peft": "0.17.1",
+        "psutil": "7.1.3",
+        "pydantic": "2.12.3",
+        "requests": "2.32.5",
+        "safetensors": "0.7.0",
+        "scipy": "1.16.3",
+        "tokenizers": "0.21.4",
+        "torch": "2.9.1",
+        "transformers": "4.55.4",
+        "urllib3": "2.5.0"
+      },
+      "python": "3.12.3",
+      "unicode": "15.0.0"
+    },
+    "threads": 1
+  }
+}

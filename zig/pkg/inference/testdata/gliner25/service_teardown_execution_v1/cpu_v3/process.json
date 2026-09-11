@@ -1,0 +1,228 @@
+{
+  "command": [
+    "/opt/homebrew/Cellar/zig/0.16.0/bin/zig",
+    "build",
+    "inference-test",
+    "-Dmetal=false",
+    "-Dcuda=false",
+    "-j1",
+    "--",
+    "--test-filter",
+    "model manager teardown",
+    "--test-filter",
+    "offline load runtime supplies",
+    "--test-filter",
+    "managed constructors retain cooperative",
+    "--test-filter",
+    "raw tokenizer budget capability pins",
+    "--test-filter",
+    "session vtable layout"
+  ],
+  "cwd": "/Users/timkaye/Documents/af/antfly/zig",
+  "environment": {
+    "ZIG_GLOBAL_CACHE_DIR": "/private/tmp/antfly-gliner25-zig-cache"
+  },
+  "process": {
+    "changed_sources": [],
+    "cleanup": {
+      "complete": true,
+      "direct_child_reaped": true,
+      "elapsed_seconds": 5.85830130148679e-05,
+      "errors": [],
+      "grandchild_proof": "observed creation identities no longer exist; direct CLI parent is their normal waiter",
+      "inspection_errors": [],
+      "known_children_gone": true,
+      "survivors": []
+    },
+    "cleanup_signals": [],
+    "elapsed_seconds": 33.70188708300702,
+    "failure": null,
+    "failure_phase": null,
+    "inspection_error_count": 0,
+    "inspection_errors": [],
+    "kill_wait_seconds": 5,
+    "max_child_tree_rss_bytes": 6442450944,
+    "max_stderr_bytes": 8388608,
+    "max_stdout_bytes": 8388608,
+    "max_tracked_processes": 64,
+    "observed_test_executables": [
+      {
+        "argv": [
+          "./.zig-cache/o/833d19cd0b83c2ac4976602e93e3278e/test",
+          "--cache-dir=./.zig-cache",
+          "--seed=0xa023884",
+          "--listen=-"
+        ],
+        "create_time": 1789066277.797954,
+        "cwd": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference",
+        "executable": {
+          "path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/.zig-cache/o/833d19cd0b83c2ac4976602e93e3278e/test",
+          "sha256": "ae2c8edb8172fd439d1f68c0ec07d4436cdd8487331efcaa82868ace3316d693",
+          "size_bytes": 4970984
+        },
+        "pid": 13694
+      },
+      {
+        "argv": [
+          "./.zig-cache/o/a8b8f9c855bec3194b029c363035e85e/test",
+          "--test-filter",
+          "model manager teardown",
+          "--test-filter",
+          "offline load runtime supplies",
+          "--test-filter",
+          "managed constructors retain cooperative",
+          "--test-filter",
+          "raw tokenizer budget capability pins",
+          "--test-filter",
+          "session vtable layout"
+        ],
+        "create_time": 1789066309.833051,
+        "cwd": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference",
+        "executable": {
+          "path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/.zig-cache/o/a8b8f9c855bec3194b029c363035e85e/test",
+          "sha256": "05d650b47cd67804ac7d16e3308b0e0bda8ad501730142408115acf98afc7590",
+          "size_bytes": 36647768
+        },
+        "pid": 13723
+      }
+    ],
+    "optional_executable_identity_errors": [
+      "(pid=13623)",
+      "(pid=13693)",
+      "(pid=13693)",
+      "(pid=13693)"
+    ],
+    "parent_grace_seconds": 5,
+    "parent_pid": 13549,
+    "peak_child_tree_rss_bytes": 3273998336,
+    "psutil_version": "7.1.3",
+    "returncode": 0,
+    "rss_measurement": "sampled sum of RSS for still-matching known child creation identities; shared pages can be counted twice",
+    "rss_poll_seconds": 0.05,
+    "rss_samples": 494,
+    "source_inventory_unchanged": true,
+    "stderr": {
+      "sha256": "bff947807e4aaa818024c31f69af76ff5d078bedc47a356c0ee802ce4103ef1e",
+      "size_bytes": 1218
+    },
+    "stdout": {
+      "sha256": "3459fccabd4b57aaca0e53c7a3da704caee13562a6d2854a5b3bf4a459753ae8",
+      "size_bytes": 203
+    },
+    "timeout_seconds": 1800,
+    "tracked_processes": [
+      {
+        "create_time": 1789066277.032741,
+        "pid": 13549,
+        "relation": "direct_child"
+      },
+      {
+        "create_time": 1789066277.072287,
+        "pid": 13552,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789066277.38725,
+        "pid": 13595,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789066277.427009,
+        "pid": 13598,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789066277.555879,
+        "pid": 13623,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789066277.615571,
+        "pid": 13642,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789066277.71406,
+        "pid": 13666,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789066277.714292,
+        "pid": 13667,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789066277.714953,
+        "pid": 13668,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789066277.715104,
+        "pid": 13669,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789066277.716579,
+        "pid": 13672,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789066277.729819,
+        "pid": 13677,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789066277.747584,
+        "pid": 13687,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789066277.745367,
+        "pid": 13684,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789066277.745915,
+        "pid": 13686,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789066277.785036,
+        "pid": 13692,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789066277.78592,
+        "pid": 13693,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789066277.797954,
+        "pid": 13694,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789066309.833051,
+        "pid": 13723,
+        "relation": "observed_descendant"
+      }
+    ],
+    "worker_parent_loss_grace_seconds": 2
+  },
+  "qualification": false,
+  "scope": "local_regional_training_and_service_checks/v1",
+  "source_count": 2583,
+  "source_inventory": {
+    "sha256": "b010d467c1fe9772fd142d421bd2b0be1821e3a7eeda63c4882e4f5b5eb5400f",
+    "size_bytes": 436906
+  },
+  "source_selection": "rg --files zig; suffixes .zig .zon .metal .m .mm .c .h; this is not a complete dependency closure",
+  "supervisor": {
+    "sha256": "a937237975be2ed879f62afd285494ccb51a7c1d7cc1dff7160621fb26b87332",
+    "size_bytes": 12474
+  },
+  "wrapper": {
+    "sha256": "45a745b995f86432c89fa57bf8dd5b92dbc810f706a7989accc66c8bbddde3b1",
+    "size_bytes": 6752
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "format": "antfly.gliner25-published-inactive-cli-process/v1",
+  "command": [
+    "/private/tmp/antfly-gliner25-runtime-inactive-metal-v1/bin/antfly-inference",
+    "finetune",
+    "train",
+    "gliner25",
+    "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-resumed.json",
+    "--shutdown-grace-seconds",
+    "30"
+  ],
+  "binary": {
+    "size_bytes": 32697376,
+    "sha256": "9f0d349efa3f33dd29b6c3dd26a12a8bcf2babf2bc78400c2b84d87d58d786f9"
+  },
+  "config": {
+    "size_bytes": 3357,
+    "sha256": "f9ea658565476d94e3f036887fb87031dc54073a81c51a3fdf23d5138ba9b50b"
+  },
+  "preparation_sha256": "e49ca907daf093303dd3919b56ab61f36983eb9d9174e3d3ccd7993ac21e83b9",
+  "driver": {
+    "size_bytes": 34287,
+    "sha256": "e0b67790bf99aee80f43d9ff7e752cc7b49dd6715ca629fdbf1767b1d658fabf"
+  },
+  "supervision": {
+    "size_bytes": 12474,
+    "sha256": "a937237975be2ed879f62afd285494ccb51a7c1d7cc1dff7160621fb26b87332"
+  },
+  "outer_timeout_seconds": 1890,
+  "max_child_tree_rss_bytes": 2147483648,
+  "max_stdout_bytes": 4194304,
+  "max_stderr_bytes": 4194304,
+  "failure": null,
+  "returncode": null
+}

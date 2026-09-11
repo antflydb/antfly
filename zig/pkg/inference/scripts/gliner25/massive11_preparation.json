@@ -1,0 +1,579 @@
+{
+  "adapter_sha256": "4543ec9710ce2c973f6e4a21f8169cc966b21896b20882b831796ca31fa8d606",
+  "audit_generator_sha256": "126edeaa6b149250d4ebde826268d084e6bfbf282d4c7c822b12e066ac9bb1c8",
+  "download_generator_sha256": "6ba11002e15bce455c26607f65dd2c22a9fea9c80c579c0f26cd693afaad5575",
+  "excluded_original_ids": 2126,
+  "harness_sha256": "8d6b137c55f64d7c13752c306246266a56d98796d349e9c301069bdafadb6927",
+  "no_model_execution": true,
+  "preparation_sha256": "036eeae95f9e7f239a36df63fc1480d61a5e9e8a8374b521204784c0caed30a8",
+  "pretraining_contamination_status": "unknown",
+  "profiles": [
+    {
+      "gold_sha256": "3903c44fc63fbaf7231d5314da9267c4737df2a1622e593f77f78f552a6f95f4",
+      "lock_sha256": "5c01d8b2dd09b0d316bbdf21e7fd913e48d2a3f66904201b093e7723a30c4336",
+      "prepared_sha256": "592b8a3b08db09db3f7b0e76274e314b0402927b4b7459eda105b7aa59f63785",
+      "profile": {
+        "id": "entities_en-US",
+        "locale": "en-US",
+        "task": "entities",
+        "word_splitter": "whitespace"
+      },
+      "requests_sha256": "637482230f4cd042d72d8f3babe55c70a5a7b40a3dfb775454b00aac7561f77c",
+      "statistics": {
+        "calibration": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 30,
+          "maximum_utf8_bytes": 153,
+          "processor_words_over_128": 0,
+          "records": 1745,
+          "slots": 1829,
+          "source_records": 2033
+        },
+        "test": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 62,
+          "maximum_utf8_bytes": 365,
+          "processor_words_over_128": 0,
+          "records": 2974,
+          "slots": 2815,
+          "source_records": 2974
+        },
+        "train": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 36,
+          "maximum_utf8_bytes": 189,
+          "processor_words_over_128": 0,
+          "records": 9676,
+          "slots": 10246,
+          "source_records": 11514
+        }
+      },
+      "transport": {
+        "records": 2974,
+        "request_ids_sha256": "bd574a6b594cb4adfac8be8e11f8c188b565c7c7b4f36231be2cad17d3bb458c",
+        "request_sha256s_sha256": "3caaae9188aa1c6ee9213ce029c09add4de8d5b546c26e9ffa44bb18eb1a6a28",
+        "rows_per_shard": [
+          1024,
+          1024,
+          926
+        ],
+        "shards": 3
+      },
+      "transport_sha256": "c4c45f3f193828a945002aefa4f4762ad7eb69352e58d7ffe6b3ff80d495d8d9"
+    },
+    {
+      "gold_sha256": "184582aaf626e81200e0a827703e73c8ad872b4aecc94d215489b7952fa5466b",
+      "lock_sha256": "a388aee59910d9894e6b76c212bd15b12cc22569919aeb91a2c9c06b4e9982d2",
+      "prepared_sha256": "0e6243a9961773363c959d3efe7a1119be30dbe594be7c1c28d645cbdfd6b91b",
+      "profile": {
+        "id": "entities_de-DE",
+        "locale": "de-DE",
+        "task": "entities",
+        "word_splitter": "whitespace"
+      },
+      "requests_sha256": "9a0673065844f3b6d9f2eeddd120f9f39becb6bd6e00ac9ec4456e1fe089c0db",
+      "statistics": {
+        "calibration": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 28,
+          "maximum_utf8_bytes": 157,
+          "processor_words_over_128": 0,
+          "records": 1745,
+          "slots": 1835,
+          "source_records": 2033
+        },
+        "test": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 58,
+          "maximum_utf8_bytes": 402,
+          "processor_words_over_128": 0,
+          "records": 2974,
+          "slots": 2824,
+          "source_records": 2974
+        },
+        "train": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 36,
+          "maximum_utf8_bytes": 200,
+          "processor_words_over_128": 0,
+          "records": 9676,
+          "slots": 10277,
+          "source_records": 11514
+        }
+      },
+      "transport": {
+        "records": 2974,
+        "request_ids_sha256": "5be8a1d56f0617eb51c1e8ed995f32136632c8d49262e0f46a9dd4cd76601f2e",
+        "request_sha256s_sha256": "8b957525ecc4e6c241e8260caf4b42a455e71fda57120a7dda3a7a207cf26ce9",
+        "rows_per_shard": [
+          1024,
+          1024,
+          926
+        ],
+        "shards": 3
+      },
+      "transport_sha256": "838a1683f3cef07e7a14787891d96b8f01163454aad102d84ee2d59fe9682ced"
+    },
+    {
+      "gold_sha256": "15188669badc921b4fff5e6f93ee533b1b38b9057e2d839a59d03b412d4f8b1d",
+      "lock_sha256": "e6a1e7fd6e4f54495910b15a51a577779d0feb82b1caa0b3822614e2e45b01a1",
+      "prepared_sha256": "ef7a49199f877e797f8670dbac24fe483102aa6dc260dfed54d0751caed46596",
+      "profile": {
+        "id": "entities_ar-SA",
+        "locale": "ar-SA",
+        "task": "entities",
+        "word_splitter": "whitespace"
+      },
+      "requests_sha256": "e8582288fe62ed72c62bca3ba5b904e0fbe5f1a6dac2f5ece8057aa89a0869c6",
+      "statistics": {
+        "calibration": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 30,
+          "maximum_utf8_bytes": 229,
+          "processor_words_over_128": 0,
+          "records": 1745,
+          "slots": 1817,
+          "source_records": 2033
+        },
+        "test": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 43,
+          "maximum_utf8_bytes": 453,
+          "processor_words_over_128": 0,
+          "records": 2974,
+          "slots": 2794,
+          "source_records": 2974
+        },
+        "train": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 29,
+          "maximum_utf8_bytes": 282,
+          "processor_words_over_128": 0,
+          "records": 9676,
+          "slots": 10150,
+          "source_records": 11514
+        }
+      },
+      "transport": {
+        "records": 2974,
+        "request_ids_sha256": "e904fec4c100886c9d6e210041db5dac70c6e44c46b1893be8fd6371df6a6e29",
+        "request_sha256s_sha256": "6becb34f2bddbeca8fb554ed61df9798cbd2346ad9402646fdbde811fc200e0d",
+        "rows_per_shard": [
+          1024,
+          1024,
+          926
+        ],
+        "shards": 3
+      },
+      "transport_sha256": "4ae92011582979aec2673021fbe9b8b50ce006453bf8c4c8dcd951b5b14e563d"
+    },
+    {
+      "gold_sha256": "0430b30e76d07383779242c82a0ad57403d17bd9e41ff3280e6904a67195e56a",
+      "lock_sha256": "75973a31a5ac32e97cbe46f1fdd7c898dc341bea493cfe6eead874b69eeb6112",
+      "prepared_sha256": "f734136960d164511056fa77626285f9420ef06cbfb27b5fcc11680f3063f1b6",
+      "profile": {
+        "id": "entities_hi-IN",
+        "locale": "hi-IN",
+        "task": "entities",
+        "word_splitter": "whitespace"
+      },
+      "requests_sha256": "57b432f2fd3e5985b73eb2c0ad6549e5ab410c93f03dc0693e6559d1e20b9070",
+      "statistics": {
+        "calibration": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 111,
+          "maximum_utf8_bytes": 431,
+          "processor_words_over_128": 0,
+          "records": 1745,
+          "slots": 1826,
+          "source_records": 2033
+        },
+        "test": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 265,
+          "maximum_utf8_bytes": 1065,
+          "processor_words_over_128": 1,
+          "records": 2974,
+          "slots": 2820,
+          "source_records": 2974
+        },
+        "train": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 119,
+          "maximum_utf8_bytes": 466,
+          "processor_words_over_128": 0,
+          "records": 9676,
+          "slots": 10230,
+          "source_records": 11514
+        }
+      },
+      "transport": {
+        "records": 2974,
+        "request_ids_sha256": "77c8a3cd6adbe11644dd88e113468430a2180325435d61783f26016f0d172cf5",
+        "request_sha256s_sha256": "dc06c225a4a5e948b2a8c18b10f1f93411c1f6b0dcaea462040db8e0ad7a1c3a",
+        "rows_per_shard": [
+          1024,
+          1024,
+          926
+        ],
+        "shards": 3
+      },
+      "transport_sha256": "772020ab345e2045afcc5741adba2cb40b1bdb153770487a8f504fc3c715bf35"
+    },
+    {
+      "gold_sha256": "8d10a66b94bc1038eb8c403f9e5e505713d777653a24a2d69508357669af5fe9",
+      "lock_sha256": "e72d7067c6a6de6bf10b143b960722001731348e32cbbe321801ae5e1bfc9302",
+      "prepared_sha256": "3bc128d5c5a7cb45005b6ebaa38a74695f3efea19aa9de961d87c74402b10c44",
+      "profile": {
+        "id": "entities_zh-CN",
+        "locale": "zh-CN",
+        "task": "entities",
+        "word_splitter": "whitespace"
+      },
+      "requests_sha256": "d9186ac9bafcc8868612ae9549c1500cef5eb830118e6c70f42c6722bd46c295",
+      "statistics": {
+        "calibration": {
+          "gold_slot_occurrences_not_representable_by_splitter": 1796,
+          "maximum_processor_words_including_terminal": 9,
+          "maximum_utf8_bytes": 129,
+          "processor_words_over_128": 0,
+          "records": 1745,
+          "slots": 1821,
+          "source_records": 2033
+        },
+        "test": {
+          "gold_slot_occurrences_not_representable_by_splitter": 2759,
+          "maximum_processor_words_including_terminal": 12,
+          "maximum_utf8_bytes": 261,
+          "processor_words_over_128": 0,
+          "records": 2974,
+          "slots": 2802,
+          "source_records": 2974
+        },
+        "train": {
+          "gold_slot_occurrences_not_representable_by_splitter": 10053,
+          "maximum_processor_words_including_terminal": 18,
+          "maximum_utf8_bytes": 156,
+          "processor_words_over_128": 0,
+          "records": 9676,
+          "slots": 10203,
+          "source_records": 11514
+        }
+      },
+      "transport": {
+        "records": 2974,
+        "request_ids_sha256": "aaa62a9491e47d258d6e56f76a79782c976dd054e42add1d2c4f0235a4288a4e",
+        "request_sha256s_sha256": "33a006fbe95a96bc90e4d7e249bd558007d3ef12bf79cd0ab9eafec10e51247d",
+        "rows_per_shard": [
+          1024,
+          1024,
+          926
+        ],
+        "shards": 3
+      },
+      "transport_sha256": "7993872502570da12f134d486c9ca77e16524344a26db321c7bd0dfbc919a25d"
+    },
+    {
+      "gold_sha256": "7536e757d1b5342d13e0c07b505ea8b656b175c3d626e032eea2808f5e23ac9d",
+      "lock_sha256": "45f7ce097e3cda2c6f614357f118b6177cc0793079ed77c3ef0f6cf766146184",
+      "prepared_sha256": "d8b725b40540dfc159b5756c868211fa3798a44661938b1508d24d51299569a8",
+      "profile": {
+        "id": "entities_ja-JP",
+        "locale": "ja-JP",
+        "task": "entities",
+        "word_splitter": "whitespace"
+      },
+      "requests_sha256": "65c7c8f6694d153a75710c929798aa03b325f97da3d457b9787fe900d7dcea35",
+      "statistics": {
+        "calibration": {
+          "gold_slot_occurrences_not_representable_by_splitter": 1708,
+          "maximum_processor_words_including_terminal": 12,
+          "maximum_utf8_bytes": 189,
+          "processor_words_over_128": 0,
+          "records": 1745,
+          "slots": 1813,
+          "source_records": 2033
+        },
+        "test": {
+          "gold_slot_occurrences_not_representable_by_splitter": 2649,
+          "maximum_processor_words_including_terminal": 13,
+          "maximum_utf8_bytes": 396,
+          "processor_words_over_128": 0,
+          "records": 2974,
+          "slots": 2794,
+          "source_records": 2974
+        },
+        "train": {
+          "gold_slot_occurrences_not_representable_by_splitter": 9603,
+          "maximum_processor_words_including_terminal": 19,
+          "maximum_utf8_bytes": 190,
+          "processor_words_over_128": 0,
+          "records": 9676,
+          "slots": 10176,
+          "source_records": 11514
+        }
+      },
+      "transport": {
+        "records": 2974,
+        "request_ids_sha256": "0eb7a164c297745f88635da8f390284a548d8965448726f821327f72db3b90f5",
+        "request_sha256s_sha256": "f6896b6dd808a2684413f6e82747503dddc0ae8f37aa0896276c76cb046b70ad",
+        "rows_per_shard": [
+          1024,
+          1024,
+          926
+        ],
+        "shards": 3
+      },
+      "transport_sha256": "9a222b092f14a0863c54c1256f8dcddccb3939a2ae4b70f614407a40dc2a3c6a"
+    },
+    {
+      "gold_sha256": "4bc1b3304579d317d03935005dae0845c5d0605862a1fa24f1d9095abb41f50a",
+      "lock_sha256": "981a396add71129f67b9f7585f7b52c04f4a77e0e3461e410de447c325294c65",
+      "prepared_sha256": "8793c7df979c1d157360a180ec148afd54e254fc8efc238399c9b7251d738a5f",
+      "profile": {
+        "id": "entities_zh-CN_char",
+        "locale": "zh-CN",
+        "task": "entities",
+        "word_splitter": "char"
+      },
+      "requests_sha256": "a0d126fa31a191c7342955baefcab8e440e49f92d6f4d68ecb8670188cb7a879",
+      "statistics": {
+        "calibration": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 44,
+          "maximum_utf8_bytes": 129,
+          "processor_words_over_128": 0,
+          "records": 1745,
+          "slots": 1821,
+          "source_records": 2033
+        },
+        "test": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 88,
+          "maximum_utf8_bytes": 261,
+          "processor_words_over_128": 0,
+          "records": 2974,
+          "slots": 2802,
+          "source_records": 2974
+        },
+        "train": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 53,
+          "maximum_utf8_bytes": 156,
+          "processor_words_over_128": 0,
+          "records": 9676,
+          "slots": 10203,
+          "source_records": 11514
+        }
+      },
+      "transport": {
+        "records": 2974,
+        "request_ids_sha256": "81558b645052cbf3ffa4d5acec47dd9a7f0a7aaaf0dffaa8c519b4b65922f115",
+        "request_sha256s_sha256": "3c07b221101c59fa1b7853e47bfddc878e2160d055a890d4f527b075f2e7c49b",
+        "rows_per_shard": [
+          1024,
+          1024,
+          926
+        ],
+        "shards": 3
+      },
+      "transport_sha256": "5be40a7e39f56d9b96025456120c8302058122768c7045d185d8e81d827d0091"
+    },
+    {
+      "gold_sha256": "4f183073c5afc63211682e5c59bc59c79ea0b80b5115c57e8007879e02bc3e55",
+      "lock_sha256": "8ad2f9aac89c5c56191ac0f8bd1c05618f4c8a5891a6850baf6c909901ac2205",
+      "prepared_sha256": "e7870af05c57a5d692f468cbb67995162649b317faca2528d7fbbaba97c9033d",
+      "profile": {
+        "id": "entities_ja-JP_char",
+        "locale": "ja-JP",
+        "task": "entities",
+        "word_splitter": "char"
+      },
+      "requests_sha256": "6832761a1e76de89274d014447e480e2cd21a4f58f2c40a98faecbf20d6254e0",
+      "statistics": {
+        "calibration": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 64,
+          "maximum_utf8_bytes": 189,
+          "processor_words_over_128": 0,
+          "records": 1745,
+          "slots": 1813,
+          "source_records": 2033
+        },
+        "test": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 133,
+          "maximum_utf8_bytes": 396,
+          "processor_words_over_128": 1,
+          "records": 2974,
+          "slots": 2794,
+          "source_records": 2974
+        },
+        "train": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 63,
+          "maximum_utf8_bytes": 190,
+          "processor_words_over_128": 0,
+          "records": 9676,
+          "slots": 10176,
+          "source_records": 11514
+        }
+      },
+      "transport": {
+        "records": 2974,
+        "request_ids_sha256": "d2cc35ddc90a55cf83eb6f5185dec7a4d62cb14fae0d246b393d9ddd14136823",
+        "request_sha256s_sha256": "88cf5307f22137edd66987f44386d9655cc95f3be5fd024466c52fe11c2e01c7",
+        "rows_per_shard": [
+          1024,
+          1024,
+          926
+        ],
+        "shards": 3
+      },
+      "transport_sha256": "265088a6df141b84622ec2ccf1622310c322cdfa1e1ec05909d59cef0c86aadc"
+    },
+    {
+      "gold_sha256": "9db0d5be93998d107b02c9d175c5c963d748e370854e49fed23bd1aef594dbdd",
+      "lock_sha256": "87c10ad37fd375b958034c9a52d271ad1e6add59c374471406a5965b8d8baca5",
+      "prepared_sha256": "35ea3b5b207c3bbcd98ce0d81d4f5d47bba68e93f12d8c34156438b50557334c",
+      "profile": {
+        "id": "intent_en-US",
+        "locale": "en-US",
+        "task": "intent",
+        "word_splitter": "whitespace"
+      },
+      "requests_sha256": "61425a6b5a1c8c52d1e4fd016e104fdcf0051fc31248b18ad5246f18ea295d34",
+      "statistics": {
+        "calibration": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 30,
+          "maximum_utf8_bytes": 153,
+          "processor_words_over_128": 0,
+          "records": 1745,
+          "slots": 1829,
+          "source_records": 2033
+        },
+        "test": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 62,
+          "maximum_utf8_bytes": 365,
+          "processor_words_over_128": 0,
+          "records": 2974,
+          "slots": 2815,
+          "source_records": 2974
+        },
+        "train": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 36,
+          "maximum_utf8_bytes": 189,
+          "processor_words_over_128": 0,
+          "records": 9676,
+          "slots": 10246,
+          "source_records": 11514
+        }
+      },
+      "transport": {
+        "records": 2974,
+        "request_ids_sha256": "2891989558174c12263091978ed08cb8c08ba519a35475aae7ae2485363ad257",
+        "request_sha256s_sha256": "56613e221da0ed1a26f636edbdf05b552d638435aabcacd8741576c9616f2f48",
+        "rows_per_shard": [
+          1024,
+          1024,
+          926
+        ],
+        "shards": 3
+      },
+      "transport_sha256": "b6282e86e96ec6259d27a5351c71ab4559b5ccae0b6d0f08e778e7114b2e96bc"
+    },
+    {
+      "gold_sha256": "f04dff132cdc3567331b905163198e6f3dce687690864cb62a9e39858c0f0b58",
+      "lock_sha256": "1ea64686ab886a9f1afebcc2cd8ea00b2d936d9baff4301ac3903d3873448b63",
+      "prepared_sha256": "ab8bcb66fa43ab727e591431121fd65fa7f8b923e55488083b9986622a9a8581",
+      "profile": {
+        "id": "intent_scenario_en-US",
+        "locale": "en-US",
+        "task": "intent_scenario",
+        "word_splitter": "whitespace"
+      },
+      "requests_sha256": "e462de914cd9bacd5ea84994036c4e34d6c197065f9d4a844eb1796cbd606187",
+      "statistics": {
+        "calibration": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 30,
+          "maximum_utf8_bytes": 153,
+          "processor_words_over_128": 0,
+          "records": 1745,
+          "slots": 1829,
+          "source_records": 2033
+        },
+        "test": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 62,
+          "maximum_utf8_bytes": 365,
+          "processor_words_over_128": 0,
+          "records": 2974,
+          "slots": 2815,
+          "source_records": 2974
+        },
+        "train": {
+          "gold_slot_occurrences_not_representable_by_splitter": 0,
+          "maximum_processor_words_including_terminal": 36,
+          "maximum_utf8_bytes": 189,
+          "processor_words_over_128": 0,
+          "records": 9676,
+          "slots": 10246,
+          "source_records": 11514
+        }
+      },
+      "transport": {
+        "records": 2974,
+        "request_ids_sha256": "f84936d68b2ab23060513d824acaca5bd612cd2514917b5c469dfb84fbc6de70",
+        "request_sha256s_sha256": "8309e0be0ae56a75c01658aa9267aa386dc94fe5ff1f0c6fc45fa113464fc128",
+        "rows_per_shard": [
+          1024,
+          1024,
+          926
+        ],
+        "shards": 3
+      },
+      "transport_sha256": "70675cbf5c9f3a449ca34478bf327d898a42e25f9b1df709fda1b17386cac22c"
+    }
+  ],
+  "qualification": false,
+  "reproducibility": {
+    "files": 291,
+    "independent_directories_equal": true,
+    "logical_bytes_per_tree": 1158067382,
+    "tree_inventory_sha256": "f090eb7a13393eba2f97b798105436016929c0877e90b37aa22070bc578394d7"
+  },
+  "scope": "gliner25_massive11_preparation_evidence/v1",
+  "source_alignment_counts": {
+    "ar-SA": {
+      "cjk_ascii_space_projection": 0,
+      "exact": 16521
+    },
+    "de-DE": {
+      "cjk_ascii_space_projection": 0,
+      "exact": 16521
+    },
+    "en-US": {
+      "cjk_ascii_space_projection": 0,
+      "exact": 16521
+    },
+    "hi-IN": {
+      "cjk_ascii_space_projection": 0,
+      "exact": 16521
+    },
+    "ja-JP": {
+      "cjk_ascii_space_projection": 10482,
+      "exact": 6039
+    },
+    "zh-CN": {
+      "cjk_ascii_space_projection": 10908,
+      "exact": 5613
+    }
+  },
+  "source_manifest_sha256": "4c9ae4372868fd70634be859970ffac384041a2bcd6dd09c188f363a5397896e",
+  "split_audit_sha256": "2b6c5d28fa0d80edb5f5b1b74d0db473c5a1a33b0643f39d694c18e2c7393a97",
+  "worker_support": "pending_explicit_profile_and_transport_integration"
+}

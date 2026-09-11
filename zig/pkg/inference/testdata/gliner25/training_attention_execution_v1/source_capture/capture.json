@@ -1,0 +1,764 @@
+{
+  "cases": [
+    {
+      "batch": 2,
+      "control_elements": 33,
+      "cotangent": "all_rows",
+      "gradient_leaf_order": [
+        "q",
+        "k",
+        "v",
+        "qr",
+        "kr"
+      ],
+      "head_dim": 4,
+      "heads": 2,
+      "hidden_size": 8,
+      "id": "ragged7_p0",
+      "lengths": [
+        7,
+        4
+      ],
+      "logical_layer": 0,
+      "micro_batch": 4294967298,
+      "original_vs_leaf_replay_exact": true,
+      "probability": 0.0,
+      "probability_stream_id": 3,
+      "relative_rows": 512,
+      "relative_stream_id": 2,
+      "replica": 9223372036854775811,
+      "seed": 18364758544493064720,
+      "sequence": 7,
+      "tensors": {
+        "context": "ragged7_p0.context",
+        "control": "ragged7_p0.control",
+        "cotangent": "ragged7_p0.cotangent",
+        "gradient": "ragged7_p0.gradient",
+        "gradient_k": "ragged7_p0.gradient_k",
+        "gradient_kr": "ragged7_p0.gradient_kr",
+        "gradient_q": "ragged7_p0.gradient_q",
+        "gradient_qr": "ragged7_p0.gradient_qr",
+        "gradient_v": "ragged7_p0.gradient_v",
+        "probabilities_after_dropout": "ragged7_p0.probabilities_after_dropout",
+        "probabilities_before_dropout": "ragged7_p0.probabilities_before_dropout",
+        "probability_mask": "ragged7_p0.probability_mask",
+        "qkv": "ragged7_p0.qkv",
+        "relative": "ragged7_p0.relative",
+        "relative_dropout": "ragged7_p0.relative_dropout",
+        "relative_mask": "ragged7_p0.relative_mask",
+        "relative_normalized": "ragged7_p0.relative_normalized"
+      },
+      "uniform_fully_masked_queries": true
+    },
+    {
+      "batch": 2,
+      "control_elements": 33,
+      "cotangent": "all_rows",
+      "gradient_leaf_order": [
+        "q",
+        "k",
+        "v",
+        "qr",
+        "kr"
+      ],
+      "head_dim": 4,
+      "heads": 2,
+      "hidden_size": 8,
+      "id": "ragged7_p01",
+      "lengths": [
+        7,
+        4
+      ],
+      "logical_layer": 2,
+      "micro_batch": 4294967298,
+      "original_vs_leaf_replay_exact": true,
+      "probability": 0.10000000149011612,
+      "probability_stream_id": 8589934595,
+      "relative_rows": 512,
+      "relative_stream_id": 8589934594,
+      "replica": 9223372036854775811,
+      "seed": 18364758544493064720,
+      "sequence": 7,
+      "tensors": {
+        "context": "ragged7_p01.context",
+        "control": "ragged7_p01.control",
+        "cotangent": "ragged7_p01.cotangent",
+        "gradient": "ragged7_p01.gradient",
+        "gradient_k": "ragged7_p01.gradient_k",
+        "gradient_kr": "ragged7_p01.gradient_kr",
+        "gradient_q": "ragged7_p01.gradient_q",
+        "gradient_qr": "ragged7_p01.gradient_qr",
+        "gradient_v": "ragged7_p01.gradient_v",
+        "probabilities_after_dropout": "ragged7_p01.probabilities_after_dropout",
+        "probabilities_before_dropout": "ragged7_p01.probabilities_before_dropout",
+        "probability_mask": "ragged7_p01.probability_mask",
+        "qkv": "ragged7_p01.qkv",
+        "relative": "ragged7_p01.relative",
+        "relative_dropout": "ragged7_p01.relative_dropout",
+        "relative_mask": "ragged7_p01.relative_mask",
+        "relative_normalized": "ragged7_p01.relative_normalized"
+      },
+      "uniform_fully_masked_queries": true
+    },
+    {
+      "batch": 2,
+      "control_elements": 33,
+      "cotangent": "all_rows",
+      "gradient_leaf_order": [
+        "q",
+        "k",
+        "v",
+        "qr",
+        "kr"
+      ],
+      "head_dim": 4,
+      "heads": 2,
+      "hidden_size": 8,
+      "id": "ragged7_p0125",
+      "lengths": [
+        7,
+        4
+      ],
+      "logical_layer": 7,
+      "micro_batch": 4294967298,
+      "original_vs_leaf_replay_exact": true,
+      "probability": 0.125,
+      "probability_stream_id": 30064771075,
+      "relative_rows": 512,
+      "relative_stream_id": 30064771074,
+      "replica": 9223372036854775811,
+      "seed": 18364758544493064720,
+      "sequence": 7,
+      "tensors": {
+        "context": "ragged7_p0125.context",
+        "control": "ragged7_p0125.control",
+        "cotangent": "ragged7_p0125.cotangent",
+        "gradient": "ragged7_p0125.gradient",
+        "gradient_k": "ragged7_p0125.gradient_k",
+        "gradient_kr": "ragged7_p0125.gradient_kr",
+        "gradient_q": "ragged7_p0125.gradient_q",
+        "gradient_qr": "ragged7_p0125.gradient_qr",
+        "gradient_v": "ragged7_p0125.gradient_v",
+        "probabilities_after_dropout": "ragged7_p0125.probabilities_after_dropout",
+        "probabilities_before_dropout": "ragged7_p0125.probabilities_before_dropout",
+        "probability_mask": "ragged7_p0125.probability_mask",
+        "qkv": "ragged7_p0125.qkv",
+        "relative": "ragged7_p0125.relative",
+        "relative_dropout": "ragged7_p0125.relative_dropout",
+        "relative_mask": "ragged7_p0125.relative_mask",
+        "relative_normalized": "ragged7_p0125.relative_normalized"
+      },
+      "uniform_fully_masked_queries": true
+    },
+    {
+      "batch": 2,
+      "control_elements": 33,
+      "cotangent": "fully_masked_sample_only",
+      "gradient_leaf_order": [
+        "q",
+        "k",
+        "v",
+        "qr",
+        "kr"
+      ],
+      "head_dim": 4,
+      "heads": 2,
+      "hidden_size": 8,
+      "id": "fully_masked7_p0",
+      "lengths": [
+        7,
+        0
+      ],
+      "logical_layer": 0,
+      "micro_batch": 4294967298,
+      "original_vs_leaf_replay_exact": true,
+      "probability": 0.0,
+      "probability_stream_id": 3,
+      "relative_rows": 512,
+      "relative_stream_id": 2,
+      "replica": 9223372036854775811,
+      "seed": 18364758544493064720,
+      "sequence": 7,
+      "tensors": {
+        "context": "fully_masked7_p0.context",
+        "control": "fully_masked7_p0.control",
+        "cotangent": "fully_masked7_p0.cotangent",
+        "gradient": "fully_masked7_p0.gradient",
+        "gradient_k": "fully_masked7_p0.gradient_k",
+        "gradient_kr": "fully_masked7_p0.gradient_kr",
+        "gradient_q": "fully_masked7_p0.gradient_q",
+        "gradient_qr": "fully_masked7_p0.gradient_qr",
+        "gradient_v": "fully_masked7_p0.gradient_v",
+        "probabilities_after_dropout": "fully_masked7_p0.probabilities_after_dropout",
+        "probabilities_before_dropout": "fully_masked7_p0.probabilities_before_dropout",
+        "probability_mask": "fully_masked7_p0.probability_mask",
+        "qkv": "fully_masked7_p0.qkv",
+        "relative": "fully_masked7_p0.relative",
+        "relative_dropout": "fully_masked7_p0.relative_dropout",
+        "relative_mask": "fully_masked7_p0.relative_mask",
+        "relative_normalized": "fully_masked7_p0.relative_normalized"
+      },
+      "uniform_fully_masked_queries": true
+    },
+    {
+      "batch": 2,
+      "control_elements": 33,
+      "cotangent": "fully_masked_sample_only",
+      "gradient_leaf_order": [
+        "q",
+        "k",
+        "v",
+        "qr",
+        "kr"
+      ],
+      "head_dim": 4,
+      "heads": 2,
+      "hidden_size": 8,
+      "id": "fully_masked7_p01",
+      "lengths": [
+        7,
+        0
+      ],
+      "logical_layer": 2,
+      "micro_batch": 4294967298,
+      "original_vs_leaf_replay_exact": true,
+      "probability": 0.10000000149011612,
+      "probability_stream_id": 8589934595,
+      "relative_rows": 512,
+      "relative_stream_id": 8589934594,
+      "replica": 9223372036854775811,
+      "seed": 18364758544493064720,
+      "sequence": 7,
+      "tensors": {
+        "context": "fully_masked7_p01.context",
+        "control": "fully_masked7_p01.control",
+        "cotangent": "fully_masked7_p01.cotangent",
+        "gradient": "fully_masked7_p01.gradient",
+        "gradient_k": "fully_masked7_p01.gradient_k",
+        "gradient_kr": "fully_masked7_p01.gradient_kr",
+        "gradient_q": "fully_masked7_p01.gradient_q",
+        "gradient_qr": "fully_masked7_p01.gradient_qr",
+        "gradient_v": "fully_masked7_p01.gradient_v",
+        "probabilities_after_dropout": "fully_masked7_p01.probabilities_after_dropout",
+        "probabilities_before_dropout": "fully_masked7_p01.probabilities_before_dropout",
+        "probability_mask": "fully_masked7_p01.probability_mask",
+        "qkv": "fully_masked7_p01.qkv",
+        "relative": "fully_masked7_p01.relative",
+        "relative_dropout": "fully_masked7_p01.relative_dropout",
+        "relative_mask": "fully_masked7_p01.relative_mask",
+        "relative_normalized": "fully_masked7_p01.relative_normalized"
+      },
+      "uniform_fully_masked_queries": true
+    },
+    {
+      "batch": 2,
+      "control_elements": 33,
+      "cotangent": "fully_masked_sample_only",
+      "gradient_leaf_order": [
+        "q",
+        "k",
+        "v",
+        "qr",
+        "kr"
+      ],
+      "head_dim": 4,
+      "heads": 2,
+      "hidden_size": 8,
+      "id": "fully_masked7_p0125",
+      "lengths": [
+        7,
+        0
+      ],
+      "logical_layer": 7,
+      "micro_batch": 4294967298,
+      "original_vs_leaf_replay_exact": true,
+      "probability": 0.125,
+      "probability_stream_id": 30064771075,
+      "relative_rows": 512,
+      "relative_stream_id": 30064771074,
+      "replica": 9223372036854775811,
+      "seed": 18364758544493064720,
+      "sequence": 7,
+      "tensors": {
+        "context": "fully_masked7_p0125.context",
+        "control": "fully_masked7_p0125.control",
+        "cotangent": "fully_masked7_p0125.cotangent",
+        "gradient": "fully_masked7_p0125.gradient",
+        "gradient_k": "fully_masked7_p0125.gradient_k",
+        "gradient_kr": "fully_masked7_p0125.gradient_kr",
+        "gradient_q": "fully_masked7_p0125.gradient_q",
+        "gradient_qr": "fully_masked7_p0125.gradient_qr",
+        "gradient_v": "fully_masked7_p0125.gradient_v",
+        "probabilities_after_dropout": "fully_masked7_p0125.probabilities_after_dropout",
+        "probabilities_before_dropout": "fully_masked7_p0125.probabilities_before_dropout",
+        "probability_mask": "fully_masked7_p0125.probability_mask",
+        "qkv": "fully_masked7_p0125.qkv",
+        "relative": "fully_masked7_p0125.relative",
+        "relative_dropout": "fully_masked7_p0125.relative_dropout",
+        "relative_mask": "fully_masked7_p0125.relative_mask",
+        "relative_normalized": "fully_masked7_p0125.relative_normalized"
+      },
+      "uniform_fully_masked_queries": true
+    },
+    {
+      "batch": 2,
+      "control_elements": 2053,
+      "cotangent": "all_rows",
+      "gradient_leaf_order": [
+        "q",
+        "k",
+        "v",
+        "qr",
+        "kr"
+      ],
+      "head_dim": 4,
+      "heads": 2,
+      "hidden_size": 8,
+      "id": "buckets512_p0",
+      "lengths": [
+        512,
+        259
+      ],
+      "logical_layer": 0,
+      "micro_batch": 4294967298,
+      "original_vs_leaf_replay_exact": true,
+      "probability": 0.0,
+      "probability_stream_id": 3,
+      "relative_rows": 512,
+      "relative_stream_id": 2,
+      "replica": 9223372036854775811,
+      "seed": 18364758544493064720,
+      "sequence": 512,
+      "tensors": {
+        "context": "buckets512_p0.context",
+        "control": "buckets512_p0.control",
+        "cotangent": "buckets512_p0.cotangent",
+        "gradient": "buckets512_p0.gradient",
+        "gradient_k": "buckets512_p0.gradient_k",
+        "gradient_kr": "buckets512_p0.gradient_kr",
+        "gradient_q": "buckets512_p0.gradient_q",
+        "gradient_qr": "buckets512_p0.gradient_qr",
+        "gradient_v": "buckets512_p0.gradient_v",
+        "probabilities_after_dropout": "buckets512_p0.probabilities_after_dropout",
+        "probabilities_before_dropout": "buckets512_p0.probabilities_before_dropout",
+        "probability_mask": "buckets512_p0.probability_mask",
+        "qkv": "buckets512_p0.qkv",
+        "relative": "buckets512_p0.relative",
+        "relative_dropout": "buckets512_p0.relative_dropout",
+        "relative_mask": "buckets512_p0.relative_mask",
+        "relative_normalized": "buckets512_p0.relative_normalized"
+      },
+      "uniform_fully_masked_queries": true
+    },
+    {
+      "batch": 2,
+      "control_elements": 2053,
+      "cotangent": "all_rows",
+      "gradient_leaf_order": [
+        "q",
+        "k",
+        "v",
+        "qr",
+        "kr"
+      ],
+      "head_dim": 4,
+      "heads": 2,
+      "hidden_size": 8,
+      "id": "buckets512_p01",
+      "lengths": [
+        512,
+        259
+      ],
+      "logical_layer": 2,
+      "micro_batch": 4294967298,
+      "original_vs_leaf_replay_exact": true,
+      "probability": 0.10000000149011612,
+      "probability_stream_id": 8589934595,
+      "relative_rows": 512,
+      "relative_stream_id": 8589934594,
+      "replica": 9223372036854775811,
+      "seed": 18364758544493064720,
+      "sequence": 512,
+      "tensors": {
+        "context": "buckets512_p01.context",
+        "control": "buckets512_p01.control",
+        "cotangent": "buckets512_p01.cotangent",
+        "gradient": "buckets512_p01.gradient",
+        "gradient_k": "buckets512_p01.gradient_k",
+        "gradient_kr": "buckets512_p01.gradient_kr",
+        "gradient_q": "buckets512_p01.gradient_q",
+        "gradient_qr": "buckets512_p01.gradient_qr",
+        "gradient_v": "buckets512_p01.gradient_v",
+        "probabilities_after_dropout": "buckets512_p01.probabilities_after_dropout",
+        "probabilities_before_dropout": "buckets512_p01.probabilities_before_dropout",
+        "probability_mask": "buckets512_p01.probability_mask",
+        "qkv": "buckets512_p01.qkv",
+        "relative": "buckets512_p01.relative",
+        "relative_dropout": "buckets512_p01.relative_dropout",
+        "relative_mask": "buckets512_p01.relative_mask",
+        "relative_normalized": "buckets512_p01.relative_normalized"
+      },
+      "uniform_fully_masked_queries": true
+    },
+    {
+      "batch": 2,
+      "control_elements": 2053,
+      "cotangent": "all_rows",
+      "gradient_leaf_order": [
+        "q",
+        "k",
+        "v",
+        "qr",
+        "kr"
+      ],
+      "head_dim": 4,
+      "heads": 2,
+      "hidden_size": 8,
+      "id": "buckets512_p0125",
+      "lengths": [
+        512,
+        259
+      ],
+      "logical_layer": 7,
+      "micro_batch": 4294967298,
+      "original_vs_leaf_replay_exact": true,
+      "probability": 0.125,
+      "probability_stream_id": 30064771075,
+      "relative_rows": 512,
+      "relative_stream_id": 30064771074,
+      "replica": 9223372036854775811,
+      "seed": 18364758544493064720,
+      "sequence": 512,
+      "tensors": {
+        "context": "buckets512_p0125.context",
+        "control": "buckets512_p0125.control",
+        "cotangent": "buckets512_p0125.cotangent",
+        "gradient": "buckets512_p0125.gradient",
+        "gradient_k": "buckets512_p0125.gradient_k",
+        "gradient_kr": "buckets512_p0125.gradient_kr",
+        "gradient_q": "buckets512_p0125.gradient_q",
+        "gradient_qr": "buckets512_p0125.gradient_qr",
+        "gradient_v": "buckets512_p0125.gradient_v",
+        "probabilities_after_dropout": "buckets512_p0125.probabilities_after_dropout",
+        "probabilities_before_dropout": "buckets512_p0125.probabilities_before_dropout",
+        "probability_mask": "buckets512_p0125.probability_mask",
+        "qkv": "buckets512_p0125.qkv",
+        "relative": "buckets512_p0125.relative",
+        "relative_dropout": "buckets512_p0125.relative_dropout",
+        "relative_mask": "buckets512_p0125.relative_mask",
+        "relative_normalized": "buckets512_p0125.relative_normalized"
+      },
+      "uniform_fully_masked_queries": true
+    }
+  ],
+  "config": {
+    "_name_or_path": "",
+    "add_cross_attention": false,
+    "architectures": null,
+    "attention_probs_dropout_prob": 0.0,
+    "bad_words_ids": null,
+    "begin_suppress_tokens": null,
+    "bos_token_id": null,
+    "chunk_size_feed_forward": 0,
+    "conv_kernel_size": 0,
+    "cross_attention_hidden_size": null,
+    "decoder_start_token_id": null,
+    "diversity_penalty": 0.0,
+    "do_sample": false,
+    "early_stopping": false,
+    "encoder_no_repeat_ngram_size": 0,
+    "eos_token_id": null,
+    "exponential_decay_length_penalty": null,
+    "finetuning_task": null,
+    "forced_bos_token_id": null,
+    "forced_eos_token_id": null,
+    "hidden_act": "gelu",
+    "hidden_dropout_prob": 0.0,
+    "hidden_size": 8,
+    "id2label": {
+      "0": "LABEL_0",
+      "1": "LABEL_1"
+    },
+    "initializer_range": 0.02,
+    "intermediate_size": 16,
+    "is_decoder": false,
+    "is_encoder_decoder": false,
+    "label2id": {
+      "LABEL_0": 0,
+      "LABEL_1": 1
+    },
+    "layer_norm_eps": 1e-07,
+    "legacy": true,
+    "length_penalty": 1.0,
+    "max_length": 20,
+    "max_position_embeddings": 512,
+    "max_relative_positions": -1,
+    "min_length": 0,
+    "model_type": "deberta-v2",
+    "no_repeat_ngram_size": 0,
+    "norm_rel_ebd": "layer_norm",
+    "num_attention_heads": 2,
+    "num_beam_groups": 1,
+    "num_beams": 1,
+    "num_hidden_layers": 1,
+    "num_return_sequences": 1,
+    "output_attentions": false,
+    "output_hidden_states": false,
+    "output_scores": false,
+    "pad_token_id": 0,
+    "pooler_dropout": 0,
+    "pooler_hidden_act": "gelu",
+    "pooler_hidden_size": 8,
+    "pos_att_type": [
+      "p2c",
+      "c2p"
+    ],
+    "position_biased_input": false,
+    "position_buckets": 256,
+    "prefix": null,
+    "problem_type": null,
+    "pruned_heads": {},
+    "relative_attention": true,
+    "remove_invalid_values": false,
+    "repetition_penalty": 1.0,
+    "return_dict": true,
+    "return_dict_in_generate": false,
+    "sep_token_id": null,
+    "share_att_key": true,
+    "suppress_tokens": null,
+    "task_specific_params": null,
+    "temperature": 1.0,
+    "tf_legacy_loss": false,
+    "tie_encoder_decoder": false,
+    "tie_word_embeddings": true,
+    "tokenizer_class": null,
+    "top_k": 50,
+    "top_p": 1.0,
+    "torch_dtype": null,
+    "torchscript": false,
+    "transformers_version": "4.55.4",
+    "type_vocab_size": 0,
+    "typical_p": 1.0,
+    "use_bfloat16": false,
+    "vocab_size": 128100
+  },
+  "contract": {
+    "sha256": "7e512fe4418d006619088093ed7410ddd9a209dcb421954c9fbb14287bbecfcc",
+    "size_bytes": 12057
+  },
+  "files": {
+    "tensors.safetensors": {
+      "sha256": "45c7b042146132e9103807f61e49b7a44a7ef59e70c338e542e9de709d38b9e3",
+      "size_bytes": 40241300
+    },
+    "weights.safetensors": {
+      "sha256": "715aa526fb9cc711352b2b57531d8648e76cba29972c1c04ecad720044d4fa54",
+      "size_bytes": 20560
+    }
+  },
+  "generator": {
+    "sha256": "c67ee517899871b4ad36a11408ff321028ad10ab88f0941aa0c09ef48f6a1a6f",
+    "size_bytes": 20879
+  },
+  "limits": {
+    "artifact_bytes": 67108864,
+    "child_rss_bytes": 2147483648,
+    "cooperative_seconds": 120,
+    "interop_threads": 1,
+    "metadata_bytes": 2097152,
+    "outer_seconds": 180,
+    "tensor_payload_bytes": 58720256,
+    "threads": 1
+  },
+  "methods": {
+    "DebertaV2Encoder.get_attention_mask": {
+      "lines": [
+        609,
+        616
+      ],
+      "sha256": "9a9167a9a22251d20b726d7f9343eb39099c155d49994feafa457da1894d2b14"
+    },
+    "DebertaV2Encoder.get_rel_embedding": {
+      "lines": [
+        603,
+        607
+      ],
+      "sha256": "f27ddfc1efdae21bfb5a59fb17117c034ec54236c424e2d9570e68f557bdcdb0"
+    },
+    "DebertaV2Encoder.get_rel_pos": {
+      "lines": [
+        618,
+        634
+      ],
+      "sha256": "2af489114d62fbf217dfe6c98030e935cecdee85e4f31225067332d8a7c65fb3"
+    },
+    "DisentangledSelfAttention.disentangled_attention_bias": {
+      "lines": [
+        282,
+        351
+      ],
+      "sha256": "593ca272bc139c85d6d5e434fc62042699f0b01a4fcf92e80128a620e2e22939"
+    },
+    "DisentangledSelfAttention.forward": {
+      "lines": [
+        196,
+        280
+      ],
+      "sha256": "0dbd0e76daf144bef99bdb709de14ac316dd30267dd3e713cd6cffb632b68c69"
+    },
+    "DisentangledSelfAttention.transpose_for_scores": {
+      "lines": [
+        191,
+        194
+      ],
+      "sha256": "56ef3fca0782312e36258597c1e4abf78f9551e461749b20bb2ea3cbe8a22591"
+    },
+    "build_relative_position": {
+      "lines": [
+        74,
+        103
+      ],
+      "sha256": "f4141b79151586f4210104586ff46dea3d7735111bc2b15352acffeab2ffb33c"
+    },
+    "build_rpos": {
+      "lines": [
+        130,
+        139
+      ],
+      "sha256": "89b7f2a9be6e12bf98f558917b5e0eb85748c00f5078ff0ab27034e3cc1e7456"
+    },
+    "make_log_bucket_position": {
+      "lines": [
+        59,
+        71
+      ],
+      "sha256": "21d5ad4335df3ddee2cd458f28b8b5751b83ce7564a26daad52794208be4b0cd"
+    },
+    "scaled_size_sqrt": {
+      "lines": [
+        125,
+        126
+      ],
+      "sha256": "f8e5b7564f0debaefd1e6c4e9872f4100652a7b772946abd4082767232234b71"
+    }
+  },
+  "provenance": {
+    "checkout": "/private/tmp/antfly-gliner25-upstream",
+    "commit": "3c913c7369301133d3b7699252074c4303ada50e",
+    "device": "cpu",
+    "dtype": "float32",
+    "imports": {
+      "gliner2": "/private/tmp/antfly-gliner25-upstream/gliner2/__init__.py",
+      "gliner2.api_client": "/private/tmp/antfly-gliner25-upstream/gliner2/api_client.py",
+      "gliner2.auto": "/private/tmp/antfly-gliner25-upstream/gliner2/auto.py",
+      "gliner2.configuration": "/private/tmp/antfly-gliner25-upstream/gliner2/configuration.py",
+      "gliner2.inference": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/__init__.py",
+      "gliner2.inference.candidate_decoder": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/candidate_decoder.py",
+      "gliner2.inference.chunking": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/chunking.py",
+      "gliner2.inference.engine": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/engine.py",
+      "gliner2.inference.overlap": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/overlap.py",
+      "gliner2.inference.runtime": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/runtime.py",
+      "gliner2.inference.schema": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/schema.py",
+      "gliner2.inference.schema_model": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/schema_model.py",
+      "gliner2.layers": "/private/tmp/antfly-gliner25-upstream/gliner2/layers.py",
+      "gliner2.models": "/private/tmp/antfly-gliner25-upstream/gliner2/models/__init__.py",
+      "gliner2.models.base": "/private/tmp/antfly-gliner25-upstream/gliner2/models/base.py",
+      "gliner2.models.boundary": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/__init__.py",
+      "gliner2.models.boundary.constants": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/constants.py",
+      "gliner2.models.boundary.content": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/content.py",
+      "gliner2.models.boundary.encoding": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/encoding.py",
+      "gliner2.models.boundary.engine": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/engine.py",
+      "gliner2.models.boundary.heads": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/heads.py",
+      "gliner2.models.boundary.indexing": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/indexing.py",
+      "gliner2.models.boundary.losses": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/losses.py",
+      "gliner2.models.boundary.model": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/model.py",
+      "gliner2.models.boundary.pool": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/pool.py",
+      "gliner2.models.boundary.proposal": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/proposal.py",
+      "gliner2.models.boundary.records": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/records.py",
+      "gliner2.models.boundary.relations": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/relations.py",
+      "gliner2.models.boundary.rotary": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/rotary.py",
+      "gliner2.models.boundary.scoring": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/scoring.py",
+      "gliner2.models.boundary.targets_device": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/targets_device.py",
+      "gliner2.models.boundary.validation": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/validation.py",
+      "gliner2.models.candidates": "/private/tmp/antfly-gliner25-upstream/gliner2/models/candidates.py",
+      "gliner2.models.loading": "/private/tmp/antfly-gliner25-upstream/gliner2/models/loading.py",
+      "gliner2.models.outputs": "/private/tmp/antfly-gliner25-upstream/gliner2/models/outputs.py",
+      "gliner2.models.span": "/private/tmp/antfly-gliner25-upstream/gliner2/models/span/__init__.py",
+      "gliner2.models.span.model": "/private/tmp/antfly-gliner25-upstream/gliner2/models/span/model.py",
+      "gliner2.processing": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/__init__.py",
+      "gliner2.processing.layouts": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/layouts.py",
+      "gliner2.processing.records": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/records.py",
+      "gliner2.processing.targets": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/targets.py",
+      "gliner2.processing.word_splitter": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/word_splitter.py",
+      "gliner2.processor": "/private/tmp/antfly-gliner25-upstream/gliner2/processor.py",
+      "gliner2.training": "/private/tmp/antfly-gliner25-upstream/gliner2/training/__init__.py",
+      "gliner2.training.data": "/private/tmp/antfly-gliner25-upstream/gliner2/training/data.py",
+      "gliner2.training.matching": "/private/tmp/antfly-gliner25-upstream/gliner2/training/matching.py",
+      "gliner2.training.sampler": "/private/tmp/antfly-gliner25-upstream/gliner2/training/sampler.py",
+      "gliner2.training.trainer": "/private/tmp/antfly-gliner25-upstream/gliner2/training/trainer.py",
+      "gliner2.utils": "namespace:/private/tmp/antfly-gliner25-upstream/gliner2/utils",
+      "gliner2.utils.device_errors": "/private/tmp/antfly-gliner25-upstream/gliner2/utils/device_errors.py",
+      "gliner2.utils.sync_probe": "/private/tmp/antfly-gliner25-upstream/gliner2/utils/sync_probe.py"
+    },
+    "platform": {
+      "machine": "arm64",
+      "system": "Darwin"
+    },
+    "runtime": {
+      "packages": {
+        "PyYAML": "6.0.3",
+        "accelerate": "1.10.1",
+        "huggingface-hub": "0.36.0",
+        "numpy": "2.3.5",
+        "packaging": "25.0",
+        "peft": "0.17.1",
+        "psutil": "7.1.3",
+        "pydantic": "2.12.3",
+        "requests": "2.32.5",
+        "safetensors": "0.7.0",
+        "scipy": "1.16.3",
+        "tokenizers": "0.21.4",
+        "torch": "2.9.1",
+        "transformers": "4.55.4",
+        "urllib3": "2.5.0"
+      },
+      "python": "3.12.3",
+      "unicode": "15.0.0"
+    },
+    "threads": 1
+  },
+  "qualification": false,
+  "scope": "gliner25_projected_training_attention/v1",
+  "semantics": {
+    "control_layout": "physical i32: seed low/high, micro_batch low/high, replica low/high (bit limbs), then mask[B,S] 0/1, then 2*S-1 source bucket indices for -(S-1)..S-1",
+    "counter": "splitmix64_site_element_v1; wrapping u64 stream=mix(seed)^mix(micro)^mix(replica+0x7265706c696361)^mix(stream_id); drop if high32(mix(stream^mix(index))) < floor(f64(f32(p))*2^32)",
+    "counter_mix": "mix(v): v+=0x9e3779b97f4a7c15; v=(v^(v>>30))*0xbf58476d1ce4e5b9; v=(v^(v>>27))*0x94d049bb133111eb; return v^(v>>31), all wrapping u64",
+    "dropout": "Explicit native counter masks replace nn.Dropout only; no claim to reproduce Torch RNG. Probabilities and inversion arithmetic use f32.",
+    "dropout_inversion": "f32(1/f32(1-f32(p)))",
+    "fully_masked_query": "uniform before dropout, zero score-path VJP, potentially nonzero V VJP including masked key rows",
+    "gradient_inputs": [
+      "Q[B*S,H]",
+      "K[B*S,H]",
+      "V[B*S,H]",
+      "Qr[R,H]",
+      "Kr[R,H]"
+    ],
+    "gradient_layout": "[dQ;dK;dV;dQr;dKr] rows 3*B*S+2*R",
+    "mask": "query AND key, masked_fill with finite -maxf32 before softmax",
+    "probability_index": "((b*num_heads+h)*S+q)*S+k; logical layer stream=(layer<<32)|3; relative-dropout stream=(layer<<32)|2",
+    "projection_boundary": "Capture actual shared Q/K/V projection returns, then substitute those same values as five independent autograd leaves. Original and leaf replay context and probabilities must be byte-identical.",
+    "qkv_layout": "[Q;K;V] in source B,S,H order",
+    "relative_index": "both Qr and Kr use bucket(q-k) for equal-length self-attention after source p2c transpose",
+    "relative_layout": "[Qr;Kr], R512 full projected shared table; table VJPs sum source batch repetition",
+    "relative_order": "shared full-table LayerNorm, then per-layer relative dropout, then shared Q/K projections, then score gathers",
+    "scale": "sqrt(3*head_dim); Q @ (K^T / scale), c2p and p2c each divided after its dot/gather, then summed in source order",
+    "scope_limit": "Projected attention primitive only; this does not independently qualify raw relative embedding/projection weight gradients, full tiled encoder or training jobs, unequal query/key lengths, inference masking, or release readiness",
+    "source_methods": "Actual pinned get_attention_mask/get_rel_embedding/get_rel_pos and DisentangledSelfAttention.forward/disentangled_attention_bias execute; attention math is not rewritten.",
+    "source_rng": "torch.manual_seed(251019) generates only the tiny source encoder initialization; it is distinct from the explicit dropout counter"
+  },
+  "transformers_source": {
+    "sha256": "98fa398f62e446e1f6303ff67fa7aceddac4f746a1a6013226896c3fa4e6cdd6",
+    "size_bytes": 56783
+  },
+  "version": 1
+}

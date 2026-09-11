@@ -1,0 +1,58 @@
+{
+  "format": "antfly.gliner25-regional-all-native-checker-checkpoint/v1",
+  "model_execution": false,
+  "preparation_sha256": "d86dafd5c9c826c65ef132d6b9b6d4e161e0a503101a9e1abdc230dab9ecfa98",
+  "files": {
+    "checker.py": {
+      "size_bytes": 33162,
+      "sha256": "4f6663719149b8d81fb81366ffce3fc5238e235edc33d0d7a6e56a5fd83d563d"
+    },
+    "run_phase.py": {
+      "size_bytes": 25942,
+      "sha256": "da4f2f5b4d67eef3920acae86ef181fae9bc1a2506298d4dd4533d80c81b9421"
+    },
+    "test_checker.py": {
+      "size_bytes": 14423,
+      "sha256": "f0b626100f4dab9dc87b49f61580d044d125750182b3f52179ff4e4ef56085f6"
+    },
+    "checker-tests-v1.log": {
+      "size_bytes": 1441,
+      "sha256": "149948428b0bbe15d79160135141cd073042eca1bd1362c90eab32723891a406"
+    },
+    "frozen-checker-source-review.json": {
+      "size_bytes": 1857,
+      "sha256": "e510f76f67828dd557485fd71a8bccaee7d46a941be09eadcc3abcdd9872aadd"
+    },
+    "CHECKER.md": {
+      "size_bytes": 7495,
+      "sha256": "531eaa2bb5f1710d7ef38acee65df3c76c34ef55a6a43b6e2de57506c8a820a8"
+    },
+    "executable.json": {
+      "size_bytes": 2089,
+      "sha256": "7675e77b26a085715245cefdad83c96790068e2c83e3431604a16c4ef980affa"
+    }
+  },
+  "tests": {
+    "selected": 9,
+    "passed": 9,
+    "failed": 0,
+    "elapsed_seconds": 0.021,
+    "scope": "Small synthetic checker and publication tests; no models."
+  },
+  "limits": {
+    "job_timeout_seconds": 1800,
+    "outer_timeout_seconds": 1890,
+    "sampled_child_tree_rss_bytes": 4294967296,
+    "output_bytes_per_stream": 4194304
+  },
+  "command": [
+    "/private/tmp/antfly-gliner25-oracle-venv/bin/python",
+    "/private/tmp/antfly-gliner25-regional-all-small-native-v1/run_phase.py",
+    "run",
+    "--mode",
+    "lora",
+    "--phase",
+    "paused"
+  ],
+  "execution_owner": "root only after serial build completes"
+}

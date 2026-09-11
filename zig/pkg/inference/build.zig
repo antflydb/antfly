@@ -1397,6 +1397,85 @@ pub fn build(b: *std.Build) void {
     const gliner2_e2e_bench_step = b.step("bench-gliner2-e2e", "Run real-bundle GLiNER2 recognition E2E benchmarks");
     gliner2_e2e_bench_step.dependOn(&run_gliner2_e2e_bench.step);
 
+    // Use the shared optimize value for the entire dependency graph. The
+    // worker refuses to compile unless that graph is ReleaseFast; forcing
+    // only this executable root would leave imported kernels unoptimized.
+    const gliner25_cpu_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-gliner25-cpu-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/gliner25_cpu.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    gliner25_cpu_bench_exe.root_module.addImport("build_options", build_options_mod);
+    gliner25_cpu_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    // The imported native runtime owns backend and BLAS linkage.
+    gliner25_cpu_bench_exe.root_module.link_libc = true;
+    const install_gliner25_cpu_bench = b.addInstallArtifact(gliner25_cpu_bench_exe, .{});
+    const gliner25_cpu_bench_step = b.step("bench-gliner25-cpu-build", "Build the supervised GLiNER2.5 direct-core CPU benchmark worker (requires ReleaseFast)");
+    gliner25_cpu_bench_step.dependOn(&install_gliner25_cpu_bench.step);
+
+    const gliner25_metal_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-gliner25-metal-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/gliner25_metal.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    gliner25_metal_bench_exe.root_module.addImport("build_options", build_options_mod);
+    gliner25_metal_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    gliner25_metal_bench_exe.root_module.link_libc = true;
+    const install_gliner25_metal_bench = b.addInstallArtifact(gliner25_metal_bench_exe, .{});
+    b.step("bench-gliner25-metal-build", "Build the supervised GLiNER2.5 production-lifetime Metal comparison worker (requires ReleaseFast)").dependOn(&install_gliner25_metal_bench.step);
+
+    const gliner25_convert = b.addExecutable(.{
+        .name = "antfly-inference-gliner25-convert",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/gliner25_convert.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    gliner25_convert.root_module.addImport("inference_internal", inference_internal_mod);
+    gliner25_convert.root_module.link_libc = true;
+    const install_gliner25_convert = b.addInstallArtifact(gliner25_convert, .{});
+    b.step("gliner25-convert-build", "Build the atomic GLiNER2.5 converter and bundle verifier").dependOn(&install_gliner25_convert.step);
+    const gliner25_bundle_check = b.addExecutable(.{
+        .name = "antfly-inference-gliner25-bundle-check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/gliner25_bundle_check.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    gliner25_bundle_check.root_module.addImport("inference_internal", inference_internal_mod);
+    gliner25_bundle_check.root_module.link_libc = true;
+    const install_gliner25_bundle_check = b.addInstallArtifact(gliner25_bundle_check, .{});
+    b.step("gliner25-bundle-check-build", "Build the converted GLiNER2.5 CPU diagnostic runner").dependOn(&install_gliner25_bundle_check.step);
+
+    const gliner25_trained_check_module = b.createModule(.{
+        .root_source_file = b.path("src/bench/gliner25_trained_check.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gliner25_trained_check_module.addImport("inference_internal", inference_internal_mod);
+    gliner25_trained_check_module.link_libc = true;
+    const gliner25_trained_check = b.addExecutable(.{
+        .name = "antfly-inference-gliner25-trained-check",
+        .root_module = gliner25_trained_check_module,
+    });
+    const install_gliner25_trained_check = b.addInstallArtifact(gliner25_trained_check, .{});
+    b.step("gliner25-trained-check-build", "Build the bounded trained GLiNER2.5 CPU/Metal artifact execution worker").dependOn(&install_gliner25_trained_check.step);
+    const gliner25_trained_tests = b.addTest(.{
+        .root_module = gliner25_trained_check_module,
+        .filters = selectTestFilters(b, &.{"trained execution"}),
+    });
+    const run_gliner25_trained_tests = b.addRunArtifact(gliner25_trained_tests);
+    run_gliner25_trained_tests.setCwd(b.path("."));
+    b.step("gliner25-trained-check-test", "Test trained GLiNER2.5 execution envelopes, identity, admission and lifetimes without a model").dependOn(&run_gliner25_trained_tests.step);
+
     const clipclap_native_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-clipclap-native-bench",
         .root_module = b.createModule(.{
@@ -1623,6 +1702,52 @@ pub fn build(b: *std.Build) void {
         .path = b.path("src/test_runner_filter.zig"),
         .mode = .simple,
     };
+    // This model-free target uses Zig's standard runner so an ordinary test
+    // run executes the deterministic corpus and --fuzz can opt into coverage
+    // mutation. The simple inference runner does not implement that protocol.
+    // Zig 0.16.0's fuzz-only test_one path passes builtin.StackTrace to the
+    // incompatible debug.StackTrace writer. Opt out of error-return traces
+    // only for an explicitly requested fuzz invocation; keep normal Debug
+    // tracing and all runtime safety/allocator leak checks unchanged.
+    const gliner25_fuzz_no_error_tracing = b.option(bool, "gliner25-fuzz-no-error-tracing", "Work around Zig 0.16.0 fuzz runner error-trace mismatch for GLiNER25 only (use with --fuzz)") orelse false;
+    // This in-memory harness uses platform time/control, never filesystem
+    // capacity. Use the platform build contract's pure-Zig dependency profile
+    // to omit its unrelated C helper, whose Clang sanitizer coverage hooks are
+    // not supplied by Zig 0.16's fuzz runner. Keep libc on the executable and
+    // retain fuzz coverage for every Zig module. ML must share this platform
+    // instance so its import does not reintroduce the production C helper.
+    const gliner25_fuzz_platform_mod = b.dependency("antfly_platform", .{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = false,
+    }).module("antfly_platform");
+    const gliner25_fuzz_ml_mod = b.createModule(.{
+        .root_source_file = b.path(b.fmt("{s}/lib/ml/src/root.zig", .{shared_lib_root})),
+        .target = target,
+        .optimize = optimize,
+    });
+    gliner25_fuzz_ml_mod.addImport("antfly_platform", gliner25_fuzz_platform_mod);
+    const gliner25_fuzz_tests = b.addTest(.{
+        .name = "gliner25-parser-properties",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gliner25_fuzz.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = link_libc,
+            .error_tracing = if (gliner25_fuzz_no_error_tracing) false else null,
+        }),
+        .filters = &.{"GLiNER25 fuzz"},
+    });
+    gliner25_fuzz_tests.root_module.addImport("build_options", build_options_mod);
+    gliner25_fuzz_tests.root_module.addImport("antfly_platform", gliner25_fuzz_platform_mod);
+    gliner25_fuzz_tests.root_module.addImport("antfly_image", antfly_image_mod);
+    gliner25_fuzz_tests.root_module.addImport("inference_tokenizer", inference_tokenizer_mod);
+    gliner25_fuzz_tests.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
+    gliner25_fuzz_tests.root_module.addImport("inference_linalg", inference_linalg_mod);
+    gliner25_fuzz_tests.root_module.addImport("ml", gliner25_fuzz_ml_mod);
+    const run_gliner25_fuzz_tests = b.addRunArtifact(gliner25_fuzz_tests);
+    const gliner25_fuzz_test_step = b.step("test-gliner25-fuzz", "Run bounded GLiNER2.5 parser, schema and document property tests");
+    gliner25_fuzz_test_step.dependOn(&run_gliner25_fuzz_tests.step);
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/inference.zig"),
@@ -1784,6 +1909,7 @@ pub fn build(b: *std.Build) void {
     if (selected_test_filters.len == 0) {
         test_step.dependOn(&run_cli_tests.step);
         test_step.dependOn(&run_bge_m3_e2e_bench_tests.step);
+        test_step.dependOn(&run_gliner25_fuzz_tests.step);
     }
     const install_tests = b.addInstallArtifact(tests, .{
         .dest_sub_path = "antfly-inference-tests",

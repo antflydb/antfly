@@ -1,0 +1,22 @@
+{
+  "scope": "gliner25_crossner_official_metric_source/v1",
+  "repository": "https://github.com/zliucr/CrossNER",
+  "revision": "2e7ba2a7798c961e3f29fbc51252c5a8d40224bf",
+  "license": "MIT",
+  "files": [
+    {
+      "path": "conll2002_metrics.py",
+      "upstream_path": "src/conll2002_metrics.py",
+      "size_bytes": 13425,
+      "sha256": "45e1b96603d09e7abe9949092789592de37b9a7744631bb8fb36e81bf0baa2e4"
+    },
+    {
+      "path": "LICENSE",
+      "upstream_path": "LICENSE",
+      "size_bytes": 1066,
+      "sha256": "9291793d0b49d69642edcd47e730136693722e3a1d398d1412e8d47e2443b71f"
+    }
+  ],
+  "modifications": [],
+  "usage": "Tests and offline metric audit only; never a native inference dependency."
+}

@@ -1,0 +1,133 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+const build_options = @import("build_options");
+pub const gliner_boundary_export = @import("gliner_boundary_export.zig");
+
+pub const platform = @import("antfly_platform");
+pub const backends = @import("backends/backends.zig");
+pub const execution_control = @import("execution_control.zig");
+pub const InferenceExecutionControl = execution_control.InferenceExecutionControl;
+pub const HardCancellationWatchdog = @import("hard_cancellation_watchdog.zig").HardCancellationWatchdog;
+pub const metal_runtime = if (build_options.enable_metal) @import("backends/metal_runtime.zig") else struct {
+    pub fn metalDeviceAvailable() bool {
+        return false;
+    }
+};
+pub const metal_native_provider = if (build_options.enable_metal) @import("backends/metal_native_provider.zig") else struct {};
+pub const graph = @import("graph/root.zig");
+pub const io = @import("io/io.zig");
+pub const ops = @import("ops/ops.zig");
+pub const run = @import("run/root.zig");
+pub const runtime = @import("runtime/root.zig");
+pub const file_snapshot = @import("runtime/file_snapshot.zig");
+pub const util = @import("util/util.zig");
+pub const tokenizer = @import("inference_tokenizer");
+pub const hf_tokenizer = @import("inference_hf_tokenizer");
+pub const native_backend_guard = @import("native_backend_guard.zig");
+pub const native_backend_choice = @import("native_backend_choice.zig");
+pub const metal_generated_quant_stats = @import("metal_generated_quant_stats.zig");
+pub const kernel_jit_profile_output = @import("kernel_jit_profile_output.zig");
+pub const server = struct {
+    pub const model_manager = @import("server/model_manager.zig");
+};
+pub const pipelines = struct {
+    pub const embedding = @import("pipelines/embedding.zig");
+    pub const extraction_schema = @import("pipelines/extraction_schema.zig");
+    pub const gliner_boundary_processor = @import("pipelines/gliner_boundary_processor.zig");
+    pub const gliner_boundary_pipeline = @import("pipelines/gliner_boundary_pipeline.zig");
+};
+pub const finetune = struct {
+    pub const gliner_boundary_training_job = @import("finetune/gliner_boundary_training_job.zig");
+    pub const gliner_boundary_native_trainer = @import("finetune/gliner_boundary_native_trainer.zig");
+    pub const colqwen2 = @import("finetune/colqwen2.zig");
+    pub const gemma4 = @import("finetune/gemma4.zig");
+    pub const gemma_chat_data = @import("finetune/gemma_chat_data.zig");
+    pub const gemma_data = @import("finetune/gemma_data.zig");
+    pub const gemma_multimodal_data = @import("finetune/gemma_multimodal_data.zig");
+    pub const gliner2 = @import("finetune/gliner2.zig");
+    pub const gliner2_boundary = @import("finetune/gliner2_boundary.zig");
+    pub const gliner2_data = @import("finetune/gliner2_data.zig");
+    pub const gliner2_run_validation = @import("finetune/gliner2_run_validation.zig");
+    pub const entity_cleanup_data = @import("finetune/entity_cleanup_data.zig");
+    pub const entity_cleanup_gliner_cache = @import("finetune/entity_cleanup_gliner_cache.zig");
+    pub const entity_cleanup_model = @import("finetune/entity_cleanup_model.zig");
+    pub const graph_bridge = @import("finetune/graph_bridge.zig");
+    pub const document_data = @import("finetune/document_data.zig");
+    pub const layoutlmv3 = @import("finetune/layoutlmv3.zig");
+    pub const gemma4_real_autodiff = @import("finetune/gemma4_real_autodiff.zig");
+    pub const gemma4_multimodal_real_autodiff = @import("finetune/gemma4_multimodal_real_autodiff.zig");
+    pub const text_encoder_boundary = @import("finetune/text_encoder_boundary.zig");
+    pub const gliner2_real_autodiff = @import("finetune/gliner2_real_autodiff.zig");
+    pub const real_autodiff_trainer = @import("finetune/real_autodiff_trainer.zig");
+    pub const graph_weight_bridge = @import("finetune/graph_weight_bridge.zig");
+    pub const graph_input_binder = @import("finetune/graph_input_binder.zig");
+    pub const reranker_data = @import("finetune/reranker_data.zig");
+    pub const reranker = @import("finetune/reranker.zig");
+    pub const reranker_lora = @import("finetune/reranker_lora.zig");
+    pub const fused_chunker_data = @import("finetune/fused_chunker_data.zig");
+    pub const fused_chunker = @import("finetune/fused_chunker.zig");
+    pub const fused_chunker_loss = @import("finetune/fused_chunker_loss.zig");
+    pub const infonce_cpu = @import("finetune/infonce_cpu.zig");
+    pub const fused_chunker_splade = @import("finetune/fused_chunker_splade.zig");
+    pub const fused_chunker_train = @import("finetune/fused_chunker_train.zig");
+    pub const lora_adapter_set = @import("finetune/lora_adapter_set.zig");
+    pub const peft = @import("finetune/peft.zig");
+    pub const recipe = @import("finetune/recipe.zig");
+    pub const tokenizer_batch = @import("finetune/tokenizer_batch.zig");
+};
+pub const architectures = struct {
+    pub const gliner_boundary_engine = @import("architectures/gliner_boundary_engine.zig");
+    pub const gliner_boundary_request_device = @import("architectures/gliner_boundary_request_device.zig");
+    pub const gliner_boundary_head = @import("architectures/gliner_boundary_head.zig");
+    pub const gliner_boundary_tasks = @import("architectures/gliner_boundary_tasks.zig");
+    pub const session_factory = @import("architectures/session_factory.zig");
+    pub const deberta = @import("architectures/deberta.zig");
+    pub const deberta_graph = @import("architectures/deberta_graph.zig");
+    pub const bert_graph = @import("architectures/bert_graph.zig");
+    pub const qwen2_graph = @import("architectures/qwen2_graph.zig");
+    pub const qwen3vl_plan = @import("architectures/qwen3vl_plan.zig");
+    pub const qwen3vl_projector = @import("architectures/qwen3vl_projector.zig");
+    pub const qwen3vl_reranker = @import("architectures/qwen3vl_reranker.zig");
+    pub const gemma_graph = @import("architectures/gemma_graph.zig");
+    pub const modern_bert_graph = @import("architectures/modern_bert_graph.zig");
+    pub const layoutlmv3_graph = @import("architectures/layoutlmv3_graph.zig");
+    pub const clip = @import("architectures/clip.zig");
+    pub const clap = @import("architectures/clap.zig");
+    pub const gliner_head = @import("architectures/gliner_head.zig");
+    pub const gliner_head_graph = @import("architectures/gliner_head_graph.zig");
+};
+pub const models = struct {
+    pub const manifest = @import("models/manifest.zig");
+    pub const gliner_boundary_bundle = @import("models/gliner_boundary_bundle.zig");
+    pub const gliner_boundary = @import("models/gliner_boundary.zig");
+    pub const gliner_boundary_artifact = @import("models/gliner_boundary_artifact.zig");
+    pub const tensor_access = @import("models/tensor_access.zig");
+    pub const deberta = @import("models/deberta.zig");
+    pub const clip = @import("models/clip.zig");
+    pub const clap = @import("models/clap.zig");
+    pub const weight_source = @import("models/weight_source.zig");
+    pub const safetensors = @import("models/safetensors.zig");
+};
+pub const native_compute = struct {
+    pub const native = @import("ops/native_compute.zig");
+    pub const gpu_hosted_store = @import("ops/gpu_hosted_store.zig");
+    pub const metal = if (build_options.enable_metal) @import("ops/metal_compute.zig") else struct {};
+    pub const cuda = if (build_options.enable_cuda) @import("ops/cuda/cuda_compute.zig") else struct {};
+    pub const wasm = if (build_options.enable_wasm) @import("ops/wasm_compute.zig") else struct {};
+};
+pub const gguf = struct {
+    pub const quant_codec = @import("gguf/quant_codec.zig");
+    pub const tensor_types = @import("gguf/tensor_types.zig");
+};

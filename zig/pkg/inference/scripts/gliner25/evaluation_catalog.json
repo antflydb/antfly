@@ -1,0 +1,514 @@
+{
+  "scope": "gliner25_evaluation_catalog/v1",
+  "status": "metadata_only",
+  "qualification": false,
+  "catalog_date": "2026-09-09",
+  "upstream_commit": "3c913c7369301133d3b7699252074c4303ada50e",
+  "upstream_evaluation_sources": [
+    {
+      "path": "gliner2/training/data.py",
+      "sha256": "e9b93e1276ed6f858dcc4191b7606e5ede32b81c8dca35714284155f6f33e24e"
+    },
+    {
+      "path": "gliner2/training/metrics.py",
+      "sha256": "5440f37dfb8c6d7aee4d825a83b719616ba83834cddf0945d308f627b141bd33"
+    },
+    {
+      "path": "gliner2/training/trainer.py",
+      "sha256": "8b720f6da4fa3d74ad2c0adda3b5ef5a71c001f01d7822ba48dfaf974dec05d3"
+    },
+    {
+      "path": "tests/test_multitask_benchmark.py",
+      "sha256": "28daf06c4adec0607e0863a8c1c023fb9478b0de370935ea3c863d129eeddca3"
+    }
+  ],
+  "upstream_missing_package": "benchmarks/multitask",
+  "metadata_sources": [
+    {
+      "repo": "zliucr/CrossNER",
+      "revision": "2e7ba2a7798c961e3f29fbc51252c5a8d40224bf",
+      "path": "README.md",
+      "url": "https://raw.githubusercontent.com/zliucr/CrossNER/2e7ba2a7798c961e3f29fbc51252c5a8d40224bf/README.md",
+      "size_bytes": 6398,
+      "sha256": "8a0dd60bca8c7f22219c9f0a614dad77c56b777e7f4220fc52f546fa939d38d8"
+    },
+    {
+      "repo": "zliucr/CrossNER",
+      "revision": "2e7ba2a7798c961e3f29fbc51252c5a8d40224bf",
+      "path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/zliucr/CrossNER/2e7ba2a7798c961e3f29fbc51252c5a8d40224bf/LICENSE",
+      "size_bytes": 1066,
+      "sha256": "9291793d0b49d69642edcd47e730136693722e3a1d398d1412e8d47e2443b71f"
+    },
+    {
+      "repo": "raspberryice/gen-arg",
+      "revision": "253e0889b2377e0f7084cb406cf5d4142ee8a365",
+      "path": "README.md",
+      "url": "https://raw.githubusercontent.com/raspberryice/gen-arg/253e0889b2377e0f7084cb406cf5d4142ee8a365/README.md",
+      "size_bytes": 1600,
+      "sha256": "0a72152b21fdb108510e70d0f7db3d4b140b02c16cf76cf1656316a5606b2fc2"
+    },
+    {
+      "repo": "raspberryice/gen-arg",
+      "revision": "253e0889b2377e0f7084cb406cf5d4142ee8a365",
+      "path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/raspberryice/gen-arg/253e0889b2377e0f7084cb406cf5d4142ee8a365/LICENSE",
+      "size_bytes": 1064,
+      "sha256": "74f80373d486546251addaace90d29983b895902e292e876d1bf0ef19d8637be"
+    },
+    {
+      "repo": "alexa/massive",
+      "revision": "f966f21846043aabef9b0f974fa7970027f43738",
+      "path": "README.md",
+      "url": "https://raw.githubusercontent.com/alexa/massive/f966f21846043aabef9b0f974fa7970027f43738/README.md",
+      "size_bytes": 20710,
+      "sha256": "431e25247129a2ae3dc50ffe4dbb2ed01e30b632b9326511795ebee32cbb068b"
+    },
+    {
+      "repo": "google-research/google-research",
+      "revision": "08a8d6736475776f42ffac23b2c13111a28e5795",
+      "path": "goemotions/README.md",
+      "url": "https://raw.githubusercontent.com/google-research/google-research/08a8d6736475776f42ffac23b2c13111a28e5795/goemotions/README.md",
+      "size_bytes": 7968,
+      "sha256": "c882c69be9f400129bce8535319606434481a085be9c20263930670890e171a7"
+    },
+    {
+      "repo": "thunlp/DocRED",
+      "revision": "64622e608d06e83deda6b6e0e871effb9d1fd74c",
+      "path": "README.md",
+      "url": "https://raw.githubusercontent.com/thunlp/DocRED/64622e608d06e83deda6b6e0e871effb9d1fd74c/README.md",
+      "size_bytes": 1583,
+      "sha256": "780b8a6e0a87289358707ef16c09d9aa8cdd659acac031bd06c51c1ee200a6e1"
+    },
+    {
+      "repo": "thunlp/DocRED",
+      "revision": "64622e608d06e83deda6b6e0e871effb9d1fd74c",
+      "path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/thunlp/DocRED/64622e608d06e83deda6b6e0e871effb9d1fd74c/LICENSE",
+      "size_bytes": 1063,
+      "sha256": "c8ad3bab352bc7fd6662ac85145d613df9063c34152108aec91e1b672e7bba50"
+    },
+    {
+      "repo": "mainlp/CrossRE",
+      "revision": "a58885fa760559d2dc9e176e730fe731f020d6f3",
+      "path": "README.md",
+      "url": "https://raw.githubusercontent.com/mainlp/CrossRE/a58885fa760559d2dc9e176e730fe731f020d6f3/README.md",
+      "size_bytes": 6787,
+      "sha256": "a25e096426ca18472524530b96b55f50caa2cb4b6a52887aac698b6d9eca1576"
+    },
+    {
+      "repo": "mainlp/CrossRE",
+      "revision": "a58885fa760559d2dc9e176e730fe731f020d6f3",
+      "path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/mainlp/CrossRE/a58885fa760559d2dc9e176e730fe731f020d6f3/LICENSE",
+      "size_bytes": 35149,
+      "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+    },
+    {
+      "repo": "shun-zheng/Doc2EDAG",
+      "revision": "da4f4bc0b9a896170d7f220baf3fe85cb535a025",
+      "path": "README.md",
+      "url": "https://raw.githubusercontent.com/shun-zheng/Doc2EDAG/da4f4bc0b9a896170d7f220baf3fe85cb535a025/README.md",
+      "size_bytes": 3569,
+      "sha256": "7cb7bad1df240f5edfa928f652b5c0040eeb0f1a3d6c5dfd98280b391877cec3"
+    },
+    {
+      "repo": "shun-zheng/Doc2EDAG",
+      "revision": "da4f4bc0b9a896170d7f220baf3fe85cb535a025",
+      "path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/shun-zheng/Doc2EDAG/da4f4bc0b9a896170d7f220baf3fe85cb535a025/LICENSE",
+      "size_bytes": 1067,
+      "sha256": "a6eae8d676fc01e40d78c82d38e86f3caa5db21a124a08df8bf1a73415575b16"
+    },
+    {
+      "repo": "PaddlePaddle/PaddleNLP",
+      "revision": "3f87dac9b719f75399f92f8bf634ae2ef0611832",
+      "path": "slm/examples/information_extraction/DuEE/README.md",
+      "url": "https://raw.githubusercontent.com/PaddlePaddle/PaddleNLP/3f87dac9b719f75399f92f8bf634ae2ef0611832/slm/examples/information_extraction/DuEE/README.md",
+      "size_bytes": 11346,
+      "sha256": "af76f24e2f5aea93bc2874ad18db696a548f18715953ac0c772a65f5f861f53c"
+    },
+    {
+      "repo": "alexa/massive",
+      "revision": "f966f21846043aabef9b0f974fa7970027f43738",
+      "path": "LICENSE.txt",
+      "url": "https://raw.githubusercontent.com/alexa/massive/f966f21846043aabef9b0f974fa7970027f43738/LICENSE.txt",
+      "size_bytes": 11542,
+      "sha256": "a601496ab5359ce7ea3dacbb0652f07d7f5700081cb47e2da3fc3d1bff6393d7"
+    },
+    {
+      "repo": "alexa/massive",
+      "revision": "f966f21846043aabef9b0f974fa7970027f43738",
+      "path": "NOTICE.md",
+      "url": "https://raw.githubusercontent.com/alexa/massive/f966f21846043aabef9b0f974fa7970027f43738/NOTICE.md",
+      "size_bytes": 500,
+      "sha256": "db1466b051afd1d9ad34b7bd6346a1857f568a0c5f6534168813b4ad3c26013e"
+    },
+    {
+      "repo": "alexa/massive",
+      "revision": "f966f21846043aabef9b0f974fa7970027f43738",
+      "path": "THIRD-PARTY.md",
+      "url": "https://raw.githubusercontent.com/alexa/massive/f966f21846043aabef9b0f974fa7970027f43738/THIRD-PARTY.md",
+      "size_bytes": 11646,
+      "sha256": "36583837e567f370c4b477bd1b6bdcac50cf26bc30d9b56162e4ec9e590b75eb"
+    },
+    {
+      "repo": "tonytan48/Re-DocRED",
+      "revision": "ccfb54f5ddf5836027c87badda10f6dfc56efaac",
+      "path": "README.md",
+      "url": "https://raw.githubusercontent.com/tonytan48/Re-DocRED/ccfb54f5ddf5836027c87badda10f6dfc56efaac/README.md",
+      "size_bytes": 1536,
+      "sha256": "1be14cb05364966518b9312de1523f3498954f1d86c9d54bdec9498129b75a86"
+    }
+  ],
+  "datasets": [
+    {
+      "id": "crossner",
+      "title": "CrossNER target-domain NER",
+      "primary_url": "https://github.com/zliucr/CrossNER",
+      "source_repository": "zliucr/CrossNER",
+      "source_revision": "2e7ba2a7798c961e3f29fbc51252c5a8d40224bf",
+      "metadata_only": true,
+      "data_files": [],
+      "adapter_status": "not_implemented",
+      "schema_status": "must_freeze_full_ontology_before_test",
+      "tasks": [
+        "entities"
+      ],
+      "languages": [
+        "en"
+      ],
+      "split_policy": "Use original train/dev/test and original document identity; exclude CoNLL Reuters from this target-domain suite.",
+      "metrics": [
+        "typed_span_micro_f1",
+        "type_macro_f1",
+        "absent_query_false_positive_rate"
+      ],
+      "limitations": [
+        "BIO tokens require explicitly versioned text reconstruction; report this separately from immutable original-text offset tests.",
+        "Keep all domain ontology types, including miscellaneous; never infer per-document query labels from gold.",
+        "Overlap with CrossRE and its translations must share a global leakage family."
+      ]
+    },
+    {
+      "id": "multiconer2",
+      "title": "MultiCoNER 2 multilingual/noisy NER",
+      "primary_url": "https://registry.opendata.aws/multiconer/",
+      "source_repository": null,
+      "source_revision": null,
+      "metadata_only": true,
+      "data_files": [],
+      "adapter_status": "not_implemented",
+      "schema_status": "must_freeze_full_ontology_before_test",
+      "tasks": [
+        "entities",
+        "multilingual"
+      ],
+      "languages": [
+        "bn",
+        "de",
+        "en",
+        "es",
+        "fa",
+        "fr",
+        "hi",
+        "it",
+        "pt",
+        "sv",
+        "uk",
+        "zh"
+      ],
+      "split_policy": "Use original splits and noise/source identifiers; keep original and noisy versions together.",
+      "metrics": [
+        "typed_span_micro_f1",
+        "type_macro_f1",
+        "language_macro_f1",
+        "clean_noisy_slice_f1"
+      ],
+      "limitations": [
+        "S3 data object bytes/version are not locked yet; published 12-language/noise metadata alone does not pin corpora.",
+        "Report clean and noisy examples separately with all 36 fine-grained labels; token-based reconstructed-text scope.",
+        "Primary registry declares CC BY 4.0; preserve dataset citation and notices."
+      ]
+    },
+    {
+      "id": "semeval2014_absa",
+      "title": "SemEval-2014 Task 4 aspect terms and polarity",
+      "primary_url": "https://alt.qcri.org/semeval2014/task4/index.php?id=data-and-tools",
+      "source_repository": null,
+      "source_revision": null,
+      "metadata_only": true,
+      "data_files": [],
+      "adapter_status": "not_implemented",
+      "schema_status": "must_freeze_full_ontology_before_test",
+      "tasks": [
+        "entities",
+        "attributes"
+      ],
+      "languages": [
+        "en"
+      ],
+      "split_policy": "Use official train and labeled phase-B test; derive calibration only from grouped training reviews.",
+      "metrics": [
+        "typed_span_micro_f1",
+        "attribute_end_to_end_f1",
+        "attribute_group_macro_f1"
+      ],
+      "limitations": [
+        "Explicit from/to occurrences support repeated aspect terms; verify XML decoded text offsets byte-for-byte.",
+        "All four polarity labels, including conflict and neutral, are declared globally.",
+        "Do not pass gold aspect spans to the end-to-end worker. Gold-span conditional accuracy is a separate diagnostic.",
+        "Organizer download terms and corpus byte pins must be recorded before acquisition; do not assume a permissive mirror license."
+      ]
+    },
+    {
+      "id": "massive11",
+      "title": "MASSIVE 1.1 intent/scenario/slots",
+      "primary_url": "https://github.com/alexa/massive",
+      "source_repository": "alexa/massive",
+      "source_revision": "f966f21846043aabef9b0f974fa7970027f43738",
+      "metadata_only": true,
+      "data_files": [],
+      "adapter_status": "not_implemented",
+      "schema_status": "must_freeze_full_ontology_before_test",
+      "tasks": [
+        "entities",
+        "classification",
+        "classification_constraints",
+        "multilingual"
+      ],
+      "languages": [
+        "all_52_locales"
+      ],
+      "split_policy": "Original partition; all locales sharing the same utterance ID form one family.",
+      "metrics": [
+        "intent_accuracy",
+        "slot_span_f1",
+        "joint_intent_slot_exact_match",
+        "constraint_violation_rate",
+        "language_macro_f1"
+      ],
+      "limitations": [
+        "Use all 60 intents and 55 slot types; derive intent-to-scenario implication mapping from the declared ontology/training only.",
+        "Treat scenario as a separately predicted task when testing constraints; never feed its gold value into inference.",
+        "Preserve utt exactly; parse annot_utt to locate spans and verify complete unannotated text reconstruction.",
+        "README pins the release URL but corpus archive bytes are still unlocked; NOTICE declares data CC BY 4.0."
+      ]
+    },
+    {
+      "id": "goemotions",
+      "title": "GoEmotions multilabel classification",
+      "primary_url": "https://github.com/google-research/google-research/tree/08a8d6736475776f42ffac23b2c13111a28e5795/goemotions",
+      "source_repository": "google-research/google-research",
+      "source_revision": "08a8d6736475776f42ffac23b2c13111a28e5795",
+      "metadata_only": true,
+      "data_files": [],
+      "adapter_status": "not_implemented",
+      "schema_status": "must_freeze_full_ontology_before_test",
+      "tasks": [
+        "classification",
+        "classification_constraints"
+      ],
+      "languages": [
+        "en"
+      ],
+      "split_policy": "Use rater-agreement train/dev/test; same comment/thread and duplicate text must not cross splits.",
+      "metrics": [
+        "label_micro_f1",
+        "label_macro_f1",
+        "subset_accuracy",
+        "constraint_violation_rate"
+      ],
+      "limitations": [
+        "Keep all 28 labels and official label order. Gold labels are not a schema.",
+        "Any Ekman/higher-level task is a named derived evaluation, with fixed mapping provenance; do not silently reinterpret official scores.",
+        "Complete annotation and neutral exclusivity must be audited before imposing a hard constraint."
+      ]
+    },
+    {
+      "id": "crossre",
+      "title": "CrossRE and Multi-CrossRE",
+      "primary_url": "https://github.com/mainlp/CrossRE",
+      "source_repository": "mainlp/CrossRE",
+      "source_revision": "a58885fa760559d2dc9e176e730fe731f020d6f3",
+      "metadata_only": true,
+      "data_files": [],
+      "adapter_status": "not_implemented",
+      "schema_status": "must_freeze_full_ontology_before_test",
+      "tasks": [
+        "entities",
+        "relations",
+        "joint_ie",
+        "multilingual"
+      ],
+      "languages": [
+        "en",
+        "26_translated_languages"
+      ],
+      "split_policy": "Original splits; source doc_key shared across CrossNER, all translations and back-translations is one family.",
+      "metrics": [
+        "typed_span_f1",
+        "directed_typed_relation_f1",
+        "joint_graph_exact_match",
+        "graph_violation_rate"
+      ],
+      "limitations": [
+        "Evaluate end-to-end predicted endpoints separately from official gold-entity relation classification.",
+        "Machine translated corpus and native-speaker-checked subset are distinct slices.",
+        "JointIE typed endpoint/graph validity can be tested; no domain-wide functional or acyclic constraint may be invented from one gold example.",
+        "Repository license is GPL-3.0; record data-specific terms separately and do not copy baseline implementation into native runtime."
+      ]
+    },
+    {
+      "id": "redocred",
+      "title": "Re-DocRED document-level relations",
+      "primary_url": "https://github.com/tonytan48/Re-DocRED",
+      "source_repository": "tonytan48/Re-DocRED",
+      "source_revision": "ccfb54f5ddf5836027c87badda10f6dfc56efaac",
+      "metadata_only": true,
+      "data_files": [],
+      "adapter_status": "not_implemented",
+      "schema_status": "must_freeze_full_ontology_before_test",
+      "tasks": [
+        "relations",
+        "joint_ie",
+        "long_document"
+      ],
+      "languages": [
+        "en"
+      ],
+      "split_policy": "Use official revised train/dev/test and source Wikipedia document identity; audit original DocRED overlap.",
+      "metrics": [
+        "official_cluster_relation_f1",
+        "mention_endpoint_coverage",
+        "graph_validity",
+        "sentence_distance_slice_f1"
+      ],
+      "limitations": [
+        "Score cluster triples only after mapping predicted mentions to gold clusters in the evaluator. No gold clusters/endpoints enter inference.",
+        "One arbitrary mention per cluster is not a valid occurrence-level ground truth.",
+        "Documents span multiple sentences; measure actual 4096-word overflow coverage rather than assuming this tests the native long-window extension.",
+        "Underlying Wikipedia/DocRED data terms and exact revised file bytes remain to be locked."
+      ]
+    },
+    {
+      "id": "wikievents",
+      "title": "WikiEvents natural event records",
+      "primary_url": "https://github.com/raspberryice/gen-arg",
+      "source_repository": "raspberryice/gen-arg",
+      "source_revision": "253e0889b2377e0f7084cb406cf5d4142ee8a365",
+      "metadata_only": true,
+      "data_files": [],
+      "adapter_status": "not_implemented",
+      "schema_status": "must_freeze_full_ontology_before_test",
+      "tasks": [
+        "records_natural",
+        "entities",
+        "long_document"
+      ],
+      "languages": [
+        "en"
+      ],
+      "split_policy": "Use official train/dev/test; document and coreference-family IDs remain together.",
+      "metrics": [
+        "record_exact_multiset_f1",
+        "natural_anchor_f1",
+        "role_argument_f1",
+        "official_head_coreference_argument_f1"
+      ],
+      "limitations": [
+        "Declare full event/role ontology per frozen schema; do not choose event types from test annotations.",
+        "Natural anchor is the explicit event trigger; reference argument extraction with gold triggers is a separate task, not end-to-end record extraction.",
+        "Full-span and head/coreference official scoring differ; preserve both metric identities.",
+        "S3 corpus objects are mutable URLs until exact bytes/version and terms are locked."
+      ]
+    },
+    {
+      "id": "doc2edag",
+      "title": "Doc2EDAG / ChFinAnn trigger-free event tables",
+      "primary_url": "https://github.com/shun-zheng/Doc2EDAG",
+      "source_repository": "shun-zheng/Doc2EDAG",
+      "source_revision": "da4f4bc0b9a896170d7f220baf3fe85cb535a025",
+      "metadata_only": true,
+      "data_files": [],
+      "adapter_status": "not_implemented",
+      "schema_status": "must_freeze_full_ontology_before_test",
+      "tasks": [
+        "records_latent",
+        "records_anchorless",
+        "long_document",
+        "multilingual"
+      ],
+      "languages": [
+        "zh"
+      ],
+      "split_policy": "Use official document splits and announcement/company/document families.",
+      "metrics": [
+        "record_exact_multiset_f1",
+        "role_value_f1",
+        "record_count_error",
+        "multi_record_slice_f1"
+      ],
+      "limitations": [
+        "Distant supervision and semantic event tables can omit occurrence identity; qualify semantic records only unless occurrence annotations are added.",
+        "Run latent and anchorless modes as separate frozen model/schema profiles against identical record gold; never manufacture a natural trigger.",
+        "Keep repeated record multiplicity; exact record matching must not collapse a multiset into a set.",
+        "Long-window coverage must be measured from actual source word/token lengths; reconstructed text policy must be pinned."
+      ]
+    },
+    {
+      "id": "dueefin",
+      "title": "DuEE-Fin records with enumerated attributes",
+      "primary_url": "https://github.com/PaddlePaddle/PaddleNLP/blob/3f87dac9b719f75399f92f8bf634ae2ef0611832/slm/examples/information_extraction/DuEE/README.md",
+      "source_repository": "PaddlePaddle/PaddleNLP",
+      "source_revision": "3f87dac9b719f75399f92f8bf634ae2ef0611832",
+      "metadata_only": true,
+      "data_files": [],
+      "adapter_status": "not_implemented",
+      "schema_status": "must_freeze_full_ontology_before_test",
+      "tasks": [
+        "records_natural",
+        "records_latent",
+        "records_anchorless",
+        "enum",
+        "long_document",
+        "multilingual"
+      ],
+      "languages": [
+        "zh"
+      ],
+      "split_policy": "Use published training/dev splits; held-out test labels/download access must be verified with the original competition.",
+      "metrics": [
+        "record_exact_multiset_f1",
+        "enum_role_accuracy",
+        "role_argument_f1",
+        "required_field_violation_rate"
+      ],
+      "limitations": [
+        "Primary baseline explicitly separates trigger, arguments and source-free enum role 环节.",
+        "Freeze all 13 event types, role cardinalities and enum vocabulary from released ontology/training before evaluation.",
+        "A labeled accessible holdout is not established by the README. If test gold is unavailable, split grouped training/dev prospectively and label result as derived.",
+        "Removing triggers for latent/anchorless evaluation is an explicit schema ablation, not the official task."
+      ]
+    }
+  ],
+  "required_additional_corpora": [
+    "production_schema_and_document_formats",
+    "all_constraint_AST_operators_with_feasible_and_infeasible_gold",
+    "typed_JointIE_cycles_symmetry_inverse_cardinality_and_degree_policies",
+    "natural_record_exclusive_resources_with_repeated_anchors",
+    "latent_anchorless_exact_occurrence_and_source_free_duplicate_identity",
+    "schema_description_instruction_example_and_regex_validator_slices",
+    "real_multilingual_attributes_and_mixed_task_documents",
+    "human_annotated_over_4096_word_documents_with_cross_window_relations_and_record_fields"
+  ],
+  "remaining_before_runs": [
+    "Acquire authorized exact corpus bytes and preserve per-file digests/notices.",
+    "Implement and review deterministic dataset adapters and official metric mappings.",
+    "Freeze schemas, prompts, thresholds and decoder/window settings on training/calibration only.",
+    "Audit global document, translation, normalized-duplicate and benchmark-smoke exclusion groups.",
+    "Execute actual labeled holdouts with model/bundle/backend/token provenance and complete coverage.",
+    "Run grouped paired bootstrap and freeze task/slice-specific quality floors before opening final test results."
+  ],
+  "pretraining_contamination_status": "unknown; local split audit cannot prove synthetic teacher/pretraining exclusion"
+}

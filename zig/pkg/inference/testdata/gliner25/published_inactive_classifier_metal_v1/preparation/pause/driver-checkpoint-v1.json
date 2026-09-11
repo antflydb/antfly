@@ -1,0 +1,63 @@
+{
+  "format": "antfly.gliner25-metal-pause-driver-checkpoint/v1",
+  "model_execution": false,
+  "files": {
+    "README.md": {
+      "size_bytes": 3309,
+      "sha256": "4e0c7e976cbefa55a8f61c4718b79b9b5fb66fad0d1b29b9e5b617618df2ce07"
+    },
+    "cpu_reference.py": {
+      "size_bytes": 34287,
+      "sha256": "e0b67790bf99aee80f43d9ff7e752cc7b49dd6715ca629fdbf1767b1d658fabf"
+    },
+    "dora-paused.json": {
+      "size_bytes": 2944,
+      "sha256": "e571dc8c36909dde1f9cacbed7919b056bf1066ad64ea29fe0bfb8a1eda5a1f1"
+    },
+    "lora-paused.json": {
+      "size_bytes": 2944,
+      "sha256": "f028629767e125abea0d83865a43ff720610ef5d6c076a5fa60627fc81417e39"
+    },
+    "metal_pause.py": {
+      "size_bytes": 13367,
+      "sha256": "4dab497e4ebcb25ce79e1235558da029fd690e611392cbbadf620af259a1808b"
+    },
+    "preparation.json": {
+      "size_bytes": 5678,
+      "sha256": "b75921b2a0e88de90fdf0ed58a9ec4207202f028d0d45efe128b8f8df90db03c"
+    },
+    "pure-tests-v1.log": {
+      "size_bytes": 1086,
+      "sha256": "59f22fecdf1356ea559b5ddb42cfc290b53748cd90bc9f136fc169e6e6c6eff7"
+    },
+    "source_identity.json": {
+      "size_bytes": 687,
+      "sha256": "54c5df9eb69e7ee8a180e1db35f3b55694de9822a466d3c3f1b0c3d95a88a308"
+    },
+    "supervision.py": {
+      "size_bytes": 12474,
+      "sha256": "a937237975be2ed879f62afd285494ccb51a7c1d7cc1dff7160621fb26b87332"
+    },
+    "test_metal_pause.py": {
+      "size_bytes": 6111,
+      "sha256": "e800ec3c7c77bb4c3c82bb1e791012dc27e720df2128835b34232158425e8317"
+    },
+    "train.jsonl": {
+      "size_bytes": 1122,
+      "sha256": "377177ee889c4e426eeeccc4dc551437999aa702b8a5055c233aaee8936c54c7"
+    }
+  },
+  "tests": {
+    "pure_contracts": 6,
+    "status": "pass",
+    "log": "pure-tests-v1.log"
+  },
+  "supervisor_lifetime": "identical a937... copied from qualified CPU preparation; no new lifetime code",
+  "command": [
+    "/private/tmp/antfly-gliner25-oracle-venv/bin/python",
+    "/private/tmp/antfly-gliner25-training-inactive-published-small-metal-v1/metal_pause.py",
+    "run",
+    "--mode",
+    "lora"
+  ]
+}

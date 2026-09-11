@@ -1,0 +1,425 @@
+{
+  "format": "antfly.gliner25-training-run/v1",
+  "config": {
+    "version": 1,
+    "source_dir": "/private/tmp/antfly-gliner25-models/small",
+    "train_file": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/train.jsonl",
+    "output_dir": "/private/tmp/antfly-gliner25-regional-all-small-native-v2/lora-uninterrupted",
+    "calibration_file": null,
+    "test_file": null,
+    "resume_from": null,
+    "expected_restore_state_sha256": null,
+    "expected_source": {
+      "backbone": "small",
+      "precision": "fp32",
+      "weight": {
+        "size_bytes": 295567700,
+        "sha256": "4ee982787ace270d4bf15dbcb28ced38e0aa201372347114ceedd6336055de2b"
+      },
+      "sidecars": [
+        {
+          "size_bytes": 3152,
+          "sha256": "0b7d9e1401ceeb83e992ec66d2f93bff7e5646428f1b4706ec527cf88f53578a"
+        },
+        {
+          "size_bytes": 856,
+          "sha256": "db837d0dc587f5858687ef860c1f400de10f3c3e44f88daef8cbda80d74e4c9c"
+        },
+        {
+          "size_bytes": 8341713,
+          "sha256": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3"
+        },
+        {
+          "size_bytes": 645,
+          "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1"
+        }
+      ]
+    },
+    "run": {
+      "mode": "lora",
+      "epochs": 1,
+      "max_optimizer_steps": null,
+      "batch_size": 1,
+      "accumulation": 2,
+      "encoder_lr": 0.000009999999747378752,
+      "task_lr": 0.0005000000237487257,
+      "weight_decay": 0.009999999776482582,
+      "beta1": 0.8999999761581421,
+      "beta2": 0.9990000128746033,
+      "epsilon": 0.00000000999999993922529,
+      "max_grad_norm": 0.699999988079071,
+      "scheduler": "constant",
+      "num_cycles": 0.5,
+      "warmup_steps": 0,
+      "warmup_ratio": 0,
+      "seed": 257713,
+      "shuffle": false,
+      "adapter_config_sha256": null
+    },
+    "execution": "native",
+    "attention_profile": "replay_tiled_v1",
+    "activation_profile": "layer_recompute_v1",
+    "peft": {
+      "kind": "lora",
+      "mode": "train",
+      "rank": 2,
+      "alpha": 3,
+      "dropout": 0,
+      "targets": [
+        "encoder",
+        "all_task_heads"
+      ]
+    },
+    "tokenization": {
+      "max_text_words": 128,
+      "max_sequence_tokens": 512,
+      "max_queries": 64,
+      "word_splitter": "whitespace"
+    },
+    "capacities": {
+      "pool": null,
+      "gold_per_query": null
+    },
+    "weights": {
+      "start": 1,
+      "end": 1,
+      "pair": 1,
+      "inside": 0.5
+    },
+    "gold_start": 1,
+    "gold_end": 1,
+    "gold_hold_fraction": 0,
+    "require_gold_relation_coverage": false,
+    "source_limits": {
+      "max_source_bytes": 536870912,
+      "max_auxiliary_bytes": 134217728,
+      "max_weight_bytes": 335544320,
+      "max_tokenizer_bytes": 16777216,
+      "max_config_bytes": 1048576,
+      "max_header_bytes": 4194304,
+      "max_json_depth": 64
+    },
+    "export_limits": {
+      "max_scratch_bytes": 16777216,
+      "max_output_bytes": 4194304,
+      "max_header_bytes": 1048576,
+      "max_config_bytes": 131072,
+      "max_receipt_bytes": 65536,
+      "max_adapter_bytes": 2097152,
+      "max_slots": 512
+    },
+    "dataset_limits": {
+      "max_file_bytes": 1048576,
+      "max_host_bytes": 4194304,
+      "max_row_bytes": 65536,
+      "max_examples": 16,
+      "max_id_bytes": 256,
+      "max_text_bytes": 4096,
+      "max_annotations": 128,
+      "max_json_depth": 64
+    },
+    "memory": {
+      "host_bytes": 805306368,
+      "backend_bytes": 1073741824,
+      "backend_metadata_bytes": 67108864,
+      "combined_bytes": 3221225472,
+      "optimizer_state_bytes": 33554432,
+      "optimizer_transaction_bytes": 33554432,
+      "job_bytes": 33554432
+    },
+    "training_limits": {
+      "version": 1,
+      "max_recomputed_batch_scratch_bytes": 67108864,
+      "encoder": {
+        "input": {
+          "max_batch": 8,
+          "max_sequence_tokens": 16384,
+          "max_batch_tokens": 65536,
+          "max_text_words": 8192,
+          "max_queries": 256,
+          "max_classification_labels": 512,
+          "max_groups": 64,
+          "max_relations": 64,
+          "max_encoder_output_bytes": 134217728,
+          "max_routed_bytes": 134217728,
+          "max_attention_work_items": 4294967296,
+          "max_attention_scratch_bytes": 8388608
+        },
+        "max_attention_score_elements": 67108864,
+        "max_dropout_mask_bytes": 536870912,
+        "max_forward_tensor_bytes": 4294967296,
+        "max_constant_bytes": 536870912
+      },
+      "head_graph": {
+        "max_nodes": 100000,
+        "max_tensor_elements": 67108864,
+        "max_graph_elements": 536870912,
+        "max_constant_bytes": 67108864,
+        "max_attention_elements": 16777216
+      },
+      "step": {
+        "recomputation": {
+          "max_regions": 13,
+          "max_source_nodes": 1000000,
+          "max_plan_host_bytes": 134217728,
+          "max_compile_bytes": 536870912,
+          "max_checkpoint_bytes": 67108864,
+          "max_gradient_bytes": 67108864,
+          "max_backend_bytes": 1073741824,
+          "max_host_bytes": 2147483648,
+          "max_total_work": 4398046511104
+        },
+        "replay": {
+          "max_source_nodes": 1000000,
+          "max_recipes": 16384,
+          "max_candidates": 65536,
+          "max_name_bytes": 1024,
+          "max_host_bytes": 16777216,
+          "max_mask_bytes": 16777216,
+          "max_explicit_bytes": 536870912,
+          "max_work_items": 268435456
+        },
+        "max_outputs": 8192,
+        "max_dropout_sites": 16384,
+        "max_record_groups": 4096,
+        "max_relation_pairs": 65536,
+        "max_step_host_bytes": 134217728,
+        "max_step_work": 524288000,
+        "max_total_host_bytes": 805306368,
+        "transfers": {
+          "max_upload_bytes": 268435456,
+          "max_readback_bytes": 134217728
+        }
+      },
+      "differentiation": {
+        "gradient": {
+          "max_forward_nodes": 1000000,
+          "max_gradient_nodes": 4000000
+        },
+        "max_tape_bytes": 268435456,
+        "max_cotangent_bytes": 67108864
+      },
+      "resident": {
+        "program": {
+          "instruction": {
+            "primitive": {
+              "max_tensor_bytes": 1073741824,
+              "max_scatter_work": 67108864,
+              "max_index_metadata_bytes": 134217728
+            },
+            "max_instruction_work": 1099511627776,
+            "max_scratch_bytes": 536870912
+          },
+          "max_source_nodes": 262144,
+          "max_program_nodes": 131072,
+          "max_outputs": 4096,
+          "max_compile_bytes": 268435456,
+          "max_constant_bytes": 67108864,
+          "max_binding_bytes": 8589934592,
+          "max_working_bytes": 536870912,
+          "max_capture_bytes": 1073741824,
+          "max_device_bytes": 10737418240,
+          "max_host_metadata_bytes": 268435456,
+          "max_total_work": 4398046511104
+        },
+        "max_compile_bytes": 1073741824,
+        "max_device_bytes": 8589934592,
+        "max_host_metadata_bytes": 268435456
+      }
+    },
+    "checkpoint_every_microbatches": 1,
+    "timeout_seconds": 1800,
+    "max_progress_bytes": 1048576,
+    "disk_headroom_bytes": 268435456
+  },
+  "backend": "native",
+  "math_policy": "strict_f32_activations_v1",
+  "training_contract": "boundary-native-training-v1",
+  "observed_executable": {
+    "path": "/private/tmp/antfly-gliner25-runtime-regional-v2/bin/train-gliner25",
+    "digest": {
+      "size_bytes": 10945056,
+      "sha256": [
+        146,
+        162,
+        129,
+        108,
+        223,
+        74,
+        61,
+        135,
+        131,
+        133,
+        6,
+        195,
+        35,
+        45,
+        101,
+        21,
+        234,
+        219,
+        100,
+        186,
+        105,
+        118,
+        198,
+        134,
+        176,
+        211,
+        220,
+        168,
+        89,
+        95,
+        21,
+        242
+      ]
+    }
+  },
+  "zig_version": "0.16.0",
+  "architecture": "aarch64",
+  "operating_system": "macos",
+  "source": {
+    "backbone": "small",
+    "precision": "fp32",
+    "weight": {
+      "size_bytes": 295567700,
+      "sha256": "4ee982787ace270d4bf15dbcb28ced38e0aa201372347114ceedd6336055de2b"
+    },
+    "sidecars": [
+      {
+        "size_bytes": 3152,
+        "sha256": "0b7d9e1401ceeb83e992ec66d2f93bff7e5646428f1b4706ec527cf88f53578a"
+      },
+      {
+        "size_bytes": 856,
+        "sha256": "db837d0dc587f5858687ef860c1f400de10f3c3e44f88daef8cbda80d74e4c9c"
+      },
+      {
+        "size_bytes": 8341713,
+        "sha256": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3"
+      },
+      {
+        "size_bytes": 645,
+        "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1"
+      }
+    ]
+  },
+  "train_sha256": [
+    55,
+    113,
+    119,
+    238,
+    136,
+    156,
+    78,
+    66,
+    110,
+    238,
+    204,
+    196,
+    220,
+    85,
+    20,
+    55,
+    153,
+    154,
+    167,
+    2,
+    184,
+    165,
+    5,
+    92,
+    35,
+    58,
+    174,
+    232,
+    147,
+    108,
+    84,
+    199
+  ],
+  "schema_sha256": [
+    97,
+    27,
+    135,
+    244,
+    253,
+    173,
+    4,
+    113,
+    139,
+    5,
+    221,
+    244,
+    28,
+    137,
+    231,
+    81,
+    114,
+    62,
+    237,
+    72,
+    133,
+    144,
+    6,
+    9,
+    140,
+    135,
+    34,
+    243,
+    84,
+    132,
+    22,
+    63
+  ],
+  "calibration_sha256": null,
+  "test_sha256": null,
+  "run_fingerprint": [
+    134,
+    72,
+    225,
+    26,
+    133,
+    213,
+    202,
+    246,
+    10,
+    89,
+    175,
+    228,
+    31,
+    242,
+    123,
+    12,
+    41,
+    48,
+    221,
+    154,
+    5,
+    114,
+    49,
+    149,
+    176,
+    213,
+    19,
+    204,
+    80,
+    119,
+    170,
+    57
+  ],
+  "initial_identity": {
+    "optimizer_step": 0,
+    "microbatch_step": 0
+  },
+  "restore_receipt": null,
+  "admitted_bytes": 2354931717,
+  "source_usage": {
+    "reserved_bytes": 438134789,
+    "live_bytes": 345498917,
+    "peak_bytes": 395864513
+  },
+  "portable_export": "model",
+  "declared_split_preflight": "all_splits",
+  "evaluation_performed": false
+}

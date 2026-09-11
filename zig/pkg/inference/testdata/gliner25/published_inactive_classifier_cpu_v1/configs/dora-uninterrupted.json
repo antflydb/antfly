@@ -1,0 +1,116 @@
+{
+  "version": 1,
+  "source_dir": "/private/tmp/antfly-gliner25-models/small",
+  "train_file": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/train.jsonl",
+  "output_dir": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-uninterrupted",
+  "expected_source": {
+    "backbone": "small",
+    "precision": "fp32",
+    "weight": {
+      "sha256": "4ee982787ace270d4bf15dbcb28ced38e0aa201372347114ceedd6336055de2b",
+      "size_bytes": 295567700
+    },
+    "sidecars": [
+      {
+        "sha256": "0b7d9e1401ceeb83e992ec66d2f93bff7e5646428f1b4706ec527cf88f53578a",
+        "size_bytes": 3152
+      },
+      {
+        "sha256": "db837d0dc587f5858687ef860c1f400de10f3c3e44f88daef8cbda80d74e4c9c",
+        "size_bytes": 856
+      },
+      {
+        "sha256": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3",
+        "size_bytes": 8341713
+      },
+      {
+        "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1",
+        "size_bytes": 645
+      }
+    ]
+  },
+  "execution": "native",
+  "run": {
+    "mode": "dora",
+    "epochs": 1,
+    "batch_size": 1,
+    "accumulation": 2,
+    "scheduler": "constant",
+    "seed": 257713,
+    "shuffle": false,
+    "warmup_steps": 0,
+    "warmup_ratio": 0,
+    "encoder_lr": 1e-05,
+    "task_lr": 0.0005,
+    "weight_decay": 0.01,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "epsilon": 1e-08,
+    "max_grad_norm": 0.7
+  },
+  "peft": {
+    "kind": "dora",
+    "mode": "train",
+    "rank": 2,
+    "alpha": 3,
+    "dropout": 0,
+    "targets": [
+      "classification_head"
+    ]
+  },
+  "tokenization": {
+    "max_text_words": 128,
+    "max_sequence_tokens": 512,
+    "max_queries": 64,
+    "word_splitter": "whitespace"
+  },
+  "capacities": {
+    "pool": null,
+    "gold_per_query": null
+  },
+  "weights": {
+    "start": 1,
+    "end": 1,
+    "pair": 1,
+    "inside": 0.5
+  },
+  "gold_start": 1,
+  "gold_end": 1,
+  "gold_hold_fraction": 0,
+  "require_gold_relation_coverage": false,
+  "source_limits": {
+    "max_source_bytes": 536870912,
+    "max_auxiliary_bytes": 134217728,
+    "max_weight_bytes": 335544320,
+    "max_tokenizer_bytes": 16777216
+  },
+  "dataset_limits": {
+    "max_file_bytes": 1048576,
+    "max_host_bytes": 4194304,
+    "max_examples": 16,
+    "max_row_bytes": 65536,
+    "max_text_bytes": 4096,
+    "max_annotations": 128
+  },
+  "memory": {
+    "host_bytes": 134217728,
+    "backend_bytes": 134217728,
+    "backend_metadata_bytes": 67108864,
+    "combined_bytes": 1073741824,
+    "optimizer_state_bytes": 33554432,
+    "optimizer_transaction_bytes": 268435456,
+    "job_bytes": 16777216
+  },
+  "export_limits": {
+    "max_scratch_bytes": 8388608,
+    "max_output_bytes": 4194304,
+    "max_adapter_bytes": 1048576
+  },
+  "training_limits": {
+    "version": 1
+  },
+  "checkpoint_every_microbatches": 1,
+  "timeout_seconds": 1800,
+  "max_progress_bytes": 1048576,
+  "disk_headroom_bytes": 268435456
+}

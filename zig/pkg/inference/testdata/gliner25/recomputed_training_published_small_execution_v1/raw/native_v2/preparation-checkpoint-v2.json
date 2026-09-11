@@ -1,0 +1,104 @@
+{
+  "format": "antfly.gliner25-regional-all-native-preparation-checkpoint/v2",
+  "campaign_version": 2,
+  "model_execution": false,
+  "executable_bound": false,
+  "previous_campaign_unchanged": true,
+  "previous_files_verified": 37,
+  "configuration_changes": "Only output/resume paths differ from v1; all source/data/semantic fields and all caps remain unchanged.",
+  "files": {
+    "README.md": {
+      "size_bytes": 5858,
+      "sha256": "1d6fd89ff547e4d5abc9ddb5466cc691c1eaf17a15621a2911d50c342ff04d01"
+    },
+    "checker-tests-v2.log": {
+      "size_bytes": 1949,
+      "sha256": "0b1ac42bd29a0a2b55cb0eb351334a28a42d0fde7ce31f5dd00d15707859265f"
+    },
+    "checker.py": {
+      "size_bytes": 33761,
+      "sha256": "60adde833efdf20a0e12bbdf8bea0c04c036c5a8149b6152e3501ebc8308f766"
+    },
+    "dora-paused.json": {
+      "size_bytes": 3689,
+      "sha256": "e2da4bc9d47e90ae2bbeea03ca5dffb8573567621811ffed21542c6378d9133a"
+    },
+    "dora-resumed.template.json": {
+      "size_bytes": 3890,
+      "sha256": "a1c5ef4b91adf0c713c1092d2a94c2c7df292e36c8959f9c7577484fd230db86"
+    },
+    "dora-uninterrupted.json": {
+      "size_bytes": 3696,
+      "sha256": "9fe6220b5377cbfac42f97e7070ccb6ac5cbc583c54fce8708d9a854c29efca7"
+    },
+    "helper_origin.json": {
+      "size_bytes": 983,
+      "sha256": "956c9a38b3030a539515db78a2e29273dfad1cea5a242f69f073299d2a7d9ace"
+    },
+    "inspect-v2.json": {
+      "size_bytes": 309,
+      "sha256": "8bd1c2d66c0d30c133b7aeb9c2313da02499b97cd8f336b6b472c27a4fc7d479"
+    },
+    "inventory.json": {
+      "size_bytes": 260137,
+      "sha256": "bbfb8f455025faa551dcd01febf55ea11354f7489474a3f7514992293f9fc249"
+    },
+    "lora-paused.json": {
+      "size_bytes": 3689,
+      "sha256": "e4ff01676d8a84c731662a78856778f04b13445234188771b6ef64d8196a8e46"
+    },
+    "lora-resumed.template.json": {
+      "size_bytes": 3890,
+      "sha256": "2b6d663ca15478980a158df6b8b9f8ba2800df75a63cf98cef4becd18ea101c0"
+    },
+    "lora-uninterrupted.json": {
+      "size_bytes": 3696,
+      "sha256": "070aceef1aec822cc812ae4a97e3e36c671a9b8f6c9a92b51e7337abfac96d6f"
+    },
+    "preparation.json": {
+      "size_bytes": 5139,
+      "sha256": "d96cb14c5c1636a7f04949d8ac9e6fd6e735cfeae582e9e7249920b3258c5b07"
+    },
+    "prepare.py": {
+      "size_bytes": 11031,
+      "sha256": "60a1ebbbca42e5f3118c066e90e2dc2120d3f08d5c6809664f10b1b537ca3887"
+    },
+    "prior_campaign.json": {
+      "size_bytes": 6330,
+      "sha256": "1b2379380a7942087c44443ea6d7fec5eb1ba7449acb13a6747fdacf44432f11"
+    },
+    "qualification_plan.json": {
+      "size_bytes": 5839,
+      "sha256": "0cab487a319992dd868efdb66d5121a37e1a8e542b9ea725f5b699150cb2ce13"
+    },
+    "resource_plan.json": {
+      "size_bytes": 7984,
+      "sha256": "22d071cacd0ddf1d2f472bfe23dd1554882f67ae451c3cb75b654fc5ca82d335"
+    },
+    "run_phase.py": {
+      "size_bytes": 26472,
+      "sha256": "eabd4518fa11c98ff77ef50356e64fd66ddc57d465f66a75851f63e5d34104a2"
+    },
+    "test_checker.py": {
+      "size_bytes": 17498,
+      "sha256": "fb9c1fa9044191442cbc38e53c6b89ba414be3c0a830da313c9601b9c130f65e"
+    }
+  },
+  "tests": {
+    "passed": 12,
+    "failed": 0,
+    "log": "checker-tests-v2.log",
+    "scope": "Bounded synthetic checker and binding tests; no models."
+  },
+  "first_phase_command": [
+    "/private/tmp/antfly-gliner25-oracle-venv/bin/python",
+    "/private/tmp/antfly-gliner25-regional-all-small-native-v2/run_phase.py",
+    "run",
+    "--mode",
+    "lora",
+    "--phase",
+    "paused"
+  ],
+  "binding_requires": "Fresh production executable excluding f482 and older; all prepared formula pins match frozen build inventory.",
+  "execution_owner": "Root after fresh artifact binding and serial build handoff."
+}

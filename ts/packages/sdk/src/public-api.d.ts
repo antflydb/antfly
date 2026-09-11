@@ -2360,6 +2360,13 @@ export interface paths {
          *     text/document classification, token classification, and structured
          *     document extraction.
          *
+         *     Set `schema_version: 2` for strict mixed-task schemas, span attributes,
+         *     constrained classification, typed records and JointIE. Each input may
+         *     replace the shared schema/options. Offsets default to half-open UTF-8
+         *     bytes, and text content parts are joined by a single newline. Inputs
+         *     are validated atomically. Unsupported features and long documents are
+         *     rejected explicitly; windowing requires runtime support.
+         *
          *     Image-backed extraction uses the same byte-reserving and image-count-weighted
          *     admission policy as `/read`, before model resolution or download. Text-only
          *     extraction consumes one admission unit.
@@ -13372,6 +13379,10 @@ export interface components {
             retryable?: boolean;
             /** @description Minimum retry delay in milliseconds */
             retry_after_ms?: number;
+            /** @description Input whose atomic extraction validation or decoding failed, when known */
+            input_index?: number;
+            /** @description Extraction failure stage, when known */
+            stage?: string;
         };
         /** @description Actionable retry contract for temporary inference-capacity failures. */
         InferenceTransientCapacityError: {
@@ -14939,51 +14950,109 @@ export interface components {
         ExtensionError: {
             error: string;
         };
+        /**
+         * @description Omission preserves the legacy extraction contract. Version 2 opts into strict mixed-task schemas, per-input replacements and explicit offsets; the selected model/runtime must support every requested feature.
+         * @default 1
+         * @enum {integer}
+         */
+        ExtractionSchemaVersion: 1 | 2;
         ExtractionToken: {
             text: string;
             box?: number[];
         };
-        ExtractionInput: {
-            id?: string;
-            content: components["schemas"]["ChatMessageContent"];
-            tokens?: components["schemas"]["ExtractionToken"][];
-            metadata?: {
-                [key: string]: unknown;
-            };
-        };
+        /** Format: double */
+        ExtractionProbability: number;
         /** @description Optional source and target labels constrain relation endpoints. A target requires a source. */
         ExtractionRelationSchema: {
             type: string;
             source?: string;
             target?: string;
+            /** @description Version 2 model-facing relation description. */
+            description?: string;
+            threshold?: components["schemas"]["ExtractionProbability"];
         };
+        ExtractionLabelDefinition: {
+            /** @description Model-facing label description. */
+            description?: string;
+        };
+        /**
+         * Format: double
+         * @description Finite centered-logit decisions require a threshold strictly between zero and one.
+         */
+        ExtractionDecisionProbability: number;
+        ExtractionClassificationExample: {
+            input: string;
+            label: string;
+        } | string[];
         ExtractionClassificationSchema: {
             name: string;
             labels: string[];
-            /**
-             * @description When false, return the highest-ranked labels up to `top_k` (one by
-             *     default). When true, return every label meeting `options.threshold`.
-             * @default false
-             */
+            /** @description The server uses false when omitted. Version 1: return highest-ranked labels up to top_k when false, or labels meeting options.threshold when true. Version 2: selects ordinary single or multi classification unless mode is specified; classification.threshold controls the decision threshold. */
             multi_label?: boolean;
-            /**
-             * @description NLI hypothesis template for this named taxonomy. Use `{}` as the
-             *     candidate-label placeholder. Non-NLI extractors ignore this field.
-             * @default This example is {}.
-             */
+            /** @description Version 1 NLI hypothesis template with {} as the label placeholder; the server uses "This example is {}." when omitted. Version 2 GLiNER boundary extraction rejects an explicit hypothesis_template; use prompt/instruction and label_definitions for model conditioning. */
             hypothesis_template?: string;
-            /**
-             * @description Maximum labels returned for single-label classification. Ignored
-             *     when `multi_label` is true, where `options.threshold` controls the
-             *     returned set.
-             * @default 1
-             */
+            /** @description Maximum labels for ordinary single-label classification; the server uses 1 when omitted. Version 2 constrained or ordinal selection uses min_labels/max_labels. Advanced set-selection options or cross-task constraints on any classification in the collection reject every explicit top_k in that collection, including 1. Omit top_k when using these options. */
             top_k?: number;
+            /**
+             * @description Version 2 classification mode. Ordinal labels are ordered from lowest to highest.
+             * @enum {string}
+             */
+            mode?: "single" | "multi" | "ordinal";
+            label_definitions?: {
+                [key: string]: components["schemas"]["ExtractionLabelDefinition"];
+            };
+            min_labels?: number;
+            /** @description Version 2 maximum selected labels. Explicit null means no maximum; omission preserves mode defaults. */
+            max_labels?: number | null;
+            ordered?: boolean;
+            threshold?: components["schemas"]["ExtractionDecisionProbability"];
+            candidate_threshold?: components["schemas"]["ExtractionProbability"];
+            /** @enum {string} */
+            activation?: "auto" | "sigmoid" | "softmax";
+            /** Format: double */
+            temperature?: number;
+            /** @description Version 2 fallback label; must be declared in labels. */
+            default?: string;
+            /** @description Version 2 model-facing task instruction. Mutually exclusive with instruction. */
+            prompt?: string;
+            /** @description Alias of prompt. */
+            instruction?: string;
+            examples?: components["schemas"]["ExtractionClassificationExample"][];
+        };
+        ExtractionRegexValidator: {
+            /** @enum {string} */
+            type?: "regex";
+            pattern: string;
+            /**
+             * @default full
+             * @enum {string}
+             */
+            mode?: "full" | "partial";
+            /** @default false */
+            exclude?: boolean;
+            /**
+             * @description Python-compatible regex flags supported by the active bounded validator engine; unsupported flags or syntax fail validation.
+             * @default 2
+             */
+            flags?: number;
         };
         ExtractionStructureField: string | ({
             /** @enum {string} */
             type?: "str" | "string" | "list" | "array";
             enum?: string[];
+            /** @enum {string} */
+            dtype?: "str" | "list";
+            choices?: string[];
+            description?: string;
+            threshold?: components["schemas"]["ExtractionProbability"];
+            /**
+             * @description Version 2 explicit cardinality. Required fields are validated after record assignment.
+             * @enum {string}
+             */
+            cardinality?: "optional_one" | "required_one" | "zero_or_more" | "one_or_more";
+            /** @description Version 2 field spans cannot be assigned to multiple record instances. */
+            exclusive?: boolean;
+            validators?: components["schemas"]["ExtractionRegexValidator"][];
         } & {
             [key: string]: unknown;
         });
@@ -14991,13 +15060,302 @@ export interface components {
             fields: {
                 [key: string]: components["schemas"]["ExtractionStructureField"];
             };
+            /**
+             * @description Version 2 record grouping. Omission preserves one-record extraction.
+             * @enum {string}
+             */
+            mode?: "natural" | "latent" | "anchorless";
+            /** @description Natural mode only; defaults to the first declared field. */
+            anchor?: string;
+            /** @enum {string} */
+            occurrence_policy?: "all" | "first" | "error_on_ambiguous" | "latent_all";
         } & {
             [key: string]: unknown;
         };
+        ExtractionEntityDefinition: {
+            description?: string;
+            /** @enum {string} */
+            dtype?: "str" | "list";
+            /** @enum {string} */
+            type?: "str" | "string" | "list" | "array";
+            threshold?: components["schemas"]["ExtractionProbability"];
+            validators?: components["schemas"]["ExtractionRegexValidator"][];
+        };
+        /** @description Version 2 attributes are scored on retained entity spans using shared encoded states. Omitted applies_to selects all entities; [] selects none. Raw labels must be unique across groups, including when qualify_labels is true. Group names text,confidence,start,end are reserved. */
+        ExtractionAttributeGroup: {
+            labels: string[];
+            /** @default false */
+            multi_label?: boolean;
+            threshold?: components["schemas"]["ExtractionProbability"];
+            applies_to?: string[];
+            /** @default false */
+            qualify_labels?: boolean;
+        };
+        ExtractionConstraintLabelRef: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "LabelRef";
+            task: string;
+            label: string;
+        };
+        ExtractionConstraintAnySelected: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "AnySelected";
+            task: string;
+        };
+        ExtractionConstraintAnyOtherSelected: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "AnyOtherSelected";
+            task: string;
+        };
+        ExtractionConstraintIsDefault: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "IsDefault";
+            task: string;
+        };
+        ExtractionConstraintCardinality: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Cardinality";
+            task: string;
+            minimum?: number;
+            maximum?: number | null;
+        };
+        ExtractionConstraintMinLevel: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "MinLevel";
+            task: string;
+            level: string | number;
+        };
+        ExtractionConstraintMaxLevel: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "MaxLevel";
+            task: string;
+            level: string | number;
+        };
+        ExtractionConstraintAtLevel: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "AtLevel";
+            task: string;
+            level: string | number;
+        };
+        ExtractionConstraintNot: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Not";
+            child: components["schemas"]["ExtractionClassificationConstraint"];
+        };
+        ExtractionConstraintAnd: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "And";
+            children: components["schemas"]["ExtractionClassificationConstraint"][];
+        };
+        ExtractionConstraintOr: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Or";
+            children: components["schemas"]["ExtractionClassificationConstraint"][];
+        };
+        ExtractionConstraintExactlyOneOf: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "ExactlyOneOf";
+            children: components["schemas"]["ExtractionClassificationConstraint"][];
+        };
+        ExtractionConstraintImplies: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Implies";
+            cond: components["schemas"]["ExtractionClassificationConstraint"];
+            then: components["schemas"]["ExtractionClassificationConstraint"];
+        };
+        ExtractionConstraintIff: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Iff";
+            left: components["schemas"]["ExtractionClassificationConstraint"];
+            right: components["schemas"]["ExtractionClassificationConstraint"];
+        };
+        ExtractionConstraintExcludes: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "Excludes";
+            left: components["schemas"]["ExtractionClassificationConstraint"];
+            right: components["schemas"]["ExtractionClassificationConstraint"];
+        };
+        /** @description Declarative, bounded constraint AST. Task and label references are validated before inference. Nesting is bounded by the server schema limit. */
+        ExtractionClassificationConstraint: components["schemas"]["ExtractionConstraintLabelRef"] | components["schemas"]["ExtractionConstraintAnySelected"] | components["schemas"]["ExtractionConstraintAnyOtherSelected"] | components["schemas"]["ExtractionConstraintIsDefault"] | components["schemas"]["ExtractionConstraintCardinality"] | components["schemas"]["ExtractionConstraintMinLevel"] | components["schemas"]["ExtractionConstraintMaxLevel"] | components["schemas"]["ExtractionConstraintAtLevel"] | components["schemas"]["ExtractionConstraintNot"] | components["schemas"]["ExtractionConstraintAnd"] | components["schemas"]["ExtractionConstraintOr"] | components["schemas"]["ExtractionConstraintExactlyOneOf"] | components["schemas"]["ExtractionConstraintImplies"] | components["schemas"]["ExtractionConstraintIff"] | components["schemas"]["ExtractionConstraintExcludes"];
+        ExtractionJointEntity: {
+            description?: string;
+            threshold?: components["schemas"]["ExtractionDecisionProbability"];
+            candidate_threshold?: components["schemas"]["ExtractionProbability"];
+            max_candidates?: number;
+            allow_nested?: boolean;
+        };
+        ExtractionJointRelation: {
+            head: string[];
+            tail: string[];
+            /** @description Retained declarative metadata; model conditioning follows the pinned JointIE compiler. */
+            description?: string;
+            threshold?: components["schemas"]["ExtractionDecisionProbability"];
+            candidate_threshold?: components["schemas"]["ExtractionProbability"];
+            /** @default true */
+            directed?: boolean;
+            /** @default false */
+            symmetric?: boolean;
+            inverse?: string;
+            /** @default false */
+            allow_self?: boolean;
+            max_per_head?: number;
+            max_per_tail?: number;
+        };
+        ExtractionJointConstraintTypedEndpoints: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "TypedEndpoints";
+            relation?: string;
+            head_types?: string[];
+            tail_types?: string[];
+        };
+        ExtractionJointConstraintNoSelfLoops: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "NoSelfLoops";
+            relation?: string;
+        };
+        ExtractionJointConstraintUniqueRelationPair: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "UniqueRelationPair";
+            relation?: string;
+            /** @default true */
+            directed?: boolean;
+        };
+        ExtractionJointConstraintUniqueRelationSlot: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "UniqueRelationSlot";
+            relation?: string;
+            /**
+             * @default head
+             * @enum {string}
+             */
+            slot?: "head" | "tail" | "slot";
+        };
+        ExtractionJointConstraintEntityOverlapPolicy: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "EntityOverlapPolicy";
+            /** @enum {string} */
+            policy?: "allow" | "disallow" | "nested";
+        };
+        ExtractionJointConstraintMaxRelationsPerHead: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "MaxRelationsPerHead";
+            relation?: string;
+            limit: number;
+        };
+        ExtractionJointConstraintMaxRelationsPerTail: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "MaxRelationsPerTail";
+            relation?: string;
+            limit: number;
+        };
+        ExtractionJointConstraintSymmetricRelation: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "SymmetricRelation";
+            relation: string;
+        };
+        ExtractionJointConstraintAcyclicRelation: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "AcyclicRelation";
+            relation: string;
+        };
+        ExtractionJointConstraintInverseRelation: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "InverseRelation";
+            relation: string;
+            inverse: string;
+        };
+        ExtractionJointConstraint: components["schemas"]["ExtractionJointConstraintTypedEndpoints"] | components["schemas"]["ExtractionJointConstraintNoSelfLoops"] | components["schemas"]["ExtractionJointConstraintUniqueRelationPair"] | components["schemas"]["ExtractionJointConstraintUniqueRelationSlot"] | components["schemas"]["ExtractionJointConstraintEntityOverlapPolicy"] | components["schemas"]["ExtractionJointConstraintMaxRelationsPerHead"] | components["schemas"]["ExtractionJointConstraintMaxRelationsPerTail"] | components["schemas"]["ExtractionJointConstraintSymmetricRelation"] | components["schemas"]["ExtractionJointConstraintAcyclicRelation"] | components["schemas"]["ExtractionJointConstraintInverseRelation"];
+        /** @description Separate typed graph schema, mutually exclusive with ordinary extraction families. Hard typed endpoints, overlap, uniqueness and declared graph constraints apply to every returned edge, including derived companions. */
+        ExtractionJointSchema: {
+            entities: {
+                [key: string]: string | components["schemas"]["ExtractionJointEntity"];
+            };
+            relations?: {
+                [key: string]: components["schemas"]["ExtractionJointRelation"];
+            };
+            constraints?: components["schemas"]["ExtractionJointConstraint"][];
+        };
         /**
-         * @description Selects one extraction operation family per request. Entity labels may
-         *     accompany relation schemas so relation extraction can return its
-         *     participating entities in the same response.
+         * @description Version 1 selects one extraction family; entities may accompany relations.
+         *     With schema_version 2, entities, attributes, classifications, structures,
+         *     and ordinary relations may share one encoded input. joint_ie is a separate,
+         *     mutually exclusive typed graph schema. The version 2 compiler rejects
+         *     unknown fields and validates all references before model execution.
          */
         ExtractionSchema: {
             entities?: string[];
@@ -15006,8 +15364,66 @@ export interface components {
             structures?: {
                 [key: string]: components["schemas"]["ExtractionStructureSchema"];
             };
+            entity_definitions?: {
+                [key: string]: components["schemas"]["ExtractionEntityDefinition"];
+            };
+            entity_attributes?: {
+                [key: string]: components["schemas"]["ExtractionAttributeGroup"];
+            };
+            classification_constraints?: components["schemas"]["ExtractionClassificationConstraint"][];
+            joint_ie?: components["schemas"]["ExtractionJointSchema"];
         } & {
             [key: string]: unknown;
+        };
+        /**
+         * @description Half-open offsets into the immutable caller text. Version 2 defaults to utf8_bytes. No normalization, lowercasing or synthetic suffix is included in these coordinates.
+         * @enum {string}
+         */
+        ExtractionOffsetUnit: "utf8_bytes" | "unicode_codepoints" | "utf16_codeunits";
+        /** @description Version 2 never silently truncates. Reject is the default. Windowing requires an enabled runtime capability, reconstructs document-global offsets and revalidates all hard graph constraints after merging. */
+        ExtractionLongDocumentOptions: {
+            /**
+             * @default reject
+             * @enum {string}
+             */
+            mode?: "reject" | "window";
+            /** @description Maximum body words per window; also bounded by the checkpoint and encoded token limits. */
+            window_words?: number;
+            overlap_words?: number;
+            max_windows?: number;
+            /**
+             * @description Identity of latent, anchorless and legacy records across windows. Occurrence uses exact source spans; semantic explicitly merges equal field values. Natural records always use their exact source anchor. This is independent of annotation occurrence_policy.
+             * @default occurrence
+             * @enum {string}
+             */
+            record_identity?: "occurrence" | "semantic";
+        };
+        /** @description Bounded classification and JointIE selection. Exact optimality is with respect to admitted candidates. A completed beam may be feasible without an optimality proof. By default exhausted search is an error; best_effort permits only a validated feasible witness and reports exhausted:true. */
+        ExtractionDecoderOptions: {
+            /**
+             * @description Omit to use the model's per-task default. GLiNER2.5 uses source-compatible beam selection for single-window JointIE and automatic selection for classification. Windowed JointIE uses the native automatic global solver with independent window resources. Explicit values select the native bounded search algorithm.
+             * @enum {string}
+             */
+            algorithm?: "auto" | "exact" | "beam";
+            beam_width?: number;
+            max_search_nodes?: number;
+            max_local_assignments?: number;
+            /** @default false */
+            best_effort?: boolean;
+        };
+        /** @description JointIE proposal admission and utility calibration. Entity candidate caps are bypassed for endpoints of retained relation proposals, subject to server hard bounds. entity_threshold overrides candidate admission, not entity decision thresholds. */
+        ExtractionJointOptions: {
+            candidate_threshold?: components["schemas"]["ExtractionProbability"];
+            entity_threshold?: components["schemas"]["ExtractionProbability"];
+            relation_role_threshold?: components["schemas"]["ExtractionProbability"];
+            top_k_entities?: number;
+            top_k_roles?: number;
+            relation_pair_cap?: number;
+            max_edges_per_type?: number;
+            /** Format: double */
+            entity_weight?: number;
+            /** Format: double */
+            relation_weight?: number;
         };
         ExtractionReaderOptions: {
             provider?: string;
@@ -15047,17 +15463,50 @@ export interface components {
             flat_ner?: boolean;
             include_confidence?: boolean;
             include_spans?: boolean;
+            /**
+             * @description Version 2 source word splitting. char keeps ASCII alphanumeric and @._-+ runs together and splits other non-whitespace codepoints, preserving original source offsets. An input's options replace the shared options in full; omitted word_splitter uses whitespace. Explicit word_splitter is rejected by version 1.
+             * @enum {string}
+             */
+            word_splitter?: "whitespace" | "char";
+            /**
+             * @description Version 2 overlap selection. flat/disallow prohibit overlap, nested permits containment, longest removes strictly contained spans.
+             * @enum {string}
+             */
+            overlap?: "allow" | "nested" | "flat" | "disallow" | "longest";
+            offset_unit?: components["schemas"]["ExtractionOffsetUnit"];
+            long_document?: components["schemas"]["ExtractionLongDocumentOptions"];
+            decoder?: components["schemas"]["ExtractionDecoderOptions"];
+            joint_ie?: components["schemas"]["ExtractionJointOptions"];
             reader?: components["schemas"]["ExtractionReaderOptions"];
             resolver?: components["schemas"]["ExtractionResolverOptions"];
         } & {
             [key: string]: unknown;
         };
+        ExtractionInput: {
+            id?: string;
+            content: components["schemas"]["ChatMessageContent"];
+            tokens?: components["schemas"]["ExtractionToken"][];
+            metadata?: {
+                [key: string]: unknown;
+            };
+            /** @description Version 2 only. Replaces the complete shared schema for this input. */
+            schema?: components["schemas"]["ExtractionSchema"];
+            /** @description Version 2 only. Replaces the complete shared options; omitted fields use runtime defaults. */
+            options?: components["schemas"]["ExtractionOptions"];
+        };
+        /** @description Atomic extraction request. Every input is validated before inference; failures return no partial data. */
         ExtractionRequest: {
             model: string;
+            schema_version?: components["schemas"]["ExtractionSchemaVersion"];
             inputs: components["schemas"]["ExtractionInput"][];
             schema: components["schemas"]["ExtractionSchema"];
             options?: components["schemas"]["ExtractionOptions"];
         };
+        ExtractionAttributeLabel: {
+            label: string;
+            confidence: components["schemas"]["ExtractionProbability"];
+        };
+        ExtractionAttributeSelection: components["schemas"]["ExtractionAttributeLabel"] | components["schemas"]["ExtractionAttributeLabel"][];
         ExtractionEntity: {
             label: string;
             text: string;
@@ -15065,10 +15514,22 @@ export interface components {
             end?: number;
             /** Format: float */
             score?: number;
+            /** @description Version 2 span attributes. Attribute confidence is retained independently of include_confidence. */
+            attributes?: {
+                [key: string]: components["schemas"]["ExtractionAttributeSelection"];
+            };
         };
         ExtractionRelationEndpoint: {
             entity_index?: number;
             id?: string;
+            /** @description Entity type when the endpoint has a typed identity. */
+            label?: string;
+            /** @description Version 2 endpoint surface, including endpoints absent from the entities list. */
+            text?: string;
+            start?: number;
+            end?: number;
+            /** Format: float */
+            score?: number;
         } & {
             [key: string]: unknown;
         };
@@ -15078,6 +15539,8 @@ export interface components {
             target?: components["schemas"]["ExtractionRelationEndpoint"];
             /** Format: float */
             score?: number;
+            /** @description Version 2 inverse or symmetric companion derived from a selected relation. */
+            derived?: boolean;
         } & {
             [key: string]: unknown;
         };
@@ -15089,14 +15552,59 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        ExtractionRecordMetadata: {
+            score?: components["schemas"]["ExtractionProbability"];
+            anchor?: {
+                start: number;
+                end: number;
+            };
+        };
+        ExtractionSolverStatus: {
+            /** @enum {string} */
+            status: "optimal" | "feasible";
+            /** Format: double */
+            utility: number;
+            visited_nodes: number;
+            exhausted: boolean;
+        };
+        ExtractionSolverDiagnostics: {
+            classification?: components["schemas"]["ExtractionSolverStatus"];
+            joint_ie?: components["schemas"]["ExtractionSolverStatus"];
+            records?: components["schemas"]["ExtractionSolverStatus"];
+        };
+        ExtractionLongDocumentMetadata: {
+            /** @enum {integer} */
+            version: 1;
+            window_count: number;
+            /** @enum {string} */
+            window_policy: "source_words_midpoint_ownership";
+            /** @enum {string} */
+            classification_aggregation: "owned_word_weighted_mean_raw_logits";
+            /** @enum {string} */
+            duplicate_score: "maximum_calibrated_score";
+            /** @enum {string} */
+            natural_record_identity: "exact_source_anchor";
+            /** @enum {string} */
+            other_record_identity: "occurrence" | "semantic";
+            /** @enum {string} */
+            solver_optimality_scope: "retained_candidate_graph";
+        };
         ExtractionObject: {
             id?: string;
+            offset_unit?: components["schemas"]["ExtractionOffsetUnit"];
             entities?: components["schemas"]["ExtractionEntity"][];
             relations?: components["schemas"]["ExtractionRelation"][];
             classifications?: components["schemas"]["ExtractionClassification"][];
+            /** @description Structure name to record array. Each record maps field names to value objects or arrays of value objects; v2 value objects follow ExtractionFieldValue. */
             structures?: {
                 [key: string]: unknown;
             };
+            /** @description Version 2 metadata arrays aligned with each named structure's record array. */
+            structure_metadata?: {
+                [key: string]: components["schemas"]["ExtractionRecordMetadata"][];
+            };
+            solvers?: components["schemas"]["ExtractionSolverDiagnostics"];
+            long_document?: components["schemas"]["ExtractionLongDocumentMetadata"];
         } & {
             [key: string]: unknown;
         };
@@ -15104,6 +15612,7 @@ export interface components {
             /** @enum {string} */
             object: "extraction";
             model: string;
+            schema_version?: components["schemas"]["ExtractionSchemaVersion"];
             data: components["schemas"]["ExtractionObject"][];
             usage?: {
                 [key: string]: unknown;
@@ -19797,8 +20306,17 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Media content exceeds the configured size limit */
+            /** @description Media, text, schema, candidate graph, or output exceeds a configured size/work limit */
             413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Extraction hard constraints are infeasible, required record fields are missing, or bounded search exhausted without an accepted feasible witness */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

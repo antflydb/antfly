@@ -1,0 +1,266 @@
+{
+  "admission": {
+    "contamination_free_claim": false,
+    "documents": 878,
+    "families": 877,
+    "lock_sha256": "a3ea7f513501af42db0030eb6557dd845dbcdf39483c7e8f23a2f7e636e4f144",
+    "qualification": false,
+    "scope": "gliner25_evaluation_admission/v1",
+    "split_counts": {
+      "calibration": 347,
+      "test": 431,
+      "train": 100
+    }
+  },
+  "evidence_files": {
+    "corpus_manifest.json": {
+      "sha256": "3718698e0c5736ad3c883a44cc40631547a7a25508461ba1ce2778b7effe7076",
+      "size_bytes": 2652
+    },
+    "lock.json": {
+      "sha256": "a3ea7f513501af42db0030eb6557dd845dbcdf39483c7e8f23a2f7e636e4f144",
+      "size_bytes": 6199
+    },
+    "preparation.json": {
+      "sha256": "af49bb6b3a2f80f760f888713e4bacfc5bb64afdfb6649c45cdafe7f91f4838c",
+      "size_bytes": 8036
+    },
+    "prepared/gold.jsonl": {
+      "sha256": "8bc22529b257d805b4e1588dd72c10c1e6edf3339ab15ee367964d91c61139f1",
+      "size_bytes": 555164
+    },
+    "prepared/prepared.json": {
+      "sha256": "486fe0bb41b9c9d4a1a0d847937b1862cd0803e320d926d639f8c6f808263712",
+      "size_bytes": 2684
+    },
+    "prepared/requests.jsonl": {
+      "sha256": "8ad4bdcd0c4cd022e61b6514a7dbedae938ca516d1d6baf949c2eef9791f2296",
+      "size_bytes": 272553
+    },
+    "split_audit.json": {
+      "sha256": "8464fa72b370c8100f7cb45d24b6b36998e9ae3ef4baa838b0f121ad2497f212",
+      "size_bytes": 2922
+    }
+  },
+  "no_model_execution": true,
+  "prepared": {
+    "adapter_sha256": "d09b050cc9ff4dab694c9a9282e9dc75df64f78606b0074982f1ef86abfc84c6",
+    "gold_sha256": "8bc22529b257d805b4e1588dd72c10c1e6edf3339ab15ee367964d91c61139f1",
+    "harness_sha256": "8d6b137c55f64d7c13752c306246266a56d98796d349e9c301069bdafadb6927",
+    "lock_sha256": "a3ea7f513501af42db0030eb6557dd845dbcdf39483c7e8f23a2f7e636e4f144",
+    "metric_contract_sha256": "b1d7f31fad1bf3176213e86f85597d3d1dfe69913358a4467b0cba8398baba6a",
+    "metrics": {
+      "entity_exact": {
+        "counting": "set",
+        "definition": "Exact author type and span in single-space reconstructed UTF-8 source"
+      },
+      "entity_type/algorithm": {
+        "counting": "set",
+        "definition": "Exact occurrence for fixed ontology type algorithm"
+      },
+      "entity_type/conference": {
+        "counting": "set",
+        "definition": "Exact occurrence for fixed ontology type conference"
+      },
+      "entity_type/country": {
+        "counting": "set",
+        "definition": "Exact occurrence for fixed ontology type country"
+      },
+      "entity_type/field": {
+        "counting": "set",
+        "definition": "Exact occurrence for fixed ontology type field"
+      },
+      "entity_type/location": {
+        "counting": "set",
+        "definition": "Exact occurrence for fixed ontology type location"
+      },
+      "entity_type/metrics": {
+        "counting": "set",
+        "definition": "Exact occurrence for fixed ontology type metrics"
+      },
+      "entity_type/misc": {
+        "counting": "set",
+        "definition": "Exact occurrence for fixed ontology type misc"
+      },
+      "entity_type/organisation": {
+        "counting": "set",
+        "definition": "Exact occurrence for fixed ontology type organisation"
+      },
+      "entity_type/person": {
+        "counting": "set",
+        "definition": "Exact occurrence for fixed ontology type person"
+      },
+      "entity_type/product": {
+        "counting": "set",
+        "definition": "Exact occurrence for fixed ontology type product"
+      },
+      "entity_type/programlang": {
+        "counting": "set",
+        "definition": "Exact occurrence for fixed ontology type programlang"
+      },
+      "entity_type/researcher": {
+        "counting": "set",
+        "definition": "Exact occurrence for fixed ontology type researcher"
+      },
+      "entity_type/task": {
+        "counting": "set",
+        "definition": "Exact occurrence for fixed ontology type task"
+      },
+      "entity_type/university": {
+        "counting": "set",
+        "definition": "Exact occurrence for fixed ontology type university"
+      }
+    },
+    "qualification": false,
+    "records": 431,
+    "requests_sha256": "8ad4bdcd0c4cd022e61b6514a7dbedae938ca516d1d6baf949c2eef9791f2296",
+    "scope": "gliner25_blinded_evaluation/v1",
+    "status": "complete"
+  },
+  "qualification": false,
+  "scope": "gliner25_crossner_ai_preparation/v1",
+  "split_audit": {
+    "article_family_ids_available": false,
+    "cross_split_groups": 3,
+    "decision_inputs": "normalized_text_and_original_split_only",
+    "duplicate_groups": [
+      {
+        "cross_split": true,
+        "exact_text_variants": 1,
+        "excluded_ids": [
+          "crossner/ai/dev/000143"
+        ],
+        "gold_variants": 1,
+        "members": [
+          {
+            "gold_sha256": "6e9ead1e7e4635afa1f819cac3e04d635edfa192d7669f8ef6b6804a60868f09",
+            "id": "crossner/ai/dev/000143",
+            "index": 143,
+            "source_split": "dev",
+            "text_sha256": "66b240a123a826fab918173c8412c1a512003b0c900289a653d0fca1e0ba521c"
+          },
+          {
+            "gold_sha256": "6e9ead1e7e4635afa1f819cac3e04d635edfa192d7669f8ef6b6804a60868f09",
+            "id": "crossner/ai/test/000090",
+            "index": 90,
+            "source_split": "test",
+            "text_sha256": "66b240a123a826fab918173c8412c1a512003b0c900289a653d0fca1e0ba521c"
+          }
+        ],
+        "normalized_text_sha256": "7223528eb80287c205066548c41e8670576731b3379d97eeec8e0f91cb4fd48e",
+        "retained_source_split": "test"
+      },
+      {
+        "cross_split": true,
+        "exact_text_variants": 1,
+        "excluded_ids": [
+          "crossner/ai/dev/000117"
+        ],
+        "gold_variants": 2,
+        "members": [
+          {
+            "gold_sha256": "b54e2202b69f8704e590f34e55577b63e87b5fd1d722b7c41ebd930fff3a8433",
+            "id": "crossner/ai/dev/000117",
+            "index": 117,
+            "source_split": "dev",
+            "text_sha256": "4ded6252051d66ea8b53031d6d4db61ddfb05b721795d86368677019e5b53927"
+          },
+          {
+            "gold_sha256": "5df0d69cf06c3bb881303b01eb255874058083bafb2d6ff6a38e2e99063d3822",
+            "id": "crossner/ai/test/000414",
+            "index": 414,
+            "source_split": "test",
+            "text_sha256": "4ded6252051d66ea8b53031d6d4db61ddfb05b721795d86368677019e5b53927"
+          },
+          {
+            "gold_sha256": "5df0d69cf06c3bb881303b01eb255874058083bafb2d6ff6a38e2e99063d3822",
+            "id": "crossner/ai/test/000418",
+            "index": 418,
+            "source_split": "test",
+            "text_sha256": "4ded6252051d66ea8b53031d6d4db61ddfb05b721795d86368677019e5b53927"
+          }
+        ],
+        "normalized_text_sha256": "7c556a9574db8b8c618a4b5b49900e84d8d4d9f95936f36d02860eeef1f33a33",
+        "retained_source_split": "test"
+      },
+      {
+        "cross_split": true,
+        "exact_text_variants": 1,
+        "excluded_ids": [
+          "crossner/ai/dev/000262"
+        ],
+        "gold_variants": 2,
+        "members": [
+          {
+            "gold_sha256": "cb9d62d4d92945fee8a1c8609e726218d7affc63828a88e5be69d41ce68e8a5a",
+            "id": "crossner/ai/dev/000262",
+            "index": 262,
+            "source_split": "dev",
+            "text_sha256": "89b7c8ea05c6f0a70f16d28bd5d695b581af6d568221f6ea142b8287df7ba761"
+          },
+          {
+            "gold_sha256": "861829bef94d20a12bb66a4a1d1ba2f219f42b99a9995f4502f6e4a120bd3ad5",
+            "id": "crossner/ai/test/000324",
+            "index": 324,
+            "source_split": "test",
+            "text_sha256": "89b7c8ea05c6f0a70f16d28bd5d695b581af6d568221f6ea142b8287df7ba761"
+          }
+        ],
+        "normalized_text_sha256": "97023c71b6b559998843bdca88f9a5c52dafe93196cf76a8a23d939d6b2bece9",
+        "retained_source_split": "test"
+      }
+    ],
+    "excluded_ids": [
+      "crossner/ai/dev/000117",
+      "crossner/ai/dev/000143",
+      "crossner/ai/dev/000262"
+    ],
+    "official_test_preserved": true,
+    "policy": "preserve_official_test_remove_lower_priority_normalized_overlaps/v1",
+    "pretraining_contamination_status": "unknown",
+    "retained_counts": {
+      "dev": 347,
+      "test": 431,
+      "train": 100
+    },
+    "scope": "gliner25_crossner_split_audit/v1",
+    "source_counts": {
+      "dev": 350,
+      "test": 431,
+      "train": 100
+    },
+    "unicode_version": "15.0.0",
+    "within_test_multiplicity_preserved": true
+  },
+  "statistics": {
+    "calibration": {
+      "documents": 347,
+      "entities": 1541,
+      "excluded_documents": 3,
+      "maximum_original_tokens": 83,
+      "maximum_utf8_bytes": 474,
+      "source_documents": 350
+    },
+    "test": {
+      "documents": 431,
+      "entities": 1809,
+      "excluded_documents": 0,
+      "maximum_original_tokens": 84,
+      "maximum_utf8_bytes": 492,
+      "source_documents": 431
+    },
+    "train": {
+      "documents": 100,
+      "entities": 532,
+      "excluded_documents": 0,
+      "maximum_original_tokens": 73,
+      "maximum_utf8_bytes": 436,
+      "source_documents": 100
+    }
+  },
+  "verification": {
+    "all_files_reproduced_byte_for_byte": true,
+    "lightweight_python_tests": 49,
+    "model_executions": 0
+  }
+}

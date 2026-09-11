@@ -135,6 +135,12 @@ pub const MmapRegion = struct {
 
     /// Memory-map an entire file read-only. Returns borrowed bytes backed by the OS page cache.
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !MmapRegion {
+        return initLimited(allocator, path, std.math.maxInt(usize));
+    }
+
+    /// Enforce admission on the opened descriptor before mapping its bytes.
+    /// Checking the same descriptor avoids a stat/open substitution window.
+    pub fn initLimited(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) !MmapRegion {
         const path_z = try allocator.dupeZ(u8, path);
         defer allocator.free(path_z);
 
@@ -145,6 +151,7 @@ pub const MmapRegion = struct {
         if (size == 0) {
             return error.EmptyFile;
         }
+        if (size > max_bytes) return error.FileTooLarge;
 
         const mapped = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
         return .{ .data = mapped, .fd = fd };

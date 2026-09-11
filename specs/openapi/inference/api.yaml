@@ -758,6 +758,13 @@ paths:
         text/document classification, token classification, and structured
         document extraction.
 
+        Set `schema_version: 2` for strict mixed-task schemas, span attributes,
+        constrained classification, typed records and JointIE. Each input may
+        replace the shared schema/options. Offsets default to half-open UTF-8
+        bytes, and text content parts are joined by a single newline. Inputs
+        are validated atomically. Unsupported features and long documents are
+        rejected explicitly; windowing requires runtime support.
+
         Image-backed extraction uses the same byte-reserving and image-count-weighted
         admission policy as `/read`, before model resolution or download. Text-only
         extraction consumes one admission unit.
@@ -794,7 +801,13 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '413':
-          description: Media content exceeds the configured size limit
+          description: Media, text, schema, candidate graph, or output exceeds a configured size/work limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          description: Extraction hard constraints are infeasible, required record fields are missing, or bounded search exhausted without an accepted feasible witness
           content:
             application/json:
               schema:
@@ -1047,6 +1060,14 @@ components:
           type: integer
           minimum: 0
           description: Minimum retry delay in milliseconds
+        input_index:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Input whose atomic extraction validation or decoding failed, when known
+        stage:
+          type: string
+          description: Extraction failure stage, when known
     TransientCapacityError:
       type: object
       description: Actionable retry contract for temporary inference-capacity failures.

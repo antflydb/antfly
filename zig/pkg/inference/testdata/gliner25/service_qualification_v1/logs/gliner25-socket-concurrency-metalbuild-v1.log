@@ -1,0 +1,38 @@
+CUDA artifact source policy passes: /Users/timkaye/Documents/af/antfly/zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.cu (15 compiler-managed dev-only runtime-wired candidates included)
+quant kernel generated sources check: 67 files + Metal/CUDA runtime regions
+1/34 server.gliner_boundary_concurrency_test.test.gliner boundary socket pinned small concurrent admission rejection release and retry...thread 3594780 panic: attempt to use null value
+/Users/timkaye/Documents/af/antfly/zig/pkg/inference/src/server/gliner_boundary_concurrency_test.zig:75:68: 0x10512ffaf in waitAdmitted (test)
+            const amounts = self.node.model_manager.resource_domain.?.admission.snapshot();
+                                                                   ^
+/Users/timkaye/Documents/af/antfly/zig/pkg/inference/src/server/gliner_boundary_concurrency_test.zig:198:31: 0x10514108f in test.gliner boundary socket pinned small concurrent admission rejection release and retry (test)
+        try first.waitAdmitted();
+                              ^
+/Users/timkaye/Documents/af/antfly/zig/pkg/inference/src/test_runner_filter.zig:108:25: 0x1051062cf in main (test)
+        if (test_fn.func()) |_| {
+                        ^
+/opt/homebrew/Cellar/zig/0.16.0/lib/zig/std/start.zig:699:88: 0x10510685b in callMain (test)
+    if (fn_info.params[0].type.? == std.process.Init.Minimal) return wrapMain(root.main(.{
+                                                                                       ^
+???:?:?: 0x18fb8fdff in start (/usr/lib/dyld)
+test
++- run test failure
+error: process terminated with signal ABRT
+failed command: ./.zig-cache/o/d01607c8d5c1b6fc390f58a394f629f8/test --test-filter "gliner boundary socket pinned small concurrent admission"
+
+Build Summary: 12/14 steps succeeded (1 failed); 23/23 tests passed
+test transitive failure
++- run test failure
+
+error: the following build command failed with exit code 1:
+.zig-cache/o/b64bde5ba7cac9c14241b5d79dabd5d6/build /opt/homebrew/Cellar/zig/0.16.0/bin/zig /opt/homebrew/Cellar/zig/0.16.0/lib/zig /Users/timkaye/Documents/af/antfly/zig/pkg/inference .zig-cache /private/tmp/antfly-gliner25-zig-cache --seed 0x495bd65f -Z6fb9029856dd753d test -Dshared-lib-root=../.. -Dmetal=true -Donnx=false -Dcuda=false -Dcuda-artifacts=fatbin -Dpjrt=false -Dsystem-blas=true -- --test-filter gliner boundary socket pinned small concurrent admission
+inference-test
++- run /opt/homebrew/Cellar/zig/0.16.0/bin/zig failure
+error: process exited with error code 1
+failed command: cd /Users/timkaye/Documents/af/antfly/zig/pkg/inference && /opt/homebrew/Cellar/zig/0.16.0/bin/zig build test -Dshared-lib-root=../.. -Dmetal=true -Donnx=false -Dcuda=false -Dcuda-artifacts=fatbin -Dpjrt=false -Dsystem-blas=true -- --test-filter "gliner boundary socket pinned small concurrent admission"
+
+Build Summary: 0/2 steps succeeded (1 failed)
+inference-test transitive failure
++- run /opt/homebrew/Cellar/zig/0.16.0/bin/zig failure
+
+error: the following build command failed with exit code 1:
+.zig-cache/o/32a2739bfe92276857e27dada958a96b/build /opt/homebrew/Cellar/zig/0.16.0/bin/zig /opt/homebrew/Cellar/zig/0.16.0/lib/zig /Users/timkaye/Documents/af/antfly/zig .zig-cache /private/tmp/antfly-gliner25-zig-cache --seed 0x7a41ecda -Zab6487332bcf4a63 inference-test -Dmetal=true -Dcuda=false -j1 -- --test-filter gliner boundary socket pinned small concurrent admission

@@ -1,0 +1,546 @@
+{
+  "helper_closure": {
+    "scripts/gliner25/check_training_export.py": {
+      "original": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/scripts/gliner25/check_training_export.py",
+      "sha256": "11c5aac29919b21eba0e66aa1ab96d6bae0591d1cc154c5c980f703a001f91d5",
+      "size_bytes": 35644,
+      "snapshot": "/private/tmp/antfly-gliner25-inactive-export-reload-v1/checker/scripts/gliner25/check_training_export.py"
+    },
+    "scripts/gliner25/oracle.py": {
+      "original": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/scripts/gliner25/oracle.py",
+      "sha256": "61bbf4544a21111dbfbd643ed2392b1d9723498493b3fa6832154d6e1dc42752",
+      "size_bytes": 28555,
+      "snapshot": "/private/tmp/antfly-gliner25-inactive-export-reload-v1/checker/scripts/gliner25/oracle.py"
+    },
+    "scripts/gliner25/oracle_manifest.json": {
+      "original": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/scripts/gliner25/oracle_manifest.json",
+      "sha256": "918005508a57d2c558c18a78167637f39c54e7c2c6d67814be15fc6714c4152f",
+      "size_bytes": 4097,
+      "snapshot": "/private/tmp/antfly-gliner25-inactive-export-reload-v1/checker/scripts/gliner25/oracle_manifest.json"
+    },
+    "scripts/gliner25/training_export_contract.json": {
+      "original": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/scripts/gliner25/training_export_contract.json",
+      "sha256": "b164ae2fe9aef1506f179fc554ae956826d782c0ff0ca7d4685d747882687978",
+      "size_bytes": 1311,
+      "snapshot": "/private/tmp/antfly-gliner25-inactive-export-reload-v1/checker/scripts/gliner25/training_export_contract.json"
+    },
+    "scripts/gliner25/training_export_peft018.json": {
+      "original": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/scripts/gliner25/training_export_peft018.json",
+      "sha256": "08905e3428c9d4a45a5e6a2c54677427f727cee1aa605647bc0b613567000968",
+      "size_bytes": 31851,
+      "snapshot": "/private/tmp/antfly-gliner25-inactive-export-reload-v1/checker/scripts/gliner25/training_export_peft018.json"
+    },
+    "scripts/gliner25/training_export_runtime.py": {
+      "original": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/scripts/gliner25/training_export_runtime.py",
+      "sha256": "b6d15a935454a84f7df18eb394e4d6dd9c1dc8a988426e93169d596236d42d63",
+      "size_bytes": 10121,
+      "snapshot": "/private/tmp/antfly-gliner25-inactive-export-reload-v1/checker/scripts/gliner25/training_export_runtime.py"
+    },
+    "testdata/gliner25/models/small/tensor_inventory.json": {
+      "original": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/testdata/gliner25/models/small/tensor_inventory.json",
+      "sha256": "8fb68ff2cb48be1fecd89cbe019cdd4c21ee10bc43793c43bd440f5beb01540f",
+      "size_bytes": 53584,
+      "snapshot": "/private/tmp/antfly-gliner25-inactive-export-reload-v1/checker/testdata/gliner25/models/small/tensor_inventory.json"
+    },
+    "testdata/gliner25/reference_manifest.json": {
+      "original": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/testdata/gliner25/reference_manifest.json",
+      "sha256": "22af8173e36b9ee5a178c5184fcd12fd7fb2915886015d5bbd77530adeeb5c69",
+      "size_bytes": 19823,
+      "snapshot": "/private/tmp/antfly-gliner25-inactive-export-reload-v1/checker/testdata/gliner25/reference_manifest.json"
+    },
+    "testdata/gliner25/requests.json": {
+      "original": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/testdata/gliner25/requests.json",
+      "sha256": "030c979419cee5fd209ba6a6f23f2e0cc7744e396d4bf3357925651293f5fe5f",
+      "size_bytes": 3467,
+      "snapshot": "/private/tmp/antfly-gliner25-inactive-export-reload-v1/checker/testdata/gliner25/requests.json"
+    }
+  },
+  "isolated_runtime": {
+    "packages": {
+      "PyYAML": "6.0.3",
+      "accelerate": "1.10.1",
+      "huggingface-hub": "0.36.0",
+      "numpy": "2.3.5",
+      "packaging": "25.0",
+      "peft": "0.18.0",
+      "psutil": "7.1.3",
+      "pydantic": "2.12.3",
+      "requests": "2.32.5",
+      "safetensors": "0.7.0",
+      "scipy": "1.16.3",
+      "tokenizers": "0.21.4",
+      "torch": "2.9.1",
+      "tqdm": "4.67.1",
+      "transformers": "4.55.4",
+      "urllib3": "2.5.0"
+    },
+    "python": "3.12.3",
+    "unicode": "15.0.0"
+  },
+  "limits": {
+    "grace_seconds": 2.0,
+    "kill_seconds": 5.0,
+    "output_limit_bytes": 4194304,
+    "rss_limit_bytes": 2147483648,
+    "tick": 0.05,
+    "timeout_seconds": 180,
+    "worker_grace_seconds": 2.0
+  },
+  "loader_profile": "peft-0.18.0-export-v1",
+  "max_artifact_bytes": 603979776,
+  "max_final_artifact_bytes": 67108864,
+  "max_runtime_copy_bytes": 536870912,
+  "original_runtime": {
+    "packages": {
+      "PyYAML": "6.0.3",
+      "accelerate": "1.10.1",
+      "huggingface-hub": "0.36.0",
+      "numpy": "2.3.5",
+      "packaging": "25.0",
+      "peft": "0.17.1",
+      "psutil": "7.1.3",
+      "pydantic": "2.12.3",
+      "requests": "2.32.5",
+      "safetensors": "0.7.0",
+      "scipy": "1.16.3",
+      "tokenizers": "0.21.4",
+      "torch": "2.9.1",
+      "transformers": "4.55.4",
+      "urllib3": "2.5.0"
+    },
+    "python": "3.12.3",
+    "unicode": "15.0.0"
+  },
+  "prior_all_target_export_proofs": {
+    "dora": {
+      "adapter_tensors": 393,
+      "path": "/private/tmp/antfly-gliner25-training-runtime-artifact-v1/dora-all-peft018-check/report.json",
+      "requests": 10,
+      "sha256": "08e8164401ad8b0ed524bc168cb8e75fe90dce50335c918873fe1ad1ae4faf6d",
+      "size_bytes": 308476,
+      "source_tensors": 334
+    },
+    "lora": {
+      "adapter_tensors": 262,
+      "path": "/private/tmp/antfly-gliner25-training-runtime-artifact-v1/lora-all-peft018-check/report.json",
+      "requests": 10,
+      "sha256": "2d377386c32c6da31e98f73dfc671fd8891c8ff046ba1154bd73584219d59275",
+      "size_bytes": 260540,
+      "source_tensors": 334
+    }
+  },
+  "profiles": {
+    "cpu-dora": {
+      "additional_request_copy_bytes": 3467,
+      "command": [
+        "/private/tmp/antfly-gliner25-oracle-venv/bin/python",
+        "-B",
+        "/private/tmp/antfly-gliner25-inactive-export-reload-v1/checker/scripts/gliner25/check_training_export.py",
+        "--variant",
+        "small",
+        "--source-dir",
+        "/private/tmp/antfly-gliner25-models/small",
+        "--export-dir",
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-uninterrupted/model",
+        "--run-dir",
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-uninterrupted",
+        "--output-dir",
+        "/private/tmp/antfly-gliner25-inactive-export-reload-v1/execution/cpu-dora/report",
+        "--runtime",
+        "--runtime-profile",
+        "peft-0.18.0-export-v1",
+        "--peft-wheel",
+        "/private/tmp/antfly-gliner25-export-peft018-v1/peft-0.18.0-py3-none-any.whl",
+        "--requests",
+        "/private/tmp/antfly-gliner25-inactive-export-reload-v1/checker/testdata/gliner25/requests.json",
+        "--upstream",
+        "/private/tmp/antfly-gliner25-upstream",
+        "--max-runtime-copy-bytes",
+        "536870912"
+      ],
+      "execution_dir": "/private/tmp/antfly-gliner25-inactive-export-reload-v1/execution/cpu-dora",
+      "expected_adapter_tensor_count": 6,
+      "expected_modules": [
+        "classifier.0",
+        "classifier.3"
+      ],
+      "expected_optimizer_identity": {
+        "microbatch_step": 5,
+        "optimizer_step": 3
+      },
+      "expected_source_tensor_count": 334,
+      "export_dir": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-uninterrupted/model",
+      "mode": "dora",
+      "original_files": {
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-uninterrupted/latest.safetensors": {
+          "sha256": "fcd76079a40d15065ca5fcc3f95d4b892709f4173f61368e7459400813027144",
+          "size_bytes": 78796
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-uninterrupted/model/adapter_config.json": {
+          "sha256": "c1d8161c29a828a1b05cddcc56197819d4226621af927884379898b7627b3414",
+          "size_bytes": 347
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-uninterrupted/model/adapter_model.safetensors": {
+          "sha256": "89905788c144bfc30bf4de4d1e78b543050a5d5e8a06e37b540a608624ab009b",
+          "size_bytes": 19132
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-uninterrupted/model/antfly_gliner25_adapter.json": {
+          "sha256": "397d8d95b8b8e782d795a0b4f62a01b63ef6604e595d5458a2cbb6b4dcf30595",
+          "size_bytes": 2308
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-uninterrupted/model/antfly_gliner25_training.json": {
+          "sha256": "2d444b016db418c2f25e68aca887c97b82b707152856cc2125879f17e2760592",
+          "size_bytes": 2885
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-uninterrupted/result.json": {
+          "sha256": "e697dbc1e6cb510aaa527dd6f99b92052b17e3fb4cefcbee5e5b1cebec9de1e8",
+          "size_bytes": 1122
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-uninterrupted/run.json": {
+          "sha256": "20c697ca3d34cec5beb2bb631e749a804fe8f8433f72cc71ffac61d95a7c0ffe",
+          "size_bytes": 9210
+        }
+      },
+      "run_dir": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/dora-uninterrupted",
+      "runtime_copy_bytes": 305926614,
+      "state_sha256": "c4244228f5e7c25d2e0c939a9e951df0f01c79bf5c41365988587f92f3d8f881",
+      "static_audit": {
+        "path": "/private/tmp/antfly-gliner25-inactive-export-reload-v1/static/cpu-dora.json",
+        "sha256": "04b0ebb363eb8ce3da0d2e782247eb46df379056800b13a938b2765d1bd2aa36",
+        "size_bytes": 86604
+      },
+      "training_backend": "cpu",
+      "training_ledger": {
+        "path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/testdata/gliner25/published_inactive_classifier_cpu_v1/manifest.json",
+        "sha256": "9119df6d243fe47c400bfec481b88e4e23bfb7d3b3f3880fd2e443ece82766f7",
+        "size_bytes": 31115
+      }
+    },
+    "cpu-lora": {
+      "additional_request_copy_bytes": 3467,
+      "command": [
+        "/private/tmp/antfly-gliner25-oracle-venv/bin/python",
+        "-B",
+        "/private/tmp/antfly-gliner25-inactive-export-reload-v1/checker/scripts/gliner25/check_training_export.py",
+        "--variant",
+        "small",
+        "--source-dir",
+        "/private/tmp/antfly-gliner25-models/small",
+        "--export-dir",
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-uninterrupted/model",
+        "--run-dir",
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-uninterrupted",
+        "--output-dir",
+        "/private/tmp/antfly-gliner25-inactive-export-reload-v1/execution/cpu-lora/report",
+        "--runtime",
+        "--runtime-profile",
+        "peft-0.18.0-export-v1",
+        "--peft-wheel",
+        "/private/tmp/antfly-gliner25-export-peft018-v1/peft-0.18.0-py3-none-any.whl",
+        "--requests",
+        "/private/tmp/antfly-gliner25-inactive-export-reload-v1/checker/testdata/gliner25/requests.json",
+        "--upstream",
+        "/private/tmp/antfly-gliner25-upstream",
+        "--max-runtime-copy-bytes",
+        "536870912"
+      ],
+      "execution_dir": "/private/tmp/antfly-gliner25-inactive-export-reload-v1/execution/cpu-lora",
+      "expected_adapter_tensor_count": 4,
+      "expected_modules": [
+        "classifier.0",
+        "classifier.3"
+      ],
+      "expected_optimizer_identity": {
+        "microbatch_step": 5,
+        "optimizer_step": 3
+      },
+      "expected_source_tensor_count": 334,
+      "export_dir": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-uninterrupted/model",
+      "mode": "lora",
+      "original_files": {
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-uninterrupted/latest.safetensors": {
+          "sha256": "0bf22c17af612735cf6d54d492c25576c63d8e20ce515bebc2d2dd2a71bf094f",
+          "size_bytes": 64900
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-uninterrupted/model/adapter_config.json": {
+          "sha256": "6f92d9b9199ef0a131d3fa1778e7fc4b468d98512ba7efaa44ae1329870c22d3",
+          "size_bytes": 348
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-uninterrupted/model/adapter_model.safetensors": {
+          "sha256": "3770e0516094895534612a448eab268c43c9f78ce16379b83e11e496b4daf1de",
+          "size_bytes": 15832
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-uninterrupted/model/antfly_gliner25_adapter.json": {
+          "sha256": "1b713144c2a796c3e39c5a695f8ba5faec7455d459fa04ec1698c31b6b3e5bb8",
+          "size_bytes": 2322
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-uninterrupted/model/antfly_gliner25_training.json": {
+          "sha256": "ce3053edeab59c617cfd958270194c64c2926294889fa261f86faec884357950",
+          "size_bytes": 2873
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-uninterrupted/result.json": {
+          "sha256": "eb7538b8b5bf712c30034f975bf8edc1a9bdef162a46008617f62c4e6fc64523",
+          "size_bytes": 1121
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-uninterrupted/run.json": {
+          "sha256": "40cc17320d201182e4ac1916cb2fb6c1633271549f5de8619f4587d26bc1b4c3",
+          "size_bytes": 9208
+        }
+      },
+      "run_dir": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/lora-uninterrupted",
+      "runtime_copy_bytes": 305923317,
+      "state_sha256": "c9117d337385f29ab2c0c6bd0f59d4435122137a5a8c02a1a51ed7b08070e4fc",
+      "static_audit": {
+        "path": "/private/tmp/antfly-gliner25-inactive-export-reload-v1/static/cpu-lora.json",
+        "sha256": "05a30d3e88087a67df26c819cb296cf8ce260b0ecf6215e06782331c806402c0",
+        "size_bytes": 86007
+      },
+      "training_backend": "cpu",
+      "training_ledger": {
+        "path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/testdata/gliner25/published_inactive_classifier_cpu_v1/manifest.json",
+        "sha256": "9119df6d243fe47c400bfec481b88e4e23bfb7d3b3f3880fd2e443ece82766f7",
+        "size_bytes": 31115
+      }
+    },
+    "metal-dora": {
+      "additional_request_copy_bytes": 3467,
+      "command": [
+        "/private/tmp/antfly-gliner25-oracle-venv/bin/python",
+        "-B",
+        "/private/tmp/antfly-gliner25-inactive-export-reload-v1/checker/scripts/gliner25/check_training_export.py",
+        "--variant",
+        "small",
+        "--source-dir",
+        "/private/tmp/antfly-gliner25-models/small",
+        "--export-dir",
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-metal-continuation-v1/dora-uninterrupted/model",
+        "--run-dir",
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-metal-continuation-v1/dora-uninterrupted",
+        "--output-dir",
+        "/private/tmp/antfly-gliner25-inactive-export-reload-v1/execution/metal-dora/report",
+        "--runtime",
+        "--runtime-profile",
+        "peft-0.18.0-export-v1",
+        "--peft-wheel",
+        "/private/tmp/antfly-gliner25-export-peft018-v1/peft-0.18.0-py3-none-any.whl",
+        "--requests",
+        "/private/tmp/antfly-gliner25-inactive-export-reload-v1/checker/testdata/gliner25/requests.json",
+        "--upstream",
+        "/private/tmp/antfly-gliner25-upstream",
+        "--max-runtime-copy-bytes",
+        "536870912"
+      ],
+      "execution_dir": "/private/tmp/antfly-gliner25-inactive-export-reload-v1/execution/metal-dora",
+      "expected_adapter_tensor_count": 6,
+      "expected_modules": [
+        "classifier.0",
+        "classifier.3"
+      ],
+      "expected_optimizer_identity": {
+        "microbatch_step": 5,
+        "optimizer_step": 3
+      },
+      "expected_source_tensor_count": 334,
+      "export_dir": "/private/tmp/antfly-gliner25-training-inactive-published-small-metal-continuation-v1/dora-uninterrupted/model",
+      "mode": "dora",
+      "original_files": {
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-metal-continuation-v1/dora-uninterrupted/latest.safetensors": {
+          "sha256": "ce7b03de645aa234e3933e0f850d1dadc5a59f2850e1bc6b2db271b934243b44",
+          "size_bytes": 78796
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-metal-continuation-v1/dora-uninterrupted/model/adapter_config.json": {
+          "sha256": "c1d8161c29a828a1b05cddcc56197819d4226621af927884379898b7627b3414",
+          "size_bytes": 347
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-metal-continuation-v1/dora-uninterrupted/model/adapter_model.safetensors": {
+          "sha256": "072ea4d9f51c8b52b906e7fe6d702798beff99ebf30011bde6c1617a55a4308f",
+          "size_bytes": 19132
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-metal-continuation-v1/dora-uninterrupted/model/antfly_gliner25_adapter.json": {
+          "sha256": "fbc1895e6d96176ac4f4b4517c68bb10213e01eea697ed81326324623749486a",
+          "size_bytes": 2310
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-metal-continuation-v1/dora-uninterrupted/model/antfly_gliner25_training.json": {
+          "sha256": "c3052d9afa3a46510444569c1e6e7f7033a4bc0dd5f3c7f687ec6667f029d326",
+          "size_bytes": 2885
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-metal-continuation-v1/dora-uninterrupted/result.json": {
+          "sha256": "b5e88b0a92466e74e955c0a9138b13db4defc80566d0724595783289a887c36a",
+          "size_bytes": 1123
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-metal-continuation-v1/dora-uninterrupted/run.json": {
+          "sha256": "2a190f856ddc3e229fef3368dba08ce4f5b46e5b85e81e042363c9e81562a5ec",
+          "size_bytes": 9246
+        }
+      },
+      "run_dir": "/private/tmp/antfly-gliner25-training-inactive-published-small-metal-continuation-v1/dora-uninterrupted",
+      "runtime_copy_bytes": 305926616,
+      "state_sha256": "0a48a8f696666bbcbe5037e773f5647df12260a7411596439f53c6e7837cbe07",
+      "static_audit": {
+        "path": "/private/tmp/antfly-gliner25-inactive-export-reload-v1/static/metal-dora.json",
+        "sha256": "329202a0bc0096401afd24f965bb6563404547dfd3aa7b018e355a7a020ab9c4",
+        "size_bytes": 86604
+      },
+      "training_backend": "metal",
+      "training_ledger": {
+        "path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/testdata/gliner25/published_inactive_classifier_metal_v1/manifest.json",
+        "sha256": "3007a69b1aca2099f146580b79b366a4fe0d87c17f1018dd508e4df8ee1fd989",
+        "size_bytes": 29022
+      }
+    },
+    "metal-lora": {
+      "additional_request_copy_bytes": 3467,
+      "command": [
+        "/private/tmp/antfly-gliner25-oracle-venv/bin/python",
+        "-B",
+        "/private/tmp/antfly-gliner25-inactive-export-reload-v1/checker/scripts/gliner25/check_training_export.py",
+        "--variant",
+        "small",
+        "--source-dir",
+        "/private/tmp/antfly-gliner25-models/small",
+        "--export-dir",
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-metal-continuation-v1/lora-uninterrupted/model",
+        "--run-dir",
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-metal-continuation-v1/lora-uninterrupted",
+        "--output-dir",
+        "/private/tmp/antfly-gliner25-inactive-export-reload-v1/execution/metal-lora/report",
+        "--runtime",
+        "--runtime-profile",
+        "peft-0.18.0-export-v1",
+        "--peft-wheel",
+        "/private/tmp/antfly-gliner25-export-peft018-v1/peft-0.18.0-py3-none-any.whl",
+        "--requests",
+        "/private/tmp/antfly-gliner25-inactive-export-reload-v1/checker/testdata/gliner25/requests.json",
+        "--upstream",
+        "/private/tmp/antfly-gliner25-upstream",
+        "--max-runtime-copy-bytes",
+        "536870912"
+      ],
+      "execution_dir": "/private/tmp/antfly-gliner25-inactive-export-reload-v1/execution/metal-lora",
+      "expected_adapter_tensor_count": 4,
+      "expected_modules": [
+        "classifier.0",
+        "classifier.3"
+      ],
+      "expected_optimizer_identity": {
+        "microbatch_step": 5,
+        "optimizer_step": 3
+      },
+      "expected_source_tensor_count": 334,
+      "export_dir": "/private/tmp/antfly-gliner25-training-inactive-published-small-metal-continuation-v1/lora-uninterrupted/model",
+      "mode": "lora",
+      "original_files": {
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-metal-continuation-v1/lora-uninterrupted/latest.safetensors": {
+          "sha256": "b90aafa1a0073ee3fb95f96c9ce05e8dbb8a6bac1e77dd25fb91076803a51a82",
+          "size_bytes": 64900
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-metal-continuation-v1/lora-uninterrupted/model/adapter_config.json": {
+          "sha256": "6f92d9b9199ef0a131d3fa1778e7fc4b468d98512ba7efaa44ae1329870c22d3",
+          "size_bytes": 348
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-metal-continuation-v1/lora-uninterrupted/model/adapter_model.safetensors": {
+          "sha256": "91658367639ddef329ed7ba7ae613461fb63bc0ff5dc3dc4dfcc2bfa453b5e70",
+          "size_bytes": 15832
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-metal-continuation-v1/lora-uninterrupted/model/antfly_gliner25_adapter.json": {
+          "sha256": "eb4d95050fd279c882668fcc4b527456622e0763ea3f09710e727b627409a0b5",
+          "size_bytes": 2320
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-metal-continuation-v1/lora-uninterrupted/model/antfly_gliner25_training.json": {
+          "sha256": "be3c43eee11304169d026009ddba710494e17b4771b30e6394d32ccc12c7048f",
+          "size_bytes": 2879
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-metal-continuation-v1/lora-uninterrupted/result.json": {
+          "sha256": "a55357574c1f08efa66c12986960f10494965b24799e86e8f8ca2f6cd88cfc5b",
+          "size_bytes": 1124
+        },
+        "/private/tmp/antfly-gliner25-training-inactive-published-small-metal-continuation-v1/lora-uninterrupted/run.json": {
+          "sha256": "acccb3aa283498d9103c75552f613491e1b4b13c4830fce12749d599455a7378",
+          "size_bytes": 9250
+        }
+      },
+      "run_dir": "/private/tmp/antfly-gliner25-training-inactive-published-small-metal-continuation-v1/lora-uninterrupted",
+      "runtime_copy_bytes": 305923321,
+      "state_sha256": "b223f7d34a047d6dabb9677aa8a70656a60deb42c7d1b548ae38b4a83d2e580c",
+      "static_audit": {
+        "path": "/private/tmp/antfly-gliner25-inactive-export-reload-v1/static/metal-lora.json",
+        "sha256": "a817e35088b61cea3588c940094509be32315d6924b2ab1cc82e939891418d8b",
+        "size_bytes": 86013
+      },
+      "training_backend": "metal",
+      "training_ledger": {
+        "path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/testdata/gliner25/published_inactive_classifier_metal_v1/manifest.json",
+        "sha256": "3007a69b1aca2099f146580b79b366a4fe0d87c17f1018dd508e4df8ee1fd989",
+        "size_bytes": 29022
+      }
+    }
+  },
+  "python_executable": {
+    "path": "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12",
+    "sha256": "80ee2dd97bc26259d4e30853336f72ad38aa4aa0531bb196cc444d899422689d",
+    "size_bytes": 152624
+  },
+  "python_invocation": "/private/tmp/antfly-gliner25-oracle-venv/bin/python",
+  "pyvenv_cfg": {
+    "path": "/private/tmp/antfly-gliner25-oracle-venv/pyvenv.cfg",
+    "sha256": "b5575d239986adf44b66e0f3c032be806b508ec16f37cdb548653c301e9c6793",
+    "size_bytes": 339
+  },
+  "qualification": false,
+  "requests": {
+    "path": "/private/tmp/antfly-gliner25-inactive-export-reload-v1/checker/testdata/gliner25/requests.json",
+    "sha256": "030c979419cee5fd209ba6a6f23f2e0cc7744e396d4bf3357925651293f5fe5f",
+    "size_bytes": 3467
+  },
+  "runtime_executed": false,
+  "scope": "gliner25_published_inactive_classifier_export_reload_plan/v1",
+  "scope_notes": [
+    "Exactly one original small FP32 base plus one classifier-only adapter is resident per process.",
+    "The unchanged checker creates private verified source/adapter copies and one exact official PEFT wheel overlay.",
+    "Published CPU and Metal training artifacts are reloaded through the same CPU upstream runtime; this is artifact interoperability, not CPU-Metal gradient equality.",
+    "Ten fixed requests are execution smoke only, not training convergence, heldout quality, or GA.",
+    "Original PEFT 0.17.1 training environment and prior load failure evidence remain unchanged.",
+    "Pure hash/audit phases are bounded by file sizes; sampled RSS and wall deadline guard the child process through cleanup."
+  ],
+  "source_dir": "/private/tmp/antfly-gliner25-models/small",
+  "source_files": {
+    "config.json": {
+      "sha256": "0b7d9e1401ceeb83e992ec66d2f93bff7e5646428f1b4706ec527cf88f53578a",
+      "size_bytes": 3152
+    },
+    "encoder_config/config.json": {
+      "sha256": "db837d0dc587f5858687ef860c1f400de10f3c3e44f88daef8cbda80d74e4c9c",
+      "size_bytes": 856
+    },
+    "model.safetensors": {
+      "sha256": "4ee982787ace270d4bf15dbcb28ced38e0aa201372347114ceedd6336055de2b",
+      "size_bytes": 295567700
+    },
+    "tokenizer.json": {
+      "sha256": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3",
+      "size_bytes": 8341713
+    },
+    "tokenizer_config.json": {
+      "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1",
+      "size_bytes": 645
+    }
+  },
+  "supervisor": {
+    "original": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/testdata/gliner25/published_inactive_classifier_cpu_v1/helpers/v2/supervision.py",
+    "sha256": "a937237975be2ed879f62afd285494ccb51a7c1d7cc1dff7160621fb26b87332",
+    "size_bytes": 12474,
+    "snapshot": "/private/tmp/antfly-gliner25-inactive-export-reload-v1/supervision.py"
+  },
+  "upstream": {
+    "checkout": "/private/tmp/antfly-gliner25-upstream",
+    "commit": "3c913c7369301133d3b7699252074c4303ada50e"
+  },
+  "version": 1,
+  "wheel": {
+    "entries": 190,
+    "path": "/private/tmp/antfly-gliner25-export-peft018-v1/peft-0.18.0-py3-none-any.whl",
+    "sha256": "624f69ca6393b765ccc6734adda7ca57d80b238f0900a42c357d8b67a03d62ff",
+    "size_bytes": 556427,
+    "uncompressed_bytes": 1987876
+  }
+}

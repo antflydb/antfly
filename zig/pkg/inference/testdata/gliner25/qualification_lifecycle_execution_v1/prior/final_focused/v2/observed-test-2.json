@@ -1,0 +1,35 @@
+{
+  "argv": [
+    "./.zig-cache/o/1a6c91e7e9034b45732f2233da8c5a6d/test",
+    "--test-filter",
+    "boundary qualification",
+    "--test-filter",
+    "model manager teardown",
+    "--test-filter",
+    "gliner boundary persistent Metal owner observation",
+    "--test-filter",
+    "gliner boundary cache pinned small Metal handle retention eviction and reload",
+    "--test-filter",
+    "native typed gather",
+    "--test-filter",
+    "resident program",
+    "--test-filter",
+    "resident session finite cotangents",
+    "--test-filter",
+    "gliner boundary long executor",
+    "--test-filter",
+    "gliner boundary long document",
+    "--test-filter",
+    "gliner boundary learned multi window",
+    "--test-filter",
+    "boundary native trainer regional recomputation"
+  ],
+  "create_time": 1789069919.091854,
+  "cwd": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference",
+  "executable": {
+    "path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/.zig-cache/o/1a6c91e7e9034b45732f2233da8c5a6d/test",
+    "sha256": "7e9519f774211ef0065137eafaa9ef9c7995f19d2f75817ed0fbe36ad01aee74",
+    "size_bytes": 85775944
+  },
+  "pid": 18587
+}

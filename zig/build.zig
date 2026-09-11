@@ -150,6 +150,7 @@ fn addScriptsPythonCommand(b: *std.Build, script_path: []const u8, args: []const
 const openapi_join_input_paths = [_][]const u8{
     "../scripts/join_openapi.py",
     "../scripts/openapi_joiner.py",
+    "../specs/openapi/ai/extraction.yaml",
     "../specs/openapi/antfly/audio.yaml",
     "../specs/openapi/antfly/chunking.yaml",
     "../specs/openapi/antfly/config.yaml",
@@ -181,14 +182,22 @@ fn addOpenApiJoinInputs(b: *std.Build, run: *std.Build.Step.Run) void {
 const inference_delegated_steps = [_][]const u8{
     "run",
     "finetune",
+    "train-gliner25",
     "bench-paged-attention",
     "bench-training",
     "bench-linalg",
     "bench-audio",
     "bench-gliner2-native",
+    "bench-gliner25-cpu-build",
+    "bench-gliner25-metal-build",
+    "gliner25-convert-build",
+    "gliner25-bundle-check-build",
+    "gliner25-trained-check-build",
+    "gliner25-trained-check-test",
     "gliner2-entity-training-readiness",
     "test-finetune",
     "test-cancellation-e2e",
+    "test-gliner25-fuzz",
     "test",
     "wasm",
 };
@@ -440,7 +449,17 @@ fn addDelegatedInferenceBuildSteps(
         const public_name = if (std.mem.eql(u8, step_name, "test-finetune")) "inference-finetune-test" else b.fmt("inference-{s}", .{step_name});
         const delegated = addDelegatedPackageStep(b, public_name, "pkg/inference", step_name, "pkg/inference");
         const run = delegated.run;
-        addDelegatedInferenceOptions(b, run, enable_metal, enable_onnx, onnx_root, enable_cuda, cuda_artifacts, enable_pjrt, enable_system_blas, blas_root);
+        const gliner25_metal_benchmark = std.mem.eql(u8, step_name, "bench-gliner25-metal-build");
+        if (gliner25_metal_benchmark) {
+            addDelegatedInferenceOptions(b, run, true, false, onnx_root, false, cuda_artifacts, false, enable_system_blas, blas_root);
+        } else {
+            addDelegatedInferenceOptions(b, run, enable_metal, enable_onnx, onnx_root, enable_cuda, cuda_artifacts, enable_pjrt, enable_system_blas, blas_root);
+        }
+        if (gliner25_metal_benchmark or std.mem.eql(u8, step_name, "bench-gliner25-cpu-build") or std.mem.eql(u8, step_name, "gliner25-convert-build") or std.mem.eql(u8, step_name, "gliner25-bundle-check-build") or std.mem.eql(u8, step_name, "gliner25-trained-check-build") or std.mem.eql(u8, step_name, "train-gliner25")) {
+            // Delegated package builds do not inherit the outer optimize/job
+            // options. Pin the entire measured dependency graph explicitly.
+            run.addArgs(&.{ "-Doptimize=ReleaseFast", "-j1" });
+        }
         forwardBuildArgs(b, run);
         if (std.mem.eql(u8, step_name, "test")) {
             test_step = delegated.step;
@@ -2892,6 +2911,11 @@ pub fn build(b: *std.Build) void {
     const run_lib_json_tests = b.addRunArtifact(lib_json_tests);
     const lib_json_test_step = b.step("lib-json-test", "Run standalone lib/json tests");
     lib_json_test_step.dependOn(&run_lib_json_tests.step);
+
+    const lib_ml_tests = b.addTest(.{ .root_module = inference_ml_mod });
+    const run_lib_ml_tests = b.addRunArtifact(lib_ml_tests);
+    const lib_ml_test_step = b.step("lib-ml-test", "Run standalone lib/ml graph and optimizer tests");
+    lib_ml_test_step.dependOn(&run_lib_ml_tests.step);
 
     const lib_ml_tabular_tests = b.addTest(.{
         .root_module = ml_tabular_mod,

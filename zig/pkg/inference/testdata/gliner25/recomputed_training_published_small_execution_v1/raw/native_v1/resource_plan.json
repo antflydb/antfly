@@ -1,0 +1,114 @@
+{
+  "format": "antfly.gliner25-regional-all-small-resource-plan/v1",
+  "model_execution": false,
+  "actual_graph_admission_measured": false,
+  "census_basis": "Exact pinned source header dimensions and supported matching-bias Linear inventory, independently equal to historical published all131 export targets. No source weight payload copied or loaded.",
+  "source_file_bytes": 303914066,
+  "source_reservation_formula": "sum(five file sizes) + max_auxiliary_bytes + sizeof(Source) + 3; calculated again by production before source load",
+  "source_reservation_historical_observed_bytes": 438134789,
+  "source_reservation_historical_scope": "Original classifier CPU run.json; not a current sizeof(Source) ABI claim.",
+  "source_reservation_current_upper_bound_bytes": 536870912,
+  "outer_job_native_admission_formula": "source_reserved + job32MiB + dataset4MiB + host768MiB + backend1024MiB; all host for native",
+  "outer_job_admission_with_historical_source_bytes": 2354931717,
+  "outer_job_admission_using_source_cap_upper_bound_bytes": 2453667840,
+  "combined_cap_bytes": 3221225472,
+  "outer_sampled_child_tree_rss_cap_bytes": 4294967296,
+  "rss_distinction": "Sampled process RSS is not allocator admission; it can count shared pages twice and miss inter-sample peaks. Production live physical-memory reserve and all owners remain enabled.",
+  "regional_host_reserved_floor_bytes": 335544320,
+  "regional_host_formula": "Source + live parent H minus live regional allocations + full128MiB regional owner + compiled runtime metadata + Step128MiB + caller64MiB + head runtime/bindings + pending optimizer transaction; must fit source_reserved+host768MiB and clamped regional max_host.",
+  "regional_backend_formula": "existing backend allocations +64MiB metadata + selected binding copies + fixed inputs + retained layer boundaries + all gradient accumulators + largest live layer replay/tape/workspace + head tape/outputs/merge copies; <=1GiB, before first forward",
+  "regional_geometry_at_declared_B1_S512": {
+    "encoder_layers": 12,
+    "hidden_size": 384,
+    "intermediate_size": 1536,
+    "attention_heads": 6,
+    "relative_rows": 512,
+    "encoder_checkpoint_payload_bytes": 11010048,
+    "one_layer_hidden_relative_dropout_payload_bytes": 2359296,
+    "attention_four_sweep_score_elements_all_layers": 75497472,
+    "note": "Static payload/work components only; not full graph admission, measured peak, FLOPs, latency, or actual dataset token length."
+  },
+  "dora_risk": "Replay attention removes S-squared materialization, not dense adapted-weight direction/delta/norm intermediates. Exact local program geometry and all overlap remain admitted.",
+  "disk": {
+    "modes": {
+      "lora": {
+        "checkpoint_job_upper_bound_bytes": 11946912,
+        "adapter_tensor_payload_bytes": 889576,
+        "export_header_upper_bound_bytes": 119199,
+        "export_upper_bound_using_declared_config_cap_bytes": 1336463,
+        "per_invocation_atomic_job_disk_reservation_bytes": 25230287,
+        "three_phase_persistent_checkpoint_and_export_upper_bound_bytes": 38513662
+      },
+      "dora": {
+        "checkpoint_job_upper_bound_bytes": 12749968,
+        "adapter_tensor_payload_bytes": 1090340,
+        "export_header_upper_bound_bytes": 177715,
+        "export_upper_bound_using_declared_config_cap_bytes": 1595743,
+        "per_invocation_atomic_job_disk_reservation_bytes": 27095679,
+        "three_phase_persistent_checkpoint_and_export_upper_bound_bytes": 41441390
+      }
+    },
+    "all_six_phase_persistent_checkpoint_and_export_upper_bound_bytes": 79955052,
+    "all_six_phase_log_receipt_allowance_bytes": 59768832,
+    "max_atomic_checkpoint_replacement_overlap_bytes": 12749968,
+    "private_directory_misc_allowance_bytes": 1048576,
+    "all_six_phase_growth_upper_bound_bytes": 153522428,
+    "required_free_headroom_bytes": 268435456,
+    "minimum_initial_free_for_entire_plan_bytes": 421957884,
+    "source_and_original_model_copy_bytes": 0,
+    "materialized_model_export_bytes": 0,
+    "note": "Adapter-only outputs. Existing artifacts remain untouched. Recheck free bytes before each phase; preserve denied/failed outputs and never retry in the same directory."
+  },
+  "code_formula_pins": {
+    "job": {
+      "path": "zig/pkg/inference/src/finetune/gliner_boundary_training_job.zig",
+      "size_bytes": 38975,
+      "sha256": "8c736fb226ac22e7740df9d1032279c8109130dfd1b6b069ad3d9d3afa0bc1e2"
+    },
+    "source": {
+      "path": "zig/pkg/inference/src/finetune/gliner_boundary_training_source.zig",
+      "size_bytes": 49596,
+      "sha256": "96c14095c55eb9f20ad02ca7f924d53c6b320cace14555e3bd1ace423290d8c6"
+    },
+    "native_trainer": {
+      "path": "zig/pkg/inference/src/finetune/gliner_boundary_native_trainer.zig",
+      "size_bytes": 51999,
+      "sha256": "7a9cf27a7d2ea10f3585ec705b58e88ce588320ca6968e06e47cae49a478d97b"
+    },
+    "layout": {
+      "path": "zig/pkg/inference/src/finetune/gliner_boundary_adapter_layout.zig",
+      "size_bytes": 12713,
+      "sha256": "323108d991401bd141fb0ee858ae313c02e8cf607ab35ce786b77649d076c3f8"
+    },
+    "peft": {
+      "path": "zig/pkg/inference/src/finetune/gliner_boundary_peft_graph.zig",
+      "size_bytes": 24997,
+      "sha256": "a926e9c86fdf7e965fefa3bc1c4c61eaa1504c1a62ee4904dd4962abdf1e6dcb"
+    },
+    "adapter": {
+      "path": "zig/pkg/inference/src/finetune/gliner_boundary_adapter.zig",
+      "size_bytes": 59649,
+      "sha256": "119d3838bddeb4196831afd776c7619add28e5aaa5e8c6eeaa4b88b37474db76"
+    },
+    "export": {
+      "path": "zig/pkg/inference/src/finetune/gliner_boundary_training_export.zig",
+      "size_bytes": 54116,
+      "sha256": "86d1bed6e0ca6f037aad65c2ee3c820c821790c2857aaa4f4eebef3db7f31000"
+    },
+    "controller": {
+      "path": "zig/pkg/inference/src/finetune/seeded_gradient_trainer.zig",
+      "size_bytes": 83283,
+      "sha256": "4b5ea8a7375c852014e74c66a20c8d3b487f8f3260b228e755cd71996386edd6"
+    },
+    "regional": {
+      "path": "zig/pkg/inference/src/graph/recomputed_training.zig",
+      "size_bytes": 62599,
+      "sha256": "b9298282921d18872bcf331341ed7b7e373f98826650cc148769064c13b0948b"
+    },
+    "wire_limits": {
+      "path": "zig/pkg/inference/src/finetune/gliner_boundary_training_limits.zig",
+      "size_bytes": 21571,
+      "sha256": "2ad63bf41ecd4e07ab099436cc1623c1187c030437388197030f23327f2f254e"
+    }
+  }
+}

@@ -75,6 +75,14 @@ components:
         error:
           type: string
           description: Error message
+        message:
+          type: string
+        input_index:
+          type: integer
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+        stage:
+          type: string
 
     # Multimodal Content Types (OpenAI-compatible)
     TextContentPart:
@@ -1984,6 +1992,12 @@ paths:
       description: |
         Canonical schema-driven extraction API.
 
+        schema_version 2 opts into strict mixed tasks, attributes, constrained
+        classification, record grouping and typed JointIE. Per-input schema and
+        options replace their shared values. Requests are atomic; half-open
+        offsets default to UTF-8 bytes in text parts joined by a single newline.
+        Unsupported features and text truncation fail explicitly.
+
         Image-backed extraction uses the same byte-reserving and image-count-weighted
         admission policy as `/read`, before model resolution or download. Text-only
         extraction consumes one admission unit.
@@ -2009,6 +2023,18 @@ paths:
                 $ref: "#/components/schemas/Error"
         "404":
           description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          description: Extraction text, schema, candidate graph, or output exceeds configured limits
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: Extraction constraints are infeasible, required fields are missing, or bounded search is exhausted
           content:
             application/json:
               schema:

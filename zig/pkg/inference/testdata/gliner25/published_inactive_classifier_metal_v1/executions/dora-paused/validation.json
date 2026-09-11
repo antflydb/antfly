@@ -1,0 +1,248 @@
+{
+  "format": "antfly.gliner25-published-classifier-metal-pause-validation/v1",
+  "mode": "dora",
+  "status": "pass",
+  "phase": "paused",
+  "binary": {
+    "size_bytes": 32697376,
+    "sha256": "9f0d349efa3f33dd29b6c3dd26a12a8bcf2babf2bc78400c2b84d87d58d786f9"
+  },
+  "source": {
+    "backbone": "small",
+    "precision": "fp32",
+    "weight": {
+      "sha256": "4ee982787ace270d4bf15dbcb28ced38e0aa201372347114ceedd6336055de2b",
+      "size_bytes": 295567700
+    },
+    "sidecars": [
+      {
+        "sha256": "0b7d9e1401ceeb83e992ec66d2f93bff7e5646428f1b4706ec527cf88f53578a",
+        "size_bytes": 3152
+      },
+      {
+        "sha256": "db837d0dc587f5858687ef860c1f400de10f3c3e44f88daef8cbda80d74e4c9c",
+        "size_bytes": 856
+      },
+      {
+        "sha256": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3",
+        "size_bytes": 8341713
+      },
+      {
+        "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1",
+        "size_bytes": 645
+      }
+    ]
+  },
+  "data": {
+    "size_bytes": 1122,
+    "sha256": "377177ee889c4e426eeeccc4dc551437999aa702b8a5055c233aaee8936c54c7"
+  },
+  "preparation_sha256": "b75921b2a0e88de90fdf0ed58a9ec4207202f028d0d45efe128b8f8df90db03c",
+  "result": {
+    "version": 1,
+    "status": "paused",
+    "identity": {
+      "optimizer_step": 0,
+      "microbatch_step": 1
+    },
+    "accumulated_microbatches": 1,
+    "run_fingerprint": [
+      93,
+      239,
+      247,
+      176,
+      67,
+      19,
+      64,
+      194,
+      173,
+      64,
+      72,
+      200,
+      134,
+      99,
+      136,
+      121,
+      0,
+      206,
+      57,
+      190,
+      2,
+      246,
+      255,
+      190,
+      191,
+      61,
+      230,
+      75,
+      182,
+      59,
+      80,
+      248
+    ],
+    "state_sha256": [
+      10,
+      102,
+      157,
+      238,
+      213,
+      234,
+      64,
+      144,
+      66,
+      129,
+      253,
+      188,
+      14,
+      101,
+      223,
+      188,
+      125,
+      129,
+      106,
+      143,
+      193,
+      33,
+      119,
+      46,
+      81,
+      11,
+      39,
+      255,
+      179,
+      104,
+      91,
+      77
+    ],
+    "portable_model": null
+  },
+  "slots": {
+    "slots": 6,
+    "global_microbatch": 1,
+    "all_slot_updates": 0,
+    "controller_fingerprint": [
+      86,
+      23,
+      60,
+      76,
+      97,
+      222,
+      150,
+      62,
+      138,
+      201,
+      104,
+      32,
+      84,
+      145,
+      48,
+      109,
+      120,
+      72,
+      17,
+      238,
+      227,
+      205,
+      79,
+      210,
+      250,
+      117,
+      59,
+      130,
+      161,
+      150,
+      147,
+      199
+    ],
+    "state_sha256": [
+      10,
+      102,
+      157,
+      238,
+      213,
+      234,
+      64,
+      144,
+      66,
+      129,
+      253,
+      188,
+      14,
+      101,
+      223,
+      188,
+      125,
+      129,
+      106,
+      143,
+      193,
+      33,
+      119,
+      46,
+      81,
+      11,
+      39,
+      255,
+      179,
+      104,
+      91,
+      77
+    ]
+  },
+  "files": {
+    "result.json": {
+      "size_bytes": 771,
+      "sha256": "9085dcc284cae7c8a3400dcae8e7407da98eb8ac7fa95c68f1139361cdc817a7"
+    },
+    "run.json": {
+      "size_bytes": 9226,
+      "sha256": "eb11c3ed282cbe36851d39f810a1124639157f6d36750d21776725dd4ab4e8d7"
+    },
+    "progress.jsonl": {
+      "size_bytes": 1236,
+      "sha256": "f8ef5407cca212eef30bf703c8e2a76f9f59a78a2fecfcb538668e3d8dbf868a"
+    },
+    "latest.safetensors": {
+      "size_bytes": 78796,
+      "sha256": "88588267206fdc9d8535483d9ee82aa500310a7be5b88c04347841d1ea39dc01"
+    },
+    "process.json": {
+      "size_bytes": 2474,
+      "sha256": "291fa0410ac461add8f8d0848613aa97fdb088f4a310bcc6c329595b3dfc8ef8"
+    },
+    "stdout.jsonl": {
+      "size_bytes": 1790,
+      "sha256": "d6402dcbf992067f3ece314f93b263bd3a31021ca50fe8da9160e8f4f2a9b686"
+    },
+    "start.json": {
+      "size_bytes": 1310,
+      "sha256": "72c4f3f5094e5952e6cb26cc8ffcf2abd85a17375a8b4e8789bbc2b1e4bab492"
+    }
+  },
+  "resources": {
+    "host_peak_bytes": 28060948,
+    "backend_metadata_peak_bytes": 1278148,
+    "resident_device_upper_bound_bytes": 775343792,
+    "sampled_child_tree_rss_bytes": 661929984,
+    "transfers": {
+      "bytes": {
+        "upload_bytes": 10623364,
+        "proposal_logits": 32,
+        "proposal_features": 3072,
+        "loss_logits": 1584,
+        "finite_control": 96
+      },
+      "upload_calls": 86,
+      "readback_calls": 13
+    },
+    "resident_gradient_control_bytes": 0
+  },
+  "checker": {
+    "size_bytes": 13367,
+    "sha256": "4dab497e4ebcb25ce79e1235558da029fd690e611392cbbadf620af259a1808b"
+  },
+  "claim": "One explicit pause after the first active row: published resident forward/VJP, accumulation and atomic checkpoint only; no optimizer update, inactive-row, published numerical parity or convergence claim.",
+  "inactive_batch_executed": false,
+  "optimizer_update_executed": false,
+  "published_source_numerical_parity": false
+}

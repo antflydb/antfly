@@ -1,0 +1,232 @@
+{
+  "format": "antfly.gliner25-published-classifier-metal-continuation-phase/v1",
+  "mode": "lora",
+  "phase": "uninterrupted",
+  "status": "pass",
+  "binary": {
+    "size_bytes": 32697376,
+    "sha256": "9f0d349efa3f33dd29b6c3dd26a12a8bcf2babf2bc78400c2b84d87d58d786f9"
+  },
+  "preparation_sha256": "9419477901e56f72cbb681f2bd46ffe4a9f1b4fb2b3310d30ccfce91e07b8c34",
+  "checker": {
+    "size_bytes": 16734,
+    "sha256": "ecf1e4b1feb2274dbc1172350c93f675f3485a80f03ea5c0bba16e509997d2a3"
+  },
+  "files": {
+    "run.json": {
+      "size_bytes": 9250,
+      "sha256": "acccb3aa283498d9103c75552f613491e1b4b13c4830fce12749d599455a7378"
+    },
+    "progress.jsonl": {
+      "size_bytes": 6711,
+      "sha256": "9c30695cf03145208d98d1eac8f59513eba4c0210c48d18dc53e5c60c9ecda2e"
+    },
+    "result.json": {
+      "size_bytes": 1124,
+      "sha256": "a55357574c1f08efa66c12986960f10494965b24799e86e8f8ca2f6cd88cfc5b"
+    },
+    "latest.safetensors": {
+      "size_bytes": 64900,
+      "sha256": "b90aafa1a0073ee3fb95f96c9ce05e8dbb8a6bac1e77dd25fb91076803a51a82"
+    },
+    "model/adapter_config.json": {
+      "size_bytes": 348,
+      "sha256": "6f92d9b9199ef0a131d3fa1778e7fc4b468d98512ba7efaa44ae1329870c22d3"
+    },
+    "model/adapter_model.safetensors": {
+      "size_bytes": 15832,
+      "sha256": "91658367639ddef329ed7ba7ae613461fb63bc0ff5dc3dc4dfcc2bfa453b5e70"
+    },
+    "model/antfly_gliner25_adapter.json": {
+      "size_bytes": 2320,
+      "sha256": "eb4d95050fd279c882668fcc4b527456622e0763ea3f09710e727b627409a0b5"
+    },
+    "model/antfly_gliner25_training.json": {
+      "size_bytes": 2879,
+      "sha256": "be3c43eee11304169d026009ddba710494e17b4771b30e6394d32ccc12c7048f"
+    },
+    "process.json": {
+      "size_bytes": 2640,
+      "sha256": "77da5804757d803f97a865f1b4e2b1792ab5c259e10878feec1f8b7ee01ab384"
+    },
+    "start.json": {
+      "size_bytes": 1477,
+      "sha256": "b959257fdfe0d2c9c0a4341debbc28fd7ad979c6c2105faaf64e054a42dfa818"
+    },
+    "stdout.jsonl": {
+      "size_bytes": 7693,
+      "sha256": "dadc648f740ae77437c8b5ae3327f8400625fb5d27529496ffd6d9cef302155c"
+    }
+  },
+  "result": {
+    "version": 1,
+    "status": "complete",
+    "identity": {
+      "optimizer_step": 3,
+      "microbatch_step": 5
+    },
+    "accumulated_microbatches": 0,
+    "run_fingerprint": [
+      153,
+      61,
+      130,
+      106,
+      234,
+      59,
+      228,
+      236,
+      196,
+      172,
+      213,
+      234,
+      49,
+      200,
+      179,
+      217,
+      54,
+      117,
+      234,
+      28,
+      91,
+      170,
+      192,
+      226,
+      82,
+      185,
+      0,
+      104,
+      113,
+      119,
+      48,
+      9
+    ],
+    "state_sha256": [
+      178,
+      35,
+      247,
+      211,
+      74,
+      4,
+      125,
+      109,
+      171,
+      185,
+      103,
+      122,
+      168,
+      167,
+      6,
+      86,
+      166,
+      13,
+      235,
+      66,
+      199,
+      209,
+      181,
+      72,
+      174,
+      56,
+      180,
+      168,
+      61,
+      46,
+      88,
+      12
+    ],
+    "portable_model": {
+      "mode": "lora",
+      "weights": {
+        "size_bytes": 15832,
+        "sha256": "91658367639ddef329ed7ba7ae613461fb63bc0ff5dc3dc4dfcc2bfa453b5e70"
+      },
+      "provenance": {
+        "size_bytes": 2879,
+        "sha256": "be3c43eee11304169d026009ddba710494e17b4771b30e6394d32ccc12c7048f"
+      },
+      "output_bytes": 21379,
+      "peak_scratch_bytes": 573632
+    }
+  },
+  "slots": {
+    "slots": 4,
+    "global_microbatch": 5,
+    "all_slot_updates": 3,
+    "controller_fingerprint": [
+      243,
+      57,
+      69,
+      140,
+      196,
+      215,
+      21,
+      26,
+      42,
+      138,
+      64,
+      91,
+      233,
+      210,
+      22,
+      218,
+      202,
+      4,
+      170,
+      63,
+      254,
+      117,
+      147,
+      237,
+      10,
+      77,
+      76,
+      96,
+      239,
+      25,
+      82,
+      23
+    ],
+    "state_sha256": [
+      178,
+      35,
+      247,
+      211,
+      74,
+      4,
+      125,
+      109,
+      171,
+      185,
+      103,
+      122,
+      168,
+      167,
+      6,
+      86,
+      166,
+      13,
+      235,
+      66,
+      199,
+      209,
+      181,
+      72,
+      174,
+      56,
+      180,
+      168,
+      61,
+      46,
+      88,
+      12
+    ]
+  },
+  "resources": {
+    "host_peak_bytes": 27969855,
+    "backend_metadata_peak_bytes": 1265664,
+    "resident_device_upper_bound_bytes": 775275748,
+    "sampled_child_tree_rss_bytes": 486834176
+  },
+  "published_source_numerical_parity": false,
+  "claim": "Published-small classifier-only LoRA/DoRA resident Metal continuation, explicit-zero fallback and optimizer/checkpoint/export continuity. Same-backend fresh-owner resumed reports, result, checkpoint and four export files must be exact versus uninterrupted. No independent published Python loss/VJP, cross-backend numerical or convergence claim."
+}

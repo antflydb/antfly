@@ -1,0 +1,17 @@
+{
+  "peft_type": "LORA",
+  "task_type": null,
+  "base_model_name_or_path": "/private/tmp/antfly-gliner25-models/small",
+  "revision": null,
+  "r": 2,
+  "lora_alpha": 3,
+  "lora_dropout": 0,
+  "target_modules": [
+    "classifier.0",
+    "classifier.3"
+  ],
+  "bias": "none",
+  "use_dora": false,
+  "fan_in_fan_out": false,
+  "inference_mode": true
+}

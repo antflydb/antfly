@@ -1,0 +1,51 @@
+{
+  "format": "antfly.gliner25-published-inactive-driver-checkpoint/v1",
+  "model_execution": false,
+  "files": {
+    "validate.py": {
+      "size_bytes": 24345,
+      "sha256": "b6fb928d4e60d6ec0867f30bea1f292470d28ef98d0d496606198d6333e3f058"
+    },
+    "supervision.py": {
+      "size_bytes": 12474,
+      "sha256": "a937237975be2ed879f62afd285494ccb51a7c1d7cc1dff7160621fb26b87332"
+    },
+    "test_validate.py": {
+      "size_bytes": 8562,
+      "sha256": "13715181c7f94e1b69196fcfc9ebc5930d658e6b289881fa794d8bca201b0904"
+    },
+    "test_supervision.py": {
+      "size_bytes": 7627,
+      "sha256": "2be045ba112529f006727b8f47ece79f85ef0f89c605fdbaf79df175f6e67bf4"
+    },
+    "lifetime-tests.log": {
+      "size_bytes": 118,
+      "sha256": "cc260adcb4e8b2752ec65e2bb63cb036115ef60407f01ffc9771628994be93e8"
+    },
+    "preparation.json": {
+      "size_bytes": 5083,
+      "sha256": "e49ca907daf093303dd3919b56ab61f36983eb9d9174e3d3ccd7993ac21e83b9"
+    },
+    "resource_analysis.json": {
+      "size_bytes": 3606,
+      "sha256": "9bd38498d59ff9c40500b921ff0ffc993322e7f33e151988fc473bad51b3465c"
+    },
+    "train.jsonl": {
+      "size_bytes": 1122,
+      "sha256": "377177ee889c4e426eeeccc4dc551437999aa702b8a5055c233aaee8936c54c7"
+    }
+  },
+  "tests": {
+    "command": "PYTHONDONTWRITEBYTECODE=1 /private/tmp/antfly-gliner25-oracle-venv/bin/python -m unittest test_validate test_supervision",
+    "exit_code": 0,
+    "tests": 19,
+    "elapsed_seconds": 1.129,
+    "scope": "11 pure schema/state tests and8 lifetime tests including real bounded subprocess FIFO, registration failure, output/RSS denial and timeout plus creation-identity cleanup; no Torch/model/checkpoint loaded",
+    "process_inspection": "auto-approved escalation; initial sandbox attempt denied sysctl inspection before any child was spawned"
+  },
+  "approved_next_binary": {
+    "path": "/private/tmp/antfly-gliner25-runtime-inactive-metal-v1/bin/antfly-inference",
+    "size_bytes": 32697376,
+    "sha256": "9f0d349efa3f33dd29b6c3dd26a12a8bcf2babf2bc78400c2b84d87d58d786f9"
+  }
+}

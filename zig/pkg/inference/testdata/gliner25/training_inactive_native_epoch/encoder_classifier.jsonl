@@ -1,0 +1,2 @@
+{"version":1,"id":"encoder_classifier-0","text":"Ada.","schema":{"entities":["person"],"classifications":[{"name":"sentiment","labels":["good","bad"]}]},"entities":[{"id":"ada","type":"person","span":{"start":0,"end":3,"unit":"utf8_bytes"}}],"classifications":[{"task":"sentiment","labels":["good"]}]}
+{"version":1,"id":"encoder_classifier-1","text":"Ada.","schema":{"entities":["person"]},"entities":[{"id":"ada","type":"person","span":{"start":0,"end":3,"unit":"utf8_bytes"}}]}

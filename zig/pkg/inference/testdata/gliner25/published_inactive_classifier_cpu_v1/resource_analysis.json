@@ -1,0 +1,59 @@
+{
+  "format": "antfly.gliner25-published-metal-training-resource-analysis/v1",
+  "model_execution": false,
+  "configuration_only": true,
+  "prior_failure": {
+    "requested_bytes": 2216519709,
+    "available_bytes": 7043746365,
+    "reserve_bytes": 6442450944,
+    "capacity_bytes": 601295421,
+    "phase": "process-wide admission before immutable Source load or encoder forward",
+    "log_sha256": "b1d30c377b06950db5e0966fbf66ee5527a38998960334d14799b8aa65b4c3c0"
+  },
+  "census": {
+    "source_five_file_bytes": 303914066,
+    "source_auxiliary_allowance": 134217728,
+    "source_owner_extra_bytes": "sizeof(Source)+3 (calculated by production, not guessed)",
+    "original_f32_payload_bytes": 295527516,
+    "largest_frozen_upload_bytes": 196624896,
+    "head_parameter_bytes": 12935772,
+    "head_trainable_device_state_bytes": 51743088,
+    "classifier_lora_parameter_bytes": 15368,
+    "classifier_lora_device_state_bytes": 61472,
+    "classifier_dora_parameter_bytes": 18444,
+    "classifier_dora_device_state_bytes": 73776
+  },
+  "initial_backend_bounds": {
+    "formula": "frozen payload + 4 trainable tensors per slot + backend host metadata + max(largest upload,2MiB)",
+    "prior_all_heads_bytes": 598068592,
+    "classifier_lora_bytes": 559322748,
+    "classifier_dora_bytes": 559335052,
+    "note": "This is initialization only. Step admission additionally includes retained captures, live inputs including borrowed parameter bindings, local program temporaries, typed upload staging and all-slot optimizer transaction, conservatively simultaneously. It is not a measured RSS."
+  },
+  "impossibility_at_prior_capacity": {
+    "source_reservation_plus_frozen_weight_lower_bound_bytes": 733659310,
+    "excess_over_prior_capacity_bytes": 132363889,
+    "claim": "Even source plus immutable resident weights exceeds old live capacity; no source/graph/backend cap reduction can honestly admit it under that observed pressure. CPU jobs must also obey current capacity."
+  },
+  "prospective_classifier_metal_profile_not_executed": {
+    "memory": {
+      "host_bytes": 134217728,
+      "backend_bytes": 1073741824,
+      "backend_metadata_bytes": 67108864,
+      "combined_bytes": 2147483648,
+      "optimizer_state_bytes": 33554432,
+      "optimizer_transaction_bytes": 268435456,
+      "job_bytes": 16777216
+    },
+    "dataset_host_bytes": 4194304,
+    "source_auxiliary_bytes": 134217728,
+    "admission_host_lower_bound_bytes": 660429906,
+    "admission_device_bytes": 1006632960,
+    "admission_combined_lower_bound_bytes": 1667062866,
+    "admission_combined_upper_bound_using_source_cap_bytes": 1765801984,
+    "required_available_bytes_at_prior_6GiB_reserve_lower_bound": 8109513810,
+    "justification": "Keep prior all-head 1GiB backend ceiling. Reduce only named host/job/dataset ceilings for the tiny authored classifier-only workload, with independent allocations enforced. Initial-bound fits; actual selected graph/tape/update bound must still pass without mutation. No guarantee of stage fit or currently available physical capacity. No workload/candidate/model/dropout change."
+  },
+  "blocked_work": "No published GPU command should be run at the recorded601MB capacity. Do not change global reserve, resource-pressure policy, model task flags, candidate budgets or dtype to force admission.",
+  "next_measurement": "After root builds corrected public CLI and CPU runs pass, a separately approved GPU profile can be attempted only through normal live admission. Preserve every denied profile and use typed exact owner-phase denial before considering another explicit profile."
+}

@@ -1,0 +1,290 @@
+{
+  "command": [
+    "/opt/homebrew/Cellar/zig/0.16.0/bin/zig",
+    "build",
+    "inference-test",
+    "-Dmetal=true",
+    "-Dcuda=false",
+    "-j1",
+    "--",
+    "--test-filter",
+    "boundary qualification",
+    "--test-filter",
+    "seeded gradient trainer restore",
+    "--test-filter",
+    "boundary training dataset",
+    "--test-filter",
+    "boundary training export",
+    "--test-filter",
+    "boundary training job dataset open",
+    "--test-filter",
+    "gliner boundary cache pinned small Metal handle retention eviction and reload",
+    "--test-filter",
+    "gliner boundary manifests",
+    "--test-filter",
+    "gliner boundary detection keeps legacy",
+    "--test-filter",
+    "gliner boundary capabilities",
+    "--test-filter",
+    "taskMatchesModelListing",
+    "--test-filter",
+    "gliner boundary long executor",
+    "--test-filter",
+    "gliner boundary executor pinned small Metal window batch"
+  ],
+  "cwd": "/Users/timkaye/Documents/af/antfly/zig",
+  "environment": {
+    "ANTFLY_GLINER25_SMALL_MODEL_DIR": "/private/tmp/antfly-gliner25-models/small",
+    "ZIG_GLOBAL_CACHE_DIR": "/private/tmp/antfly-gliner25-zig-cache"
+  },
+  "process": {
+    "changed_sources": [],
+    "cleanup": {
+      "complete": true,
+      "direct_child_reaped": true,
+      "elapsed_seconds": 5.179201252758503e-05,
+      "errors": [],
+      "grandchild_proof": "observed creation identities no longer exist; direct CLI parent is their normal waiter",
+      "inspection_errors": [],
+      "known_children_gone": true,
+      "survivors": []
+    },
+    "cleanup_signals": [],
+    "elapsed_seconds": 194.88731737498892,
+    "failure": "RuntimeError: public CLI exited 1",
+    "failure_phase": "execution",
+    "inspection_error_count": 0,
+    "inspection_errors": [],
+    "kill_wait_seconds": 5,
+    "max_child_tree_rss_bytes": 6442450944,
+    "max_stderr_bytes": 8388608,
+    "max_stdout_bytes": 8388608,
+    "max_tracked_processes": 64,
+    "observed_test_executables": [
+      {
+        "argv": [
+          "./.zig-cache/o/d93233285d1d62c43d4408acbe770aa5/test",
+          "--cache-dir=./.zig-cache",
+          "--seed=0xa2205c7e",
+          "--listen=-"
+        ],
+        "create_time": 1789067359.388721,
+        "cwd": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference",
+        "executable": {
+          "path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/.zig-cache/o/d93233285d1d62c43d4408acbe770aa5/test",
+          "sha256": "650c1f87eb88d96c111d05f81135ab22eaee3e21a4be655bdb9fac24752da79e",
+          "size_bytes": 4970984
+        },
+        "pid": 15193
+      },
+      {
+        "argv": [
+          "./.zig-cache/o/7b1fa3efb9bebccfbc7a89f0beb18b7f/test",
+          "--test-filter",
+          "boundary qualification",
+          "--test-filter",
+          "seeded gradient trainer restore",
+          "--test-filter",
+          "boundary training dataset",
+          "--test-filter",
+          "boundary training export",
+          "--test-filter",
+          "boundary training job dataset open",
+          "--test-filter",
+          "gliner boundary cache pinned small Metal handle retention eviction and reload",
+          "--test-filter",
+          "gliner boundary manifests",
+          "--test-filter",
+          "gliner boundary detection keeps legacy",
+          "--test-filter",
+          "gliner boundary capabilities",
+          "--test-filter",
+          "taskMatchesModelListing",
+          "--test-filter",
+          "gliner boundary long executor",
+          "--test-filter",
+          "gliner boundary executor pinned small Metal window batch"
+        ],
+        "create_time": 1789067410.738922,
+        "cwd": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference",
+        "executable": {
+          "path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/.zig-cache/o/7b1fa3efb9bebccfbc7a89f0beb18b7f/test",
+          "sha256": "ddc9797781b4e98bf8b8f88613aa209f3fbf283124e2b326090a9b0e84406415",
+          "size_bytes": 83606552
+        },
+        "pid": 15232
+      }
+    ],
+    "optional_executable_identity_errors": [
+      "(pid=15164)",
+      "(pid=15164)",
+      "(pid=15186)",
+      "(pid=15186)",
+      "(pid=15186)",
+      "(pid=15186)",
+      "(pid=15186)"
+    ],
+    "parent_grace_seconds": 5,
+    "parent_pid": 14983,
+    "peak_child_tree_rss_bytes": 4508696576,
+    "psutil_version": "7.1.3",
+    "returncode": 1,
+    "rss_measurement": "sampled sum of RSS for still-matching known child creation identities; shared pages can be counted twice",
+    "rss_poll_seconds": 0.05,
+    "rss_samples": 1573,
+    "source_inventory_unchanged": true,
+    "stderr": {
+      "sha256": "52139fe9b286a51bc4a8fa7b40179851fc75921bc0e0c62ddff0918077182399",
+      "size_bytes": 11771
+    },
+    "stdout": {
+      "sha256": "3459fccabd4b57aaca0e53c7a3da704caee13562a6d2854a5b3bf4a459753ae8",
+      "size_bytes": 203
+    },
+    "timeout_seconds": 1800,
+    "tracked_processes": [
+      {
+        "create_time": 1789067351.527442,
+        "pid": 14983,
+        "relation": "direct_child"
+      },
+      {
+        "create_time": 1789067351.583697,
+        "pid": 14986,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789067351.643661,
+        "pid": 14989,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789067351.990282,
+        "pid": 15035,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789067352.021939,
+        "pid": 15039,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789067352.069449,
+        "pid": 15042,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789067352.167368,
+        "pid": 15052,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789067352.229815,
+        "pid": 15064,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789067352.239787,
+        "pid": 15066,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789067352.304377,
+        "pid": 15080,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789067352.36071,
+        "pid": 15093,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789067352.496313,
+        "pid": 15122,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789067352.559957,
+        "pid": 15138,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789067352.620727,
+        "pid": 15154,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789067352.669237,
+        "pid": 15160,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789067352.669457,
+        "pid": 15161,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789067352.670817,
+        "pid": 15162,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789067352.671665,
+        "pid": 15163,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789067352.671878,
+        "pid": 15164,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789067352.677518,
+        "pid": 15170,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789067352.688585,
+        "pid": 15171,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789067352.738044,
+        "pid": 15186,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789067352.747874,
+        "pid": 15187,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789067359.388721,
+        "pid": 15193,
+        "relation": "observed_descendant"
+      },
+      {
+        "create_time": 1789067410.738922,
+        "pid": 15232,
+        "relation": "observed_descendant"
+      }
+    ],
+    "worker_parent_loss_grace_seconds": 2
+  },
+  "qualification": false,
+  "scope": "local_regional_training_and_service_checks/v1",
+  "source_count": 2587,
+  "source_inventory": {
+    "sha256": "6047ee7c164dca1a114af134331f74d5b49eb2eb23a10f1ae49e10925afdc0b9",
+    "size_bytes": 437855
+  },
+  "source_selection": "rg --files zig; suffixes .zig .zon .metal .m .mm .c .h; this is not a complete dependency closure",
+  "supervisor": {
+    "sha256": "a937237975be2ed879f62afd285494ccb51a7c1d7cc1dff7160621fb26b87332",
+    "size_bytes": 12474
+  },
+  "wrapper": {
+    "sha256": "45a745b995f86432c89fa57bf8dd5b92dbc810f706a7989accc66c8bbddde3b1",
+    "size_bytes": 6752
+  }
+}

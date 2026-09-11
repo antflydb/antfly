@@ -1,0 +1,148 @@
+{
+  "confidence_absolute_tolerance": 0.0005,
+  "default_limits": {
+    "combined_bytes": 3221225472,
+    "encoder_device_bytes": 536870912,
+    "event_bytes": 4194304,
+    "head_device_bytes": 134217728,
+    "loader_host_bytes": 134217728,
+    "proposal_download_bytes": 8388608,
+    "request_scratch_bytes": 134217728,
+    "request_timeout_ms": 120000,
+    "result_download_bytes": 8388608,
+    "startup_timeout_ms": 180000,
+    "total_output_bytes": 67108864,
+    "total_timeout_ms": 600000,
+    "version": 1
+  },
+  "event_count": 12,
+  "frozen_helpers": {
+    "../paired_benchmark.py": {
+      "sha256": "09612b67c2eeac5de17703088cb790c70d674a476053868f588699c5ca6e8411",
+      "size_bytes": 6183
+    },
+    "benchmark_cpu.py": {
+      "sha256": "277fd7f16371ff055be07142a9d32e10f54c4e4fa90aff6011c21995044b4b9d",
+      "size_bytes": 27929
+    },
+    "check_bundles.py": {
+      "sha256": "4c58f89ea38065223696752743aa5db89d4fa6f430fe21765e0d729c21dc8b74",
+      "size_bytes": 24424
+    },
+    "check_training_export.py": {
+      "sha256": "11c5aac29919b21eba0e66aa1ab96d6bae0591d1cc154c5c980f703a001f91d5",
+      "size_bytes": 35644
+    },
+    "check_training_merge.py": {
+      "sha256": "920fb9041a110c0381aff3afc70fae7f0f885e141679caa9fc34dbc01288bb00",
+      "size_bytes": 47384
+    },
+    "extract_token_evidence.py": {
+      "sha256": "e9ddf6de97c2f3821e69159c2416be8ad9f99e88b43077f25480616441b36c0d",
+      "size_bytes": 6242
+    },
+    "generate_pipeline_cases.py": {
+      "sha256": "f52353cf718111f7242faa5faec6edda9937146dffdf77d7678a32e4fbd73bfe",
+      "size_bytes": 9982
+    },
+    "oracle.py": {
+      "sha256": "61bbf4544a21111dbfbd643ed2392b1d9723498493b3fa6832154d6e1dc42752",
+      "size_bytes": 28555
+    },
+    "oracle_manifest.json": {
+      "sha256": "918005508a57d2c558c18a78167637f39c54e7c2c6d67814be15fc6714c4152f",
+      "size_bytes": 4097
+    },
+    "training_export_contract.json": {
+      "sha256": "b164ae2fe9aef1506f179fc554ae956826d782c0ff0ca7d4685d747882687978",
+      "size_bytes": 1311
+    },
+    "training_export_peft018.json": {
+      "sha256": "08905e3428c9d4a45a5e6a2c54677427f727cee1aa605647bc0b613567000968",
+      "size_bytes": 31851
+    },
+    "training_export_runtime.py": {
+      "sha256": "b6d15a935454a84f7df18eb394e4d6dd9c1dc8a988426e93169d596236d42d63",
+      "size_bytes": 10121
+    },
+    "training_merge_contract.json": {
+      "sha256": "b18312e337302e7c0c1bf2b0ec5c4679ade912f0ec5029905d94131f43e89149",
+      "size_bytes": 3034
+    }
+  },
+  "hard_limits": {
+    "combined_bytes": [
+      1048576,
+      12884901888
+    ],
+    "encoder_device_bytes": [
+      1048576,
+      4294967296
+    ],
+    "event_bytes": [
+      1,
+      4194304
+    ],
+    "head_device_bytes": [
+      1048576,
+      1073741824
+    ],
+    "loader_host_bytes": [
+      1048576,
+      1073741824
+    ],
+    "proposal_download_bytes": [
+      1,
+      67108864
+    ],
+    "request_scratch_bytes": [
+      1048576,
+      2147483648
+    ],
+    "request_timeout_ms": [
+      1,
+      120000
+    ],
+    "result_download_bytes": [
+      1,
+      67108864
+    ],
+    "startup_timeout_ms": [
+      1,
+      180000
+    ],
+    "total_output_bytes": [
+      1,
+      67108864
+    ],
+    "total_timeout_ms": [
+      1,
+      1800000
+    ]
+  },
+  "input_scope": "gliner25_trained_artifact_inputs/v1",
+  "inputs": {
+    "sha256": "d9414f1d7a2138ed0a9211285bcee5f662667747a31b255ca1708f48a7966abd",
+    "size_bytes": 5965
+  },
+  "math_policy": "strict_f32_activations_v1",
+  "max_encoded_tokens": 512,
+  "max_private_copy_bytes": 2147483648,
+  "max_queries": 64,
+  "max_report_bytes": 8388608,
+  "max_stderr_bytes": 8388608,
+  "max_words": 128,
+  "metal_requires_native": "identical_binary_artifact_inputs_math_policy_and_approved_report_hash",
+  "native_probability_map_parity_claimed": false,
+  "qualification": false,
+  "report_scope": "gliner25_trained_artifact_execution_report/v1",
+  "request_count": 10,
+  "requests": {
+    "sha256": "030c979419cee5fd209ba6a6f23f2e0cc7744e396d4bf3357925651293f5fe5f",
+    "size_bytes": 3467
+  },
+  "rss_limit_bytes": 6442450944,
+  "scope": "gliner25_trained_artifact_execution/v1",
+  "source_coordinate_contract": "original_codepoints_and_exact_utf8_bytes_no_synthetic_clipping",
+  "version": 1
+}

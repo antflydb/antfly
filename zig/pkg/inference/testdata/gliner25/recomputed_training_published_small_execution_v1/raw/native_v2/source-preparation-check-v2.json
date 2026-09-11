@@ -1,0 +1,31 @@
+{
+  "format": "antfly.gliner25-regional-all-native-source-preparation-check/v1",
+  "campaign_version": 2,
+  "source_dir": "/private/tmp/antfly-gliner25-models/small",
+  "current_sidecars": {
+    "config.json": {
+      "size_bytes": 3152,
+      "sha256": "0b7d9e1401ceeb83e992ec66d2f93bff7e5646428f1b4706ec527cf88f53578a"
+    },
+    "encoder_config/config.json": {
+      "size_bytes": 856,
+      "sha256": "db837d0dc587f5858687ef860c1f400de10f3c3e44f88daef8cbda80d74e4c9c"
+    },
+    "tokenizer.json": {
+      "size_bytes": 8341713,
+      "sha256": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3"
+    },
+    "tokenizer_config.json": {
+      "size_bytes": 645,
+      "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1"
+    }
+  },
+  "current_weight_size_bytes": 295567700,
+  "current_weight_header": {
+    "size_bytes": 40176,
+    "sha256": "bec3666c67e3b7764a1248efed2e72ed3e536b673b665d389534130a648d8946"
+  },
+  "full_weight_payload_rehashed": false,
+  "model_execution": false,
+  "note": "Current four sidecar hashes and bounded weight header/size checked independently after preparation. The prospective driver/native Source must enforce the full five-file identity before execution."
+}

@@ -1,0 +1,37 @@
+{
+  "argv": [
+    "./.zig-cache/o/7b1fa3efb9bebccfbc7a89f0beb18b7f/test",
+    "--test-filter",
+    "boundary qualification",
+    "--test-filter",
+    "seeded gradient trainer restore",
+    "--test-filter",
+    "boundary training dataset",
+    "--test-filter",
+    "boundary training export",
+    "--test-filter",
+    "boundary training job dataset open",
+    "--test-filter",
+    "gliner boundary cache pinned small Metal handle retention eviction and reload",
+    "--test-filter",
+    "gliner boundary manifests",
+    "--test-filter",
+    "gliner boundary detection keeps legacy",
+    "--test-filter",
+    "gliner boundary capabilities",
+    "--test-filter",
+    "taskMatchesModelListing",
+    "--test-filter",
+    "gliner boundary long executor",
+    "--test-filter",
+    "gliner boundary executor pinned small Metal window batch"
+  ],
+  "create_time": 1789067410.738922,
+  "cwd": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference",
+  "executable": {
+    "path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/.zig-cache/o/7b1fa3efb9bebccfbc7a89f0beb18b7f/test",
+    "sha256": "ddc9797781b4e98bf8b8f88613aa209f3fbf283124e2b326090a9b0e84406415",
+    "size_bytes": 83606552
+  },
+  "pid": 15232
+}

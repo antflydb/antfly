@@ -29,6 +29,9 @@ pub const Config = struct {
     max_position_embeddings: u32 = 512,
     position_buckets: u32 = 256,
     layer_norm_eps: f32 = 1e-7,
+    /// The legacy eager path used tanh GELU. New artifact contracts can select
+    /// Hugging Face's exact-erf `hidden_act=gelu` without changing legacy runs.
+    use_exact_gelu: bool = false,
     // GLiNER label marker token IDs (from added_tokens.json).
     classification_token_id: i64 = 128004,
     entity_token_id: i64 = 128005,

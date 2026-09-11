@@ -1,0 +1,241 @@
+--- a/zig/pkg/inference/src/server/model_manager.zig
++++ b/zig/pkg/inference/src/server/model_manager.zig
+@@ -3519,6 +3519,12 @@
+     }
+ 
+     pub fn release(self: *ModelHandle) void {
++        self.releaseWithUsage(true);
++    }
++
++    // Observation pins share exactly the same final-retired-owner cleanup,
++    // but are not inference usage and must not renew idle cache residency.
++    fn releaseWithUsage(self: *ModelHandle, used: bool) void {
+         const model = self.model orelse return;
+         var destroy_retired = false;
+         self.manager.lockLoadedModels();
+@@ -3526,7 +3532,7 @@
+         model.active_handles -= 1;
+         if (model.retired) {
+             destroy_retired = model.active_handles == 0;
+-        } else {
++        } else if (used) {
+             model.last_used_ns = platform.time.monotonicNs();
+         }
+         self.manager.unlockLoadedModels();
+@@ -3556,10 +3562,11 @@
+ 
+ pub const LoadedModelSnapshot = struct {
+     allocator: std.mem.Allocator,
++    /// Borrowed observation pins; release them only through this owner.
+     handles: []ModelHandle,
+ 
+     pub fn deinit(self: *LoadedModelSnapshot) void {
+-        for (self.handles) |*handle| handle.release();
++        for (self.handles) |*handle| handle.releaseWithUsage(false);
+         self.allocator.free(self.handles);
+         self.handles = &.{};
+     }
+@@ -5722,7 +5729,8 @@
+ 
+     /// Pin one handle for every currently published model. Callers may release
+     /// load_lock before taking per-model locks without racing model eviction or
+-    /// retirement destruction.
++    /// retirement destruction. Metrics/listing observation does not renew TTL;
++    /// ordinary inference handles still record use when they are released.
+     pub fn acquireLoadedModelSnapshot(
+         self: *ModelManager,
+         allocator: std.mem.Allocator,
+@@ -7825,7 +7833,7 @@
+     allocator.free(evicted.?.key);
+ }
+ 
+-test "loaded model snapshot pins model lifetimes until release" {
++test "loaded model snapshot preserves TTL while ordinary inference release records use" {
+     const allocator = std.testing.allocator;
+     var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+     defer {
+@@ -7835,21 +7843,120 @@
+         manager.loaded_aliases.deinit(allocator);
+         manager.in_flight_loads.deinit(allocator);
+     }
+-
++    manager.configureModelCache(1, 1);
+     var model: LoadedModel = undefined;
+     model.active_handles = 0;
+     model.last_used_ns = 1;
+     model.pinned = false;
+     model.retired = false;
+     try manager.loaded.put(allocator, try allocator.dupe(u8, "model"), &model);
+-
++    const old_expiry = model.last_used_ns + std.time.ns_per_ms;
++
++    for (0..3) |_| {
++        var snapshot = try manager.acquireLoadedModelSnapshot(allocator);
++        defer snapshot.deinit();
++        try std.testing.expectEqual(@as(usize, 1), snapshot.handles.len);
++        try std.testing.expectEqual(@as(usize, 1), model.active_handles);
++        try std.testing.expect(snapshot.handles[0].get() == &model);
++        manager.lockLoadedModels();
++        const held = manager.takeLruModelLocked(old_expiry, true, null);
++        manager.unlockLoadedModels();
++        defer if (held) |removed| allocator.free(removed.key);
++        try std.testing.expect(held == null);
++        snapshot.deinit();
++        try std.testing.expectEqual(@as(usize, 0), model.active_handles);
++        try std.testing.expectEqual(@as(u64, 1), model.last_used_ns);
++    }
++
++    // A real inference handle can finish while observation remains pinned.
++    // Releasing that observer must neither reset nor renew the inference time.
++    var observation = try manager.acquireLoadedModelSnapshot(allocator);
++    defer observation.deinit();
++    var inference = manager.acquireLoadedModel("model") orelse return error.MissingTestModel;
++    defer inference.release();
++    try std.testing.expectEqual(@as(usize, 2), model.active_handles);
++    const before_release = platform.time.monotonicNs();
++    inference.release();
++    const used_at = model.last_used_ns;
++    try std.testing.expect(used_at >= before_release and used_at > 1);
++    try std.testing.expectEqual(@as(usize, 1), model.active_handles);
++    observation.deinit();
++    try std.testing.expectEqual(used_at, model.last_used_ns);
++    try std.testing.expectEqual(@as(usize, 0), model.active_handles);
++
++    manager.lockLoadedModels();
++    const not_yet = manager.takeLruModelLocked(used_at + std.time.ns_per_ms - 1, true, null);
++    manager.unlockLoadedModels();
++    defer if (not_yet) |removed| allocator.free(removed.key);
++    try std.testing.expect(not_yet == null);
++    manager.lockLoadedModels();
++    const expired = manager.takeLruModelLocked(used_at + std.time.ns_per_ms, true, null);
++    manager.unlockLoadedModels();
++    defer if (expired) |removed| allocator.free(removed.key);
++    try std.testing.expect(expired != null and expired.?.model == &model);
++    try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
++}
++
++test "loaded model snapshot allocation failure preserves lifetime usage and retry" {
++    const allocator = std.testing.allocator;
++    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
++    defer {
++        var it = manager.loaded.iterator();
++        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
++        manager.loaded.deinit(allocator);
++        manager.loaded_aliases.deinit(allocator);
++        manager.in_flight_loads.deinit(allocator);
++    }
++    var model: LoadedModel = undefined;
++    model.active_handles = 0;
++    model.last_used_ns = 123;
++    model.pinned = false;
++    model.retired = false;
++    try manager.loaded.put(allocator, try allocator.dupe(u8, "model"), &model);
++    var failure = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
++    try std.testing.expectError(error.OutOfMemory, manager.acquireLoadedModelSnapshot(failure.allocator()));
++    try std.testing.expectEqual(@as(usize, 0), model.active_handles);
++    try std.testing.expectEqual(@as(u64, 123), model.last_used_ns);
++    try std.testing.expectEqual(@as(usize, 1), manager.loaded.count());
++    // The failed acquisition also releases load_lock before this retry.
++    var retry = try manager.acquireLoadedModelSnapshot(allocator);
++    defer retry.deinit();
++    try std.testing.expectEqual(@as(usize, 1), model.active_handles);
++    retry.deinit();
++    try std.testing.expectEqual(@as(usize, 0), model.active_handles);
++    try std.testing.expectEqual(@as(u64, 123), model.last_used_ns);
++}
++
++test "loaded model snapshot final retired observation keeps protected cleanup and admission" {
++    const allocator = std.testing.allocator;
++    var manager = ModelManager.init(allocator, .{ .allocator = allocator, .preferred_backends = &.{.native} });
++    defer manager.deinit();
++    manager.configureAdmissionLimits(.{ .host_limit_bytes = 64 });
++    try manager.ensureResourceOwnerReady();
++    var probe = TeardownTestProbe{};
++    const model = try teardownTestModel(&manager, &probe);
++    var inference = try manager.publishLoadedModel(model, true, null);
++    defer inference.release();
+     var snapshot = try manager.acquireLoadedModelSnapshot(allocator);
+-    try std.testing.expectEqual(@as(usize, 1), snapshot.handles.len);
++    defer snapshot.deinit();
++    try std.testing.expectEqual(@as(usize, 2), model.active_handles);
++    const used_at = model.last_used_ns;
++    inference.retire();
++    try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
++    try std.testing.expectEqual(@as(usize, 0), manager.loaded_aliases.count());
++    try std.testing.expect(model.retired and !probe.closed);
+     try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+-    try std.testing.expect(snapshot.handles[0].get() == &model);
+-
++    try std.testing.expectEqual(used_at, model.last_used_ns);
++    try std.testing.expectEqual(@as(usize, 64), manager.admissionController().snapshot().host_weight_bytes);
++    // This is the final owner. The existing fake process-required session
++    // asserts active close protection and its 64-byte lease inside close().
+     snapshot.deinit();
+-    try std.testing.expectEqual(@as(usize, 0), model.active_handles);
++    try std.testing.expect(probe.closed);
++    try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, manager.admissionController().snapshot());
++    const watchdog = manager.teardown_domain.?.watchdog;
++    spinLock(&watchdog.mutex);
++    defer watchdog.mutex.unlock();
++    try std.testing.expectEqual(@as(usize, 0), watchdog.entries.items.len);
+ }
+ 
+ test "failed loaded model retires from lookup while active handles unwind" {
+--- a/zig/pkg/inference/src/server/server.zig
++++ b/zig/pkg/inference/src/server/server.zig
+@@ -16721,27 +16721,10 @@
+             "embedders",  "rerankers", "chunkers", "generators",
+             "extractors", "rewriters", "readers",  "transcribers",
+         };
+-        // Keep every snapshotted model alive while filesystem canonicalization
+-        // and manifest rendering run without the manager lock.
+-        var loaded_model_snapshot = std.ArrayListUnmanaged(model_manager_mod.ModelHandle).empty;
+-        defer {
+-            for (loaded_model_snapshot.items) |*handle| handle.release();
+-            loaded_model_snapshot.deinit(a);
+-        }
+-        self.model_manager.lockLoadedModels();
+-        loaded_model_snapshot.ensureTotalCapacity(a, self.model_manager.loaded.count()) catch |err| {
+-            self.model_manager.unlockLoadedModels();
+-            return err;
+-        };
+-        var loaded_it = self.model_manager.loaded.valueIterator();
+-        while (loaded_it.next()) |model| {
+-            model.*.active_handles += 1;
+-            loaded_model_snapshot.appendAssumeCapacity(.{
+-                .manager = &self.model_manager,
+-                .model = model.*,
+-            });
+-        }
+-        self.model_manager.unlockLoadedModels();
++        // Keep models alive through unlocked listing work without counting
++        // observation as inference use or extending their idle residency.
++        var loaded_model_snapshot = try self.model_manager.acquireLoadedModelSnapshot(a);
++        defer loaded_model_snapshot.deinit();
+ 
+         const LoadedListing = struct {
+             model: *model_manager_mod.LoadedModel,
+@@ -16784,7 +16767,7 @@
+         defer if (canonical_models_dir) |path| a.free(path);
+ 
+         if (canonical_models_dir) |models_root| {
+-            for (loaded_model_snapshot.items) |*model_handle| {
++            for (loaded_model_snapshot.handles) |*model_handle| {
+                 const model = model_handle.get();
+                 if (discoveredContainsModelDir(discovered, model.model_dir)) continue;
+ 
+--- a/zig/pkg/inference/src/server/gliner_boundary_cache_lifecycle_test.zig
++++ b/zig/pkg/inference/src/server/gliner_boundary_cache_lifecycle_test.zig
+@@ -369,6 +369,12 @@
+             try sockets.metric(&response, "antfly_inference_extract_v2_active", 0);
+         }
+         try transport.idle();
++        // Scraping metrics pins model lifetime without renewing usage. The
++        // original pre-scrape TTL remains eligible for exact final eviction.
++        const after_scrape = try inspect(&node, directory, pins, 1, 0);
++        try sameCachedOwner(retried.entry.?, after_scrape.entry.?);
++        try std.testing.expectEqual(retried.amounts, after_scrape.amounts);
++        try std.testing.expectEqual(retried.entry.?.last_used_ns, after_scrape.entry.?.last_used_ns);
+         try expire(&node, maintenance, try expiry(retried.entry.?), .reload_eviction);
+         try std.testing.expectEqual(empty, try inspect(&node, directory, pins, 0, 0));
+         try expectRequestTensorStorageBalanced(initial_tensors);

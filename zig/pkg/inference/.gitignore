@@ -1,2 +1,5 @@
 # Local training and validation outputs.
 output/
+
+# Versioned GLiNER2.5 evidence ledgers require their bounded raw receipts.
+!testdata/gliner25/**/*.log

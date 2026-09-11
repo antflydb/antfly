@@ -1,0 +1,41 @@
+{
+  "command": [
+    "/opt/homebrew/Cellar/zig/0.16.0/bin/zig",
+    "build",
+    "inference-test",
+    "-Dmetal=false",
+    "-Dcuda=false",
+    "-j1",
+    "--",
+    "--test-filter",
+    "model manager teardown",
+    "--test-filter",
+    "offline load runtime supplies",
+    "--test-filter",
+    "managed constructors retain cooperative",
+    "--test-filter",
+    "raw tokenizer budget capability pins",
+    "--test-filter",
+    "session vtable layout"
+  ],
+  "cwd": "/Users/timkaye/Documents/af/antfly/zig",
+  "environment": {
+    "ZIG_GLOBAL_CACHE_DIR": "/private/tmp/antfly-gliner25-zig-cache"
+  },
+  "qualification": false,
+  "scope": "local_regional_training_and_service_checks/v1",
+  "source_count": 2583,
+  "source_inventory": {
+    "sha256": "ca375210aac4cb9530ea978bf94043d4798a258aab190b7a76365f249b2b1024",
+    "size_bytes": 436906
+  },
+  "source_selection": "rg --files zig; suffixes .zig .zon .metal .m .mm .c .h; this is not a complete dependency closure",
+  "supervisor": {
+    "sha256": "a937237975be2ed879f62afd285494ccb51a7c1d7cc1dff7160621fb26b87332",
+    "size_bytes": 12474
+  },
+  "wrapper": {
+    "sha256": "45a745b995f86432c89fa57bf8dd5b92dbc810f706a7989accc66c8bbddde3b1",
+    "size_bytes": 6752
+  }
+}

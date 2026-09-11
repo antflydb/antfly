@@ -15,6 +15,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// Process-fatal watchdog and owner-loss paths must bypass C atexit handlers
+/// and stdio flushing: either can wait on a lock held by the stalled thread.
+/// Callers must explicitly publish and flush any durable state beforehand.
+pub fn exitImmediately(status: u8) noreturn {
+    if (builtin.link_libc) std.c._Exit(status);
+    std.process.exit(status);
+}
+
 fn hasPosixProcessApi() bool {
     return switch (builtin.os.tag) {
         .freestanding, .windows, .wasi => false,

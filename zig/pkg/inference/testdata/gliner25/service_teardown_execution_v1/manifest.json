@@ -1,0 +1,372 @@
+{
+  "cpu_attempts": {
+    "cpu_v1": {
+      "cleanup_complete": true,
+      "elapsed_seconds": 2.800193874980323,
+      "failure": "OSError: [Errno 0] Undefined error: 0 (originated from sysctl(KERN_PROCARGS2))",
+      "optional_executable_identity_errors": [],
+      "peak_sampled_child_tree_rss_bytes": 487079936,
+      "process_receipt": "cpu_v1/process.json",
+      "recorded_sources_unchanged": true,
+      "returncode": -15,
+      "source_files": 2583,
+      "source_inventory": "cpu_v1/source_inventory.json",
+      "start_receipt": "cpu_v1/start.json",
+      "status": "optional_argv_observation_failure_before_target_tests",
+      "stderr": "cpu_v1/stderr.log",
+      "stdout": "cpu_v1/stdout.log",
+      "tests": {
+        "target_passed": 0,
+        "target_selected": 0,
+        "target_skipped": 0
+      }
+    },
+    "cpu_v2": {
+      "auxiliary_tests": "The build log separately reports 23/23 prerequisite tests; this is not execution of the selected teardown fixture.",
+      "cleanup_complete": true,
+      "elapsed_seconds": 9.889638416003436,
+      "failure": "RuntimeError: public CLI exited 1",
+      "optional_executable_identity_errors": [],
+      "peak_sampled_child_tree_rss_bytes": 870596608,
+      "process_receipt": "cpu_v2/process.json",
+      "recorded_sources_unchanged": true,
+      "returncode": 1,
+      "source_files": 2583,
+      "source_inventory": "cpu_v2/source_inventory.json",
+      "start_receipt": "cpu_v2/start.json",
+      "status": "six_fixture_compile_errors_before_target_tests",
+      "stderr": "cpu_v2/stderr.log",
+      "stdout": "cpu_v2/stdout.log",
+      "tests": {
+        "target_passed": 0,
+        "target_selected": 0,
+        "target_skipped": 0
+      }
+    },
+    "cpu_v3": {
+      "cleanup_complete": true,
+      "elapsed_seconds": 33.70188708300702,
+      "failure": null,
+      "optional_executable_identity_errors": [
+        "(pid=13623)",
+        "(pid=13693)",
+        "(pid=13693)",
+        "(pid=13693)"
+      ],
+      "peak_sampled_child_tree_rss_bytes": 3273998336,
+      "process_receipt": "cpu_v3/process.json",
+      "recorded_sources_unchanged": true,
+      "returncode": 0,
+      "source_files": 2583,
+      "source_inventory": "cpu_v3/source_inventory.json",
+      "start_receipt": "cpu_v3/start.json",
+      "status": "pass",
+      "stderr": "cpu_v3/stderr.log",
+      "stdout": "cpu_v3/stdout.log",
+      "test_results": [
+        "1/42 server.model_manager.test.managed constructors retain cooperative fallback without a process boundary...OK",
+        "2/42 server.model_manager.test.raw tokenizer budget capability pins resource domain through teardown...OK",
+        "3/42 server.model_manager.test.offline load runtime supplies a real hard cancellation boundary only for disposable processes...OK",
+        "4/42 server.model_manager.test.model manager teardown starts both tickets before cached executor destruction...OK",
+        "5/42 server.model_manager.test.model manager teardown composite keeps both peer tickets through ordered session cleanup...OK",
+        "6/42 server.model_manager.test.model manager teardown dormant ticket covers nested close without allocation or borrowed request...OK",
+        "7/42 server.model_manager.test.model manager teardown raw session retains monitor and offline driver IO after manager...OK",
+        "8/42 server.model_manager.test.model manager teardown rejects missing isolation and failed ticket before backend entry...OK",
+        "9/42 server.model_manager.test.model manager teardown supervised child fixture...SKIP",
+        "10/42 backends.session.test.session vtable layout...OK"
+      ],
+      "tests": {
+        "skip_reason": "Process-only child fixture requires its private test environment mode.",
+        "target_failed": 0,
+        "target_passed": 9,
+        "target_selected": 10,
+        "target_skipped": 1
+      }
+    }
+  },
+  "files": {
+    "cpu_v1/observed-test-1.json": {
+      "original_path": "/private/tmp/antfly-gliner25-manager-teardown-native-v1/observed-test-1.json",
+      "sha256": "569fd7cecd99b67c733b5f14528ea24359f74810d1c0665996cb348cf590e5db",
+      "size_bytes": 520
+    },
+    "cpu_v1/process.json": {
+      "original_path": "/private/tmp/antfly-gliner25-manager-teardown-native-v1/process.json",
+      "sha256": "09eafffabf12ab088ed6fba848205d3f3700edbd18e9248e10369cac510fdaac",
+      "size_bytes": 6096
+    },
+    "cpu_v1/source_inventory.json": {
+      "original_path": "/private/tmp/antfly-gliner25-manager-teardown-native-v1/source_inventory.json",
+      "sha256": "ca375210aac4cb9530ea978bf94043d4798a258aab190b7a76365f249b2b1024",
+      "size_bytes": 436906
+    },
+    "cpu_v1/start.json": {
+      "original_path": "/private/tmp/antfly-gliner25-manager-teardown-native-v1/start.json",
+      "sha256": "10b3a420171e8205147c9b5d5aeead07720c78c3f0cae27bb5a1a715bc85a561",
+      "size_bytes": 1225
+    },
+    "cpu_v1/stderr.log": {
+      "original_path": "/private/tmp/antfly-gliner25-manager-teardown-native-v1/stderr.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size_bytes": 0
+    },
+    "cpu_v1/stdout.log": {
+      "original_path": "/private/tmp/antfly-gliner25-manager-teardown-native-v1/stdout.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size_bytes": 0
+    },
+    "cpu_v2/observed-test-1.json": {
+      "original_path": "/private/tmp/antfly-gliner25-manager-teardown-native-v2/observed-test-1.json",
+      "sha256": "81f1aa7e1ad4c896962b75d832ca85bad39e1a1d8d670a41cf261f657063a4f1",
+      "size_bytes": 521
+    },
+    "cpu_v2/process.json": {
+      "original_path": "/private/tmp/antfly-gliner25-manager-teardown-native-v2/process.json",
+      "sha256": "17b293f9fd9c6f7f52c3de23bbff6d5039f92600d2fac222ce050356922e8e0b",
+      "size_bytes": 5302
+    },
+    "cpu_v2/source_inventory.json": {
+      "original_path": "/private/tmp/antfly-gliner25-manager-teardown-native-v2/source_inventory.json",
+      "sha256": "ca375210aac4cb9530ea978bf94043d4798a258aab190b7a76365f249b2b1024",
+      "size_bytes": 436906
+    },
+    "cpu_v2/start.json": {
+      "original_path": "/private/tmp/antfly-gliner25-manager-teardown-native-v2/start.json",
+      "sha256": "056f65affbf760b0745d413cdaf2c17b5c5f1ac0e8e020b0631c9e934f419796",
+      "size_bytes": 1225
+    },
+    "cpu_v2/stderr.log": {
+      "original_path": "/private/tmp/antfly-gliner25-manager-teardown-native-v2/stderr.log",
+      "sha256": "b82dde1356d13c9bee4e9804dfc1c7de3d15f28651e53d06acb4bf1bd313f9d2",
+      "size_bytes": 11100
+    },
+    "cpu_v2/stdout.log": {
+      "original_path": "/private/tmp/antfly-gliner25-manager-teardown-native-v2/stdout.log",
+      "sha256": "3459fccabd4b57aaca0e53c7a3da704caee13562a6d2854a5b3bf4a459753ae8",
+      "size_bytes": 203
+    },
+    "cpu_v3/observed-test-1.json": {
+      "original_path": "/private/tmp/antfly-gliner25-manager-teardown-native-v3/observed-test-1.json",
+      "sha256": "28188afbf79bff61076c0dd6394978a83fb0bd6e6a671d44c1877fbeafc7f7c9",
+      "size_bytes": 520
+    },
+    "cpu_v3/observed-test-2.json": {
+      "original_path": "/private/tmp/antfly-gliner25-manager-teardown-native-v3/observed-test-2.json",
+      "sha256": "e232f1e1fca8431db10e427911257027ab4bedc30e059fe7b091c4f393eee32b",
+      "size_bytes": 739
+    },
+    "cpu_v3/process.json": {
+      "original_path": "/private/tmp/antfly-gliner25-manager-teardown-native-v3/process.json",
+      "sha256": "60a64f40e5f998f3768bfbbb1bdf8e75111cd6961d03a67a1efd226a2c97ed8a",
+      "size_bytes": 6719
+    },
+    "cpu_v3/source_inventory.json": {
+      "original_path": "/private/tmp/antfly-gliner25-manager-teardown-native-v3/source_inventory.json",
+      "sha256": "b010d467c1fe9772fd142d421bd2b0be1821e3a7eeda63c4882e4f5b5eb5400f",
+      "size_bytes": 436906
+    },
+    "cpu_v3/start.json": {
+      "original_path": "/private/tmp/antfly-gliner25-manager-teardown-native-v3/start.json",
+      "sha256": "3bde93e67af532023ad7227ac8e308a0f09d2e2d880574ad051708407e675ed4",
+      "size_bytes": 1225
+    },
+    "cpu_v3/stderr.log": {
+      "original_path": "/private/tmp/antfly-gliner25-manager-teardown-native-v3/stderr.log",
+      "sha256": "bff947807e4aaa818024c31f69af76ff5d078bedc47a356c0ee802ce4103ef1e",
+      "size_bytes": 1218
+    },
+    "cpu_v3/stdout.log": {
+      "original_path": "/private/tmp/antfly-gliner25-manager-teardown-native-v3/stdout.log",
+      "sha256": "3459fccabd4b57aaca0e53c7a3da704caee13562a6d2854a5b3bf4a459753ae8",
+      "size_bytes": 203
+    },
+    "frozen_build/archive.json": {
+      "original_path": "/private/tmp/antfly-gliner25-manager-teardown-native-v3-archive/archive.json",
+      "sha256": "18e8681aa80d53b0024cc95b8c05de31f2a33a6706da427ef7ab33055b1fb54b",
+      "size_bytes": 1659
+    },
+    "helpers/build_wrapper_v3.py": {
+      "original_path": "/private/tmp/antfly-gliner25-regional-validation/run-v3.py",
+      "sha256": "3aaa54522c71d11ae2f21c7821e0cc7cb01a4585011109f083f06479b763ab6f",
+      "size_bytes": 6723
+    },
+    "helpers/build_wrapper_v4.py": {
+      "original_path": "/private/tmp/antfly-gliner25-regional-validation/run.py",
+      "sha256": "45a745b995f86432c89fa57bf8dd5b92dbc810f706a7989accc66c8bbddde3b1",
+      "size_bytes": 6752
+    },
+    "helpers/check_model_manager_teardown.py": {
+      "original_path": "/private/tmp/gliner25-manager-teardown-v1/check_model_manager_teardown.py",
+      "sha256": "337cbeb756dc6c6df0d0ffdae573bd13c3c8fc1057f9cd978296d68c0e6c64ac",
+      "size_bytes": 6426
+    },
+    "helpers/supervision.py": {
+      "original_path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/supervision.py",
+      "sha256": "a937237975be2ed879f62afd285494ccb51a7c1d7cc1dff7160621fb26b87332",
+      "size_bytes": 12474
+    },
+    "process_children/admission.stderr.log": {
+      "original_path": "/private/tmp/gliner25-manager-teardown-process-v1/admission.stderr.log",
+      "sha256": "7c6dd832fee512f3fcfbabad72bca087b3be42e1698ed3f740062aa98a7cc337",
+      "size_bytes": 270
+    },
+    "process_children/admission.stdout.log": {
+      "original_path": "/private/tmp/gliner25-manager-teardown-process-v1/admission.stdout.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size_bytes": 0
+    },
+    "process_children/cache.stderr.log": {
+      "original_path": "/private/tmp/gliner25-manager-teardown-process-v1/cache.stderr.log",
+      "sha256": "e9750737c6e7b9e4899f5d43146a6a4dba9ac52abdfa417256dd89095de30be4",
+      "size_bytes": 294
+    },
+    "process_children/cache.stdout.log": {
+      "original_path": "/private/tmp/gliner25-manager-teardown-process-v1/cache.stdout.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size_bytes": 0
+    },
+    "process_children/escaped.stderr.log": {
+      "original_path": "/private/tmp/gliner25-manager-teardown-process-v1/escaped.stderr.log",
+      "sha256": "5fcf9d3626b7dfcbb7147ea608bf29481d1e92f35a5340d567ada83941fe886c",
+      "size_bytes": 264
+    },
+    "process_children/escaped.stdout.log": {
+      "original_path": "/private/tmp/gliner25-manager-teardown-process-v1/escaped.stdout.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size_bytes": 0
+    },
+    "process_children/report.json": {
+      "original_path": "/private/tmp/gliner25-manager-teardown-process-v1/report.json",
+      "sha256": "96f2bec04254e539a826f036ebec540da30601eb857373c346b578569ff05b8f",
+      "size_bytes": 8094
+    },
+    "process_children/retired.stderr.log": {
+      "original_path": "/private/tmp/gliner25-manager-teardown-process-v1/retired.stderr.log",
+      "sha256": "97ce965fc9a1e370d609590b8550f4f5227c76f7af43aa9cd005296000c15db9",
+      "size_bytes": 354
+    },
+    "process_children/retired.stdout.log": {
+      "original_path": "/private/tmp/gliner25-manager-teardown-process-v1/retired.stdout.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size_bytes": 0
+    },
+    "process_children/rollback.stderr.log": {
+      "original_path": "/private/tmp/gliner25-manager-teardown-process-v1/rollback.stderr.log",
+      "sha256": "8598d5660ec7317ef17c786a72eaa50e26147ef4fff4f9f1ea859f083969794b",
+      "size_bytes": 269
+    },
+    "process_children/rollback.stdout.log": {
+      "original_path": "/private/tmp/gliner25-manager-teardown-process-v1/rollback.stdout.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size_bytes": 0
+    },
+    "process_children/shutdown.stderr.log": {
+      "original_path": "/private/tmp/gliner25-manager-teardown-process-v1/shutdown.stderr.log",
+      "sha256": "9bca70e4e559ad4b6a8ce2816761bd851f76bbb796f859a14f897bbbb6e96030",
+      "size_bytes": 269
+    },
+    "process_children/shutdown.stdout.log": {
+      "original_path": "/private/tmp/gliner25-manager-teardown-process-v1/shutdown.stdout.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size_bytes": 0
+    },
+    "process_children/ttl.stderr.log": {
+      "original_path": "/private/tmp/gliner25-manager-teardown-process-v1/ttl.stderr.log",
+      "sha256": "1acaab56454c1c5f2ebb9b215395df950ad394065944ae250cf7cf05e18c6485",
+      "size_bytes": 264
+    },
+    "process_children/ttl.stdout.log": {
+      "original_path": "/private/tmp/gliner25-manager-teardown-process-v1/ttl.stdout.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size_bytes": 0
+    },
+    "source_snapshots/zig/pkg/inference/src/backends/session.zig": {
+      "original_path": "zig/pkg/inference/src/backends/session.zig",
+      "sha256": "1f4dd8800429250d2c61a218aeef862ac68b13ea51924d56fee9b6503d9e79fb",
+      "size_bytes": 73938,
+      "source_archive_member": "zig/pkg/inference/src/backends/session.zig"
+    },
+    "source_snapshots/zig/pkg/inference/src/server/gliner_boundary_cache_lifecycle_test.zig": {
+      "original_path": "zig/pkg/inference/src/server/gliner_boundary_cache_lifecycle_test.zig",
+      "sha256": "f6e4b05af7c9edb181a45f2cc9e5606feeb92fe7e7f09dde75d14e1c946a4c80",
+      "size_bytes": 17941,
+      "source_archive_member": "zig/pkg/inference/src/server/gliner_boundary_cache_lifecycle_test.zig"
+    },
+    "source_snapshots/zig/pkg/inference/src/server/model_manager.zig": {
+      "original_path": "zig/pkg/inference/src/server/model_manager.zig",
+      "sha256": "87841d5edbf2e650441642b468f3858229817df0d48ed4ee93698893531df849",
+      "size_bytes": 523677,
+      "source_archive_member": "zig/pkg/inference/src/server/model_manager.zig"
+    }
+  },
+  "format_version": 1,
+  "frozen_build": {
+    "archive_receipt": "frozen_build/archive.json",
+    "binary_copied_to_repository": false,
+    "full_archive_copied_to_repository": false,
+    "full_source_archive": {
+      "original_path": "/private/tmp/antfly-gliner25-manager-teardown-native-v3-archive/recorded-source-selection.tar.gz",
+      "sha256": "bf784c5f7454cd4b6d6a5c7fd89d8694694bc9b9a33907d9c3d3d8cafa28ef1a",
+      "size_bytes": 25897695
+    },
+    "recorded_source_files": 2583,
+    "selected_source_snapshots": {
+      "zig/pkg/inference/src/backends/session.zig": "source_snapshots/zig/pkg/inference/src/backends/session.zig",
+      "zig/pkg/inference/src/server/gliner_boundary_cache_lifecycle_test.zig": "source_snapshots/zig/pkg/inference/src/server/gliner_boundary_cache_lifecycle_test.zig",
+      "zig/pkg/inference/src/server/model_manager.zig": "source_snapshots/zig/pkg/inference/src/server/model_manager.zig"
+    },
+    "test_binary": {
+      "path": "/private/tmp/antfly-gliner25-manager-teardown-native-v3-archive/test",
+      "sha256": "05d650b47cd67804ac7d16e3308b0e0bda8ad501730142408115acf98afc7590",
+      "size_bytes": 36647768
+    }
+  },
+  "kind": "local_model_manager_teardown_execution_ledger",
+  "limitations": [
+    "The CPU fixture and seven synthetic blocked-cleanup processes prove ownership, ticket ordering and watchdog exits, not actual driver-hang recovery.",
+    "A private 100 ms test close deadline is used only under builtin.is_test. The production 30-second deadline is source-verified, not a measured 30-second process campaign.",
+    "The escaped raw-session case has no admission lease and is not evidence of lease retention; it proves independent monitor/IO lifetime after manager destruction.",
+    "Actual published-small Metal TTL eviction/reload under this teardown implementation remains pending. The archived lifecycle test source was not selected by this CPU command.",
+    "The exact executable is recorded and was rehashed; it and the full archive are retained outside the repository. Three source files are copied, not a complete dependency or system SDK closure.",
+    "The four optional executable-argv observation errors in CPU v3 remain in the raw receipt. Required creation-identity ownership and cleanup checks report no errors.",
+    "No release gate, service soak, simultaneous learned forward, mid-kernel cancellation, performance or all-model/backend qualification claim follows."
+  ],
+  "model_execution_during_packaging": false,
+  "process_proof": {
+    "all_direct_children_reaped": true,
+    "blocked_destructor": "Synthetic test cache/session callback; no model or Metal driver work executes.",
+    "cases": 7,
+    "driver": "helpers/check_model_manager_teardown.py",
+    "elapsed_seconds_range": [
+      0.10625533299753442,
+      0.6830504999961704
+    ],
+    "escaped_raw_session_case": {
+      "admission_lease_expected": false,
+      "lease_order_proof": false,
+      "manager_already_destroyed": true,
+      "name": "escaped"
+    },
+    "lease_held_64_bytes_cases": [
+      "cache",
+      "ttl",
+      "admission",
+      "retired",
+      "shutdown",
+      "rollback"
+    ],
+    "outer_kills": 0,
+    "outer_limits": {
+      "child_seconds": 5,
+      "reap_seconds": 5,
+      "stream_bytes": 1048576
+    },
+    "passed": 7,
+    "production_close_deadline_ms": 30000,
+    "report": "process_children/report.json",
+    "test_close_deadline_ms": 100,
+    "watchdog_exits_86": 7
+  },
+  "release_qualification": false,
+  "upstream_oracle": false
+}

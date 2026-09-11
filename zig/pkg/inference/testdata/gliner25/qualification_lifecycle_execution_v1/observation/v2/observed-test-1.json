@@ -1,0 +1,21 @@
+{
+  "argv": [
+    "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/.zig-cache/o/5752a3df14fdca131a03fb681f772f83/test",
+    "--test-filter",
+    "loaded model snapshot",
+    "--test-filter",
+    "failed loaded model retires",
+    "--test-filter",
+    "model listing",
+    "--test-filter",
+    "gliner boundary cache pinned small Metal handle retention eviction and reload"
+  ],
+  "create_time": 1789071281.975983,
+  "cwd": "/Users/timkaye/Documents/af/antfly/zig",
+  "executable": {
+    "path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/.zig-cache/o/5752a3df14fdca131a03fb681f772f83/test",
+    "sha256": "4a7af5cb45c5202b51ddfd57065d866a67c521be00bba85667f71b02d749fc64",
+    "size_bytes": 82720136
+  },
+  "pid": 19643
+}

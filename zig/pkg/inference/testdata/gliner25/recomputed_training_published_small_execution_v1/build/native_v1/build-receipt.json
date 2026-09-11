@@ -1,0 +1,54 @@
+{
+  "scope": "gliner25_regional_production_training_cli_build/v1",
+  "qualification": false,
+  "binary": {
+    "path": "/private/tmp/antfly-gliner25-runtime-regional-v1/bin/train-gliner25",
+    "sha256": "f482989317fd34c0a8852d5a36d837fb78f6cc57862863f5a0b77981125f02b8",
+    "size_bytes": 10944672
+  },
+  "entrypoint": "standalone",
+  "build_process_receipt": "/private/tmp/antfly-gliner25-regional-training-cli-build-v1/process.json",
+  "build_argv": [
+    "/opt/homebrew/Cellar/zig/0.16.0/bin/zig",
+    "build",
+    "inference-train-gliner25",
+    "-Doptimize=ReleaseFast",
+    "-Dmetal=true",
+    "-Dcuda=false",
+    "-Donnx=false",
+    "-Dpjrt=false",
+    "-j1",
+    "--",
+    "--help"
+  ],
+  "build_cwd": "/Users/timkaye/Documents/af/antfly/zig",
+  "source_inventory": {
+    "sha256": "b5b0d7fa44d8acd117254a1c127b2789189a4dff3e2613789ece61fee3d1fb14",
+    "size_bytes": 436906,
+    "path": "/private/tmp/antfly-gliner25-regional-training-cli-build-v1/source_inventory.json",
+    "files": 2583,
+    "all_recorded_files_reverified_unchanged": true
+  },
+  "live_help_observation": {
+    "argv": [
+      "./.zig-cache/o/deb3537194e58a005691f6f094d03219/train-gliner25",
+      "--help"
+    ],
+    "create_time": 1789065152.124164,
+    "cwd": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference",
+    "executable": {
+      "path": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/.zig-cache/o/deb3537194e58a005691f6f094d03219/train-gliner25",
+      "sha256": "f482989317fd34c0a8852d5a36d837fb78f6cc57862863f5a0b77981125f02b8",
+      "size_bytes": 10944672
+    },
+    "pid": 12270
+  },
+  "build_peak_sampled_tree_rss_bytes": 4884889600,
+  "build_elapsed_seconds": 113.85468745901017,
+  "limits": [
+    "Focused production training CLI and same Job implementation; this is not a successful full server/runtime build.",
+    "Repository source inventory is not a full transitive dependency or system SDK receipt.",
+    "Help execution loads no model; published regional training has not run yet.",
+    "Public boundary inference availability remains false."
+  ]
+}

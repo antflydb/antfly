@@ -1,0 +1,7403 @@
+{
+  "cases": [
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.8,
+          "source_index": 0,
+          "tail": {
+            "end": 24,
+            "start": 20,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 1,
+          "tail": {
+            "end": 29,
+            "start": 20,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.9,
+          "source_index": 2,
+          "tail": {
+            "end": 24,
+            "start": 20,
+            "text": "Acme"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 2,
+          "tail": {
+            "end": 29,
+            "start": 20,
+            "text": "Acme Corp"
+          }
+        }
+      ],
+      "id": "dedup_0"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 6,
+            "start": 0,
+            "text": "Straße"
+          },
+          "probability": 0.99,
+          "source_index": 0,
+          "tail": {
+            "end": 104,
+            "start": 100,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 97,
+            "start": 90,
+            "text": "STRASSE"
+          },
+          "probability": 0.8,
+          "source_index": 1,
+          "tail": {
+            "end": 104,
+            "start": 100,
+            "text": "ACME"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 97,
+            "start": 90,
+            "text": "STRASSE"
+          },
+          "probability": 0.8,
+          "source_index": 1,
+          "tail": {
+            "end": 104,
+            "start": 100,
+            "text": "ACME"
+          }
+        }
+      ],
+      "id": "dedup_1"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "ALICE Smith"
+          },
+          "probability": 0.8,
+          "source_index": 0,
+          "tail": {
+            "end": 24,
+            "start": 20,
+            "text": "ACME"
+          }
+        },
+        {
+          "head": {
+            "end": 111,
+            "start": 100,
+            "text": "alice smith"
+          },
+          "probability": 0.9,
+          "source_index": 1,
+          "tail": {
+            "end": 124,
+            "start": 120,
+            "text": "acme"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 111,
+            "start": 100,
+            "text": "alice smith"
+          },
+          "probability": 0.9,
+          "source_index": 1,
+          "tail": {
+            "end": 124,
+            "start": 120,
+            "text": "acme"
+          }
+        }
+      ],
+      "id": "dedup_2"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.9,
+          "source_index": 0,
+          "tail": {
+            "end": 24,
+            "start": 20,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 111,
+            "start": 100,
+            "text": "Alice Smith"
+          },
+          "probability": 0.8,
+          "source_index": 1,
+          "tail": {
+            "end": 124,
+            "start": 120,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 217,
+            "start": 200,
+            "text": "Alice Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 2,
+          "tail": {
+            "end": 229,
+            "start": 220,
+            "text": "Acme Corp"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 217,
+            "start": 200,
+            "text": "Alice Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 2,
+          "tail": {
+            "end": 229,
+            "start": 220,
+            "text": "Acme Corp"
+          }
+        }
+      ],
+      "id": "dedup_3"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 8,
+            "start": 0,
+            "text": "İ Σς K ﬃ"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 11,
+            "start": 10,
+            "text": "B"
+          }
+        },
+        {
+          "head": {
+            "end": 111,
+            "start": 100,
+            "text": "i̇ σσ k ffi"
+          },
+          "probability": 0.9,
+          "source_index": 1,
+          "tail": {
+            "end": 114,
+            "start": 113,
+            "text": "b"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 111,
+            "start": 100,
+            "text": "i̇ σσ k ffi"
+          },
+          "probability": 0.9,
+          "source_index": 1,
+          "tail": {
+            "end": 114,
+            "start": 113,
+            "text": "b"
+          }
+        }
+      ],
+      "id": "dedup_4"
+    },
+    {
+      "edges": [],
+      "expected": [],
+      "id": "dedup_5"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 1,
+            "start": 0,
+            "text": "X"
+          },
+          "probability": 0.5,
+          "source_index": 0,
+          "tail": {
+            "end": 3,
+            "start": 2,
+            "text": "Y"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 1,
+            "start": 0,
+            "text": "X"
+          },
+          "probability": 0.5,
+          "source_index": 0,
+          "tail": {
+            "end": 3,
+            "start": 2,
+            "text": "Y"
+          }
+        }
+      ],
+      "id": "dedup_6"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 0,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.5,
+          "source_index": 1,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.5,
+          "source_index": 2,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.5,
+          "source_index": 3,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.7,
+          "source_index": 4,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.5,
+          "source_index": 5,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 6,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.7,
+          "source_index": 7,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 8,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 9,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.9,
+          "source_index": 10,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.9,
+          "source_index": 11,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.7,
+          "source_index": 12,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 13,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.7,
+          "source_index": 14,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.5,
+          "source_index": 15,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 16,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.7,
+          "source_index": 17,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 11,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 8,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.5,
+          "source_index": 3,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.7,
+          "source_index": 17,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 0,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 16,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 9,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 14,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 4,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        }
+      ],
+      "id": "dedup_7"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.5,
+          "source_index": 0,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.7,
+          "source_index": 1,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.9,
+          "source_index": 2,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.5,
+          "source_index": 3,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.7,
+          "source_index": 4,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.7,
+          "source_index": 5,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 6,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.9,
+          "source_index": 7,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.7,
+          "source_index": 8,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.7,
+          "source_index": 9,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 10,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.5,
+          "source_index": 11,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 12,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.9,
+          "source_index": 13,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 14,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.7,
+          "source_index": 15,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.5,
+          "source_index": 16,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.5,
+          "source_index": 17,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.7,
+          "source_index": 4,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.7,
+          "source_index": 15,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.7,
+          "source_index": 8,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.9,
+          "source_index": 2,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.7,
+          "source_index": 5,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.9,
+          "source_index": 13,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 12,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.7,
+          "source_index": 9,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.7,
+          "source_index": 1,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.9,
+          "source_index": 7,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        }
+      ],
+      "id": "dedup_8"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.9,
+          "source_index": 0,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 1,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 2,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.7,
+          "source_index": 3,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 4,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 2,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.9,
+          "source_index": 0,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 4,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 1,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        }
+      ],
+      "id": "dedup_9"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 0,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.5,
+          "source_index": 1,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.9,
+          "source_index": 2,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.9,
+          "source_index": 3,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.5,
+          "source_index": 4,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.7,
+          "source_index": 5,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.5,
+          "source_index": 6,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.5,
+          "source_index": 7,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.7,
+          "source_index": 8,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.5,
+          "source_index": 9,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.7,
+          "source_index": 8,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.9,
+          "source_index": 3,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.5,
+          "source_index": 7,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.9,
+          "source_index": 2,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.7,
+          "source_index": 5,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.5,
+          "source_index": 4,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.5,
+          "source_index": 1,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        }
+      ],
+      "id": "dedup_10"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 1,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.7,
+          "source_index": 2,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.9,
+          "source_index": 3,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.9,
+          "source_index": 4,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.7,
+          "source_index": 5,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.5,
+          "source_index": 6,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 1,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.9,
+          "source_index": 3,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.9,
+          "source_index": 4,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.7,
+          "source_index": 2,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        }
+      ],
+      "id": "dedup_11"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.7,
+          "source_index": 1,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 2,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 3,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 4,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.9,
+          "source_index": 5,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.9,
+          "source_index": 6,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.9,
+          "source_index": 7,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 8,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 9,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.5,
+          "source_index": 10,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.7,
+          "source_index": 11,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 3,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 1,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.5,
+          "source_index": 10,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.9,
+          "source_index": 6,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.7,
+          "source_index": 11,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.9,
+          "source_index": 5,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.9,
+          "source_index": 7,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        }
+      ],
+      "id": "dedup_12"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.9,
+          "source_index": 0,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.5,
+          "source_index": 1,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.5,
+          "source_index": 2,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 3,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.7,
+          "source_index": 4,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.5,
+          "source_index": 5,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.5,
+          "source_index": 6,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 7,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.9,
+          "source_index": 8,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 9,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.7,
+          "source_index": 10,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.9,
+          "source_index": 11,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.5,
+          "source_index": 5,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 0,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.9,
+          "source_index": 11,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.5,
+          "source_index": 6,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.7,
+          "source_index": 4,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 9,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 3,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 8,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        }
+      ],
+      "id": "dedup_13"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.5,
+          "source_index": 0,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.7,
+          "source_index": 1,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.9,
+          "source_index": 2,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.9,
+          "source_index": 3,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.5,
+          "source_index": 4,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.9,
+          "source_index": 5,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 6,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.7,
+          "source_index": 1,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.9,
+          "source_index": 5,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.9,
+          "source_index": 3,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.5,
+          "source_index": 0,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 6,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.9,
+          "source_index": 2,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.5,
+          "source_index": 4,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        }
+      ],
+      "id": "dedup_14"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.9,
+          "source_index": 1,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 2,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 3,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 4,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.5,
+          "source_index": 5,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.5,
+          "source_index": 5,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 2,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 1,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        }
+      ],
+      "id": "dedup_15"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 0,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.9,
+          "source_index": 1,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.9,
+          "source_index": 2,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 3,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.7,
+          "source_index": 4,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 5,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.5,
+          "source_index": 6,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.9,
+          "source_index": 7,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 8,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.7,
+          "source_index": 9,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.9,
+          "source_index": 10,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.5,
+          "source_index": 11,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.9,
+          "source_index": 12,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 13,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.9,
+          "source_index": 14,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.5,
+          "source_index": 15,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 16,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.5,
+          "source_index": 17,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.9,
+          "source_index": 18,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 14,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.5,
+          "source_index": 6,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 13,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.5,
+          "source_index": 11,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.5,
+          "source_index": 17,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.5,
+          "source_index": 15,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.9,
+          "source_index": 2,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.9,
+          "source_index": 1,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.9,
+          "source_index": 18,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 4,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 3,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 5,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        }
+      ],
+      "id": "dedup_16"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.5,
+          "source_index": 0,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 1,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.5,
+          "source_index": 2,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 1,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        }
+      ],
+      "id": "dedup_17"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 0,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.5,
+          "source_index": 1,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.7,
+          "source_index": 2,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 3,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.5,
+          "source_index": 4,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.9,
+          "source_index": 5,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.9,
+          "source_index": 5,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.5,
+          "source_index": 4,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.7,
+          "source_index": 2,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 3,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.5,
+          "source_index": 1,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        }
+      ],
+      "id": "dedup_18"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.5,
+          "source_index": 1,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.5,
+          "source_index": 2,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.9,
+          "source_index": 3,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.5,
+          "source_index": 4,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 5,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 6,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.5,
+          "source_index": 7,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.9,
+          "source_index": 8,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.9,
+          "source_index": 9,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.5,
+          "source_index": 1,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.9,
+          "source_index": 9,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.5,
+          "source_index": 7,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.9,
+          "source_index": 8,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.9,
+          "source_index": 3,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 5,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 6,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        }
+      ],
+      "id": "dedup_19"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        }
+      ],
+      "id": "dedup_20"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.9,
+          "source_index": 0,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.9,
+          "source_index": 0,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        }
+      ],
+      "id": "dedup_21"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.9,
+          "source_index": 0,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 1,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.9,
+          "source_index": 2,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 3,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.5,
+          "source_index": 4,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 5,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 6,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 7,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.5,
+          "source_index": 8,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 9,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 10,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.5,
+          "source_index": 11,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.7,
+          "source_index": 12,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.5,
+          "source_index": 13,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.5,
+          "source_index": 13,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 6,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.5,
+          "source_index": 4,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.5,
+          "source_index": 8,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.9,
+          "source_index": 0,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 7,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 9,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 1,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        }
+      ],
+      "id": "dedup_22"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.5,
+          "source_index": 1,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 2,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 3,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.9,
+          "source_index": 4,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.7,
+          "source_index": 5,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.5,
+          "source_index": 6,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.5,
+          "source_index": 7,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 8,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 9,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.7,
+          "source_index": 10,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 11,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.9,
+          "source_index": 12,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.9,
+          "source_index": 13,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 14,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.5,
+          "source_index": 15,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 16,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 9,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.9,
+          "source_index": 4,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.7,
+          "source_index": 10,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.5,
+          "source_index": 1,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 11,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 6,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        }
+      ],
+      "id": "dedup_23"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.9,
+          "source_index": 0,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.9,
+          "source_index": 0,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        }
+      ],
+      "id": "dedup_24"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.9,
+          "source_index": 1,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 2,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.5,
+          "source_index": 3,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.5,
+          "source_index": 4,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.9,
+          "source_index": 5,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.5,
+          "source_index": 6,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 7,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.7,
+          "source_index": 8,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 9,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.5,
+          "source_index": 10,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 11,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.7,
+          "source_index": 12,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 13,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.5,
+          "source_index": 14,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.7,
+          "source_index": 15,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.5,
+          "source_index": 14,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.9,
+          "source_index": 5,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.7,
+          "source_index": 15,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 11,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 7,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 2,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 4,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 3,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        }
+      ],
+      "id": "dedup_25"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.7,
+          "source_index": 1,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 2,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.9,
+          "source_index": 3,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.7,
+          "source_index": 4,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.5,
+          "source_index": 5,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 6,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.9,
+          "source_index": 7,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 8,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 9,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.5,
+          "source_index": 10,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 11,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.7,
+          "source_index": 12,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.5,
+          "source_index": 10,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 9,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.9,
+          "source_index": 3,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.5,
+          "source_index": 5,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 8,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 6,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 11,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        }
+      ],
+      "id": "dedup_26"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 0,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.9,
+          "source_index": 1,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.7,
+          "source_index": 2,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 3,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 4,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.5,
+          "source_index": 5,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.9,
+          "source_index": 6,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 7,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.9,
+          "source_index": 1,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 7,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 0,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 6,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 4,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.5,
+          "source_index": 5,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.7,
+          "source_index": 2,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        }
+      ],
+      "id": "dedup_27"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 0,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 1,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.9,
+          "source_index": 2,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.7,
+          "source_index": 3,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.9,
+          "source_index": 4,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.7,
+          "source_index": 5,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.9,
+          "source_index": 6,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 7,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 8,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 0,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 4,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.9,
+          "source_index": 2,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.7,
+          "source_index": 5,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 7,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 3,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 1,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.9,
+          "source_index": 6,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        }
+      ],
+      "id": "dedup_28"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.9,
+          "source_index": 0,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.5,
+          "source_index": 1,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 2,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.9,
+          "source_index": 3,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 4,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.5,
+          "source_index": 5,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.9,
+          "source_index": 6,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.7,
+          "source_index": 7,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.9,
+          "source_index": 8,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.9,
+          "source_index": 9,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.7,
+          "source_index": 10,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 11,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 12,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.9,
+          "source_index": 13,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.7,
+          "source_index": 14,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.5,
+          "source_index": 15,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.7,
+          "source_index": 16,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 11,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 13,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.5,
+          "source_index": 5,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.7,
+          "source_index": 10,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 4,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 12,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 8,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 9,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        }
+      ],
+      "id": "dedup_29"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.9,
+          "source_index": 0,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 1,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 2,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.5,
+          "source_index": 3,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.5,
+          "source_index": 4,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.5,
+          "source_index": 5,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.7,
+          "source_index": 6,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.5,
+          "source_index": 7,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.9,
+          "source_index": 8,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 9,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.7,
+          "source_index": 10,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 11,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.9,
+          "source_index": 12,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 13,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.5,
+          "source_index": 14,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 11,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 12,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.9,
+          "source_index": 0,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.7,
+          "source_index": 6,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 1,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 7,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 13,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.5,
+          "source_index": 14,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        }
+      ],
+      "id": "dedup_30"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 1,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 2,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 3,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 4,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 5,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.5,
+          "source_index": 6,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.9,
+          "source_index": 7,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 3,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.9,
+          "source_index": 7,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 5,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 1,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 4,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        }
+      ],
+      "id": "dedup_31"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 0,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.5,
+          "source_index": 1,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 2,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.5,
+          "source_index": 3,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.5,
+          "source_index": 3,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 0,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 2,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        }
+      ],
+      "id": "dedup_32"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.9,
+          "source_index": 1,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.7,
+          "source_index": 2,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.5,
+          "source_index": 3,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.9,
+          "source_index": 4,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 5,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.7,
+          "source_index": 6,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.5,
+          "source_index": 7,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.5,
+          "source_index": 8,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 9,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 10,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 10,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 2,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.9,
+          "source_index": 4,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.5,
+          "source_index": 7,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 9,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.7,
+          "source_index": 6,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        }
+      ],
+      "id": "dedup_33"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.9,
+          "source_index": 1,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.9,
+          "source_index": 1,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        }
+      ],
+      "id": "dedup_34"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.7,
+          "source_index": 1,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.5,
+          "source_index": 2,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.5,
+          "source_index": 3,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 4,
+          "tail": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 5,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.5,
+          "source_index": 6,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 7,
+          "tail": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 8,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.5,
+          "source_index": 9,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.5,
+          "source_index": 10,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.7,
+          "source_index": 11,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 12,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 5,
+            "start": 0,
+            "text": "Alice"
+          },
+          "probability": 0.9,
+          "source_index": 13,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.7,
+          "source_index": 14,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.9,
+          "source_index": 13,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.7,
+          "source_index": 5,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.5,
+          "source_index": 12,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 4,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 8,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.5,
+          "source_index": 7,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        }
+      ],
+      "id": "dedup_35"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 64,
+            "start": 60,
+            "text": "Acme"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 1,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 2,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.9,
+          "source_index": 1,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        }
+      ],
+      "id": "dedup_36"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.9,
+          "source_index": 1,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.9,
+          "source_index": 2,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.5,
+          "source_index": 3,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.5,
+          "source_index": 4,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.5,
+          "source_index": 5,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.9,
+          "source_index": 6,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          },
+          "probability": 0.5,
+          "source_index": 3,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.7,
+          "source_index": 0,
+          "tail": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          }
+        },
+        {
+          "head": {
+            "end": 39,
+            "start": 30,
+            "text": "Bob Jones"
+          },
+          "probability": 0.9,
+          "source_index": 6,
+          "tail": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          }
+        },
+        {
+          "head": {
+            "end": 84,
+            "start": 80,
+            "text": "acme"
+          },
+          "probability": 0.9,
+          "source_index": 1,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        }
+      ],
+      "id": "dedup_37"
+    },
+    {
+      "edges": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.5,
+          "source_index": 0,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 1,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 2,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.9,
+          "source_index": 3,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "head": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          },
+          "probability": 0.5,
+          "source_index": 0,
+          "tail": {
+            "end": 11,
+            "start": 0,
+            "text": "Alice Smith"
+          }
+        },
+        {
+          "head": {
+            "end": 33,
+            "start": 30,
+            "text": "Bob"
+          },
+          "probability": 0.9,
+          "source_index": 3,
+          "tail": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          }
+        },
+        {
+          "head": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          },
+          "probability": 0.7,
+          "source_index": 2,
+          "tail": {
+            "end": 53,
+            "start": 50,
+            "text": "BOB"
+          }
+        },
+        {
+          "head": {
+            "end": 69,
+            "start": 60,
+            "text": "Acme Corp"
+          },
+          "probability": 0.7,
+          "source_index": 1,
+          "tail": {
+            "end": 25,
+            "start": 20,
+            "text": "ALICE"
+          }
+        }
+      ],
+      "id": "dedup_38"
+    }
+  ],
+  "format_version": 1,
+  "provenance": {
+    "checkout": "/private/tmp/antfly-gliner25-upstream",
+    "commit": "3c913c7369301133d3b7699252074c4303ada50e",
+    "device": "cpu",
+    "dtype": "float32",
+    "imports": {
+      "gliner2": "/private/tmp/antfly-gliner25-upstream/gliner2/__init__.py",
+      "gliner2.api_client": "/private/tmp/antfly-gliner25-upstream/gliner2/api_client.py",
+      "gliner2.auto": "/private/tmp/antfly-gliner25-upstream/gliner2/auto.py",
+      "gliner2.configuration": "/private/tmp/antfly-gliner25-upstream/gliner2/configuration.py",
+      "gliner2.inference": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/__init__.py",
+      "gliner2.inference.candidate_decoder": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/candidate_decoder.py",
+      "gliner2.inference.chunking": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/chunking.py",
+      "gliner2.inference.engine": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/engine.py",
+      "gliner2.inference.overlap": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/overlap.py",
+      "gliner2.inference.runtime": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/runtime.py",
+      "gliner2.inference.schema": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/schema.py",
+      "gliner2.inference.schema_model": "/private/tmp/antfly-gliner25-upstream/gliner2/inference/schema_model.py",
+      "gliner2.layers": "/private/tmp/antfly-gliner25-upstream/gliner2/layers.py",
+      "gliner2.models": "/private/tmp/antfly-gliner25-upstream/gliner2/models/__init__.py",
+      "gliner2.models.base": "/private/tmp/antfly-gliner25-upstream/gliner2/models/base.py",
+      "gliner2.models.boundary": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/__init__.py",
+      "gliner2.models.boundary.constants": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/constants.py",
+      "gliner2.models.boundary.content": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/content.py",
+      "gliner2.models.boundary.encoding": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/encoding.py",
+      "gliner2.models.boundary.engine": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/engine.py",
+      "gliner2.models.boundary.heads": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/heads.py",
+      "gliner2.models.boundary.indexing": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/indexing.py",
+      "gliner2.models.boundary.losses": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/losses.py",
+      "gliner2.models.boundary.model": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/model.py",
+      "gliner2.models.boundary.pool": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/pool.py",
+      "gliner2.models.boundary.proposal": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/proposal.py",
+      "gliner2.models.boundary.records": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/records.py",
+      "gliner2.models.boundary.relations": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/relations.py",
+      "gliner2.models.boundary.rotary": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/rotary.py",
+      "gliner2.models.boundary.scoring": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/scoring.py",
+      "gliner2.models.boundary.targets_device": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/targets_device.py",
+      "gliner2.models.boundary.validation": "/private/tmp/antfly-gliner25-upstream/gliner2/models/boundary/validation.py",
+      "gliner2.models.candidates": "/private/tmp/antfly-gliner25-upstream/gliner2/models/candidates.py",
+      "gliner2.models.loading": "/private/tmp/antfly-gliner25-upstream/gliner2/models/loading.py",
+      "gliner2.models.outputs": "/private/tmp/antfly-gliner25-upstream/gliner2/models/outputs.py",
+      "gliner2.models.span": "/private/tmp/antfly-gliner25-upstream/gliner2/models/span/__init__.py",
+      "gliner2.models.span.model": "/private/tmp/antfly-gliner25-upstream/gliner2/models/span/model.py",
+      "gliner2.processing": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/__init__.py",
+      "gliner2.processing.layouts": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/layouts.py",
+      "gliner2.processing.records": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/records.py",
+      "gliner2.processing.targets": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/targets.py",
+      "gliner2.processing.word_splitter": "/private/tmp/antfly-gliner25-upstream/gliner2/processing/word_splitter.py",
+      "gliner2.processor": "/private/tmp/antfly-gliner25-upstream/gliner2/processor.py",
+      "gliner2.training": "/private/tmp/antfly-gliner25-upstream/gliner2/training/__init__.py",
+      "gliner2.training.data": "/private/tmp/antfly-gliner25-upstream/gliner2/training/data.py",
+      "gliner2.training.matching": "/private/tmp/antfly-gliner25-upstream/gliner2/training/matching.py",
+      "gliner2.training.sampler": "/private/tmp/antfly-gliner25-upstream/gliner2/training/sampler.py",
+      "gliner2.training.trainer": "/private/tmp/antfly-gliner25-upstream/gliner2/training/trainer.py",
+      "gliner2.utils": "namespace:/private/tmp/antfly-gliner25-upstream/gliner2/utils",
+      "gliner2.utils.device_errors": "/private/tmp/antfly-gliner25-upstream/gliner2/utils/device_errors.py",
+      "gliner2.utils.sync_probe": "/private/tmp/antfly-gliner25-upstream/gliner2/utils/sync_probe.py"
+    },
+    "platform": {
+      "machine": "arm64",
+      "system": "Darwin"
+    },
+    "runtime": {
+      "packages": {
+        "PyYAML": "6.0.3",
+        "accelerate": "1.10.1",
+        "huggingface-hub": "0.36.0",
+        "numpy": "2.3.5",
+        "packaging": "25.0",
+        "peft": "0.17.1",
+        "psutil": "7.1.3",
+        "pydantic": "2.12.3",
+        "requests": "2.32.5",
+        "safetensors": "0.7.0",
+        "scipy": "1.16.3",
+        "tokenizers": "0.21.4",
+        "torch": "2.9.1",
+        "transformers": "4.55.4",
+        "urllib3": "2.5.0"
+      },
+      "python": "3.12.3",
+      "unicode": "15.0.0"
+    },
+    "threads": 1
+  }
+}

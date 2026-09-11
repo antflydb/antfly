@@ -159,6 +159,20 @@ pub const TensorStore = struct {
         return self.vtable.ggufFile(self.ptr);
     }
 
+    /// Borrow the exact complete artifact used by this store. Composite and
+    /// custom stores cannot masquerade as a single verified bundle.
+    pub fn ggufArtifactBytes(self: TensorStore) ?[]const u8 {
+        if (self.vtable != &GgufStore.vtable) return null;
+        const store: *const GgufStore = @ptrCast(@alignCast(self.ptr));
+        return store.rawData();
+    }
+
+    pub fn singleSafetensorsReader(self: TensorStore) ?*const @import("safetensors.zig").MMapReader {
+        if (self.vtable != &SafetensorsStore.vtable) return null;
+        const store: *const SafetensorsStore = @ptrCast(@alignCast(self.ptr));
+        return &store.source.reader;
+    }
+
     pub fn deinit(self: TensorStore) void {
         self.vtable.deinit(self.ptr);
     }
@@ -503,6 +517,7 @@ fn ggufGetTensor(self: *GgufStore, name: []const u8) !weight_source_mod.LoadedWe
 
     const quantized_storage = if (tensor.tensor_type.isQuantized()) blk: {
         const quant_shape = try self.allocator.dupe(i64, shape);
+        errdefer self.allocator.free(quant_shape);
         const storage_source_name = try self.allocator.dupe(u8, tensor.name);
         errdefer self.allocator.free(storage_source_name);
         break :blk weight_source_mod.QuantizedStorage{

@@ -1,0 +1,170 @@
+{
+  "format": "antfly.gliner25-published-inactive-resume-validation/v1",
+  "mode": "dora",
+  "status": "pass",
+  "binary": {
+    "size_bytes": 32697376,
+    "sha256": "9f0d349efa3f33dd29b6c3dd26a12a8bcf2babf2bc78400c2b84d87d58d786f9"
+  },
+  "preparation_sha256": "e49ca907daf093303dd3919b56ab61f36983eb9d9174e3d3ccd7993ac21e83b9",
+  "source": {
+    "backbone": "small",
+    "precision": "fp32",
+    "weight": {
+      "sha256": "4ee982787ace270d4bf15dbcb28ced38e0aa201372347114ceedd6336055de2b",
+      "size_bytes": 295567700
+    },
+    "sidecars": [
+      {
+        "sha256": "0b7d9e1401ceeb83e992ec66d2f93bff7e5646428f1b4706ec527cf88f53578a",
+        "size_bytes": 3152
+      },
+      {
+        "sha256": "db837d0dc587f5858687ef860c1f400de10f3c3e44f88daef8cbda80d74e4c9c",
+        "size_bytes": 856
+      },
+      {
+        "sha256": "cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3",
+        "size_bytes": 8341713
+      },
+      {
+        "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1",
+        "size_bytes": 645
+      }
+    ]
+  },
+  "data": {
+    "path": "/private/tmp/antfly-gliner25-training-inactive-published-small-v1/train.jsonl",
+    "size_bytes": 1122,
+    "sha256": "377177ee889c4e426eeeccc4dc551437999aa702b8a5055c233aaee8936c54c7",
+    "origin": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/testdata/gliner25/training_inactive_native_epoch/classifier_only.jsonl",
+    "interpretation": "authored text/schema/annotation bytes only; actual published source tokenizer and normal production constructor, no tiny model weights/tokenizer/adapter initial states"
+  },
+  "microbatches": 5,
+  "optimizer_updates": 3,
+  "fallback_sequence": [
+    false,
+    true,
+    false,
+    true,
+    true
+  ],
+  "flush_after": [
+    2,
+    4,
+    5
+  ],
+  "state_sha256": [
+    196,
+    36,
+    66,
+    40,
+    245,
+    231,
+    194,
+    93,
+    46,
+    12,
+    147,
+    154,
+    158,
+    149,
+    29,
+    240,
+    240,
+    28,
+    121,
+    191,
+    92,
+    65,
+    54,
+    89,
+    136,
+    88,
+    127,
+    146,
+    243,
+    216,
+    248,
+    129
+  ],
+  "run_fingerprint": [
+    59,
+    1,
+    242,
+    250,
+    97,
+    74,
+    21,
+    112,
+    247,
+    231,
+    65,
+    229,
+    145,
+    234,
+    116,
+    146,
+    138,
+    178,
+    90,
+    158,
+    80,
+    67,
+    247,
+    216,
+    32,
+    157,
+    79,
+    237,
+    53,
+    19,
+    25,
+    66
+  ],
+  "artifacts": {
+    "result.json": {
+      "size_bytes": 1122,
+      "sha256": "e697dbc1e6cb510aaa527dd6f99b92052b17e3fb4cefcbee5e5b1cebec9de1e8"
+    },
+    "latest.safetensors": {
+      "size_bytes": 78796,
+      "sha256": "fcd76079a40d15065ca5fcc3f95d4b892709f4173f61368e7459400813027144"
+    },
+    "model/adapter_config.json": {
+      "size_bytes": 347,
+      "sha256": "c1d8161c29a828a1b05cddcc56197819d4226621af927884379898b7627b3414"
+    },
+    "model/adapter_model.safetensors": {
+      "size_bytes": 19132,
+      "sha256": "89905788c144bfc30bf4de4d1e78b543050a5d5e8a06e37b540a608624ab009b"
+    },
+    "model/antfly_gliner25_adapter.json": {
+      "size_bytes": 2308,
+      "sha256": "397d8d95b8b8e782d795a0b4f62a01b63ef6604e595d5458a2cbb6b4dcf30595"
+    },
+    "model/antfly_gliner25_training.json": {
+      "size_bytes": 2885,
+      "sha256": "2d444b016db418c2f25e68aca887c97b82b707152856cc2125879f17e2760592"
+    }
+  },
+  "resource_peaks": {
+    "uninterrupted": {
+      "host": 25620123,
+      "backend": 30659864,
+      "child_tree_rss": 466305024
+    },
+    "paused": {
+      "host": 25620123,
+      "backend": 30659864,
+      "child_tree_rss": 462848000
+    },
+    "resumed": {
+      "host": 25620123,
+      "backend": 30659864,
+      "child_tree_rss": 466206720
+    }
+  },
+  "claim": "normal production CLI continuity, zero-loss routing and scalar reports, final named optimizer counters and exported-byte equality; no independent published Python loss/VJP or quality claim",
+  "quality_or_published_source_numeric_qualification": false
+}
