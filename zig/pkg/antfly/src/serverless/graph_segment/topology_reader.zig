@@ -393,7 +393,6 @@ pub fn readAlloc(alloc: Allocator, store: *artifacts.ArtifactStore, source: refs
 pub fn readPreparedAlloc(alloc: Allocator, context: *Context, configs: anytype, limits: anytype, cancellation: CancellationToken) !?Topology {
     const reader = context;
     const trailer = reader.trailer;
-    if (trailer.source_nodes > limits.max_nodes or trailer.source_edges > limits.max_edges) return error.GraphMetricBuildBudgetExceeded;
     const directory = reader.directory orelse return null;
     if (trailer.source_nodes > directory.nodes) return error.InvalidGraphSegment;
     for (0..directory.page_offsets.len / 8) |i| {
@@ -412,6 +411,7 @@ pub fn readPreparedAlloc(alloc: Allocator, context: *Context, configs: anytype, 
         selected_edges = std.math.add(usize, selected_edges, std.math.cast(usize, entry.edges) orelse return error.GraphMetricBuildBudgetExceeded) catch return error.GraphMetricBuildBudgetExceeded;
     }
     if (expected_offset != trailer.body_len + trailer.topology_len or trailer.topology_len / 8 > trailer.source_edges) return error.InvalidGraphSegment;
+    if (selected_edges > limits.max_edges) return error.GraphMetricBuildBudgetExceeded;
     const edges = try alloc.alloc(Edge, selected_edges);
     errdefer alloc.free(edges);
     const dense = selected_edges > directory.nodes / 64;
@@ -481,6 +481,7 @@ pub fn readPreparedAlloc(alloc: Allocator, context: *Context, configs: anytype, 
             unique += 1;
         }
     }
+    if (unique > limits.max_nodes) return error.GraphMetricBuildBudgetExceeded;
     const ordinals = endpoints[0..unique];
     const nodes = try alloc.alloc([]const u8, unique);
     errdefer alloc.free(nodes);

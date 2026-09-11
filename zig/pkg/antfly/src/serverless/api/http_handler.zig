@@ -626,6 +626,7 @@ pub const HttpHandler = struct {
             .chunk_embeddings_incomplete_namespaces = chunk_embeddings_incomplete_namespaces,
             .rerank_terms_incomplete_namespaces = rerank_terms_incomplete_namespaces,
             .published_namespaces = runtime_stats.published_namespaces,
+            .publish_budget_rejected_namespaces = runtime_stats.publish_budget_rejected_namespaces,
             .publish_head_conflicts = runtime_stats.publish_head_conflicts,
             .compacted_namespaces = runtime_stats.compacted_namespaces,
             .compact_head_conflicts = runtime_stats.compact_head_conflicts,
@@ -1124,6 +1125,7 @@ pub const HttpHandler = struct {
         if (try self.requirePublishRoute()) |resp| return resp;
         var result = self.catalog.buildNamespace(namespace) catch |err| switch (err) {
             error.HeadChanged => return try textResponse(self.alloc, 409, "head changed"),
+            error.LakeSidecarBuildBudgetExceeded => return try textResponse(self.alloc, 422, "sidecar build exceeds resource limits; published head is unchanged"),
             else => return try textResponse(self.alloc, 500, "build failed"),
         };
         defer result.deinit(self.alloc);
@@ -1135,6 +1137,7 @@ pub const HttpHandler = struct {
         var result = self.catalog.buildTable(table_name) catch |err| switch (err) {
             error.NamespaceNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.HeadChanged => return try textResponse(self.alloc, 409, "head changed"),
+            error.LakeSidecarBuildBudgetExceeded => return try textResponse(self.alloc, 422, "sidecar build exceeds resource limits; published head is unchanged"),
             else => return try textResponse(self.alloc, 500, "build failed"),
         };
         defer result.deinit(self.alloc);

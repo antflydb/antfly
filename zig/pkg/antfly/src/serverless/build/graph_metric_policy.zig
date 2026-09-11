@@ -23,14 +23,14 @@ const bounded_decode = @import("../bounded_decode.zig");
 
 /// Increment whenever an implementation change can alter admission or output
 /// without changing the user-visible metric configuration.
-// Addressable topology changes cold read/work admission, not metric semantics.
-pub const materializer_epoch: u32 = 25;
+// Indexed preparation admits selected work instead of unrelated source size.
+pub const materializer_epoch: u32 = 26;
 const max_tracked_graph_indexes: usize = 16;
 
 pub const Limits = struct {
-    // Keep graph admission aligned with the decoder and query-runtime
-    // artifact contract. Larger topology artifacts cannot be served safely by
-    // this runtime and are represented by durable rejected metric sidecars.
+    // Whole-payload decoding cap only. Authenticated indexed preparation is
+    // admitted by actual fetched bytes, selected nodes/edges and live memory,
+    // independently of the size of unrelated topology in the source artifact.
     max_graph_payload_bytes: usize = (bounded_decode.Limits{}).max_artifact_bytes,
     // Publication charges actual topology ranges, including authenticated block
     // alignment. Unbound controls require full-content authentication; explicit

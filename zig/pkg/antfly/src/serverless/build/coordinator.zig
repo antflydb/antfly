@@ -26,6 +26,7 @@ pub const PublishRunStats = struct {
     idle_namespaces: usize = 0,
     lease_conflicts: usize = 0,
     lease_takeovers: usize = 0,
+    budget_rejected_namespaces: usize = 0,
 };
 
 pub const BackgroundPublisher = struct {
@@ -34,6 +35,8 @@ pub const BackgroundPublisher = struct {
     catalog: *catalog_service.CatalogService,
     poll_interval_ms: u64,
     lifecycle_mutex: std.Io.Mutex = .init,
+    run_mutex: std.Io.Mutex = .init,
+    budget_backoff: BudgetBackoff = .{},
     future: ?std.Io.Future(void) = null,
     stop_requested: std.atomic.Value(bool) = .init(false),
     stop_wake: std.Io.Event = .unset,
@@ -136,6 +139,8 @@ pub const BackgroundPublisher = struct {
     }
 
     fn runOnceWithToken(self: *BackgroundPublisher, cancellation: maintenance_cancellation.Token) !PublishRunStats {
+        try self.run_mutex.lock(self.io);
+        defer self.run_mutex.unlock(self.io);
         const namespaces = try self.catalog.listNamespacesAlloc(self.alloc);
         defer self.catalog.freeNamespaces(self.alloc, namespaces);
 
@@ -151,7 +156,13 @@ pub const BackgroundPublisher = struct {
             };
             defer status.deinit(self.alloc);
             if (!status.publish_recommended) {
+                self.budget_backoff.clear(namespace.name);
                 stats.idle_namespaces += 1;
+                continue;
+            }
+            const now = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
+            if (self.budget_backoff.blocked(namespace.name, now)) {
+                stats.budget_rejected_namespaces += 1;
                 continue;
             }
 
@@ -214,6 +225,14 @@ pub const BackgroundPublisher = struct {
                 publication_guard,
                 build_cancellation,
             ) catch |err| switch (err) {
+                error.LakeSidecarBuildBudgetExceeded => {
+                    // Deterministic per-namespace admission must not terminate
+                    // the publisher or hot-loop an expensive failed build.
+                    self.budget_backoff.reject(namespace.name, std.Io.Timestamp.now(self.io, .awake).toNanoseconds());
+                    stats.budget_rejected_namespaces += 1;
+                    std.log.warn("serverless sidecar build budget exceeded namespace={s}; retaining published head and backing off", .{namespace.name});
+                    continue;
+                },
                 error.HeadChanged => {
                     stats.head_conflicts += 1;
                     continue;
@@ -232,6 +251,7 @@ pub const BackgroundPublisher = struct {
                 else => return err,
             };
             defer result.deinit(self.alloc);
+            self.budget_backoff.clear(namespace.name);
             if (result.published) {
                 stats.published_namespaces += 1;
             } else {
@@ -267,6 +287,63 @@ pub const BackgroundPublisher = struct {
         }
     }
 };
+
+/// Bounded process-local retry throttling, not durable publication authority.
+/// Explicit build requests bypass this cache. A changed policy/source is
+/// eligible for retry within a minute, even without a new WAL record or restart.
+const BudgetBackoff = struct {
+    const Entry = struct { key: [32]u8, until_ns: i96, attempts: u8 };
+    entries: [64]?Entry = @splat(null),
+    next: usize = 0,
+
+    fn key(namespace: []const u8) [32]u8 {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(namespace, &digest, .{});
+        return digest;
+    }
+
+    fn find(self: *BudgetBackoff, namespace: []const u8) ?*?Entry {
+        const digest = key(namespace);
+        for (&self.entries) |*entry| if (entry.*) |value| {
+            if (std.mem.eql(u8, &value.key, &digest)) return entry;
+        };
+        return null;
+    }
+
+    fn blocked(self: *BudgetBackoff, namespace: []const u8, now: i96) bool {
+        const entry = self.find(namespace) orelse return false;
+        return now < entry.*.?.until_ns;
+    }
+
+    fn clear(self: *BudgetBackoff, namespace: []const u8) void {
+        if (self.find(namespace)) |entry| entry.* = null;
+    }
+
+    fn reject(self: *BudgetBackoff, namespace: []const u8, now: i96) void {
+        const entry = self.find(namespace) orelse blk: {
+            const slot = &self.entries[self.next];
+            self.next = (self.next + 1) % self.entries.len;
+            slot.* = null;
+            break :blk slot;
+        };
+        const attempts = @min(@as(u8, if (entry.*) |previous| previous.attempts else 0) + 1, 4);
+        const delay_seconds: i96 = @min(@as(i96, 5) << @intCast(attempts), 60);
+        entry.* = .{ .key = key(namespace), .until_ns = now +| delay_seconds * std.time.ns_per_s, .attempts = attempts };
+    }
+};
+
+test "serverless publication budget backoff isolates namespaces and retries within a minute" {
+    var backoff = BudgetBackoff{};
+    backoff.reject("large", 0);
+    try std.testing.expect(backoff.blocked("large", 0));
+    try std.testing.expect(!backoff.blocked("small", 0));
+    try std.testing.expect(!backoff.blocked("large", 10 * std.time.ns_per_s));
+    for (0..10) |_| backoff.reject("large", 0);
+    try std.testing.expect(backoff.blocked("large", 59 * std.time.ns_per_s));
+    try std.testing.expect(!backoff.blocked("large", 60 * std.time.ns_per_s));
+    backoff.clear("large");
+    try std.testing.expect(!backoff.blocked("large", 0));
+}
 
 test "serverless background publisher publishes once and stop wakes a long idle wait" {
     const alloc = std.testing.allocator;
@@ -333,6 +410,31 @@ test "serverless background publisher publishes once and stop wakes a long idle 
     try std.testing.expectEqual(@as(usize, 1), published.published_namespaces);
     try std.testing.expectEqual(@as(usize, 0), published.head_conflicts);
     try std.testing.expectEqual(@as(u64, 1), try progress_store.getHead("docs"));
+
+    _ = try catalog.ensureNamespace("healthy", 100);
+    for ([_][]const u8{ "docs", "healthy" }) |namespace| {
+        var pending = try api.ingestBatch(.{ .namespace = namespace, .timestamp_ns = 300, .mutations = &mutation });
+        pending.deinit(alloc);
+    }
+    const Reject = struct {
+        fn reach(_: *anyopaque, event: @import("builder.zig").PublicationLifecycleEvent) !void {
+            if (std.mem.eql(u8, event.namespace, "docs")) return error.LakeSidecarBuildBudgetExceeded;
+        }
+    };
+    var hook_context: u8 = 0;
+    builder.setPublicationLifecycleHook(.{ .ptr = &hook_context, .reach_fn = Reject.reach });
+    const rejected = try publisher.runOnce();
+    try std.testing.expectEqual(@as(usize, 1), rejected.budget_rejected_namespaces);
+    try std.testing.expectEqual(@as(usize, 1), rejected.published_namespaces);
+    try std.testing.expectEqual(@as(u64, 1), try progress_store.getHead("docs"));
+    try std.testing.expect(publisher.runtimeFailure() == null);
+    builder.setPublicationLifecycleHook(null);
+    const throttled = try publisher.runOnce();
+    try std.testing.expectEqual(@as(usize, 1), throttled.budget_rejected_namespaces);
+    try std.testing.expectEqual(@as(usize, 0), throttled.published_namespaces);
+    publisher.budget_backoff.clear("docs");
+    const retried = try publisher.runOnce();
+    try std.testing.expectEqual(@as(usize, 1), retried.published_namespaces);
 
     var canceled: std.atomic.Value(bool) = .init(true);
     try std.testing.expectError(error.Canceled, publisher.runOnceUntil(&canceled));

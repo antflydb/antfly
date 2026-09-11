@@ -36,6 +36,8 @@ const vector_index = @import("vector_index.zig");
 const graph_metric_config = @import("graph_metric_config.zig");
 const graph_metric_policy = @import("graph_metric_policy.zig");
 const lake_graph_metric = @import("lake_graph_metric.zig");
+const graph_build_limits = @import("lake_build_limits.zig");
+pub const GraphBuildLimits = graph_build_limits.Limits;
 const publication_plan = @import("publication_plan.zig");
 const work_lease = @import("work_lease.zig");
 const maintenance_cancellation = @import("../maintenance_cancellation.zig");
@@ -4377,31 +4379,67 @@ pub fn buildGraphSegmentAllocUntil(
     include_graph: bool,
     maintenance: ?maintenance_cancellation.Token,
 ) !GraphSegmentBuildResult {
+    return buildGraphSegmentWithLimitsAlloc(alloc, source_table, docs, include_graph, maintenance, .{});
+}
+
+/// The WAL and lake paths share the same bounded construction contract.
+/// Returned bytes belong to the backing allocator, never the stack limiter.
+pub fn buildGraphSegmentWithLimitsAlloc(
+    alloc: Allocator,
+    source_table: []const u8,
+    docs: []const query_mod.QueryMaterializedDocument,
+    include_graph: bool,
+    maintenance: ?maintenance_cancellation.Token,
+    limits: GraphBuildLimits,
+) !GraphSegmentBuildResult {
+    var working_set = try graph_build_limits.WorkingSetAllocator.init(alloc, limits);
+    return buildGraphSegmentBoundedAlloc(working_set.allocator(), source_table, docs, include_graph, maintenance, limits) catch |err| {
+        if ((err == error.OutOfMemory and working_set.limit_exceeded) or err == error.GraphSegmentTooLarge)
+            return error.LakeSidecarBuildBudgetExceeded;
+        return err;
+    };
+}
+
+fn buildGraphSegmentBoundedAlloc(
+    alloc: Allocator,
+    source_table: []const u8,
+    docs: []const query_mod.QueryMaterializedDocument,
+    include_graph: bool,
+    maintenance: ?maintenance_cancellation.Token,
+    limits: GraphBuildLimits,
+) !GraphSegmentBuildResult {
     var bridge = maintenance_cancellation.GraphBridge{ .maintenance = maintenance };
     const cancellation = bridge.token();
     try cancellation.check();
     if (!include_graph) return .{ .payload = null, .edge_count = 0 };
+    if (docs.len > limits.max_rows) return error.LakeSidecarBuildBudgetExceeded;
     var builder = graph_segment_mod.Builder{ .alloc = alloc };
     defer builder.deinit();
+    var input_bytes: usize = 0;
 
     for (docs) |doc| {
         try cancellation.check();
+        input_bytes = std.math.add(usize, input_bytes, doc.body.len) catch return error.LakeSidecarBuildBudgetExceeded;
+        if (input_bytes > limits.max_input_bytes) return error.LakeSidecarBuildBudgetExceeded;
         try builder.addNode(doc.doc_id);
         const parsed_edges = try parseGraphEdgesAlloc(alloc, doc.body);
         defer freeParsedGraphEdges(alloc, parsed_edges);
         for (parsed_edges, 0..) |edge, i| {
             if (i % 4096 == 0) try cancellation.check();
+            if (builder.edges.items.len >= limits.max_retained_items) return error.LakeSidecarBuildBudgetExceeded;
             const target_table = if (edge.target_table) |table|
                 if (std.mem.eql(u8, table, source_table)) null else table
             else
                 null;
             try builder.addEdge(doc.doc_id, edge.target, edge.edge_type, edge.weight, target_table);
         }
+        if (builder.nodes.values.count() +| builder.edges.items.len > limits.max_retained_items)
+            return error.LakeSidecarBuildBudgetExceeded;
     }
 
     if (builder.edges.items.len == 0) return .{ .payload = null, .edge_count = 0 };
     return .{
-        .payload = try builder.encodeAlloc(std.math.maxInt(usize), cancellation),
+        .payload = try builder.encodeAlloc(limits.max_output_bytes, cancellation),
         .edge_count = builder.edges.items.len,
     };
 }
@@ -4495,6 +4533,31 @@ test "serverless graph builder parser propagates allocation failure without losi
             try std.testing.expectEqual(@as(usize, 1), edges.len);
         }
     }.run, .{});
+}
+
+test "serverless graph builder admits input scratch identities and output before publication" {
+    const a = std.testing.allocator;
+    const docs = [_]query_mod.QueryMaterializedDocument{.{
+        .doc_id = @constCast("a"),
+        .body = @constCast("{\"graph_edges\":[{\"target\":\"b\",\"edge_type\":\"link\"}]}"),
+        .last_lsn = 1,
+        .last_timestamp_ns = 1,
+    }};
+    for ([_]GraphBuildLimits{
+        .{ .max_input_bytes = 1 },
+        .{ .max_working_set_bytes = 1 },
+        .{ .max_retained_items = 1 },
+        .{ .max_output_bytes = 1 },
+    }) |limits| {
+        try std.testing.expectError(error.LakeSidecarBuildBudgetExceeded, buildGraphSegmentWithLimitsAlloc(a, "docs", &docs, true, null, limits));
+    }
+    try std.testing.checkAllAllocationFailures(a, struct {
+        fn run(alloc: Allocator, input: []const query_mod.QueryMaterializedDocument) !void {
+            const built = try buildGraphSegmentWithLimitsAlloc(alloc, "docs", input, true, null, .{});
+            defer if (built.payload) |payload| alloc.free(payload);
+            try std.testing.expectEqual(@as(usize, 1), built.edge_count);
+        }
+    }.run, .{@as([]const query_mod.QueryMaterializedDocument, &docs)});
 }
 
 fn sortParsedGraphEdges(edges: []ParsedGraphEdge) void {

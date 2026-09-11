@@ -38,6 +38,7 @@ pub const RuntimeConfig = struct {
 
 pub const RuntimeRunStats = struct {
     published_namespaces: usize = 0,
+    publish_budget_rejected_namespaces: usize = 0,
     publish_head_conflicts: usize = 0,
     compacted_namespaces: usize = 0,
     compact_head_conflicts: usize = 0,
@@ -214,6 +215,7 @@ pub const ManagedRuntime = struct {
             try self.chargeWork(.publish_round, 1);
             const publish_stats = try self.publisher.runOnceWithCancellation(bridge.token());
             stats.published_namespaces = publish_stats.published_namespaces;
+            stats.publish_budget_rejected_namespaces = publish_stats.budget_rejected_namespaces;
             stats.publish_head_conflicts = publish_stats.head_conflicts;
             stats.work_lease_conflicts += publish_stats.lease_conflicts;
             stats.work_lease_takeovers += publish_stats.lease_takeovers;
@@ -517,6 +519,7 @@ pub const ManagedRuntime = struct {
         lockAtomic(&self.stats_mu);
         defer self.stats_mu.unlock();
         self.cumulative_stats.published_namespaces += stats.published_namespaces;
+        self.cumulative_stats.publish_budget_rejected_namespaces += stats.publish_budget_rejected_namespaces;
         self.cumulative_stats.publish_head_conflicts += stats.publish_head_conflicts;
         self.cumulative_stats.compacted_namespaces += stats.compacted_namespaces;
         self.cumulative_stats.compact_head_conflicts += stats.compact_head_conflicts;

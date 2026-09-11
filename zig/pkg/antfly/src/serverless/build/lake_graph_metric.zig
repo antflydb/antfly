@@ -374,7 +374,6 @@ pub fn publishManyFromGraphArtifactWithBudgetAlloc(
 }
 
 fn prepareSelectedGraphArtifactAlloc(alloc: Allocator, artifacts: *artifact_store.ArtifactStore, source: artifact_ref.ArtifactRef, configs: []const graph_mod.GraphMetricConfig, cancellation: CancellationToken, limits: Limits, budget: *graph_metric_policy.Budget) !?PreparedGraphArtifact {
-    if (source.byte_len > limits.max_graph_payload_bytes) return error.GraphMetricBuildBudgetExceeded;
     var limiter = try bounded_decode.AllocationLimiter.init(alloc, limits.max_peak_memory_bytes);
     var remaining: u64 = limits.max_total_graph_payload_bytes -| budget.graph_payload_bytes;
     const before = remaining;
@@ -397,7 +396,7 @@ fn prepareSelectedGraphArtifactAlloc(alloc: Allocator, artifacts: *artifact_stor
 }
 
 fn prepareContextGraphAlloc(alloc: Allocator, context: *indexed_topology.Context, source: artifact_ref.ArtifactRef, configs: []const graph_mod.GraphMetricConfig, cancellation: CancellationToken, limits: Limits) !?PreparedGraphArtifact {
-    if (source.byte_len > limits.max_graph_payload_bytes or context.retainedBytes() >= limits.max_peak_memory_bytes) return error.GraphMetricBuildBudgetExceeded;
+    if (context.retainedBytes() >= limits.max_peak_memory_bytes) return error.GraphMetricBuildBudgetExceeded;
     var limiter = try bounded_decode.AllocationLimiter.init(alloc, limits.max_peak_memory_bytes - context.retainedBytes());
     var topology = (indexed_topology.readPreparedAlloc(limiter.allocator(), context, configs, limits, cancellation) catch |err| {
         if (err == error.OutOfMemory and limiter.limit_exceeded) return error.GraphMetricBuildBudgetExceeded;
@@ -949,7 +948,7 @@ const TopologyDirectory = struct { bytes: []u8, checksum: [32]u8 };
 /// charged to the same reuse-read allowance as prior metric control reads.
 fn readTopologyDirectoryAlloc(alloc: Allocator, artifacts: *artifact_store.ArtifactStore, source: artifact_ref.ArtifactRef, budget: *graph_metric_policy.Budget, cancellation: CancellationToken) !?TopologyDirectory {
     const wire = graph_segment.codec.compact;
-    if (source.byte_len < wire.topology_trailer_len or source.byte_len > budget.limits.max_graph_payload_bytes or
+    if (source.byte_len < wire.topology_trailer_len or
         budget.limits.max_peak_memory_bytes < wire.topology_trailer_len or
         budget.identity_work_bytes >= budget.limits.max_total_identity_work_bytes) return null;
     var remaining = budget.limits.max_total_reuse_read_bytes -| budget.reuse_read_bytes;
@@ -961,7 +960,7 @@ fn readTopologyDirectoryAlloc(alloc: Allocator, artifacts: *artifact_store.Artif
         error.OutOfMemory => if (limiter.limit_exceeded) return null else return err,
         else => return err,
     };
-    if (context.trailer.source_nodes > budget.limits.max_nodes or context.trailer.source_edges > budget.limits.max_edges or context.directory == null) {
+    if (context.directory == null) {
         context.deinit();
         return null;
     }
@@ -1062,7 +1061,7 @@ pub fn publishRequestsWithPriorAlloc(
             context.deinit();
             source_context = null;
         };
-        if (source_context == null and first.source_graph.byte_len <= limits.max_graph_payload_bytes) {
+        if (source_context == null) {
             source_remaining = limits.max_total_graph_payload_bytes -| budget.graph_payload_bytes;
             const before = source_remaining;
             defer budget.graph_payload_bytes += @intCast(before - source_remaining);
@@ -1115,7 +1114,6 @@ pub fn publishRequestsWithPriorAlloc(
         if (configs.items.len == 0) continue;
         const built = build: {
             var prepared = prepare: {
-                if (first.source_graph.byte_len > limits.max_graph_payload_bytes) break :prepare null;
                 const context = if (source_context) |*value| value else break :prepare null;
                 source_remaining = limits.max_total_graph_payload_bytes -| budget.graph_payload_bytes;
                 const before = source_remaining;
@@ -1176,7 +1174,6 @@ fn validatePublicationOptions(
     try graph_metric_policy.validateConfigs(configs, limits);
     if (!std.meta.eql(batch_budget.limits, limits)) return error.InvalidGraphMetricBuildOptions;
     if (graph_index_name.len == 0 or source_graph.kind != .graph_segment or source_graph.byte_len == 0) return error.InvalidGraphMetricBuildOptions;
-    if (source_graph.byte_len > limits.max_graph_payload_bytes) return error.GraphMetricBuildBudgetExceeded;
     try graph_mod.validateGraphMetricEdgeFilters(&.{}, configs);
 }
 
@@ -1784,12 +1781,11 @@ fn buildProjectionWithEdgeCopyAlloc(alloc: Allocator, topology: CompiledTopology
     {
         return error.InvalidGraphMetricBuildOptions;
     }
-    if (topology.source_node_count > options.limits.max_nodes or topology.source_edge_count > options.limits.max_edges)
-        return error.GraphMetricBuildBudgetExceeded;
     const requirements = options.topology_requirements orelse topologyRequirementsForKind(options.config.kind);
     if (!requirements.satisfies(topologyRequirementsForKind(options.config.kind)))
         return error.InvalidGraphMetricBuildOptions;
     const selected_edges = try selectedEdgeCount(topology, options.config.edge_filter, options.cancellation);
+    if (selected_edges > options.limits.max_edges) return error.GraphMetricBuildBudgetExceeded;
     // Sorting a tiny endpoint set avoids allocating/clearing source-wide
     // bitsets and ordinal/count arrays. Dense projections retain O(V + E) CSR.
     if (!copy_edges and useSparseProjection(topology.node_ids.len, selected_edges))
@@ -2139,8 +2135,6 @@ fn buildDegreeProjectionFromTopologyAlloc(
     decoded_retained_bytes: usize,
     options: BuildOptions,
 ) !Projection {
-    if (topology.source_node_count > options.limits.max_nodes or topology.source_edge_count > options.limits.max_edges)
-        return error.GraphMetricBuildBudgetExceeded;
     var projection = Projection{
         .source_node_count = topology.source_node_count,
         .source_edge_count = topology.source_edge_count,
@@ -2239,19 +2233,14 @@ fn preparedProjectionAlloc(
     prepared: *PreparedGraphArtifact,
     options: BuildOptions,
 ) !PreparedProjection {
-    // Prepared artifacts may outlive a single publication request. Re-admit
-    // the immutable source topology against every caller's limits before a
-    // cache hit can bypass projection construction.
-    if (prepared.topology.source_node_count > options.limits.max_nodes or
-        prepared.topology.source_edge_count > options.limits.max_edges)
-    {
-        return error.GraphMetricBuildBudgetExceeded;
-    }
     const requirements = options.topology_requirements orelse topologyRequirementsForKind(options.config.kind);
     if (prepared.cached_projection != null and
         prepared.cached_projection_filter.?.equivalent(options.config.edge_filter) and
         prepared.cached_projection_requirements.satisfies(requirements))
     {
+        const projection = prepared.cached_projection.?;
+        if (projection.node_ids.items.len > options.limits.max_nodes or projection.edgeCount() > options.limits.max_edges)
+            return error.GraphMetricBuildBudgetExceeded;
         return .{ .projection = &prepared.cached_projection.?, .built = false };
     }
 
@@ -2423,6 +2412,7 @@ fn projectionWorkItems(projection: Projection, options: BuildOptions) !u64 {
 }
 
 fn chargeProjectionConstruction(options: BuildOptions, topology: CompiledTopology, nodes: usize, edges: usize) !void {
+    if (nodes > options.limits.max_nodes or edges > options.limits.max_edges) return error.GraphMetricBuildBudgetExceeded;
     const requirements = options.topology_requirements orelse topologyRequirementsForKind(options.config.kind);
     const passes: u64 = if (requirements.incoming == .neighbors or requirements.outgoing == .neighbors) 4 else 3;
     const total = std.math.add(u64, try compiledProjectionCensusWork(topology, options), try graph_metric_policy.workItems(nodes, edges, 1, passes)) catch return error.GraphMetricBuildBudgetExceeded;
@@ -3121,6 +3111,16 @@ test "serverless graph metric indexed preparation selects topology and cleans up
     var cold = (try prepareSelectedGraphArtifactAlloc(alloc, &cold_artifacts, source, &.{config}, .none, cold_budget.limits, &cold_budget)).?;
     defer cold.deinit(alloc);
     try std.testing.expectEqual(indexed.read_bytes, cold_budget.graph_payload_bytes);
+    // Indexed admission is about selected work, not the unrelated source.
+    // A full decode under the same policy must still reject the payload.
+    const selected_limits = Limits{ .max_graph_payload_bytes = 1, .max_nodes = 2, .max_edges = 2 };
+    var selected_budget = graph_metric_policy.Budget{ .limits = selected_limits };
+    var selected = (try prepareSelectedGraphArtifactAlloc(alloc, &artifacts, source, &.{config}, .none, selected_limits, &selected_budget)).?;
+    defer selected.deinit(alloc);
+    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, prepareGraphArtifactAlloc(alloc, &artifacts, source, .none, selected_limits));
+    var all_budget = graph_metric_policy.Budget{ .limits = selected_limits };
+    const all_config = graph_mod.GraphMetricConfig{ .name = "all", .kind = .degree };
+    try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, prepareSelectedGraphArtifactAlloc(alloc, &artifacts, source, &.{all_config}, .none, selected_limits, &all_budget));
     var corrupted = source;
     corrupted.graph_topology_control_checksum[0] ^= 1;
     var bad_budget = graph_metric_policy.Budget{ .limits = .{} };
@@ -3206,7 +3206,7 @@ test "serverless graph metric semantic reuse authenticates current provenance an
     }
 }
 
-test "serverless graph metric directory reuse preserves source admission limits" {
+test "serverless graph metric directory reuse admits selected work and rejects selected growth" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3219,11 +3219,11 @@ test "serverless graph metric directory reuse preserves source admission limits"
     const limits = Limits{ .max_nodes = 2 };
     var prior: ?artifact_ref.ArtifactRef = null;
     defer if (prior) |ref| freeArtifactRef(alloc, ref);
-    for (0..2) |round| {
+    for (0..3) |round| {
         var builder = graph_segment.Builder{ .alloc = alloc };
         defer builder.deinit();
         try builder.addEdge("a", "b", "cites", 1, null);
-        if (round == 1) try builder.addEdge("c", "d", "unrelated", 1, null);
+        if (round > 0) try builder.addEdge("c", "d", if (round == 1) "unrelated" else "cites", 1, null);
         const payload = try builder.encodeAlloc(4096, .none);
         defer alloc.free(payload);
         var metadata = try artifacts.put(payload);
@@ -3235,7 +3235,7 @@ test "serverless graph metric directory reuse preserves source admission limits"
         defer alloc.free(refs);
         if (prior) |ref| freeArtifactRef(alloc, ref);
         prior = refs[0];
-        try std.testing.expectEqual(if (round == 0) artifact_ref.GraphMetricMaterializationState.ready else .rejected, prior.?.graph_metric_materialization_state);
+        try std.testing.expectEqual(if (round < 2) artifact_ref.GraphMetricMaterializationState.ready else .rejected, prior.?.graph_metric_materialization_state);
     }
 }
 
