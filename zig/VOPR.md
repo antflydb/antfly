@@ -3195,6 +3195,15 @@ entropy from that I/O instead of host time and a process-global counter.
 Virtual-clock regressions cover retry readiness, repeatable jitter, and a
 transfer's remaining deadline across realtime clock changes.
 
+Queued Raft delivery preserves the request's timeout when taking ownership of
+its copied payload. The original failed history's suspended stacks showed a
+node-status request waiting inside a queued Raft batch delivery; dropping that
+timeout made the nested request unbounded when socket timeouts were disabled.
+The transport gate exercises a real HTTP peer that never responds, verifies
+expiry on virtual time, and delivers a subsequent request to prove the
+serialized drain owner was released. Queued requests do not retain the enqueue
+caller's borrowed cancellation or delivery-tracker pointers.
+
 The executable, run and merged-corpus artifacts are retained for 90 days.
 Fiber callsite identities are scoped to a pinned executable layout; keep the
 original executable when investigating older traces. The diagnostic dispatch

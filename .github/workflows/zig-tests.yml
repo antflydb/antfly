@@ -236,6 +236,7 @@ jobs:
             ':(glob)zig/pkg/antfly/src/raft/transport/**' \
             zig/pkg/antfly/src/raft/host.zig \
             zig/pkg/antfly/src/raft/reconciler.zig \
+            zig/pkg/antfly/src/raft/vopr_harness.zig \
             ':(glob)zig/pkg/antfly/build/**' \
             ':(glob)scripts/ci/*vopr*.py' \
             scripts/ci/toolchain-policy.json \
