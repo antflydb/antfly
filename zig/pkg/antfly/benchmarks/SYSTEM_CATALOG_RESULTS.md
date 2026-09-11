@@ -407,6 +407,62 @@ redundant syncs. The full Antfly build, Python lint/formatting, and Zig formatti
 passed. These counts describe overlapping focused targets, not a summed total
 or a claim that every repository test was run.
 
+## Coherent listings and retained schema memory (2026-09-10)
+
+[Raw observations](system_catalog_listing_workloads_2026_09_10.json) compare
+`69fe2d21b` with the final source committed as `e3c5f83a4`. The after binary was
+built from that working tree before its source commit; the artifact records its
+SHA-256. The after source includes main `444440574`, including its build refactor.
+This is an end-to-end comparison, not an isolated attribution of main's changes.
+
+Sequential Debug standalone runs on the same shared macOS host, with 200 extra
+schema fields, 10 samples and two warmups. No other agent-started builds, tests,
+or benchmarks overlapped measured requests. Table creation/readiness is excluded.
+Distinct schemas add one unique declared field per table.
+
+| Public listing workload | Before p50 / p95 (ms) | After p50 / p95 (ms) |
+| --- | --- | --- |
+| One table beside 100 unrelated tables | 7.624 / 7.844 | 1.789 / 1.939 |
+| Prefix selecting one of 100 tables | 7.570 / 7.734 | 1.750 / 1.837 |
+| 100 tables, shared schema | 509.523 / 533.364 | 93.832 / 96.772 |
+| 100 tables, distinct schemas | 508.313 / 535.352 | 93.990 / 95.001 |
+
+The 100-table medians improve about 5.4× in both schema workloads. Scoped reads
+avoid unrelated definitions, and the API groups ranges once per response.
+Only completed immutable schema projections enter the bounded cache. Index
+incarnations, permissions, runtime field observations, and counters remain fresh.
+The distinct-schema workload exposed retention of parser/aggregation scratch;
+compacting the owned projection reduced one 200-field fixture from 825,584 to
+460,156 retained bytes. An allocation-budget regression caps that fixture at
+512 KiB, alongside eviction/lifetime and all-allocation-failure tests.
+
+The cache retains at most 256 entries and 64 MiB; active response leases and
+in-flight compiler scratch can temporarily consume additional memory. Larger
+working sets can evict entries. Response serialization still scales with the
+selected inventory and schema width. These small-sample Debug results are not
+production latency promises or evidence about clustered listing throughput.
+
+The checked-in component benchmark also reports tenant create/drop churn. After
+10, 1,000, and 10,000 cycles, the fixed implementation retains two live resources,
+two parent buckets, and 784 child-array bytes. The baseline retained 10,002 parent
+buckets and 4,480,784 child-array bytes after 10,000 cycles. These byte counts
+exclude hash-table capacity, rows, allocator overhead, and process RSS.
+
+Correctness coverage includes concurrent private-table drop/listing, a projection
+that rejects any attempt to join independent admin/binding snapshots, and scoped
+metadata allocation budgets. Portable HA topology v4 preserves the logical
+catalog and extension inventory alongside physical topology; v3 remains readable.
+Tests cover restored names/IDs/tablespaces/next ID, invalid logical references,
+literal and long restore names, and materialization publication crashes.
+
+Merged validation: 118 catalog tests, six HA materialization/activation tests,
+and two data-runtime seed-capture tests passed. All 32 selected catalog,
+resolution, schema-migration, and exact-sort E2E tests passed. After the final
+schema compaction, the 46-test catalog API suite and all 17 affected catalog,
+schema-migration, and exact-sort E2E tests passed again. Full builds, both
+relocated benchmark targets, Python lint/formatting, and Zig formatting passed.
+Counts overlap; these are focused suites rather than the complete repository.
+
 ## Reproduction
 
 See [workloads and commands](SYSTEM_CATALOG.md). Run the resolution scenario

@@ -1,0 +1,394 @@
+{
+  "date": "2026-09-10",
+  "before_revision": "69fe2d21beacc150b10165e2025e2edd1d9378ac",
+  "after_source_revision": "e3c5f83a4a3231703ab5c7cae0b13ae937cc4188",
+  "after_main_revision": "444440574",
+  "notes": [
+    "Sequential shared-host Debug standalone runs; 10 samples and 2 warmups; provisioning excluded.",
+    "After binary was built from the final source working tree before its source commit. Binary SHA256 is the authoritative executable identity.",
+    "After includes origin/main build refactor; this is an end-to-end comparison, not an isolated attribution of every change."
+  ],
+  "runs": {
+    "before_shared": {
+      "binary": "/private/tmp/antfly-catalog-round5-baseline",
+      "binary_sha256": "fcd2159fe6c9330d48b663b538b83a97927d5743d9d8f5cfbbec619f4a560e3d",
+      "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+      "settings": {
+        "binary": "/private/tmp/antfly-catalog-round5-baseline",
+        "scenario": "listing",
+        "deployment": "standalone",
+        "restart_after_ddl": false,
+        "listing_distinct_schemas": false,
+        "table_counts": [
+          10,
+          100
+        ],
+        "resolution_workload": "exact",
+        "schema_fields": 200,
+        "tenant_counts": [
+          10,
+          100
+        ],
+        "entity_shards": 1,
+        "entity_key_layout": "clustered",
+        "mentions": [
+          10,
+          100
+        ],
+        "documents": 5,
+        "concurrency": 8,
+        "samples": 10,
+        "warmup": 2,
+        "ndjson_lines": 20,
+        "poll_ms": 20,
+        "readiness_timeout": 115,
+        "output": "/private/tmp/catalog-round5-before-listing.json"
+      },
+      "scenarios": {
+        "listing": {
+          "deployment": "standalone",
+          "startup_ms": 2644.5183330215514,
+          "checkpoints": [
+            {
+              "unrelated_tables": 10,
+              "small_namespace": {
+                "samples": 10,
+                "p50_ms": 6.0055,
+                "p95_ms": 6.281917,
+                "max_ms": 6.281917
+              },
+              "selective_prefix": {
+                "samples": 10,
+                "p50_ms": 5.918083,
+                "p95_ms": 6.304375,
+                "max_ms": 6.304375
+              },
+              "large_namespace": {
+                "samples": 10,
+                "p50_ms": 50.7901455,
+                "p95_ms": 51.539334,
+                "max_ms": 51.539334
+              }
+            },
+            {
+              "unrelated_tables": 100,
+              "small_namespace": {
+                "samples": 10,
+                "p50_ms": 7.623646,
+                "p95_ms": 7.843834,
+                "max_ms": 7.843834
+              },
+              "selective_prefix": {
+                "samples": 10,
+                "p50_ms": 7.570354,
+                "p95_ms": 7.73375,
+                "max_ms": 7.73375
+              },
+              "large_namespace": {
+                "samples": 10,
+                "p50_ms": 509.5227085,
+                "p95_ms": 533.363541,
+                "max_ms": 533.363541
+              }
+            }
+          ]
+        }
+      }
+    },
+    "before_distinct": {
+      "binary": "/private/tmp/antfly-catalog-round5-baseline",
+      "binary_sha256": "fcd2159fe6c9330d48b663b538b83a97927d5743d9d8f5cfbbec619f4a560e3d",
+      "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+      "settings": {
+        "binary": "/private/tmp/antfly-catalog-round5-baseline",
+        "scenario": "listing",
+        "deployment": "standalone",
+        "restart_after_ddl": false,
+        "listing_distinct_schemas": true,
+        "table_counts": [
+          10,
+          100
+        ],
+        "resolution_workload": "exact",
+        "schema_fields": 200,
+        "tenant_counts": [
+          10,
+          100
+        ],
+        "entity_shards": 1,
+        "entity_key_layout": "clustered",
+        "mentions": [
+          10,
+          100
+        ],
+        "documents": 5,
+        "concurrency": 8,
+        "samples": 10,
+        "warmup": 2,
+        "ndjson_lines": 20,
+        "poll_ms": 20,
+        "readiness_timeout": 115,
+        "output": "/private/tmp/catalog-round5-before-distinct.json"
+      },
+      "scenarios": {
+        "listing": {
+          "deployment": "standalone",
+          "startup_ms": 694.424582645297,
+          "checkpoints": [
+            {
+              "unrelated_tables": 10,
+              "small_namespace": {
+                "samples": 10,
+                "p50_ms": 6.045083,
+                "p95_ms": 6.415125,
+                "max_ms": 6.415125
+              },
+              "selective_prefix": {
+                "samples": 10,
+                "p50_ms": 6.2246455,
+                "p95_ms": 6.384041,
+                "max_ms": 6.384041
+              },
+              "large_namespace": {
+                "samples": 10,
+                "p50_ms": 50.9363745,
+                "p95_ms": 52.163625,
+                "max_ms": 52.163625
+              }
+            },
+            {
+              "unrelated_tables": 100,
+              "small_namespace": {
+                "samples": 10,
+                "p50_ms": 7.651166,
+                "p95_ms": 7.789709,
+                "max_ms": 7.789709
+              },
+              "selective_prefix": {
+                "samples": 10,
+                "p50_ms": 7.950771,
+                "p95_ms": 8.090084,
+                "max_ms": 8.090084
+              },
+              "large_namespace": {
+                "samples": 10,
+                "p50_ms": 508.31291650000003,
+                "p95_ms": 535.352375,
+                "max_ms": 535.352375
+              }
+            }
+          ]
+        }
+      }
+    },
+    "after_shared": {
+      "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+      "binary_sha256": "65af4252d1794170592726c96e638828dc9c05b12b1ea7d9996e34546a6de1a6",
+      "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+      "settings": {
+        "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+        "scenario": "listing",
+        "deployment": "standalone",
+        "restart_after_ddl": false,
+        "listing_distinct_schemas": false,
+        "table_counts": [
+          10,
+          100
+        ],
+        "resolution_workload": "exact",
+        "schema_fields": 200,
+        "tenant_counts": [
+          10,
+          100
+        ],
+        "entity_shards": 1,
+        "entity_key_layout": "clustered",
+        "mentions": [
+          10,
+          100
+        ],
+        "documents": 5,
+        "concurrency": 8,
+        "samples": 10,
+        "warmup": 2,
+        "ndjson_lines": 20,
+        "poll_ms": 20,
+        "readiness_timeout": 115,
+        "output": "/private/tmp/catalog-round5-after-listing-compact.json"
+      },
+      "scenarios": {
+        "listing": {
+          "deployment": "standalone",
+          "startup_ms": 746.4153748005629,
+          "checkpoints": [
+            {
+              "unrelated_tables": 10,
+              "small_namespace": {
+                "samples": 10,
+                "p50_ms": 1.7447915,
+                "p95_ms": 2.036916,
+                "max_ms": 2.036916
+              },
+              "selective_prefix": {
+                "samples": 10,
+                "p50_ms": 1.6792500000000001,
+                "p95_ms": 1.898917,
+                "max_ms": 1.898917
+              },
+              "large_namespace": {
+                "samples": 10,
+                "p50_ms": 9.4019375,
+                "p95_ms": 9.967333,
+                "max_ms": 9.967333
+              }
+            },
+            {
+              "unrelated_tables": 100,
+              "small_namespace": {
+                "samples": 10,
+                "p50_ms": 1.789354,
+                "p95_ms": 1.939292,
+                "max_ms": 1.939292
+              },
+              "selective_prefix": {
+                "samples": 10,
+                "p50_ms": 1.7497085,
+                "p95_ms": 1.837458,
+                "max_ms": 1.837458
+              },
+              "large_namespace": {
+                "samples": 10,
+                "p50_ms": 93.831625,
+                "p95_ms": 96.771625,
+                "max_ms": 96.771625
+              }
+            }
+          ]
+        }
+      }
+    },
+    "after_distinct": {
+      "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+      "binary_sha256": "65af4252d1794170592726c96e638828dc9c05b12b1ea7d9996e34546a6de1a6",
+      "platform": "macOS-26.3.1-arm64-arm-64bit-Mach-O",
+      "settings": {
+        "binary": "/Users/ajroetker/antfly/.worktrees/feature-catalog-core/zig/zig-out/bin/antfly",
+        "scenario": "listing",
+        "deployment": "standalone",
+        "restart_after_ddl": false,
+        "listing_distinct_schemas": true,
+        "table_counts": [
+          10,
+          100
+        ],
+        "resolution_workload": "exact",
+        "schema_fields": 200,
+        "tenant_counts": [
+          10,
+          100
+        ],
+        "entity_shards": 1,
+        "entity_key_layout": "clustered",
+        "mentions": [
+          10,
+          100
+        ],
+        "documents": 5,
+        "concurrency": 8,
+        "samples": 10,
+        "warmup": 2,
+        "ndjson_lines": 20,
+        "poll_ms": 20,
+        "readiness_timeout": 115,
+        "output": "/private/tmp/catalog-round5-after-distinct-compact.json"
+      },
+      "scenarios": {
+        "listing": {
+          "deployment": "standalone",
+          "startup_ms": 811.405916698277,
+          "checkpoints": [
+            {
+              "unrelated_tables": 10,
+              "small_namespace": {
+                "samples": 10,
+                "p50_ms": 1.663896,
+                "p95_ms": 1.73725,
+                "max_ms": 1.73725
+              },
+              "selective_prefix": {
+                "samples": 10,
+                "p50_ms": 1.710021,
+                "p95_ms": 1.843083,
+                "max_ms": 1.843083
+              },
+              "large_namespace": {
+                "samples": 10,
+                "p50_ms": 9.313499499999999,
+                "p95_ms": 14.717,
+                "max_ms": 14.717
+              }
+            },
+            {
+              "unrelated_tables": 100,
+              "small_namespace": {
+                "samples": 10,
+                "p50_ms": 1.743708,
+                "p95_ms": 1.846209,
+                "max_ms": 1.846209
+              },
+              "selective_prefix": {
+                "samples": 10,
+                "p50_ms": 1.779,
+                "p95_ms": 1.967792,
+                "max_ms": 1.967792
+              },
+              "large_namespace": {
+                "samples": 10,
+                "p50_ms": 93.98987500000001,
+                "p95_ms": 95.000833,
+                "max_ms": 95.000833
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "tenant_churn": {
+    "cycles": [
+      10,
+      1000,
+      10000
+    ],
+    "after_live_resources": [
+      2,
+      2,
+      2
+    ],
+    "after_parent_buckets": [
+      2,
+      2,
+      2
+    ],
+    "after_retained_child_array_bytes": [
+      784,
+      784,
+      784
+    ],
+    "before_10000_parent_buckets": 10002,
+    "before_10000_retained_child_array_bytes": 4480784,
+    "excluded": [
+      "hash table capacity",
+      "row storage",
+      "allocator overhead",
+      "RSS"
+    ]
+  },
+  "wide_schema_cache": {
+    "fields": 200,
+    "retained_bytes": 460156,
+    "regression_budget_bytes": 524288,
+    "max_entries": 256,
+    "max_retained_bytes": 67108864
+  }
+}

@@ -169,3 +169,10 @@ table. This prevents a shared-schema benchmark from hiding cache-capacity costs.
 Returned JSON size still grows with selected tables and schema width. The
 bounded cache can evict definitions beyond its entry or byte budget; compare
 larger inventories separately when sizing an application workload.
+
+
+The component target also reports retained child-array bytes after 10, 1,000,
+and 10,000 tenant create/drop cycles. This counts array capacity in the parent
+index, excluding hash-table capacity, row storage, allocator overhead, and RSS.
+It complements the public management workload and the commit/rollback regression
+without treating memory counters as elapsed-time assertions.

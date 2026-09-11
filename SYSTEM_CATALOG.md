@@ -293,7 +293,8 @@ runtime status or materializing public schemas.
 
 The API server retains immutable schema projections by a length-framed SHA-256
 of the write and read schema bytes. The cache holds at most 256 entries and
-64 MiB of owned arenas; compiler scratch is released after compilation. Leases
+64 MiB of owned arenas. Only finished projections are retained; compiler, parser,
+and aggregation scratch is released after compilation. Leases
 keep evicted generations alive until response serialization finishes. Index
 incarnations, permissions, dynamic field observations, storage counters, and
 replication status remain request data. Schema changes select a new entry;
