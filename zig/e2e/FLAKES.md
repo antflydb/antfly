@@ -1,5 +1,33 @@
 # Zig E2E flakes
 
+## 2026-09-11: final mixed Linux acceptance for #694
+
+The fresh run completed **300/300**, with **100/100 each** for CLI quickstart,
+three-by-three metadata backup/restore, and CLI retry exhaustion/restart.
+Four workers each ran 25 iterations of all three scenarios, from 02:21:01 to
+03:17:04 UTC. There were zero failures, errors, skips, or failed-case retries;
+the driver exited 0. These results are from one revision and do not combine
+passes from the earlier failed runs.
+
+Production commit `05f96814e` includes the atomic coverage batch, lifecycle and
+placement authority fixes, durable Raft replacement/abort fixes, and monotonic
+replication progress. Test revision `b63468094` includes complete publication
+before exact semantic ranking. The subsequent `574af3586` formatter correction
+has an identical Python AST. The Linux x86_64 ReleaseFast executable was built
+with a fresh compiler cache and verified SHA-256:
+`dfdbe000a2712b11d0919a4dc66888c51f905030d3d14a8a360bee4d5cbc3265`.
+The driver used eight allowed CPUs (`0-6,8`) on a pod requesting four CPUs and
+limited to eight; these were not dedicated cores. The retry scenario retained
+all 36 provider attempts and the real production backoff.
+
+Complete logs, runner script, and machine-checked acceptance manifest are in
+`/private/tmp/ci694-replication-acceptance-results.tar.gz`, SHA-256
+`f78936d40adbf5f6b96519bdc3a8c871e96531b0f168a838192531326515a9cd`,
+verified against the runner archive. Historical failure archives remain
+preserved separately. This acceptance result does not establish that unrelated
+flakes cannot occur; deterministic regressions and evidence limits are recorded
+below. GitHub CI is tracked separately from this controlled Linux soak.
+
 ## 2026-09-11: delayed Raft responses amplify metadata replication (#694)
 
 The full `42cb81c6a` run completed **297/300**: quickstart 99/100,
@@ -20,7 +48,8 @@ heartbeat probes to recover a lost append/ack without enlarging its window.
 Quorum commit also requires a current-term entry. All 401 Raft library tests
 pass; the corrected snapshot-abort history matches the etcd oracle. See
 `../FLAKES.md` for before/after evidence and protocol details. This is another
-failed acceptance run; a fresh 100/100 for all three scenarios is required.
+failed acceptance run; the fresh corrected run recorded above passes 100/100
+for all three scenarios.
 
 The standalone quickstart failure also exposed an invalid test assumption:
 one searchable artifact does not guarantee that Alpha has published ahead of

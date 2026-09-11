@@ -4,6 +4,34 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-11: final mixed Linux acceptance for #694
+
+The fresh run completed **300/300**, with **100/100 each** for CLI quickstart,
+three-by-three metadata backup/restore, and CLI retry exhaustion/restart.
+Four workers each ran 25 iterations of all three scenarios, from 02:21:01 to
+03:17:04 UTC. There were zero failures, errors, skips, or failed-case retries;
+the driver exited 0. These results are from one revision and do not combine
+passes from the earlier failed runs.
+
+Production commit `05f96814e` includes the atomic coverage batch, lifecycle and
+placement authority fixes, durable Raft replacement/abort fixes, and monotonic
+replication progress. Test revision `b63468094` includes complete publication
+before exact semantic ranking. The subsequent `574af3586` formatter correction
+has an identical Python AST. The Linux x86_64 ReleaseFast executable was built
+with a fresh compiler cache and verified SHA-256:
+`dfdbe000a2712b11d0919a4dc66888c51f905030d3d14a8a360bee4d5cbc3265`.
+The driver used eight allowed CPUs (`0-6,8`) on a pod requesting four CPUs and
+limited to eight; these were not dedicated cores. The retry scenario retained
+all 36 provider attempts and the real production backoff.
+
+Complete logs, runner script, and machine-checked acceptance manifest are in
+`/private/tmp/ci694-replication-acceptance-results.tar.gz`, SHA-256
+`f78936d40adbf5f6b96519bdc3a8c871e96531b0f168a838192531326515a9cd`,
+verified against the runner archive. Historical failure archives remain
+preserved separately. This acceptance result does not establish that unrelated
+flakes cannot occur; deterministic regressions and evidence limits are recorded
+below. GitHub CI is tracked separately from this controlled Linux soak.
+
 ## Delayed Raft responses amplify replication and exhaust outbound admission (#694)
 
 The `42cb81c6a` run ultimately finished **297/300**: quickstart 99/100,
@@ -57,8 +85,8 @@ stress-profile comparison encounters an existing removed-voter visibility
 difference at seed 3, step 25; the pre-fix revision reproduces it as well
 (`/private/tmp/ci694-raft-stress-seed3-before-oracle.log`). This comparison is
 not counted as passing acceptance. Repeated compaction actions now have the
-same idempotent storage semantics in both harnesses. Fresh Linux
-100-per-scenario acceptance remains required for this revision.
+same idempotent storage semantics in both harnesses. The fresh Linux
+100-per-scenario acceptance above passes for this revision.
 
 Isolated-cache validation of the complete Raft and data-runtime integration
 targets passes **1,045 tests**, with one existing opt-in external wrong-route
@@ -434,7 +462,8 @@ inactive cross-process child helper skipped and no failures or leaks. Its
 standalone build target also declares the PDF dependency already required by
 the shared background runtime. The posting/vector lag is an observed
 consequence, not independent proof that every native publication stall has
-this cause; Linux acceptance remains required.
+this cause. The final mixed Linux acceptance above includes this coverage fix
+and passes all 100 runs of each scenario.
 
 ## Online vector-publication test counts unrelated posting progress (#694)
 
