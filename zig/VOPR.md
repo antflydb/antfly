@@ -3186,7 +3186,9 @@ The same CI gate runs the production Raft transport tests and determinism
 audit. A bounded-fair HA/scaling history exposed a timer divergence: the HTTP
 frame queue calculated retry deadlines and jitter from host time while sleeping
 on borrowed I/O. Retry readiness and snapshot-transfer deadlines now use their
-owning I/O's monotonic clock throughout. Snapshot staging names also obtain
+owning I/O's monotonic clock throughout. HTTP host construction propagates
+that authority to route reconciliation, admission retries, policy rechecks,
+and bootstrap status timestamps. Snapshot staging names also obtain
 entropy from that I/O instead of host time and a process-global counter.
 Virtual-clock regressions cover retry readiness, repeatable jitter, and a
 transfer's remaining deadline across realtime clock changes.

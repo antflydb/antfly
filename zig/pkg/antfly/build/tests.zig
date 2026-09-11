@@ -1583,7 +1583,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const raft_transport_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "raft integration module compiles", "raft.transport." },
+        .filters = &.{ "raft integration module compiles", "raft.transport.", "raft.reconciler.", "http host shares its borrowed clock" },
     });
     const run_raft_transport_tests = addFilteredTestRunArtifact(b, raft_transport_tests);
 
@@ -3810,7 +3810,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const raft_restore_test_step = b.step("antfly-raft-restore-test", "Run focused Raft restore authority and restart tests");
     raft_restore_test_step.dependOn(&run_raft_restore_tests.step);
 
-    const raft_transport_test_step = b.step("antfly-raft-transport-test", "Run raft transport unit tests");
+    const raft_transport_test_step = b.step("antfly-raft-transport-test", "Run raft transport and route reconciliation unit tests");
     raft_transport_test_step.dependOn(&run_raft_transport_tests.step);
 
     const raft_storage_test_step = b.step("antfly-raft-storage-test", "Run Raft snapshot artifact storage tests");
