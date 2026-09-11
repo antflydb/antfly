@@ -4,6 +4,47 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-11: forwarding retirement admission and dense-finalization fixture (#694)
+
+The forwarding review gap below is fixed by checking the native executor's
+busy count under its scheduler mutex after acquiring a request lease. Admission
+accounts for all still-busy tasks (including completed requests still retiring)
+plus the full remaining grant of every active lease. Already-submitted work is
+conservatively counted twice so an admission cannot consume another request's
+unused grant. Insufficient capacity returns the existing pre-transport overload
+classification. This constant-time check adds no retries, polling, task churn,
+or workers; the 252-worker aggregate and dedicated Raft lane remain unchanged.
+Borrowed schedulers retain their own admission contract.
+
+A regression pauses real Threaded group-task destruction after group completion,
+releases the request lease, and verifies that a supported six-slot forwarding
+lane rejects new admission until physical capacity is available. It fails on
+the old implementation with `TestUnexpectedResult`, then passes with the fix.
+The production path does not wait for executor retirement.
+Negative control: `/private/tmp/ci694-forward-finalization-negative.log`.
+
+The Linux failure in `db dense finalization owner drains requests queued during
+publication` used an online, best-effort publication attempt as if it established
+a synchronous native-generation boundary. CI logged both finalization attempts
+before the posting checkpoint finished installing. The fixture now explicitly
+publishes at a stable tip before asserting certification and acquires the
+finalization claim through the normal claim function. The queued-request and
+clean-generation assertions remain intact. Production background publication
+and deadlines are unchanged. The original fixture passed 100 local repetitions;
+that does not invalidate the recorded Linux interleaving.
+
+Native Debug validation passed the 62-test DB/backend selection and 67-test
+runtime selection (including real forwarding under saturated control/Raft
+executors), with zero skips, failures, or leaks. The two targeted regressions
+passed 100 repetitions each, 200 executions total. Evidence:
+`/private/tmp/ci694-capacity-finalization-final.log`,
+`/private/tmp/ci694-capacity-data-final.log`,
+`/private/tmp/ci694-capacity-finalization-repeat.log`, and
+`/private/tmp/ci694-finalization-original-repeat.log`.
+The initial runtime test attempt could not bind its listener inside the sandbox;
+the same binary passed with local socket access. Fresh binary soak and CI
+acceptance for this follow-up are recorded separately when complete.
+
 ## 2026-09-11: combined native Debug acceptance and remaining review gap (#694)
 
 The Debug executable built from `cdc9ffcc8c4d0ed9020564427694173d80185629`

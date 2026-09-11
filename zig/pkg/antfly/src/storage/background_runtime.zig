@@ -1168,8 +1168,8 @@ pub const BackendRuntime = struct {
 
     /// A forwarding request owns enough capacity for its complete nested task
     /// graph. Its executor is isolated from both Raft transport and ingress;
-    /// overload is rejected before transport admission, never halfway through
-    /// an accepted request because a sibling forwarder consumed its workers.
+    /// overload is rejected before transport admission. Native admission also
+    /// accounts for completed tasks which have not retired from the executor.
     pub const RequestForwardLaneLease = struct {
         runtime: *BackendRuntime,
         borrowed_io: Io,
@@ -1201,6 +1201,18 @@ pub const BackendRuntime = struct {
         else blk: {
             const impl = self.ensureSpecializedIoLane(&self.request_forward_io_impl, self.lane_limits.request_forward) orelse
                 return error.BackendRuntimeUnavailable;
+            // Group/Future completion precedes Threaded's busy-count release.
+            // Count every still-busy task, including those whose request lease
+            // has already gone away, plus the full future demand of all leases.
+            // This deliberately overcounts already-submitted work: observing
+            // spare capacity must not steal a sibling's as-yet-unused grant.
+            // No waiting, task submission, or transport occurs under this lock.
+            const sync_io = Io.Threaded.global_single_threaded.io();
+            impl.mutex.lockUncancelable(sync_io);
+            const remaining = @intFromEnum(impl.concurrent_limit) -| impl.busy_count;
+            const reserved = self.request_forward_lane_gate.active() * threaded_io_limits.request_forward_workers_per_request;
+            impl.mutex.unlock(sync_io);
+            if (reserved > remaining) return error.RequestForwardCapacityUnavailable;
             break :blk self.threadedNetworkIo(impl);
         };
         return .{ .runtime = self, .borrowed_io = forward_io };
@@ -3074,6 +3086,89 @@ test "backend runtime async lane limit is CPU aware" {
     else |_|
         std.Io.Limit.limited(8);
     try std.testing.expectEqual(expected, boundedIoAsyncLimit(8));
+}
+
+test "backend runtime forwarding admission includes retiring executor tasks" {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return error.SkipZigTest;
+    const PausedAllocator = struct {
+        hold: std.atomic.Value(bool) = .init(false),
+        retiring: std.atomic.Value(usize) = .init(0),
+        all_retiring: Io.Event = .unset,
+        release: Io.Event = .unset,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn allocate(_: *anyopaque, len: usize, align_: std.mem.Alignment, ra: usize) ?[*]u8 {
+            return std.heap.page_allocator.rawAlloc(len, align_, ra);
+        }
+        fn resize(_: *anyopaque, buf: []u8, align_: std.mem.Alignment, len: usize, ra: usize) bool {
+            return std.heap.page_allocator.rawResize(buf, align_, len, ra);
+        }
+        fn remap(_: *anyopaque, buf: []u8, align_: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+            return std.heap.page_allocator.rawRemap(buf, align_, len, ra);
+        }
+        fn free(ptr: *anyopaque, buf: []u8, align_: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.hold.load(.acquire)) {
+                if (self.retiring.fetchAdd(1, .release) + 1 == 6) self.all_retiring.set(std.testing.io);
+                self.release.waitUncancelable(std.testing.io);
+            }
+            std.heap.page_allocator.rawFree(buf, align_, ra);
+        }
+    };
+
+    var allocator: PausedAllocator = .{};
+    var handle = try BackendRuntimeHandle.init(allocator.allocator(), .{
+        .lane_limits = .{ .request_forward = 6 },
+    });
+    defer handle.deinit();
+    const runtime = handle.ptr();
+    var lease = try runtime.acquireRequestForwardLane();
+    defer lease.release();
+    const io = lease.io();
+    var release: Io.Event = .unset;
+    var tasks: Io.Group = .init;
+    defer {
+        allocator.hold.store(false, .release);
+        allocator.release.set(std.testing.io);
+        release.set(io);
+        tasks.cancel(io);
+    }
+    const Task = struct {
+        fn run(task_io: Io, event: *Io.Event) void {
+            event.waitUncancelable(task_io);
+        }
+    };
+    for (0..6) |_| try tasks.concurrent(io, Task.run, .{ io, &release });
+    allocator.hold.store(true, .release);
+    defer allocator.hold.store(false, .release);
+    release.set(io);
+    try tasks.await(io);
+    // Pause real executor retirement after every task has reported completion.
+    // The request has finished and releases its lease, but its slots are busy.
+    try allocator.all_retiring.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    lease.release();
+    const admission = runtime.acquireRequestForwardLane();
+    if (admission) |value| {
+        var unexpected = value;
+        unexpected.release();
+        return error.TestUnexpectedResult;
+    } else |err| try std.testing.expectEqual(error.RequestForwardCapacityUnavailable, err);
+    try std.testing.expectEqual(@as(usize, 0), runtime.request_forward_lane_gate.active());
+    allocator.hold.store(false, .release);
+    allocator.release.set(std.testing.io);
+    // Only this test waits for the deliberately paused retirement. Production
+    // rejects overload immediately before any request bytes are sent.
+    const deadline = Io.Clock.Timestamp.fromNow(std.testing.io, .{ .raw = .fromSeconds(5), .clock = .awake });
+    while (true) {
+        if (runtime.acquireRequestForwardLane()) |value| {
+            var recovered = value;
+            recovered.release();
+            break;
+        } else |err| try std.testing.expectEqual(error.RequestForwardCapacityUnavailable, err);
+        if (Io.Clock.Timestamp.now(std.testing.io, .awake).compare(.gte, deadline)) return error.TestUnexpectedResult;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
 }
 
 test "backend runtime honors reduced per-lane limits under the aggregate ceiling" {

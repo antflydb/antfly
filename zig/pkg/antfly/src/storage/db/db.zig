@@ -97142,7 +97142,10 @@ test "db dense finalization owner drains requests queued during publication" {
         .sync_level = .full_index,
     });
 
-    _ = try db.publishVectorBlockBasesOnline(.{});
+    // This fixture exercises the certification handoff, whose prerequisite
+    // is an already-published native generation. Online maintenance can return
+    // busy/deferred while another owner is staging files; it is not a barrier.
+    _ = try db.publishVectorBlockBasesAtStableTip();
 
     const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, config.name);
     defer alloc.free(counter_key);
@@ -97159,7 +97162,11 @@ test "db dense finalization owner drains requests queued during publication" {
 
     db.async_context.apply_mutex.lockShared();
     defer db.async_context.apply_mutex.unlockShared();
-    db.async_context.dense_projection_finalizing.store(true, .release);
+    var claim_lock = lockAtomicWithBackoffProfiled(&db.async_context.dense_finish_mutex, &db.async_context.stats.dense_finish_mutex);
+    const claimed = tryClaimDenseProjectionFinalizationLocked(db.async_context);
+    claim_lock.unlock();
+    try std.testing.expect(claimed);
+    defer finishDenseProjectionFinalization(db.async_context);
     try std.testing.expect(db.snapshotAsyncIndexingStats().dense_projection_finalizing);
     try std.testing.expect(!try finalizeCoveredDenseProjectionCheckpoint(db.async_context, config.name, applied));
     try std.testing.expect(db.async_context.dense_projection_finalization_requested);
