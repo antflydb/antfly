@@ -27,7 +27,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: vopr-soak-${{ github.ref }}
+  group: vopr-soak-${{ github.ref }}-${{ inputs.diagnostic_trace || 'campaign' }}
   cancel-in-progress: false
 
 jobs:
