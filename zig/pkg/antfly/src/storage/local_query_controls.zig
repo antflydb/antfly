@@ -16,11 +16,5 @@ pub fn applyExecutionOptions(req: *types.SearchRequest, options: abi.LocalQueryE
             .member => .member,
         };
         req.max_chunks_per_parent = options.max_chunks_per_parent;
-        if (options.dense_k != 0) {
-            for (@constCast(req.dense_queries)) |*query| query.query.k = options.dense_k;
-        }
-        if (options.sparse_k != 0) {
-            for (@constCast(req.sparse_queries)) |*query| query.query.k = options.sparse_k;
-        }
     }
 }

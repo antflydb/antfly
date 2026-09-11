@@ -6632,10 +6632,6 @@ pub const DataServer = struct {
             self.provisioned_storage.attachBackendRuntime(runtime, &self.read_source, &self.write_source);
         }
         try self.provisioned_storage.attachSources(&self.read_source, &self.write_source);
-        if (comptime linked_storage) {
-            const owner_source = try self.ensureKernelOwnerSource();
-            _ = owner_source.withReadSafetyBarrier(self.read_source.read_safety_barrier);
-        }
         if (self.data_raft) |raft| {
             try raft.attachDataApplyStoreResourceManager(&self.provisioned_storage.resource_manager);
             // Public strong distributed reads must follow the live data-Raft
@@ -6654,6 +6650,12 @@ pub const DataServer = struct {
             // A non-Raft data server owns its local state directly. Make that
             // proof explicit only after startup has selected this mode.
             self.read_source.read_safety_barrier = antfly.raft.read_gate.alreadyReadSafeBarrier();
+        }
+        // Select the live barrier before constructing or updating the owner:
+        // the owner stores a value copy, not a reference to read_source.
+        if (comptime linked_storage) {
+            const owner_source = try self.ensureKernelOwnerSource();
+            _ = owner_source.withReadSafetyBarrier(self.read_source.read_safety_barrier);
         }
         _ = self.read_source.withHAReadGate(self.haReadGate());
         const ha_write_gate = self.haWriteGate();

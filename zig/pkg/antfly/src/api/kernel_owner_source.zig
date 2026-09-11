@@ -1578,15 +1578,40 @@ pub const ProvisionedKernelOwnerSource = struct {
         };
     }
 
+    const ReadControls = struct {
+        execution_deadline_ns: ?u64 = null,
+        cancellation: ?db_types.CancellationToken = null,
+
+        fn from(req: anytype) ReadControls {
+            return .{ .execution_deadline_ns = req.execution_deadline_ns, .cancellation = req.cancellation };
+        }
+
+        fn check(self: ReadControls) !void {
+            try table_reads.checkQueryDeadline(.{
+                .execution_deadline_ns = self.execution_deadline_ns,
+                .cancellation = self.cancellation,
+            });
+        }
+    };
+
     fn acquire(
         self: *ProvisionedKernelOwnerSource,
         group_id: u64,
         table_name: []const u8,
     ) !Lease {
+        return self.acquireWithControls(group_id, table_name, .{});
+    }
+
+    fn acquireWithControls(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+        controls: ReadControls,
+    ) !Lease {
+        try controls.check();
         var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
         defer descriptor.deinit(self.alloc);
-
-        return try self.acquireDescriptor(group_id, table_name, descriptor.path, descriptor.view());
+        return self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, controls);
     }
 
     fn transactionRecoveryStatus(err: anyerror) abi.Status {
@@ -1846,7 +1871,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         path: []const u8,
         descriptor: descriptor_contract.Descriptor,
     ) !Lease {
-        return try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor, false);
+        return try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor, false, .{});
     }
 
     /// Lease only an already-resident owner whose complete catalog descriptor
@@ -1886,7 +1911,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         path: []const u8,
         descriptor: descriptor_contract.Descriptor,
     ) !Lease {
-        return try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor, true);
+        return try self.acquireDescriptorWithMode(group_id, table_name, path, descriptor, true, .{});
     }
 
     fn acquireDescriptorWithMode(
@@ -1896,17 +1921,23 @@ pub const ProvisionedKernelOwnerSource = struct {
         path: []const u8,
         descriptor: descriptor_contract.Descriptor,
         exclusive: bool,
+        controls: ReadControls,
     ) !Lease {
-        return self.acquireDescriptorOnce(group_id, table_name, path, descriptor, exclusive) catch |err| switch (err) {
-            error.StorageKernelOwnerTransitionRequired => self.acquireDescriptorAfterTransition(
+        try controls.check();
+        var lease = self.acquireDescriptorOnce(group_id, table_name, path, descriptor, exclusive) catch |err| switch (err) {
+            error.StorageKernelOwnerTransitionRequired => try self.acquireDescriptorAfterTransition(
                 group_id,
                 table_name,
                 path,
                 descriptor,
                 exclusive,
+                controls,
             ),
             else => return err,
         };
+        errdefer lease.deinit();
+        try controls.check();
+        return lease;
     }
 
     fn acquireDescriptorAfterTransition(
@@ -1916,6 +1947,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         path: []const u8,
         descriptor: descriptor_contract.Descriptor,
         exclusive: bool,
+        controls: ReadControls,
     ) !Lease {
         errdefer if (exclusive) self.clearExclusivePending(group_id, table_name);
         var wait_io_impl = std.Io.Threaded.init(self.alloc, .{});
@@ -1923,9 +1955,12 @@ pub const ProvisionedKernelOwnerSource = struct {
         const wait_io = wait_io_impl.io();
         const deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
         while (true) {
+            try controls.check();
             try wait_io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+            try controls.check();
             return self.acquireDescriptorOnce(group_id, table_name, path, descriptor, exclusive) catch |err| switch (err) {
                 error.StorageKernelOwnerTransitionRequired => {
+                    try controls.check();
                     if (platform_time.monotonicNs() >= deadline_ns) return error.StorageBusy;
                     continue;
                 },
@@ -1969,7 +2004,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         descriptor: descriptor_contract.Descriptor,
         exclusive: bool,
     ) !Lease {
-        lock(&self.mutex);
+        if (!self.mutex.tryLock()) return error.StorageKernelOwnerTransitionRequired;
         defer self.mutex.unlock();
         var stale_index: ?usize = null;
         for (self.entries.items, 0..) |entry, index| {
@@ -2129,7 +2164,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         try self.prepareQueryRead(group_id, req, consistency);
         const request_json = try table_reads.encodeStorageKernelQueryRequest(alloc, req);
         defer alloc.free(request_json);
-        var lease = try self.acquire(group_id, table_name);
+        var lease = try self.acquireWithControls(group_id, table_name, .from(req));
         defer lease.deinit();
         try table_reads.checkQueryDeadline(req);
         var cancellation = req.cancellation;
@@ -2149,8 +2184,6 @@ pub const ProvisionedKernelOwnerSource = struct {
                     .member => .member,
                 },
                 .max_chunks_per_parent = req.max_chunks_per_parent,
-                .dense_k = if (req.dense) |dense| dense.k else 0,
-                .sparse_k = if (req.sparse) |sparse| sparse.k else 0,
             },
         });
         errdefer response.deinit();
@@ -2512,7 +2545,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         try self.prepareQueryRead(group_id, req, consistency);
         const request_json = try table_reads.encodeStorageKernelPreflightRequest(alloc, req, max_work);
         defer alloc.free(request_json);
-        var lease = try self.acquire(group_id, table_name);
+        var lease = try self.acquireWithControls(group_id, table_name, .from(req));
         defer lease.deinit();
         var response = try lease.owner().preflightJson(table_name, request_json);
         defer response.deinit();
@@ -3499,7 +3532,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         try self.prepareGraphExpandRead(alloc, group_id, controlled, consistency);
         const request_json = try distributed_graph.encodeGraphExpandRequest(alloc, controlled);
         defer alloc.free(request_json);
-        var lease = try self.acquire(group_id, table_name);
+        var lease = try self.acquireWithControls(group_id, table_name, .from(controlled));
         defer lease.deinit();
         var cancellation = req.cancellation;
         var response = try lease.owner().graphExpandJson(
@@ -3529,7 +3562,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         try self.prepareQueryRead(group_id, table_reads.graphHydrateSearchRequest(controlled), consistency);
         const request_json = try distributed_graph.encodeGraphHydrateRequest(alloc, controlled);
         defer alloc.free(request_json);
-        var lease = try self.acquire(group_id, table_name);
+        var lease = try self.acquireWithControls(group_id, table_name, .from(controlled));
         defer lease.deinit();
         var cancellation = req.cancellation;
         var response = try lease.owner().graphHydrateJson(
@@ -3559,7 +3592,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         try self.prepareLookupRead(group_id, req.key, .{}, consistency);
         const request_json = try distributed_graph.encodeGraphEdgesRequest(alloc, controlled);
         defer alloc.free(request_json);
-        var lease = try self.acquire(group_id, table_name);
+        var lease = try self.acquireWithControls(group_id, table_name, .from(controlled));
         defer lease.deinit();
         var cancellation = req.cancellation;
         var response = try lease.owner().graphEdgesJson(

@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 49;
+pub const abi_version: u32 = 50;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -242,8 +242,6 @@ pub const LocalQueryExecutionOptions = extern struct {
     _reserved0: [2]u8 = @splat(0),
     return_mode: LocalQueryReturnMode = .parent,
     max_chunks_per_parent: u32 = 0,
-    dense_k: u32 = 0,
-    sparse_k: u32 = 0,
 };
 
 /// One complete local query against a DB owned by the storage archive. The DB

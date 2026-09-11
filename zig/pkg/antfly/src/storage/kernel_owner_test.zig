@@ -320,7 +320,25 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     defer batch_response.deinit();
     try std.testing.expect(std.mem.indexOf(u8, batch_response.bytes(), "\"inserted\":2") != null);
 
-    var status_response = try owner.runtimeStatusJson("docs");
+    // Status reads deliberately avoid waiting under the owner lease for a
+    // background writer. A full-index acknowledgement does not make the next
+    // observational read uncontended, so retry this transient status here.
+    var status_response = status: {
+        const time = @import("antfly_platform").time;
+        const deadline = time.monotonicNs() + 5 * std.time.ns_per_s;
+        var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+        defer io_impl.deinit();
+        while (true) {
+            break :status owner.runtimeStatusJson("docs") catch |err| switch (err) {
+                error.StorageBusy => {
+                    if (time.monotonicNs() >= deadline) return err;
+                    try io_impl.io().sleep(.fromMilliseconds(2), .awake);
+                    continue;
+                },
+                else => return err,
+            };
+        }
+    };
     defer status_response.deinit();
     try std.testing.expect(std.mem.indexOf(u8, status_response.bytes(), "\"source_doc_count\":2") != null);
 
@@ -1597,4 +1615,72 @@ test "storage query wire preserves empty projection and decoded sort profile lif
             try result.setOwnedSortProfile(result.sort_profile.?);
         }
     }.decode, .{allocation_wire.json});
+}
+
+test "storage query contract preserves each vector candidate budget" {
+    const alloc = std.testing.allocator;
+    const contract = @import("../api/local_query_contract.zig");
+    const query = @import("../api/query_contract.zig");
+    const controls = @import("local_query_controls.zig");
+    const wire = try contract.encodeStorageKernelQueryRequest(alloc, .{
+        .limit = 100,
+        .dense_queries = &.{
+            .{ .name = "a", .index_name = "a", .query = .{ .vector = &.{ 1, 0 }, .k = 3 } },
+            .{ .name = "b", .index_name = "b", .query = .{ .vector = &.{ 0, 1 }, .k = 9 } },
+        },
+        .sparse_queries = &.{
+            .{ .name = "s", .index_name = "s", .query = .{ .indices = &.{1}, .values = &.{1}, .k = 0 } },
+        },
+    });
+    defer alloc.free(wire);
+    var parsed = try query.parseQueryRequest(alloc, null, "docs", wire);
+    defer parsed.deinit(alloc);
+    controls.applyExecutionOptions(&parsed.req, .{ .enabled = 1 });
+    try std.testing.expectEqual(@as(u32, 3), parsed.req.dense_queries[0].query.k);
+    try std.testing.expectEqual(@as(u32, 9), parsed.req.dense_queries[1].query.k);
+    try std.testing.expectEqual(@as(u32, 0), parsed.req.sparse_queries[0].query.k);
+    try std.testing.expectEqual(@as(u32, 100), parsed.req.limit);
+    const default_wire = try contract.encodeStorageKernelQueryRequest(alloc, .{
+        .limit = 7,
+        .dense_queries = &.{.{ .name = "a", .index_name = "a", .query = .{ .vector = &.{ 1, 0 }, .k = 7 } }},
+    });
+    defer alloc.free(default_wire);
+    try std.testing.expect(std.mem.indexOf(u8, default_wire, "_embedding_limits") == null);
+    // The extension is admitted only on internal query paths.
+    try std.testing.expectError(error.InvalidQueryRequest, query.parsePublicQueryRequest(alloc, null, "docs", wire));
+
+    const public_wire = "{\"embeddings\":{\"sparse_idx\":{\"indices\":[1,5],\"values\":[0.5,0.75],\"k\":4}},\"indexes\":[\"sparse_idx\"],\"limit\":9}";
+    var original = try query.parsePublicQueryRequest(alloc, null, "docs", public_wire);
+    defer original.deinit(alloc);
+    const internal_wire = try contract.encodeStorageKernelQueryRequest(alloc, original.req);
+    defer alloc.free(internal_wire);
+    var restored = try query.parseQueryRequest(alloc, null, "docs", internal_wire);
+    defer restored.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 4), restored.req.sparse_queries[0].query.k);
+
+    const legacy_wire = try contract.encodeStorageKernelQueryRequest(alloc, .{
+        .index_name = "a",
+        .dense = .{ .vector = &.{ 1, 0 }, .k = 7 },
+        .limit = 100,
+    });
+    defer alloc.free(legacy_wire);
+    var legacy = try query.parseQueryRequest(alloc, null, "docs", legacy_wire);
+    defer legacy.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 7), legacy.req.dense_queries[0].query.k);
+
+    // Match by index, not iteration order, and reject malformed or unknown
+    // budgets instead of silently reverting to the public result limit.
+    const reordered = "{\"embeddings\":{\"a\":[1,0],\"b\":[0,1]},\"indexes\":[\"b\",\"a\"],\"_embedding_limits\":{\"a\":3,\"b\":9},\"limit\":100}";
+    var order = try query.parseQueryRequest(alloc, null, "docs", reordered);
+    defer order.deinit(alloc);
+    try std.testing.expectEqualStrings("b", order.req.dense_queries[0].index_name);
+    try std.testing.expectEqual(@as(u32, 9), order.req.dense_queries[0].query.k);
+    try std.testing.expectEqual(@as(u32, 3), order.req.dense_queries[1].query.k);
+    for ([_][]const u8{
+        "{\"embeddings\":{\"a\":[1,0]},\"_embedding_limits\":{\"missing\":3}}",
+        "{\"embeddings\":{\"a\":[1,0]},\"_embedding_limits\":{\"a\":-1}}",
+        "{\"embeddings\":{\"a\":[1,0]},\"_embedding_limits\":{\"a\":4294967296}}",
+    }) |invalid| {
+        try std.testing.expectError(error.InvalidQueryRequest, query.parseQueryRequest(alloc, null, "docs", invalid));
+    }
 }

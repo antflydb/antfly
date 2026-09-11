@@ -199,6 +199,42 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     _ = read_source.withGroupVisibleRootGeneration(generations.iface());
 
     try std.testing.expect((try write_source.source().createTable(alloc, "articles", .{})) != null);
+    // A storage transition can outlive a request. Admission must stop waiting
+    // on the request's controls, without altering the transition's ownership.
+    {
+        const time = @import("antfly_platform").time;
+        const entry = owner_source.entries.items[0];
+        entry.exclusive_active = true;
+        defer entry.exclusive_active = false;
+        const started = time.monotonicNs();
+        try std.testing.expectError(error.Timeout, owner_source.readSource().queryGroupLocal(alloc, 7001, "articles", .{
+            .execution_deadline_ns = started + 20 * std.time.ns_per_ms,
+        }, .stale));
+        try std.testing.expect(time.monotonicNs() - started < 4 * std.time.ns_per_s);
+        try std.testing.expect(entry.exclusive_active);
+        const CancelAfter = struct {
+            at: u64,
+            fn requested(ptr: *const anyopaque) bool {
+                const self: *const @This() = @ptrCast(@alignCast(ptr));
+                return @import("antfly_platform").time.monotonicNs() >= self.at;
+            }
+        };
+        const cancel = CancelAfter{ .at = time.monotonicNs() + 20 * std.time.ns_per_ms };
+        try std.testing.expectError(error.Cancelled, owner_source.readSource().queryGroupLocal(alloc, 7001, "articles", .{
+            .cancellation = .{ .ptr = &cancel, .is_cancelled_fn = CancelAfter.requested },
+        }, .stale));
+        try std.testing.expect(entry.exclusive_active);
+    }
+    // Registry contention must use the same interruptible wait, not a spin lock
+    // that prevents the request from reaching its cancellation checks.
+    {
+        try std.testing.expect(owner_source.mutex.tryLock());
+        defer owner_source.mutex.unlock();
+        try std.testing.expectError(error.Timeout, owner_source.readSource().queryGroupLocal(alloc, 7001, "articles", .{
+            .execution_deadline_ns = @import("antfly_platform").time.monotonicNs() + 20 * std.time.ns_per_ms,
+        }, .stale));
+    }
+
     // Background publication uses only existing owners and does not open a DB.
     const owner_count = (try owner_source.maintenanceSource().maintenanceSnapshot(false)).owner_count;
     write_source.publishCachedWriterRuntimeStatusesBestEffort(alloc);

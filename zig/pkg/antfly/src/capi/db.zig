@@ -771,8 +771,6 @@ fn executeLocalSearch(handle: *Handle, req: db_mod.types.SearchRequest) !db_mod.
                     .member => .member,
                 },
                 .max_chunks_per_parent = req.max_chunks_per_parent,
-                .dense_k = if (req.dense) |query| query.k else 0,
-                .sparse_k = if (req.sparse) |query| query.k else 0,
             },
             req.execution_deadline_ns,
             if (cancellation != null) @ptrCast(&cancellation.?) else null,

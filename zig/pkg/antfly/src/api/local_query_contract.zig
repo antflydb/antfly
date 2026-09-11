@@ -3378,6 +3378,7 @@ pub fn encodeQueryRequestWithGraphWireMode(
     } else req.sparse_queries;
     if (dense_queries.len > 0 or sparse_queries.len > 0) {
         try appendEmbeddingsField(alloc, &out, &first, dense_queries, sparse_queries);
+        try appendEmbeddingLimits(alloc, &out, &first, dense_queries, sparse_queries, req.limit);
     }
     if (req.hierarchy_children != null) {
         // Child traversal is an ordered hierarchy scan rather than a relevance
@@ -3828,6 +3829,38 @@ pub fn appendPrunerField(
     }
     if (pruner.std_dev_threshold > 0) {
         try appendJsonFieldF64(alloc, out, &pruner_first, "std_dev_threshold", pruner.std_dev_threshold);
+    }
+    try out.append(alloc, '}');
+}
+
+/// Candidate budgets belong to each named vector query, independently of the
+/// response limit. Public dense arrays cannot carry k, so keep these in the
+/// internal envelope rather than flattening them into one ABI scalar.
+fn appendEmbeddingLimits(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    dense_queries: []const db_mod.types.NamedDenseQuery,
+    sparse_queries: []const db_mod.types.NamedSparseQuery,
+    default_k: u32,
+) !void {
+    var overrides: usize = 0;
+    inline for (.{ dense_queries, sparse_queries }) |queries| {
+        for (queries) |named| {
+            if (named.query.k != default_k) overrides += 1;
+        }
+    }
+    // Ordinary queries use the result limit already; avoid adding an internal
+    // extension (and its parsing work) when the public envelope is lossless.
+    if (overrides == 0) return;
+    try appendJsonFieldName(alloc, out, first, "_embedding_limits");
+    try out.append(alloc, '{');
+    var first_limit = true;
+    inline for (.{ dense_queries, sparse_queries }) |queries| {
+        for (queries) |named| {
+            if (named.query.k != default_k)
+                try appendJsonFieldU32(alloc, out, &first_limit, named.index_name, named.query.k);
+        }
     }
     try out.append(alloc, '}');
 }

@@ -2442,6 +2442,7 @@ fn parseQueryTimeoutMs(alloc: std.mem.Allocator, body: []const u8) !?u64 {
 
 const QueryBodyContractFields = struct {
     has_internal_shard_fields: bool,
+    has_embedding_limits: bool,
     has_public_doc_filter_bindings: bool,
     has_public_hierarchy_controls: bool,
     has_query_timeout: bool,
@@ -2621,6 +2622,7 @@ fn queryBodyContractFields(alloc: std.mem.Allocator, body: []const u8) !QueryBod
     try validateRawGraphQueriesValueAlloc(alloc, parsed.value);
     return .{
         .has_internal_shard_fields = objectHasInternalShardField(parsed.value.object),
+        .has_embedding_limits = objectHasNonNullField(parsed.value.object, "_embedding_limits"),
         .has_public_doc_filter_bindings = parsed.value.object.get("with") != null,
         .has_public_hierarchy_controls = objectHasNonNullField(parsed.value.object, "hierarchy"),
         .has_query_timeout = parsed.value.object.get("timeout_ms") != null,
@@ -2810,11 +2812,15 @@ pub fn parseQueryRequestWithDeadline(
     );
     try ensureQueryDeadline(execution_deadline_ns);
 
-    const vector_queries = try buildSemanticVectorQueries(alloc, semantic_resolver, table_name, request, req.limit);
-    errdefer vector_queries.deinit(alloc);
-    try ensureQueryDeadline(execution_deadline_ns);
-    req.dense_queries = vector_queries.dense;
-    req.sparse_queries = vector_queries.sparse;
+    {
+        const vector_queries = try buildSemanticVectorQueries(alloc, semantic_resolver, table_name, request, req.limit);
+        errdefer vector_queries.deinit(alloc);
+        try ensureQueryDeadline(execution_deadline_ns);
+        req.dense_queries = vector_queries.dense;
+        req.sparse_queries = vector_queries.sparse;
+    }
+    if (contract_fields.has_embedding_limits)
+        try applyInternalEmbeddingLimits(alloc, effective_body, &req);
     req.graph_queries = try buildGraphQueries(alloc, request);
     if (req.graph_queries.len > 0) {
         req.graph_query_transport = try captureGraphQueryTransportAlloc(alloc, effective_body, req.graph_queries);
@@ -3403,6 +3409,7 @@ fn fastDensePublicQueryMayApply(body: []const u8) bool {
         "\"_exclusion_query_json\"",
         "\"_index_name\"",
         "\"_primary_text_index_name\"",
+        "\"_embedding_limits\"",
         db_mod.doc_filter_wire.field_name,
     };
     for (disallowed) |needle| {
@@ -12439,6 +12446,7 @@ fn isInternalShardFieldName(name: []const u8) bool {
         "_identity_read_generation",
         "_index_name",
         "_primary_text_index_name",
+        "_embedding_limits",
         "_defer_hierarchy_child_hydration",
         "_require_algebraic_filter_resolution",
         db_mod.doc_filter_wire.field_name,
@@ -12777,6 +12785,7 @@ fn removeInternalShardFields(object: *std.json.ObjectMap) void {
         "_identity_read_generation",
         "_index_name",
         "_primary_text_index_name",
+        "_embedding_limits",
         "_defer_hierarchy_child_hydration",
         "_require_algebraic_filter_resolution",
         db_mod.doc_filter_wire.field_name,
@@ -13144,6 +13153,32 @@ fn parseInternalFilterJsonStringAlloc(alloc: std.mem.Allocator, value: std.json.
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, value.string, .{}) catch return error.InvalidQueryRequest;
     parsed.deinit();
     return try alloc.dupe(u8, value.string);
+}
+
+fn applyInternalEmbeddingLimits(alloc: std.mem.Allocator, body: []const u8, req: *db_mod.types.SearchRequest) !void {
+    // Typed parsing skips the vector payload instead of materializing a second
+    // JSON tree. Matching by index survives changes in map/dispatch order.
+    const Wire = struct { _embedding_limits: ?std.json.ArrayHashMap(u32) = null };
+    var parsed = std.json.parseFromSlice(Wire, alloc, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidQueryRequest,
+    };
+    defer parsed.deinit();
+    const limits = parsed.value._embedding_limits orelse return;
+    var it = limits.map.iterator();
+    while (it.next()) |entry| {
+        var matched = false;
+        inline for (.{ req.dense_queries, req.sparse_queries }) |queries| {
+            for (@constCast(queries)) |*named| {
+                if (std.mem.eql(u8, named.index_name, entry.key_ptr.*)) {
+                    if (matched) return error.InvalidQueryRequest;
+                    named.query.k = entry.value_ptr.*;
+                    matched = true;
+                }
+            }
+        }
+        if (!matched) return error.InvalidQueryRequest;
+    }
 }
 
 fn parseInternalDocIdConstraintsAlloc(
