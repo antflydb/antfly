@@ -1183,7 +1183,7 @@ pub const DBCore = struct {
         try self.index_manager.pruneTextSplitRange(split_key);
         try self.index_manager.pruneDenseSplitRange(self.store, split_key);
         try self.index_manager.pruneSparseSplitRange(split_key, original_range_end);
-        try self.index_manager.pruneGraphSplitRange(split_key, original_range_end);
+        try self.index_manager.fenceGraphSplitRange(split_key, original_range_end);
     }
 
     pub fn splitRightStoreToDir(self: *DBCore, split_lower: []const u8, dest_dir: []const u8) !bool {

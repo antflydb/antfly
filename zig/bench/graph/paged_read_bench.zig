@@ -292,6 +292,53 @@ fn largeNodeDirectory(io: std.Io, out: anytype) !void {
     try out.flush();
 }
 
+pub fn runFilteredPrefix(io: std.Io, out: anytype) !void {
+    const alloc = std.heap.smp_allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var builder = graph.Builder{ .alloc = alloc };
+    defer builder.deinit();
+    var kinds: [64][]const u8 = undefined;
+    for (&kinds, 0..) |*kind, i| kind.* = try std.fmt.allocPrint(a, "kind{d:0>2}", .{i});
+    for (0..100000) |i| try builder.addEdge("hub", try std.fmt.allocPrint(a, "node{d:0>8}", .{i}), kinds[i % kinds.len], 1, null);
+    const payload = try builder.encodeAlloc(128 * 1024 * 1024, .none);
+    defer alloc.free(payload);
+    const checksum = try digestAlloc(a, payload);
+    var source = antfly.serverless.ArtifactRef{ .kind = .graph_segment, .name = "g", .artifact_id = try std.fmt.allocPrint(a, "sha256:{s}", .{checksum}), .checksum = checksum, .byte_len = payload.len };
+    try graph.codec.compact.bindTopologyControl(&source, payload);
+    var memory = Memory{ .payload = payload };
+    var store = artifacts.ArtifactStore{ .allocator = alloc, .ptr = &memory, .vtable = &Memory.vtable };
+    for ([_]usize{ 0, 1, 64 }) |type_count| {
+        var times: [5]u64 = undefined;
+        var inspected: usize = 0;
+        for (0..6) |sample| {
+            memory.calls = 0;
+            memory.bytes = 0;
+            var bytes: u64 = 128 * 1024 * 1024;
+            var work: usize = 1000000;
+            const start = std.Io.Clock.awake.now(io);
+            {
+                var reader = (try graph.AdjacencyReader.init(alloc, &store, source, .none, &bytes)).?;
+                defer reader.deinit();
+                var cursor = try reader.cursor("hub", kinds[0..type_count], false, &work);
+                defer cursor.deinit();
+                var edge = (try cursor.next()).?;
+                defer edge.deinit(alloc);
+                if (!std.mem.eql(u8, edge.neighbor_id, "node00000000") or !std.mem.eql(u8, edge.edge_type, "kind00")) return error.InvalidBenchmarkResult;
+            }
+            if (sample != 0) times[sample - 1] = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds());
+            inspected = 1000000 - work;
+        }
+        if (type_count == 64 and inspected != 1) return error.RangeAmplificationRegression;
+        std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+        const json = try std.json.Stringify.valueAlloc(a, .{ .mode = "filtered_first_edge", .edges = 100000, .requested_types = type_count, .artifact_bytes = payload.len, .range_calls = memory.calls, .read_bytes = memory.bytes, .inspected_edges = inspected, .median_ns = times[2], .note = "same first result; fresh reader, in-memory transport, no shared cache; includes authentication, string ownership and cleanup; no network latency model" }, .{});
+        try out.interface.writeAll(json);
+        try out.interface.writeByte('\n');
+        try out.flush();
+    }
+}
+
 fn digestAlloc(alloc: Allocator, payload: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});

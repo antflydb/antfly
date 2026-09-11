@@ -4,6 +4,52 @@ Graph metrics use shared numerical semantics with backend-specific persistence.
 The production boundary is admitted, generation-fenced work—not a synchronous
 full-graph calculation hidden inside a query or maintenance tick.
 
+### Stateful split ownership and bounded retirement
+
+Logical ownership is separate from physical graph cleanup. Before committing a
+narrower primary range and its Raft receipt, each private graph store durably
+prepares a source-range retirement task. That transaction advances dependency
+epochs and fences numerical leases, while preserving jobs and score namespaces
+for their normal bounded reclamation. A prepared task does **not** hide edges
+or permit deletion until the authoritative primary range excludes its interval.
+Range adoption activates the fence without allocation or I/O. On reopen the
+catalog reconciles the same durable task against the persisted primary range
+before publishing the index. A failed primary commit therefore leaves the old
+graph visible, and retry can complete the transition safely.
+
+Outgoing and reverse reads use the same source-ownership predicate. Their
+snapshot-owned scopes survive outer transaction closure and physical cleanup
+until the last cursor closes. Cursors seek across excluded source intervals
+rather than scanning each excluded edge, including within incoming target/type
+runs. Pre-transition snapshots retain their old membership. Metrics cannot
+acquire leases or publish across the ownership transition; background numerical
+work resumes after physical accounting converges. Explicit synchronous metric
+refresh and graph repair are drain boundaries.
+
+The existing `backend_runtime` maintenance scheduler retires at most one graph
+page per turn, round-robin across indexes, even when no metrics are configured.
+Each page admits at most 1,024 identities / 4 MiB (one oversized identity is
+indivisible). Its cross-store intent is durable before forward deletion; reverse
+accounting, intent removal and the full-range resume cursor commit together.
+Reopen can replay an interrupted page without double-counting, and later pages
+seek after the committed cursor instead of revisiting prior tombstones. The
+range task and visibility fence are removed only after all pages finish. One
+range task is admitted per graph index; retries of that range are idempotent,
+and a different transition receives `GraphMaintenanceInProgress` until the
+existing task retires. Replicated split apply normalizes this admission result
+to `RaftApplyWriterUnavailable`, retaining the committed entry for retry while
+other groups and background cleanup progress; its receipt does not advance.
+Copying into a previously split receiving index drains
+its prior cleanup before installing replacement edges.
+
+Physical counters remain cheap and durable during retirement. A request for
+exact logical graph statistics temporarily uses a scoped edge scan and node
+set until cleanup completes; ordinary adjacency queries do not pay that cost.
+This is not a range-aggregate index or a single-store transactional redesign.
+The two private stores and their durability barriers remain intact. Those
+larger storage changes require separate write-amplification and recovery
+benchmarks rather than weakening the current durability contract.
+
 ### Durable cross-job stateful topology
 
 Membership blocks, ordinal dictionaries, exact out-degree totals, and packed

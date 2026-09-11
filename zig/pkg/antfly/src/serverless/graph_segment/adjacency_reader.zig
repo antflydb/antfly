@@ -232,6 +232,11 @@ pub const Reader = struct {
         reader: *Reader,
         offset: u64,
         ranges: []Range,
+        /// Until consumed, ranges contain canonical half-open type runs,
+        /// not physical row offsets. Adjacent requested types share one seek.
+        type_ranges: bool = false,
+        row_count: usize = 0,
+        selected: ?Range = null,
         range: usize = 0,
         position: usize = 0,
         bytes: []u8 = &.{},
@@ -250,10 +255,12 @@ pub const Reader = struct {
 
         pub fn nextWire(self: *Cursor) !?wire.Edge {
             while (self.range < self.ranges.len) {
-                const selected = self.ranges[self.range];
+                if (self.selected == null) self.selected = try self.resolveRange(self.range);
+                const selected = self.selected.?;
                 self.position = @max(self.position, selected.begin);
                 if (self.position == selected.end) {
                     self.range += 1;
+                    self.selected = null;
                     continue;
                 }
                 try self.reader.context.reader.cancellation.check();
@@ -271,6 +278,28 @@ pub const Reader = struct {
                 return edge;
             }
             return null;
+        }
+
+        fn resolveRange(self: *Cursor, index: usize) !Range {
+            const run = self.ranges[index];
+            if (!self.type_ranges) return run;
+            try self.reader.context.reader.cancellation.check();
+            return .{
+                .begin = if (run.begin == 0) 0 else try self.reader.lowerBound(self.offset, self.row_count, @intCast(run.begin), 0, self.work),
+                .end = if (run.end == self.reader.context.layout.?.types) self.row_count else try self.reader.lowerBound(self.offset, self.row_count, @intCast(run.end), 0, self.work),
+            };
+        }
+
+        /// Eager materialization still admits the complete result before
+        /// copying strings. Streaming callers never resolve unconsumed runs.
+        fn resolveAll(self: *Cursor) !usize {
+            var total: usize = 0;
+            for (self.ranges, 0..) |*range, i| {
+                range.* = try self.resolveRange(i);
+                total = std.math.add(usize, total, range.end - range.begin) catch return error.QueryCandidateBudgetExceeded;
+            }
+            self.type_ranges = false;
+            return total;
         }
     };
 
@@ -315,16 +344,25 @@ pub const Reader = struct {
         if (types_filter == null) {
             if (count != 0) try ranges.append(self.alloc, .{ .begin = 0, .end = count });
         } else for (types_filter.?) |id| {
-            const begin = try self.lowerBound(offset, count, @intCast(id), 0, work);
-            const end = try self.lowerBound(offset, count, @intCast(id + 1), 0, work);
-            if (begin != end) try ranges.append(self.alloc, .{ .begin = begin, .end = end });
+            if (id >= self.context.layout.?.types) return error.InvalidGraphSegment;
+            try ranges.append(self.alloc, .{ .begin = id, .end = @as(usize, id) + 1 });
         }
         std.mem.sort(Cursor.Range, ranges.items, {}, struct {
             fn less(_: void, a: Cursor.Range, b: Cursor.Range) bool {
                 return a.begin < b.begin;
             }
         }.less);
-        return .{ .reader = self, .offset = offset, .ranges = try ranges.toOwnedSlice(self.alloc), .work = work };
+        var kept: usize = 0;
+        for (ranges.items) |run| {
+            if (kept > 0 and run.begin <= ranges.items[kept - 1].end) {
+                ranges.items[kept - 1].end = @max(ranges.items[kept - 1].end, run.end);
+            } else {
+                ranges.items[kept] = run;
+                kept += 1;
+            }
+        }
+        ranges.items.len = kept;
+        return .{ .reader = self, .offset = offset, .ranges = try ranges.toOwnedSlice(self.alloc), .type_ranges = types_filter != null, .row_count = count, .work = work };
     }
 
     /// Work is a shared remaining physical-edge allowance, consumed before I/O.
@@ -343,8 +381,7 @@ pub const Reader = struct {
     fn readEdges(self: *Reader, offset: u64, count: usize, requested: []const []const u8, limit: usize, work: *usize, skip_qualified: bool, skip_node: ?[]const u8) ![]types.Edge {
         var selected = try self.cursorAt(offset, count, requested, work);
         defer selected.deinit();
-        var total: usize = 0;
-        for (selected.ranges) |range| total = std.math.add(usize, total, range.end - range.begin) catch return error.QueryCandidateBudgetExceeded;
+        const total = try selected.resolveAll();
         if (!skip_qualified and skip_node == null and total > limit) return error.QueryCandidateBudgetExceeded;
         if (total > work.*) return error.GraphTraversalQueryBudgetExceeded;
         var result: std.ArrayListUnmanaged(types.Edge) = .empty;
@@ -409,6 +446,52 @@ const TestStore = struct {
     }
     const vtable = artifacts.ArtifactStore.VTable{ .deinit = deinit, .put = put, .get_alloc = get, .get_range_alloc = range, .stat = stat, .delete = delete };
 };
+
+test "serverless graph filtered cursors lazily coalesce canonical type runs" {
+    const a = std.testing.allocator;
+    var builder = @import("builder.zig").Builder{ .alloc = a };
+    defer builder.deinit();
+    const kinds = [_][]const u8{ "a", "b", "c", "d" };
+    for (0..4096) |i| {
+        var key: [32]u8 = undefined;
+        const node = try std.fmt.bufPrint(&key, "node{d:0>8}", .{i});
+        try builder.addEdge("hub", node, kinds[i % kinds.len], 1, null);
+        try builder.addEdge(node, "incoming", kinds[i % kinds.len], 1, null);
+    }
+    const payload = try builder.encodeAlloc(4 * 1024 * 1024, .none);
+    defer a.free(payload);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+    const checksum = std.fmt.bytesToHex(digest, .lower);
+    var source = refs.ArtifactRef{ .kind = .graph_segment, .name = "g", .artifact_id = "sha256:" ++ checksum, .checksum = &checksum, .byte_len = payload.len };
+    try wire.bindTopologyControl(&source, payload);
+    var memory = TestStore{ .payload = payload };
+    var store = artifacts.ArtifactStore{ .allocator = a, .ptr = &memory, .vtable = &TestStore.vtable };
+    var bytes: u64 = 16 * 1024 * 1024;
+    var reader = (try Reader.init(a, &store, source, .none, &bytes)).?;
+    defer reader.deinit();
+    for ([_]bool{ false, true }) |incoming| {
+        const key = if (incoming) "incoming" else "hub";
+        var one: usize = 1;
+        var all = try reader.cursor(key, &.{ "d", "a", "c", "b", "a", "absent" }, incoming, &one);
+        defer all.deinit();
+        try std.testing.expectEqual(@as(usize, 1), one);
+        var first = (try all.next()).?;
+        defer first.deinit(a);
+        try std.testing.expectEqualStrings("a", first.edge_type);
+        try std.testing.expectEqualStrings("node00000000", first.neighbor_id);
+        try std.testing.expectEqual(@as(usize, 0), one);
+        var work: usize = 20;
+        var sparse = try reader.cursor(key, &.{ "c", "a" }, incoming, &work);
+        defer sparse.deinit();
+        // Construction may resolve the dictionary/row but does no edge work.
+        try std.testing.expectEqual(@as(usize, 20), work);
+        var selected = (try sparse.next()).?;
+        defer selected.deinit(a);
+        try std.testing.expectEqualStrings("a", selected.edge_type);
+        try std.testing.expect(work > 0);
+    }
+}
 
 fn exerciseReader(alloc: Allocator, payload: []const u8, source: refs.ArtifactRef) !void {
     var memory = TestStore{ .payload = payload };

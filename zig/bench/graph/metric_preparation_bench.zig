@@ -200,6 +200,7 @@ pub fn main(init: std.process.Init) !void {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--paged-only")) return @import("paged_read_bench.zig").run(init.io, &output);
         if (std.mem.eql(u8, arg, "--prune-only")) return benchmarkRangePrune(init.io, &output);
+        if (std.mem.eql(u8, arg, "--filtered-prefix-only")) return @import("paged_read_bench.zig").runFilteredPrefix(init.io, &output);
         if (std.mem.eql(u8, arg, "--native-scans-only")) return benchmarkNativeScans(init.io, &output);
         if (std.mem.eql(u8, arg, "--presence-only")) return benchmarkPresence(&output);
         if (std.mem.eql(u8, arg, "--tree-only")) return benchmarkTreeValidation(init.io, &output);
@@ -558,7 +559,7 @@ fn benchmarkNativeScans(io: std.Io, out: anytype) !void {
 
 fn benchmarkRangePrune(io: std.Io, out: anytype) !void {
     const alloc = std.heap.smp_allocator;
-    for ([_]usize{ 4096, 16384 }) |count| {
+    for ([_]usize{ 4096, 16384, 65536 }) |count| {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -572,16 +573,41 @@ fn benchmarkRangePrune(io: std.Io, out: anytype) !void {
         const writes = try a.alloc(antfly.graph.BatchWrite, count);
         for (writes, 0..) |*write, i| write.* = .{ .source = try std.fmt.allocPrint(a, "source-{d:0>8}", .{i}), .target = "hub", .edge_type = "link" };
         var samples: [5]u64 = undefined;
+        var fence_samples: [5]u64 = undefined;
+        var lookup_samples: [5]u64 = undefined;
+        var maximum_page_ns: u64 = 0;
         for (0..6) |sample| {
             try index.batchApply(writes, &.{});
             const start = std.Io.Clock.awake.now(io);
-            const removed = try index.pruneOwnedRange(alloc, "source-", "");
-            const elapsed: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds());
+            try index.fenceOwnedRange(alloc, "source-", "");
+            const fence_ns: u64 = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds());
+            if (index.edge_count != count) return error.UnexpectedSynchronousRetirement;
+            const lookup_start = std.Io.Clock.awake.now(io);
+            const hidden = try index.getEdges(alloc, "hub", "link", .in);
+            defer antfly.graph.GraphIndex.freeEdges(alloc, hidden);
+            if (hidden.len != 0) return error.InvalidBenchmarkResult;
+            const lookup_ns: u64 = @intCast(lookup_start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds());
+            const retire_start = std.Io.Clock.awake.now(io);
+            var removed: usize = 0;
+            while (true) {
+                const page_start = std.Io.Clock.awake.now(io);
+                const page = try index.pruneOwnedRangePage();
+                const page_ns: u64 = @intCast(page_start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds());
+                if (sample != 0) maximum_page_ns = @max(maximum_page_ns, page_ns);
+                removed += page orelse break;
+            }
+            const elapsed: u64 = @intCast(retire_start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds());
             if (removed != count or index.edge_count != 0 or index.node_count != 0) return error.InvalidBenchmarkResult;
-            if (sample != 0) samples[sample - 1] = elapsed;
+            if (sample != 0) {
+                samples[sample - 1] = elapsed;
+                fence_samples[sample - 1] = fence_ns;
+                lookup_samples[sample - 1] = lookup_ns;
+            }
         }
         std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
-        const json = try std.json.Stringify.valueAlloc(a, .{ .mode = "durable_stateful_range_prune", .edges = count, .page_record_limit = 1024, .page_identity_byte_limit = 4 * 1024 * 1024, .median_ns = samples[2], .note = "default LSM; includes durable intent, forward sync, reverse accounting and intent retirement; excludes fixture insertion; five warm samples" }, .{});
+        std.mem.sort(u64, &fence_samples, {}, std.sort.asc(u64));
+        std.mem.sort(u64, &lookup_samples, {}, std.sort.asc(u64));
+        const json = try std.json.Stringify.valueAlloc(a, .{ .mode = "durable_stateful_range_retirement", .edges = count, .page_record_limit = 1024, .page_identity_byte_limit = 4 * 1024 * 1024, .fence_median_ns = fence_samples[2], .retirement_median_ns = samples[2], .maximum_page_ns = maximum_page_ns, .scoped_incoming_median_ns = lookup_samples[2], .note = "default LSM; graph ownership fence and durability only, not end-to-end Raft apply; retirement includes all durable barriers; excludes insertion; five warm samples" }, .{});
         try out.interface.writeAll(json);
         try out.interface.writeByte('\n');
         try out.flush();

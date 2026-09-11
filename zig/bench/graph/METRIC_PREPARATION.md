@@ -1,5 +1,56 @@
 # Graph metric execution and query benchmarks
 
+## Ownership fences and lazy type runs (2026-09-10)
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseSafe -j1 -- --filtered-prefix-only
+zig build graph-metric-preparation-bench -Doptimize=ReleaseSafe -j1 -- --prune-only
+```
+
+Apple M4 Max, Zig 0.16.0, five measured samples after one warmup. The filtered
+benchmark uses a 100,000-edge hub with 64 edge types, a fresh reader per query,
+in-memory artifact transport and no shared cache. Every variant returns the same
+first edge; timings include authentication, string ownership and cleanup.
+
+| Requested types | Median | GETs | Fetched bytes | Inspected edges |
+| --- | ---: | ---: | ---: | ---: |
+| Wildcard | 0.214 ms | 7 | 299,988 | 1 |
+| First type only | 0.320 ms | 10 | 496,596 | 18 |
+| All 64 explicitly | 0.216 ms | 7 | 299,988 | 1 |
+
+The pre-change diagnostic on the same fixture used 36 GETs, 2,200,532 fetched
+bytes and 2,148 edge inspections for all 64 types. Canonical adjacent type runs
+now share endpoint seeks, and unconsumed runs perform no edge I/O. Selecting
+the whole dictionary requires no endpoint probes. This removes 81% of GETs
+and 86% of fetched bytes for that query without changing its result or budget.
+These are physical-work reductions, not a network-latency prediction. A narrow
+interior filter still requires logarithmic endpoint searches.
+
+Stateful split acknowledgment no longer drains physical topology. The durable
+ownership task fences metrics and, once activated by the primary range commit,
+filters outgoing and reverse reads by source ownership. Retirement runs in
+1,024-record / 4 MiB identity pages through the existing maintenance scheduler.
+Each completed page atomically advances its durable key cursor with reverse
+accounting, avoiding scans through earlier pages' tombstones after a yield or
+restart. A separate raw-LSM diagnostic with 65,535 tombstones measured an
+original-lower-bound seek at 2.56 ms versus 0.37 µs for the surviving key;
+this isolates seek CPU and excludes persistence and page mutation.
+
+| Retired edges | Fence median | Complete retirement | Largest page | Scoped empty incoming lookup |
+| --- | ---: | ---: | ---: | ---: |
+| 4,096 | 1.558 ms | 101.870 ms | 31.227 ms | 0.551 ms |
+| 16,384 | 16.506 ms | 476.265 ms | 50.049 ms | 0.923 ms |
+| 65,536 | 1.757 ms | 3,316.889 ms | 159.168 ms | 1.330 ms |
+
+The default durable LSM benchmark excludes insertion and includes all retirement
+durability barriers. Fence timing covers private graph metadata and its sync,
+not end-to-end Raft apply or primary coverage rebasing. It does not configure
+metrics; fencing cost also depends on the configured metric count. Storage
+maintenance and fsync can dominate even a small transaction (as the 16K sample
+illustrates); page bounds are work/memory bounds, not hard wall-clock deadlines.
+The architectural improvement is removing the complete edge drain from split
+acknowledgment and allowing apply ownership to be released between pages.
+
 ## Retained native cursors and durable lifecycle ownership (2026-09-10)
 
 In-process adjacency streams retain their native read snapshots and physical

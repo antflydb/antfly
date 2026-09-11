@@ -7248,12 +7248,17 @@ pub const DB = struct {
         const range: types.ByteRange = .{ .start = start, .end = end };
         const range_value = try range_state_mod.encodeRangeAlloc(self.alloc, range);
         defer self.alloc.free(range_value);
-        // Private graph stores/counters do not inherit the primary range
-        // filter. Retire split-off source topology (including reverse edges
-        // and metric dependency epochs) before persisting the Raft receipt.
-        // Pruning is bounded, durable, and replayable: a failed page must leave
-        // this entry unapplied so retry can finish the remaining ownership work.
-        try self.core.index_manager.pruneGraphSplitRange(transition.split_key, current.end);
+        // Publish graph source ownership before acknowledging the transition.
+        // Physical retirement is a durable maintenance task, not Raft apply
+        // work. Reverse reads use the same source fence; old metric jobs are
+        // invalidated before they can publish against the narrowed range.
+        self.core.index_manager.fenceGraphSplitRange(transition.split_key, current.end) catch |err| switch (err) {
+            // A previous split's cleanup is bounded background work. Keep
+            // this committed entry pending, not a fatal Raft apply failure.
+            error.GraphMaintenanceInProgress => return error.RaftApplyWriterUnavailable,
+            else => return err,
+        };
+        if (builtin.is_test and graph_mod.test_abort_ownership_before_range_commit) return error.TestInjectedBackfillFailure;
         var marker_buf: [raft_applied_entry_value_len]u8 = undefined;
         try rebaseRangeCoverageMetadata(self.alloc, self.core.store, self.core.index_manager, range, &.{
             .{ .key = range_state_mod.range_key, .value = range_value },
@@ -24980,7 +24985,7 @@ pub const DB = struct {
         lockApply(self);
         defer self.core.unlockApply();
 
-        var more = false;
+        var more = try self.core.index_manager.runGraphOwnershipCleanupStep();
         more = (try self.rebuildArtifactRepairSummaryIfMissing(self.alloc)) or more;
         more = (try self.rebuildArtifactRepairKindIndexIfMissing(self.alloc)) or more;
         if (self.source_vectors) |source| {
@@ -25051,13 +25056,13 @@ pub const DB = struct {
             // is due. State survives scheduler yields, not a pinned thread.
             if (now >= self.artifact_repair_metadata_due_ns or !source.continueScanWithoutApply()) {
                 self.artifact_repair_metadata_due_ns = now +| artifact_repair_metadata_active_poll_ns;
-                _ = self.runArtifactRepairMetadataMaintenanceAfterScan() catch |err| {
+                self.artifact_repair_metadata_pending = self.runArtifactRepairMetadataMaintenanceAfterScan() catch |err| {
                     std.log.warn("artifact repair metadata maintenance pass failed: {}", .{err});
                     return artifact_repair_metadata_active_poll_ns / std.time.ns_per_ms;
                 };
             }
         } else {
-            _ = self.runArtifactRepairMetadataMaintenancePass() catch |err| {
+            self.artifact_repair_metadata_pending = self.runArtifactRepairMetadataMaintenancePass() catch |err| {
                 std.log.warn("artifact repair metadata maintenance pass failed: {}", .{err});
                 return artifact_repair_metadata_poll_ns / std.time.ns_per_ms;
             };
@@ -25192,6 +25197,15 @@ pub const DB = struct {
 
     pub fn runGraphMetricMaintenanceForIdle(self: *DB) !usize {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        while (true) {
+            lockApply(self);
+            const more = self.core.index_manager.runGraphOwnershipCleanupStep() catch |err| {
+                self.core.unlockApply();
+                return err;
+            };
+            self.core.unlockApply();
+            if (!more) break;
+        }
         // Planned maintenance uses the same catalog pins and transaction
         // fences as background workers. Never hold the ingest lock while
         // draining graph computation; graph writes may supersede a build.
@@ -55378,6 +55392,10 @@ fn finalizeSplitLocked(self: *DB, new_range: types.ByteRange) !void {
     if (!std.mem.eql(u8, split_state.split_key, new_range.end)) return error.KeyOutOfRange;
     const replay_floor = self.core.nextDerivedAppendSequence();
 
+    // Prepare all private ownership tasks before the authoritative range can
+    // narrow. Partial preparation/failure leaves the old graph visible, and
+    // primary range adoption activates the prepared fences infallibly.
+    try self.core.index_manager.fenceGraphSplitRange(split_state.split_key, split_state.original_range_end);
     const split_lower = try documentRangeLowerAlloc(self.alloc, split_state.split_key);
     defer self.alloc.free(split_lower);
     try markSplitOffDocumentArtifactChildRangesLocked(self, split_state, split_lower);

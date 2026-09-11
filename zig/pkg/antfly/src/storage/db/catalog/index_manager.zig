@@ -1422,6 +1422,7 @@ pub const IndexManager = struct {
     retired_lsm_owner_labels_collapsed: [2]u64 = .{ 0, 0 },
     sparse_indexes: std.ArrayListUnmanaged(SparseIndex),
     graph_indexes: std.ArrayListUnmanaged(GraphIndex),
+    graph_ownership_cleanup_cursor: usize = 0,
     /// Lock-free cursors give bounded scheduler sweeps stable round-robin
     /// fairness while the catalog shared lock keeps the indexed slices stable.
     graph_metric_coordinator_cursor: std.atomic.Value(usize) = .init(0),
@@ -5109,6 +5110,7 @@ pub const IndexManager = struct {
         deleteIndexDirIfPresent(path);
 
         entry.index = try graph_mod.GraphIndex.openWithPrivateStores(self.alloc, zforward, zreverse, entry.config.name, .{
+            .managed_ownership_range = true,
             .no_sync = self.relaxed_split_durability,
             .no_meta_sync = self.relaxed_split_durability,
             .reverse_backend = self.graph_reverse_backend,
@@ -5121,6 +5123,7 @@ pub const IndexManager = struct {
             .rebuild_owner_generation = coverageGenerationForConfig(entry.config),
             .algebraic_semiring_traversal = graph_cfg.algebraic_semiring_traversal,
         });
+        entry.index.reconcileOwnershipRange(self.byte_range.start, self.byte_range.end);
     }
 
     pub fn resetFullTextIndexForArtifactRebuild(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8) !u64 {
@@ -6737,6 +6740,7 @@ pub const IndexManager = struct {
 
     pub fn updateRange(self: *IndexManager, byte_range: docstore_mod.ByteRange) void {
         self.byte_range = byte_range;
+        for (self.graph_indexes.items) |*entry| entry.index.reconcileOwnershipRange(byte_range.start, byte_range.end);
     }
 
     pub fn syncAll(self: *IndexManager, force: bool) !void {
@@ -8639,6 +8643,7 @@ pub const IndexManager = struct {
         for (0..entry_count) |_| {
             const scheduled = schedule.next();
             const entry = scheduled.entry;
+            if (entry.index.ownershipTransitionPending()) continue;
             const cfg = scheduled.config.*;
             if (options.auto_idle_options != null and counted_entry != entry) {
                 counted_entry = entry;
@@ -8767,6 +8772,7 @@ pub const IndexManager = struct {
         var topology_census_steps: usize = 0;
         for (scheduled_entries) |scheduled| {
             const entry = scheduled.entry;
+            if (entry.index.ownershipTransitionPending()) continue;
             const metric_name = scheduled.metric_name;
             if (result.worker_steps >= options.max_pages) {
                 result.budget_exhausted = true;
@@ -13423,6 +13429,28 @@ pub const IndexManager = struct {
         for (self.graph_indexes.items) |*entry| {
             _ = try entry.index.pruneOwnedRange(self.alloc, split_key, original_range_end);
         }
+    }
+
+    pub fn fenceGraphSplitRange(self: *IndexManager, split_key: []const u8, original_range_end: []const u8) !void {
+        for (self.graph_indexes.items) |*entry| {
+            try entry.index.fenceOwnedRange(self.alloc, split_key, original_range_end);
+            entry.index.reconcileOwnershipRange(self.byte_range.start, self.byte_range.end);
+        }
+    }
+
+    /// One page across the catalog per turn, independent of metric enablement.
+    pub fn runGraphOwnershipCleanupStep(self: *IndexManager) !bool {
+        const entries = self.graph_indexes.items;
+        if (entries.len == 0) return false;
+        for (0..entries.len) |_| {
+            const index = self.graph_ownership_cleanup_cursor % entries.len;
+            self.graph_ownership_cleanup_cursor = (index + 1) % entries.len;
+            const entry = &entries[index];
+            if (!entry.index.ownershipCleanupPending()) continue;
+            _ = try entry.index.pruneOwnedRangePage();
+            return true;
+        }
+        return false;
     }
 
     pub fn textChunkName(self: *const IndexManager, name: []const u8) ?[]const u8 {
@@ -18498,6 +18526,7 @@ pub const IndexManager = struct {
                 errdefer if (!cloned_cfg_moved) cloned_cfg.deinit(self.alloc);
 
                 var index = try graph_mod.GraphIndex.openWithPrivateStores(self.alloc, zforward, zreverse, cloned_cfg.name, .{
+                    .managed_ownership_range = true,
                     .no_sync = self.relaxed_split_durability,
                     .no_meta_sync = self.relaxed_split_durability,
                     .reverse_backend = self.graph_reverse_backend,
@@ -18513,6 +18542,7 @@ pub const IndexManager = struct {
                 });
                 var index_moved = false;
                 errdefer if (!index_moved) index.close();
+                index.reconcileOwnershipRange(self.byte_range.start, self.byte_range.end);
                 const apply_mutex = try self.allocIndexApplyMutex();
                 var apply_mutex_owned = true;
                 errdefer if (apply_mutex_owned) self.destroyIndexApplyMutex(apply_mutex);
@@ -18536,7 +18566,10 @@ pub const IndexManager = struct {
                 const rebuild_state = self.rebuildState(.graph, entry.rebuild_root_path, entry.config);
                 const resume_from = try rebuild_state.checkWithIo(self.alloc, self.checkpointIo());
                 defer if (resume_from) |buf| self.alloc.free(buf);
-                const reverse_edges = (try entry.index.stats(self.alloc)).edge_count;
+                // Repair detection concerns physical presence, not the scoped
+                // logical count. A pending retirement is not an empty/corrupt
+                // projection and must not turn reopen into a full rebuild.
+                const reverse_edges = entry.index.edge_count;
 
                 const applied_sequence = try apply_state.loadAppliedSequenceWithCheckpoint(
                     self.alloc,
@@ -18548,7 +18581,7 @@ pub const IndexManager = struct {
                 const latest_replay_sequence = store.nextReplaySequence(1) -| 1;
                 const graph_replay_pending = applied_sequence < latest_replay_sequence;
                 const has_replay_history = latest_replay_sequence != 0;
-                if (allow_backfill and (resume_from != null or (has_replay_history and (reverse_store_missing or reverse_edges == 0) and !graph_replay_pending))) {
+                if (allow_backfill and (resume_from != null or (has_replay_history and (reverse_store_missing or (reverse_edges == 0 and !entry.index.ownershipTransitionPending())) and !graph_replay_pending))) {
                     const backfill_started_ns = nowNs();
                     try rebuild_state.updateWithIo(self.checkpointIo(), if (resume_from) |buf| buf else "");
                     _ = try entry.index.rebuildReverseFromOwnedOutgoingEdgesResumeWithIo(

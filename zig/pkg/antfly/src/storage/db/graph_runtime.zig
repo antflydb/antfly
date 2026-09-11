@@ -22,7 +22,81 @@ const types = @import("types.zig");
 
 const TestHelpers = if (builtin.is_test) @import("test_support.zig") else struct {};
 
-test "db graph runtime replicated split prunes metric topology before its durable receipt" {
+test "db graph runtime prepared ownership waits for authoritative range commit across reopen" {
+    const DB = @import("mod.zig").DB;
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+    const request = types.BatchRequest{ .split_transition = .{ .kind = .finalize, .transition_id = 1, .attempt_epoch = 1, .destination_group_id = 2, .split_key = "m" } };
+    {
+        var db = try DB.open(a, std.mem.span(path), .{});
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+        try db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "z", .target = "a", .edge_type = "link", .weight = 1 }}, .sync_level = .full_index });
+        graph_mod.test_abort_ownership_before_range_commit = true;
+        defer graph_mod.test_abort_ownership_before_range_commit = false;
+        try std.testing.expectError(error.TestInjectedBackfillFailure, db.batchRaftReplicatedApply(request, .{ .term = 1, .index = 1 }));
+        try std.testing.expect((try db.raftAppliedEntry()) == null);
+        const index = &db.core.index_manager.graphIndex("g").?.index;
+        try std.testing.expect(index.ownershipTransitionPending());
+        try std.testing.expect(!index.ownershipCleanupPending());
+        try std.testing.expect(!try db.core.index_manager.runGraphOwnershipCleanupStep());
+        const visible = try index.getEdges(a, "a", "link", .in);
+        defer graph_mod.GraphIndex.freeEdges(a, visible);
+        try std.testing.expectEqual(@as(usize, 1), visible.len);
+    }
+    var db = try DB.open(a, std.mem.span(path), .{});
+    defer db.close();
+    const index = &db.core.index_manager.graphIndex("g").?.index;
+    try std.testing.expect(index.ownershipTransitionPending());
+    try std.testing.expect(!index.ownershipCleanupPending());
+    try std.testing.expectEqual(@as(u64, 1), (try index.stats(a)).edge_count);
+    try db.batchRaftReplicatedApply(request, .{ .term = 1, .index = 1 });
+    try std.testing.expect(index.ownershipCleanupPending());
+    const hidden = try index.getEdges(a, "a", "link", .in);
+    defer graph_mod.GraphIndex.freeEdges(a, hidden);
+    try std.testing.expectEqual(@as(usize, 0), hidden.len);
+    // Receipt replay does not need to wait for any physical cleanup.
+    try db.batchRaftReplicatedApply(request, .{ .term = 1, .index = 1 });
+    try std.testing.expectEqual(@as(u64, 1), index.edge_count);
+    while (try db.core.index_manager.runGraphOwnershipCleanupStep()) {}
+    try std.testing.expectEqual(@as(u64, 0), index.edge_count);
+}
+
+test "db graph runtime repeated split defers behind cleanup without advancing its receipt" {
+    const DB = @import("mod.zig").DB;
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+    var db = try DB.open(a, std.mem.span(path), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{ .graph_writes = &.{
+        .{ .index_name = "g", .source = "a", .target = "hub", .edge_type = "link", .weight = 1 },
+        .{ .index_name = "g", .source = "i", .target = "hub", .edge_type = "link", .weight = 1 },
+        .{ .index_name = "g", .source = "z", .target = "hub", .edge_type = "link", .weight = 1 },
+    }, .sync_level = .full_index });
+    const first = types.BatchRequest{ .split_transition = .{ .kind = .finalize, .transition_id = 1, .attempt_epoch = 1, .destination_group_id = 2, .split_key = "m" } };
+    const second = types.BatchRequest{ .split_transition = .{ .kind = .finalize, .transition_id = 2, .attempt_epoch = 1, .destination_group_id = 3, .split_key = "h" } };
+    try db.batchRaftReplicatedApply(first, .{ .term = 1, .index = 1 });
+    try std.testing.expectError(error.RaftApplyWriterUnavailable, db.batchRaftReplicatedApply(second, .{ .term = 1, .index = 2 }));
+    try std.testing.expectEqualStrings("m", db.getRange().end);
+    try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
+    const index = &db.core.index_manager.graphIndex("g").?.index;
+    try std.testing.expectEqual(@as(u64, 2), (try index.stats(a)).edge_count);
+    // The normal metadata scheduler also services graph-only indexes.
+    try db.runArtifactRepairMetadataMaintenanceUntilIdle();
+    try db.batchRaftReplicatedApply(second, .{ .term = 1, .index = 2 });
+    try std.testing.expectEqualStrings("h", db.getRange().end);
+    try std.testing.expectEqual(@as(u64, 2), (try db.raftAppliedEntry()).?.index);
+    try std.testing.expectEqual(@as(u64, 1), (try index.stats(a)).edge_count);
+    try db.runArtifactRepairMetadataMaintenanceUntilIdle();
+    try std.testing.expectEqual(@as(u64, 1), index.edge_count);
+}
+
+test "db graph runtime replicated split fences topology before receipt and retires it after" {
     const DB = @import("mod.zig").DB;
     const a = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -44,13 +118,22 @@ test "db graph runtime replicated split prunes metric topology before its durabl
         {
             graph_mod.test_abort_prune_after_forward_commit = true;
             defer graph_mod.test_abort_prune_after_forward_commit = false;
-            try std.testing.expectError(error.TestInjectedBackfillFailure, db.batchRaftReplicatedApply(request, .{ .term = 1, .index = 1 }));
-            try std.testing.expect((try db.raftAppliedEntry()) == null);
+            // No edge pruning occurs on the Raft apply path.
+            try db.batchRaftReplicatedApply(request, .{ .term = 1, .index = 1 });
+            try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
+            try std.testing.expect(index.ownershipCleanupPending());
+            try std.testing.expectEqual(@as(u64, 2), index.edge_count);
+            try std.testing.expectEqual(@as(u64, 1), (try index.stats(a)).edge_count);
+            const hidden = try index.getEdges(a, "y", "link", .in);
+            defer graph_mod.GraphIndex.freeEdges(a, hidden);
+            try std.testing.expectEqual(@as(usize, 0), hidden.len);
+            try std.testing.expectError(error.TestInjectedBackfillFailure, index.pruneOwnedRangePage());
+            try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
         }
     }
     {
-        // Opening recovers any cross-store prune intent; replay completes the
-        // range change and only then records the applied entry.
+        // Reopen reconciles authoritative ownership before resuming cleanup.
+        // The receipt and logical visibility do not depend on that drain.
         var db = try DB.open(a, std.mem.span(path), .{});
         defer db.close();
         try db.batchRaftReplicatedApply(request, .{ .term = 1, .index = 1 });
