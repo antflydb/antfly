@@ -1154,13 +1154,17 @@ pub const HttpHandler = struct {
     }
 
     fn handleBuildStatus(self: *HttpHandler, namespace: []const u8) !HttpResponse {
-        var status = self.catalog.buildStatus(namespace) catch return try textResponse(self.alloc, 500, "status failed");
+        var status = self.catalog.buildStatus(namespace) catch |err| switch (err) {
+            error.LakeSidecarBuildBudgetExceeded => return try textResponse(self.alloc, 422, "publication prediction exceeds resource limits; published head is unchanged"),
+            else => return try textResponse(self.alloc, 500, "status failed"),
+        };
         defer status.deinit(self.alloc);
         return try jsonResponse(self.alloc, 200, status);
     }
 
     fn handleTableBuildStatus(self: *HttpHandler, table_name: []const u8) !HttpResponse {
         var status = self.catalog.tableBuildStatus(table_name) catch |err| switch (err) {
+            error.LakeSidecarBuildBudgetExceeded => return try textResponse(self.alloc, 422, "publication prediction exceeds resource limits; published head is unchanged"),
             error.NamespaceNotFound => return try textResponse(self.alloc, 404, "not found"),
             else => {
                 std.log.warn("table build status failed table={s} err={s}", .{ table_name, @errorName(err) });
@@ -4994,8 +4998,9 @@ pub const HttpHandler = struct {
     }
 
     fn graphNeighborsResponseImpl(self: *HttpHandler, session: *query_mod.QuerySession, namespace: []const u8, table_name: ?[]const u8, req: query_mod.GraphNeighborsRequest) !HttpResponse {
-        var status = self.catalog.buildStatus(namespace) catch return try textResponse(self.alloc, 500, "query failed");
-        defer status.deinit(self.alloc);
+        // Serving a pinned graph only needs the WAL tip for freshness. Never
+        // load pending documents or run publication planning on the read path.
+        const status = .{ .latest_wal_lsn = self.api.wal.latestLsn(namespace) catch return try textResponse(self.alloc, 500, "query failed") };
         const neighbors = query_mod.graphNeighborsAlloc(self.alloc, session, req) catch |err| switch (err) {
             error.GraphSegmentNotFound => return try textResponse(self.alloc, 404, "graph segment not found"),
             error.GraphNeighborQueryBudgetExceeded => return try textResponse(self.alloc, 422, "graph neighbor query exceeds configured limits"),
@@ -5115,8 +5120,7 @@ pub const HttpHandler = struct {
     }
 
     fn graphTraverseResponseImpl(self: *HttpHandler, session: *query_mod.QuerySession, namespace: []const u8, table_name: ?[]const u8, req: query_mod.GraphTraverseRequest) !HttpResponse {
-        var status = self.catalog.buildStatus(namespace) catch return try textResponse(self.alloc, 500, "query failed");
-        defer status.deinit(self.alloc);
+        const status = .{ .latest_wal_lsn = self.api.wal.latestLsn(namespace) catch return try textResponse(self.alloc, 500, "query failed") };
         const nodes = query_mod.graphTraverseAlloc(self.alloc, session, req) catch |err| switch (err) {
             error.GraphSegmentNotFound => return try textResponse(self.alloc, 404, "graph segment not found"),
             error.GraphTraversalQueryBudgetExceeded => return try textResponse(self.alloc, 422, "graph traversal query exceeds configured limits"),
@@ -5178,8 +5182,7 @@ pub const HttpHandler = struct {
     }
 
     fn graphShortestPathResponseImpl(self: *HttpHandler, session: *query_mod.QuerySession, namespace: []const u8, table_name: ?[]const u8, req: query_mod.GraphShortestPathRequest) !HttpResponse {
-        var status = self.catalog.buildStatus(namespace) catch return try textResponse(self.alloc, 500, "query failed");
-        defer status.deinit(self.alloc);
+        const status = .{ .latest_wal_lsn = self.api.wal.latestLsn(namespace) catch return try textResponse(self.alloc, 500, "query failed") };
         const maybe_path = query_mod.graphShortestPathAlloc(self.alloc, session, req) catch |err| switch (err) {
             error.GraphSegmentNotFound => return try textResponse(self.alloc, 404, "graph segment not found"),
             error.GraphTraversalQueryBudgetExceeded => return try textResponse(self.alloc, 422, "graph shortest-path query exceeds configured limits"),

@@ -364,6 +364,11 @@ pub const CatalogService = struct {
     }
 
     pub fn buildStatus(self: *CatalogService, namespace: []const u8) !catalog_types.BuildStatus {
+        return self.buildStatusUntil(namespace, null);
+    }
+
+    pub fn buildStatusUntil(self: *CatalogService, namespace: []const u8, cancellation: ?maintenance_cancellation.Token) !catalog_types.BuildStatus {
+        try maintenance_cancellation.check(cancellation);
         const policy = self.getPolicy(namespace) catch catalog_types.NamespacePolicy{};
         var plan = try self.publicationPlanForNamespaceAlloc(namespace, policy, .status);
         defer plan.deinit(self.alloc);
@@ -492,10 +497,11 @@ pub const CatalogService = struct {
         var predicted_pending_wal_enrichment_stage: ?catalog_types.EnrichmentStage = null;
         var predicted_pending_wal_enrichment_document_count: u64 = 0;
         if (pending_records > 0 and !plan.forceRepublishFromHead()) {
-            if (try self.builder.predictPendingWalPublicationActionsAlloc(
+            if (try self.builder.predictPendingWalPublicationActionsAllocUntil(
                 namespace,
                 effective_policy.vector_distance_metric,
                 plan,
+                cancellation,
             )) |predicted_value| {
                 var predicted = predicted_value;
                 defer predicted.deinit(self.alloc);

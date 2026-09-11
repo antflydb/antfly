@@ -498,7 +498,7 @@ pub const Builder = struct {
         };
         try maintenance_cancellation.check(cancellation);
 
-        const materialized = try materializeWalDocumentsAlloc(self, namespace, current_head, applicable_records, targets.include_graph);
+        const materialized = try materializeWalDocumentsAlloc(self, namespace, current_head, applicable_records, targets.include_graph, cancellation);
         defer freeMaterializerMutations(self.alloc, materialized.mutations);
         defer query_mod.freeMaterializedDocuments(self.alloc, materialized.base_documents);
         defer query_mod.freeMaterializedDocuments(self.alloc, materialized.documents);
@@ -558,14 +558,13 @@ pub const Builder = struct {
         try maintenance_cancellation.check(cancellation);
         const graph_index_names = try listGraphIndexNamesAlloc(self.alloc, plan.table_definition.indexes_json);
         defer freeOwnedStrings(self.alloc, graph_index_names);
-        const graph_refs = try buildGraphArtifactRefsForMaterializedDocsAllocUntil(
+        const graph_refs = try buildGraphArtifactRefsFromImpactAllocUntil(
             self.alloc,
             self.artifacts,
             namespace,
             current_manifest,
-            materialized.base_documents,
             materialized.documents,
-            materialized.mutations,
+            materialized.graph_changed,
             graph_index_names,
             targets.include_graph,
             cancellation,
@@ -992,6 +991,61 @@ pub const Builder = struct {
         vector_metric: shared_vector.DistanceMetric,
         plan: publication_plan.TablePublicationPlan,
     ) !?PredictedPublicationActions {
+        return self.predictPendingWalPublicationActionsAllocUntil(namespace, vector_metric, plan, null);
+    }
+
+    pub fn predictPendingWalPublicationActionsAllocUntil(
+        self: *Builder,
+        namespace: []const u8,
+        vector_metric: shared_vector.DistanceMetric,
+        plan: publication_plan.TablePublicationPlan,
+        cancellation: ?maintenance_cancellation.Token,
+    ) !?PredictedPublicationActions {
+        return self.predictPendingWalPublicationActionsWithLimitsAlloc(namespace, vector_metric, plan, cancellation, .{});
+    }
+
+    pub fn predictPendingWalPublicationActionsWithLimitsAlloc(
+        self: *Builder,
+        namespace: []const u8,
+        vector_metric: shared_vector.DistanceMetric,
+        plan: publication_plan.TablePublicationPlan,
+        cancellation: ?maintenance_cancellation.Token,
+        limits: GraphBuildLimits,
+    ) !?PredictedPublicationActions {
+        // Borrow storage capabilities with an operation-local result allocator.
+        // Never mutate/deinit the shared store owners: concurrent queries retain
+        // their allocator and lifetime. This admits WAL, manifest, document and
+        // projection allocations together, before any decoded expansion.
+        var working_set = try graph_build_limits.WorkingSetAllocator.init(self.alloc, limits);
+        const alloc = working_set.allocator();
+        var artifacts = self.artifacts.*;
+        artifacts.allocator = alloc;
+        var manifests = self.manifests.*;
+        manifests.allocator = alloc;
+        var wal = self.wal.*;
+        wal.allocator = alloc;
+        var bounded = self.*;
+        bounded.alloc = alloc;
+        bounded.artifacts = &artifacts;
+        bounded.manifests = &manifests;
+        bounded.wal = &wal;
+        // The allocator adds no allocation header. Returned owned actions are
+        // released by the caller using the original backing allocator.
+        return bounded.predictPendingWalPublicationActionsBoundedAlloc(namespace, vector_metric, plan, cancellation, limits) catch |err| {
+            if (err == error.OutOfMemory and working_set.limit_exceeded) return error.LakeSidecarBuildBudgetExceeded;
+            return err;
+        };
+    }
+
+    fn predictPendingWalPublicationActionsBoundedAlloc(
+        self: *Builder,
+        namespace: []const u8,
+        vector_metric: shared_vector.DistanceMetric,
+        plan: publication_plan.TablePublicationPlan,
+        cancellation: ?maintenance_cancellation.Token,
+        limits: GraphBuildLimits,
+    ) !?PredictedPublicationActions {
+        try maintenance_cancellation.check(cancellation);
         _ = vector_metric;
         if (plan.forceRepublishFromHead()) return null;
 
@@ -1009,12 +1063,25 @@ pub const Builder = struct {
         const records = try self.wal.readFromAlloc(namespace, start_lsn);
         defer wal_mod.freeRecords(self.alloc, records);
         if (records.len == 0) return null;
+        if (records.len > limits.max_rows) return error.LakeSidecarBuildBudgetExceeded;
+        var input_bytes: usize = 0;
+        for (records) |record| {
+            try maintenance_cancellation.check(cancellation);
+            input_bytes = std.math.add(usize, input_bytes, record.payload.len) catch return error.LakeSidecarBuildBudgetExceeded;
+            if (input_bytes > limits.max_input_bytes) return error.LakeSidecarBuildBudgetExceeded;
+        }
 
-        const built_documents = try buildDocumentSegmentAlloc(self, namespace, current_head, records, plan.targets.include_graph);
+        // Prediction needs the materialized view, never an encoded segment.
+        const built_documents = try materializeWalDocumentsAlloc(self, namespace, current_head, records, plan.targets.include_graph, cancellation);
         defer freeMaterializerMutations(self.alloc, built_documents.mutations);
         defer query_mod.freeMaterializedDocuments(self.alloc, built_documents.base_documents);
         defer query_mod.freeMaterializedDocuments(self.alloc, built_documents.documents);
-        defer self.alloc.free(built_documents.payload);
+        if (built_documents.documents.len > limits.max_rows) return error.LakeSidecarBuildBudgetExceeded;
+        for (built_documents.documents) |doc| {
+            try maintenance_cancellation.check(cancellation);
+            input_bytes = std.math.add(usize, input_bytes, doc.body.len) catch return error.LakeSidecarBuildBudgetExceeded;
+            if (input_bytes > limits.max_input_bytes) return error.LakeSidecarBuildBudgetExceeded;
+        }
 
         const text_index_specs = try resolvePublishedTextIndexSpecsAlloc(self.alloc, plan.table_definition, plan.full_text_index_actions);
         defer full_text_indexes.freeFullTextIndexSpecs(self.alloc, text_index_specs);
@@ -1044,6 +1111,7 @@ pub const Builder = struct {
             .vector,
             plan.vector_index_actions,
             plan.artifact_actions.dense_vector,
+            built_documents.graph_changed,
         );
         errdefer {
             for (vector_index_actions) |*entry| entry.deinit(self.alloc);
@@ -1061,6 +1129,7 @@ pub const Builder = struct {
             .sparse,
             plan.sparse_index_actions,
             plan.artifact_actions.sparse_vector,
+            built_documents.graph_changed,
         );
         errdefer {
             for (sparse_index_actions) |*entry| entry.deinit(self.alloc);
@@ -1077,6 +1146,7 @@ pub const Builder = struct {
             .graph,
             plan.graph_index_actions,
             plan.artifact_actions.graph,
+            built_documents.graph_changed,
         );
         errdefer {
             for (graph_index_actions) |*entry| entry.deinit(self.alloc);
@@ -2163,23 +2233,26 @@ fn materializeWalDocumentsAlloc(
     current_head: u64,
     records: []const wal_mod.Record,
     check_graph_impact: bool,
+    cancellation: ?maintenance_cancellation.Token,
 ) !struct {
     base_documents: []query_mod.QueryMaterializedDocument,
     documents: []query_mod.QueryMaterializedDocument,
     mutations: []query_mod.QueryMaterializerMutation,
     graph_changed: bool,
 } {
+    try maintenance_cancellation.check(cancellation);
     const mutations = try decodeWalMutationsAlloc(self.alloc, records);
-
-    const base_docs = try loadPublishedDocumentsAlloc(self, namespace, current_head);
-
-    const next_docs = try query_mod.materializeDocumentsOverBaseAlloc(self.alloc, base_docs, mutations);
-    errdefer query_mod.freeMaterializedDocuments(self.alloc, next_docs);
-    errdefer query_mod.freeMaterializedDocuments(self.alloc, base_docs);
     errdefer freeMaterializerMutations(self.alloc, mutations);
 
+    const base_docs = try loadPublishedDocumentsAlloc(self, namespace, current_head);
+    errdefer query_mod.freeMaterializedDocuments(self.alloc, base_docs);
+
+    try maintenance_cancellation.check(cancellation);
+    const next_docs = try query_mod.materializeDocumentsOverBaseAlloc(self.alloc, base_docs, mutations);
+    errdefer query_mod.freeMaterializedDocuments(self.alloc, next_docs);
+
     const graph_changed = if (check_graph_impact)
-        try graphProjectionChangedForMutationsAlloc(self.alloc, base_docs, next_docs, mutations)
+        try graphProjectionChangedForMutationsAlloc(self.alloc, namespace, base_docs, next_docs, mutations, cancellation, .{})
     else
         false;
 
@@ -2205,7 +2278,7 @@ fn buildDocumentSegmentAlloc(
     mutations: []query_mod.QueryMaterializerMutation,
     graph_changed: bool,
 } {
-    const materialized = try materializeWalDocumentsAlloc(self, namespace, current_head, records, check_graph_impact);
+    const materialized = try materializeWalDocumentsAlloc(self, namespace, current_head, records, check_graph_impact, null);
     errdefer freeMaterializerMutations(self.alloc, materialized.mutations);
     errdefer query_mod.freeMaterializedDocuments(self.alloc, materialized.documents);
     errdefer query_mod.freeMaterializedDocuments(self.alloc, materialized.base_documents);
@@ -2383,14 +2456,19 @@ fn allocQueryMutationsFromSegmentEntries(alloc: Allocator, entries: []const segm
     const mutations = try alloc.alloc(query_mod.QueryMaterializerMutation, entries.len);
     errdefer alloc.free(mutations);
     var initialized: usize = 0;
-    errdefer freeQueryMutations(alloc, mutations[0..initialized]);
+    errdefer for (mutations[0..initialized]) |mutation| {
+        alloc.free(mutation.doc_id);
+        if (mutation.body) |body| alloc.free(body);
+    };
 
     for (entries, 0..) |entry, idx| {
+        const doc_id = try alloc.dupe(u8, entry.doc_id);
+        errdefer alloc.free(doc_id);
         mutations[idx] = .{
             .lsn = entry.lsn,
             .timestamp_ns = entry.timestamp_ns,
             .kind = entry.kind,
-            .doc_id = try alloc.dupe(u8, entry.doc_id),
+            .doc_id = doc_id,
             .body = if (entry.body) |body| try alloc.dupe(u8, body) else null,
         };
         initialized += 1;
@@ -2403,16 +2481,21 @@ fn decodeWalMutationsAlloc(alloc: Allocator, records: []const wal_mod.Record) ![
     errdefer alloc.free(mutations);
 
     var initialized: usize = 0;
-    errdefer freeMaterializerMutations(alloc, mutations[0..initialized]);
+    errdefer for (mutations[0..initialized]) |mutation| {
+        alloc.free(mutation.doc_id);
+        if (mutation.body) |body| alloc.free(body);
+    };
 
     for (records, 0..) |record, idx| {
         var mutation = try api_codec.decodeMutationAlloc(alloc, record.payload);
         defer mutation.deinit(alloc);
+        const doc_id = try alloc.dupe(u8, mutation.doc_id);
+        errdefer alloc.free(doc_id);
         mutations[idx] = .{
             .lsn = record.lsn,
             .timestamp_ns = record.timestamp_ns,
             .kind = mutation.kind,
-            .doc_id = try alloc.dupe(u8, mutation.doc_id),
+            .doc_id = doc_id,
             .body = if (mutation.body) |body| try alloc.dupe(u8, body) else null,
         };
         initialized += 1;
@@ -2420,27 +2503,94 @@ fn decodeWalMutationsAlloc(alloc: Allocator, records: []const wal_mod.Record) ![
     return mutations;
 }
 
-fn graphProjectionChangedForMutationsAlloc(
+pub fn graphProjectionChangedForMutationsAlloc(
     alloc: Allocator,
+    source_table: []const u8,
     before_docs: []const query_mod.QueryMaterializedDocument,
     after_docs: []const query_mod.QueryMaterializedDocument,
     mutations: []const query_mod.QueryMaterializerMutation,
+    cancellation: ?maintenance_cancellation.Token,
+    limits: GraphBuildLimits,
 ) !bool {
+    var working_set = try graph_build_limits.WorkingSetAllocator.init(alloc, limits);
+    return graphProjectionChangedBoundedAlloc(working_set.allocator(), source_table, before_docs, after_docs, mutations, cancellation, limits) catch |err| {
+        if (err == error.OutOfMemory and working_set.limit_exceeded) return error.LakeSidecarBuildBudgetExceeded;
+        return err;
+    };
+}
+
+fn graphProjectionChangedBoundedAlloc(
+    alloc: Allocator,
+    source_table: []const u8,
+    before_docs: []const query_mod.QueryMaterializedDocument,
+    after_docs: []const query_mod.QueryMaterializedDocument,
+    mutations: []const query_mod.QueryMaterializerMutation,
+    cancellation: ?maintenance_cancellation.Token,
+    limits: GraphBuildLimits,
+) !bool {
+    try maintenance_cancellation.check(cancellation);
+    if (mutations.len > limits.max_rows) return error.LakeSidecarBuildBudgetExceeded;
     var seen = std.StringHashMapUnmanaged(void).empty;
     defer seen.deinit(alloc);
+    var input_bytes: usize = 0;
 
     for (mutations) |mutation| {
+        try maintenance_cancellation.check(cancellation);
         const gop = try seen.getOrPut(alloc, mutation.doc_id);
         if (gop.found_existing) continue;
+        if (seen.count() > limits.max_retained_items) return error.LakeSidecarBuildBudgetExceeded;
+        const before = findMaterializedDocument(before_docs, mutation.doc_id);
+        const after = findMaterializedDocument(after_docs, mutation.doc_id);
+        // Byte-identical bodies cannot change topology. Avoid parsing ordinary
+        // idempotent WAL replay, while still counting the admitted source bytes.
+        for ([_]?query_mod.QueryMaterializedDocument{ before, after }) |doc| {
+            if (doc) |value| {
+                input_bytes = std.math.add(usize, input_bytes, value.body.len) catch return error.LakeSidecarBuildBudgetExceeded;
+                if (input_bytes > limits.max_input_bytes) return error.LakeSidecarBuildBudgetExceeded;
+            }
+        }
+        if (before != null and after != null and std.mem.eql(u8, before.?.body, after.?.body)) continue;
         if (try graphProjectionChangedAlloc(
             alloc,
-            findMaterializedDocument(before_docs, mutation.doc_id),
-            findMaterializedDocument(after_docs, mutation.doc_id),
+            source_table,
+            before,
+            after,
+            cancellation,
+            limits,
         )) {
             return true;
         }
     }
     return false;
+}
+
+test "serverless builder graph impact admits scratch input and cancellation and canonicalizes local targets" {
+    const a = std.testing.allocator;
+    const before = [_]query_mod.QueryMaterializedDocument{.{
+        .doc_id = @constCast("a"),
+        .body = @constCast("{\"graph_edges\":[{\"target\":\"b\",\"edge_type\":\"link\"}]}"),
+        .last_lsn = 1,
+        .last_timestamp_ns = 1,
+    }};
+    const after = [_]query_mod.QueryMaterializedDocument{.{
+        .doc_id = @constCast("a"),
+        .body = @constCast("{\"graph_edges\":[{\"target\":\"b\",\"edge_type\":\"link\",\"target_table\":\"docs\"}]}"),
+        .last_lsn = 2,
+        .last_timestamp_ns = 2,
+    }};
+    const mutations = [_]query_mod.QueryMaterializerMutation{.{ .lsn = 2, .timestamp_ns = 2, .kind = .upsert, .doc_id = "a", .body = after[0].body }};
+    try std.testing.expect(!try graphProjectionChangedForMutationsAlloc(a, "docs", &before, &after, &mutations, null, .{}));
+    try std.testing.expect(try graphProjectionChangedForMutationsAlloc(a, "other", &before, &after, &mutations, null, .{}));
+    try std.testing.expectError(error.LakeSidecarBuildBudgetExceeded, graphProjectionChangedForMutationsAlloc(a, "docs", &before, &after, &mutations, null, .{ .max_working_set_bytes = 1 }));
+    try std.testing.expectError(error.LakeSidecarBuildBudgetExceeded, graphProjectionChangedForMutationsAlloc(a, "docs", &before, &after, &mutations, null, .{ .max_input_bytes = 1 }));
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, graphProjectionChangedForMutationsAlloc(a, "docs", &before, &after, &mutations, .{ .io = std.testing.io, .requested = &canceled }, .{}));
+    const Check = struct {
+        fn run(alloc: Allocator, old: []const query_mod.QueryMaterializedDocument, new: []const query_mod.QueryMaterializedDocument, wal: []const query_mod.QueryMaterializerMutation) !void {
+            try std.testing.expect(!try graphProjectionChangedForMutationsAlloc(alloc, "docs", old, new, wal, null, .{}));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Check.run, .{ &before, &after, &mutations });
 }
 
 fn findMaterializedDocument(
@@ -2462,8 +2612,11 @@ fn findMaterializedDocument(
 
 fn graphProjectionChangedAlloc(
     alloc: Allocator,
+    source_table: []const u8,
     before_doc: ?query_mod.QueryMaterializedDocument,
     after_doc: ?query_mod.QueryMaterializedDocument,
+    cancellation: ?maintenance_cancellation.Token,
+    limits: GraphBuildLimits,
 ) !bool {
     if ((before_doc == null) != (after_doc == null)) return true;
     if (before_doc == null and after_doc == null) return false;
@@ -2473,11 +2626,24 @@ fn graphProjectionChangedAlloc(
 
     const before_edges = try parseGraphEdgesAlloc(alloc, before.body);
     defer freeParsedGraphEdges(alloc, before_edges);
+    if (before_edges.len > limits.max_retained_items) return error.LakeSidecarBuildBudgetExceeded;
     const after_edges = try parseGraphEdgesAlloc(alloc, after.body);
     defer freeParsedGraphEdges(alloc, after_edges);
+    if (before_edges.len +| after_edges.len > limits.max_retained_items) return error.LakeSidecarBuildBudgetExceeded;
 
+    // Use exactly the same local-table identity as graph construction.
+    for ([_][]ParsedGraphEdge{ before_edges, after_edges }) |edges| {
+        for (edges, 0..) |*edge, i| {
+            if (i % 4096 == 0) try maintenance_cancellation.check(cancellation);
+            if (edge.target_table) |table| if (std.mem.eql(u8, table, source_table)) {
+                alloc.free(table);
+                edge.target_table = null;
+            };
+        }
+    }
     sortParsedGraphEdges(before_edges);
     sortParsedGraphEdges(after_edges);
+    try maintenance_cancellation.check(cancellation);
     if (before_edges.len != after_edges.len) return true;
     for (before_edges, after_edges) |lhs, rhs| {
         if (!std.mem.eql(u8, lhs.target, rhs.target)) return true;
@@ -2728,8 +2894,10 @@ fn allocDocumentSegmentEntries(alloc: Allocator, docs: []const query_mod.QueryMa
     }
 
     for (docs, 0..) |doc, idx| {
+        const doc_id = try alloc.dupe(u8, doc.doc_id);
+        errdefer alloc.free(doc_id);
         entries[idx] = .{
-            .doc_id = try alloc.dupe(u8, doc.doc_id),
+            .doc_id = doc_id,
             .body = try alloc.dupe(u8, doc.body),
             .last_lsn = doc.last_lsn,
             .last_timestamp_ns = doc.last_timestamp_ns,
@@ -2749,8 +2917,10 @@ fn allocMaterializedDocuments(alloc: Allocator, entries: []const document_segmen
     }
 
     for (entries, 0..) |entry, idx| {
+        const doc_id = try alloc.dupe(u8, entry.doc_id);
+        errdefer alloc.free(doc_id);
         docs[idx] = .{
-            .doc_id = try alloc.dupe(u8, entry.doc_id),
+            .doc_id = doc_id,
             .body = try alloc.dupe(u8, entry.body),
             .last_lsn = entry.last_lsn,
             .last_timestamp_ns = entry.last_timestamp_ns,
@@ -3079,18 +3249,15 @@ pub fn resolvePublishedTextIndexSpecsAlloc(
             for (filtered.items) |*spec| spec.deinit(alloc);
             filtered.deinit(alloc);
         }
-        for (specs) |spec| {
+        try filtered.ensureTotalCapacity(alloc, specs.len);
+        for (specs) |*spec| {
             if (fullTextActionForName(planned_actions, spec.name, .reuse) == .drop) continue;
-            try filtered.append(alloc, .{
-                .name = try alloc.dupe(u8, spec.name),
-                .config_json = try alloc.dupe(u8, spec.config_json),
-                .source_artifact_name = if (spec.source_artifact_name) |name| try alloc.dupe(u8, name) else null,
-                .source_mode = spec.source_mode,
-                .chunked_sources = try full_text_indexes.cloneChunkedFullTextSourcesAlloc(alloc, spec.chunked_sources),
-            });
+            filtered.appendAssumeCapacity(spec.*);
+            spec.* = .{ .name = &.{}, .config_json = &.{} };
         }
+        const selected = try filtered.toOwnedSlice(alloc);
         full_text_indexes.freeFullTextIndexSpecs(alloc, specs);
-        specs = try filtered.toOwnedSlice(alloc);
+        specs = selected;
     }
     const chunked_sources = try full_text_indexes.listChunkedFullTextSourcesAlloc(alloc, table_definition.indexes_json);
     defer full_text_indexes.freeChunkedFullTextSources(alloc, chunked_sources);
@@ -3098,13 +3265,20 @@ pub fn resolvePublishedTextIndexSpecsAlloc(
     if (specs.len == 0) {
         const fallback_specs = try alloc.alloc(FullTextIndexSpec, 1);
         errdefer alloc.free(fallback_specs);
+        const name = try alloc.dupe(u8, search_sources.default_full_text_index_name);
+        errdefer alloc.free(name);
+        const config_json = try alloc.dupe(u8, "{\"type\":\"full_text\"}");
+        errdefer alloc.free(config_json);
+        const source_name = if (chunk_full_text_source_name) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (source_name) |value| alloc.free(value);
         fallback_specs[0] = .{
-            .name = try alloc.dupe(u8, search_sources.default_full_text_index_name),
-            .config_json = try alloc.dupe(u8, "{\"type\":\"full_text\"}"),
-            .source_artifact_name = if (chunk_full_text_source_name) |name| try alloc.dupe(u8, name) else null,
+            .name = name,
+            .config_json = config_json,
+            .source_artifact_name = source_name,
             .source_mode = if (chunk_full_text_source_name != null) .document_plus_artifact else .document,
             .chunked_sources = try full_text_indexes.cloneChunkedFullTextSourcesAlloc(alloc, chunked_sources),
         };
+        full_text_indexes.freeFullTextIndexSpecs(alloc, specs);
         return fallback_specs;
     }
     if (chunk_full_text_source_name) |name| {
@@ -3851,7 +4025,23 @@ pub fn buildGraphArtifactRefsForMaterializedDocsAllocUntil(
 ) ![]manifest_mod.ArtifactRef {
     if (!include_graph) return try alloc.alloc(manifest_mod.ArtifactRef, 0);
 
-    const changed = try graphProjectionChangedForMutationsAlloc(alloc, before_docs, docs, mutations);
+    const changed = try graphProjectionChangedForMutationsAlloc(alloc, source_table, before_docs, docs, mutations, cancellation, .{});
+    return buildGraphArtifactRefsFromImpactAllocUntil(alloc, artifacts, source_table, current, docs, changed, graph_index_names, include_graph, cancellation);
+}
+
+fn buildGraphArtifactRefsFromImpactAllocUntil(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    source_table: []const u8,
+    current: ?manifest_mod.Manifest,
+    docs: []const query_mod.QueryMaterializedDocument,
+    changed: bool,
+    graph_index_names: []const []u8,
+    include_graph: bool,
+    cancellation: ?maintenance_cancellation.Token,
+) ![]manifest_mod.ArtifactRef {
+    try maintenance_cancellation.check(cancellation);
+    if (!include_graph) return try alloc.alloc(manifest_mod.ArtifactRef, 0);
     if (graph_index_names.len == 0) {
         if (current) |manifest| {
             if (!changed) {
@@ -4175,7 +4365,8 @@ fn predictFullTextIndexActionsAlloc(
             publication_plan.ArtifactAction.reuse
         else
             publication_plan.ArtifactAction.rebuild;
-        try out.append(alloc, .{
+        try out.ensureUnusedCapacity(alloc, 1);
+        out.appendAssumeCapacity(.{
             .name = try alloc.dupe(u8, spec.name),
             .action = action,
             .source_mode = spec.source_mode,
@@ -4197,6 +4388,7 @@ fn predictNamedArtifactActionsAlloc(
     kind: PredictedNamedSourceKind,
     planned_actions: []const publication_plan.NamedArtifactAction,
     fallback: publication_plan.ArtifactAction,
+    graph_changed: bool,
 ) ![]publication_plan.NamedArtifactAction {
     var out = std.ArrayListUnmanaged(publication_plan.NamedArtifactAction).empty;
     errdefer {
@@ -4217,7 +4409,8 @@ fn predictNamedArtifactActionsAlloc(
                     publication_plan.ArtifactAction.reuse
                 else
                     publication_plan.ArtifactAction.rebuild;
-                try out.append(alloc, .{
+                try out.ensureUnusedCapacity(alloc, 1);
+                out.appendAssumeCapacity(.{
                     .name = try alloc.dupe(u8, source.index_name),
                     .action = action,
                 });
@@ -4235,7 +4428,8 @@ fn predictNamedArtifactActionsAlloc(
                     publication_plan.ArtifactAction.reuse
                 else
                     publication_plan.ArtifactAction.rebuild;
-                try out.append(alloc, .{
+                try out.ensureUnusedCapacity(alloc, 1);
+                out.appendAssumeCapacity(.{
                     .name = try alloc.dupe(u8, source.index_name),
                     .action = action,
                 });
@@ -4245,11 +4439,12 @@ fn predictNamedArtifactActionsAlloc(
             for (planned_actions) |planned_item| {
                 const action = if (planned_item.action == .drop)
                     publication_plan.ArtifactAction.drop
-                else if (artifactAvailableForName(current, artifact_kind, planned_item.name) and !try graphProjectionChangedForMutationsAlloc(alloc, before_docs, docs, mutations))
+                else if (artifactAvailableForName(current, artifact_kind, planned_item.name) and !graph_changed)
                     publication_plan.ArtifactAction.reuse
                 else
                     publication_plan.ArtifactAction.rebuild;
-                try out.append(alloc, .{
+                try out.ensureUnusedCapacity(alloc, 1);
+                out.appendAssumeCapacity(.{
                     .name = try alloc.dupe(u8, planned_item.name),
                     .action = action,
                 });
@@ -5897,7 +6092,7 @@ test "builder rebuilds named vector and sparse artifacts when wal updates change
     try std.testing.expect(!std.mem.eql(u8, first_sparse_id, second_manifest.artifacts[findNamedArtifactIndex(second_manifest, .sparse_segment, "sparse_a").?].artifact_id));
 }
 
-test "builder reuses full text artifact when wal updates do not change indexed text" {
+test "serverless builder prediction admits allocations and reuses unchanged text projection" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -5951,6 +6146,19 @@ test "builder reuses full text artifact when wal updates do not change indexed t
     });
     defer alloc.free(second);
     _ = try wal_store.append("docs", 200, second);
+
+    const prediction_plan = publication_plan.TablePublicationPlan{ .targets = .{ .published_search_sources = search_sources.defaultPublishedSearchSources() } };
+    try std.testing.expectError(error.LakeSidecarBuildBudgetExceeded, builder.predictPendingWalPublicationActionsWithLimitsAlloc("docs", .cosine, prediction_plan, null, .{ .max_working_set_bytes = 1 }));
+    try std.testing.expectError(error.LakeSidecarBuildBudgetExceeded, builder.predictPendingWalPublicationActionsWithLimitsAlloc("docs", .cosine, prediction_plan, null, .{ .max_input_bytes = 1 }));
+    const PredictionCheck = struct {
+        fn run(failing: Allocator, owner: *Builder, plan: publication_plan.TablePublicationPlan) !void {
+            var borrowed = owner.*;
+            borrowed.alloc = failing;
+            var prediction = (try borrowed.predictPendingWalPublicationActionsAlloc("docs", .cosine, plan)).?;
+            defer prediction.deinit(failing);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, PredictionCheck.run, .{ &builder, prediction_plan });
 
     var second_result = try builder.publishNamespace("docs");
     defer second_result.deinit(alloc);

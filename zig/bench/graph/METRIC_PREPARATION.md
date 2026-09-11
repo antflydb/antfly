@@ -992,3 +992,22 @@ allocation and no traversal. The previous exact status scan took 1.206/4.861/
 19.212 ms at 4,096/16,384/65,536 retained edges and exhausted an 8 KiB allocator
 during retirement. Exact diagnostic scans remain available, but are no longer
 used by operational status, live replay snapshots or cached status refresh.
+## Shared graph-impact planning (2026-09-11)
+
+Run `zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --graph-impact-only`.
+M4 Max, Zig 0.16; median of five samples after one warmup. This compares repeated
+per-alias calls with one shared result using the **same bounded comparator**;
+it is not an end-to-end before/after publisher benchmark. The source document's
+text changes while its 16,384 graph edges remain unchanged. Document loading,
+WAL IO, encoding and object publication are excluded.
+
+| Aliases | Repeated comparisons | Shared comparison | Total allocation traffic, repeated / shared |
+|---:|---:|---:|---:|
+| 1 | 7.254 ms | 7.233 ms | 22.8 / 22.8 MB |
+| 8 | 57.368 ms | 7.627 ms | 182.1 / 22.8 MB |
+| 32 | 237.413 ms | 7.351 ms | 728.4 / 22.8 MB |
+
+Peak scratch remains 11.0 MB in both modes; sharing removes repeated work and
+allocation traffic, not the peak of one comparison. The companion cardinality
+regression verifies every retry deadline survives three polling passes at 65,
+128 and 4,096 rejected namespaces and that deleted entries are reclaimed.

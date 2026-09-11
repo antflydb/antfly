@@ -186,6 +186,57 @@ fn benchmarkSparseProjections(output: anytype) !void {
     }
 }
 
+fn benchmarkGraphImpact(io: std.Io, out: anytype) !void {
+    const a = std.heap.smp_allocator;
+    const b = antfly.serverless.build;
+    const q = antfly.serverless.query;
+    for ([_]usize{ 1024, 16384 }) |degree| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const temp = arena.allocator();
+        const Edge = struct { target: []const u8, edge_type: []const u8 = "link" };
+        const edges = try temp.alloc(Edge, degree);
+        for (edges, 0..) |*edge, i| edge.* = .{ .target = try std.fmt.allocPrint(temp, "node-{d:0>8}", .{i}) };
+        const before_body = try std.json.Stringify.valueAlloc(temp, .{ .text = "before", .graph_edges = edges }, .{});
+        const after_body = try std.json.Stringify.valueAlloc(temp, .{ .text = "after", .graph_edges = edges }, .{});
+        const before = [_]q.QueryMaterializedDocument{.{ .doc_id = @constCast("a"), .body = before_body, .last_lsn = 1, .last_timestamp_ns = 1 }};
+        const after = [_]q.QueryMaterializedDocument{.{ .doc_id = @constCast("a"), .body = after_body, .last_lsn = 2, .last_timestamp_ns = 2 }};
+        const mutations = [_]q.QueryMaterializerMutation{.{ .lsn = 2, .timestamp_ns = 2, .kind = .upsert, .doc_id = "a", .body = after_body }};
+        for ([_]usize{ 1, 8, 32 }) |aliases| {
+            for ([_]bool{ false, true }) |shared| {
+                var times: [5]u64 = undefined;
+                var peak_bytes: usize = 0;
+                var total_bytes: usize = 0;
+                for (0..6) |sample| {
+                    var stats = PhaseAllocStats{};
+                    var tracker = PhaseTrackingAllocator{ .backing = a, .stats = &stats };
+                    const start = std.Io.Clock.awake.now(io);
+                    for (0..if (shared) @as(usize, 1) else aliases) |_| {
+                        if (try b.builder.graphProjectionChangedForMutationsAlloc(tracker.allocator(), "docs", &before, &after, &mutations, null, .{})) return error.InvalidBenchmarkResult;
+                    }
+                    if (sample > 0) times[sample - 1] = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds());
+                    if (stats.current_bytes != 0) return error.BenchmarkAllocationLeak;
+                    peak_bytes = @max(peak_bytes, stats.peak_bytes);
+                    total_bytes = @max(total_bytes, stats.total_alloc_bytes);
+                }
+                std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+                const json = try std.json.Stringify.valueAlloc(temp, .{
+                    .mode = if (shared) "shared_graph_impact" else "repeated_alias_graph_impact",
+                    .degree = degree,
+                    .aliases = aliases,
+                    .median_ns = times[2],
+                    .peak_bytes = peak_bytes,
+                    .total_alloc_bytes = total_bytes,
+                    .note = "isolated unchanged-topology metadata update; same bounded comparator; excludes document loading, WAL, and publication",
+                }, .{});
+                try out.interface.writeAll(json);
+                try out.interface.writeByte('\n');
+                try out.flush();
+            }
+        }
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     var output_buf: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &output_buf);
@@ -200,6 +251,7 @@ pub fn main(init: std.process.Init) !void {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--paged-only")) return @import("paged_read_bench.zig").run(init.io, &output);
         if (std.mem.eql(u8, arg, "--prune-only")) return benchmarkRangePrune(init.io, &output);
+        if (std.mem.eql(u8, arg, "--graph-impact-only")) return benchmarkGraphImpact(init.io, &output);
         if (std.mem.eql(u8, arg, "--ownership-reads-only")) return @import("ownership_read_bench.zig").run(init.io, &output);
         if (std.mem.eql(u8, arg, "--ownership-disk-reads-only")) return @import("ownership_read_bench.zig").runDisk(init.io, &output);
         if (std.mem.eql(u8, arg, "--filtered-prefix-only")) return @import("paged_read_bench.zig").runFilteredPrefix(init.io, &output);

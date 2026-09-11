@@ -810,6 +810,7 @@ const reverse_rebuild_batch_size: usize = 1024;
 pub var test_abort_reverse_rebuild_after_batches: ?usize = null;
 pub var test_abort_prune_after_forward_commit = false;
 threadlocal var test_counter_publication_hook: ?*const fn (*GraphIndex, GraphIndex.Stats) anyerror!void = null;
+threadlocal var test_ownership_sync_hook: ?*const fn (*GraphIndex) anyerror!void = null;
 pub var test_abort_ownership_before_range_commit = false;
 pub var test_abort_counter_rebuild_after_pages: ?usize = null;
 const graph_meta_prefix = "meta:";
@@ -7977,8 +7978,6 @@ pub const GraphIndex = struct {
     }
 
     fn startPruneRange(self: *GraphIndex, alloc: Allocator, lower: []const u8, upper: []const u8, fence: bool) !void {
-        @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
-        defer self.ownership_mutex.unlock();
         const range_lower_owned = if (lower.len > 0) try internal_keys.documentRangeLowerAlloc(alloc, lower) else null;
         defer if (range_lower_owned) |key| alloc.free(key);
         const range_upper_owned = if (upper.len > 0) try internal_keys.documentRangeLowerAlloc(alloc, upper) else null;
@@ -7993,45 +7992,56 @@ pub const GraphIndex = struct {
         errdefer if (!transferred) {
             if (owned) |value| self.alloc.free(value);
         };
-        var batch = try self.beginWriteReverseBatch();
-        errdefer batch.abort();
-        if (batch.get(maintenance.range_key)) |raw| {
-            const progress = try maintenance.RangeProgress.decode(raw);
-            if (!std.mem.eql(u8, progress.lower, range_lower) or !std.mem.eql(u8, progress.upper, range_upper)) return error.GraphMaintenanceInProgress;
-            if (!fence or self.ownership_fence != null) {
-                if (owned) |value| self.alloc.free(value);
+        publish: {
+            // Allocation and durability do not need the reader visibility lock.
+            // Commit and in-memory adoption remain one snapshot handoff: readers
+            // must not combine a new reverse epoch with an old ownership scope.
+            @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+            defer self.ownership_mutex.unlock();
+            var batch = try self.beginWriteReverseBatch();
+            errdefer batch.abort();
+            if (batch.get(maintenance.range_key)) |raw| {
+                const progress = try maintenance.RangeProgress.decode(raw);
+                if (!std.mem.eql(u8, progress.lower, range_lower) or !std.mem.eql(u8, progress.upper, range_upper)) return error.GraphMaintenanceInProgress;
+                if (!fence or self.ownership_fence != null) {
+                    if (owned) |value| self.alloc.free(value);
+                    transferred = true;
+                    batch.abort();
+                    break :publish;
+                }
+            } else |err| if (err != error.NotFound) return err;
+            try batch.put(maintenance.range_key, encoded);
+            const generation = if (fence) try std.math.add(u64, self.edge_generation, 1) else self.edge_generation;
+            if (fence) {
+                try batch.put(maintenance.ownership_key, encoded);
+                try putU64(&batch, graph_edge_generation_key, generation);
+                try putU64(&batch, graph_metric_type_epoch_floor_key, generation);
+                for (self.metric_configs) |cfg| {
+                    const lease = try self.graphMetricBuildLeaseKeyAlloc(cfg.name);
+                    defer self.alloc.free(lease);
+                    batch.delete(lease) catch |err| if (err != error.NotFound) return err;
+                    const dirty = try self.graphMetricDirtyGenerationKeyAlloc(cfg.name);
+                    defer self.alloc.free(dirty);
+                    try putU64(&batch, dirty, generation);
+                }
+            }
+            try batch.commit();
+            // Adopt immediately after commit, even if the durability barrier
+            // fails. Retry must never serve a broader view than persisted state.
+            if (fence) {
+                self.ownership_fence = owned;
+                self.ownership_active = !self.managed_ownership_range;
                 transferred = true;
-                batch.abort();
-                try self.reverse_owner.sync(true);
-                return;
+                self.edge_generation = generation;
             }
-        } else |err| if (err != error.NotFound) return err;
-        try batch.put(maintenance.range_key, encoded);
-        const generation = if (fence) try std.math.add(u64, self.edge_generation, 1) else self.edge_generation;
-        if (fence) {
-            try batch.put(maintenance.ownership_key, encoded);
-            try putU64(&batch, graph_edge_generation_key, generation);
-            try putU64(&batch, graph_metric_type_epoch_floor_key, generation);
-            for (self.metric_configs) |cfg| {
-                const lease = try self.graphMetricBuildLeaseKeyAlloc(cfg.name);
-                defer self.alloc.free(lease);
-                batch.delete(lease) catch |err| if (err != error.NotFound) return err;
-                const dirty = try self.graphMetricDirtyGenerationKeyAlloc(cfg.name);
-                defer self.alloc.free(dirty);
-                try putU64(&batch, dirty, generation);
-            }
-        }
-        try batch.commit();
-        // Adopt immediately after commit, even if the durability barrier
-        // fails. Retry must never serve a broader view than persisted state.
-        if (fence) {
-            self.ownership_fence = owned;
-            self.ownership_active = !self.managed_ownership_range;
-            transferred = true;
-            self.edge_generation = generation;
         }
         // Ownership has moved to self; a failed sync must not free its scope.
-        self.reverse_owner.sync(true) catch |err| return err;
+        try self.syncOwnership();
+    }
+
+    fn syncOwnership(self: *GraphIndex) !void {
+        if (builtin.is_test) if (test_ownership_sync_hook) |hook| try hook(self);
+        try self.reverse_owner.sync(true);
     }
 
     /// One bounded, replayable unit. Null means there is no remaining task.
@@ -8078,16 +8088,18 @@ pub const GraphIndex = struct {
                 }
             }
             if (keys.items.len == 0) {
-                @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
-                defer self.ownership_mutex.unlock();
-                var batch = try self.beginWriteReverseBatch();
-                errdefer batch.abort();
-                try batch.delete(maintenance.range_key);
-                batch.delete(maintenance.ownership_key) catch |err| if (err != error.NotFound) return err;
-                try batch.commit();
-                if (self.ownership_fence) |scope| self.alloc.free(scope);
-                self.ownership_fence = null;
-                try self.reverse_owner.sync(true);
+                {
+                    @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+                    defer self.ownership_mutex.unlock();
+                    var batch = try self.beginWriteReverseBatch();
+                    errdefer batch.abort();
+                    try batch.delete(maintenance.range_key);
+                    batch.delete(maintenance.ownership_key) catch |err| if (err != error.NotFound) return err;
+                    try batch.commit();
+                    if (self.ownership_fence) |scope| self.alloc.free(scope);
+                    self.ownership_fence = null;
+                }
+                try self.syncOwnership();
                 return null;
             }
             const intent = try maintenance.encodeKeys(temp, keys.items);
@@ -34911,6 +34923,42 @@ test "graph maintenance ownership range seeks preserve escaped boundaries in bot
     try std.testing.expectEqualStrings("p", BorrowedEdgeKey.parse(after.key, .in).?.source);
     while (try g.pruneOwnedRangePage()) |_| {}
     try std.testing.expectEqual(@as(u64, 3), (try g.stats(a)).edge_count);
+}
+
+test "graph maintenance ownership durability never holds the reader lock and failed sync retains visibility" {
+    const a = std.testing.allocator;
+    var g = try GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .lsm_memory });
+    defer g.close();
+    try g.addEdge("z", "a", "link", 1, 0, 0, "{}");
+    const Hook = struct {
+        var fail = true;
+        var calls: usize = 0;
+        fn check(index: *GraphIndex) !void {
+            // A real fsync may stall. Reads and status must remain available
+            // throughout it, including a retry of an already committed fence.
+            try std.testing.expect(index.ownership_mutex.tryLock());
+            index.ownership_mutex.unlock();
+            _ = index.operationalStats();
+            var read = try index.beginReadReverseTxn();
+            read.abort();
+            calls += 1;
+            if (fail) return error.TestOwnershipSyncFailed;
+        }
+    };
+    Hook.fail = true;
+    Hook.calls = 0;
+    test_ownership_sync_hook = Hook.check;
+    defer test_ownership_sync_hook = null;
+    try std.testing.expectError(error.TestOwnershipSyncFailed, g.fenceOwnedRange(a, "m", ""));
+    try std.testing.expect(g.ownershipCleanupPending());
+    try std.testing.expectEqual(@as(u64, 0), (try g.stats(a)).edge_count);
+    const epoch = g.edge_generation;
+    Hook.fail = false;
+    try g.fenceOwnedRange(a, "m", "");
+    try std.testing.expectEqual(epoch, g.edge_generation);
+    while (try g.pruneOwnedRangePage()) |_| {}
+    try std.testing.expectEqual(@as(usize, 3), Hook.calls);
+    try std.testing.expect(!g.ownershipCleanupPending());
 }
 
 test "graph maintenance ownership fences pin snapshots and retire bounded pages" {

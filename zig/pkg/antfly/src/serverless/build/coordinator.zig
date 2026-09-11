@@ -67,6 +67,7 @@ pub const BackgroundPublisher = struct {
 
     pub fn deinit(self: *BackgroundPublisher) void {
         self.stop();
+        self.budget_backoff.deinit(self.alloc);
         if (self.lease_owner_id) |owner_id| self.alloc.free(owner_id);
         self.* = undefined;
     }
@@ -145,9 +146,22 @@ pub const BackgroundPublisher = struct {
         defer self.catalog.freeNamespaces(self.alloc, namespaces);
 
         var stats = PublishRunStats{};
+        self.budget_backoff.beginPass();
         for (namespaces) |namespace| {
             try cancellation.check();
-            var status = self.catalog.buildStatus(namespace.name) catch |err| switch (err) {
+            const now = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
+            // Eligibility precedes all document loading and impact prediction.
+            if (self.budget_backoff.blocked(namespace.name, now)) {
+                stats.budget_rejected_namespaces += 1;
+                continue;
+            }
+            var status = self.catalog.buildStatusUntil(namespace.name, cancellation) catch |err| switch (err) {
+                error.LakeSidecarBuildBudgetExceeded => {
+                    try self.budget_backoff.reject(self.alloc, namespace.name, std.Io.Timestamp.now(self.io, .awake).toNanoseconds());
+                    stats.budget_rejected_namespaces += 1;
+                    std.log.warn("serverless prediction budget exceeded namespace={s}; retaining published head and backing off", .{namespace.name});
+                    continue;
+                },
                 error.FileNotFound => {
                     stats.idle_namespaces += 1;
                     continue;
@@ -158,11 +172,6 @@ pub const BackgroundPublisher = struct {
             if (!status.publish_recommended) {
                 self.budget_backoff.clear(namespace.name);
                 stats.idle_namespaces += 1;
-                continue;
-            }
-            const now = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
-            if (self.budget_backoff.blocked(namespace.name, now)) {
-                stats.budget_rejected_namespaces += 1;
                 continue;
             }
 
@@ -228,7 +237,7 @@ pub const BackgroundPublisher = struct {
                 error.LakeSidecarBuildBudgetExceeded => {
                     // Deterministic per-namespace admission must not terminate
                     // the publisher or hot-loop an expensive failed build.
-                    self.budget_backoff.reject(namespace.name, std.Io.Timestamp.now(self.io, .awake).toNanoseconds());
+                    try self.budget_backoff.reject(self.alloc, namespace.name, std.Io.Timestamp.now(self.io, .awake).toNanoseconds());
                     stats.budget_rejected_namespaces += 1;
                     std.log.warn("serverless sidecar build budget exceeded namespace={s}; retaining published head and backing off", .{namespace.name});
                     continue;
@@ -262,6 +271,7 @@ pub const BackgroundPublisher = struct {
             }
         }
 
+        self.budget_backoff.endPass();
         return stats;
     }
 
@@ -288,13 +298,32 @@ pub const BackgroundPublisher = struct {
     }
 };
 
-/// Bounded process-local retry throttling, not durable publication authority.
-/// Explicit build requests bypass this cache. A changed policy/source is
+/// Process-local retry scheduling, not durable publication authority. There is
+/// one entry per rejected live namespace, never a FIFO that evicts an active
+/// deadline. Successful catalog passes reclaim deleted namespaces. Memory is
+/// O(catalog namespace count), independent of the number of failed attempts.
+/// Explicit build requests bypass scheduling. A changed policy/source is
 /// eligible for retry within a minute, even without a new WAL record or restart.
 const BudgetBackoff = struct {
-    const Entry = struct { key: [32]u8, until_ns: i96, attempts: u8 };
-    entries: [64]?Entry = @splat(null),
-    next: usize = 0,
+    const Entry = struct { until_ns: i96, attempts: u8, seen: bool = true };
+    entries: std.AutoHashMapUnmanaged([32]u8, Entry) = .empty,
+
+    fn deinit(self: *BudgetBackoff, alloc: Allocator) void {
+        self.entries.deinit(alloc);
+    }
+
+    fn beginPass(self: *BudgetBackoff) void {
+        var values = self.entries.valueIterator();
+        while (values.next()) |entry| entry.seen = false;
+    }
+
+    fn endPass(self: *BudgetBackoff) void {
+        var entries = self.entries.iterator();
+        // remove does not relocate entries or invalidate the iterator.
+        while (entries.next()) |entry| {
+            if (!entry.value_ptr.seen) _ = self.entries.remove(entry.key_ptr.*);
+        }
+    }
 
     fn key(namespace: []const u8) [32]u8 {
         var digest: [32]u8 = undefined;
@@ -302,47 +331,63 @@ const BudgetBackoff = struct {
         return digest;
     }
 
-    fn find(self: *BudgetBackoff, namespace: []const u8) ?*?Entry {
-        const digest = key(namespace);
-        for (&self.entries) |*entry| if (entry.*) |value| {
-            if (std.mem.eql(u8, &value.key, &digest)) return entry;
-        };
-        return null;
-    }
-
     fn blocked(self: *BudgetBackoff, namespace: []const u8, now: i96) bool {
-        const entry = self.find(namespace) orelse return false;
-        return now < entry.*.?.until_ns;
+        const entry = self.entries.getPtr(key(namespace)) orelse return false;
+        entry.seen = true;
+        return now < entry.until_ns;
     }
 
     fn clear(self: *BudgetBackoff, namespace: []const u8) void {
-        if (self.find(namespace)) |entry| entry.* = null;
+        _ = self.entries.remove(key(namespace));
     }
 
-    fn reject(self: *BudgetBackoff, namespace: []const u8, now: i96) void {
-        const entry = self.find(namespace) orelse blk: {
-            const slot = &self.entries[self.next];
-            self.next = (self.next + 1) % self.entries.len;
-            slot.* = null;
-            break :blk slot;
-        };
-        const attempts = @min(@as(u8, if (entry.*) |previous| previous.attempts else 0) + 1, 4);
+    fn reject(self: *BudgetBackoff, alloc: Allocator, namespace: []const u8, now: i96) !void {
+        const entry = try self.entries.getOrPut(alloc, key(namespace));
+        const attempts = @min(@as(u8, if (entry.found_existing) entry.value_ptr.attempts else 0) + 1, 4);
         const delay_seconds: i96 = @min(@as(i96, 5) << @intCast(attempts), 60);
-        entry.* = .{ .key = key(namespace), .until_ns = now +| delay_seconds * std.time.ns_per_s, .attempts = attempts };
+        entry.value_ptr.* = .{ .until_ns = now +| delay_seconds * std.time.ns_per_s, .attempts = attempts };
     }
 };
 
 test "serverless publication budget backoff isolates namespaces and retries within a minute" {
     var backoff = BudgetBackoff{};
-    backoff.reject("large", 0);
+    defer backoff.deinit(std.testing.allocator);
+    try backoff.reject(std.testing.allocator, "large", 0);
     try std.testing.expect(backoff.blocked("large", 0));
     try std.testing.expect(!backoff.blocked("small", 0));
     try std.testing.expect(!backoff.blocked("large", 10 * std.time.ns_per_s));
-    for (0..10) |_| backoff.reject("large", 0);
+    for (0..10) |_| try backoff.reject(std.testing.allocator, "large", 0);
     try std.testing.expect(backoff.blocked("large", 59 * std.time.ns_per_s));
     try std.testing.expect(!backoff.blocked("large", 60 * std.time.ns_per_s));
     backoff.clear("large");
     try std.testing.expect(!backoff.blocked("large", 0));
+}
+
+test "serverless publication retry scheduling survives namespace cardinality and reclaims deletions" {
+    var backoff = BudgetBackoff{};
+    defer backoff.deinit(std.testing.allocator);
+    var name_buf: [32]u8 = undefined;
+    for ([_]usize{ 65, 128, 4096 }) |count| {
+        backoff.beginPass();
+        for (0..count) |i| {
+            const name = try std.fmt.bufPrint(&name_buf, "namespace-{d}", .{i});
+            try backoff.reject(std.testing.allocator, name, 0);
+        }
+        backoff.endPass();
+        for (0..3) |_| {
+            backoff.beginPass();
+            for (0..count) |i| {
+                const name = try std.fmt.bufPrint(&name_buf, "namespace-{d}", .{i});
+                try std.testing.expect(backoff.blocked(name, std.time.ns_per_s));
+            }
+            backoff.endPass();
+            try std.testing.expectEqual(count, backoff.entries.count());
+        }
+    }
+    backoff.beginPass();
+    try std.testing.expect(backoff.blocked("namespace-0", 0));
+    backoff.endPass();
+    try std.testing.expectEqual(@as(usize, 1), backoff.entries.count());
 }
 
 test "serverless background publisher publishes once and stop wakes a long idle wait" {

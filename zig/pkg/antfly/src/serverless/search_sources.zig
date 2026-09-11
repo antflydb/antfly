@@ -436,8 +436,10 @@ pub fn cloneVectorSourceDescriptorAlloc(
     alloc: Allocator,
     descriptor: VectorSourceDescriptor,
 ) !VectorSourceDescriptor {
+    const index_name = try alloc.dupe(u8, descriptor.index_name);
+    errdefer alloc.free(index_name);
     return .{
-        .index_name = try alloc.dupe(u8, descriptor.index_name),
+        .index_name = index_name,
         .document_source = descriptor.document_source,
         .embedding_name = if (descriptor.embedding_name) |name| try alloc.dupe(u8, name) else null,
         .distance_metric = descriptor.distance_metric,
@@ -448,8 +450,10 @@ pub fn cloneSparseSourceDescriptorAlloc(
     alloc: Allocator,
     descriptor: SparseSourceDescriptor,
 ) !SparseSourceDescriptor {
+    const index_name = try alloc.dupe(u8, descriptor.index_name);
+    errdefer alloc.free(index_name);
     return .{
-        .index_name = try alloc.dupe(u8, descriptor.index_name),
+        .index_name = index_name,
         .document_source = descriptor.document_source,
         .embedding_name = if (descriptor.embedding_name) |name| try alloc.dupe(u8, name) else null,
     };
@@ -589,13 +593,17 @@ pub fn listVectorSourcesAlloc(
             matches.deinit(alloc);
         }
         for (items) |item| switch (item) {
-            .vector => |value| try matches.append(alloc, try cloneVectorSourceDescriptorAlloc(alloc, value)),
+            .vector => |value| {
+                try matches.ensureUnusedCapacity(alloc, 1);
+                matches.appendAssumeCapacity(try cloneVectorSourceDescriptorAlloc(alloc, value));
+            },
             else => {},
         };
         return try matches.toOwnedSlice(alloc);
     }
     if (sources.vector) |value| {
         const out = try alloc.alloc(VectorSourceDescriptor, 1);
+        errdefer alloc.free(out);
         out[0] = try cloneVectorSourceDescriptorAlloc(alloc, value);
         return out;
     }
@@ -613,13 +621,17 @@ pub fn listSparseSourcesAlloc(
             matches.deinit(alloc);
         }
         for (items) |item| switch (item) {
-            .sparse => |value| try matches.append(alloc, try cloneSparseSourceDescriptorAlloc(alloc, value)),
+            .sparse => |value| {
+                try matches.ensureUnusedCapacity(alloc, 1);
+                matches.appendAssumeCapacity(try cloneSparseSourceDescriptorAlloc(alloc, value));
+            },
             else => {},
         };
         return try matches.toOwnedSlice(alloc);
     }
     if (sources.sparse) |value| {
         const out = try alloc.alloc(SparseSourceDescriptor, 1);
+        errdefer alloc.free(out);
         out[0] = try cloneSparseSourceDescriptorAlloc(alloc, value);
         return out;
     }

@@ -16,11 +16,38 @@ after complete encoding; no partial graph or replacement HEAD is published.
 
 Explicit build routes report resource rejection with HTTP 422. Background
 publication retains the prior HEAD, counts/logs the affected namespace and
-continues other namespaces. A bounded process-local retry cache backs off from
-10 seconds to at most one minute; explicit build requests bypass that cache.
-This is retry throttling, not durable failure/progress state. Cache eviction or
-restart can retry sooner. Metric computation budget rejection remains its
+continues other namespaces. Process-local retry scheduling backs off from
+10 seconds to at most one minute; explicit build requests bypass scheduling.
+Eligibility is checked before status prediction. Each rejected live namespace
+retains its deadline: there is no fixed-cardinality FIFO eviction cliff.
+Successful catalog passes remove deleted namespaces; retained map capacity is
+proportional to the high-water namespace count, not retry history.
+This is retry throttling, not durable failure/progress state. A restart can
+retry sooner. Metric computation budget rejection remains its
 separate durable per-metric sidecar contract.
+
+### Publication prediction and graph read isolation
+
+Prediction uses one operation-local allocator for returned WAL, manifest,
+document and projection buffers, capped at 1 GiB live allocations. It also
+admits source rows/bytes, observes maintenance cancellation, and reports the
+same configured-budget error as construction. Store owners and their allocators
+are never modified. Actual backing-allocator OOM remains a distinct failure.
+Prediction no longer clones/encodes a document segment only to discard it.
+Document materialization transfers owned output buffers rather than copying
+the entire completed view again.
+
+Graph impact is computed once per materialization and shared by aliases and
+the publication path. Byte-identical updates skip JSON parsing; explicit
+local-table targets canonicalize identically to implicit local targets.
+Graph neighbors, traversal and shortest-path HTTP responses fetch only the WAL
+tip for freshness, not build status. An inadmissible pending publication cannot
+prevent those reads from serving their pinned graph.
+
+Remaining control-plane work: prediction still materializes the namespace and
+is repeated between status and publication. The long-term incremental root
+transition below must provide a source-fenced, reusable touched-document change
+plan plus persisted scheduling facts; a memory cap alone is not that transition.
 
 ### Remaining storage-layout work: incremental serverless graph roots
 
@@ -52,6 +79,13 @@ Simply splitting uploads while retaining the global dictionary would not meet
 the incremental construction requirement.
 
 ### Stateful split ownership and bounded retirement
+
+Ownership allocation and fsync run outside the reader visibility mutex. Durable
+metadata commit and adoption of the in-memory fence remain one locked handoff,
+so a reader cannot capture a new epoch with an old ownership scope. Sync failure
+does not undo committed visibility; idempotent retries sync without holding the
+reader mutex. Moving backend commit itself off this mutex requires a versioned
+snapshot handoff and is not implemented by this change.
 
 Logical ownership is separate from physical graph cleanup. Before committing a
 narrower primary range and its Raft receipt, each private graph store durably
