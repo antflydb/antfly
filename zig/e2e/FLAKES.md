@@ -1,5 +1,23 @@
 # Zig E2E flakes
 
+## 2026-09-11: stale expiry and uncertain capacity found in fresh review (#694)
+
+Two deterministic regressions failed on `8a4d2d83e`: a delayed expired-job
+poll deleted a replacement after an unknown admission receipt, and a full
+retained-byte budget still allowed durable admission. The fix invalidates
+stale observations before persistence, conditionally deletes only the observed
+durable record, and reserves admission/update capacity through unknown outcomes.
+See `../FLAKES.md` for the proof, protocol/ABI changes, and regression coverage.
+
+Focused native Debug validation passed 29 restore-store, 248 metadata-logic,
+and 36 restore HTTP tests with no skips, failures, or leaks. Fresh 100/100
+acceptance per E2E scenario remains pending on a rebuilt revision.
+
+The native Debug soak starting 2026-09-11 17:01:24 UTC uses `8a4d2d83e`
+(binary SHA-256 `9d65a426a0e64b37687220f146b5d3d99f63322ed475162d79f34f4a024707f4`).
+Those results are historical; these fixes require another rebuilt binary.
+Short-lived E2E scenarios do not replace the expiry and capacity regressions.
+
 ## 2026-09-11: expired restore key reuse found during soak review (#694)
 
 Review of `0126d8b30` found a seven-day expiry case outside the short-lived E2E

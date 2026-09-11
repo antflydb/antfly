@@ -23,8 +23,10 @@ const std = @import("std");
 /// carrying table compare-and-set preconditions.
 /// Version 5 adds conditional restore admission; ordinary job updates retain
 /// their existing wire format.
-pub const current_version: u16 = 5;
+/// Version 6 adds digest-conditional restore expiry.
+pub const current_version: u16 = 6;
 pub const restore_job_admission_version: u16 = 5;
+pub const restore_job_expiry_version: u16 = 6;
 /// Minimum decoder capability required by the atomic create/drop wire format.
 /// Later, unrelated metadata features must not unnecessarily stop table DDL
 /// when a membership change temporarily includes a lower-capability peer.

@@ -747,6 +747,7 @@ const MetadataAdminMux = struct {
 
 fn metadataRestoreJobPersistence(svc: *service.MetadataHttpService) restore_jobs.ReplicatedPersistence {
     return restore_jobs.ReplicatedPersistence.fromLocal(svc, .{
+        .delete_matching = metadataRestoreJobDeleteMatching,
         .create = metadataRestoreJobCreate,
         .load = metadataRestoreJobLoad,
         .get = metadataRestoreJobGet,
@@ -812,6 +813,25 @@ fn metadataRestoreJobCreate(ptr: *anyopaque, alloc: std.mem.Allocator, key: []co
     );
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     return (try store.getRestoreJobValue(alloc, svc.metadata_group_id, key)) orelse error.RestoreJobCommitNotApplied;
+}
+
+fn metadataRestoreJobDeleteMatching(ptr: *anyopaque, key: []const u8, value_hash: []const u8, leadership_term: u64) !bool {
+    const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, @import("topology_protocol.zig").restore_job_expiry_version);
+    svc.lockCatalogMutation();
+    defer svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(.{}, readiness);
+    _ = try svc.proposeTransitionCommandAndWaitAppliedInTerm(
+        .{ .remove_restore_job_if_matches = .{ .key = key, .value_hash = value_hash } },
+        leadership_term,
+    );
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const current = (try store.getRestoreJobValue(svc.alloc, svc.metadata_group_id, key)) orelse return true;
+    defer svc.alloc.free(current);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(current, &digest, .{});
+    if (std.mem.eql(u8, &digest, value_hash)) return error.RestoreJobCommitNotApplied;
+    return false;
 }
 
 fn metadataRestoreJobDelete(ptr: *anyopaque, key: []const u8, leadership_term: u64) !void {

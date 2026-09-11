@@ -260,6 +260,7 @@ pub const TransitionCommand = union(enum) {
     },
     upsert_restore_job: RestoreJobWrite,
     create_restore_job: RestoreJobWrite,
+    remove_restore_job_if_matches: struct { key: []const u8, value_hash: []const u8 },
     remove_restore_job: struct {
         key: []const u8,
     },
@@ -390,6 +391,10 @@ pub const TransitionCommand = union(enum) {
                 alloc.free(record.value);
             },
             .remove_restore_job => |record| alloc.free(record.key),
+            .remove_restore_job_if_matches => |record| {
+                alloc.free(record.key);
+                alloc.free(record.value_hash);
+            },
             .remove_restore_jobs => |record| {
                 for (record.keys) |key| alloc.free(key);
                 alloc.free(record.keys);
@@ -589,6 +594,10 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
             if (record.value.len == 0 or record.value.len > max_restore_job_value_bytes) return error.InvalidRestoreJobRecord;
         },
         .remove_restore_job => |record| try validateRestoreJobLogicalKey(record.key),
+        .remove_restore_job_if_matches => |record| {
+            try validateRestoreJobLogicalKey(record.key);
+            if (record.value_hash.len != 32) return error.InvalidRestoreJobRecord;
+        },
         .remove_restore_jobs => |record| {
             if (record.keys.len == 0 or record.keys.len > 4096) return error.InvalidRestoreJobRecord;
             for (record.keys) |key| try validateRestoreJobLogicalKey(key);
@@ -4019,7 +4028,7 @@ pub const RaftApplyStore = struct {
                 metadataSnapshotProjectionBit(.table_transition_fence),
             .upsert_reconcile_lease, .remove_reconcile_lease => metadataSnapshotProjectionBit(.reconcile_lease),
             .upsert_shuffle_join_lease, .remove_shuffle_join_lease => metadataSnapshotProjectionBit(.shuffle_join_lease),
-            .upsert_restore_job, .create_restore_job, .remove_restore_job, .remove_restore_jobs => metadataSnapshotProjectionBit(.restore_job),
+            .upsert_restore_job, .create_restore_job, .remove_restore_job, .remove_restore_jobs, .remove_restore_job_if_matches => metadataSnapshotProjectionBit(.restore_job),
             .upsert_reallocation_request, .remove_reallocation_request => metadataSnapshotProjectionBit(.reallocation_request) |
                 metadataSnapshotProjectionBit(.reallocation_request_pending),
             .upsert_extension_package, .remove_extension_package => metadataSnapshotProjectionBit(.extension_package),
@@ -4928,6 +4937,20 @@ pub const RaftApplyStore = struct {
                     .kind = .restore_job,
                     .metadata_group_id = group_id,
                 });
+            },
+            .remove_restore_job_if_matches => |record| {
+                var key_buf: [256]u8 = undefined;
+                const key = try restoreJobKeyForGroup(&key_buf, group_id, record.key);
+                const existing = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => return,
+                    else => return err,
+                };
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(existing, &digest, .{});
+                if (!std.mem.eql(u8, &digest, record.value_hash)) return;
+                try txn.delete(key);
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+                self.notifyProjectionListeners(.{ .kind = .restore_job, .metadata_group_id = group_id });
             },
             .remove_restore_job => |record| {
                 var key_buf: [256]u8 = undefined;
@@ -7181,6 +7204,7 @@ const TransitionTag = enum(u8) {
     apply_table_topology = 50,
     apply_extension_lifecycle_v2 = 51,
     create_restore_job = 52,
+    remove_restore_job_if_matches = 53,
 };
 
 pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionCommand) ![]u8 {
@@ -7457,6 +7481,11 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try out.append(alloc, @intFromEnum(if (command == .create_restore_job) TransitionTag.create_restore_job else TransitionTag.upsert_restore_job));
             try appendRequiredString(alloc, &out, record.key);
             try appendRequiredString(alloc, &out, record.value);
+        },
+        .remove_restore_job_if_matches => |record| {
+            try out.append(alloc, @intFromEnum(TransitionTag.remove_restore_job_if_matches));
+            try appendRequiredString(alloc, &out, record.key);
+            try appendRequiredString(alloc, &out, record.value_hash);
         },
         .remove_restore_job => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.remove_restore_job));
@@ -7811,6 +7840,14 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
                 .key = try readRequiredString(alloc, encoded, &pos),
                 .value = try readRequiredString(alloc, encoded, &pos),
             },
+        },
+        .remove_restore_job_if_matches => blk: {
+            const key = try readRequiredString(alloc, encoded, &pos);
+            errdefer alloc.free(key);
+            const value_hash = try readRequiredString(alloc, encoded, &pos);
+            errdefer alloc.free(value_hash);
+            if (value_hash.len != 32 or pos != encoded.len) return error.InvalidMetadataTransitionEncoding;
+            break :blk .{ .remove_restore_job_if_matches = .{ .key = key, .value_hash = value_hash } };
         },
         .remove_restore_job => .{
             .remove_restore_job = .{ .key = try readRequiredString(alloc, encoded, &pos) },
@@ -14582,6 +14619,38 @@ test "metadata raft apply store restore admission never overwrites a previously 
     const result = (try store.getRestoreJobValue(alloc, 1, key)).?;
     defer alloc.free(result);
     try std.testing.expectEqualStrings("running-checkpoint", result);
+    var running_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(result, &running_hash, .{});
+    var replacement_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("replacement", &replacement_hash, .{});
+    const expiry_commands = [_]TransitionCommand{
+        .{ .remove_restore_job_if_matches = .{ .key = key, .value_hash = &running_hash } },
+        .{ .create_restore_job = .{ .key = key, .value = "replacement" } },
+        // A delayed expiry command must not erase the replacement incarnation.
+        .{ .remove_restore_job_if_matches = .{ .key = key, .value_hash = &running_hash } },
+        .{ .remove_restore_job_if_matches = .{ .key = key, .value_hash = &replacement_hash } },
+        .{ .remove_restore_job_if_matches = .{ .key = key, .value_hash = &replacement_hash } },
+    };
+    for (expiry_commands, 4..) |command, index| {
+        const encoded = try encodeTransitionCommand(alloc, command);
+        defer alloc.free(encoded);
+        var decoded = (try decodeTransitionCommand(alloc, encoded)).?;
+        defer decoded.deinit(alloc);
+        try validateTransitionCommandDataGroupIds(decoded);
+        const entries = try raft_state_machine.encodeCommittedEntries(alloc, &.{
+            .{ .term = 1, .index = index, .entry_type = .normal, .data = encoded },
+        });
+        defer alloc.free(entries);
+        try store.snapshotBuilder().applyBatch(.{ .group_id = 1, .commit_index = index, .entries_bytes = entries });
+        const current = try store.getRestoreJobValue(alloc, 1, key);
+        defer if (current) |value| alloc.free(value);
+        if (index == 5 or index == 6) {
+            try std.testing.expectEqualStrings("replacement", current.?);
+        } else try std.testing.expect(current == null);
+    }
+    try std.testing.expectError(error.InvalidRestoreJobRecord, validateTransitionCommandDataGroupIds(.{
+        .remove_restore_job_if_matches = .{ .key = key, .value_hash = "short" },
+    }));
 }
 
 test "metadata raft apply store projects restore progress records from committed entries" {

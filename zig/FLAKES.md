@@ -4,6 +4,46 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-11: fence stale expiry and reserve uncertain restore capacity (#694)
+
+Review of `8a4d2d83e` added two deterministic failures in the isolated
+`ci694-expiry-race-review` worktree. An old poll captured an uncached expired
+record; re-admission retired it and committed a replacement with an unknown
+receipt. Neither operation advanced the missing-record refresh revision, so
+the old poll erased the new durable job. Separately, a full 64 MiB retained-byte
+budget still admitted a durable create before the cache rejected it.
+`/private/tmp/ci694-review-expiry-race-tests.log` records both failures,
+with the 26 existing tests passing and no leaks.
+
+Every attempted persistence mutation now invalidates older observations,
+including unknown outcomes and absent cache entries. Point expiry proposes a
+SHA-256 digest-conditional delete: Raft apply removes only the exact observed
+record, so a delayed command cannot erase a changed or replacement job.
+The wire command is gated on metadata protocol version 6; restore persistence
+ABI version 4 carries the conditional callback and has no unsafe fallback.
+The digest keeps the expiry command small without copying a 64 KiB record.
+
+Admission reserves bytes and a job slot before proposing. Reservations remain
+charged after an unknown outcome; a missing point read cannot release them.
+Uncertain updates also reserve potential record growth. Cache adoption moves
+the existing charge without double counting, while confirmed writes/deletes
+resolve reservations. A newly fenced leadership preparation rebuilds accounting
+from its linearizable durable view. Ordinary operations maintain this ledger
+in constant time; there is no per-admission durable scan or added Raft round.
+
+Regressions cover stale polling, replayed digest-conditional deletion across
+key reuse, aggregate byte exhaustion before persistence, missing-row polling,
+uncertain create recovery, and uncertain update growth. Run the restore-store,
+metadata-logic, and restore HTTP targets in Debug. Historical soaks of
+`0126d8b30` and `8a4d2d83e` do not validate these changes.
+
+Native macOS Debug validation passed all 29 restore-store, 248 metadata-logic,
+and 36 restore HTTP tests, with no skips, failures, or leaks. The store build
+completed 14/14 steps and the combined metadata/HTTP build completed 17/17.
+Evidence: `/private/tmp/ci694-reservation-store-tests.log` and
+`/private/tmp/ci694-reservation-integration-tests.log`. Fresh E2E acceptance
+requires rebuilding this revision and reaching 100/100 in each scenario.
+
 ## 2026-09-11: restore expiry must retire durable idempotency ownership (#694)
 
 Fresh review of `0126d8b30` reproduced an expiry regression: after a terminal
