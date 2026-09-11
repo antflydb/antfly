@@ -169,7 +169,7 @@ const CompactionWork = struct {
 /// certificate. Each maintenance turn performs at most one preparation or
 /// validation quantum; only admitted streaming execution drains a whole job.
 pub const PendingAdmission = struct {
-    directory: *Directory,
+    accounting: Directory.Accounting,
     selected: ?SelectedPlan,
     policy: PlanningPolicy,
     validation: ?DependencyValidation = null,
@@ -186,16 +186,16 @@ pub const PendingAdmission = struct {
     fn create(backend: anytype, selected: SelectedPlan, policy: PlanningPolicy) !*@This() {
         var reservation: ?resource_manager_mod.Reservation = null;
         errdefer if (reservation) |*lease| lease.release();
-        if (backend.options.resource_manager) |manager| reservation = try manager.reserve(.lsm_table_builder_working_set, @sizeOf(@This()) + @sizeOf(Directory));
-        const directory = try (try backend.planningDirectory()).fork(backend.allocator);
-        errdefer directory.destroy(backend.allocator);
+        if (backend.options.resource_manager) |manager| reservation = try manager.reserve(.lsm_table_builder_working_set, @sizeOf(@This()));
+        var accounting = (try backend.planningDirectory()).pinAccounting();
+        errdefer accounting.deinit();
         const self = try backend.allocator.create(@This());
-        self.* = .{ .directory = directory, .selected = selected, .policy = policy, .reservation = reservation, .option_input_limit = backend.options.max_compaction_input_bytes, .option_allow_oversized = backend.options.max_compaction_input_allow_oversized_single_job, .partition_key = backend.options.run_partition_key };
+        self.* = .{ .accounting = accounting, .selected = selected, .policy = policy, .reservation = reservation, .option_input_limit = backend.options.max_compaction_input_bytes, .option_allow_oversized = backend.options.max_compaction_input_allow_oversized_single_job, .partition_key = backend.options.run_partition_key };
         return self;
     }
 
     pub fn accountedMemoryBytes(self: *const @This(), pass: u64) u64 {
-        var bytes = self.directory.accountedMemoryBytes(pass);
+        var bytes = self.accounting.accountedMemoryBytes(pass);
         if (self.validation) |validation| {
             bytes +|= validation.directory.accountedMemoryBytes(pass);
             if (validation.latest) |latest| bytes +|= latest.accountedMemoryBytes(pass);
@@ -275,7 +275,7 @@ pub const PendingAdmission = struct {
         var credits: usize = std.math.maxInt(usize);
         std.debug.assert(self.cleanupStep(backend.allocator, &credits));
         if (self.validation) |*validation| validation.deinit(backend);
-        backend.retireCheckpointDirectory(self.directory);
+        self.accounting.deinit();
         self.work.deinit(backend.allocator);
         if (self.reservation) |*lease| lease.release();
         backend.allocator.destroy(self);
@@ -366,6 +366,81 @@ test "compaction admission retains prepared work and wakes all paused lanes" {
             if (backend.pending_admissions[lane] == null) break;
         }
         try std.testing.expect(backend.pending_admissions[lane] == null);
+        try std.testing.expectEqual(@as(u64, 0), backend.compaction_scheduler.grants);
+    }
+}
+
+test "compaction parked jobs release unrelated SSTs across admission retries" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    const allocator = std.testing.allocator;
+    // Ordinary, L0-only, GC, and bulk admission all obey the same lifetime
+    // contract. Keep the job denied while unrelated publications churn.
+    for (0..4) |lane| {
+        var backend = Backend.init(allocator, .{ .wal_enabled = false, .compaction_scheduler = .{ .max_in_flight_input_bytes = 1, .allow_oversized_single_job = false } });
+        defer backend.close();
+        try std.testing.expect(backend.mu.tryLock());
+        defer backend.mu.unlock();
+        const level: u32 = if (lane == 1 or lane == 3) 0 else 1;
+        for (0..3) |i| {
+            var run = testRun(i + 1, if (i == 2) 3 else level, if (i == 2) "z" else "a", if (i == 2) "z" else "a", 100);
+            run.path = @constCast(if (i == 2) "unrelated.sst" else "selected.sst");
+            run.tombstone_count = 0;
+            try backend.runs.append(allocator, run);
+        }
+        const directory = try backend.planningDirectory();
+        if (lane < 3) {
+            const handles = try allocator.alloc(Directory.Handle, 2);
+            for (handles, 0..) |*handle, i| handle.* = directory.at(i).retain();
+            var selected = SelectedPlan{ .plan = .{ .source_level = level, .source_start = 0, .source_len = 2, .target_start = 2, .target_len = 0, .output_level = level + 1, .input_handles = handles, .partition_key = wholeKeyspace } };
+            errdefer selected.deinit(allocator);
+            backend.pending_admissions[lane] = try PendingAdmission.create(&backend, selected, .{ .l0_limit = 0, .l0_only = lane == 1, .max_bytes = 0, .allow_oversized = false });
+        }
+        const policy = BulkPolicy{ .fan_in = 2 };
+        for (0..64) |_| {
+            if (lane < 3) {
+                _ = try resumeAdmission(&backend, lane, 1);
+            } else {
+                _ = try compactBulkDirectory(&backend, policy, true, 1);
+            }
+            if (backend.compaction_scheduler.denied_capacity != 0) break;
+        }
+        try std.testing.expect(backend.compaction_scheduler.denied_capacity != 0);
+        const ids = if (lane < 3) backend.pending_admissions[lane].?.work.run_ids.ptr else backend.pending_bulk_plan.?.work.run_ids.ptr;
+        if (lane == 3) {
+            try std.testing.expect(backend.pending_bulk_plan.?.directory == null);
+            try std.testing.expect(backend.pending_bulk_plan.?.selection == null);
+            try std.testing.expect(backend.pending_bulk_plan.?.cursor == null);
+        }
+        // Remove a file outside the selected inputs, exactly as an unrelated
+        // compaction publication would. Its old physical pin must disappear
+        // once delta validation advances, without admitting the parked job.
+        const unrelated = backend.run_directory.?.byId(3).?;
+        const replacement = try backend.run_directory.?.fork(allocator);
+        try replacement.remove(allocator, unrelated);
+        try backend.runs.remove(allocator, backend.runs.find(unrelated).?);
+        backend.invalidateReadVersion();
+        backend.publishRunDirectory(replacement);
+        try backend.queueObsoleteFilePath(try allocator.dupe(u8, "unrelated.sst"));
+        const denials = backend.compaction_scheduler.denied_capacity;
+        if (lane < 3) backend.pending_admissions[lane].?.retry_after_ns = 0 else backend.pending_bulk_plan.?.retry_after_ns = 0;
+        for (0..64) |_| {
+            if (lane < 3) {
+                _ = try resumeAdmission(&backend, lane, 1);
+            } else {
+                _ = try compactBulkDirectory(&backend, policy, true, 1);
+            }
+            if (backend.compaction_scheduler.denied_capacity > denials) break;
+        }
+        try std.testing.expect(backend.compaction_scheduler.denied_capacity > denials);
+        try std.testing.expectEqual(ids, if (lane < 3) backend.pending_admissions[lane].?.work.run_ids.ptr else backend.pending_bulk_plan.?.work.run_ids.ptr);
+        for (0..32) |_| {
+            backend.unlockWithReclamation();
+            try std.testing.expect(backend.mu.tryLock());
+        }
+        backend.mu.unlock();
+        const stats = backend.snapshotMaintenanceStats();
+        try std.testing.expect(backend.mu.tryLock());
+        try std.testing.expectEqual(@as(u64, 0), stats.obsolete_paths_pinned_by_readers);
         try std.testing.expectEqual(@as(u64, 0), backend.compaction_scheduler.grants);
     }
 }
@@ -3179,9 +3254,12 @@ pub fn bulkDirectoryPlanningDue(backend: anytype, policy: BulkPolicy) bool {
 }
 
 pub const PendingBulkPlan = struct {
-    directory: *Directory,
+    directory: ?*Directory,
+    accounting: Directory.Accounting,
     generation: u64,
-    selection: BulkSelection,
+    policy: BulkPolicy,
+    selection: ?BulkSelection,
+    no_candidate: bool = false,
     phase: enum { select, emit, validate, done } = .select,
     cursor: ?Directory.Cursor = null,
     handles: ?[]Directory.Handle = null,
@@ -3199,7 +3277,8 @@ pub const PendingBulkPlan = struct {
     active_next: ?*@This() = null,
 
     pub fn accountedMemoryBytes(self: *const @This(), pass: u64) u64 {
-        var bytes = self.directory.accountedMemoryBytes(pass);
+        var bytes = self.accounting.accountedMemoryBytes(pass);
+        if (self.directory) |directory| bytes +|= directory.accountedMemoryBytes(pass);
         if (self.validation) |validation| {
             bytes +|= validation.directory.accountedMemoryBytes(pass);
             if (validation.latest) |latest| bytes +|= latest.accountedMemoryBytes(pass);
@@ -3215,7 +3294,7 @@ pub const PendingBulkPlan = struct {
         const directory = try (try backend.planningDirectory()).fork(backend.allocator);
         errdefer directory.destroy(backend.allocator);
         const self = try backend.allocator.create(@This());
-        self.* = .{ .directory = directory, .generation = backend.run_directory_generation, .selection = .init(directory, policy), .reservation = credit };
+        self.* = .{ .directory = directory, .accounting = directory.pinAccounting(), .generation = backend.run_directory_generation, .policy = policy, .selection = .init(directory, policy), .reservation = credit };
         self.active_next = backend.active_bulk_plans;
         backend.active_bulk_plans = self;
         return self;
@@ -3232,6 +3311,16 @@ pub const PendingBulkPlan = struct {
         }
         backend.directory_planning_slices +|= 1;
         if (self.phase == .validate) {
+            // Emission owns every selected handle now. Drop the discovery
+            // snapshot before validation admission can park this job. Only
+            // the certificate's current/delta epochs may pin unrelated SSTs.
+            if (self.directory) |directory| {
+                self.cursor = null;
+                self.selection = null;
+                backend.retireCheckpointDirectory(directory);
+                self.directory = null;
+                if (self.reservation) |*lease| lease.shrink(@sizeOf(Directory));
+            }
             if (self.validation == null) {
                 self.validation = try DependencyValidation.init(backend, self.selected.?.plan);
                 self.validation.?.job.indices = @constCast(self.selected.?.plan.run_indices.?);
@@ -3261,10 +3350,13 @@ pub const PendingBulkPlan = struct {
         var credits = credits_arg;
         const allocator = backend.allocator;
         if (self.phase == .select) {
-            if (self.selection.step(credits, deadline)) self.phase = if (self.selection.result != null) .emit else .done;
+            if (self.selection.?.step(credits, deadline)) {
+                self.no_candidate = self.selection.?.result == null;
+                self.phase = if (self.no_candidate) .done else .emit;
+            }
             return;
         }
-        const range = self.selection.result.?;
+        const range = self.selection.?.result.?;
         if (self.handles == null) {
             if (backend.options.resource_manager) |manager|
                 self.output_reservation = try manager.reserve(.lsm_table_builder_working_set, range.len * (@sizeOf(Directory.Handle) + @sizeOf(usize)));
@@ -3279,7 +3371,7 @@ pub const PendingBulkPlan = struct {
             try self.work.run_id_index.?.ensureTotalCapacity(allocator, std.math.cast(u32, range.len) orelse return error.OutOfMemory);
             self.indices = indices;
             self.handles = handles;
-            self.cursor = self.directory.readCursor();
+            self.cursor = self.directory.?.readCursor();
             self.cursor.?.rank = range.start;
         }
         while (self.emitted < range.len and credits != 0 and @import("antfly_platform").time.monotonicNs() < deadline) {
@@ -3336,7 +3428,8 @@ pub const PendingBulkPlan = struct {
     pub fn finish(self: *@This(), backend: anytype) void {
         backend.unregisterBulkPlanning(self);
         if (self.validation) |*validation| validation.deinit(backend);
-        backend.retireCheckpointDirectory(self.directory);
+        if (self.directory) |directory| backend.retireCheckpointDirectory(directory);
+        self.accounting.deinit();
         if (self.output_reservation) |*lease| lease.release();
         self.work.deinit(backend.allocator);
         if (self.work_reservation) |*lease| lease.release();
@@ -3355,7 +3448,7 @@ fn compactBulkDirectory(backend: anytype, policy: BulkPolicy, scheduled: bool, s
     if (scheduled) if (backend.pending_bulk_plan) |pending|
         if (pending.retry_after_ns > backend.nowNs()) return false;
     if (scheduled and !bulkDirectoryPlanningDue(backend, policy)) return false;
-    if (scheduled) if (backend.pending_bulk_plan) |pending| if (!pending.selection.policy.eql(policy)) {
+    if (scheduled) if (backend.pending_bulk_plan) |pending| if (!pending.policy.eql(policy)) {
         backend.retireBulkPlanning(pending);
         backend.pending_bulk_plan = null;
     };
@@ -3384,7 +3477,7 @@ fn compactBulkDirectory(backend: anytype, policy: BulkPolicy, scheduled: bool, s
     }
     if (pending.selected == null or pending.selected.?.plan.validated_generation == null) {
         retire = true;
-        if (scheduled and pending.selection.result == null and pending.generation == backend.run_directory_generation) {
+        if (scheduled and pending.no_candidate and pending.generation == backend.run_directory_generation) {
             backend.bulk_plan_negative_generation = pending.generation;
             backend.bulk_plan_negative_policy = policy;
         }

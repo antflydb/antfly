@@ -3082,7 +3082,7 @@ pub const Backend = struct {
 
     fn bulkPlanNeededLocked(self: *const Backend, pending: *const compaction_mod.PendingBulkPlan) bool {
         return self.options.bulk_ingest_tiered_l0_fan_in >= 2 and self.l0SoftPressureLocked() and
-            pending.selection.policy.eql(.{ .fan_in = self.options.bulk_ingest_tiered_l0_fan_in, .max_bytes = self.options.max_compaction_input_bytes, .sequence = if (self.bulkIngestActive()) self.bulk_ingest_window_first_sequence else 0 });
+            pending.policy.eql(.{ .fan_in = self.options.bulk_ingest_tiered_l0_fan_in, .max_bytes = self.options.max_compaction_input_bytes, .sequence = if (self.bulkIngestActive()) self.bulk_ingest_window_first_sequence else 0 });
     }
 
     fn retireUnneededBulkPlanLocked(self: *Backend) bool {

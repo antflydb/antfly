@@ -22,6 +22,89 @@ const Account = @import("memory_account.zig").Account;
 const Run = repository.Run;
 const generation_index = @import("generation_index.zig");
 
+test "directory accounting pin retention scaling benchmark" {
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        pins: usize = 0,
+        pub fn retainRunSnapshotRef(self: *@This(), _: *Run) !void {
+            self.pins += 1;
+        }
+        pub fn releaseRunSnapshotRef(self: *@This(), _: *Run) void {
+            self.pins -= 1;
+        }
+    };
+    const allocator = std.heap.smp_allocator;
+    const time = @import("antfly_platform").time;
+    for ([_]usize{ 1000, 10000, 50000 }) |count| {
+        var fixture = Fixture{ .allocator = allocator };
+        const directory = try Directory.create(allocator);
+        for (0..count) |i| try directory.put(&fixture, .{ .id = i + 1, .level = 0, .size_bytes = 1024, .path = @constCast("benchmark.sst"), .smallest_namespace_name = null, .smallest_key = @constCast("a"), .largest_namespace_name = null, .largest_key = @constCast("z"), .entry_count = 1, .bloom_filter = null, .state = null });
+        const started = time.monotonicNs();
+        for (0..10000) |_| {
+            var token = directory.pinAccounting();
+            std.mem.doNotOptimizeAway(&token);
+            token.deinit();
+        }
+        const token_ns = (time.monotonicNs() - started) / 10000;
+        const old_root = try directory.fork(allocator);
+        var accounting = directory.pinAccounting();
+        defer accounting.deinit();
+        const selected = directory.at(0).retain();
+        defer selected.release(allocator);
+        directory.destroy(allocator);
+        const old_pins = fixture.pins;
+        const old_bytes = accounting.accountedMemoryBytes(@import("memory_account.zig").nextPass());
+        old_root.destroy(allocator);
+        const new_bytes = accounting.accountedMemoryBytes(@import("memory_account.zig").nextPass());
+        try std.testing.expectEqual(count, old_pins);
+        try std.testing.expectEqual(@as(usize, 1), fixture.pins);
+        std.debug.print("accounting-retention runs={d} selected=1 old_pins={d} new_pins={d} old_metadata_bytes={d} new_metadata_bytes={d} token_capture_release_ns={d}\n", .{ count, old_pins, fixture.pins, old_bytes, new_bytes, token_ns });
+    }
+}
+
+test "directory accounting token charges selected payloads without pinning unrelated files" {
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        pins: usize = 0,
+        pub fn retainRunSnapshotRef(self: *@This(), _: *Run) !void {
+            self.pins += 1;
+        }
+        pub fn releaseRunSnapshotRef(self: *@This(), _: *Run) void {
+            self.pins -= 1;
+        }
+        fn check(allocator: std.mem.Allocator) !void {
+            var fixture = @This(){ .allocator = allocator };
+            var accounting: ?Directory.Accounting = null;
+            defer if (accounting) |*token| token.deinit();
+            var selected: ?Directory.Handle = null;
+            defer if (selected) |handle| handle.release(allocator);
+            {
+                const directory = try Directory.create(allocator);
+                defer directory.destroy(allocator);
+                for (0..3) |i| try directory.put(&fixture, .{ .id = i + 1, .level = 0, .size_bytes = 1, .path = @constCast("account.sst"), .smallest_namespace_name = null, .smallest_key = @constCast("a"), .largest_namespace_name = null, .largest_key = @constCast("z"), .entry_count = 1, .bloom_filter = null, .state = null });
+                accounting = directory.pinAccounting();
+                selected = directory.at(0).retain();
+            }
+            try std.testing.expectEqual(@as(usize, 1), fixture.pins);
+            const pass = @import("memory_account.zig").nextPass();
+            const bytes = accounting.?.accountedMemoryBytes(pass);
+            try std.testing.expect(bytes > 6 * @sizeOf(Account));
+            try std.testing.expectEqual(@as(u64, 0), selected.?.accountedMemoryBytes(pass));
+            try std.testing.expectEqual(@as(u64, 0), accounting.?.accountedMemoryBytes(pass));
+            selected.?.release(allocator);
+            selected = null;
+            try std.testing.expectEqual(@as(usize, 0), fixture.pins);
+            var headers: u64 = 0;
+            for (accounting.?.accounts) |maybe| if (maybe) |_| {
+                headers += @sizeOf(Account);
+            };
+            try std.testing.expectEqual(headers, accounting.?.accountedMemoryBytes(@import("memory_account.zig").nextPass()));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{});
+}
+
 const Payload = struct {
     refs: std.atomic.Value(usize) = .init(1),
     run: Run,
@@ -250,6 +333,38 @@ pub const Directory = struct {
         if (self.levels.account) |account| account.release();
         if (self.generations.account) |account| account.release();
     }
+
+    /// Memory ownership is not read visibility. A parked job can charge its
+    /// selected payloads after releasing the discovery root without retaining
+    /// tree nodes or the physical SST pins of unrelated runs. Capturing and
+    /// releasing this token is O(1), independent of the number of inputs.
+    pub const Accounting = struct {
+        accounts: [6]?*Account,
+
+        pub fn accountedMemoryBytes(self: *const Accounting, pass: u64) u64 {
+            var bytes: u64 = 0;
+            for (self.accounts) |maybe| if (maybe) |account| {
+                bytes +|= account.chargeOnce(pass);
+            };
+            return bytes;
+        }
+
+        pub fn deinit(self: *Accounting) void {
+            for (&self.accounts) |*maybe| {
+                if (maybe.*) |account| account.release();
+                maybe.* = null;
+            }
+        }
+    };
+
+    pub fn pinAccounting(self: *const Directory) Accounting {
+        const result = Accounting{ .accounts = .{ self.tree.account, self.ids.account, self.bounds.account, self.ends.account, self.levels.account, self.generations.account } };
+        for (result.accounts) |maybe| if (maybe) |account| {
+            _ = account.retain();
+        };
+        return result;
+    }
+
     pub fn put(self: *Directory, backend: anytype, run: Run) !void {
         const allocator = backend.allocator;
         const previous = find(self.tree.root, .{ .run = &run });

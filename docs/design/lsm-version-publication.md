@@ -50,6 +50,51 @@ writer-tree lookups under the mutex. Any intervening publication requires
 input identity/closure validation before execution, including tombstone-free
 tables and split-GC plans; absence of deletes is not an identity certificate.
 
+### Phase-scoped file pins and independent accounting
+
+Accounting ownership must not extend read visibility. `Directory.Accounting`
+retains the six shared allocation accounts, not directory roots or SST payloads.
+Capturing/releasing it takes constant work and no allocation. Accounting passes
+deduplicate these accounts with live roots and selected handles; atomic byte
+counters continue to include payloads during off-lock, sliced cleanup.
+
+Ordinary, L0-only and GC admission owners retain selected handles and an
+accounting token, but no redundant discovery root. Bulk jobs need their original
+root while selecting/emitting; they retire it and clear both discovery cursors
+before admitting validation. Their policy and negative-selection result remain
+available independently of those cursors. Consequently, validation-budget or
+scheduler denial cannot keep an otherwise unused discovery snapshot alive.
+
+The dependency certificate still owns the epochs required for initial validation
+and delta traversal. Once it advances, the superseded epoch goes through bounded
+directory reclamation. Selected input files remain pinned until execution or
+retirement completes. This bounds *redundant discovery-epoch* retention after
+churn to the selected inputs, rather than the entire original table; active
+readers, validation cursors, checkpoints and retention deadlines can legitimately
+keep additional files alive. This is not a global storage-amplification bound.
+
+Local arm64 ReleaseFast lifetime benchmark, one selected input after the rest of
+its original directory becomes obsolete:
+
+| Original runs | Previous retained payload pins | Accounting-only pins | Previous retained metadata | New retained metadata |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 1,000 | 1 | 1,047,328 B | 775 B |
+| 10,000 | 10,000 | 1 | 10,470,328 B | 775 B |
+| 50,000 | 50,000 | 1 | 52,350,328 B | 775 B |
+
+Token capture/release averaged 9–11 ns across 10,000 repetitions. This synthetic
+fixture measures ownership and retained metadata, not physical disk usage or
+compaction throughput. A separate backend regression keeps all four admission
+lanes denied, removes an unrelated SST, advances the certificate, and verifies
+that its physical-file pin is released without rebuilding prepared input IDs.
+Allocation-failure coverage verifies token/handle cleanup and exact shared
+accounting after all directory roots have been destroyed.
+
+```sh
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -- --test-filter 'compaction parked jobs' --test-filter 'directory accounting token'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'directory accounting pin retention scaling benchmark'
+```
+
 Tombstone metadata distinguishes known zero, known nonzero and unknown. Mainline
 v9/v10 manifests remain readable, but their unknown counts now contribute explicit
 maintenance debt. An augmented directory query finds an unknown input without
