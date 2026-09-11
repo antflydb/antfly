@@ -27,6 +27,12 @@ const runtime_status = @import("../api/runtime_status.zig");
 const metadata_runtime_status_protocol = @import("../metadata/runtime_status_protocol.zig");
 const api_http_test_runtime = if (@import("builtin").is_test) @import("../api/http_test_runtime.zig") else struct {};
 
+var test_before_runtime_status_fallback_probe: ?struct {
+    ptr: *anyopaque,
+    run: *const fn (*anyopaque) void,
+    observed: *const fn (*anyopaque) void,
+} = null;
+
 fn executeApiHttpxTestRequest(
     api: *antfly.public_api.http_server.ApiHttpServer,
     req: antfly.raft.transport.http_common.HttpRequest,
@@ -17956,25 +17962,38 @@ pub const DataServer = struct {
                 }
                 continue;
             }
+            if (@import("builtin").is_test) {
+                if (test_before_runtime_status_fallback_probe) |hook| hook.run(hook.ptr);
+            }
             switch (self.probeManagedWriterGroupBestEffort(table.name, group_id)) {
                 .leased => |cached| {
                     var lease = cached;
                     const release_alloc = if (lease.cache) |cache| cache.alloc else std.heap.page_allocator;
                     defer lease.deinit(release_alloc);
-                    var status = runtime_status.LocalTableRuntimeStatus{
-                        .group_id = group_id,
-                        .metadata = .{
-                            .updated_at_ns = self.backgroundMonotonicNs(),
-                            .source = .live_writer_publish,
-                            .freshness = .fresh,
-                        },
-                        .stats = try lease.db.stats(self.alloc),
-                    };
-                    errdefer status.deinit(self.alloc);
-                    self.overlayManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id, &status);
-                    self.applyRuntimeStatusStorageFactsBestEffort(&status, group_id, lease.db);
-                    try items.append(self.alloc, status);
-                    continue;
+                    // Owning a DB lease does not make operational stats a
+                    // coherent observation: stats() can omit every index when
+                    // apply is busy. Admit authority only after a complete
+                    // nonblocking snapshot, otherwise retain cached facts below.
+                    const observed_stats = try lease.db.runtimeStatusStatsConsistentIfAvailable(self.alloc);
+                    if (@import("builtin").is_test) {
+                        if (test_before_runtime_status_fallback_probe) |hook| hook.observed(hook.ptr);
+                    }
+                    if (observed_stats) |fresh_stats| {
+                        var status = runtime_status.LocalTableRuntimeStatus{
+                            .group_id = group_id,
+                            .metadata = .{
+                                .updated_at_ns = self.backgroundMonotonicNs(),
+                                .source = .live_writer_publish,
+                                .freshness = .fresh,
+                            },
+                            .stats = fresh_stats,
+                        };
+                        errdefer status.deinit(self.alloc);
+                        self.overlayManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id, &status);
+                        self.applyRuntimeStatusStorageFactsBestEffort(&status, group_id, lease.db);
+                        try items.append(self.alloc, status);
+                        continue;
+                    }
                 },
                 .unknown => {
                     if (try self.provisioned_storage.runtime_status_cache.snapshotGroupStatus(self.alloc, table.name, group_id)) |cached| {
@@ -30707,6 +30726,196 @@ test "data runtime status refresh publishes placeholder when live managed writer
     try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.stale, docs_cached.items[0].metadata.freshness);
     try std.testing.expect(!runtime_status.statusHasRuntimeFacts(docs_cached.items[0]));
     try std.testing.expectEqual(@as(u64, 0), docs_cached.items[0].stats.doc_count);
+}
+
+test "data runtime status refresh retains serving facts when fallback lease races apply contention" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-refresh-fallback-apply-contention", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root_dir});
+    defer alloc.free(db_path);
+
+    const FakeStatus = struct {
+        fn iface() antfly.public_api.http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = 77,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{.{
+                    .store_id = 19,
+                    .node_id = 9,
+                    .role = "data",
+                    .live = true,
+                    .health_class = "healthy",
+                }})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{.{
+                    .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 9 },
+                    .store_id = 19,
+                    .peer_node_ids = &.{9},
+                }})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeCatalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                    .linearizable_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                    .free_routing_snapshot = antfly.public_api.table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return try FakeStatus.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    var write_cache = antfly.public_api.ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+
+    var server: DataServer = .{
+        .alloc = alloc,
+        .store_registration = .{
+            .node_id = 9,
+            .store_id = 19,
+            .role = "data",
+            .failure_domain = "test",
+        },
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            FakeCatalog.iface(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            replica_root_dir,
+            FakeCatalog.iface(),
+        ),
+        .status_source = FakeStatus.iface(),
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+    try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+    server.write_source.write_cache = &write_cache;
+
+    var resident_db: *antfly.db.DB = undefined;
+    {
+        lockAtomic(server.write_source.localDbMutex());
+        defer server.write_source.localDbMutex().unlock();
+        var cached = try write_cache.getOrOpenLocked(db_path, FakeCatalog.iface(), 77, 0, "docs");
+        defer cached.deinit(alloc);
+        resident_db = cached.db;
+        try cached.db.addIndex(.{ .name = "search", .kind = .full_text, .config_json = "{}" });
+        try cached.db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .sync_level = .write,
+        });
+    }
+
+    var initial = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 77,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = try resident_db.runtimeStatusStatsConsistent(alloc),
+    };
+    defer initial.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), initial.stats.indexes.len);
+    try publishRuntimeStatusGroupForTest(&server.provisioned_storage.runtime_status_cache, "docs", initial);
+
+    const Probe = struct {
+        mutex: *std.atomic.Mutex,
+        db: *antfly.db.DB,
+        apply_locked: bool = false,
+        held: bool = true,
+        called: bool = false,
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.held) return;
+            self.called = true;
+            self.held = false;
+            self.mutex.unlock();
+        }
+        fn observed(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.apply_locked) return;
+            self.apply_locked = false;
+            self.db.core.unlockApplyExclusive();
+        }
+    };
+    var probe = Probe{ .mutex = server.write_source.localDbMutex(), .db = resident_db };
+    // The first owner probe loses cache admission. Its fallback acquires a
+    // lease after that mutex is released, while foreground apply remains busy.
+    resident_db.core.lockApplyExclusive();
+    probe.apply_locked = true;
+    defer if (probe.apply_locked) resident_db.core.unlockApplyExclusive();
+    lockAtomic(probe.mutex);
+    defer if (probe.held) probe.mutex.unlock();
+    test_before_runtime_status_fallback_probe = .{ .ptr = &probe, .run = Probe.run, .observed = Probe.observed };
+    defer test_before_runtime_status_fallback_probe = null;
+    const refresh = server.runRuntimeStatusRefreshWithBudget(0);
+    try std.testing.expect(probe.called);
+    try std.testing.expectEqual(@as(u64, 1), refresh.group_count);
+    var retained = (try server.provisioned_storage.runtime_status_cache.snapshot(alloc, "docs")).?;
+    defer retained.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), retained.items[0].stats.source_doc_count);
+    try std.testing.expectEqual(@as(usize, 1), retained.items[0].stats.indexes.len);
+    try std.testing.expectEqualStrings("search", retained.items[0].stats.indexes[0].name);
+
+    try std.testing.expect(!probe.apply_locked);
+    test_before_runtime_status_fallback_probe = null;
+    try resident_db.batch(.{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
+        .sync_level = .write,
+    });
+    _ = server.runRuntimeStatusRefreshWithBudget(0);
+    var refreshed = (try server.provisioned_storage.runtime_status_cache.snapshot(alloc, "docs")).?;
+    defer refreshed.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), refreshed.items[0].stats.source_doc_count);
+    try std.testing.expectEqual(@as(usize, 1), refreshed.items[0].stats.indexes.len);
 }
 
 test "data local group status refresh skips active group when cache entry is missing" {

@@ -30575,7 +30575,10 @@ fn publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
         } else {
             var status = runtime_status.LocalTableRuntimeStatus{
                 .group_id = group_id,
-                .stats = try db.stats(alloc),
+                // A cold startup has no retained serving observation to
+                // overlay. Retry contention instead of publishing partial
+                // operational telemetry as an observed index inventory.
+                .stats = (try db.runtimeStatusStatsConsistentIfAvailable(alloc)) orelse return error.WriterLocked,
             };
             defer status.deinit(alloc);
             const startup = startupCatchUpStatsForPhase(phase, db);
@@ -49687,6 +49690,14 @@ test "provisioned table write source best effort publish does not advertise lock
 
     try std.testing.expect(!published_while_busy);
     try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
+
+    for ([_]db_mod.types.StartupCatchUpPhase{ .opening_db, .artifact_rebuild, .startup_catch_up }) |phase| {
+        db.core.lockApplyExclusive();
+        const startup_publication = publishRuntimeStatusSnapshotWithStartupPhase(&source, alloc, "docs", 7001, phase, &db);
+        db.core.unlockApplyExclusive();
+        try std.testing.expectError(error.WriterLocked, startup_publication);
+        try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
+    }
 
     try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &db));
     var published = (try snapshot_cache.snapshot(alloc, "docs")).?;

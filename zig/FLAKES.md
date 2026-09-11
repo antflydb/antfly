@@ -4,6 +4,47 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-11: partial operational stats erase the published index inventory (#694)
+
+The native Debug soak of `badafbaf9` finished with quickstart **97/100**, while
+backup/restore and retry/restart each passed **100/100**. Two quickstart polls
+lost the already-serving text index after creating the image index; another
+returned zero source documents after the image searchable-artifact wait.
+Evidence is retained under `/private/tmp/ci694-reservation-native-soak-badafbaf9`.
+
+A diagnostic variant polled the existing index 100 times after releasing the
+embedder. It reproduced the missing-runtime response twice in 20 runs. The
+instrumented API received `source=live_writer_publish`, `docs=3`, `indexes=0`;
+the immutable table read view had not been invalidated. See
+`/private/tmp/ci694-api-diag-soak/tmp/antfly-zig-standalone-e2e-z3pie08a/server.log`
+and the sibling failure `antfly-zig-standalone-e2e-0lvzz9hb`.
+
+The runtime refresher first missed writer-cache admission, then acquired a
+lease in its fallback probe. That fallback called `DB.stats()`, whose bounded
+operational contract permits an empty index inventory while apply is busy.
+Later overlays could refresh document counters without restoring those index
+rows. Publishing this as a fresh writer observation let the complete refresh
+replace the prior index inventory with an empty one.
+
+The fallback now uses `runtimeStatusStatsConsistentIfAvailable`: only a
+coherent observation receives writer authority. Contention falls through to
+the retained cached observation, or an explicit synthetic placeholder if no
+runtime has published yet. The cold startup publication path uses the same
+boundary and returns retryable `WriterLocked` instead of manufacturing an
+observed empty inventory. Neither path adds a blocking apply-lock acquisition,
+a polling loop, or a longer public timeout.
+
+The deterministic regression releases the writer-cache mutex between the two
+probes while holding apply through the fallback observation. It fails on the
+old code with `expected 1, found 0`, without leaks. With the fix it retains
+source cardinality and the serving index, then observes a subsequent write.
+The cold-publication regression covers opening, artifact rebuild, and startup
+catch-up phases. Native Debug validation passed ten focused refresh/publication
+tests and all 226 writer lifecycle regressions (236 total), without skips,
+failures, or leaks; the combined build completed 17/17 steps. Logs:
+`/private/tmp/ci694-status-fallback-before.log` and
+`/private/tmp/ci694-status-fallback-fixed.log`.
+
 ## 2026-09-11: prefetch restart races executor capacity release (#694)
 
 [CI run 34627106321](https://github.com/antflydb/antfly/actions/runs/34627106321/job/103355428154)
