@@ -11460,7 +11460,7 @@ test "lsm backend accounts in-memory recovery state in the resource manager and 
     }
 
     const maintenance = backend.snapshotMaintenanceStats();
-    const expected_in_memory_bytes = maintenance.mutable_bytes + maintenance.immutable_bytes;
+    const expected_in_memory_bytes = maintenance.mutable_bytes + maintenance.immutable_bytes + @sizeOf(output_cleanup.Queue) + maintenance.unpublished_output_cleanup_bytes;
     try std.testing.expect(expected_in_memory_bytes > 0);
     try std.testing.expectEqual(expected_in_memory_bytes, manager.sliceStats(.lsm_in_memory_state).used_bytes);
 

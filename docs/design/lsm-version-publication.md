@@ -2,6 +2,49 @@
 
 ## Logical-generation scheduling and unknown metadata
 
+### Abandoned output ownership and bounded deletion
+
+Every persisted output builder obtains a path-owning cleanup ticket before
+creating its SST. A successful, irrevocable publication disarms the ticket.
+Partial builds, cancellation, stale input validation and failed publication
+transfer ownership to a backend FIFO without allocation or filesystem I/O.
+Tickets are independent of candidate run metadata: retiring a shared candidate
+cannot delay or lose the cleanup obligation. Locked callers use an explicit
+off-lock destruction helper with 512-output/two-millisecond slices; builders and
+split destinations use a separate helper that never changes lock ownership.
+
+Maintenance admits at most 64 ticket paths or two milliseconds of ledger edits
+per turn. Admission/OOM failures retain the original tickets and expose a retry
+deadline instead of spinning. Bulk mode advertises this work too, even when it
+defers physical deletion. Sync drains pending handoffs and persists their paths
+in the existing obsolete-file journal. Queue paths and memory, admission failures,
+and existing deletion/retry counters make the debt observable. Tickets reserve
+builder working-set credit before file creation and release it on publication or
+ledger handoff.
+
+Physical reclamation retains its own path and lifecycle pin, releases the backend
+mutex for deletion/cache invalidation, then reacquires it to update the ledger.
+Each turn visits at most 128 entries or two milliseconds. Failed deletes retain
+their durable retry records, including across reopen. One storage or allocator
+operation can exceed the cooperative time budget; this is not a hard realtime
+bound. Atomic-writer temporary-file cleanup remains the writer's responsibility.
+A crash before ticket handoff, or a close unable to persist due to storage failure,
+still relies on native orphan reconciliation; RAM ownership is not a durable
+pre-creation intent log.
+
+Local arm64 ReleaseFast ownership-handoff benchmark (no SST I/O or durable ledger
+admission in the timed region): 1,000 outputs took 62 µs, 10,000 took 775 µs, and
+50,000 took 3.63 ms total, outside the writer mutex. Tickets retained 87 bytes per
+fixture path. These samples measure cleanup handoff, not end-to-end deletion
+throughput. Tests additionally cover allocation failure, partial output after an
+ambiguous cancelled rename, bulk maintenance, and failed deletes surviving reopen;
+the delete hook checks that the backend mutex is available during physical I/O.
+
+```sh
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -- --test-filter 'output cleanup'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'output cleanup off-lock handoff scaling benchmark'
+```
+
 ### Time-sliced compaction publication
 
 Compaction installation now owns a registered publication job. It pins immutable
