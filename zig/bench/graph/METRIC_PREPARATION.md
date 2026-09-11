@@ -128,7 +128,7 @@ zig build graph-metric-preparation-bench -Doptimize=ReleaseSafe -j1 -- --prune-o
 
 ## Streaming cursors, paged control, and tree batches (2026-09-10)
 
-Current graph wire v8 / manifest v23 / materializer epoch 24 uses a 112-byte
+Current graph wire v9 / manifest v24 / materializer epoch 25 uses a 112-byte
 trailer, a bounded authenticated root, and 64 KiB directory leaves. A directory
 larger than 1 MiB stays addressable. Queries load type names and node fences
 lazily, and request sessions share authenticated blocks with single-flight fills.
@@ -923,3 +923,46 @@ preparation dominates the peak. Artifact-store-owned memory is outside that
 tracker. Semantic reuse removes projection/kernel/output work, but still reads
 and prepares a changed source graph; it does not claim a cold object-store I/O
 reduction. The reuse assertion also requires the exact prior metric artifact ID.
+
+## Ownership reads and adaptive type routing (2026-09-10)
+
+```sh
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --ownership-reads-only
+zig build graph-metric-preparation-bench -Doptimize=ReleaseFast -j1 -- --filtered-prefix-only
+```
+
+Apple M4 Max, Zig 0.16.0, five samples after one warmup. Diagnostic before/after
+probes used ReleaseSafe, identical fixtures, and fresh readers without shared
+cache. The checked-in harness also validates exact result identities and work.
+
+| 100,000-edge hub / 64 types | Before GETs / bytes / inspected edges | After GETs / bytes / inspected edges |
+| --- | --- | --- |
+| Wildcard | 7 / 299,988 / 1 | 8 / 364,565 / 1 |
+| kind00 | 10 / 496,596 / 18 | 7 / 299,029 / 1 |
+| kind31 | 15 / 824,276 / 34 | 8 / 364,565 / 1 |
+| kind62 | 11 / 562,132 / 34 | 8 / 364,565 / 1 |
+| All 64 types | 7 / 299,988 / 1 | 8 / 364,565 / 1 |
+
+The sparse directory adds 528 payload bytes plus block-authentication overhead
+to this roughly 7.6 MB artifact. The kind31 probe's local median changed from
+0.392 to 0.229 ms. Cold wildcard/all-type queries pay one extra authenticated
+block read to resolve the indexed row descriptor; this is a deliberate tradeoff,
+not an across-the-board latency claim. No network RTT is modeled. Both
+directions, high-entropy fallback, eager reads, output admission, allocation
+failure, canonical round trips and directory corruption have regression tests.
+Reservation is at most 8 bytes per 16 row edges plus a 16-byte descriptor per
+qualifying row. Encoding fills that reservation during its existing validation
+pass; there is no additional graph-wide edge array or payload copy.
+
+For stateful ownership exclusion, an empty incoming query at the first of
+65,536 target rows changed from 24.053 to 6.624 ms, matching the last target's
+6.693 ms. At 4,096 and 16,384 rows it changed from 1.724/5.637 ms to
+0.442/1.630 ms. The LSM-memory fixture still incurs graph-size-dependent
+snapshot/cursor setup; the graph visibility layer now stops at its physical
+prefix rather than seeking through every later excluded target.
+
+Operational counts now use maintained counters and a pending flag, with zero
+allocation and no traversal. The previous exact status scan took 1.206/4.861/
+19.212 ms at 4,096/16,384/65,536 retained edges and exhausted an 8 KiB allocator
+during retirement. Exact diagnostic scans remain available, but are no longer
+used by operational status, live replay snapshots or cached status refresh.

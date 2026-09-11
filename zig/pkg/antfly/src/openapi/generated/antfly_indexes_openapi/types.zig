@@ -5306,7 +5306,7 @@ pub const GraphIndexStatsIndexType = enum {
     }
 };
 
-/// Statistics for graph index
+/// Statistics for graph index. While counts_pending is true, edge/node/document counts are physical upper bounds awaiting ownership cleanup, not exact logical counts.
 pub const GraphIndexStats = struct {
     /// Discriminator for the index stats variant.
     index_type: GraphIndexStatsIndexType,
@@ -5321,6 +5321,8 @@ pub const GraphIndexStats = struct {
     @"error": ?[]const u8 = null,
     /// Total number of edges in the graph
     total_edges: ?i64 = null,
+    /// True while ownership cleanup is pending on any observed shard. Counts are physical upper bounds until cleanup completes; serving adjacency already enforces ownership.
+    counts_pending: ?bool = null,
     /// Count of edges per edge type
     edge_types: ?std.json.ArrayHashMap(i64) = null,
     /// Whether the index is currently rebuilding
@@ -5397,6 +5399,7 @@ pub const GraphIndexStats = struct {
         .{ "milestones", "milestones", true },
         .{ "error", "error", true },
         .{ "total_edges", "total_edges", true },
+        .{ "counts_pending", "counts_pending", true },
         .{ "edge_types", "edge_types", true },
         .{ "rebuilding", "rebuilding", true },
         .{ "repair", "repair", true },
@@ -5482,6 +5485,10 @@ pub const GraphIndexStats = struct {
         }
         if (self.total_edges) |value| {
             try jw.objectField("total_edges");
+            try jw.write(value);
+        }
+        if (self.counts_pending) |value| {
+            try jw.objectField("counts_pending");
             try jw.write(value);
         }
         if (self.edge_types) |value| {

@@ -39,16 +39,49 @@ and a different transition receives `GraphMaintenanceInProgress` until the
 existing task retires. Replicated split apply normalizes this admission result
 to `RaftApplyWriterUnavailable`, retaining the committed entry for retry while
 other groups and background cleanup progress; its receipt does not advance.
+The same precommit admission applies to range expansion, including receiver
+merge checkpoints and direct range updates. An excluded interval cannot become
+owned again until its old retirement task finishes. This prevents both deletion
+of newly accepted writes and reopen-dependent visibility. Checkpoints that leave
+the range unchanged remain admissible; an overlapping expansion returns the
+same retryable Raft admission result without committing its receipt or range.
 Copying into a previously split receiving index drains
 its prior cleanup before installing replacement edges.
 
-Physical counters remain cheap and durable during retirement. A request for
-exact logical graph statistics temporarily uses a scoped edge scan and node
-set until cleanup completes; ordinary adjacency queries do not pay that cost.
+Operational status and replay snapshots always read maintained physical counters
+in constant time, without edge scans or a distinct-node set. Public graph status
+sets `counts_pending` while retirement is pending on any observed shard: these
+counts are upper bounds, not exact logical membership. The flag survives status
+caches, metadata transport/persistence and durable local snapshots, and clears
+after accounting converges. Provisional graph counts do not inflate the table's
+document count. Explicit diagnostic graph statistics can still request an exact
+scoped edge scan. Adjacency, paged, streaming and presence reads install their
+physical prefix upper bound before seeking, so the ownership wrapper cannot
+walk unrelated incoming targets looking for a visible edge.
 This is not a range-aggregate index or a single-store transactional redesign.
 The two private stores and their durability barriers remain intact. Those
 larger storage changes require separate write-amplification and recovery
 benchmarks rather than weakening the current durability contract.
+
+### Adaptive serverless adjacency type directories
+
+The current graph wire adds sparse type-run offsets for high-degree rows.
+Outgoing and incoming directions are admitted independently: at least 1,024
+edges, and no more than `min(global_types, edges / 16)` distinct types. An
+indexed row stores a 16-byte descriptor and eight bytes per reserved run;
+small rows retain their existing eight-byte routing entry. High-entropy rows
+fall back to edge binary search. The bounded reservation avoids resizing or
+copying the full immutable payload and adds no graph-wide encoder side array.
+
+Typed routing entries address authenticated metadata inside the same block
+checksum tree as adjacency. Streaming, eager adjacency and exact probes share
+the directory; only selected edges consume the physical-edge work allowance.
+Metadata reads still consume cancellation, byte and allocation budgets.
+Directories are resolved lazily, without materializing all type runs. A cold
+wildcard query on an indexed hub can require one extra block read; the benchmark
+records that tradeoff alongside reduced I/O for interior-type queries.
+Serverless is unreleased: readers accept only the current graph/manifest wire
+and materializer epoch, without a legacy layout branch.
 
 ### Durable cross-job stateful topology
 
@@ -277,7 +310,7 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
   and isolated local nodes are preserved.
   Both JSON adapters propagate allocator exhaustion and unwind partial edge
   ownership; allocation failure cannot silently produce an empty graph.
-- Graph wire v8 and manifest v23 bind a 112-byte topology trailer to the
+- Graph wire v9 and manifest v24 bind a 112-byte topology trailer to the
   manifest. Its SHA-256-authenticated directory contains canonical per-type
   semantic digests, dictionary page offsets, bounded first-key fence prefixes,
   and SHA-256 checksums for 64 KiB
@@ -356,7 +389,7 @@ normal worker-page budget; durable tombstones/deleted keys provide recovery.
   allocation; exact construction admission and the live-allocation limiter
   remain authoritative. Serverless additionally reserves local-ID adapters,
   selection permutations and replacement-node buffers before allocation.
-  Materializer epoch 24 binds the current addressed graph layout and preparation admission.
+  Materializer epoch 25 binds the current addressed graph layout and preparation admission.
 - Preparation has two admission phases. The projection census is charged before
   allocations or edge scans; exact projection construction is charged after the
   census and before CSR allocation. Reserved census work remains charged when

@@ -28,71 +28,74 @@ T = TypeVar("T", bound="GraphIndexStats")
 
 @_attrs_define
 class GraphIndexStats:
-    """Statistics for graph index
+    """Statistics for graph index. While counts_pending is true, edge/node/document counts are physical upper bounds
+    awaiting ownership cleanup, not exact logical counts.
 
-    Attributes:
-        index_type (GraphIndexStatsIndexType): Discriminator for the index stats variant.
-        readiness (IndexReadinessStatus | Unset):
-        incarnation (str | Unset): Opaque identity of the desired index incarnation. Clients may compare it for equality
-            but must not interpret its contents.
-        target_revision (int | Unset):
-        published_revision (int | Unset):
-        milestones (IndexMilestones | Unset):
-        error (str | Unset): Error message if stats could not be retrieved
-        total_edges (int | Unset): Total number of edges in the graph
-        edge_types (GraphIndexStatsEdgeTypes | Unset): Count of edges per edge type
-        rebuilding (bool | Unset): Whether the index is currently rebuilding
-        repair (IndexRepairStatus | Unset): Compact user-facing state for an automatic index repair. Detailed
-            diagnostics are available from the admin API and metrics.
-        backfill_active (bool | Unset): Whether the index is actively rebuilding, materializing, or catching up.
-        backfill_progress (float | Unset): Rebuild progress as a ratio from 0.0 to 1.0
-        backfill_items_processed (int | Unset): Number of edges indexed during current rebuild
-        backfill_state (str | Unset): Operational readiness state such as ready, running, retrying, degraded, or failed.
-        doc_count (int | Unset): Number of documents covered by the graph index.
-        edge_count (int | Unset): Number of graph edges currently indexed.
-        node_count (int | Unset): Number of graph nodes currently indexed.
-        replay_applied_sequence (int | Unset):
-        replay_target_sequence (int | Unset):
-        replay_catch_up_required (bool | Unset):
-        runtime_present (bool | Unset):
-        runtime_fresh (bool | Unset):
-        runtime_source (str | Unset):
-        runtime_freshness (str | Unset):
-        catch_up_active (bool | Unset):
-        catch_up_phase (str | Unset):
-        catch_up_applied_sequence (int | Unset):
-        catch_up_target_sequence (int | Unset):
-        source_artifact (GraphIndexStatsSourceArtifact | Unset): Graph source artifact materialization status.
-        resolver_replay (GraphIndexStatsResolverReplay | Unset): Resolver replay diagnostics for graph materialization.
-        async_indexing (GraphIndexStatsAsyncIndexing | Unset):
-        projection_checkpoint_status (str | Unset): Durable projection checkpoint status: clean, rebuilding, degraded,
-            or repair_required.
-        projection_checkpoint_applied_sequence (int | Unset): Highest derived-log sequence covered by the durable
-            projection checkpoint.
-        projection_checkpoint_generation (int | Unset): Projection generation associated with the durable checkpoint.
-        projection_checkpoint_config_fingerprint (str | Unset): Projection configuration identity associated with the
-            durable checkpoint.
-        checkpoint_replay_tail_sequence_count (int | Unset): Number of derived-log sequences after the durable
-            checkpoint that still need replay.
-        repair_scan_issue_count (int | Unset): Repair issues found by explicit repair-scan accounting for this
-            projection.
-        term_count (int | Unset):
-        repair_degraded (bool | Unset):
-        repair_issue_count (int | Unset):
-        repair_summary_ready (bool | Unset):
-        repair_issue_count_estimated (bool | Unset):
-        expected_groups (int | Unset):
-        reported_groups (int | Unset):
-        fresh_groups (int | Unset):
-        stale_groups (int | Unset):
-        missing_groups (int | Unset):
-        unknown_remote_groups (int | Unset):
-        resolution (GraphIndexStatsResolution | Unset): Artifact resolution replay diagnostics.
-        promotion (GraphIndexStatsPromotion | Unset): Artifact promotion replay diagnostics.
-        algebraic_graph (GraphIndexStatsAlgebraicGraph | Unset): Algebraic graph execution health for bounded semiring
-            traversal.
-        graph_metric_runtime (GraphMetricRuntimeStats | Unset): Summarized graph metric maintenance runtime state.
-            Identity fields are stable hashes, not raw process or owner identifiers.
+        Attributes:
+            index_type (GraphIndexStatsIndexType): Discriminator for the index stats variant.
+            readiness (IndexReadinessStatus | Unset):
+            incarnation (str | Unset): Opaque identity of the desired index incarnation. Clients may compare it for equality
+                but must not interpret its contents.
+            target_revision (int | Unset):
+            published_revision (int | Unset):
+            milestones (IndexMilestones | Unset):
+            error (str | Unset): Error message if stats could not be retrieved
+            total_edges (int | Unset): Total number of edges in the graph
+            counts_pending (bool | Unset): True while ownership cleanup is pending on any observed shard. Counts are
+                physical upper bounds until cleanup completes; serving adjacency already enforces ownership.
+            edge_types (GraphIndexStatsEdgeTypes | Unset): Count of edges per edge type
+            rebuilding (bool | Unset): Whether the index is currently rebuilding
+            repair (IndexRepairStatus | Unset): Compact user-facing state for an automatic index repair. Detailed
+                diagnostics are available from the admin API and metrics.
+            backfill_active (bool | Unset): Whether the index is actively rebuilding, materializing, or catching up.
+            backfill_progress (float | Unset): Rebuild progress as a ratio from 0.0 to 1.0
+            backfill_items_processed (int | Unset): Number of edges indexed during current rebuild
+            backfill_state (str | Unset): Operational readiness state such as ready, running, retrying, degraded, or failed.
+            doc_count (int | Unset): Number of documents covered by the graph index.
+            edge_count (int | Unset): Number of graph edges currently indexed.
+            node_count (int | Unset): Number of graph nodes currently indexed.
+            replay_applied_sequence (int | Unset):
+            replay_target_sequence (int | Unset):
+            replay_catch_up_required (bool | Unset):
+            runtime_present (bool | Unset):
+            runtime_fresh (bool | Unset):
+            runtime_source (str | Unset):
+            runtime_freshness (str | Unset):
+            catch_up_active (bool | Unset):
+            catch_up_phase (str | Unset):
+            catch_up_applied_sequence (int | Unset):
+            catch_up_target_sequence (int | Unset):
+            source_artifact (GraphIndexStatsSourceArtifact | Unset): Graph source artifact materialization status.
+            resolver_replay (GraphIndexStatsResolverReplay | Unset): Resolver replay diagnostics for graph materialization.
+            async_indexing (GraphIndexStatsAsyncIndexing | Unset):
+            projection_checkpoint_status (str | Unset): Durable projection checkpoint status: clean, rebuilding, degraded,
+                or repair_required.
+            projection_checkpoint_applied_sequence (int | Unset): Highest derived-log sequence covered by the durable
+                projection checkpoint.
+            projection_checkpoint_generation (int | Unset): Projection generation associated with the durable checkpoint.
+            projection_checkpoint_config_fingerprint (str | Unset): Projection configuration identity associated with the
+                durable checkpoint.
+            checkpoint_replay_tail_sequence_count (int | Unset): Number of derived-log sequences after the durable
+                checkpoint that still need replay.
+            repair_scan_issue_count (int | Unset): Repair issues found by explicit repair-scan accounting for this
+                projection.
+            term_count (int | Unset):
+            repair_degraded (bool | Unset):
+            repair_issue_count (int | Unset):
+            repair_summary_ready (bool | Unset):
+            repair_issue_count_estimated (bool | Unset):
+            expected_groups (int | Unset):
+            reported_groups (int | Unset):
+            fresh_groups (int | Unset):
+            stale_groups (int | Unset):
+            missing_groups (int | Unset):
+            unknown_remote_groups (int | Unset):
+            resolution (GraphIndexStatsResolution | Unset): Artifact resolution replay diagnostics.
+            promotion (GraphIndexStatsPromotion | Unset): Artifact promotion replay diagnostics.
+            algebraic_graph (GraphIndexStatsAlgebraicGraph | Unset): Algebraic graph execution health for bounded semiring
+                traversal.
+            graph_metric_runtime (GraphMetricRuntimeStats | Unset): Summarized graph metric maintenance runtime state.
+                Identity fields are stable hashes, not raw process or owner identifiers.
     """
 
     index_type: GraphIndexStatsIndexType
@@ -103,6 +106,7 @@ class GraphIndexStats:
     milestones: IndexMilestones | Unset = UNSET
     error: str | Unset = UNSET
     total_edges: int | Unset = UNSET
+    counts_pending: bool | Unset = UNSET
     edge_types: GraphIndexStatsEdgeTypes | Unset = UNSET
     rebuilding: bool | Unset = UNSET
     repair: IndexRepairStatus | Unset = UNSET
@@ -170,6 +174,8 @@ class GraphIndexStats:
         error = self.error
 
         total_edges = self.total_edges
+
+        counts_pending = self.counts_pending
 
         edge_types: dict[str, Any] | Unset = UNSET
         if not isinstance(self.edge_types, Unset):
@@ -300,6 +306,8 @@ class GraphIndexStats:
             field_dict["error"] = error
         if total_edges is not UNSET:
             field_dict["total_edges"] = total_edges
+        if counts_pending is not UNSET:
+            field_dict["counts_pending"] = counts_pending
         if edge_types is not UNSET:
             field_dict["edge_types"] = edge_types
         if rebuilding is not UNSET:
@@ -433,6 +441,8 @@ class GraphIndexStats:
         error = d.pop("error", UNSET)
 
         total_edges = d.pop("total_edges", UNSET)
+
+        counts_pending = d.pop("counts_pending", UNSET)
 
         _edge_types = d.pop("edge_types", UNSET)
         edge_types: GraphIndexStatsEdgeTypes | Unset
@@ -578,6 +588,7 @@ class GraphIndexStats:
             milestones=milestones,
             error=error,
             total_edges=total_edges,
+            counts_pending=counts_pending,
             edge_types=edge_types,
             rebuilding=rebuilding,
             repair=repair,

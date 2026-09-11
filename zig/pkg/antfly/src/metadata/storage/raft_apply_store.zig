@@ -8758,10 +8758,14 @@ fn appendRuntimeIndexStatusRecordBody(
         try out.append(alloc, @intFromEnum(record.dense_native_storage_phase));
     }
     if (version >= runtime_status_protocol.framed_index_status_record_version) {
-        // Extension payload is a sequence of {field_id:u16, length:u32,
-        // value:[length]u8}. No extensions are emitted yet; reserving the
-        // framed area now makes subsequent additions independently skippable.
-        try appendInt(alloc, out, u32, 0);
+        // Optional field 1: graph counts are physical upper bounds while
+        // ownership retirement is pending. Old readers skip the extension.
+        try appendInt(alloc, out, u32, if (record.graph_counts_pending) 7 else 0);
+        if (record.graph_counts_pending) {
+            try appendInt(alloc, out, u16, 1);
+            try appendInt(alloc, out, u32, 1);
+            try out.append(alloc, 1);
+        }
     }
 }
 
@@ -8924,6 +8928,7 @@ fn readRuntimeIndexStatusRecordBody(
         break :blk std.enums.fromInt(metadata.DenseNativeStoragePhase, value) orelse
             return error.InvalidMetadataTransitionEncoding;
     } else .legacy;
+    var graph_counts_pending = false;
     if (version >= runtime_status_protocol.framed_index_status_record_version) {
         const extensions_len = try readInt(encoded, pos, u32);
         const extensions_end = std.math.add(usize, pos.*, extensions_len) catch
@@ -8939,6 +8944,10 @@ fn readRuntimeIndexStatusRecordBody(
             if (field_id == 0 or field_end > extensions_end or seen.contains(field_id))
                 return error.InvalidMetadataTransitionEncoding;
             try seen.put(alloc, field_id, {});
+            if (field_id == 1) {
+                if (field_len != 1 or encoded[pos.*] > 1) return error.InvalidMetadataTransitionEncoding;
+                graph_counts_pending = encoded[pos.*] == 1;
+            }
             pos.* = field_end;
         }
     }
@@ -8949,6 +8958,7 @@ fn readRuntimeIndexStatusRecordBody(
         .doc_count = doc_count,
         .term_count = term_count,
         .edge_count = edge_count,
+        .graph_counts_pending = graph_counts_pending,
         .node_count = node_count,
         .root_node = root_node,
         .publication_target_count = publication_target_count,
@@ -15360,6 +15370,27 @@ test "metadata runtime index status codec rejects unreleased profiles" {
         error.InvalidMetadataTransitionEncoding,
         readRuntimeIndexStatusRecord(alloc, encoded.items, &pos, 10),
     );
+}
+
+test "metadata runtime index status graph count uncertainty survives framed persistence" {
+    const alloc = std.testing.allocator;
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+    try appendRuntimeIndexStatusRecord(alloc, &encoded, .{
+        .name = "graph",
+        .kind = "graph",
+        .edge_count = 12,
+        .graph_counts_pending = true,
+    }, runtime_status_protocol.current_record_version);
+    var pos: usize = 0;
+    const decoded = try readRuntimeIndexStatusRecord(alloc, encoded.items, &pos, runtime_status_protocol.current_record_version);
+    defer metadata_table_manager.freeRuntimeIndexStatusReport(alloc, decoded);
+    try std.testing.expect(decoded.graph_counts_pending);
+    try std.testing.expectEqual(@as(u64, 12), decoded.edge_count);
+    try std.testing.expectEqual(encoded.items.len, pos);
+    encoded.items[encoded.items.len - 1] = 2;
+    pos = 0;
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, readRuntimeIndexStatusRecord(alloc, encoded.items, &pos, runtime_status_protocol.current_record_version));
 }
 
 test "metadata runtime index status current profile preserves source failures" {

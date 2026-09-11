@@ -161,7 +161,8 @@ pub const Reader = struct {
         return std.mem.order(u8, a, b);
     }
 
-    const Row = struct { offset: u64, out: u32, in: u32 };
+    const TypeRuns = struct { offset: u64 = 0, count: u32 = 0 };
+    const Row = struct { offset: u64, out: u32, in: u32, runs: [2]TypeRuns = .{ .{}, .{} } };
     pub fn containsNode(self: *Reader, key: []const u8) !bool {
         return try self.row(key) != null;
     }
@@ -175,15 +176,56 @@ pub const Reader = struct {
         const routing = self.context.trailer.body_len + self.context.trailer.topology_len;
         const raw = try self.context.readAlloc(self.alloc, routing + @as(u64, node) * 8, 8);
         defer self.alloc.free(raw);
-        const offset = std.mem.readInt(u64, raw[0..8], .little);
+        var offset = std.mem.readInt(u64, raw[0..8], .little);
         if (offset == 0) return null;
+        var runs: [2]TypeRuns = .{ .{}, .{} };
+        if (offset & wire.typed_row_flag != 0) {
+            const descriptor_offset = offset & ~wire.typed_row_flag;
+            const end = self.context.trailer.directoryOffset();
+            if (descriptor_offset < routing + @as(u64, self.context.layout.?.nodes) * 8 or
+                descriptor_offset > end or end - descriptor_offset < 16) return error.InvalidGraphSegment;
+            const descriptor = try self.context.readAlloc(self.alloc, descriptor_offset, 16);
+            defer self.alloc.free(descriptor);
+            offset = std.mem.readInt(u64, descriptor[0..8], .little);
+            runs[0] = .{ .offset = descriptor_offset + 16, .count = std.mem.readInt(u32, descriptor[8..12], .little) };
+            runs[1] = .{ .offset = runs[0].offset + @as(u64, runs[0].count) * 8, .count = std.mem.readInt(u32, descriptor[12..16], .little) };
+            if (runs[1].offset > end or @as(u64, runs[1].count) * 8 > end - runs[1].offset or
+                (runs[0].count == 0 and runs[1].count == 0)) return error.InvalidGraphSegment;
+        }
         if (offset < wire.header_len or offset > self.context.trailer.body_len or self.context.trailer.body_len - offset < 12) return error.InvalidGraphSegment;
         const header = try self.context.readAlloc(self.alloc, offset, 12);
         defer self.alloc.free(header);
         if (std.mem.readInt(u32, header[0..4], .little) != node) return error.InvalidGraphSegment;
-        const result = Row{ .offset = offset + 12, .out = std.mem.readInt(u32, header[4..8], .little), .in = std.mem.readInt(u32, header[8..12], .little) };
+        const result = Row{ .offset = offset + 12, .out = std.mem.readInt(u32, header[4..8], .little), .in = std.mem.readInt(u32, header[8..12], .little), .runs = runs };
         if ((@as(u64, result.out) + result.in) * wire.edge_len > self.context.trailer.body_len - result.offset) return error.InvalidGraphSegment;
+        for (runs, [_]u32{ result.out, result.in }) |directory, count| {
+            if (directory.count > wire.typeRunCapacity(count, self.context.layout.?.types)) return error.InvalidGraphSegment;
+        }
         return result;
+    }
+
+    /// Sparse metadata probes consume authenticated transport/allocation
+    /// budgets, not the physical-edge work allowance. No unrelated edge is
+    /// decoded to find a type boundary on an indexed hub.
+    fn typeRunBound(self: *Reader, runs: TypeRuns, row_count: usize, kind: u32) !usize {
+        var lower: usize = 0;
+        var upper: usize = runs.count;
+        var position = row_count;
+        while (lower < upper) {
+            const middle = lower + (upper - lower) / 2;
+            const raw = try self.context.readAlloc(self.alloc, runs.offset + middle * 8, 8);
+            defer self.alloc.free(raw);
+            const entry_kind = std.mem.readInt(u32, raw[0..4], .little);
+            const begin = std.mem.readInt(u32, raw[4..8], .little);
+            if (entry_kind >= self.context.layout.?.types or begin >= row_count or (middle == 0 and begin != 0)) return error.InvalidGraphSegment;
+            if (entry_kind < kind) {
+                lower = middle + 1;
+            } else {
+                upper = middle;
+                position = begin;
+            }
+        }
+        return position;
     }
 
     fn edgeAt(self: *Reader, offset: u64, index: usize, work: *usize) !wire.Edge {
@@ -236,6 +278,7 @@ pub const Reader = struct {
         /// not physical row offsets. Adjacent requested types share one seek.
         type_ranges: bool = false,
         row_count: usize = 0,
+        runs: TypeRuns = .{},
         selected: ?Range = null,
         range: usize = 0,
         position: usize = 0,
@@ -284,10 +327,15 @@ pub const Reader = struct {
             const run = self.ranges[index];
             if (!self.type_ranges) return run;
             try self.reader.context.reader.cancellation.check();
-            return .{
-                .begin = if (run.begin == 0) 0 else try self.reader.lowerBound(self.offset, self.row_count, @intCast(run.begin), 0, self.work),
-                .end = if (run.end == self.reader.context.layout.?.types) self.row_count else try self.reader.lowerBound(self.offset, self.row_count, @intCast(run.end), 0, self.work),
-            };
+            const begin = if (run.begin == 0) 0 else try self.typeBound(@intCast(run.begin));
+            const end = if (run.end == self.reader.context.layout.?.types) self.row_count else try self.typeBound(@intCast(run.end));
+            if (begin > end) return error.InvalidGraphSegment;
+            return .{ .begin = begin, .end = end };
+        }
+
+        fn typeBound(self: *Cursor, kind: u32) !usize {
+            if (self.runs.count != 0) return self.reader.typeRunBound(self.runs, self.row_count, kind);
+            return self.reader.lowerBound(self.offset, self.row_count, kind, 0, self.work);
         }
 
         /// Eager materialization still admits the complete result before
@@ -307,7 +355,9 @@ pub const Reader = struct {
         const found = try self.row(key);
         const offset = if (found) |row_value| row_value.offset + (if (incoming) @as(u64, row_value.out) * wire.edge_len else 0) else 0;
         const count: usize = if (found) |row_value| (if (incoming) row_value.in else row_value.out) else 0;
-        return self.cursorAt(offset, count, requested, work);
+        var result = try self.cursorAt(offset, count, requested, work);
+        if (found) |row_value| result.runs = row_value.runs[@intFromBool(incoming)];
+        return result;
     }
 
     /// Resolve the type dictionary once per query, not once per expanded row.
@@ -327,7 +377,9 @@ pub const Reader = struct {
         const found = try self.rowOrdinal(node);
         const offset = if (found) |r| r.offset + (if (incoming) @as(u64, r.out) * wire.edge_len else 0) else 0;
         const count: usize = if (found) |r| (if (incoming) r.in else r.out) else 0;
-        return self.cursorAtTypes(offset, count, types_filter, work);
+        var result = try self.cursorAtTypes(offset, count, types_filter, work);
+        if (found) |row_value| result.runs = row_value.runs[@intFromBool(incoming)];
+        return result;
     }
 
     fn cursorAt(self: *Reader, offset: u64, count: usize, requested: []const []const u8, work: *usize) !Cursor {
@@ -371,16 +423,20 @@ pub const Reader = struct {
         const kind_id = try self.context.kindId(kind) orelse return null;
         const target_id = try self.ordinal(target) orelse return null;
         const found = try self.row(source) orelse return null;
-        const index = try self.lowerBound(found.offset, found.out, @intCast(kind_id), target_id, work);
-        if (index == found.out) return null;
+        const begin = if (found.runs[0].count == 0) 0 else try self.typeRunBound(found.runs[0], found.out, @intCast(kind_id));
+        const end = if (found.runs[0].count == 0) found.out else try self.typeRunBound(found.runs[0], found.out, @intCast(kind_id + 1));
+        if (begin > end) return error.InvalidGraphSegment;
+        const index = begin + try self.lowerBound(found.offset + begin * wire.edge_len, end - begin, @intCast(kind_id), target_id, work);
+        if (index == end) return null;
         const edge = try self.edgeAt(found.offset, index, work);
         if (edge.edge_type != kind_id or edge.node != target_id) return null;
         return try self.copyEdge(edge);
     }
 
-    fn readEdges(self: *Reader, offset: u64, count: usize, requested: []const []const u8, limit: usize, work: *usize, skip_qualified: bool, skip_node: ?[]const u8) ![]types.Edge {
+    fn readEdges(self: *Reader, offset: u64, count: usize, runs: TypeRuns, requested: []const []const u8, limit: usize, work: *usize, skip_qualified: bool, skip_node: ?[]const u8) ![]types.Edge {
         var selected = try self.cursorAt(offset, count, requested, work);
         defer selected.deinit();
+        selected.runs = runs;
         const total = try selected.resolveAll();
         if (!skip_qualified and skip_node == null and total > limit) return error.QueryCandidateBudgetExceeded;
         if (total > work.*) return error.GraphTraversalQueryBudgetExceeded;
@@ -410,12 +466,12 @@ pub const Reader = struct {
         const found = try self.row(key) orelse return null;
         const node = try self.alloc.dupe(u8, key);
         errdefer self.alloc.free(node);
-        const out = try self.readEdges(found.offset, if (direction == .out or direction == .both) found.out else 0, requested, limit, work, !include_qualified, null);
+        const out = try self.readEdges(found.offset, if (direction == .out or direction == .both) found.out else 0, found.runs[0], requested, limit, work, !include_qualified, null);
         errdefer {
             for (out) |*edge| edge.deinit(self.alloc);
             self.alloc.free(out);
         }
-        const incoming = try self.readEdges(found.offset + @as(u64, found.out) * wire.edge_len, if (direction == .in or direction == .both) found.in else 0, requested, limit - out.len, work, false, if (deduplicate_self_loops and direction == .both) key else null);
+        const incoming = try self.readEdges(found.offset + @as(u64, found.out) * wire.edge_len, if (direction == .in or direction == .both) found.in else 0, found.runs[1], requested, limit - out.len, work, false, if (deduplicate_self_loops and direction == .both) key else null);
         return .{ .node_id = node, .out_edges = out, .in_edges = incoming };
     }
 };
@@ -490,6 +546,90 @@ test "serverless graph filtered cursors lazily coalesce canonical type runs" {
         defer selected.deinit(a);
         try std.testing.expectEqualStrings("a", selected.edge_type);
         try std.testing.expect(work > 0);
+        // Interior types use metadata boundaries, including ordinal callers.
+        var single: usize = 1;
+        var interior = try reader.cursorOrdinal((try reader.ordinal(key)).?, &.{2}, incoming, &single);
+        defer interior.deinit();
+        try std.testing.expectEqual(@as(u32, 2), (try interior.nextWire()).?.edge_type);
+        try std.testing.expectEqual(@as(usize, 0), single);
+        const Direction = enum { out, in, both };
+        var eager_work: usize = 1024;
+        var eager = (try reader.adjacency(key, &.{"b"}, if (incoming) Direction.in else Direction.out, 1024, &eager_work)).?;
+        defer eager.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), eager_work);
+        try std.testing.expectEqual(@as(usize, 1024), if (incoming) eager.in_edges.len else eager.out_edges.len);
+    }
+    try std.testing.checkAllAllocationFailures(a, exerciseIndexedCursor, .{ payload, source });
+    const hub = (try reader.row("hub")).?;
+    const entry_offset: usize = @intCast(hub.runs[0].offset);
+    payload[entry_offset] ^= 1;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, exerciseIndexedCursor(a, payload, source));
+    payload[entry_offset] ^= 1;
+    var decoded = try wire.decodeAllocWithLimitsAndCancellation(a, payload, .{}, .none);
+    defer decoded.deinit(a);
+    const encoded = try wire.encodeAlloc(a, decoded);
+    defer a.free(encoded);
+    try std.testing.expectEqualSlices(u8, payload, encoded);
+}
+
+fn exerciseIndexedCursor(a: Allocator, payload: []const u8, source: refs.ArtifactRef) !void {
+    var memory = TestStore{ .payload = payload };
+    var store = artifacts.ArtifactStore{ .allocator = a, .ptr = &memory, .vtable = &TestStore.vtable };
+    var bytes: u64 = 16 * 1024 * 1024;
+    var reader = (try Reader.init(a, &store, source, .none, &bytes)).?;
+    defer reader.deinit();
+    var work: usize = 1;
+    var cursor = try reader.cursor("hub", &.{"c"}, false, &work);
+    defer cursor.deinit();
+    try std.testing.expectEqual(@as(u32, 2), (try cursor.nextWire()).?.edge_type);
+    try std.testing.expectEqual(@as(usize, 0), work);
+}
+
+test "serverless graph sparse type directory bounds overhead and independently admits directions" {
+    const a = std.testing.allocator;
+    var builder = @import("builder.zig").Builder{ .alloc = a };
+    defer builder.deinit();
+    for (0..1024) |i| {
+        var key_buf: [32]u8 = undefined;
+        var kind_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "node{d:0>4}", .{i});
+        const kind = try std.fmt.bufPrint(&kind_buf, "type{d:0>3}", .{i % 128});
+        try builder.addEdge("hub", key, "link", 1, null);
+        try builder.addEdge(key, "hub", kind, 1, null);
+        try builder.addEdge("reverse", key, kind, 1, null);
+        try builder.addEdge(key, "reverse", "link", 1, null);
+    }
+    const payload = try builder.encodeAlloc(4 * 1024 * 1024, .none);
+    defer a.free(payload);
+    try std.testing.expectError(error.GraphSegmentTooLarge, builder.encodeAlloc(payload.len - 1, .none));
+    const trailer = try wire.decodeTopologyTrailer(payload[payload.len - wire.topology_trailer_len ..], payload.len);
+    const nodes = std.mem.readInt(u32, payload[10..14], .little);
+    try std.testing.expectEqual(@as(u64, nodes) * 8 + 2 * (16 + 128 * 8), trailer.adjacency_index_len);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
+    const checksum = std.fmt.bytesToHex(digest, .lower);
+    var source = refs.ArtifactRef{ .kind = .graph_segment, .name = "g", .artifact_id = "sha256:" ++ checksum, .checksum = &checksum, .byte_len = payload.len };
+    try wire.bindTopologyControl(&source, payload);
+    var memory = TestStore{ .payload = payload };
+    var store = artifacts.ArtifactStore{ .allocator = a, .ptr = &memory, .vtable = &TestStore.vtable };
+    var bytes: u64 = 16 * 1024 * 1024;
+    var reader = (try Reader.init(a, &store, source, .none, &bytes)).?;
+    defer reader.deinit();
+    for ([_][]const u8{ "hub", "reverse" }, 0..) |key, direction| {
+        const row_value = (try reader.row(key)).?;
+        try std.testing.expectEqual(@as(u32, 1), row_value.runs[direction].count);
+        try std.testing.expectEqual(@as(u32, 0), row_value.runs[1 - direction].count);
+        var work: usize = 1;
+        var indexed = try reader.cursor(key, &.{"link"}, direction == 1, &work);
+        defer indexed.deinit();
+        try std.testing.expectEqual(@as(u32, 0), (try indexed.nextWire()).?.edge_type);
+        try std.testing.expectEqual(@as(usize, 0), work);
+        work = 100;
+        var fallback = try reader.cursor(key, &.{"type063"}, direction == 0, &work);
+        defer fallback.deinit();
+        for (0..8) |_| try std.testing.expectEqual(@as(u32, 64), (try fallback.nextWire()).?.edge_type);
+        try std.testing.expect((try fallback.nextWire()) == null);
+        try std.testing.expect(work < 92);
     }
 }
 

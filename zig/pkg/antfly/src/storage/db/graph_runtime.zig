@@ -64,6 +64,67 @@ test "db graph runtime prepared ownership waits for authoritative range commit a
     try std.testing.expectEqual(@as(u64, 0), index.edge_count);
 }
 
+test "db graph runtime expansion waits for retirement before range and merge receipt commit" {
+    const DB = @import("mod.zig").DB;
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+    const merge = types.BatchRequest{ .merge_checkpoint = .{
+        .kind = .accept,
+        .transition_id = 10,
+        .donor_group_id = 2,
+        .receiver_group_id = 1,
+        .receiver_base_start = "",
+        .receiver_base_end = "m",
+        .merged_start = "",
+        .merged_end = "",
+    } };
+    {
+        var db = try DB.open(a, std.mem.span(path), .{});
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+        try db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "z", .target = "a", .edge_type = "link", .weight = 1 }}, .sync_level = .full_index });
+        try db.batchRaftReplicatedApply(.{ .split_transition = .{ .kind = .finalize, .transition_id = 1, .attempt_epoch = 1, .destination_group_id = 2, .split_key = "m" } }, .{ .term = 1, .index = 1 });
+        try std.testing.expectError(error.GraphMaintenanceInProgress, db.updateRange(.{ .start = "", .end = "" }));
+        try std.testing.expectError(error.GraphMaintenanceInProgress, db.core.updateRange(.{ .start = "", .end = "" }));
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, db.batchRaftReplicatedApply(merge, .{ .term = 1, .index = 2 }));
+        try std.testing.expectEqualStrings("m", db.getRange().end);
+        try std.testing.expectEqual(@as(u64, 1), (try db.raftAppliedEntry()).?.index);
+        const stats = try db.stats(a);
+        defer types.freeDBStats(a, stats);
+        try std.testing.expect(stats.indexes[0].graph_counts_pending);
+        try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].edge_count);
+    }
+    {
+        var db = try DB.open(a, std.mem.span(path), .{});
+        defer db.close();
+        try std.testing.expectEqualStrings("m", db.getRange().end);
+        const index = &db.core.index_manager.graphIndex("g").?.index;
+        try std.testing.expect(index.ownershipCleanupPending());
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, db.batchRaftReplicatedApply(merge, .{ .term = 1, .index = 2 }));
+        try db.runArtifactRepairMetadataMaintenanceUntilIdle();
+        try std.testing.expect(!index.ownershipTransitionPending());
+        try db.batchRaftReplicatedApply(merge, .{ .term = 1, .index = 2 });
+        try std.testing.expectEqualStrings("", db.getRange().end);
+        try std.testing.expectEqual(@as(u64, 2), (try db.raftAppliedEntry()).?.index);
+        try db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "z", .target = "b", .edge_type = "link", .weight = 1 }}, .sync_level = .full_index });
+        const stats = try db.stats(a);
+        defer types.freeDBStats(a, stats);
+        try std.testing.expect(!stats.indexes[0].graph_counts_pending);
+        try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].edge_count);
+    }
+    var db = try DB.open(a, std.mem.span(path), .{});
+    defer db.close();
+    const incoming = try db.getEdges(a, "g", "b", "link", .in);
+    defer graph_mod.GraphIndex.freeEdges(a, incoming);
+    try std.testing.expectEqual(@as(usize, 1), incoming.len);
+    try std.testing.expectEqualStrings("z", incoming[0].source);
+    const retired = try db.getEdges(a, "g", "a", "link", .in);
+    defer graph_mod.GraphIndex.freeEdges(a, retired);
+    try std.testing.expectEqual(@as(usize, 0), retired.len);
+}
+
 test "db graph runtime repeated split defers behind cleanup without advancing its receipt" {
     const DB = @import("mod.zig").DB;
     const a = std.testing.allocator;

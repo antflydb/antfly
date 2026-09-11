@@ -131,8 +131,7 @@ pub const Builder = struct {
         size = std.math.add(usize, size, std.math.mul(usize, record_count, wire.edge_len) catch return error.GraphSegmentTooLarge) catch return error.GraphSegmentTooLarge;
         size = std.math.add(usize, size, std.math.mul(usize, self.nodeCount(), 12) catch return error.GraphSegmentTooLarge) catch return error.GraphSegmentTooLarge;
         const body_len = size;
-        size = std.math.add(usize, size, try wire.topologyExtensionSize(self.kinds.values.keys(), self.nodes.values.count(), local_edges, body_len)) catch return error.GraphSegmentTooLarge;
-        if (size > max_bytes) return error.GraphSegmentTooLarge;
+        if (body_len > max_bytes) return error.GraphSegmentTooLarge;
         // Count and scatter directly into final adjacency storage. No mapped
         // forward/reverse Edge arrays coexist with the immutable wire payload.
         const counts = try self.alloc.alloc([2]u32, node_order.len);
@@ -147,6 +146,10 @@ pub const Builder = struct {
                 counts[dst][1] = std.math.add(u32, counts[dst][1], 1) catch return error.GraphSegmentTooLarge;
             }
         }
+        var routing_extra: usize = 0;
+        for (counts) |count| routing_extra = std.math.add(usize, routing_extra, wire.typeRunReservation(count[0], count[1], self.kinds.values.count())) catch return error.GraphSegmentTooLarge;
+        size = std.math.add(usize, size, try wire.topologyExtensionSize(self.kinds.values.keys(), self.nodes.values.count(), local_edges, body_len, routing_extra)) catch return error.GraphSegmentTooLarge;
+        if (size > max_bytes) return error.GraphSegmentTooLarge;
         const positions = try self.alloc.alloc([2]usize, node_order.len);
         defer self.alloc.free(positions);
         const bytes = try self.alloc.alloc(u8, size);
@@ -195,7 +198,7 @@ pub const Builder = struct {
                 std.mem.sort([wire.edge_len]u8, records, {}, wireEdgeLess);
             }
         }
-        try wire.finishEncoding(self.alloc, bytes, body_len, wire.topologyDirectorySize(self.kinds.values.keys(), self.nodes.values.count(), body_len + local_edges * 8, 0), cancellation);
+        try wire.finishEncoding(self.alloc, bytes, body_len, wire.topologyDirectorySize(self.kinds.values.keys(), self.nodes.values.count(), body_len + local_edges * 8, routing_extra), routing_extra, cancellation);
         return bytes;
     }
 };

@@ -11656,7 +11656,7 @@ export interface components {
             last_failed_builds?: number;
             last_budget_exhausted?: boolean;
         };
-        /** @description Statistics for graph index */
+        /** @description Statistics for graph index. While counts_pending is true, edge/node/document counts are physical upper bounds awaiting ownership cleanup, not exact logical counts. */
         GraphIndexStats: {
             /**
              * @description Discriminator for the index stats variant. (enum property replaced by openapi-typescript)
@@ -11682,6 +11682,8 @@ export interface components {
              * @description Total number of edges in the graph
              */
             total_edges?: number;
+            /** @description True while ownership cleanup is pending on any observed shard. Counts are physical upper bounds until cleanup completes; serving adjacency already enforces ownership. */
+            counts_pending?: boolean;
             /** @description Count of edges per edge type */
             edge_types?: {
                 [key: string]: number;

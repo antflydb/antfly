@@ -2062,6 +2062,7 @@ const AggregatedIndexStatus = struct {
     term_count: u64 = 0,
     edge_count: u64 = 0,
     node_count: u64 = 0,
+    graph_counts_pending: bool = false,
     root_node: u64 = 0,
     publication_target_count: u64 = 0,
     publication_target_ready: bool = false,
@@ -2807,6 +2808,7 @@ fn aggregateIndexStatusIndexed(
         aggregate.doc_count += item.doc_count;
         aggregate.term_count += item.term_count;
         aggregate.edge_count += item.edge_count;
+        aggregate.graph_counts_pending = aggregate.graph_counts_pending or item.graph_counts_pending;
         aggregate.node_count += item.node_count;
         aggregate.root_node = if (materialization_count == 1) item.root_node else 0;
         if (item.kind == .dense_vector) {
@@ -6167,6 +6169,8 @@ fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
             try appendIntValue(alloc, out, visible_doc_count);
         },
         .graph => {
+            try out.appendSlice(alloc, ",\"counts_pending\":");
+            try out.appendSlice(alloc, if (item.graph_counts_pending) "true" else "false");
             try out.appendSlice(alloc, ",\"total_edges\":");
             try appendIntValue(alloc, out, visible_edge_count);
         },
@@ -10436,12 +10440,18 @@ test "index encoders expose graph metric runtime ownership summary" {
 
 test "index encoders expose mixed graph metric runtime roles without aggregate role" {
     const alloc = std.testing.allocator;
+    var config = try std.json.parseFromSlice(std.json.Value, alloc, "{\"type\":\"graph\"}", .{});
+    defer config.deinit();
+    const identity = (try indexRuntimeIdentity(alloc, "graph_idx", config.value)).?;
     const shard_a_indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1);
     defer alloc.free(shard_a_indexes);
     shard_a_indexes[0] = .{
         .name = try alloc.dupe(u8, "graph_idx"),
         .kind = .graph,
         .edge_count = 12,
+        .coverage_generation = identity.incarnation,
+        .coverage_config_hash = identity.config_hash,
+        .coverage_identity_ready = true,
     };
     defer alloc.free(shard_a_indexes[0].name);
 
@@ -10451,6 +10461,10 @@ test "index encoders expose mixed graph metric runtime roles without aggregate r
         .name = try alloc.dupe(u8, "graph_idx"),
         .kind = .graph,
         .edge_count = 8,
+        .graph_counts_pending = true,
+        .coverage_generation = identity.incarnation,
+        .coverage_config_hash = identity.config_hash,
+        .coverage_identity_ready = true,
     };
     defer alloc.free(shard_b_indexes[0].name);
 
@@ -10518,6 +10532,7 @@ test "index encoders expose mixed graph metric runtime roles without aggregate r
     defer parsed.deinit();
 
     const aggregate_runtime = parsed.value.object.get("status").?.object.get("graph_metric_runtime").?.object;
+    try std.testing.expect(parsed.value.object.get("status").?.object.get("counts_pending").?.bool);
     try std.testing.expect(aggregate_runtime.get("role") == null);
     try std.testing.expectEqual(@as(i64, 0x33), aggregate_runtime.get("owner_id_hash").?.integer);
     try std.testing.expectEqual(@as(i64, 2), aggregate_runtime.get("worker_count").?.integer);
@@ -10528,6 +10543,8 @@ test "index encoders expose mixed graph metric runtime roles without aggregate r
     try std.testing.expectEqual(@as(i64, 4), aggregate_runtime.get("total_pages_completed").?.integer);
 
     const shard_status = parsed.value.object.get("shard_status").?.object;
+    try std.testing.expect(!shard_status.get("7").?.object.get("counts_pending").?.bool);
+    try std.testing.expect(shard_status.get("8").?.object.get("counts_pending").?.bool);
     const shard_a_runtime = shard_status.get("7").?.object.get("graph_metric_runtime").?.object;
     const shard_b_runtime = shard_status.get("8").?.object.get("graph_metric_runtime").?.object;
     try std.testing.expectEqualStrings("coordinator", shard_a_runtime.get("role").?.string);

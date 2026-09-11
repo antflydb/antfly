@@ -46,12 +46,24 @@ pub fn begin(a: A, inner: backend.ReadTxn, raw: []const u8, incoming: bool, comp
             inner: backend.Cursor,
             scope: maintenance.RangeProgress,
             incoming: bool,
+            upper: ?[]const u8 = null,
             pub fn close(self: *@This()) void {
                 self.inner.close();
             }
             fn visible(self: *@This(), initial: ?backend.Entry, backwards: bool) !?backend.Entry {
                 var entry = initial;
                 while (entry) |value| {
+                    // Some erased backends do not implement native bounds.
+                    // Enforce the borrowed bound here too, before visibility
+                    // skipping can escape the caller's adjacency prefix.
+                    if (self.upper) |upper| if (std.mem.order(u8, value.key, upper) != .lt) {
+                        if (!backwards) return null;
+                        entry = try self.inner.seekAtOrBefore(upper);
+                        if (entry) |boundary| if (std.mem.eql(u8, boundary.key, upper)) {
+                            entry = try self.inner.prev();
+                        };
+                        continue;
+                    };
                     if (accepts(self.scope, value.key, self.incoming)) return value;
                     const boundary = try seekPast(self.alloc, self.scope, value.key, self.incoming, backwards);
                     defer self.alloc.free(boundary);
@@ -78,6 +90,7 @@ pub fn begin(a: A, inner: backend.ReadTxn, raw: []const u8, incoming: bool, comp
                 return self.visible(try self.inner.seekAtOrBefore(key), true);
             }
             pub fn setUpperBound(self: *@This(), upper: ?[]const u8) void {
+                self.upper = upper;
                 self.inner.setUpperBound(upper);
             }
         };

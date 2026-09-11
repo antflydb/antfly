@@ -5381,6 +5381,7 @@ pub const ApiHttpServer = struct {
                 .doc_count = index.doc_count,
                 .term_count = index.term_count,
                 .edge_count = index.edge_count,
+                .graph_counts_pending = index.graph_counts_pending,
                 .node_count = index.node_count,
                 .root_node = index.root_node,
                 .publication_target_count = index.publication_target_count,

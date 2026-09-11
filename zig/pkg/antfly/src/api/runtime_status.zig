@@ -4962,6 +4962,7 @@ fn preserveIndexArtifactVisibility(dst: *db_mod.types.DBIndexStats, cached: db_m
     dst.doc_count = cached.doc_count;
     dst.term_count = cached.term_count;
     dst.edge_count = cached.edge_count;
+    dst.graph_counts_pending = cached.graph_counts_pending;
     dst.node_count = cached.node_count;
     dst.root_node = cached.root_node;
     dst.publication_target_count = cached.publication_target_count;
@@ -5357,10 +5358,11 @@ fn testGraphMetricStatsClone(alloc: std.mem.Allocator) !void {
         .last_error = "diagnostic",
         .build_pages = &pages,
     }};
-    var indexes = [_]db_mod.types.DBIndexStats{.{ .name = "graph_idx", .kind = .graph, .graph_metric_status = &metrics }};
+    var indexes = [_]db_mod.types.DBIndexStats{.{ .name = "graph_idx", .kind = .graph, .graph_counts_pending = true, .graph_metric_status = &metrics }};
     const cloned = try cloneDBStats(alloc, .{ .indexes = &indexes, .index_count = 1 });
     defer db_mod.types.freeDBStats(alloc, cloned);
     try std.testing.expectEqual(@as(usize, 1), cloned.indexes[0].graph_metric_status.len);
+    try std.testing.expect(cloned.indexes[0].graph_counts_pending);
     const status = cloned.indexes[0].graph_metric_status[0];
     try std.testing.expectEqualStrings("pagerank", status.name);
     try std.testing.expect(status.name.ptr != metrics[0].name.ptr);
@@ -5499,6 +5501,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .doc_count = item.doc_count,
             .term_count = item.term_count,
             .edge_count = item.edge_count,
+            .graph_counts_pending = item.graph_counts_pending,
             .node_count = item.node_count,
             .root_node = item.root_node,
             .publication_target_count = item.publication_target_count,

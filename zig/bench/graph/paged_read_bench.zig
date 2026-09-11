@@ -244,7 +244,7 @@ fn largeNodeDirectory(io: std.Io, out: anytype) !void {
     // dictionary hash-map fixture to this routing-only benchmark. Production
     // finishEncoding builds and authenticates every routing/control structure.
     const body_len = wire.header_len + count * (12 + 12);
-    const size = body_len + try wire.topologyExtensionSize(&.{}, count, 0, body_len);
+    const size = body_len + try wire.topologyExtensionSize(&.{}, count, 0, body_len, 0);
     const payload = try alloc.alloc(u8, size);
     defer alloc.free(payload);
     @memset(payload[0..wire.header_len], 0);
@@ -261,7 +261,7 @@ fn largeNodeDirectory(io: std.Io, out: anytype) !void {
         std.mem.writeInt(u32, row[0..4], @intCast(i), .little);
     }
     const directory_len = wire.topologyDirectorySize(&.{}, count, body_len, 0);
-    try wire.finishEncoding(alloc, payload, body_len, directory_len, .none);
+    try wire.finishEncoding(alloc, payload, body_len, directory_len, 0, .none);
     const checksum = try digestAlloc(alloc, payload);
     defer alloc.free(checksum);
     const id = try std.fmt.allocPrint(alloc, "sha256:{s}", .{checksum});
@@ -309,7 +309,7 @@ pub fn runFilteredPrefix(io: std.Io, out: anytype) !void {
     try graph.codec.compact.bindTopologyControl(&source, payload);
     var memory = Memory{ .payload = payload };
     var store = artifacts.ArtifactStore{ .allocator = alloc, .ptr = &memory, .vtable = &Memory.vtable };
-    for ([_]usize{ 0, 1, 64 }) |type_count| {
+    for ([_]usize{ 0, 1, 32, 63, 64 }) |type_count| {
         var times: [5]u64 = undefined;
         var inspected: usize = 0;
         for (0..6) |sample| {
@@ -321,18 +321,21 @@ pub fn runFilteredPrefix(io: std.Io, out: anytype) !void {
             {
                 var reader = (try graph.AdjacencyReader.init(alloc, &store, source, .none, &bytes)).?;
                 defer reader.deinit();
-                var cursor = try reader.cursor("hub", kinds[0..type_count], false, &work);
+                const requested = if (type_count == 0 or type_count == 64) kinds[0..type_count] else kinds[type_count - 1 .. type_count];
+                var cursor = try reader.cursor("hub", requested, false, &work);
                 defer cursor.deinit();
                 var edge = (try cursor.next()).?;
                 defer edge.deinit(alloc);
-                if (!std.mem.eql(u8, edge.neighbor_id, "node00000000") or !std.mem.eql(u8, edge.edge_type, "kind00")) return error.InvalidBenchmarkResult;
+                const expected = if (type_count == 0 or type_count == 64) 0 else type_count - 1;
+                var key: [32]u8 = undefined;
+                if (!std.mem.eql(u8, edge.neighbor_id, try std.fmt.bufPrint(&key, "node{d:0>8}", .{expected})) or !std.mem.eql(u8, edge.edge_type, kinds[expected])) return error.InvalidBenchmarkResult;
             }
             if (sample != 0) times[sample - 1] = @intCast(start.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds());
             inspected = 1000000 - work;
         }
-        if (type_count == 64 and inspected != 1) return error.RangeAmplificationRegression;
+        if (inspected != 1) return error.RangeAmplificationRegression;
         std.mem.sort(u64, &times, {}, std.sort.asc(u64));
-        const json = try std.json.Stringify.valueAlloc(a, .{ .mode = "filtered_first_edge", .edges = 100000, .requested_types = type_count, .artifact_bytes = payload.len, .range_calls = memory.calls, .read_bytes = memory.bytes, .inspected_edges = inspected, .median_ns = times[2], .note = "same first result; fresh reader, in-memory transport, no shared cache; includes authentication, string ownership and cleanup; no network latency model" }, .{});
+        const json = try std.json.Stringify.valueAlloc(a, .{ .mode = "filtered_first_edge", .edges = 100000, .filter_variant = type_count, .artifact_bytes = payload.len, .range_calls = memory.calls, .read_bytes = memory.bytes, .inspected_edges = inspected, .median_ns = times[2], .note = "variants 0=wildcard, 1/32/63=single kind00/31/62, 64=all; fresh reader, in-memory transport, no shared cache; includes authentication, string ownership and cleanup; no network latency model" }, .{});
         try out.interface.writeAll(json);
         try out.interface.writeByte('\n');
         try out.flush();

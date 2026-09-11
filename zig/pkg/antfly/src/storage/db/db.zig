@@ -7209,12 +7209,15 @@ pub const DB = struct {
         }
         var apply_req = req;
         apply_req.sync_level = .write;
-        try self.batchInternal(apply_req, null, .{
+        self.batchInternal(apply_req, null, .{
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
             .bypass_ha_write_gate = true,
             .raft_applied_entry_marker = identity,
-        });
+        }) catch |err| switch (err) {
+            error.GraphMaintenanceInProgress => return error.RaftApplyWriterUnavailable,
+            else => return err,
+        };
     }
 
     /// The durable Raft projection validates the split lifecycle before the
@@ -8523,6 +8526,7 @@ pub const DB = struct {
             });
             try delete_keys.append(self.alloc, merge_state_mod.legacy_key);
         }
+        if (persisted_range) |range| try self.core.index_manager.validateRangeTransition(range);
         try appendDenseArtifactCounterMutations(
             self.alloc,
             self.core.store,
@@ -28597,14 +28601,16 @@ pub const DB = struct {
         doc_count: u64 = 0,
         term_count: u64 = 0,
         edge_count: u64 = 0,
+        graph_counts_pending: bool = false,
         node_count: u64 = 0,
         root_node: u64 = 0,
         updated_at_ns: u64 = 0,
     };
 
     const index_status_prefix = "\x00\x00__metadata__:index_status:";
-    const index_status_magic: u64 = 0x3153544154584449; // "IDXTATS1" little-endian
-    const index_status_encoded_len = 8 * 8;
+    const index_status_magic_v1: u64 = 0x3153544154584449; // "IDXTATS1" little-endian
+    const index_status_magic: u64 = 0x3253544154584449; // "IDXTATS2" little-endian
+    const index_status_encoded_len = 9 * 8;
     const index_load_failure_prefix = "\x00\x00__metadata__:index_load_failure:";
 
     fn indexStatusKeyAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
@@ -28622,6 +28628,7 @@ pub const DB = struct {
             status_snapshot.node_count,
             status_snapshot.root_node,
             status_snapshot.updated_at_ns,
+            @as(u64, @intFromBool(status_snapshot.graph_counts_pending)),
         }) |value| {
             std.mem.writeInt(u64, out[offset..][0..8], value, .little);
             offset += 8;
@@ -28629,11 +28636,14 @@ pub const DB = struct {
     }
 
     fn decodeIndexStatusSnapshot(raw: []const u8) !IndexStatusSnapshot {
-        if (raw.len != index_status_encoded_len) return error.InvalidIndexStatusSnapshot;
+        if (raw.len != index_status_encoded_len and raw.len != 64) return error.InvalidIndexStatusSnapshot;
         var offset: usize = 0;
         const magic = std.mem.readInt(u64, raw[offset..][0..8], .little);
         offset += 8;
-        if (magic != index_status_magic) return error.InvalidIndexStatusSnapshot;
+        if (!((magic == index_status_magic and raw.len == index_status_encoded_len) or
+            (magic == index_status_magic_v1 and raw.len == 64))) return error.InvalidIndexStatusSnapshot;
+        const counts_pending = if (raw.len == 64) 0 else std.mem.readInt(u64, raw[64..72], .little);
+        if (counts_pending > 1) return error.InvalidIndexStatusSnapshot;
         const kind_raw = std.mem.readInt(u64, raw[offset..][0..8], .little);
         offset += 8;
         const kind: types.IndexKind = switch (kind_raw) {
@@ -28646,6 +28656,7 @@ pub const DB = struct {
         };
         return .{
             .kind = kind,
+            .graph_counts_pending = counts_pending != 0,
             .doc_count = blk: {
                 const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
                 offset += 8;
@@ -28707,11 +28718,12 @@ pub const DB = struct {
             };
         }
         if (index_manager.graphIndex(index_name)) |entry| {
-            const graph_stats = entry.index.stats(index_manager.alloc) catch return null;
+            const graph_stats = entry.index.operationalStats();
             return .{
                 .kind = .graph,
                 .doc_count = graph_stats.node_count,
                 .edge_count = graph_stats.edge_count,
+                .graph_counts_pending = graph_stats.counts_pending,
                 .node_count = graph_stats.node_count,
                 .updated_at_ns = platform_time.monotonicNs(),
             };
@@ -28802,6 +28814,7 @@ pub const DB = struct {
         item.doc_count = status_snapshot.doc_count;
         item.term_count = status_snapshot.term_count;
         item.edge_count = status_snapshot.edge_count;
+        item.graph_counts_pending = status_snapshot.graph_counts_pending;
         item.node_count = status_snapshot.node_count;
         item.root_node = status_snapshot.root_node;
     }
@@ -29347,14 +29360,14 @@ pub const DB = struct {
                 },
                 .graph => {
                     if (self.core.graphIndex(item.name)) |entry| {
-                        if (entry.index.stats(self.alloc)) |graph_stats| {
-                            item.edge_count = graph_stats.edge_count;
-                            item.node_count = graph_stats.node_count;
-                            item.doc_count = graph_stats.node_count;
-                        } else |_| {}
+                        const graph_stats = entry.index.operationalStats();
+                        item.edge_count = graph_stats.edge_count;
+                        item.node_count = graph_stats.node_count;
+                        item.doc_count = graph_stats.node_count;
+                        item.graph_counts_pending = graph_stats.counts_pending;
                         applyGraphAlgebraicRuntimeStats(item, &entry.index);
                     }
-                    visible_doc_count = @max(visible_doc_count, item.doc_count);
+                    if (!item.graph_counts_pending) visible_doc_count = @max(visible_doc_count, item.doc_count);
                 },
                 .algebraic => {
                     if (self.core.index_manager.algebraicIndex(item.name)) |entry| {
@@ -29849,16 +29862,14 @@ pub const DB = struct {
                 },
                 .graph => {
                     if (self.core.graphIndex(cfg.name)) |entry| {
-                        graph_stats: {
-                            const graph_snapshot = entry.index.stats(alloc) catch {
-                                serving_observed = false;
-                                break :graph_stats;
-                            };
+                        {
+                            const graph_snapshot = entry.index.operationalStats();
+                            item.graph_counts_pending = graph_snapshot.counts_pending;
                             item.edge_count = graph_snapshot.edge_count;
                             item.node_count = graph_snapshot.node_count;
                             item.doc_count = graph_snapshot.node_count;
                             serving_observed = true;
-                            visible_doc_count = @max(visible_doc_count, item.doc_count);
+                            if (!graph_snapshot.counts_pending) visible_doc_count = @max(visible_doc_count, item.doc_count);
                         }
                         applyGraphAlgebraicRuntimeStats(&item, &entry.index);
                         try populateGraphMetricStatusStats(alloc, &item, &entry.index);
@@ -54414,6 +54425,7 @@ fn rebaseRangeCoverageMetadata(
     byte_range: types.ByteRange,
     extra_writes: []const docstore_mod.KVPair,
 ) !void {
+    try index_manager.validateRangeTransition(byte_range);
     var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer writes.deinit(alloc);
     var owned_keys = std.ArrayListUnmanaged([]u8).empty;
@@ -60806,6 +60818,21 @@ test "db transaction recovery enabled requires backend runtime io" {
             .resolve_participant_fn = TestTransactionRecoveryResolver.resolve,
         },
     }));
+}
+
+test "db graph runtime count snapshots preserve pending state and read released snapshots" {
+    var encoded: [DB.index_status_encoded_len]u8 = undefined;
+    DB.encodeIndexStatusSnapshot(.{ .kind = .graph, .edge_count = 12, .graph_counts_pending = true }, &encoded);
+    const current = try DB.decodeIndexStatusSnapshot(&encoded);
+    try std.testing.expect(current.graph_counts_pending);
+    try std.testing.expectEqual(@as(u64, 12), current.edge_count);
+    std.mem.writeInt(u64, encoded[64..72], 2, .little);
+    try std.testing.expectError(error.InvalidIndexStatusSnapshot, DB.decodeIndexStatusSnapshot(&encoded));
+    var released: [64]u8 = encoded[0..64].*;
+    std.mem.writeInt(u64, released[0..8], DB.index_status_magic_v1, .little);
+    const old = try DB.decodeIndexStatusSnapshot(&released);
+    try std.testing.expect(!old.graph_counts_pending);
+    try std.testing.expectEqual(@as(u64, 12), old.edge_count);
 }
 
 test "db default primary backend survives reopen" {

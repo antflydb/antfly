@@ -527,7 +527,7 @@ test "public index contract exposes runtime status metadata" {
 test "indexes openapi parses graph metric runtime summary" {
     const alloc = std.testing.allocator;
     var parsed = try std.json.parseFromSlice(indexes_generated.IndexStats, alloc,
-        \\{"index_type":"graph","total_edges":4,"graph_metric_runtime":{"enabled":true,"role":"worker_pool","owner_id_hash":17,"worker_id_hash":23,"worker_count":3,"lease_owned":true,"has_lease":true,"takeover_count":2,"lost_leases":1,"ticks_started":9,"ticks_completed":8,"durable_progress_ticks":7,"total_pages_claimed":6,"total_pages_completed":5,"last_pages_claimed":4,"last_pages_completed":3}}
+        \\{"index_type":"graph","counts_pending":true,"total_edges":4,"graph_metric_runtime":{"enabled":true,"role":"worker_pool","owner_id_hash":17,"worker_id_hash":23,"worker_count":3,"lease_owned":true,"has_lease":true,"takeover_count":2,"lost_leases":1,"ticks_started":9,"ticks_completed":8,"durable_progress_ticks":7,"total_pages_claimed":6,"total_pages_completed":5,"last_pages_claimed":4,"last_pages_completed":3}}
     , .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     defer parsed.deinit();
 
@@ -535,6 +535,7 @@ test "indexes openapi parses graph metric runtime summary" {
         .graph_index_stats => |stats| {
             const runtime = stats.graph_metric_runtime orelse return error.UnexpectedOpenApiVariant;
             try std.testing.expect(runtime.enabled.?);
+            try std.testing.expect(stats.counts_pending.?);
             try std.testing.expectEqualStrings("worker_pool", runtime.role.?);
             try std.testing.expectEqual(@as(i64, 17), runtime.owner_id_hash.?);
             try std.testing.expectEqual(@as(i64, 3), runtime.worker_count.?);
@@ -550,7 +551,7 @@ test "indexes openapi parses graph metric runtime summary" {
 test "client openapi parses graph metric runtime summary" {
     const alloc = std.testing.allocator;
     var parsed = try std.json.parseFromSlice(client_generated.IndexStats, alloc,
-        \\{"index_type":"graph","total_edges":4,"graph_metric_runtime":{"enabled":true,"role":"coordinator","owner_id_hash":99,"worker_count":1,"takeover_count":2,"lost_leases":1,"total_pages_claimed":6,"last_pages_completed":3}}
+        \\{"index_type":"graph","counts_pending":true,"total_edges":4,"graph_metric_runtime":{"enabled":true,"role":"coordinator","owner_id_hash":99,"worker_count":1,"takeover_count":2,"lost_leases":1,"total_pages_claimed":6,"last_pages_completed":3}}
     , .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     defer parsed.deinit();
 
@@ -558,6 +559,7 @@ test "client openapi parses graph metric runtime summary" {
         .graph_index_stats => |stats| {
             const runtime = stats.graph_metric_runtime orelse return error.UnexpectedOpenApiVariant;
             try std.testing.expect(runtime.enabled.?);
+            try std.testing.expect(stats.counts_pending.?);
             try std.testing.expectEqualStrings("coordinator", runtime.role.?);
             try std.testing.expectEqual(@as(i64, 99), runtime.owner_id_hash.?);
             try std.testing.expectEqual(@as(i64, 1), runtime.worker_count.?);

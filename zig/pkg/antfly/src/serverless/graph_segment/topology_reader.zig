@@ -123,7 +123,7 @@ pub const Context = struct {
             const covered = trailer.directoryOffset();
             if (pages != nodes / wire.node_page_entries + @intFromBool(nodes % wire.node_page_entries != 0) or
                 blocks != (covered + wire.authentication_block_bytes - 1) / wire.authentication_block_bytes or
-                trailer.adjacency_index_len != @as(u64, nodes) * 8) return error.InvalidGraphSegment;
+                trailer.adjacency_index_len < @as(u64, nodes) * 8) return error.InvalidGraphSegment;
             const fences: u64 = 16 + (@as(u64, pages) + 1) * 8;
             const checksums = fences + @as(u64, pages) * wire.node_page_fence_bytes;
             const type_offsets = checksums + @as(u64, blocks) * 32;
@@ -163,7 +163,7 @@ pub const Context = struct {
             const covered = trailer.directoryOffset();
             const blocks = covered / wire.authentication_block_bytes + @intFromBool(covered % wire.authentication_block_bytes != 0);
             if (dir.block_checksums.len / 32 != blocks) return error.InvalidGraphSegment;
-            if (trailer.adjacency_index_len != @as(u64, dir.nodes) * 8) return error.InvalidGraphSegment;
+            if (trailer.adjacency_index_len < @as(u64, dir.nodes) * 8) return error.InvalidGraphSegment;
         }
         const covered = trailer.directoryOffset();
         const slots: usize = if (layout != null) @intCast(@min(requested_slots, (covered + wire.authentication_block_bytes - 1) / wire.authentication_block_bytes)) else 0;

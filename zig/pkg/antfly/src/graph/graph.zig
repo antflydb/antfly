@@ -274,6 +274,14 @@ fn graphIndexEdgePrefixAlloc(alloc: Allocator, doc_key: []const u8, index_name: 
     return try list.toOwnedSlice(alloc);
 }
 
+fn graphIndexEdgeUpperAlloc(alloc: Allocator, prefix: []const u8) ![]u8 {
+    // Prefixes end in a terminator or graph_edge_record_kind, never 0xff.
+    std.debug.assert(prefix.len > 0 and prefix[prefix.len - 1] < 255);
+    const upper = try alloc.dupe(u8, prefix);
+    upper[upper.len - 1] += 1;
+    return upper;
+}
+
 fn graphIndexEdgeKeyAlloc(alloc: Allocator, doc_key: []const u8, index_name: []const u8, edge_type: []const u8, target_doc_key: []const u8) ![]u8 {
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);
@@ -1080,6 +1088,18 @@ pub const GraphIndex = struct {
         const before = end.len > 0 and scope.lower.len > 0 and compareEncodedBoundary(scope.lower[1..], end) != .lt;
         const after = scope.upper.len > 0 and compareEncodedBoundary(scope.upper[1..], start) != .gt;
         self.ownership_active = self.ownership_active or before or after;
+    }
+
+    /// Admit every authoritative range transition before its durable commit.
+    /// An existing task owns its excluded interval until retirement finishes.
+    pub fn validateOwnershipRange(self: *GraphIndex, start: []const u8, end: []const u8) !void {
+        @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+        defer self.ownership_mutex.unlock();
+        const raw = self.ownership_fence orelse return;
+        const scope = try maintenance.RangeProgress.decode(raw);
+        const before = end.len > 0 and scope.lower.len > 0 and compareEncodedBoundary(scope.lower[1..], end) != .lt;
+        const after = scope.upper.len > 0 and compareEncodedBoundary(scope.upper[1..], start) != .gt;
+        if (!before and !after) return error.GraphMaintenanceInProgress;
     }
 
     fn ownershipSeekAlloc(a: Allocator, scope: maintenance.RangeProgress, key: []const u8, incoming: bool, backwards: bool) ![]u8 {
@@ -6460,6 +6480,18 @@ pub const GraphIndex = struct {
         };
     }
 
+    pub const OperationalStats = struct { edge_count: u64, node_count: u64, counts_pending: bool };
+
+    /// Physical counters are upper bounds until ownership cleanup completes.
+    /// Status publication never allocates a node set or scans graph topology.
+    pub fn operationalStats(self: *GraphIndex) OperationalStats {
+        // Sample after acquiring the fence lock so completion cannot clear
+        // uncertainty between reading old physical counts and their flag.
+        @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+        defer self.ownership_mutex.unlock();
+        return .{ .edge_count = self.edge_count, .node_count = self.node_count, .counts_pending = self.ownership_fence != null };
+    }
+
     pub fn scanStats(self: *GraphIndex, alloc: Allocator) !Stats {
         var txn = try self.beginReadReverseTxn();
         defer txn.abort();
@@ -7209,6 +7241,7 @@ pub const GraphIndex = struct {
         incoming: ?backend_erased.ReadTxn = null,
         cursor: ?backend_erased.Cursor = null,
         prefix: ?[]u8 = null,
+        upper: ?[]u8 = null,
         entry: ?backend_erased.Entry = null,
         advance: bool = false,
         started: bool = false,
@@ -7219,6 +7252,8 @@ pub const GraphIndex = struct {
             self.cursor = null;
             if (self.prefix) |prefix| a.free(prefix);
             self.prefix = null;
+            if (self.upper) |upper| a.free(upper);
+            self.upper = null;
             self.entry = null;
             self.advance = false;
         }
@@ -7265,7 +7300,9 @@ pub const GraphIndex = struct {
                     }
                     const kind = if (self.kinds.len == 0) "" else self.kinds[self.type_index];
                     self.prefix = try graphIndexEdgePrefixAlloc(a, self.key, self.index.index_name, kind);
+                    self.upper = try graphIndexEdgeUpperAlloc(a, self.prefix.?);
                     self.cursor = if (self.phase == .out) try self.outgoing.?.openCursor() else try self.incoming.?.openCursor();
+                    self.cursor.?.setUpperBound(self.upper.?);
                     self.entry = try self.cursor.?.seekAtOrAfter(self.prefix.?);
                 } else if (self.advance) {
                     self.entry = try self.cursor.?.next();
@@ -7320,6 +7357,8 @@ pub const GraphIndex = struct {
         else
             try reverseEdgePrefixAlloc(alloc, key, self.index_name, requested_type);
         defer alloc.free(prefix);
+        const upper = try graphIndexEdgeUpperAlloc(alloc, prefix);
+        defer alloc.free(upper);
 
         const resume_key = if (scan_cursor) |cursor|
             if (cursor.at_phase_start)
@@ -7336,6 +7375,7 @@ pub const GraphIndex = struct {
         defer txn.abort();
         var cursor = try txn.openCursor();
         defer cursor.close();
+        cursor.setUpperBound(upper);
 
         var entry = (try cursor.seekAtOrAfter(resume_key orelse prefix)) orelse return null;
         if (resume_key) |value| {
@@ -7517,6 +7557,10 @@ pub const GraphIndex = struct {
         for (keys, 0..) |key, i| {
             const prefix = try reverseEdgePrefixAlloc(alloc, key, self.index_name, "");
             defer alloc.free(prefix);
+            const upper = try graphIndexEdgeUpperAlloc(alloc, prefix);
+            defer alloc.free(upper);
+            cursor.setUpperBound(upper);
+            defer cursor.setUpperBound(null);
             const first = (try cursor.seekAtOrAfter(prefix)) orelse continue;
             result[i] = std.mem.startsWith(u8, first.key, prefix);
         }
@@ -7526,11 +7570,14 @@ pub const GraphIndex = struct {
     fn scanOutgoingEdges(self: *GraphIndex, alloc: Allocator, results: *std.ArrayListUnmanaged(Edge), key: []const u8, edge_type: []const u8) !void {
         const prefix = try edgePrefixAlloc(alloc, key, self.index_name, edge_type);
         defer alloc.free(prefix);
+        const upper = try graphIndexEdgeUpperAlloc(alloc, prefix);
+        defer alloc.free(upper);
 
         var txn = try self.beginReadOutgoingTxn();
         defer txn.abort();
         var cur = try txn.openCursor();
         defer cur.close();
+        cur.setUpperBound(upper);
 
         const first = (try cur.seekAtOrAfter(prefix)) orelse return;
         if (!std.mem.startsWith(u8, first.key, prefix)) return;
@@ -7551,12 +7598,15 @@ pub const GraphIndex = struct {
     ) !void {
         const prefix = try reverseEdgePrefixAlloc(alloc, key, self.index_name, edge_type);
         defer alloc.free(prefix);
+        const upper = try graphIndexEdgeUpperAlloc(alloc, prefix);
+        defer alloc.free(upper);
 
         var txn = try self.beginReadReverseTxn();
         defer txn.abort();
 
         var cur = try txn.openCursor();
         defer cur.close();
+        cur.setUpperBound(upper);
 
         const first = (try cur.seekAtOrAfter(prefix)) orelse return;
 
@@ -34805,6 +34855,11 @@ test "graph maintenance ownership fences pin snapshots and retire bounded pages"
     GraphIndex.freeEdges(a, first);
     try g.fenceOwnedRange(a, "m", "");
     try std.testing.expectEqual(@as(u64, 3), g.edge_count);
+    const pending = g.operationalStats();
+    try std.testing.expect(pending.counts_pending);
+    try std.testing.expectEqual(@as(u64, 3), pending.edge_count);
+    try std.testing.expectError(error.GraphMaintenanceInProgress, g.validateOwnershipRange("", ""));
+    try g.validateOwnershipRange("", "m");
     try std.testing.expectEqual(@as(u64, 1), (try g.stats(a)).edge_count);
     try std.testing.expectError(error.KeyOutOfRange, g.addEdge("z", "d", "link", 1, 0, 0, "{}"));
     for ([_]struct { key: []const u8, direction: EdgeDirection }{ .{ .key = "z", .direction = .out }, .{ .key = "b", .direction = .in } }) |request| {
@@ -34828,9 +34883,53 @@ test "graph maintenance ownership fences pin snapshots and retire bounded pages"
     try std.testing.expect(g.ownershipCleanupPending());
     try std.testing.expectEqual(@as(?usize, null), try g.pruneOwnedRangePage());
     try std.testing.expect(!g.ownershipCleanupPending());
+    try std.testing.expect(!g.operationalStats().counts_pending);
+    try g.validateOwnershipRange("", "");
     try std.testing.expectEqual(@as(u64, 1), (try g.stats(a)).edge_count);
     const first_visible = (try retained.first()).?;
     try std.testing.expectEqualStrings("a", BorrowedEdgeKey.parse(first_visible.key, .in).?.source);
+}
+
+test "graph maintenance bounded adjacency never seeks through unrelated fenced targets" {
+    const a = std.testing.allocator;
+    var g = try GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .mem });
+    defer g.close();
+    for (0..64) |i| {
+        var key: [32]u8 = undefined;
+        try g.addEdge("z", try std.fmt.bufPrint(&key, "target{d:0>4}", .{i}), "link", 1, 0, 0, "{}");
+    }
+    try g.fenceOwnedRange(a, "m", "");
+    // The visibility wrapper allocates each seek-past boundary through the
+    // index allocator. A missing prefix must not allocate once per later row.
+    for (0..4) |mode| {
+        var counted = std.testing.FailingAllocator.init(a, .{});
+        g.alloc = counted.allocator();
+        defer g.alloc = a;
+        switch (mode) {
+            0 => {
+                var scan = g.nativeEdgeScan("target0000", &.{"link"}, .in);
+                defer scan.deinit(a);
+                try std.testing.expect((try scan.nextPage(a, 1, 4096)) == null);
+            },
+            1 => {
+                const edges = try g.getEdges(a, "target0000", "link", .in);
+                defer GraphIndex.freeEdges(a, edges);
+                try std.testing.expectEqual(@as(usize, 0), edges.len);
+            },
+            2 => {
+                const present = try g.hasIncomingEdgesManyAlloc(a, &.{ "target0000", "target0063" });
+                defer a.free(present);
+                try std.testing.expectEqualSlices(bool, &.{ false, false }, present);
+            },
+            3 => {
+                var page = try g.getEdgesByTypesPage(a, "target0000", &.{"link"}, .in, null, .{ .max_edges = 1, .max_owned_bytes = 4096 });
+                defer page.deinit(a);
+                try std.testing.expectEqual(@as(usize, 0), page.edges.len);
+            },
+            else => unreachable,
+        }
+        try std.testing.expect(counted.allocations < 20);
+    }
 }
 
 test "graph maintenance ownership read wrappers release scopes on allocation failure" {

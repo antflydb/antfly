@@ -10422,6 +10422,7 @@ pub fn build(b: *std.Build) void {
         "graph metric status clone owns active build worker id",
         "graph metric index stats cleanup owns nested status payloads",
         "graph metric cached index stats clone retains owned progress and survives allocation failures",
+        "metadata runtime index status",
     };
     const graph_metric_fan_in_tests = b.addTest(.{
         .root_module = api_graph_metric_test_mod,

@@ -22,6 +22,7 @@ const openapi_contract = @import("api/openapi_contract.zig");
 const indexes = @import("api/indexes.zig");
 const public_table_http = @import("api/public_table_http.zig");
 const graph_exec = @import("storage/db/query/graph_exec.zig");
+const metadata_status_codec = @import("metadata/storage/raft_apply_store.zig");
 
 // Storage adapters resolve these declarations through their discovery root.
 pub const storage_backend_erased = @import("storage/backend_erased.zig");
@@ -34,4 +35,5 @@ test {
     _ = indexes;
     _ = public_table_http;
     _ = graph_exec;
+    _ = metadata_status_codec;
 }

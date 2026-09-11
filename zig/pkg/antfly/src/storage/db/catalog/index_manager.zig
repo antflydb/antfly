@@ -6743,6 +6743,11 @@ pub const IndexManager = struct {
         for (self.graph_indexes.items) |*entry| entry.index.reconcileOwnershipRange(byte_range.start, byte_range.end);
     }
 
+    pub fn validateRangeTransition(self: *IndexManager, byte_range: docstore_mod.ByteRange) !void {
+        if (std.mem.eql(u8, self.byte_range.start, byte_range.start) and std.mem.eql(u8, self.byte_range.end, byte_range.end)) return;
+        for (self.graph_indexes.items) |*entry| try entry.index.validateOwnershipRange(byte_range.start, byte_range.end);
+    }
+
     pub fn syncAll(self: *IndexManager, force: bool) !void {
         for (self.text_indexes.items) |*entry| try entry.persistent.sync(force);
         for (self.dense_indexes.items) |*entry| try entry.index.sync(force);

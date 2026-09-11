@@ -567,6 +567,7 @@ pub const DBCore = struct {
     }
 
     pub fn updateRange(self: *DBCore, byte_range: types.ByteRange) !void {
+        try self.index_manager.validateRangeTransition(byte_range);
         const start = try self.alloc.dupe(u8, byte_range.start);
         errdefer self.alloc.free(start);
         const end = try self.alloc.dupe(u8, byte_range.end);

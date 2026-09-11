@@ -22308,7 +22308,8 @@ components:
           type: boolean
     GraphIndexStats:
       type: object
-      description: Statistics for graph index
+      description: Statistics for graph index. While counts_pending is true, edge/node/document counts
+        are physical upper bounds awaiting ownership cleanup, not exact logical counts.
       required:
         - index_type
       properties:
@@ -22346,6 +22347,11 @@ components:
           type: integer
           format: uint64
           description: Total number of edges in the graph
+        counts_pending:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: True while ownership cleanup is pending on any observed shard. Counts are physical
+            upper bounds until cleanup completes; serving adjacency already enforces ownership.
         edge_types:
           type: object
           additionalProperties:

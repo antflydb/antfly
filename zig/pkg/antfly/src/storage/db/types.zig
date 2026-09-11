@@ -3597,6 +3597,7 @@ pub const DBIndexStats = struct {
     term_count: u64 = 0,
     edge_count: u64 = 0,
     node_count: u64 = 0,
+    graph_counts_pending: bool = false,
     root_node: u64 = 0,
     // Exact physical artifact cardinality owned by this index incarnation.
     // Unlike source coverage, this remains correct for chunked projections
