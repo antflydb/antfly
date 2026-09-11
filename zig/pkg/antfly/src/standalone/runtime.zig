@@ -1398,17 +1398,42 @@ const LocalStandaloneMetadata = struct {
         }
         var ranges: std.ArrayListUnmanaged(antfly.metadata.RangeRecord) = .empty;
         var intents: std.ArrayListUnmanaged(antfly.raft.PlacementIntent) = .empty;
+        const RangeSelection = struct {
+            prefix: []const u8,
+            table_id: u64,
+            fn less(_: void, left: @This(), right: @This()) bool {
+                return std.mem.lessThan(u8, left.prefix, right.prefix);
+            }
+        };
+        const selections = try a.alloc(RangeSelection, page.entries.len);
+        for (selections, page.entries) |*selection, entry| selection.* = .{
+            .prefix = try listingRangePrefix(a, entry.table.table_id),
+            .table_id = entry.table.table_id,
+        };
+        std.mem.sort(RangeSelection, selections, {}, RangeSelection.less);
         var cursor = try txn.openCursor();
         defer cursor.close();
-        for (page.entries) |entry| {
-            const prefix = try listingRangePrefix(a, entry.table.table_id);
-            var row = try cursor.seekAtOrAfter(prefix);
+        var row = if (selections.len == 0) null else try cursor.seekAtOrAfter(selections[0].prefix);
+        for (selections) |selection| {
+            // A broad inventory walks adjacent ranges once. A narrow page
+            // bounds unrelated skips before seeking its next selected table.
+            var skipped: usize = 0;
+            while (row) |kv| {
+                if (!std.mem.lessThan(u8, kv.key, selection.prefix)) break;
+                if (skipped == 16) {
+                    row = try cursor.seekAtOrAfter(selection.prefix);
+                    break;
+                }
+                row = try cursor.next();
+                skipped += 1;
+            }
             while (row) |kv| : (row = try cursor.next()) {
-                if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+                if (!std.mem.startsWith(u8, kv.key, selection.prefix)) break;
+                try context.ensureActive();
                 if (kv.value.len != 8) return error.InvalidCatalogRecord;
                 const id = std.mem.readInt(u64, kv.value[0..8], .little);
                 const range = self.manager.ranges.get(id) orelse return error.InvalidCatalogRecord;
-                if (range.table_id != entry.table.table_id) return error.InvalidCatalogRecord;
+                if (range.table_id != selection.table_id) return error.InvalidCatalogRecord;
                 try ranges.append(a, try antfly.metadata.table_manager.cloneRange(a, range));
                 try intents.append(a, .{ .record = .{ .group_id = id, .replica_id = 1, .local_node_id = self.local_node_id, .bootstrap_mode = .persisted, .metadata_version = self.epoch }, .store_id = self.store_id, .peer_node_ids = &.{} });
             }
