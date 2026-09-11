@@ -110,6 +110,7 @@ pub fn reconcileAlloc(alloc: Allocator, current: manifests.Manifest, plan: publi
     }
     const configured_metrics = try metrics.parseIndexSpecsAlloc(alloc, plan.table_definition.indexes_json);
     defer metrics.freeIndexSpecs(alloc, configured_metrics);
+    const reuse_rejections = try rejectionPlanUnchanged(alloc, configured_metrics, retained.items, current.artifacts);
     for (configured_metrics) |spec| {
         const graph = find(retained.items, .graph_segment, spec.index_name) orelse continue;
         const digest = artifacts.sha256DigestFromChecksum(graph.checksum) catch continue;
@@ -126,6 +127,7 @@ pub fn reconcileAlloc(alloc: Allocator, current: manifests.Manifest, plan: publi
                 if (ref.kind != .graph_metric_segment or ref.metadata_version != metric_segment.wire_version or
                     !std.mem.eql(u8, &digest, &ref.graph_metric_source_checksum) or
                     ref.graph_metric_config_fingerprint != metric_kernel.configFingerprint(config)) continue;
+                if (ref.graph_metric_materialization_state == .rejected and !reuse_rejections) continue;
                 selected = ref;
                 if (std.mem.eql(u8, ref.name, name)) break;
             }
@@ -154,6 +156,29 @@ pub fn reconcileAlloc(alloc: Allocator, current: manifests.Manifest, plan: publi
     result.stats.sparse_segment_count = count(retained.items, .sparse_segment);
     result.stats.graph_segment_count = count(retained.items, .graph_segment);
     return result;
+}
+
+/// A rejected computation depends on the entire admission plan, not just its
+/// own source/configuration. If that witness changes, omit old rejections so
+/// the next rebuild can reconsider the remaining work under the new plan.
+fn rejectionPlanUnchanged(alloc: Allocator, specs: []const metrics.IndexSpec, retained: []const manifests.ArtifactRef, previous: []const manifests.ArtifactRef) !bool {
+    const has_rejections = for (previous) |ref| {
+        if (ref.kind == .graph_metric_segment and ref.graph_metric_materialization_state == .rejected) break true;
+    } else false;
+    if (!has_rejections) return false;
+    var requests = std.ArrayListUnmanaged(metric_kernel.PublicationRequest).empty;
+    defer requests.deinit(alloc);
+    for (specs) |spec| {
+        if (spec.configs.len == 0) continue;
+        const graph = find(retained, .graph_segment, spec.index_name) orelse return false;
+        for (spec.configs) |config| try requests.append(alloc, .{
+            .graph_index_name = spec.index_name,
+            .source_graph = graph,
+            .config = config,
+            .provenance = .{},
+        });
+    }
+    return metric_kernel.admissionPlanUnchanged(alloc, requests.items, previous, .{});
 }
 
 fn snapshot(kind: @import("../../storage/rowsource/types.zig").SourceKind, source: manifests.ExternalBaseSource, source_id: []const u8) lake.LakeSourceSnapshot {
@@ -289,6 +314,14 @@ test "serverless external metadata allocation failures release every owned snaps
     const a = std.testing.allocator;
     var current = try testing.fixtureAlloc(a, 1024);
     defer current.deinit(a);
+    for (current.artifacts) |*ref| {
+        if (ref.kind != .graph_metric_segment) continue;
+        ref.materializer_fingerprint = metric_kernel.materializerFingerprint(.{});
+        if (std.mem.eql(u8, ref.name, "9:graph_idx4:rank")) {
+            ref.graph_metric_materialization_state = .rejected;
+            ref.graph_metric_rejection_reason = .build_budget_exceeded;
+        }
+    }
     const Exercise = struct {
         fn run(alloc: Allocator, source: manifests.Manifest) !void {
             var result = try reconcileAlloc(alloc, source, .{
@@ -302,4 +335,93 @@ test "serverless external metadata allocation failures release every owned snaps
     var singular_sources = current;
     singular_sources.stats.published_search_sources.items = null;
     try std.testing.checkAllAllocationFailures(a, Exercise.run, .{singular_sources});
+}
+
+test "serverless external metadata rejections retain only the complete unchanged admission plan" {
+    const a = std.testing.allocator;
+    var current = try testing.fixtureAlloc(a, 16384);
+    defer current.deinit(a);
+    const degree_name = "9:graph_idx6:degree";
+    const rank_name = "9:graph_idx4:rank";
+    for (current.artifacts) |*ref| {
+        if (ref.kind != .graph_metric_segment) continue;
+        ref.materializer_fingerprint = metric_kernel.materializerFingerprint(.{});
+        if (std.mem.eql(u8, ref.name, rank_name)) {
+            ref.graph_metric_materialization_state = .rejected;
+            ref.graph_metric_rejection_reason = .build_budget_exceeded;
+        }
+    }
+    var plan: publication.TablePublicationPlan = .{
+        .targets = .{ .published_search_sources = .{} },
+        .table_definition = .{ .indexes_json = @constCast(testing.indexes), .read_schema_json = @constCast("{}") },
+    };
+    var stable = try reconcileAlloc(a, current, plan);
+    defer stable.deinit(a);
+    const original_rejection = find(current.artifacts, .graph_metric_segment, rank_name).?;
+    try std.testing.expectEqualStrings(original_rejection.artifact_id, find(stable.artifacts, .graph_metric_segment, rank_name).?.artifact_id);
+    try std.testing.expect(find(stable.artifacts, .graph_metric_segment, rank_name).?.graph_metric_materialization_state == .rejected);
+    // Removing the first computation must not rewrite the original [degree,
+    // rank] witness into an apparently stable [rank] rejected publication.
+    const only_rank = "{\"graph_idx\":{\"type\":\"graph\",\"field\":\"graph_edges\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\",\"max_iterations\":20}}}}";
+    plan.table_definition.indexes_json = @constCast(only_rank);
+    var removed = try reconcileAlloc(a, current, plan);
+    defer removed.deinit(a);
+    try std.testing.expect(find(removed.artifacts, .graph_segment, "graph_idx") != null);
+    try std.testing.expect(find(removed.artifacts, .graph_metric_segment, rank_name) == null);
+    // A changed sibling, or a newly configured graph with no source sidecar,
+    // also changes admission even though rank's own kernel is identical.
+    const changed_sibling = "{\"graph_idx\":{\"type\":\"graph\",\"field\":\"graph_edges\",\"metrics\":{\"degree\":{\"kind\":\"pagerank\",\"max_iterations\":5},\"rank\":{\"kind\":\"pagerank\",\"max_iterations\":20}}}}";
+    const missing_graph = "{\"graph_idx\":{\"type\":\"graph\",\"field\":\"graph_edges\",\"metrics\":{\"degree\":{\"kind\":\"degree\"},\"rank\":{\"kind\":\"pagerank\",\"max_iterations\":20}}},\"other\":{\"type\":\"graph\",\"field\":\"other_edges\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\",\"max_iterations\":20}}}}";
+    for ([_][]const u8{ changed_sibling, missing_graph }) |indexes| {
+        plan.table_definition.indexes_json = @constCast(indexes);
+        var changed = try reconcileAlloc(a, current, plan);
+        defer changed.deinit(a);
+        try std.testing.expect(find(changed.artifacts, .graph_metric_segment, rank_name) == null);
+    }
+    // Ready computations still alias normally, but a rejection cannot acquire
+    // a new logical admission plan merely by renaming its reference.
+    plan.table_definition.indexes_json = @constCast("{\"graph_alias\":{\"type\":\"graph\",\"field\":\"graph_edges\",\"metrics\":{\"degree_alias\":{\"kind\":\"degree\"},\"rank_alias\":{\"kind\":\"pagerank\",\"max_iterations\":20}}}}");
+    var aliases = try reconcileAlloc(a, current, plan);
+    defer aliases.deinit(a);
+    try std.testing.expectEqualStrings(find(current.artifacts, .graph_metric_segment, degree_name).?.artifact_id, find(aliases.artifacts, .graph_metric_segment, "11:graph_alias12:degree_alias").?.artifact_id);
+    try std.testing.expect(find(aliases.artifacts, .graph_metric_segment, "11:graph_alias10:rank_alias") == null);
+    plan.table_definition.indexes_json = @constCast(testing.indexes);
+    for (current.artifacts) |*ref| if (std.mem.eql(u8, ref.name, rank_name)) {
+        ref.materializer_fingerprint ^= 1;
+    };
+    var policy_changed = try reconcileAlloc(a, current, plan);
+    defer policy_changed.deinit(a);
+    try std.testing.expect(find(policy_changed.artifacts, .graph_metric_segment, rank_name) == null);
+    try std.testing.expect(find(policy_changed.artifacts, .graph_metric_segment, degree_name) != null);
+}
+
+test "serverless external metadata removes an explicit default-named full text index without resurrecting it" {
+    const a = std.testing.allocator;
+    var fixture = try testing.fixtureAlloc(a, 12);
+    defer fixture.deinit(a);
+    var text = find(fixture.artifacts, .text_segment, "body_text").?;
+    text.name = "full_text_index_v0";
+    const refs = [_]manifests.ArtifactRef{text};
+    var current = fixture;
+    current.artifacts = @constCast(&refs);
+    current.stats.indexes_json = @constCast("{\"full_text_index_v0\":{\"type\":\"full_text\"}}");
+    current.stats.published_search_sources = .{ .text = .{ .index_name = "full_text_index_v0" } };
+    var plan: publication.TablePublicationPlan = .{
+        .targets = .{ .published_search_sources = .{} },
+        .table_definition = .{ .indexes_json = current.stats.indexes_json },
+    };
+    var unchanged = try reconcileAlloc(a, current, plan);
+    defer unchanged.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), unchanged.artifacts.len);
+    try std.testing.expect(unchanged.stats.published_search_sources.findText() != null);
+    plan.table_definition.indexes_json = @constCast("{}");
+    var removed = try reconcileAlloc(a, current, plan);
+    defer removed.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), removed.artifacts.len);
+    try std.testing.expectEqual(@as(u32, 0), removed.stats.text_segment_count);
+    try std.testing.expect(removed.stats.published_search_sources.findText() == null);
+    var repeated = try reconcileAlloc(a, removed, plan);
+    defer repeated.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), repeated.artifacts.len);
+    try std.testing.expect(repeated.stats.published_search_sources.findText() == null);
 }

@@ -34,9 +34,14 @@ test "serverless external metadata retention qualification benchmark" {
     const metadata = @import("external_publication_metadata.zig");
     var runtime = std.Io.Threaded.init(a, .{});
     defer runtime.deinit();
-    for ([_]u64{ 1024, 16384 }) |count| {
+    for ([_]u64{ 1024, 16384 }) |count| for ([_]bool{ false, true }) |rejected| {
         var source = try metadata.testing.fixtureAlloc(a, count);
         defer source.deinit(a);
+        if (rejected) for (source.artifacts) |*ref| {
+            if (ref.kind != .graph_metric_segment) continue;
+            ref.materializer_fingerprint = @import("lake_graph_metric.zig").materializerFingerprint(.{});
+            if (std.mem.eql(u8, ref.name, "9:graph_idx4:rank")) ref.graph_metric_materialization_state = .rejected;
+        };
         var plan = publication_plan.TablePublicationPlan{ .targets = .{ .published_search_sources = .{} } };
         plan.table_definition = .{
             .schema_json = source.stats.schema_json,
@@ -55,8 +60,8 @@ test "serverless external metadata retention qualification benchmark" {
             if (round != 0) samples[round - 1] = elapsed;
         }
         std.mem.sort(i96, &samples, {}, std.sort.asc(i96));
-        std.debug.print("external_metadata_retention docs={} retained_sidecars=5 median_ns={} artifact_io_capability=false samples=5\n", .{ count, samples[2] });
-    }
+        std.debug.print("external_metadata_retention docs={} rejected={} retained_sidecars=5 median_ns={} artifact_io_capability=false samples=5\n", .{ count, rejected, samples[2] });
+    };
 }
 
 test "serverless pending work index qualification benchmark" {

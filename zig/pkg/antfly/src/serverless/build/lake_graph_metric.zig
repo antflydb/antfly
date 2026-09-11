@@ -930,7 +930,7 @@ pub fn publishRequestsOracleAlloc(
 /// complete ordered plan, not just dirty metrics: removing/changing a sibling
 /// can make a previously rejected computation affordable. Provenance alone is
 /// not a plan change, and stable rejections must not turn into retry hot loops.
-fn admissionPlanUnchanged(alloc: Allocator, requests: []const PublicationRequest, previous: []const artifact_ref.ArtifactRef, limits: Limits) !bool {
+pub fn admissionPlanUnchanged(alloc: Allocator, requests: []const PublicationRequest, previous: []const artifact_ref.ArtifactRef, limits: Limits) !bool {
     var index: usize = 0;
     for (previous) |prior| {
         if (prior.kind != .graph_metric_segment) continue;

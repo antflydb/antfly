@@ -969,12 +969,25 @@ pub const CatalogService = struct {
             var external_binding = try publication_plan.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json);
             defer if (external_binding) |*binding| binding.deinit(self.alloc);
             const default_indexes = table.indexes_json.len == 0 or std.mem.eql(u8, table.indexes_json, "{}");
-            // A read-only external inventory has no implicit managed text or
-            // graph artifacts. Keep explicitly configured sidecar targets, but
-            // do not repeatedly request a default local index for remote rows.
-            var targets: builder_mod.Builder.PublicationTargets = if (external_binding != null and default_indexes)
-                .{ .published_search_sources = .{}, .include_graph = false }
-            else if (default_indexes)
+            // External targets always come from explicit declarations,
+            // including graph-only and whitespace-empty configurations.
+            var targets: builder_mod.Builder.PublicationTargets = if (external_binding != null) external: {
+                const graph_names = try builder_mod.listGraphIndexNamesAlloc(self.alloc, table.indexes_json);
+                defer {
+                    for (graph_names) |name| self.alloc.free(name);
+                    self.alloc.free(graph_names);
+                }
+                break :external .{
+                    .published_search_sources = try search_sources.publishedSearchSourcesForTableDefinitionWithDefaultsAlloc(
+                        self.alloc,
+                        table.schema_json,
+                        table.read_schema_json,
+                        table.indexes_json,
+                        .explicit_only,
+                    ),
+                    .include_graph = graph_names.len != 0,
+                };
+            } else if (default_indexes)
                 .{
                     .published_search_sources = try search_sources.clonePublishedSearchSourcesAlloc(self.alloc, search_sources.defaultPublishedSearchSources()),
                     .include_graph = true,
@@ -1083,7 +1096,10 @@ pub const CatalogService = struct {
 
                 const artifact_actions: publication_plan.ArtifactActions = .{
                     .document_segment = if (findManifestArtifactIndex(manifest, .document_segment) != null) .reuse else .rebuild,
-                    .full_text = publication_plan.collapseFullTextArtifactAction(full_text_index_actions, findManifestArtifactIndex(manifest, .text_segment) != null, .rebuild),
+                    .full_text = if (external_binding != null and targets.published_search_sources.findText() == null)
+                        .drop
+                    else
+                        publication_plan.collapseFullTextArtifactAction(full_text_index_actions, findManifestArtifactIndex(manifest, .text_segment) != null, .rebuild),
                     .dense_vector = if (targets.published_search_sources.findVector() == null)
                         .drop
                     else
@@ -1214,7 +1230,10 @@ pub const CatalogService = struct {
                 .metadata_republish = metadata_republish,
                 .artifact_actions = .{
                     .document_segment = .rebuild,
-                    .full_text = publication_plan.collapseFullTextArtifactAction(full_text_index_actions, false, .rebuild),
+                    .full_text = if (external_binding != null and targets.published_search_sources.findText() == null)
+                        .drop
+                    else
+                        publication_plan.collapseFullTextArtifactAction(full_text_index_actions, false, .rebuild),
                     .dense_vector = if (targets.published_search_sources.findVector() == null)
                         .drop
                     else
@@ -5399,6 +5418,12 @@ test "serverless catalog status stays local and write admission rejects read-onl
     defer catalog.deinit();
     try std.testing.expect(try catalog.ensureTableWithDefinition("events", 1, .{}, current_schema, "", "{}"));
 
+    var initial_targets = try catalog.publicationPlanForNamespaceAlloc("events", .{}, .status, null);
+    defer initial_targets.deinit(alloc);
+    try std.testing.expect(initial_targets.targets.published_search_sources.findText() == null);
+    try std.testing.expect(!initial_targets.targets.include_graph);
+    try std.testing.expectEqual(publication_plan.ArtifactAction.drop, initial_targets.artifact_actions.full_text);
+
     var status = try catalog.tableBuildStatus("events");
     defer status.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 0), status.latest_wal_lsn);
@@ -5483,6 +5508,20 @@ test "serverless catalog status stays local and write admission rejects read-onl
     defer configured_status.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), configured_status.graph_metrics_configured);
     try std.testing.expectEqual(@as(usize, 1), configured_status.graph_metrics_pending);
+    // Target planning must use the same explicit-index contract as lake
+    // reconciliation, independent of JSON whitespace or unrelated indexes.
+    for ([_]struct { json: []const u8, graph: bool }{
+        .{ .json = "{}", .graph = false },
+        .{ .json = "{ }", .graph = false },
+        .{ .json = graph_indexes, .graph = true },
+    }) |case| {
+        try std.testing.expect(try catalog.setTableDefinition("events", current_schema, "{}", case.json));
+        var target_plan = try catalog.publicationPlanForNamespaceAlloc("events", .{}, .status, null);
+        defer target_plan.deinit(alloc);
+        try std.testing.expect(target_plan.targets.published_search_sources.findText() == null);
+        try std.testing.expectEqual(case.graph, target_plan.targets.include_graph);
+        try std.testing.expectEqual(publication_plan.ArtifactAction.drop, target_plan.artifact_actions.full_text);
+    }
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

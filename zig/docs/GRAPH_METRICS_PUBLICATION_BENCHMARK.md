@@ -155,14 +155,24 @@ text, vector, graph, degree and PageRank sidecars. One warmup precedes five
 samples; the table reports median reconciliation latency, excluding discovery,
 leases, manifest persistence and HEAD publication.
 
-| Document count in manifest | Retained sidecars | Median (ms) | Artifact I/O |
-| ---: | ---: | ---: | --- |
-| 1,024 | 5 | 0.288 | None; no capability supplied |
-| 16,384 | 5 | 0.269 | None; no capability supplied |
+The rejected variant marks PageRank rejected under the current materializer
+policy. The unchanged full admission plan must preserve that rejection; this
+exercises the same complete-plan predicate used by actual materialization.
+
+| Document count in manifest | PageRank state | Retained sidecars | Median (ms) | Artifact I/O |
+| ---: | --- | ---: | ---: | --- |
+| 1,024 | Ready | 5 | 0.297 | None; no capability supplied |
+| 1,024 | Rejected | 5 | 0.286 | None; no capability supplied |
+| 16,384 | Ready | 5 | 0.316 | None; no capability supplied |
+| 16,384 | Rejected | 5 | 0.246 | None; no capability supplied |
 
 This measures metadata work, not a cloud latency SLO or a before/after speedup.
 The relevant scaling property is dependence on configured artifacts, not the
 external document count.
+The similar small-sample timings do not establish that rejection handling is
+faster; the structural result is that complete-plan validation adds no artifact
+reads or document-count-dependent work. Regression tests separately check that
+changed plans drop rejections while retaining compatible ready computations.
 
 ```sh
 ANTFLY_DOCUMENT_FACTS_BENCH=1 zig build antfly-document-facts-test -Doptimize=ReleaseFast -- --test-filter 'external metadata retention qualification benchmark'

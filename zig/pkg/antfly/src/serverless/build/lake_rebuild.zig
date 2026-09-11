@@ -396,7 +396,14 @@ pub fn desiredArtifactsFromTableDefinitionAlloc(
         artifacts.deinit(alloc);
     }
 
-    const text_specs = try lakeTextIndexSpecsAlloc(alloc, index_root, table.indexes_json.len != 0);
+    // External sources never synthesize sidecars absent from the declared
+    // configuration. Otherwise deleting the final default-named index would
+    // resurrect it during metadata reconciliation.
+    const allow_default = switch (source.source_kind) {
+        .external_parquet, .external_iceberg, .external_lance => false,
+        .serverless_fragment, .relational_store, .json_materialized => table.indexes_json.len != 0,
+    };
+    const text_specs = try lakeTextIndexSpecsAlloc(alloc, index_root, allow_default);
     defer freeLakeTextIndexSpecs(alloc, text_specs);
     for (text_specs) |spec| {
         const text_column = try textColumnFromIndexConfigAlloc(alloc, spec.config_json);
@@ -2558,8 +2565,8 @@ test "lake rebuild desired artifacts derive supported algebraic materializations
     });
     defer desired.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 4), desired.artifacts.len);
-    try std.testing.expect(desired.find(default_full_text_index_name) != null);
+    try std.testing.expectEqual(@as(usize, 3), desired.artifacts.len);
+    try std.testing.expect(desired.find(default_full_text_index_name) == null);
 
     const grouped = desired.find("alg.count_by_tenant").?;
     try std.testing.expectEqual(source_binding.SidecarKind.algebraic, grouped.binding.sidecar_kind);
@@ -2589,10 +2596,32 @@ test "lake rebuild desired artifacts derive supported algebraic materializations
 
     var operations = try planOperationsAlloc(alloc, desired.artifacts, &.{});
     defer operations.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 4), operations.operations.len);
+    try std.testing.expectEqual(@as(usize, 3), operations.operations.len);
     try std.testing.expectEqual(BuilderKind.algebraic_group_by, operations.find("alg.count_by_tenant").?.builder_kind.?);
     try std.testing.expectEqual(BuilderKind.algebraic_expression, operations.find("alg.sum_amount").?.builder_kind.?);
     try std.testing.expectEqual(BuilderKind.algebraic_group_by, operations.find("alg.avg_by_tenant").?.builder_kind.?);
+}
+
+test "lake external desired targets are explicit while managed row sources keep defaults" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "", "{}", "{ }", "{\"graph_idx\":{\"type\":\"graph\"}}" }) |indexes| {
+        var desired = try desiredArtifactsFromTableDefinitionAlloc(a, .{
+            .source_kind = .external_parquet,
+            .source_id = "docs",
+            .snapshot_id = "1",
+            .schema_fingerprint = "s",
+        }, .{ .table_name = "docs", .indexes_json = indexes });
+        defer desired.deinit(a);
+        try std.testing.expect(desired.find(default_full_text_index_name) == null);
+    }
+    var managed = try desiredArtifactsFromTableDefinitionAlloc(a, .{
+        .source_kind = .serverless_fragment,
+        .source_id = "docs",
+        .snapshot_id = "1",
+        .schema_fingerprint = "s",
+    }, .{ .table_name = "docs", .indexes_json = "{}" });
+    defer managed.deinit(a);
+    try std.testing.expect(managed.find(default_full_text_index_name) != null);
 }
 
 test "lake rebuild planner rebuilds stale source snapshots and missing folds" {

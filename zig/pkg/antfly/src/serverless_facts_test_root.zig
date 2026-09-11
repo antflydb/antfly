@@ -19,6 +19,9 @@ test {
     _ = @import("serverless/build/document_facts.zig");
     _ = @import("serverless/build/document_facts_builder.zig");
     _ = @import("serverless/build/document_facts_publication_bench.zig");
+    _ = @import("serverless/build/external_publication_metadata.zig");
+    _ = @import("serverless/build/lake_rebuild.zig");
+    _ = @import("serverless/search_sources.zig");
     _ = @import("serverless/graph_segment/page_bootstrap.zig");
     _ = @import("serverless/query/runtime.zig");
     _ = @import("serverless/query/document_facts_reader.zig");

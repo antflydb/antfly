@@ -136,6 +136,21 @@ match. Changed dependencies are removed individually, while source replacement
 invalidates the prior sidecars. This reconciliation has no artifact-store or
 row-source capability: metadata refresh cannot silently hydrate remote bodies.
 
+External lake planning and catalog search targets both use explicit index
+declarations. Empty objects (including whitespace variants) and graph-only
+configurations do not synthesize a text index; deleting the last explicitly
+configured default-named index removes its sidecar and serving descriptor.
+Managed namespaces retain their existing implicit defaults. Defaults already
+persisted as declarations during table creation remain ordinary explicit indexes.
+
+Ready metric reuse depends on its computation and source identity. A budget
+rejection additionally depends on the complete ordered admission plan. Metadata
+reconciliation uses the same admission-plan predicate as materialization;
+removing or changing a sibling, changing aliases or sources, or changing the
+materializer policy invalidates the old rejection. An unchanged plan retains
+its rejection without creating a retry loop. Dropped rejections become pending
+and are eligible for the normal sidecar materialization workflow.
+
 ### Incremental serverless graph roots
 
 WAL publication, compaction and lake sidecars publish immutable graph page roots.
