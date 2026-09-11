@@ -158,6 +158,13 @@ scans write no durable cursor or WAL record. Idle inspections have a per-sweep
 budget without reporting eligible worker work. Actual reclamation consumes the
 normal worker-page budget; durable tombstones/deleted keys provide recovery.
 
+Topology task execution uses an explicit borrowed view, never a copy of the
+live graph index. Synchronization, cache and cursor state is initialized afresh;
+read snapshots and ownership admission delegate to the pinned live owner.
+Counters come from the existing task transaction without another store scan or
+snapshot. This prevents copying a concurrently held mutex into an execution
+view that no thread can unlock, and avoids retaining stale ownership fences.
+
 ## Non-serverless
 
 - Generation-transition contention retains a stable retryable error across

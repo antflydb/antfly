@@ -868,6 +868,9 @@ pub const ReverseBackend = enum {
 };
 
 pub const GraphIndex = struct {
+    /// Topology task views borrow stores and live ownership from this owner.
+    /// Never copy a live GraphIndex: its mutexes and caches have identity.
+    borrowed_owner: ?*GraphIndex = null,
     /// Explicit small-page injection for recovery fixtures; production uses
     /// byte/work-bounded checkpoints with 4096-unit scheduling ranges.
     test_partition_target_units: ?usize = null,
@@ -1029,6 +1032,7 @@ pub const GraphIndex = struct {
     }
 
     fn beginReadOutgoingTxn(self: *GraphIndex) !backend_erased.ReadTxn {
+        if (self.borrowed_owner) |owner| return owner.beginReadOutgoingTxn();
         @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
         defer self.ownership_mutex.unlock();
         var read = try self.outgoing_store.beginRead();
@@ -1038,6 +1042,7 @@ pub const GraphIndex = struct {
     }
 
     fn beginReadReverseTxn(self: *GraphIndex) !backend_erased.ReadTxn {
+        if (self.borrowed_owner) |owner| return owner.beginReadReverseTxn();
         @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
         defer self.ownership_mutex.unlock();
         var read = try self.reverse_store.beginRead();
@@ -1055,12 +1060,14 @@ pub const GraphIndex = struct {
     }
 
     pub fn ownershipCleanupPending(self: *GraphIndex) bool {
+        if (self.borrowed_owner) |owner| return owner.ownershipCleanupPending();
         @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
         defer self.ownership_mutex.unlock();
         return self.ownership_active and self.ownership_fence != null;
     }
 
     pub fn ownershipTransitionPending(self: *GraphIndex) bool {
+        if (self.borrowed_owner) |owner| return owner.ownershipTransitionPending();
         @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
         defer self.ownership_mutex.unlock();
         return self.ownership_fence != null;
@@ -1127,10 +1134,14 @@ pub const GraphIndex = struct {
     fn loadGraphCounters(store: *backend_erased.Store) !Stats {
         var txn = try store.beginRead();
         defer txn.abort();
+        return graphCountersInTxn(&txn);
+    }
+
+    fn graphCountersInTxn(txn: anytype) !Stats {
         return .{
-            .edge_count = try readU64OrZero(&txn, graph_edge_count_key),
-            .node_count = try readU64OrZero(&txn, graph_node_count_key),
-            .edge_generation = try readU64OrZero(&txn, graph_edge_generation_key),
+            .edge_count = try readU64OrZero(txn, graph_edge_count_key),
+            .node_count = try readU64OrZero(txn, graph_node_count_key),
+            .edge_generation = try readU64OrZero(txn, graph_edge_generation_key),
         };
     }
 
@@ -6376,6 +6387,7 @@ pub const GraphIndex = struct {
     }
 
     pub fn close(self: *GraphIndex) void {
+        std.debug.assert(self.borrowed_owner == null);
         if (self.ownership_fence) |scope| self.alloc.free(scope);
         self.sealed_vectors.deinit(self.alloc);
         self.outgoing_store.deinit();
@@ -6387,6 +6399,7 @@ pub const GraphIndex = struct {
     }
 
     pub fn abandonAfterCrash(self: *GraphIndex) void {
+        std.debug.assert(self.borrowed_owner == null);
         if (self.ownership_fence) |scope| self.alloc.free(scope);
         self.sealed_vectors.deinit(self.alloc);
         self.outgoing_store.deinit();
@@ -6485,6 +6498,7 @@ pub const GraphIndex = struct {
     /// Physical counters are upper bounds until ownership cleanup completes.
     /// Status publication never allocates a node set or scans graph topology.
     pub fn operationalStats(self: *GraphIndex) OperationalStats {
+        if (self.borrowed_owner) |owner| return owner.operationalStats();
         // Sample after acquiring the fence lock so completion cannot clear
         // uncertainty between reading old physical counts and their flag.
         @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
@@ -14891,6 +14905,39 @@ pub const GraphIndex = struct {
         return .queued;
     }
 
+    fn topologyExecutionView(self: *GraphIndex, configs: []const GraphMetricConfig, counters: Stats) GraphIndex {
+        std.debug.assert(self.borrowed_owner == null);
+        // Borrow counters from the existing task snapshot, not unsynchronized
+        // owner fields. Every mutex/cache/cursor below is newly initialized;
+        // ownership reads delegate to the pinned owner's live publication.
+        return .{
+            .borrowed_owner = self,
+            .alloc = self.alloc,
+            .index_name = self.index_name,
+            .outgoing_store = self.outgoing_store,
+            .reverse_store = self.reverse_store,
+            .outgoing_owner = .none,
+            .reverse_owner = .none,
+            .edge_type_configs = self.edge_type_configs,
+            .metric_configs = configs,
+            .rebuild_root_path = null,
+            .rebuild_storage = null,
+            .rebuild_owner_generation = 0,
+            .algebraic_semiring_traversal = false,
+            .edge_count = counters.edge_count,
+            .node_count = counters.node_count,
+            .edge_generation = counters.edge_generation,
+            .algebraic_traversal_attempt_count = 0,
+            .algebraic_traversal_proven_count = 0,
+            .algebraic_traversal_rejected_count = 0,
+            .algebraic_traversal_fallback_count = 0,
+            .algebraic_traversal_result_node_count = 0,
+            .test_partition_target_units = self.test_partition_target_units,
+            .sealed_vectors = .{ .capacity = 0 },
+            .topology_preparation_only = true,
+        };
+    }
+
     /// One bounded index-scoped task step. The borrowed execution view has its
     /// own control namespace and no owned backend handles or numerical cache.
     /// It reuses durable page leases/CAS/recovery without depending on a user
@@ -14920,14 +14967,11 @@ pub const GraphIndex = struct {
             if (!std.mem.startsWith(u8, entry.key, topology_task_prefix)) return false;
             if (entry.key.len != topology_task_prefix.len + 64) return error.InvalidGraphMetricBuildManifest;
             self.topology_preparation_cursor = entry.key[topology_task_prefix.len..][0..64].*;
-            break :read .{ .key = try temp.dupe(u8, entry.key), .raw = try temp.dupe(u8, entry.value), .name = try topologyTaskNameAlloc(temp, entry.key, entry.value) };
+            break :read .{ .key = try temp.dupe(u8, entry.key), .raw = try temp.dupe(u8, entry.value), .name = try topologyTaskNameAlloc(temp, entry.key, entry.value), .counters = try graphCountersInTxn(&txn) };
         };
         const cfg = try topologyTaskConfigAlloc(temp, task.name, task.raw);
         const generation = std.mem.readInt(u64, task.raw[0..8], .little);
-        var view = self.*;
-        view.metric_configs = &.{cfg};
-        view.sealed_vectors = .{ .capacity = 0 };
-        view.topology_preparation_only = true;
+        var view = self.topologyExecutionView(&.{cfg}, task.counters);
         var failure_reason: ?[]const u8 = null;
         const finished = check: {
             if (task.raw[8] & 2 != 0) break :check true;
@@ -20542,10 +20586,7 @@ test "graph metric shared topology retry incarnation fences delayed failure clea
     try graph.propagateTopologyTaskFailure(old_cfg, graph.edge_generation, "DelayedOldIncarnationFailure");
     try std.testing.expect(!try graph.retireTopologyTaskPage(old.key, old.name, old.raw));
     try std.testing.expect(try graph.graphMetricBuildRequested("rank"));
-    var old_view = graph;
-    old_view.metric_configs = &.{old_cfg};
-    old_view.topology_preparation_only = true;
-    old_view.sealed_vectors = .{ .capacity = 0 };
+    var old_view = graph.topologyExecutionView(&.{old_cfg}, try GraphIndex.loadGraphCounters(&graph.reverse_store));
     try std.testing.expectError(error.GraphMetricBuildSuperseded, old_view.ensureGraphMetricPlannedBuildFromCachedPlan(old.name, graph.edge_generation));
     try std.testing.expect(try graph.runGraphMetricTopologyPreparationStep("replacement"));
     var txn = try graph.beginReadReverseTxn();
@@ -34888,6 +34929,46 @@ test "graph maintenance ownership fences pin snapshots and retire bounded pages"
     try std.testing.expectEqual(@as(u64, 1), (try g.stats(a)).edge_count);
     const first_visible = (try retained.first()).?;
     try std.testing.expectEqualStrings("a", BorrowedEdgeKey.parse(first_visible.key, .in).?.source);
+}
+
+test "graph maintenance topology execution views never copy held locks or stale ownership" {
+    const a = std.testing.allocator;
+    var g = try GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .mem });
+    defer g.close();
+    try g.addEdge("z", "a", "link", 1, 0, 0, "{}");
+    const counters = try GraphIndex.loadGraphCounters(&g.reverse_store);
+    var view = blk: {
+        // Force the copy hazard behind intermittent background worker hangs:
+        // copying the owner here would copy permanently held mutexes.
+        try std.testing.expect(g.ownership_mutex.tryLock());
+        defer g.ownership_mutex.unlock();
+        try std.testing.expect(g.topology_preparation_mutex.tryLock());
+        defer g.topology_preparation_mutex.unlock();
+        try std.testing.expect(g.topology_gc_mutex.tryLock());
+        defer g.topology_gc_mutex.unlock();
+        break :blk g.topologyExecutionView(&.{}, counters);
+    };
+    try std.testing.expect(view.borrowed_owner.? == &g);
+    try std.testing.expect(view.ownership_mutex.tryLock());
+    view.ownership_mutex.unlock();
+    try std.testing.expect(view.topology_preparation_mutex.tryLock());
+    view.topology_preparation_mutex.unlock();
+    try std.testing.expect(view.topology_gc_mutex.tryLock());
+    view.topology_gc_mutex.unlock();
+    try std.testing.expectEqual(.none, std.meta.activeTag(view.outgoing_owner));
+    try std.testing.expectEqual(.none, std.meta.activeTag(view.reverse_owner));
+    try std.testing.expectEqual(@as(u64, 1), view.edge_count);
+    try std.testing.expect(!view.ownershipTransitionPending());
+    try g.fenceOwnedRange(a, "m", "");
+    try std.testing.expect(view.ownershipTransitionPending());
+    try std.testing.expect(view.ownershipCleanupPending());
+    for ([_]struct { key: []const u8, direction: EdgeDirection }{ .{ .key = "a", .direction = .in }, .{ .key = "z", .direction = .out } }) |request| {
+        const edges = try view.getEdges(a, request.key, "link", request.direction);
+        defer GraphIndex.freeEdges(a, edges);
+        try std.testing.expectEqual(@as(usize, 0), edges.len);
+    }
+    while (try g.pruneOwnedRangePage()) |_| {}
+    try std.testing.expect(!view.ownershipTransitionPending());
 }
 
 test "graph maintenance bounded adjacency never seeks through unrelated fenced targets" {
