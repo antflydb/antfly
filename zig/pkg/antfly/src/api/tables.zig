@@ -784,7 +784,7 @@ pub const DefinitionCache = struct {
     }
     fn estimate(self: *DefinitionCache, key: [32]u8) u64 {
         var count: u8 = 255;
-        for (self.frequency, 0..) |row, i| count = @min(count, row[std.mem.readInt(u16, key[i * 2 ..][0..2], .little) % row.len]);
+        for (&self.frequency, 0..) |*row, i| count = @min(count, row[std.mem.readInt(u16, key[i * 2 ..][0..2], .little) % row.len]);
         return count;
     }
 

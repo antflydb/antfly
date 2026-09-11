@@ -1324,6 +1324,7 @@ const LocalStandaloneMetadata = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
+        if (request.revision) |expected| if (expected != self.systemCatalogState().revision) return error.CatalogGenerationChanged;
         const index = &self.system_catalog_state.?.index;
         var entries: std.ArrayListUnmanaged(projection.TableEntry) = .empty;
         var selected: std.AutoHashMapUnmanaged(u64, void) = .empty;
