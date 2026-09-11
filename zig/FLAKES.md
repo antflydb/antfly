@@ -4,6 +4,55 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## Delayed Raft responses amplify replication and exhaust outbound admission (#694)
+
+The fresh Linux mixed soak on `42cb81c6a` failed backup/restore in worker 1,
+iteration 1. Metadata node 1 accumulated a Ready batch of **1,144,753,225 bytes**,
+exceeding the unchanged 1,140,850,688-byte hard ceiling, and quarantined its
+group. Earlier batches grew from hundreds of messages to thousands. The first
+failure's logs, durable state, and native stacks are preserved in
+`/private/tmp/ci694-durable-first-failure.tar.gz` (SHA-256
+`70658edd776376a2c5dc2a966b59d6941b0ea9a37b3030200e8d7fe835350657`, verified
+against the runner archive). This run is failed acceptance.
+
+The leader assigned every success response directly to both `match_index` and
+`next_index`, rewinding acknowledged progress and the optimistic send cursor.
+A deterministic 32-entry pipeline reproduces the amplification: acknowledging
+its first entry requeues the remaining **31 already-sent entries**
+(`/private/tmp/ci694-raft-progress-before-focused.log`). Successes now preserve
+monotonic Match and Next, while current empty-probe acknowledgements can still
+resume replication. Rejections identify the rejected append's previous index
+separately from the follower's last-index hint; delayed rejections cannot clear
+a newer flight window or supersede a newer probe. Earlier-term acknowledgements
+cannot authorize progress in a replacement leader's term.
+
+A full window also needs recovery if an append or its acknowledgement is lost.
+Heartbeat responses now allow a payload-free append probe at the last sent
+prefix. Its acknowledgement releases the window; a valid rejection resumes
+catch-up from the known matching prefix. Normal acknowledgements continue
+unsent work even when another voter has already advanced commit. Message/byte
+limits, outbound quarantine, and request deadlines are unchanged.
+
+The same response-path review reproduced an older-term entry being committed
+by counting replicas alone (`/private/tmp/ci694-raft-current-term-before.log`,
+expected commit 1, observed 2). A quorum now directly commits only a current-term
+entry, which commits its older prefix indirectly. The snapshot-abort harness
+also now installs the acknowledged prefix before claiming the follower has it;
+the old fixture invented a durable acknowledgement for absent data and relied
+on Match regression to recover. Its corrected history matches the etcd 3.6.0
+oracle (`/private/tmp/ci694-snapshot-abort-oracle.log`). All **401 Raft library
+tests pass**, with no skips or leaks (`/private/tmp/ci694-raft-progress-fixed.log`).
+All **176 data-runtime integration tests** also pass without skips or leaks
+(`/private/tmp/ci694-replication-data-runtime.log`). The etcd comparison matches
+**100/100 stable-profile seeds**, 48 actions each, with pre-vote and quorum
+checking (`/private/tmp/ci694-raft-progress-stable-differential.log`). The broader
+stress-profile comparison encounters an existing removed-voter visibility
+difference at seed 3, step 25; the pre-fix revision reproduces it as well
+(`/private/tmp/ci694-raft-stress-seed3-before-oracle.log`). This comparison is
+not counted as passing acceptance. Repeated compaction actions now have the
+same idempotent storage semantics in both harnesses. Fresh Linux
+100-per-scenario acceptance remains required for this revision.
+
 ## Provider-restart regression races an independent index consumer (#694)
 
 The x86 job in run `34543627560` failed
@@ -18,6 +67,9 @@ exercises the adverse ordering directly instead of racing a negative progress
 assertion. The three focused retention/restart tests pass with no skips or leaks
 (`/private/tmp/ci694-replay-retention-fixed.log`). Original CI log:
 `/private/tmp/ci694-26ff-x86-ci.log`.
+The corrected restart test also passed **100/100 native macOS arm64 executions**
+on `42cb81c6a`, using four workers with 25 fresh processes each and no retries
+(`/private/tmp/ci694-replay-unit-soak/results.json` and `manifest.json`).
 
 ## Leadership replacement skips persistence and loses a confirmed abort outcome (#694)
 

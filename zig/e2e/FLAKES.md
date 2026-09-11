@@ -1,5 +1,22 @@
 # Zig E2E flakes
 
+## 2026-09-11: delayed Raft responses amplify metadata replication (#694)
+
+The new mixed Linux run on `42cb81c6a` failed backup/restore immediately in
+worker 1. Metadata node 1 quarantined its group after one Ready batch exceeded
+the existing hard outbound ceiling at 1,144,753,225 bytes. Preserved logs/state
+and native stacks: `/private/tmp/ci694-durable-first-failure.tar.gz`, SHA-256
+`70658edd776376a2c5dc2a966b59d6941b0ea9a37b3030200e8d7fe835350657`.
+
+A deterministic regression shows an early acknowledgement resending 31 entries
+already in flight. The leader now preserves monotonic replication progress,
+ignores stale rejections and prior-term acknowledgements, and uses empty
+heartbeat probes to recover a lost append/ack without enlarging its window.
+Quorum commit also requires a current-term entry. All 401 Raft library tests
+pass; the corrected snapshot-abort history matches the etcd oracle. See
+`../FLAKES.md` for before/after evidence and protocol details. This is another
+failed acceptance run; a fresh 100/100 for all three scenarios is required.
+
 ## 2026-09-11: unit CI retention assertion races legitimate consumer progress (#694)
 
 Run `34543627560`, x86 job `103092055515`, failed the provider-restart storage

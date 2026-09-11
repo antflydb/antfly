@@ -988,8 +988,88 @@ test "max_inflight_msgs limits replicate append pipelining until ack" {
     try std.testing.expectEqual(@as(types.Index, last_index + 2), fixture.raft.messages.items[0].entries[0].index);
 }
 
+test "append acknowledgements preserve pipelined progress under delayed and duplicate responses" {
+    var fixture = try initLeaderFromSnapshotWithMaxInflight(256);
+    defer fixture.raft.deinit();
+    defer fixture.storage.deinit();
+
+    const base = fixture.raft.log.lastIndex();
+    fixture.raft.progress[1] = .{
+        .match_index = base,
+        .next_index = base + 1,
+        .state = .replicate,
+        .recent_active = true,
+    };
+    for (0..32) |_| try fixture.raft.propose("pipelined");
+    const sent_next = fixture.raft.progress[1].next_index;
+    clearMessages(&fixture.raft);
+
+    // An early acknowledgement must not rewind the optimistic send cursor.
+    // Reordered and duplicated successes must not regress the matched prefix
+    // or cause already-sent entries to be cloned into another Ready batch.
+    for ([_]types.Index{ base + 1, base + 16, base + 2, base + 16, base + 32, base + 1 }) |index| {
+        const previous_match = fixture.raft.progress[1].match_index;
+        try fixture.raft.step(.{
+            .msg_type = .append_entries_response,
+            .from = 2,
+            .to = 1,
+            .term = fixture.raft.hard_state.current_term,
+            .log_index = index,
+        });
+        try std.testing.expectEqual(@max(previous_match, index), fixture.raft.progress[1].match_index);
+        try std.testing.expectEqual(sent_next, fixture.raft.progress[1].next_index);
+        for (fixture.raft.messages.items) |msg| try std.testing.expectEqual(@as(usize, 0), msg.entries.len);
+        clearMessages(&fixture.raft);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fixture.raft.inflights[1].items.len);
+}
+
+test "stale append rejections cannot reset replication or supersede a newer probe" {
+    var fixture = try initLeaderFromSnapshotWithMaxInflight(256);
+    defer fixture.raft.deinit();
+    defer fixture.storage.deinit();
+    const base = fixture.raft.log.lastIndex();
+    fixture.raft.progress[1] = .{
+        .match_index = base,
+        .next_index = base + 1,
+        .state = .replicate,
+        .recent_active = true,
+    };
+    try fixture.raft.propose("first");
+    try fixture.raft.propose("second");
+    clearMessages(&fixture.raft);
+    try fixture.raft.step(.{
+        .msg_type = .append_entries_response,
+        .from = 2,
+        .to = 1,
+        .term = fixture.raft.hard_state.current_term,
+        .log_index = base,
+        .reject = true,
+        .reject_hint = 0,
+    });
+    try std.testing.expectEqual(types.ProgressState.replicate, fixture.raft.progress[1].state);
+    try std.testing.expectEqual(base + 3, fixture.raft.progress[1].next_index);
+    try std.testing.expectEqual(@as(usize, 2), fixture.raft.inflights[1].items.len);
+    try std.testing.expectEqual(@as(usize, 0), fixture.raft.messages.items.len);
+
+    fixture.raft.progress[1].state = .probe;
+    fixture.raft.progress[1].probe_sent = true;
+    try fixture.raft.step(.{
+        .msg_type = .append_entries_response,
+        .from = 2,
+        .to = 1,
+        .term = fixture.raft.hard_state.current_term,
+        .log_index = base + 1,
+        .reject = true,
+        .reject_hint = 0,
+    });
+    try std.testing.expectEqual(base + 3, fixture.raft.progress[1].next_index);
+    try std.testing.expect(fixture.raft.progress[1].probe_sent);
+    try std.testing.expectEqual(@as(usize, 0), fixture.raft.messages.items.len);
+}
+
 test "append rejection clears inflight window and retries immediately" {
-    var fixture = try initLeaderFromSnapshotWithMaxInflight(1);
+    var fixture = try initLeaderFromSnapshotWithMaxInflight(2);
     defer fixture.raft.deinit();
     defer fixture.storage.deinit();
 
@@ -1005,6 +1085,7 @@ test "append rejection clears inflight window and retries immediately" {
     clearMessages(&fixture.raft);
     try fixture.raft.propose("first");
     try std.testing.expectEqual(@as(usize, 1), fixture.raft.inflights[1].items.len);
+    try fixture.raft.propose("second");
     clearMessages(&fixture.raft);
 
     try fixture.raft.step(.{
@@ -1013,7 +1094,7 @@ test "append rejection clears inflight window and retries immediately" {
         .to = 1,
         .term = fixture.raft.hard_state.current_term,
         .reject = true,
-        .log_index = last_index,
+        .log_index = last_index + 1,
         .reject_hint = last_index,
     });
 
@@ -1021,6 +1102,123 @@ test "append rejection clears inflight window and retries immediately" {
     try std.testing.expectEqual(@as(usize, 0), fixture.raft.inflights[1].items.len);
     try std.testing.expectEqual(@as(usize, 1), fixture.raft.messages.items.len);
     try std.testing.expectEqual(message_mod.MessageType.append_entries, fixture.raft.messages.items[0].msg_type);
+}
+
+test "full replication window recovers lost append or acknowledgement with an empty heartbeat probe" {
+    for ([_]bool{ false, true }) |lost_append| {
+        var fixture = try initLeaderFromSnapshotWithMaxInflight(1);
+        defer fixture.raft.deinit();
+        defer fixture.storage.deinit();
+        const base = fixture.raft.log.lastIndex();
+        fixture.raft.progress[1] = .{
+            .match_index = base,
+            .next_index = base + 1,
+            .state = .replicate,
+            .recent_active = true,
+        };
+        try fixture.raft.propose("first");
+        try fixture.raft.propose("second");
+        clearMessages(&fixture.raft);
+        try fixture.raft.step(.{
+            .msg_type = .heartbeat_response,
+            .from = 2,
+            .to = 1,
+            .term = fixture.raft.hard_state.current_term,
+        });
+        try std.testing.expectEqual(@as(usize, 1), fixture.raft.messages.items.len);
+        const probe = fixture.raft.messages.items[0];
+        try std.testing.expectEqual(message_mod.MessageType.append_entries, probe.msg_type);
+        try std.testing.expectEqual(@as(usize, 0), probe.entries.len);
+        try std.testing.expectEqual(base + 1, probe.log_index);
+        try std.testing.expectEqual(@as(usize, 1), fixture.raft.inflights[1].items.len);
+        clearMessages(&fixture.raft);
+        try fixture.raft.step(.{
+            .msg_type = .append_entries_response,
+            .from = 2,
+            .to = 1,
+            .term = fixture.raft.hard_state.current_term,
+            .log_index = base + 1,
+            .reject = lost_append,
+            .reject_hint = if (lost_append) base else 0,
+        });
+        try std.testing.expectEqual(@as(usize, 1), fixture.raft.messages.items.len);
+        const resumed = fixture.raft.messages.items[0];
+        try std.testing.expectEqual(base + (if (lost_append) @as(u64, 1) else 2), resumed.entries[0].index);
+        try std.testing.expectEqual(base + 2, resumed.entries[resumed.entries.len - 1].index);
+        clearMessages(&fixture.raft);
+        try fixture.raft.step(.{
+            .msg_type = .append_entries_response,
+            .from = 2,
+            .to = 1,
+            .term = fixture.raft.hard_state.current_term,
+            .log_index = base + 2,
+        });
+        try std.testing.expectEqual(base + 2, fixture.raft.progress[1].match_index);
+        try std.testing.expectEqual(@as(usize, 0), fixture.raft.inflights[1].items.len);
+    }
+}
+
+test "append rejection identifies the rejected probe separately from follower last index" {
+    var fixture = try initLeaderFromSnapshot();
+    defer fixture.raft.deinit();
+    defer fixture.storage.deinit();
+    const last = fixture.raft.log.lastIndex();
+    try fixture.raft.step(.{
+        .msg_type = .append_entries,
+        .from = 2,
+        .to = 1,
+        .term = fixture.raft.hard_state.current_term + 1,
+        .log_index = last + 5,
+        .log_term = fixture.raft.hard_state.current_term,
+    });
+    try std.testing.expectEqual(@as(usize, 1), fixture.raft.messages.items.len);
+    const response = fixture.raft.messages.items[0];
+    try std.testing.expect(response.reject);
+    try std.testing.expectEqual(last + 5, response.log_index);
+    try std.testing.expectEqual(last, response.reject_hint);
+}
+
+test "replacement leader commits an older prefix only through a current term entry" {
+    var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var voters = [_]types.NodeId{ 1, 2, 3 };
+    try storage.seedConfState(.{ .voters = &voters });
+    try storage.append(&.{ .{ .index = 1, .term = 1 }, .{ .index = 2, .term = 2 } });
+    storage.setHardState(.{ .current_term = 2, .commit_index = 1 });
+    var raft = try raft_mod.Raft.init(std.testing.allocator, .{
+        .id = 1,
+        .group_id = 1,
+        .peers = &voters,
+        .check_quorum = false,
+        .pre_vote = false,
+    }, storage.storage());
+    defer raft.deinit();
+    try raft.campaign();
+    clearMessages(&raft);
+    try raft.step(.{ .msg_type = .request_vote_response, .from = 2, .to = 1, .term = 3 });
+    clearMessages(&raft);
+    try raft.step(.{ .msg_type = .append_entries_response, .from = 2, .to = 1, .term = 3, .log_index = 2 });
+    try std.testing.expectEqual(@as(types.Index, 1), raft.log.committed);
+    try raft.step(.{ .msg_type = .append_entries_response, .from = 2, .to = 1, .term = 3, .log_index = 3 });
+    try std.testing.expectEqual(@as(types.Index, 3), raft.log.committed);
+}
+
+test "append responses from earlier terms cannot acknowledge replacement leader entries" {
+    var fixture = try initLeaderFromSnapshot();
+    defer fixture.raft.deinit();
+    defer fixture.storage.deinit();
+    const previous = fixture.raft.progress[1];
+    try fixture.raft.step(.{
+        .msg_type = .append_entries_response,
+        .from = 2,
+        .to = 1,
+        .term = fixture.raft.hard_state.current_term - 1,
+        .log_index = fixture.raft.log.lastIndex(),
+    });
+    try std.testing.expectEqual(previous.match_index, fixture.raft.progress[1].match_index);
+    try std.testing.expectEqual(previous.next_index, fixture.raft.progress[1].next_index);
+    try std.testing.expectEqual(previous.state, fixture.raft.progress[1].state);
+    try std.testing.expectEqual(@as(usize, 0), fixture.raft.messages.items.len);
 }
 
 test "max_inflight_bytes limits replicate append pipelining until ack" {
