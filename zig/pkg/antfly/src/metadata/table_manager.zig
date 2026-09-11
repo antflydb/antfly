@@ -794,8 +794,13 @@ pub fn voterSetFingerprint(node_ids: []const u64, required_node_id: ?u64) VoterS
     return digest;
 }
 
+pub const store_runtime_reference_header = "X-Antfly-Store-Runtime-Reference";
+
 pub const StoreStatusReport = struct {
     store_id: u64,
+    /// Internal heartbeat endpoint only: retain committed runtime observations
+    /// for this exact reporter incarnation and status generation.
+    runtime_reference: bool = false,
     /// Version of the volatile owner-activity projection carried by this
     /// heartbeat. Zero means absent/legacy; version 2 is the current schema.
     /// This is intentionally not copied into StoreRecord or Raft state.

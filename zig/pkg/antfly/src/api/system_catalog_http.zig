@@ -42,7 +42,7 @@ pub fn response(alloc: std.mem.Allocator, status: u16, value: anytype) !Response
 }
 
 pub fn failure(alloc: std.mem.Allocator, err: anyerror) !Response {
-    var result = try response(alloc, domain.httpStatus(err), .{ .error_code = @errorName(err) });
+    var result = try response(alloc, domain.httpStatus(err), .{ .@"error" = @errorName(err), .code = @errorName(err) });
     if (err == error.MetadataMutationOutcomeUnknown) result.metadata_mutation_outcome = .unknown;
     return result;
 }
@@ -183,4 +183,14 @@ test "system catalog committed mutations retain success when projection fails" {
     var result = try execute(Source{ .snapshot = "invalid JSON" }, std.testing.allocator, .{}, .{ .kind = .database, .name = "created" }, null, "");
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 500), result.status);
+}
+
+test "system catalog failures use the shared public error envelope" {
+    var result = try failure(std.testing.allocator, error.CatalogNotFound);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), result.status);
+    const parsed = try std.json.parseFromSlice(struct { @"error": []const u8, code: []const u8 }, std.testing.allocator, result.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("CatalogNotFound", parsed.value.@"error");
+    try std.testing.expectEqualStrings("CatalogNotFound", parsed.value.code);
 }

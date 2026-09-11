@@ -63,3 +63,23 @@ func TestCatalogPaginationConflictResponse(t *testing.T) {
 		t.Fatalf("missing scoped conflict: %#v", scoped)
 	}
 }
+
+func TestCatalogMutationVisibilityAndErrorResponses(t *testing.T) {
+	response := func(status int, body string) *http.Response {
+		return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body))}
+	}
+	pending, err := ParseCreateDatabaseResponse(response(202, `{"status":"committed_visibility_pending"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.JSON202 == nil || string(pending.JSON202.Status) != "committed_visibility_pending" {
+		t.Fatalf("missing committed outcome: %#v", pending)
+	}
+	missing, err := ParseGetDatabaseResponse(response(404, `{"error":"CatalogNotFound","code":"CatalogNotFound"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missing.JSON404 == nil || missing.JSON404.Error != "CatalogNotFound" || missing.JSON404.Code != "CatalogNotFound" {
+		t.Fatalf("missing catalog error: %#v", missing)
+	}
+}

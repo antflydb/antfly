@@ -76,6 +76,8 @@ from .brave_search_config_freshness import BraveSearchConfigFreshness
 from .calendar_interval import CalendarInterval
 from .capability import Capability
 from .cardinality_mode import CardinalityMode
+from .catalog_mutation_visibility_pending import CatalogMutationVisibilityPending
+from .catalog_mutation_visibility_pending_status import CatalogMutationVisibilityPendingStatus
 from .catalog_table_scope import CatalogTableScope
 from .catalog_table_target import CatalogTableTarget
 from .catalog_tablespace_binding_request import CatalogTablespaceBindingRequest
@@ -1103,6 +1105,8 @@ __all__ = (
     "CalendarInterval",
     "Capability",
     "CardinalityMode",
+    "CatalogMutationVisibilityPending",
+    "CatalogMutationVisibilityPendingStatus",
     "CatalogTableScope",
     "CatalogTablespaceBindingRequest",
     "CatalogTableTarget",

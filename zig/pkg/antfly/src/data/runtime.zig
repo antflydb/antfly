@@ -15385,12 +15385,18 @@ pub const DataServer = struct {
     fn reportStoreStatusHeartbeat(self: *DataServer) !void {
         const remote_metadata = self.remote_metadata orelse return;
         const registration = self.store_registration orelse return;
-        var report = (try self.cloneHeartbeatStoreStatusReport(registration.store_id)) orelse return try self.reportStoreStatus();
+        const reference = remote_metadata.supports_runtime_reference.load(.acquire);
+        var report = (try self.cloneHeartbeatStoreStatusReport(registration.store_id, reference)) orelse return try self.reportStoreStatus();
         defer freeStoreStatusReportOwned(self.alloc, &report);
         for (report.group_statuses) |*group_status| {
             overlayLiveRaftGroupStatus(group_status, self.group_leadership_source, self.group_membership_source);
         }
-        try remote_metadata.reportNodeStatus(report);
+        if (reference) {
+            remote_metadata.reportNodeHeartbeat(report) catch |err| switch (err) {
+                error.UnsupportedOperation, error.StoreReportBaseMismatch => return self.reportStoreStatus(),
+                else => return err,
+            };
+        } else try remote_metadata.reportNodeStatus(report);
         self.last_store_status_report_at_ms = self.backgroundMonotonicMs();
         self.clearMetadataBootstrapRetry();
     }
@@ -15398,12 +15404,13 @@ pub const DataServer = struct {
     fn cloneHeartbeatStoreStatusReport(
         self: *DataServer,
         store_id: u64,
+        reference: bool,
     ) !?antfly.metadata.table_manager.StoreStatusReport {
         lockAtomic(&self.store_status_cache_mutex);
         defer self.store_status_cache_mutex.unlock();
         const cache = &self.store_status_heartbeat_cache;
         if (!cache.valid) return null;
-        const runtime_statuses = try antfly.metadata.table_manager.cloneRuntimeGroupStatusReports(self.alloc, cache.runtime_statuses);
+        const runtime_statuses = if (reference) try self.alloc.alloc(antfly.metadata.table_manager.RuntimeGroupStatusReport, 0) else try antfly.metadata.table_manager.cloneRuntimeGroupStatusReports(self.alloc, cache.runtime_statuses);
         errdefer if (runtime_statuses.len > 0)
             antfly.metadata.table_manager.freeRuntimeGroupStatusReports(self.alloc, runtime_statuses);
         for (runtime_statuses) |*group_runtime_status| {
@@ -15412,8 +15419,11 @@ pub const DataServer = struct {
                 index_status.embedding_activity = .{};
             }
         }
+        const health_class = try self.alloc.dupe(u8, cache.health_class);
+        errdefer self.alloc.free(health_class);
         return .{
             .store_id = store_id,
+            .runtime_reference = reference,
             .embedding_activity_protocol_version = cache.embedding_activity_protocol_version,
             // A cached heartbeat is a durable liveness refresh, not a new
             // activity observation. Keep the owner sequence for diagnostics,
@@ -15424,7 +15434,7 @@ pub const DataServer = struct {
             .artifact_sources_protocol_version = cache.artifact_sources_protocol_version,
             .dense_native_storage_protocol_version = cache.dense_native_storage_protocol_version,
             .live = cache.live,
-            .health_class = try self.alloc.dupe(u8, cache.health_class),
+            .health_class = health_class,
             .capacity_bytes = cache.capacity_bytes,
             .available_bytes = cache.available_bytes,
             .lease_pressure = cache.lease_pressure,
@@ -19249,6 +19259,7 @@ const RemoteMetadataSource = struct {
         lifecycle_linearizable_snapshot_calls: std.atomic.Value(u64) = .init(0),
     } else struct {};
 
+    supports_runtime_reference: std.atomic.Value(bool) = .init(false),
     alloc: std.mem.Allocator,
     /// Clock authority must match the executor that performs the requests.
     /// This makes cache TTLs and retry suppression part of VOPR replay truth.
@@ -21445,11 +21456,26 @@ const RemoteMetadataSource = struct {
         defer arena.deinit();
         const scratch = arena.allocator();
         const body = try stringifyJsonAlloc(scratch, report);
-        try self.withMetadataApiClient(void, struct {
-            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: []const u8) !void {
-                try client.reportNodeStatus(base_uri, ctx);
+        const supported = try self.withMetadataApiClient(bool, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: []const u8) !bool {
+                return try client.reportNodeStatusWithReferenceSupport(base_uri, ctx);
             }
         }.call, body);
+        self.supports_runtime_reference.store(supported, .release);
+    }
+
+    fn reportNodeHeartbeat(self: *RemoteMetadataSource, report: antfly.metadata.table_manager.StoreStatusReport) !void {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const body = try stringifyJsonAlloc(arena.allocator(), report);
+        self.withMetadataApiClient(void, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, bytes: []const u8) !void {
+                try client.reportNodeHeartbeat(base_uri, bytes);
+            }
+        }.call, body) catch |err| {
+            if (err == error.UnsupportedOperation or err == error.StoreReportBaseMismatch) self.supports_runtime_reference.store(false, .release);
+            return err;
+        };
     }
 
     fn upsertSchemaProgress(self: *RemoteMetadataSource, record: antfly.metadata.table_manager.SchemaProgressRecord) !void {

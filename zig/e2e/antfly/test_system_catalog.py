@@ -514,3 +514,21 @@ def test_catalog_pagination_preserves_scope_order_and_detects_ddl(stateful_api):
         for row in api.get(path):
             api.delete(path + "/" + quote(row["name"], safe=""))
         api.delete(f"/databases/{database}")
+
+
+def test_catalog_failures_use_shared_error_contract(stateful_api):
+    api = stateful_api
+    name = "catalog_errors_" + uuid.uuid4().hex[:10]
+    response = api._request("GET", f"/databases/{name}")
+    assert response.status_code == 404
+    assert response.json() == {"error": "CatalogNotFound", "code": "CatalogNotFound"}
+    api.post(f"/databases/{name}", {})
+    try:
+        response = api._request("POST", f"/databases/{name}", payload={})
+        assert response.status_code == 409
+        assert response.json() == {
+            "error": "CatalogAlreadyExists",
+            "code": "CatalogAlreadyExists",
+        }
+    finally:
+        api.delete(f"/databases/{name}")

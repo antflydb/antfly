@@ -3370,6 +3370,11 @@ export interface components {
         TableSchemaPatch: {
             [key: string]: unknown;
         };
+        /** @description The mutation committed. Read the resource to observe it; do not replay the mutation to obtain its representation. */
+        CatalogMutationVisibilityPending: {
+            /** @enum {string} */
+            status: "committed_visibility_pending";
+        };
         Error: {
             /** @description Optional stable machine-readable error code for programmatic handling. */
             code?: string;
@@ -18921,13 +18926,24 @@ export interface operations {
                     "application/json": components["schemas"]["TablespaceCatalogRecord"];
                 };
             };
+            /** @description Mutation committed; resource visibility is pending. Observe with GET instead of repeating the mutation. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CatalogMutationVisibilityPending"];
+                };
+            };
             400: components["responses"]["BadRequest"];
             /** @description Tablespace already exists */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
             };
             500: components["responses"]["InternalServerError"];
         };
@@ -19023,13 +19039,24 @@ export interface operations {
                     "application/json": components["schemas"]["DatabaseCatalogRecord"];
                 };
             };
+            /** @description Mutation committed; resource visibility is pending. Observe with GET instead of repeating the mutation. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CatalogMutationVisibilityPending"];
+                };
+            };
             400: components["responses"]["BadRequest"];
             /** @description Database already exists */
             409: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
             };
             500: components["responses"]["InternalServerError"];
         };
@@ -19060,7 +19087,9 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
             };
             500: components["responses"]["InternalServerError"];
         };
@@ -19090,6 +19119,15 @@ export interface operations {
                     "application/json": components["schemas"]["DatabaseCatalogRecord"];
                 };
             };
+            /** @description Mutation committed; resource visibility is pending. Observe with GET instead of repeating the mutation. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CatalogMutationVisibilityPending"];
+                };
+            };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             500: components["responses"]["InternalServerError"];
@@ -19114,6 +19152,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DatabaseCatalogRecord"];
+                };
+            };
+            /** @description Mutation committed; resource visibility is pending. Observe with GET instead of repeating the mutation. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CatalogMutationVisibilityPending"];
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -19170,6 +19217,15 @@ export interface operations {
                     "application/json": components["schemas"]["NamespaceCatalogRecord"];
                 };
             };
+            /** @description Mutation committed; resource visibility is pending. Observe with GET instead of repeating the mutation. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CatalogMutationVisibilityPending"];
+                };
+            };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             /** @description Namespace already exists */
@@ -19177,7 +19233,9 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
             };
             500: components["responses"]["InternalServerError"];
         };
@@ -19210,7 +19268,9 @@ export interface operations {
                 headers: {
                     [name: string]: unknown;
                 };
-                content?: never;
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
             };
             500: components["responses"]["InternalServerError"];
         };
@@ -19242,6 +19302,15 @@ export interface operations {
                     "application/json": components["schemas"]["NamespaceCatalogRecord"];
                 };
             };
+            /** @description Mutation committed; resource visibility is pending. Observe with GET instead of repeating the mutation. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CatalogMutationVisibilityPending"];
+                };
+            };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             500: components["responses"]["InternalServerError"];
@@ -19268,6 +19337,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["NamespaceCatalogRecord"];
+                };
+            };
+            /** @description Mutation committed; resource visibility is pending. Observe with GET instead of repeating the mutation. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CatalogMutationVisibilityPending"];
                 };
             };
             400: components["responses"]["BadRequest"];

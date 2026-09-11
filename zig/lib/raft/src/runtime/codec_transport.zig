@@ -22,6 +22,8 @@ pub const RetryPolicy = struct {
     initial_backoff_rounds: u32 = 1,
     max_backoff_rounds: u32 = 8,
     max_attempts: u32 = 4,
+    max_pending_frames: usize = 4096,
+    max_pending_bytes: usize = 8 * 1024 * 1024,
 };
 
 pub const Metrics = struct {
@@ -44,9 +46,11 @@ const OwnedEndpoint = struct {
     metadata: []u8,
 
     fn clone(alloc: std.mem.Allocator, peer_endpoint: transport_iface.PeerEndpoint) !OwnedEndpoint {
+        const address = try alloc.dupe(u8, peer_endpoint.address);
+        errdefer alloc.free(address);
         return .{
             .protocol = peer_endpoint.protocol,
-            .address = try alloc.dupe(u8, peer_endpoint.address),
+            .address = address,
             .metadata = try alloc.dupe(u8, peer_endpoint.metadata),
         };
     }
@@ -70,6 +74,29 @@ const OwnedEndpoint = struct {
             std.mem.eql(u8, self.address, peer_endpoint.address) and
             std.mem.eql(u8, self.metadata, peer_endpoint.metadata);
     }
+};
+
+const BundleRoute = struct {
+    peer: core.types.NodeId,
+    source: core.types.NodeId,
+    protocol: transport_iface.TransportProtocol,
+    address: []const u8,
+    metadata: []const u8,
+    const Context = struct {
+        pub fn hash(_: @This(), key: BundleRoute) u64 {
+            var h = std.hash.Wyhash.init(0);
+            std.hash.autoHash(&h, key.peer);
+            std.hash.autoHash(&h, key.source);
+            std.hash.autoHash(&h, key.protocol);
+            std.hash.autoHash(&h, key.address.len);
+            h.update(key.address);
+            h.update(key.metadata);
+            return h.final();
+        }
+        pub fn eql(_: @This(), a: BundleRoute, b: BundleRoute) bool {
+            return a.peer == b.peer and a.source == b.source and a.protocol == b.protocol and std.mem.eql(u8, a.address, b.address) and std.mem.eql(u8, a.metadata, b.metadata);
+        }
+    };
 };
 
 const PendingRetry = struct {
@@ -97,6 +124,7 @@ pub const CodecTransportHost = struct {
     peer_routes: std.AutoHashMapUnmanaged(PeerRouteKey, OwnedEndpoint) = .empty,
     pending_retries: std.ArrayListUnmanaged(PendingRetry) = .empty,
     metrics: Metrics = .{},
+    pending_retry_bytes: usize = 0,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -186,19 +214,61 @@ pub const CodecTransportHost = struct {
 
     fn sendPeerBatches(ptr: *anyopaque, batches: []const transport_iface.PeerBatch) !void {
         const self: *CodecTransportHost = @ptrCast(@alignCast(ptr));
-        for (batches) |batch| {
-            if (batch.groups.len <= 1) {
-                try self.sendBatch(batch);
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const Builder = struct { peer: core.types.NodeId, groups: std.ArrayListUnmanaged(transport_iface.GroupMessageBatch) = .empty, messages: usize = 0 };
+        var builders: std.ArrayListUnmanaged(Builder) = .empty;
+        var routes: std.HashMapUnmanaged(BundleRoute, usize, BundleRoute.Context, 80) = .empty;
+        for (batches) |batch| for (batch.groups) |group| {
+            if (group.messages.len == 0) continue;
+            const source = group.messages[0].from;
+            var heartbeat_only = true;
+            for (group.messages) |message| {
+                if ((message.msg_type != .heartbeat and message.msg_type != .heartbeat_response) or message.from != source or message.to != batch.peer_id) heartbeat_only = false;
+            }
+            // Append/vote/snapshot work keeps its existing scheduling. Only
+            // ready heartbeat messages are bundled, without timers or dedup.
+            if (!heartbeat_only or group.messages.len > 1024) {
+                // Preserve order even for callers supplying a group more than
+                // once across batches in the same flush.
+                for (builders.items) |*builder| {
+                    if (builder.peer != batch.peer_id) continue;
+                    var contains_group = false;
+                    for (builder.groups.items) |pending| if (pending.group_id == group.group_id) {
+                        contains_group = true;
+                        break;
+                    };
+                    if (!contains_group) continue;
+                    try self.sendBatch(.{ .peer_id = builder.peer, .groups = builder.groups.items });
+                    builder.groups.clearRetainingCapacity();
+                    builder.messages = 0;
+                }
+                try self.sendBatch(.{ .peer_id = batch.peer_id, .groups = &.{group} });
                 continue;
             }
-            for (batch.groups) |group_batch| {
-                var single_group = group_batch;
-                try self.sendBatch(.{
-                    .peer_id = batch.peer_id,
-                    .groups = (&single_group)[0..1],
-                });
+            const endpoint = self.peer_routes.get(.{ .group_id = group.group_id, .node_id = batch.peer_id }) orelse {
+                self.metrics.send_failures += 1;
+                continue;
+            };
+            const route: BundleRoute = .{ .peer = batch.peer_id, .source = source, .protocol = endpoint.protocol, .address = endpoint.address, .metadata = endpoint.metadata };
+            const entry = try routes.getOrPut(a, route);
+            if (!entry.found_existing) {
+                entry.key_ptr.address = try a.dupe(u8, route.address);
+                entry.key_ptr.metadata = try a.dupe(u8, route.metadata);
+                entry.value_ptr.* = builders.items.len;
+                try builders.append(a, .{ .peer = batch.peer_id });
             }
-        }
+            const builder = &builders.items[entry.value_ptr.*];
+            if (builder.groups.items.len == 256 or builder.messages + group.messages.len > 1024) {
+                try self.sendBatch(.{ .peer_id = builder.peer, .groups = builder.groups.items });
+                builder.groups.clearRetainingCapacity();
+                builder.messages = 0;
+            }
+            try builder.groups.append(a, group);
+            builder.messages += group.messages.len;
+        };
+        for (builders.items) |builder| if (builder.groups.items.len != 0) try self.sendBatch(.{ .peer_id = builder.peer, .groups = builder.groups.items });
     }
 
     fn sendBatch(self: *CodecTransportHost, batch: transport_iface.PeerBatch) !void {
@@ -208,6 +278,15 @@ pub const CodecTransportHost = struct {
         };
         const frame = try self.codec.encodePeerBatch(self.alloc, batch);
         errdefer self.codec.freeFrame(self.alloc, frame);
+        // Bound encoded bundles as well as group/message count. A preexisting
+        // single-group message retains the driver's existing size contract.
+        if (frame.bytes.len > 1024 * 1024 and batch.groups.len > 1) {
+            const midpoint = batch.groups.len / 2;
+            try self.sendBatch(.{ .peer_id = batch.peer_id, .groups = batch.groups[0..midpoint] });
+            try self.sendBatch(.{ .peer_id = batch.peer_id, .groups = batch.groups[midpoint..] });
+            self.codec.freeFrame(self.alloc, frame);
+            return;
+        }
 
         self.driver.sendFrame(.{
             .source_id = firstSourceNodeId(batch),
@@ -215,13 +294,14 @@ pub const CodecTransportHost = struct {
             .endpoint = endpoint,
             .frame = frame,
         }) catch {
-            const group_id = firstGroupId(batch) orelse {
-                self.metrics.send_failures += 1;
-                self.codec.freeFrame(self.alloc, frame);
-                return;
-            };
             self.metrics.send_failures += 1;
-            try self.scheduleRetry(group_id, firstSourceNodeId(batch), batch.peer_id, frame, 1);
+            // Failure ownership is per group. A later route change/removal
+            // cannot send another group's pending messages to the wrong node.
+            for (batch.groups) |group| {
+                const isolated = try self.codec.encodePeerBatch(self.alloc, .{ .peer_id = batch.peer_id, .groups = &.{group} });
+                defer self.codec.freeFrame(self.alloc, isolated);
+                try self.scheduleRetry(group.group_id, if (group.messages.len > 0) group.messages[0].from else null, batch.peer_id, isolated, 1);
+            }
             self.codec.freeFrame(self.alloc, frame);
             return;
         };
@@ -237,18 +317,27 @@ pub const CodecTransportHost = struct {
         frame: codec_iface.EncodedFrame,
         attempt: u32,
     ) !void {
+        if (self.pending_retries.items.len >= self.retry_policy.max_pending_frames or frame.bytes.len > self.retry_policy.max_pending_bytes -| self.pending_retry_bytes) {
+            // Raft transport is lossy; bounded retry retention never prevents
+            // the consensus layer from retransmitting current work later.
+            self.metrics.retries_exhausted += 1;
+            return;
+        }
         const bounded_delay = computeBackoffRounds(self.retry_policy, attempt);
+        const bytes = try self.alloc.dupe(u8, frame.bytes);
+        errdefer self.alloc.free(bytes);
         try self.pending_retries.append(self.alloc, .{
             .group_id = group_id,
             .source_id = source_id,
             .peer_id = peer_id,
             .frame = .{
-                .bytes = try self.alloc.dupe(u8, frame.bytes),
+                .bytes = bytes,
                 .media_type = frame.media_type,
             },
             .attempts = attempt,
             .retry_round = self.current_round + bounded_delay,
         });
+        self.pending_retry_bytes += frame.bytes.len;
         self.metrics.retries_scheduled += 1;
     }
 
@@ -275,19 +364,23 @@ pub const CodecTransportHost = struct {
         const self: *CodecTransportHost = @ptrCast(@alignCast(ptr));
         const key: PeerRouteKey = .{ .group_id = group_id, .node_id = peer.node_id };
         if (self.peer_routes.contains(key)) return;
-        try self.peer_routes.put(self.alloc, key, try OwnedEndpoint.clone(self.alloc, peer.endpoints[0]));
+        var endpoint = try OwnedEndpoint.clone(self.alloc, peer.endpoints[0]);
+        errdefer endpoint.deinit(self.alloc);
+        try self.peer_routes.put(self.alloc, key, endpoint);
     }
 
     fn upsertPeer(ptr: *anyopaque, group_id: core.types.GroupId, peer: transport_iface.PeerDescriptor) !void {
         const self: *CodecTransportHost = @ptrCast(@alignCast(ptr));
         const key: PeerRouteKey = .{ .group_id = group_id, .node_id = peer.node_id };
-        const gop = try self.peer_routes.getOrPut(self.alloc, key);
-        if (gop.found_existing) {
-            if (gop.value_ptr.eql(peer.endpoints[0])) return;
-            gop.value_ptr.deinit(self.alloc);
+        if (self.peer_routes.get(key)) |current| if (current.eql(peer.endpoints[0])) return;
+        var replacement = try OwnedEndpoint.clone(self.alloc, peer.endpoints[0]);
+        errdefer replacement.deinit(self.alloc);
+        const entry = try self.peer_routes.getOrPut(self.alloc, key);
+        if (entry.found_existing) {
+            entry.value_ptr.deinit(self.alloc);
             self.metrics.peer_refreshes += 1;
         }
-        gop.value_ptr.* = try OwnedEndpoint.clone(self.alloc, peer.endpoints[0]);
+        entry.value_ptr.* = replacement;
     }
 
     fn removePeer(ptr: *anyopaque, group_id: core.types.GroupId, node_id: core.types.NodeId) !void {
@@ -324,6 +417,7 @@ pub const CodecTransportHost = struct {
                 .node_id = pending.peer_id,
             }) orelse {
                 self.metrics.retries_exhausted += 1;
+                self.pending_retry_bytes -= pending.frame.bytes.len;
                 pending.deinit(self.alloc);
                 _ = self.pending_retries.orderedRemove(i);
                 continue;
@@ -337,6 +431,7 @@ pub const CodecTransportHost = struct {
             self.driver.sendFrame(req) catch {
                 if (pending.attempts >= self.retry_policy.max_attempts) {
                     self.metrics.retries_exhausted += 1;
+                    self.pending_retry_bytes -= pending.frame.bytes.len;
                     pending.deinit(self.alloc);
                     _ = self.pending_retries.orderedRemove(i);
                     continue;
@@ -349,6 +444,7 @@ pub const CodecTransportHost = struct {
 
             self.metrics.retried_successes += 1;
             self.metrics.sent_frames += 1;
+            self.pending_retry_bytes -= pending.frame.bytes.len;
             pending.deinit(self.alloc);
             _ = self.pending_retries.orderedRemove(i);
         }

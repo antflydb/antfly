@@ -5558,6 +5558,13 @@ paths:
             schema:
               $ref: '#/components/schemas/CreateTablespaceRequest'
       responses:
+        '202':
+          description: Mutation committed; resource visibility is pending. Observe with GET instead of
+            repeating the mutation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogMutationVisibilityPending'
         '201':
           description: Tablespace created
           content:
@@ -5568,6 +5575,10 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '409':
           description: Tablespace already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -5654,6 +5665,13 @@ paths:
         - table_management
       operationId: createDatabase
       responses:
+        '202':
+          description: Mutation committed; resource visibility is pending. Observe with GET instead of
+            repeating the mutation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogMutationVisibilityPending'
         '201':
           description: Database created
           content:
@@ -5664,6 +5682,10 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '409':
           description: Database already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -5685,6 +5707,10 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           description: Database is not empty
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -5713,6 +5739,13 @@ paths:
             schema:
               $ref: '#/components/schemas/CatalogTablespaceBindingRequest'
       responses:
+        '202':
+          description: Mutation committed; resource visibility is pending. Observe with GET instead of
+            repeating the mutation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogMutationVisibilityPending'
         '200':
           description: Updated database
           content:
@@ -5736,6 +5769,13 @@ paths:
         - table_management
       operationId: clearDatabaseTablespace
       responses:
+        '202':
+          description: Mutation committed; resource visibility is pending. Observe with GET instead of
+            repeating the mutation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogMutationVisibilityPending'
         '200':
           description: Updated database
           content:
@@ -5811,6 +5851,13 @@ paths:
         - table_management
       operationId: createNamespace
       responses:
+        '202':
+          description: Mutation committed; resource visibility is pending. Observe with GET instead of
+            repeating the mutation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogMutationVisibilityPending'
         '201':
           description: Namespace created
           content:
@@ -5823,6 +5870,10 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           description: Namespace already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -5844,6 +5895,10 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           description: Namespace is not empty
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -5879,6 +5934,13 @@ paths:
             schema:
               $ref: '#/components/schemas/CatalogTablespaceBindingRequest'
       responses:
+        '202':
+          description: Mutation committed; resource visibility is pending. Observe with GET instead of
+            repeating the mutation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogMutationVisibilityPending'
         '200':
           description: Updated namespace
           content:
@@ -5902,6 +5964,13 @@ paths:
         - table_management
       operationId: clearNamespaceTablespace
       responses:
+        '202':
+          description: Mutation committed; resource visibility is pending. Observe with GET instead of
+            repeating the mutation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogMutationVisibilityPending'
         '200':
           description: Updated namespace
           content:
@@ -9394,6 +9463,17 @@ components:
         recursively; null removes a member. The resulting document must be a
 
         valid TableSchema and `version` remains server-managed.
+    CatalogMutationVisibilityPending:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum:
+            - committed_visibility_pending
+      description: The mutation committed. Read the resource to observe it; do not replay the mutation
+        to obtain its representation.
     Error:
       type: object
       properties:

@@ -1808,6 +1808,11 @@ pub const CardinalityMode = enum {
     }
 };
 
+/// The mutation committed. Read the resource to observe it; do not replay the mutation to obtain its representation.
+pub const CatalogMutationVisibilityPending = struct {
+    status: []const u8,
+};
+
 /// A table or all tables in an explicit namespace. A missing table selects the namespace; a table named '*' remains literal.
 pub const CatalogTableScope = struct {
     database: ?[]const u8 = null,

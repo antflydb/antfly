@@ -582,14 +582,27 @@ pub const MetadataHttpClient = struct {
         try self.requestNoBody(base_uri, .DELETE, path, null, null, null);
     }
 
-    pub fn reportNodeStatus(
-        self: *MetadataHttpClient,
-        base_uri: []const u8,
-        body: []const u8,
-    ) !void {
-        const status_route = try nodeStatusRouteForBody(self.alloc, body);
-        defer self.alloc.free(status_route);
-        try self.requestWithBody(base_uri, .POST, status_route, body, error.InvalidStoreStatusRequest, error.UnknownStore, null);
+    pub fn reportNodeStatus(self: *MetadataHttpClient, base_uri: []const u8, body: []const u8) !void {
+        _ = try self.reportNodeStatusWithReferenceSupport(base_uri, body);
+    }
+
+    pub fn reportNodeStatusWithReferenceSupport(self: *MetadataHttpClient, base_uri: []const u8, body: []const u8) !bool {
+        const route = try nodeStatusRouteForBody(self.alloc, body);
+        defer self.alloc.free(route);
+        const uri = try join(self.alloc, base_uri, route);
+        defer self.alloc.free(uri);
+        var resp = try self.executeWithRetry(.{ .method = .POST, .uri = uri, .body = body, .content_type = "application/json", .timeout_ms = default_request_timeout_ms });
+        defer resp.deinit(self.alloc);
+        try mapResponseStatus(resp, error.InvalidStoreStatusRequest, error.UnknownStore, null);
+        return responseHasHeaderValueAnyStatus(resp, metadata_table_manager.store_runtime_reference_header, "1");
+    }
+
+    pub fn reportNodeHeartbeat(self: *MetadataHttpClient, base_uri: []const u8, body: []const u8) !void {
+        const route = try nodeStatusRouteForBody(self.alloc, body);
+        defer self.alloc.free(route);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}/heartbeat", .{route});
+        defer self.alloc.free(path);
+        try self.requestWithBody(base_uri, .POST, path, body, error.InvalidStoreStatusRequest, error.UnsupportedOperation, error.StoreReportBaseMismatch);
     }
 
     pub fn upsertSchemaProgress(
@@ -3321,6 +3334,7 @@ test "metadata http client round-trips server endpoints" {
         upsert_node_count: usize = 0,
         upsert_store_count: usize = 0,
         report_store_status_count: usize = 0,
+        referenced_report_count: usize = 0,
         forwarded_create_deadline_seen: bool = false,
         forwarded_drop_deadline_seen: bool = false,
 
@@ -3552,6 +3566,7 @@ test "metadata http client round-trips server endpoints" {
             try std.testing.expectEqual(@as(u64, 7), report.store_id);
             try std.testing.expectEqualStrings("healthy", report.health_class);
             self.report_store_status_count += 1;
+            if (report.runtime_reference) self.referenced_report_count += 1;
         }
 
         fn requestSplit(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: metadata_http_server.SplitRequest) !void {
@@ -3641,7 +3656,9 @@ test "metadata http client round-trips server endpoints" {
     try client.dropTable(base_uri, "docs");
     try client.dropTableForwarded(base_uri, "docs");
     try client.upsertNode(base_uri, "{\"store_id\":7,\"node_id\":7}");
-    try client.reportNodeStatus(base_uri, "{\"store_id\":7,\"health_class\":\"healthy\"}");
+    try std.testing.expect(try client.reportNodeStatusWithReferenceSupport(base_uri, "{\"store_id\":7,\"health_class\":\"healthy\"}"));
+    try client.reportNodeHeartbeat(base_uri, "{\"store_id\":7,\"reporter_incarnation\":77,\"status_generation\":1}");
+    try std.testing.expectError(error.InvalidStoreStatusRequest, client.reportNodeHeartbeat(base_uri, "{\"store_id\":7}"));
     try client.requestTableSplit(base_uri, "docs", "{\"split_key\":\"doc:m\"}");
     try client.requestTableMerge(base_uri, "docs", "{\"donor_group_id\":11,\"receiver_group_id\":10}");
     try std.testing.expectEqual(@as(usize, 2), source.create_count);
@@ -3655,7 +3672,8 @@ test "metadata http client round-trips server endpoints" {
     try std.testing.expectEqual(@as(usize, 1), source.delete_artifact_enrichment_count);
     try std.testing.expectEqual(@as(usize, 1), source.upsert_node_count);
     try std.testing.expectEqual(@as(usize, 1), source.upsert_store_count);
-    try std.testing.expectEqual(@as(usize, 1), source.report_store_status_count);
+    try std.testing.expectEqual(@as(usize, 2), source.report_store_status_count);
+    try std.testing.expectEqual(@as(usize, 1), source.referenced_report_count);
     try std.testing.expectEqual(@as(usize, 1), source.reallocate_count);
     try std.testing.expectEqual(@as(usize, 1), source.split_count);
     try std.testing.expectEqual(@as(usize, 1), source.merge_count);

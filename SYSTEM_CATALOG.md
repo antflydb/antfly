@@ -375,8 +375,11 @@ avoiding a probe for every store/group combination. Logical result order is
 preserved independently of storage key order.
 
 Store reports have a normalized local primary representation: one compact
-header, stable per-group slots in bounded 64-group payload/clock pages, and a
-sorted membership/slot/digest row per store. Reporter indexes map selected groups
+header and stable per-group slots in bounded 64-group payload, clock and membership
+pages. A compact sorted directory lists live pages; each membership entry stores
+the group, slot and structural digest in 48 bytes. Changing one group rewrites
+only its membership page, and clock-only changes leave membership untouched.
+Reporter indexes map selected groups
 to actual stores and slots; fixed page directories locate only the selected
 binary record without decoding adjacent reports. Deleted slots are reused, so
 ordinary group churn does not renumber or rewrite unrelated pages. Structural SHA-256 digests exclude
@@ -399,9 +402,39 @@ normalized primary pages. Raft
 snapshot export reconstructs the existing full-record wire format from one read
 transaction. Snapshot installation removes the replaced group's local report
 rows together with its old headers; other metadata groups remain intact. The
-local format is versioned separately from the unchanged command/snapshot wire
+local format is versioned separately from the logical snapshot wire
 format. Directly opening a normalized data directory with an older binary is not
 a supported downgrade path; use the compatible logical snapshot format.
+
+Compatibility is required for formats shipped on `main`, including full store
+records, the standalone catalog input, and applied-batch watermarks. Intermediate
+catalog layouts introduced only during this unmerged PR are not upgrade inputs.
+There are no migrations between those development layouts; recreate disposable
+development data when changing between them.
+
+Cached store heartbeats may reference committed runtime observations by exact
+reporter incarnation and status generation. A separate internal heartbeat endpoint
+and a full-report response capability header negotiate support; all metadata voters
+must pass the catalog protocol readiness fence before proposing the new command.
+Missing support or a mismatched base triggers a full report. Apply checks the fence
+again in its write transaction and preserves existing observation clocks. Current
+per-group Raft facts still travel with every heartbeat. Changed observations use
+full reports; this is not an arbitrary sparse-update protocol. Reconstruction and
+validation remain proportional to the referenced store's groups.
+
+Committed projection notifications coalesce changed store IDs and report flags in
+a bounded, allocation-free queue. Header-only updates retain owned report arrays;
+report changes reload only the affected store. Other projection collections refresh
+only when their own kind changes. Overflow, snapshot replacement and failed refresh
+force a full rebuild. Consumers still receive owned snapshots; this does not remove
+all reconciliation cloning.
+
+Raft transport batches ready heartbeat and heartbeat-response messages only when
+destination, source identity, protocol, address and endpoint metadata match. Frames
+cap at 256 groups, 1,024 messages and 1 MiB (a single group's existing size contract
+still applies). No timer or deduplication changes consensus evidence. Failed frames
+retain per-group retries so each route is resolved again, bounded by 4,096 retained
+frames and 8 MiB. Append, vote and snapshot scheduling retain their existing path.
 
 Metadata apply commits a versioned 26-byte checkpoint in the same transaction
 as projected records. It contains the applied index, input kind (committed entries

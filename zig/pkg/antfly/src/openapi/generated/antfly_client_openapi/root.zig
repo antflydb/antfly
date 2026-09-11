@@ -58,6 +58,7 @@ pub const CalendarInterval = types.CalendarInterval;
 pub const Capability = types.Capability;
 pub const CapabilityName = types.CapabilityName;
 pub const CardinalityMode = types.CardinalityMode;
+pub const CatalogMutationVisibilityPending = types.CatalogMutationVisibilityPending;
 pub const CatalogTableScope = types.CatalogTableScope;
 pub const CatalogTableTarget = types.CatalogTableTarget;
 pub const CatalogTablespaceBindingRequest = types.CatalogTablespaceBindingRequest;

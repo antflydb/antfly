@@ -12,10 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Idle tenant/range workload. This measures framing/encoding only: the
-// production CodecTransportHost still splits peer batches into single groups.
+// Idle tenant/range workloads: codec framing and the production transport
+// routing/encoding path. The counting driver excludes HTTP/network latency.
 const std = @import("std");
 const raft = @import("raft");
+const CountingDriver = struct {
+    frames: usize = 0,
+    bytes: usize = 0,
+    fn send(ptr: *anyopaque, request: raft.runtime.frame_driver_iface.SendFrameRequest) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.frames += 1;
+        self.bytes += request.frame.bytes.len;
+    }
+    fn iface(self: *@This()) raft.runtime.FrameDriver {
+        return .{ .ptr = self, .vtable = &.{ .send_frame = send } };
+    }
+};
+
 pub fn main() !void {
     const alloc = std.heap.page_allocator;
     var io_runtime = std.Io.Threaded.init(alloc, .{});
@@ -30,6 +43,21 @@ pub fn main() !void {
         for (groups, messages, 0..) |*group, *message, i| {
             message.* = .{ .msg_type = .heartbeat, .from = 1, .to = 2, .term = 7, .commit_index = i + 10 };
             group.* = .{ .group_id = i + 100, .messages = messages[i..][0..1] };
+        }
+        {
+            var driver: CountingDriver = .{};
+            var host = raft.runtime.CodecTransportHost.init(alloc, codec, driver.iface(), .{});
+            defer host.deinit();
+            for (groups) |group| try host.transport().addPeer(group.group_id, .{ .node_id = 2, .endpoints = &.{.{ .protocol = .http1, .address = "http://node-2" }} });
+            var elapsed: [7]i96 = undefined;
+            for (&elapsed) |*sample| {
+                driver = .{};
+                const start = std.Io.Clock.awake.now(io).nanoseconds;
+                try host.transport().sendPeerBatches(&.{.{ .peer_id = 2, .groups = groups }});
+                sample.* = std.Io.Clock.awake.now(io).nanoseconds - start;
+            }
+            std.mem.sort(i96, &elapsed, {}, std.sort.asc(i96));
+            std.debug.print("HEARTBEAT_HOST_BENCH groups={d} frames={d} encoded_bytes={d} send_p50_ms={d:.3}\n", .{ count, driver.frames, driver.bytes, @as(f64, @floatFromInt(elapsed[3])) / 1e6 });
         }
         for ([_]usize{ 1, 64, 256 }) |cap| {
             var elapsed: [7]i96 = undefined;

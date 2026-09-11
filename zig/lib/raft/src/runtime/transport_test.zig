@@ -164,7 +164,7 @@ test "codec transport host rejects frames for unserved groups so senders retry" 
     }));
 }
 
-test "codec transport host sends multi-group peer batches as isolated frames" {
+test "codec transport host bundles heartbeat groups sharing a route and source" {
     var driver = RecordingFrameDriver{ .alloc = std.testing.allocator };
     defer driver.deinit();
 
@@ -201,15 +201,16 @@ test "codec transport host sends multi-group peer batches as isolated frames" {
     };
     try host.transport().sendPeerBatches((&[_]runtime.transport_iface.PeerBatch{batch})[0..]);
 
-    try std.testing.expectEqual(@as(usize, 2), driver.sent.items.len);
-    for (driver.sent.items, 0..) |frame, i| {
+    try std.testing.expectEqual(@as(usize, 1), driver.sent.items.len);
+    for (driver.sent.items) |frame| {
         const decoded = try runtime.BinaryCodec.codec().decodeFrame(std.testing.allocator, .{
             .bytes = frame.bytes,
             .media_type = frame.media_type,
         });
         defer runtime.BinaryCodec.codec().freeDecoded(std.testing.allocator, decoded);
-        try std.testing.expectEqual(@as(usize, 1), decoded.raft_peer_batch.groups.len);
-        try std.testing.expectEqual(@as(core.types.GroupId, if (i == 0) 41 else 42), decoded.raft_peer_batch.groups[0].group_id);
+        try std.testing.expectEqual(@as(usize, 2), decoded.raft_peer_batch.groups.len);
+        try std.testing.expectEqual(@as(core.types.GroupId, 41), decoded.raft_peer_batch.groups[0].group_id);
+        try std.testing.expectEqual(@as(core.types.GroupId, 42), decoded.raft_peer_batch.groups[1].group_id);
     }
 }
 
@@ -288,4 +289,116 @@ test "codec transport host treats missing peer route as non-fatal send failure" 
     try std.testing.expectEqual(@as(usize, 0), driver.sent.items.len);
     try std.testing.expectEqual(@as(usize, 0), host.pendingRetryCount());
     try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().send_failures);
+}
+
+test "codec transport heartbeat retries re-resolve each group and bound retained bytes" {
+    var driver = RecordingFrameDriver{ .alloc = std.testing.allocator, .failures_remaining = 1 };
+    defer driver.deinit();
+    var host = runtime.CodecTransportHost.init(std.testing.allocator, runtime.BinaryCodec.codec(), driver.driver(), .{});
+    defer host.deinit();
+    for ([_]u64{ 41, 42, 43 }) |id| try host.transport().addPeer(id, .{ .node_id = 2, .endpoints = &.{.{ .protocol = .http1, .address = "http://old" }} });
+    var context = "read-index-token".*;
+    const messages = [_]core.Message{.{ .msg_type = .heartbeat, .from = 1, .to = 2, .term = 7, .context = &context }};
+    const groups = [_]runtime.transport_iface.GroupMessageBatch{
+        .{ .group_id = 41, .messages = &messages }, .{ .group_id = 42, .messages = &messages }, .{ .group_id = 43, .messages = &messages },
+    };
+    try host.transport().sendPeerBatches(&.{.{ .peer_id = 2, .groups = &groups }});
+    try std.testing.expectEqual(@as(usize, 3), host.pendingRetryCount());
+    try host.transport().upsertPeer(42, .{ .node_id = 2, .endpoints = &.{.{ .protocol = .http1, .address = "http://new" }} });
+    try host.transport().removePeer(43, 2);
+    try host.transport().advanceRound();
+    try std.testing.expectEqual(@as(usize, 2), driver.sent.items.len);
+    try std.testing.expectEqualStrings("http://old", driver.sent.items[0].address);
+    try std.testing.expectEqualStrings("http://new", driver.sent.items[1].address);
+    try std.testing.expectEqual(@as(usize, 0), host.pendingRetryCount());
+    try std.testing.expectEqual(@as(usize, 0), host.pending_retry_bytes);
+    for (driver.sent.items) |frame| {
+        const decoded = try host.codec.decodeFrame(std.testing.allocator, .{ .bytes = frame.bytes, .media_type = frame.media_type });
+        defer host.codec.freeDecoded(std.testing.allocator, decoded);
+        try std.testing.expectEqualStrings("read-index-token", decoded.raft_peer_batch.groups[0].messages[0].context);
+    }
+    driver.failures_remaining = 1;
+    host.retry_policy.max_pending_bytes = 1;
+    try host.transport().sendPeerBatches(&.{.{ .peer_id = 2, .groups = groups[0..1] }});
+    try std.testing.expectEqual(@as(usize, 0), host.pendingRetryCount());
+    try std.testing.expectEqual(@as(usize, 0), host.pending_retry_bytes);
+}
+
+test "codec transport heartbeat bundles bound groups and separate source identities" {
+    var driver = RecordingFrameDriver{ .alloc = std.testing.allocator };
+    defer driver.deinit();
+    var host = runtime.CodecTransportHost.init(std.testing.allocator, runtime.BinaryCodec.codec(), driver.driver(), .{});
+    defer host.deinit();
+    var groups: [300]runtime.transport_iface.GroupMessageBatch = undefined;
+    const message = [_]core.Message{.{ .msg_type = .heartbeat, .from = 1, .to = 2, .term = 7 }};
+    const other_source = [_]core.Message{.{ .msg_type = .heartbeat_response, .from = 3, .to = 2, .term = 7 }};
+    for (&groups, 0..) |*group, i| {
+        group.* = .{ .group_id = i + 1, .messages = if (i == 299) &other_source else &message };
+        try host.transport().addPeer(i + 1, .{ .node_id = 2, .endpoints = &.{.{ .protocol = .http1, .address = "http://same" }} });
+    }
+    try host.transport().sendPeerBatches(&.{.{ .peer_id = 2, .groups = &groups }});
+    try std.testing.expectEqual(@as(usize, 3), driver.sent.items.len);
+    var total: usize = 0;
+    for (driver.sent.items) |frame| {
+        const decoded = try host.codec.decodeFrame(std.testing.allocator, .{ .bytes = frame.bytes, .media_type = frame.media_type });
+        defer host.codec.freeDecoded(std.testing.allocator, decoded);
+        const batch = decoded.raft_peer_batch;
+        try std.testing.expect(batch.groups.len <= 256);
+        for (batch.groups) |group| try std.testing.expectEqual(batch.groups[0].messages[0].from, group.messages[0].from);
+        total += batch.groups.len;
+    }
+    try std.testing.expectEqual(@as(usize, 300), total);
+}
+
+test "codec transport bundles separate endpoint metadata and preserve group message order" {
+    var driver = RecordingFrameDriver{ .alloc = std.testing.allocator };
+    defer driver.deinit();
+    var host = runtime.CodecTransportHost.init(std.testing.allocator, runtime.BinaryCodec.codec(), driver.driver(), .{});
+    defer host.deinit();
+    for ([_]u64{ 41, 42 }) |id| try host.transport().addPeer(id, .{ .node_id = 2, .endpoints = &.{.{ .protocol = .http1, .address = "http://same", .metadata = if (id == 41) "tenant=a" else "tenant=b" }} });
+    const heartbeat = [_]core.Message{.{ .msg_type = .heartbeat, .from = 1, .to = 2, .term = 7 }};
+    const vote = [_]core.Message{.{ .msg_type = .request_vote, .from = 1, .to = 2, .term = 8 }};
+    try host.transport().sendPeerBatches(&.{.{ .peer_id = 2, .groups = &.{
+        .{ .group_id = 41, .messages = &heartbeat },
+        .{ .group_id = 42, .messages = &heartbeat },
+        .{ .group_id = 41, .messages = &vote },
+    } }});
+    try std.testing.expectEqual(@as(usize, 3), driver.sent.items.len);
+    var seen_heartbeat = false;
+    for (driver.sent.items) |frame| {
+        const decoded = try host.codec.decodeFrame(std.testing.allocator, .{ .bytes = frame.bytes, .media_type = frame.media_type });
+        defer host.codec.freeDecoded(std.testing.allocator, decoded);
+        try std.testing.expectEqual(@as(usize, 1), decoded.raft_peer_batch.groups.len);
+        const group = decoded.raft_peer_batch.groups[0];
+        if (group.group_id == 41) {
+            if (group.messages[0].msg_type == .request_vote) try std.testing.expect(seen_heartbeat) else seen_heartbeat = true;
+        }
+    }
+}
+
+test "codec transport bounds encoded heartbeat bundles and preserves read contexts" {
+    var driver = RecordingFrameDriver{ .alloc = std.testing.allocator };
+    defer driver.deinit();
+    var host = runtime.CodecTransportHost.init(std.testing.allocator, runtime.BinaryCodec.codec(), driver.driver(), .{});
+    defer host.deinit();
+    const context = try std.testing.allocator.alloc(u8, 300 * 1024);
+    defer std.testing.allocator.free(context);
+    @memset(context, 7);
+    const heartbeat = [_]core.Message{.{ .msg_type = .heartbeat, .from = 1, .to = 2, .term = 7, .context = context }};
+    var groups: [4]runtime.transport_iface.GroupMessageBatch = undefined;
+    for (&groups, 0..) |*group, i| {
+        group.* = .{ .group_id = i + 1, .messages = &heartbeat };
+        try host.transport().addPeer(i + 1, .{ .node_id = 2, .endpoints = &.{.{ .protocol = .http1, .address = "http://same" }} });
+    }
+    try host.transport().sendPeerBatches(&.{.{ .peer_id = 2, .groups = &groups }});
+    try std.testing.expectEqual(@as(usize, 2), driver.sent.items.len);
+    var total: usize = 0;
+    for (driver.sent.items) |frame| {
+        try std.testing.expect(frame.bytes.len <= 1024 * 1024);
+        const decoded = try host.codec.decodeFrame(std.testing.allocator, .{ .bytes = frame.bytes, .media_type = frame.media_type });
+        defer host.codec.freeDecoded(std.testing.allocator, decoded);
+        for (decoded.raft_peer_batch.groups) |group| try std.testing.expectEqualSlices(u8, context, group.messages[0].context);
+        total += decoded.raft_peer_batch.groups.len;
+    }
+    try std.testing.expectEqual(@as(usize, 4), total);
 }

@@ -6,6 +6,7 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
+from ...models.catalog_mutation_visibility_pending import CatalogMutationVisibilityPending
 from ...models.error import Error
 from ...models.namespace_catalog_record import NamespaceCatalogRecord
 from ...types import Response
@@ -29,11 +30,16 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Error | NamespaceCatalogRecord | None:
+) -> CatalogMutationVisibilityPending | Error | NamespaceCatalogRecord | None:
     if response.status_code == 200:
         response_200 = NamespaceCatalogRecord.from_dict(response.json())
 
         return response_200
+
+    if response.status_code == 202:
+        response_202 = CatalogMutationVisibilityPending.from_dict(response.json())
+
+        return response_202
 
     if response.status_code == 400:
         response_400 = Error.from_dict(response.json())
@@ -58,7 +64,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Error | NamespaceCatalogRecord]:
+) -> Response[CatalogMutationVisibilityPending | Error | NamespaceCatalogRecord]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -72,7 +78,7 @@ def sync_detailed(
     namespace_name: str,
     *,
     client: AuthenticatedClient,
-) -> Response[Error | NamespaceCatalogRecord]:
+) -> Response[CatalogMutationVisibilityPending | Error | NamespaceCatalogRecord]:
     """Clear namespace tablespace
 
      Clears the namespace catalog object's durable tablespace binding.
@@ -86,7 +92,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | NamespaceCatalogRecord]
+        Response[CatalogMutationVisibilityPending | Error | NamespaceCatalogRecord]
     """
 
     kwargs = _get_kwargs(
@@ -106,7 +112,7 @@ def sync(
     namespace_name: str,
     *,
     client: AuthenticatedClient,
-) -> Error | NamespaceCatalogRecord | None:
+) -> CatalogMutationVisibilityPending | Error | NamespaceCatalogRecord | None:
     """Clear namespace tablespace
 
      Clears the namespace catalog object's durable tablespace binding.
@@ -120,7 +126,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | NamespaceCatalogRecord
+        CatalogMutationVisibilityPending | Error | NamespaceCatalogRecord
     """
 
     return sync_detailed(
@@ -135,7 +141,7 @@ async def asyncio_detailed(
     namespace_name: str,
     *,
     client: AuthenticatedClient,
-) -> Response[Error | NamespaceCatalogRecord]:
+) -> Response[CatalogMutationVisibilityPending | Error | NamespaceCatalogRecord]:
     """Clear namespace tablespace
 
      Clears the namespace catalog object's durable tablespace binding.
@@ -149,7 +155,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | NamespaceCatalogRecord]
+        Response[CatalogMutationVisibilityPending | Error | NamespaceCatalogRecord]
     """
 
     kwargs = _get_kwargs(
@@ -167,7 +173,7 @@ async def asyncio(
     namespace_name: str,
     *,
     client: AuthenticatedClient,
-) -> Error | NamespaceCatalogRecord | None:
+) -> CatalogMutationVisibilityPending | Error | NamespaceCatalogRecord | None:
     """Clear namespace tablespace
 
      Clears the namespace catalog object's durable tablespace binding.
@@ -181,7 +187,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | NamespaceCatalogRecord
+        CatalogMutationVisibilityPending | Error | NamespaceCatalogRecord
     """
 
     return (

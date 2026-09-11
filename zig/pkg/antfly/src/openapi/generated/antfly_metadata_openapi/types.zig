@@ -1614,6 +1614,11 @@ pub const CardinalityMode = enum {
     }
 };
 
+/// The mutation committed. Read the resource to observe it; do not replay the mutation to obtain its representation.
+pub const CatalogMutationVisibilityPending = struct {
+    status: []const u8,
+};
+
 /// An explicit native table target. Components are literal names; dots do not qualify a string table name.
 pub const CatalogTableTarget = struct {
     database: ?[]const u8 = null,

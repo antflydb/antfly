@@ -1660,6 +1660,7 @@ pub const MetadataHttpServer = struct {
         const node_path = routes.Routes.internal_nodes_prefix ++ ":node_id";
         try server.delete(node_path, httpx.Handler.bind(self, metadataFinalizeNodeShutdown));
         try server.post(node_path ++ routes.Routes.internal_node_status_suffix, httpx.Handler.bind(self, metadataReportNodeStatus));
+        try server.post(node_path ++ routes.Routes.internal_node_status_suffix ++ "/heartbeat", httpx.Handler.bind(self, metadataReportNodeHeartbeat));
         try server.post("/internal/v1/system-catalog", httpx.Handler.bind(self, metadataSystemCatalog));
         try server.post(routes.Routes.internal_catalog_publication_check, httpx.Handler.bind(self, metadataCatalogPublicationCheck));
         try server.post(routes.Routes.internal_catalog_table_publication_check, httpx.Handler.bind(self, metadataCatalogTablePublicationCheck));
@@ -2630,6 +2631,7 @@ pub const MetadataHttpServer = struct {
         return switch (err) {
             error.InvalidArgument, error.StoreIdentityMismatch => ctx.status(400).text("invalid node request"),
             error.NodeNotFound, error.UnknownStore => ctx.status(404).text("node not found"),
+            error.StoreReportBaseMismatch => ctx.status(409).text("store report generation changed; send a full report"),
             error.ActiveNodeFinalizeRejected => ctx.status(409).text("node is not ready to finalize"),
             error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
             else => metadataReadError(ctx, err),
@@ -2675,6 +2677,18 @@ pub const MetadataHttpServer = struct {
             return ctx.status(400).text("invalid node status request");
         var owned = node_operations.StatusReport{ .value = report };
         defer owned.deinit(ctx.allocator);
+        self.nodeOperations().reportStatus(ctx.allocator, requestContext(ctx), &owned) catch |err| return nodeMutationError(ctx, err);
+        try ctx.setHeader(metadata_table_manager.store_runtime_reference_header, "1");
+        return ctx.status(202).text("accepted");
+    }
+
+    fn metadataReportNodeHeartbeat(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const node_id = numericParam(ctx, "node_id", false) catch return ctx.status(404).text("not found");
+        var report = parseNodeStatusReport(ctx.allocator, (try ctx.body()) orelse "", node_id) catch return ctx.status(400).text("invalid node heartbeat");
+        report.runtime_reference = true;
+        var owned = node_operations.StatusReport{ .value = report };
+        defer owned.deinit(ctx.allocator);
+        if (report.runtime_statuses.len != 0 or report.reporter_incarnation == 0) return ctx.status(400).text("invalid runtime reference");
         self.nodeOperations().reportStatus(ctx.allocator, requestContext(ctx), &owned) catch |err| return nodeMutationError(ctx, err);
         return ctx.status(202).text("accepted");
     }

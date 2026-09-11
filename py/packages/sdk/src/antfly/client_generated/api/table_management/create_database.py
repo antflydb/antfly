@@ -1,11 +1,12 @@
 from http import HTTPStatus
-from typing import Any, cast
+from typing import Any
 from urllib.parse import quote
 
 import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
+from ...models.catalog_mutation_visibility_pending import CatalogMutationVisibilityPending
 from ...models.database_catalog_record import DatabaseCatalogRecord
 from ...models.error import Error
 from ...types import Response
@@ -27,11 +28,16 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Any | DatabaseCatalogRecord | Error | None:
+) -> CatalogMutationVisibilityPending | DatabaseCatalogRecord | Error | None:
     if response.status_code == 201:
         response_201 = DatabaseCatalogRecord.from_dict(response.json())
 
         return response_201
+
+    if response.status_code == 202:
+        response_202 = CatalogMutationVisibilityPending.from_dict(response.json())
+
+        return response_202
 
     if response.status_code == 400:
         response_400 = Error.from_dict(response.json())
@@ -39,7 +45,8 @@ def _parse_response(
         return response_400
 
     if response.status_code == 409:
-        response_409 = cast(Any, None)
+        response_409 = Error.from_dict(response.json())
+
         return response_409
 
     if response.status_code == 500:
@@ -55,7 +62,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Any | DatabaseCatalogRecord | Error]:
+) -> Response[CatalogMutationVisibilityPending | DatabaseCatalogRecord | Error]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -68,7 +75,7 @@ def sync_detailed(
     database_name: str,
     *,
     client: AuthenticatedClient,
-) -> Response[Any | DatabaseCatalogRecord | Error]:
+) -> Response[CatalogMutationVisibilityPending | DatabaseCatalogRecord | Error]:
     """Create database
 
      Creates a database catalog object. The server applies the same semantics as `CREATE DATABASE`.
@@ -81,7 +88,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | DatabaseCatalogRecord | Error]
+        Response[CatalogMutationVisibilityPending | DatabaseCatalogRecord | Error]
     """
 
     kwargs = _get_kwargs(
@@ -99,7 +106,7 @@ def sync(
     database_name: str,
     *,
     client: AuthenticatedClient,
-) -> Any | DatabaseCatalogRecord | Error | None:
+) -> CatalogMutationVisibilityPending | DatabaseCatalogRecord | Error | None:
     """Create database
 
      Creates a database catalog object. The server applies the same semantics as `CREATE DATABASE`.
@@ -112,7 +119,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | DatabaseCatalogRecord | Error
+        CatalogMutationVisibilityPending | DatabaseCatalogRecord | Error
     """
 
     return sync_detailed(
@@ -125,7 +132,7 @@ async def asyncio_detailed(
     database_name: str,
     *,
     client: AuthenticatedClient,
-) -> Response[Any | DatabaseCatalogRecord | Error]:
+) -> Response[CatalogMutationVisibilityPending | DatabaseCatalogRecord | Error]:
     """Create database
 
      Creates a database catalog object. The server applies the same semantics as `CREATE DATABASE`.
@@ -138,7 +145,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | DatabaseCatalogRecord | Error]
+        Response[CatalogMutationVisibilityPending | DatabaseCatalogRecord | Error]
     """
 
     kwargs = _get_kwargs(
@@ -154,7 +161,7 @@ async def asyncio(
     database_name: str,
     *,
     client: AuthenticatedClient,
-) -> Any | DatabaseCatalogRecord | Error | None:
+) -> CatalogMutationVisibilityPending | DatabaseCatalogRecord | Error | None:
     """Create database
 
      Creates a database catalog object. The server applies the same semantics as `CREATE DATABASE`.
@@ -167,7 +174,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | DatabaseCatalogRecord | Error
+        CatalogMutationVisibilityPending | DatabaseCatalogRecord | Error
     """
 
     return (
