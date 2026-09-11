@@ -463,6 +463,124 @@ schema-migration, and exact-sort E2E tests passed again. Full builds, both
 relocated benchmark targets, Python lint/formatting, and Zig formatting passed.
 Counts overlap; these are focused suites rather than the complete repository.
 
+## Bounded inventory and shared schema compilation (2026-09-11)
+
+[Raw observations and executable provenance](system_catalog_capacity_workloads_2026_09_11.json)
+compare the preceding PR head `a05523e6b` with the implementations recorded per
+run. Standalone capacity and pagination use `0ef9fe841`; the subsequent
+metadata-only batching change is `1ff6ad950`. Both include main `c3bc00135`.
+Runs used Debug binaries on the same shared macOS ARM64 host. No task-started
+build, test, or other benchmark overlapped measured requests; unrelated host
+activity was outside our control. Provisioning and readiness are excluded.
+These are small-sample workload observations, not production capacity estimates.
+
+### Wide inventory while applications read table details
+
+Five measured inventories after two warmups, with 200 extra schema fields and a
+unique declared field per table. The 200-table case exceeds the schema cache's
+64 MiB retention budget. The mixed workload uses one inventory scanner and eight
+detail readers; readers remain active until the scanner finishes.
+
+| Workload | Before p50 / p95 (ms) | After p50 / p95 (ms) |
+| --- | --- | --- |
+| 100-table full inventory | 96.601 / 97.741 | 102.948 / 104.606 |
+| 200-table full inventory | 1120.286 / 1132.184 | 496.549 / 498.701 |
+| Detail beside 200 tables | 11.758 / 12.037 | 4.931 / 5.065 |
+| 200-table inventory alongside readers | 1217.340 / 1221.480 | 558.464 / 585.840 |
+| Detail alongside 200-table inventory | 12.360 / 13.460 | 6.057 / 8.275 |
+
+At 200 tables, full inventory improved about 2.26× and concurrent detail
+throughput rose from 614 to 1143 requests/s. The 100-table full inventory median
+regressed 6.6%; this change does not make every cache-resident scan faster.
+Frequency/size admission prevents sequential scans from replacing equally useful
+resident definitions. Concurrent misses share compilation, and point details use
+the same immutable cache. Runtime observations, permissions, and index
+incarnations remain fresh. Nonresident definitions still require compilation;
+active response leases and compiler scratch are outside the retention budget.
+
+A separate 200-table run measured the first 25-row page at 26.291 / 26.376 ms
+(p50 / p95). The validated complete cursor walk took 473.240 / 488.068 ms,
+compared with 490.992 / 497.898 ms for the unpaged inventory in that run.
+Pagination bounds each response; it does not eliminate full-inventory work.
+The harness checks scope, counts, unique names, complete traversal, ordering, and
+cursor progress. Optional pagination keeps the baseline comparison usable with
+older binaries that do not implement cursors.
+
+### Single-table details as unrelated inventory grows
+
+Five requests after two warmups, shared 200-field schemas, standalone. The final
+binary is `1ff6ad950`; this isolates the application workflow rather than a
+synthetic schema-compilation loop.
+
+| Unrelated tables | Before p50 / p95 (ms) | After p50 / p95 (ms) |
+| --- | --- | --- |
+| 1 | 11.331 / 11.921 | 4.083 / 4.262 |
+| 100 | 11.131 / 11.372 | 4.657 / 4.677 |
+| 1000 | 16.340 / 16.498 | 4.808 / 4.979 |
+
+At 1,000 unrelated tables, the detail median improved about 3.40×. The final
+point projection avoids copying the full catalog and shares immutable schema
+compilation with inventory reads.
+
+### Clustered projections and profiling
+
+Twenty measured requests after five warmups, on three metadata and three data
+nodes on one host. The final batched implementation is `1ff6ad950`.
+
+| Workload | Before p50 / p95 (ms) | After p50 / p95 (ms) |
+| --- | --- | --- |
+| One table beside 30 tables | 27.232 / 190.852 | 24.609 / 43.253 |
+| Prefix selecting one of 30 tables | 28.794 / 217.020 | 23.160 / 40.618 |
+| 30-table full inventory | 78.485 / 277.536 | 103.602 / 485.014 |
+| Detail beside 30 tables | 27.240 / 221.178 | 28.713 / 320.416 |
+| Empty default namespace beside 30 tables | 26.139 / 235.148 | 22.882 / 51.666 |
+
+No clustered full-inventory improvement is established. The matched 30-table
+inventory median regressed 32%, and detail tail latency was worse in the final
+run. Earlier five-sample baseline inventory measured 110 ms; repeated updated
+runs measured 101–109 ms. At ten tables, empty-default-namespace latency rose
+from 12.644 to 25.603 ms, while selective-prefix medians were similar. These
+differences and broad tails remain visible in the artifact; local quorum timing,
+metadata heartbeat/index maintenance, storage work, and host contention are all
+included. Selected-key batching reduces repeated LSM work, but does not remove
+the read barrier, derived-index write amplification, or full-response serialization.
+
+The initial implementation encoded derived heartbeat reports as JSON and resolved
+logical names before a separate status read. Its 30-table inventory/detail
+medians were 258.137 / 55.855 ms. Those observations prompted two corrections:
+derived rows reuse the primary binary codec, and HTTP/MCP status resolves names
+and projects status behind one read barrier. Repeated full-inventory profiling
+then identified selected report and definition point reads as avoidable work.
+The final projection sorts selected keys and batches their storage reads, retaining
+logical result order and excluding unrelated payloads.
+
+A ten-second sample of the serving metadata node attributed 318 of 955 sampled
+projection stacks to report point reads and 155 to definition point reads. These
+are call-site stack observations, not end-to-end CPU percentages. The separate
+unprofiled 100-request inventory run measured 101.449 / 353.457 ms before batching.
+The artifact retains intermediate regressions and the profiling summary rather
+than replacing them with successful results.
+
+### Correctness and compatibility
+
+The final batched implementation passed the full build and all 134 focused
+catalog tests. The metadata regression stays within a 128 KiB caller allocator
+with a 256 KiB unrelated definition/report and 2,000 group summaries; it covers
+missing selected reports, lexical versus numeric key order, cursor continuation,
+heartbeat removal, membership invalidation, and derived-index rebuild. Other tests
+cover single compilation under concurrent cold reads, cache admission/eviction
+leases, allocation failure cleanup, cursor validation, CORS, and one coherent
+HTTP/MCP detail observation.
+
+The 19 selected catalog, schema-migration, exact-sort, and exact-star grant E2E
+cases passed on the fused-detail implementation. The subsequent batching change
+is confined to metadata reads and covered by the focused storage regression and
+clustered public-API workload. Generated OpenAPI checks, Go SDK pagination tests,
+Python SDK generation checks, TypeScript SDK typechecking, and changed-file
+formatting/lint passed. The global license scan still reports inherited failures;
+new files were checked individually. These are focused, overlapping checks, not
+a claim that the complete repository suite passed.
+
 ## Reproduction
 
 See [workloads and commands](SYSTEM_CATALOG.md). Run the resolution scenario
