@@ -167,6 +167,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data raft read safety barrier completes only after matching ReadState apply",
         "data raft read safety barrier rejects pre-restart responses for both read paths",
         "data raft ticker advances consensus independently of control rounds",
+        "data raft stable placement refreshes changed peer transport endpoints",
         "raft batch round trips table batch payload",
         "raft batch round trips deterministic transaction begin",
         "raft protocol barrier is fail closed for legacy batch parsers",

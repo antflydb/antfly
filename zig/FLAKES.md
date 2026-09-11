@@ -4,7 +4,36 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
-## 2026-09-11: final mixed Linux acceptance for #694
+## Peer endpoint changes bypass stable placement reconciliation (#694 review)
+
+After merging `origin/main` (`444440574`) in `6b0985d09`, review found that
+`DataRaftPlacementInputs` compared placement and split inputs but omitted
+store Raft endpoints. A peer restart can change its URL without changing
+membership or the local metadata counter. The stable path then returned before
+publishing updated transport routes, indefinitely retaining the old endpoint.
+
+The cache now owns and compares node IDs and Raft URLs alongside its existing
+inputs. It deliberately excludes heartbeat generations, capacity, and health
+telemetry. Unchanged inputs use an allocation-free linear comparison and retain
+the admitted topology; a changed route is published through reconciliation.
+Local placement changes still require linearizable metadata authority.
+
+The deterministic production DataServer regression fails before the fix:
+transport retains port 31001 when metadata advertises port 31002. It passes
+after the fix and also verifies that heartbeat/capacity changes and repeated
+unchanged observations retain the admitted plan. The merged data-runtime suite
+passes **179/179**, without skips or leaks, and **73 Python harness checks**
+pass. Evidence: `/private/tmp/ci694-main-review-peer-before.log`,
+`/private/tmp/ci694-main-review-data-fixed-unrestricted.log`, and
+`/private/tmp/ci694-main-review-python.log`. The initial sandboxed full suite
+could not bind local HTTP listeners; its nine failures and two skips are
+superseded by the unrestricted 179/179 run, not counted as acceptance.
+
+The merge preserves all 34 regression build additions in main's new owner
+modules. A fresh Linux build and 100-per-scenario soak are required for the
+merged endpoint fix; the earlier 300/300 result below predates this merge.
+
+## 2026-09-11: mixed Linux acceptance before the main merge (#694)
 
 The fresh run completed **300/300**, with **100/100 each** for CLI quickstart,
 three-by-three metadata backup/restore, and CLI retry exhaustion/restart.

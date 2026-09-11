@@ -1,6 +1,16 @@
 # Zig E2E flakes
 
-## 2026-09-11: final mixed Linux acceptance for #694
+## 2026-09-11: main merge and peer endpoint review follow-up (#694)
+
+The main merge preserves the regression targets in the new build modules.
+Review reproduced a peer endpoint change being ignored while placement stayed
+unchanged; the fix now includes owned node IDs and Raft URLs in the cache
+inputs without invalidating on heartbeat telemetry. The merged data-runtime
+suite passes 179/179 and Python harness checks pass 73/73. See `../FLAKES.md`
+for the deterministic before/after evidence. Fresh 100-per-scenario Linux
+acceptance is required; the 300/300 result below belongs to the pre-merge code.
+
+## 2026-09-11: mixed Linux acceptance before the main merge (#694)
 
 The fresh run completed **300/300**, with **100/100 each** for CLI quickstart,
 three-by-three metadata backup/restore, and CLI retry exhaustion/restart.

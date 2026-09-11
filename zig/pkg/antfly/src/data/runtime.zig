@@ -19028,6 +19028,15 @@ const DataRaftPlacementInputs = struct {
     metadata_incarnation: ?antfly.metadata_api.MetadataClusterIncarnation = null,
     intents: []antfly.raft.PlacementIntent = &.{},
     split_destinations: []u64 = &.{},
+    // Transport routes change independently of placement (for example after
+    // a peer restarts on a different endpoint). Own only routing inputs, not
+    // heartbeat generations, capacity, or other frequently changing status.
+    peer_routes: []PeerRoute = &.{},
+
+    const PeerRoute = struct {
+        node_id: u64 = 0,
+        raft_url: []const u8 = &.{},
+    };
 
     fn clone(alloc: std.mem.Allocator, snapshot: *const antfly.metadata_api.AdminSnapshot) !@This() {
         var result: @This() = .{
@@ -19039,6 +19048,11 @@ const DataRaftPlacementInputs = struct {
         result.split_destinations = try alloc.alloc(u64, snapshot.split_transitions.len);
         for (result.split_destinations, snapshot.split_transitions) |*destination, transition|
             destination.* = transition.destination_group_id;
+        result.peer_routes = try alloc.alloc(PeerRoute, snapshot.stores.len);
+        @memset(result.peer_routes, .{});
+        for (result.peer_routes, snapshot.stores) |*route, store| {
+            route.* = .{ .node_id = store.node_id, .raft_url = try alloc.dupe(u8, store.raft_url) };
+        }
         return result;
     }
 
@@ -19046,6 +19060,8 @@ const DataRaftPlacementInputs = struct {
         for (self.intents) |intent| antfly.raft.reconciler.freeIntentOwned(alloc, intent);
         alloc.free(self.intents);
         alloc.free(self.split_destinations);
+        for (self.peer_routes) |route| alloc.free(route.raft_url);
+        alloc.free(self.peer_routes);
         self.* = .{};
     }
 
@@ -19053,9 +19069,13 @@ const DataRaftPlacementInputs = struct {
         if (self.metadata_group_id != snapshot.status.metadata_group_id or
             !std.meta.eql(self.metadata_incarnation, snapshot.status.metadata_incarnation) or
             !dataRaftPlacementAuthorityMatches(self.intents, snapshot.placement_intents) or
-            self.split_destinations.len != snapshot.split_transitions.len) return false;
+            self.split_destinations.len != snapshot.split_transitions.len or
+            self.peer_routes.len != snapshot.stores.len) return false;
         for (self.split_destinations, snapshot.split_transitions) |destination, transition|
             if (destination != transition.destination_group_id) return false;
+        for (self.peer_routes, snapshot.stores) |route, store| {
+            if (route.node_id != store.node_id or !std.mem.eql(u8, route.raft_url, store.raft_url)) return false;
+        }
         return true;
     }
 };
@@ -26565,6 +26585,87 @@ test "data server registered data raft uses wal state backend by default" {
     server.requestDataRaftMetadataSync();
     try std.testing.expect(server.data_raft_metadata_sync_requested.swap(false, .acq_rel));
     try std.testing.expect(!server.data_raft_metadata_sync_requested.swap(false, .acq_rel));
+}
+
+test "data raft stable placement refreshes changed peer transport endpoints" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-peer-route-refresh", .{tmp.sub_path});
+    defer alloc.free(replica_root);
+
+    var server = try DataServer.initFromMetadataApiUrl(alloc, .{
+        .replica_root_dir = replica_root,
+        .store_registration = .{
+            .node_id = 1,
+            .store_id = 1,
+            .api_url = "http://127.0.0.1:1",
+        },
+    }, "http://127.0.0.1:2");
+    defer server.deinit();
+    const data_raft = server.data_raft orelse return error.MissingDataRaft;
+
+    var snapshot = antfly.metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 9, .metadata_epoch = 17, .metrics = .{} },
+        .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+            .group_id = 77,
+            .table_id = 7,
+            .start_key = "",
+            .end_key = null,
+        }})[0..]),
+        .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{.{
+            .store_id = 1,
+            .node_id = 1,
+            .role = "data",
+            .live = true,
+            .health_class = "healthy",
+            .api_url = "http://127.0.0.1:1",
+            .raft_url = "http://127.0.0.1:2",
+        }})[0..]),
+        .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{ .{
+            .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 },
+            .store_id = 1,
+            .peer_node_ids = &.{ 1, 2 },
+        }, .{
+            .record = .{ .group_id = 77, .replica_id = 2, .local_node_id = 2 },
+            .store_id = 2,
+            .peer_node_ids = &.{ 1, 2 },
+        } })[0..]),
+        .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+    };
+    var stores = [_]antfly.metadata.StoreRecord{ snapshot.stores[0], .{
+        .store_id = 2,
+        .node_id = 2,
+        .raft_url = "http://127.0.0.1:31001",
+    } };
+    snapshot.stores = &stores;
+    try server.syncDataRaftFromSnapshot(&snapshot, .linearizable);
+    const routes = &data_raft.host.http_host.transport_stack.transport_host.peer_routes;
+    try std.testing.expectEqualStrings(stores[1].raft_url, routes.get(.{ .group_id = 77, .node_id = 2 }).?.address);
+    const admitted = server.last_data_raft_local_intents.ptr;
+
+    // Heartbeats must retain the plan without rebuilding its owned topology.
+    stores[1].status_generation += 1;
+    stores[1].available_bytes += 1;
+    try server.syncDataRaftFromSnapshot(&snapshot, .observation);
+    try std.testing.expectEqual(admitted, server.last_data_raft_local_intents.ptr);
+
+    // Restart can move an endpoint without changing membership or the local
+    // lifecycle counter. Transport must receive the new route in this round.
+    stores[1].raft_url = "http://127.0.0.1:31002";
+    try server.syncDataRaftFromSnapshot(&snapshot, .observation);
+    try std.testing.expectEqualStrings(stores[1].raft_url, routes.get(.{ .group_id = 77, .node_id = 2 }).?.address);
+    const refreshed = server.last_data_raft_local_intents.ptr;
+    try server.syncDataRaftFromSnapshot(&snapshot, .observation);
+    try std.testing.expectEqual(refreshed, server.last_data_raft_local_intents.ptr);
 }
 
 test "data raft ticker advances consensus independently of control rounds" {
