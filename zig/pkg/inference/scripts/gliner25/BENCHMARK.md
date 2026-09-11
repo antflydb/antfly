@@ -36,17 +36,18 @@ Build from `zig/`, through the repository graph:
 zig build inference-bench-gliner25-cpu-build -Doptimize=ReleaseFast -Dmetal=false -Dcuda=false -Donnx=false -Dpjrt=false -j1
 ```
 
-The target explicitly forwards `ReleaseFast` and `-j1` into the delegated
-package build. The entire shared dependency graph receives that optimization
-mode; the worker rejects Debug builds. The executable is installed at
-`zig/pkg/inference/zig-out/bin/antfly-inference-gliner25-cpu-bench` relative to
-the repository root.
+Pass these flags explicitly: the modular repository build uses one shared
+dependency graph, and the worker rejects other optimization/backend profiles.
+The executable is installed at
+`zig/zig-out/bin/antfly-inference-gliner25-cpu-bench` relative to the repository
+root. A standalone build from `zig/pkg/inference/` uses the unprefixed target
+`bench-gliner25-cpu-build` and its package-local `zig-out/bin/` instead.
 
 Run an initial bounded smoke from the repository root with the pinned oracle
 venv and already verified model directory:
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 /private/tmp/antfly-gliner25-oracle-venv/bin/python zig/pkg/inference/scripts/gliner25/benchmark_cpu.py run --native-bin zig/pkg/inference/zig-out/bin/antfly-inference-gliner25-cpu-bench --model small --model-root /private/tmp/antfly-gliner25-models --upstream /private/tmp/antfly-gliner25-upstream --cases mixed_tasks --threads 1 --warmup 1 --pairs 2 --max-rss-mib 8192 --output /private/tmp/gliner25-cpu-smoke
+PYTHONDONTWRITEBYTECODE=1 /private/tmp/antfly-gliner25-oracle-venv/bin/python zig/pkg/inference/scripts/gliner25/benchmark_cpu.py run --native-bin zig/zig-out/bin/antfly-inference-gliner25-cpu-bench --model small --model-root /private/tmp/antfly-gliner25-models --upstream /private/tmp/antfly-gliner25-upstream --cases mixed_tasks --threads 1 --warmup 1 --pairs 2 --max-rss-mib 8192 --output /private/tmp/gliner25-cpu-smoke
 ```
 
 Use `--model base`, `--model multi`, or explicitly `--model all` for serial

@@ -79,7 +79,7 @@ An explicitly scheduled serial numerical capture uses a fresh directory:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 /private/tmp/antfly-gliner25-oracle-venv/bin/python \
-  /Users/timkaye/Documents/af/antfly/zig/pkg/inference/scripts/gliner25/capture_training_inactive_adapters.py \
+  zig/pkg/inference/scripts/gliner25/capture_training_inactive_adapters.py \
   --upstream /private/tmp/antfly-gliner25-upstream \
   --output-dir /private/tmp/gliner25-training-inactive-adapters-new
 ```
@@ -208,92 +208,17 @@ separate published classifier CLI evidence below does not extend these source
 numerical comparisons to a published checkpoint. Convergence and release
 qualification remain open requirements.
 
-## Published-small CPU command proof
+## Published-artifact scope
 
-Separate normal production CLI jobs now execute the same authored five-row
-classifier sequence using the original published small checkpoint and actual
-tokenizer. Both rank-2/alpha-3 LoRA and DoRA use adapter dropout zero and retain
-the published encoder/head dropout of 0.1. They use ordinary production
-initialization, without the synthetic fixture constructor or captured initial
-adapter tensors. Each completes five microbatches and three updates at
-`[2,4,5]`; the inactive objective sequence is exactly `[false,true,false,true,true]`,
-with raw frozen-task diagnostics retained. All four/six parameter slots reach
-three Adam steps. Uninterrupted execution and pause-after-one/fresh resume
-produce byte-identical final results, checkpoints and all four export files.
+Separate local published-small classifier-only LoRA/DoRA jobs exercised the
+ordinary CPU and resident-Metal CLI with five active/inactive microbatches,
+three updates and exact fresh-owner resume within each backend. Their final
+adapters also underwent strict upstream CPU reload and ten fixed requests.
+Those process receipts and output artifacts are campaign data, not fixtures.
 
-The 32,697,376-byte ReleaseFast CPU+Metal-capable public executable has SHA256
-`9f0d349efa3f33dd29b6c3dd26a12a8bcf2babf2bc78400c2b84d87d58d786f9`;
-these six invocations selected **native CPU**. Their exact configuration,
-source, executable, process, progress and state identities are archived in
-the [published CPU ledger](../../testdata/gliner25/published_inactive_classifier_cpu_v1/manifest.json).
-The LoRA validation receipt is
-`a0d46d07a1a1c8f55967c7193d5ec65c8117e523df5ac32edefa627c70336516`;
-DoRA is
-`81106db7aaf6eac4512d367ee29ea96e33c061173a8de253ffce7986d70348fe`.
-The checker independently derives the Controller fingerprint and the complete
-owned-state SHA256 from exact ordered checkpoint values. No numeric tolerance
-is used for identity or resume continuity.
-
-The first paused process succeeded before a checker-only representation
-failure. Exact original helpers, process and output files remain preserved;
-revision 2 uses explicit declared-f32 conversion, fixed digest-byte conversion,
-the actual Controller hash contract and flattened checkpoint layout. Its
-additive offline validation passed without a model rerun. Nineteen revised
-pure tests passed; the unchanged supervisor retains eight process-lifetime
-regressions. Host/backend peaks were at most 25,589,151/30,631,060 bytes for
-LoRA and 25,620,123/30,659,864 for DoRA under separate 128 MiB caps. The sampled
-child-tree RSS peaks were 466,141,184 and 466,305,024 bytes under the explicit
-2 GiB outer guard, with clean process ownership/reaping in all six runs.
-
-This adds published CPU policy and durable-continuity evidence. It does not
-claim independent published Fastino loss/VJP parity, useful trained quality,
-long-context training, or the separate Metal command qualification below.
-
-## Published-small Metal command proof
-
-Six separate invocations of the same frozen `9f0d349e…786f9` executable now
-pass the ordinary production recipe on resident Metal: pause after one,
-fresh-owner resume, and uninterrupted execution for LoRA and DoRA. Every mode
-completes five microbatches and three updates at `[2,4,5]`, with fallback
-`[false,true,false,true,true]`, preserved raw frozen-task terms and every
-selected slot at three Adam steps. Stitched progress semantics, final result,
-checkpoint and all four export-file bytes agree exactly within Metal.
-
-The [published Metal ledger](../../testdata/gliner25/published_inactive_classifier_metal_v1/manifest.json)
-archives 86 exact files and final tensor-file digests. Its manifest SHA256 is
-`3007a69b1aca2099f146580b79b366a4fe0d87c17f1018dd508e4df8ee1fd989`.
-Final LoRA validation is
-`93e7e83ca915bbcff5f1a45b5437f8cb00d24e3b69a9f71a140598d658e4b018`;
-DoRA is
-`d723cb5b9be072e767885f9527cd3e631739c9905f642f149fd2e0d668fd7912`.
-Both final and all four continuation phase receipts reconstruct exactly from
-the immutable original files, including independent Controller/state hashes.
-
-The explicit profile keeps host at 128 MiB and admits 1 GiB backend including
-64 MiB metadata, with 2 GiB combined and the unchanged live-memory guard.
-Other source/job/dataset owners remain separately admitted. Resident upper
-bounds were 775,275,748 / 775,343,792 bytes for LoRA/DoRA; largest host peaks
-were 27,969,855 / 28,060,948 bytes and backend-metadata peaks were
-1,265,664 / 1,278,148 bytes. The distinct 3 GiB outer sampled process-tree RSS
-guard recorded maxima of 581,730,304 / 661,929,984 bytes across all six phases;
-all processes were cleanly reaped.
-
-These jobs use materialized training attention. They establish Metal policy
-and exact durable continuity, not published Fastino loss/VJP or CPU–Metal
-numerical parity, other targets/backbones/ranks, replay-tiled long-context
-training, trained quality, throughput or release readiness.
-
-## Published classifier-only export reloads
-
-All four final CPU/Metal LoRA/DoRA artifacts now pass actual pinned Fastino
-CPU loading with isolated official PEFT 0.18.0. Each preserves all 334 base
-tensor bytes and its exact four/six adapter tensor bytes, matches the final
-checkpoint and separately resumed export, and executes the ten fixed
-requests. Four processes completed within their unchanged 180-second/2 GiB
-RSS guards and released every private model/wheel copy. The
-[reload ledger](../../testdata/gliner25/published_inactive_classifier_export_reload_v1/manifest.json)
-contains all reports/process records, portable adapter bytes and helper pins.
-The earlier Metal-LoRA disk-preflight denial remains separate and launched
-no model child. These reloads use CPU even for Metal-trained artifacts; they
-prove interoperability, without extending the training-gradient, attention,
-quality or release scope above.
+The retained tiny source fixtures above remain the numerical regression
+contract. Published restart/reload consistency does not establish published
+Fastino VJP parity, equality of CPU/Metal updates, broader ranks/backbones,
+full-context training, useful trained quality or release readiness. See
+[training](../../../../../docs/GLINER25_TRAINING.md) and
+[export compatibility](../../../../../docs/GLINER25_TRAINING_EXPORT.md).

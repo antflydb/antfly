@@ -22,57 +22,22 @@ final result, checkpoint and four adapter-export files are byte-exact against
 uninterrupted execution. It does not qualify published regional Metal or
 published-model PyTorch numerical parity.
 
-The [recorded native jobs](../zig/pkg/inference/testdata/gliner25/recomputed_training_published_small_execution_v1/README.md)
-retain explicit 768 MiB host, 1 GiB backend, 3 GiB combined and 32 MiB optimizer
-transaction caps. An earlier LoRA resume failed cleanly because restore charged
-the default 64 MiB header-parser ceiling before reading the checkpoint. The
-successful revision reserves staged state plus the actual immutable snapshot,
-then clamps parser capacity to the transaction remainder. All job memory caps
-remain unchanged; the ledger preserves both the failure and all six successful
-LoRA/DoRA phases. These are short authored examples, not a full-context or
-performance qualification.
+The local published-small recipes establish restart/export consistency for
+short authored inputs. They do not establish full-context training or
+performance. Resource-admission failures occur before execution and must
+remain distinct from numerical failures or successful training.
 
-The attempted published-small Metal head job was denied by live-memory
-admission before source loading: it requested 2,216,519,709 bytes against a
-current capacity of 601,295,421 bytes under the dynamic macOS pressure policy.
-No model training ran and no allocation leaked. This is a resource-admission
-failure, not evidence of model numerical failure or successful GPU training.
-The log is `/private/tmp/gliner25-real-small-training-job-metal-v1.log`, SHA-256
-`b1d30c377b06950db5e0966fbf66ee5527a38998960334d14799b8aa65b4c3c0`.
-
-The source owner, native runner, CLI and exporter are implemented. All three
-published source snapshots and the tiny composed CPU training profiles have
-focused validation evidence. The real-small head-only library job passed four
-microbatches/two optimizer updates, pause-after-one/resume, exact final state
-and model agreement, all 334 exported tensors and the four unchanged sidecars.
-A persistent native CLI job then completed with identical final state/model
-hashes; its export passed strict pinned Fastino loading and all ten bounded
-task requests. A fresh supervised CPU CLI also passed pause-after-one/resume
-with the same final hashes and every redirected stdout event retained. See
-[training evidence](GLINER25_TRAINING.md) and [release gates](GLINER25_IMPLEMENTATION.md).
-
-That successful four-row integration probe produced model SHA-256
-`ed1c88487e6b1936f0586e3868c4b944af9707b5a31ea0834156f60d354cefd7`
-and canonical optimizer-state SHA-256
-`508c7369ee604274321ae5666c88d57eb9dbae1efe881118b96ff86dd04bdf3c`.
-These identities belong to that probe, not arbitrary runs of the example below.
-The test process exited successfully with four selected tests passing and no
-skips; its log is `/private/tmp/gliner25-real-small-training-job-v2.log`, SHA-256
-`93b5add68241adc4736d85ad818199dbe2dfb137524fe1a0b342f30e65628e0f`.
-The persistent CLI output is
-`/private/tmp/antfly-gliner25-training-cli-v1/uninterrupted`, produced by binary
-SHA-256 `aee7147d1724b093768dbaba2a2e992d42b29c3e09ef8fc3e1f1cbe7275956a0`.
-The upstream checker report is
-`/private/tmp/gliner25-training-export-heads-check-v1/report.json`, SHA-256
-`5692fd22c94069de7d96135668705e0dca70a9ca79810921dc60f03ebff3e841`.
-This proves this head-only artifact loads and runs; same-trained-artifact
-native/Python output parity, extraction quality and convergence remain open.
+Checkpoint restore accounts for staged state, the actual immutable snapshot
+and a header-parser budget clamped to the remaining transaction capacity.
+No default cap is raised to make a restore fit. The CLI's process supervisor,
+configuration identity, typed resource diagnostics and final-output ownership
+are part of the job contract below.
 
 ## A concrete bounded job
 
-Save the following JSON as `/private/tmp/gliner25-heads-job-v1.json`. Paths are
-absolute and refer to the current checkout and previously downloaded pinned
-small model. The output directory must not exist; its parent must exist.
+Save the following JSON as `/private/tmp/gliner25-heads-job-v1.json`. Replace
+the absolute checkout and model paths with your local paths. The model must
+match the pinned small source below. The output directory must not exist; its parent must exist.
 Every row already carries the complete schema described in
 [the JSONL contract](GLINER25_TRAINING_DATA.md).
 
@@ -80,8 +45,8 @@ Every row already carries the complete schema described in
 {
   "version": 1,
   "source_dir": "/private/tmp/antfly-gliner25-models/small",
-  "train_file": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/testdata/gliner25/training_job_small_v1/train.jsonl",
-  "calibration_file": "/Users/timkaye/Documents/af/antfly/zig/pkg/inference/testdata/gliner25/training_job_small_v1/validation.jsonl",
+  "train_file": "/absolute/path/to/antfly/zig/pkg/inference/testdata/gliner25/training_job_small_v1/train.jsonl",
+  "calibration_file": "/absolute/path/to/antfly/zig/pkg/inference/testdata/gliner25/training_job_small_v1/validation.jsonl",
   "output_dir": "/private/tmp/gliner25-heads-paused-v1",
   "expected_source": {
     "backbone": "small",
@@ -137,23 +102,24 @@ four microbatches and perform two optimizer updates. These authored rows test
 plumbing, not model quality. Their exact bytes and limitations are recorded in
 [the fixture manifest](../zig/pkg/inference/testdata/gliner25/training_job_small_v1/manifest.json).
 
-The package build graph compiles and runs the dedicated command. Running from
-the package makes the requested optimization mode and single build job apply
-to its dependency graph:
+Start from the repository root and choose either invocation below. The package
+build graph compiles and runs the dedicated command with one shared optimization
+profile:
 
 ```sh
-cd /Users/timkaye/Documents/af/antfly/zig/pkg/inference
-ZIG_GLOBAL_CACHE_DIR=/private/tmp/antfly-gliner25-zig-cache zig build train-gliner25 -Doptimize=ReleaseFast -Dmetal=false -Dcuda=false -j1 -- /private/tmp/gliner25-heads-job-v1.json --stop-after-microbatches 1
+cd zig/pkg/inference
+zig build train-gliner25 -Doptimize=ReleaseFast -Dmetal=false -Dcuda=false -Donnx=false -Dpjrt=false -j1 -- /private/tmp/gliner25-heads-job-v1.json --stop-after-microbatches 1
 ```
 
 The command is also registered as `antfly-inference finetune train gliner25 <job.json>`
 (or `antfly inference finetune train gliner25 <job.json>` through the parent
-CLI). The top-level Zig graph exposes `inference-train-gliner25`, explicitly
-delegated with `ReleaseFast` and `-j1` for the whole package:
+CLI). The top-level Zig graph exposes `inference-train-gliner25` using the
+same command module. Pass `ReleaseFast` and the backend settings explicitly
+for the complete shared dependency graph:
 
 ```sh
-cd /Users/timkaye/Documents/af/antfly/zig
-ZIG_GLOBAL_CACHE_DIR=/private/tmp/antfly-gliner25-zig-cache zig build inference-train-gliner25 -Dmetal=false -Dcuda=false -j1 -- /private/tmp/gliner25-heads-job-v1.json --stop-after-microbatches 1
+cd zig
+zig build inference-train-gliner25 -Doptimize=ReleaseFast -Dmetal=false -Dcuda=false -Donnx=false -Dpjrt=false -j1 -- /private/tmp/gliner25-heads-job-v1.json --stop-after-microbatches 1
 ```
 
 Choose one invocation route; running both against the same output is rejected.
@@ -486,8 +452,8 @@ PY
 ```
 
 ```sh
-cd /Users/timkaye/Documents/af/antfly/zig/pkg/inference
-ZIG_GLOBAL_CACHE_DIR=/private/tmp/antfly-gliner25-zig-cache zig build train-gliner25 -Doptimize=ReleaseFast -Dmetal=false -Dcuda=false -j1 -- /private/tmp/gliner25-heads-resume-v1.json
+cd zig/pkg/inference
+zig build train-gliner25 -Doptimize=ReleaseFast -Dmetal=false -Dcuda=false -Donnx=false -Dpjrt=false -j1 -- /private/tmp/gliner25-heads-resume-v1.json
 ```
 
 Keep all semantic settings and consumed source/train/holdout bytes unchanged.

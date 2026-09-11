@@ -13,10 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
-const inference = @import("inference_internal");
 const platform = @import("antfly_platform");
-const compat = inference.io.compat;
-const c_file = inference.util.c_file;
 
 const Row = struct {
     kind: []const u8,
@@ -87,13 +84,13 @@ pub fn main(init: std.process.Init) !void {
     out_dir = try resolveCliPath(allocator, invocation_cwd, out_dir);
     defer allocator.free(out_dir);
 
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(init.io, out_dir);
     const decision_json = try std.fs.path.join(allocator, &.{ out_dir, "recursive_lora_sweep_decision.json" });
     defer allocator.free(decision_json);
     const decision_md = try std.fs.path.join(allocator, &.{ out_dir, "recursive_lora_sweep_decision.md" });
     defer allocator.free(decision_md);
 
-    try analyze(allocator, comparison_path, decision_json, decision_md, criteria);
+    try analyze(init.io, allocator, comparison_path, decision_json, decision_md, criteria);
 
     const stdout = std.Io.File.stdout();
     var buf: [2048]u8 = undefined;
@@ -123,13 +120,14 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn analyze(
+    io: std.Io,
     allocator: std.mem.Allocator,
     comparison_path: []const u8,
     decision_json: []const u8,
     decision_md: []const u8,
     criteria: Criteria,
 ) !void {
-    const bytes = try c_file.readFile(allocator, comparison_path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, comparison_path, allocator, .unlimited);
     defer allocator.free(bytes);
     var parsed = try std.json.parseFromSlice(Comparison, allocator, bytes, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
@@ -164,9 +162,9 @@ fn analyze(
         .evaluated = evaluated.items,
     }, .{ .whitespace = .indent_2 }, &out.writer);
     try out.writer.writeByte('\n');
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = decision_json, .data = out.written() });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = decision_json, .data = out.written() });
 
-    try writeMarkdown(allocator, decision_md, criteria, status, recommendation, evaluated.items);
+    try writeMarkdown(io, allocator, decision_md, criteria, status, recommendation, evaluated.items);
 }
 
 fn evaluateRow(allocator: std.mem.Allocator, row: Row, baseline: ?Row, criteria: Criteria) !Evaluated {
@@ -205,6 +203,7 @@ fn evaluateRow(allocator: std.mem.Allocator, row: Row, baseline: ?Row, criteria:
 }
 
 fn writeMarkdown(
+    io: std.Io,
     allocator: std.mem.Allocator,
     decision_md: []const u8,
     criteria: Criteria,
@@ -264,7 +263,7 @@ fn writeMarkdown(
         }
         try writer.writeAll(" |\n");
     }
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = decision_md, .data = out.written() });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = decision_md, .data = out.written() });
 }
 
 fn writeNamedOptional(writer: anytype, name: []const u8, value: anytype) !void {

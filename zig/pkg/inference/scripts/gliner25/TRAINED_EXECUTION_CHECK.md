@@ -59,19 +59,21 @@ reference, so its exact executable hash can match both runs:
 
 ```sh
 zig build inference-gliner25-trained-check-build \
-  -Dmetal=true -Donnx=false -Dcuda=false -Dpjrt=false -j1
+  -Doptimize=ReleaseFast -Dmetal=true -Donnx=false -Dcuda=false -Dpjrt=false -j1
 ```
 
 The output is
-`zig/pkg/inference/zig-out/bin/antfly-inference-gliner25-trained-check` relative
-to the repository root. Freeze a copy and record its digest before actual
+`zig/zig-out/bin/antfly-inference-gliner25-trained-check` relative
+to the repository root. A standalone package build uses the unprefixed
+`gliner25-trained-check-build` target and package-local `zig-out/bin/`.
+Freeze a copy and record its digest before actual
 execution. The build, CPU run and Metal run share the serialized model lane
 on the development machine. The following command reproduces the small
 all-target LoRA check with a fresh output directory; the completed runs are
 recorded below.
 
 ```sh
-GLINER25_EXECUTION_CHECKER=/Users/timkaye/Documents/af/antfly/zig/pkg/inference/scripts/gliner25/check_trained_execution.py
+GLINER25_EXECUTION_CHECKER=zig/pkg/inference/scripts/gliner25/check_trained_execution.py
 GLINER25_TRAINED_WORKER=/absolute/path/frozen-antfly-inference-gliner25-trained-check
 GLINER25_ADAPTER_RUN=/private/tmp/antfly-gliner25-training-runtime-artifact-v1/lora-all-host128-backend384-uninterrupted
 GLINER25_MATERIALIZATION=/private/tmp/antfly-gliner25-materialization-v1

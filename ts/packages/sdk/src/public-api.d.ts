@@ -4593,7 +4593,17 @@ export interface components {
         ShardConfig: {
             byte_range: components["schemas"]["ByteRange"];
         };
+        /** @description Immutable source embedding storage selected when creating a table. */
+        TableStorageSettings: {
+            /**
+             * @description Experimental vector_store mode requires a fresh local single-shard table without HA or replication.
+             * @default primary_lsm
+             * @enum {string}
+             */
+            dense_embeddings?: "primary_lsm" | "vector_store";
+        };
         CreateTableRequest: {
+            storage?: components["schemas"]["TableStorageSettings"];
             /**
              * Format: uint
              * @description Number of shards to create for the table. Data is partitioned across shards based on key ranges.
@@ -4744,6 +4754,7 @@ export interface components {
         /** @enum {string} */
         AntflyType: "search_as_you_type" | "keyword" | "text" | "html" | "numeric" | "datetime" | "boolean" | "link" | "geopoint" | "geoshape" | "embedding" | "blob";
         Table: {
+            storage?: components["schemas"]["TableStorageSettings"];
             name: string;
             /**
              * @description Optional description of the table.
@@ -5214,7 +5225,301 @@ export interface components {
             /** Format: uint64 */
             direct_bulk_ingest_fallback_below_threshold_count?: number;
         };
+        /** @description Source vector payload counters and the last completed reclamation observation. Counters reset on process reopen. */
+        VectorSourceStorageStatus: {
+            /** Format: int64 */
+            directory_publications?: number;
+            /** Format: int64 */
+            directory_publication_deferrals?: number;
+            /** Format: int64 */
+            outer_db_batch_lock_wait_ns?: number;
+            /**
+             * Format: int64
+             * @description Mark steps that yielded after their elapsed time budget.
+             */
+            collection_mark_budget_yields?: number;
+            /**
+             * Format: int64
+             * @description Concurrent scan attempts deferred to the active snapshot scanner.
+             */
+            collection_mark_busy_deferrals?: number;
+            /**
+             * Format: int64
+             * @description Snapshot marking time spent outside the source writer lock in nanoseconds.
+             */
+            collection_mark_outside_lock_ns?: number;
+            /**
+             * Format: int64
+             * @description Time merging bounded scan discoveries and concurrent preparation tails under the source writer lock.
+             */
+            collection_mark_merge_ns?: number;
+            /**
+             * Format: int64
+             * @description Longest scan tail merge under the source writer lock in nanoseconds.
+             */
+            collection_mark_max_merge_ns?: number;
+            /** Format: int64 */
+            collection_mark_steps?: number;
+            /** Format: int64 */
+            collection_mark_rows?: number;
+            /** Format: int64 */
+            collection_mark_max_step_rows?: number;
+            /** Format: int64 */
+            collection_mark_max_step_ns?: number;
+            /** Format: int64 */
+            collection_plan_ns?: number;
+            /**
+             * Format: int64
+             * @description Incomplete scan turns advanced without entering DB apply; metadata maintenance retains its own cadence.
+             */
+            collection_apply_visits_avoided?: number;
+            /**
+             * Format: int64
+             * @description Segment entries visited during full physical inventory scans or incremental updates; excludes WAL entries.
+             */
+            inventory_rows_scanned?: number;
+            /**
+             * Format: int64
+             * @description Logical immutable catalog bytes shared instead of copied by successful source snapshot and WAL-successor allocations; not resident bytes.
+             */
+            catalog_metadata_bytes_shared?: number;
+            /**
+             * Format: int64
+             * @description Immutable catalog array bytes copied by successful source snapshot and WAL-successor allocations; excludes object and root-path allocations.
+             */
+            catalog_metadata_bytes_copied?: number;
+            /**
+             * Format: int64
+             * @description WAL identities visited while maintaining the current occurrence cache, including foreground append deltas; resets when the cache is discarded.
+             */
+            inventory_wal_rows?: number;
+            /**
+             * Format: int64
+             * @description WAL identity contributions retired by checkpoint deltas; resets when the cache is discarded.
+             */
+            inventory_wal_retirements?: number;
+            /**
+             * Format: int64
+             * @description Inventory installations that used a validated WAL prefix delta; resets when the cache is discarded.
+             */
+            inventory_delta_installs?: number;
+            /**
+             * Format: int64
+             * @description Inventory installations that rebuilt WAL membership, including initialization; resets when the cache is discarded.
+             */
+            inventory_fallback_installs?: number;
+            /**
+             * Format: int64
+             * @description Changes between full and incremental physical inventory under the optional size cutoff.
+             */
+            inventory_policy_switches?: number;
+            /**
+             * Format: int64
+             * @description One when incremental physical inventory is currently enabled, otherwise zero.
+             */
+            inventory_incremental_active?: number;
+            /**
+             * Format: int64
+             * @description Current segment bitmap and offset allocation bytes; excludes pinned source metadata and WAL fallback maps.
+             */
+            mark_bitmap_bytes?: number;
+            /**
+             * Format: int64
+             * @description Current WAL-only reachability entries when bitmap marking is enabled, or all mark entries in the hash-map control.
+             */
+            mark_fallback_entries?: number;
+            /**
+             * Format: int64
+             * @description Background mark setups deferred by the optional obsolete-debt scheduling policy.
+             */
+            collection_debt_deferrals?: number;
+            /**
+             * Format: int64
+             * @description Conservative committed obsolete-payload scheduling debt; not a measurement of reclaimable bytes.
+             */
+            obsolete_payload_debt_bytes?: number;
+            /**
+             * Format: int64
+             * @description Full physical inventory scans and incremental occurrence-cache updates; this cache is not ownership authority.
+             */
+            inventory_updates?: number;
+            /**
+             * Format: int64
+             * @description Time spent on full physical inventory scans or incremental occurrence-cache updates.
+             */
+            inventory_update_ns?: number;
+            /**
+             * Format: int64
+             * @description Total time inside the source writer lock for collection entry points; includes nested stages.
+             */
+            collection_locked_ns?: number;
+            /**
+             * Format: int64
+             * @description Longest collection entry point hold of the source writer lock.
+             */
+            collection_max_locked_ns?: number;
+            /**
+             * Format: int64
+             * @description Collection setup time, including primary sync, checkpoint and snapshot acquisition.
+             */
+            collection_setup_ns?: number;
+            /**
+             * Format: int64
+             * @description Longest collection setup.
+             */
+            collection_max_setup_ns?: number;
+            /**
+             * Format: int64
+             * @description Longest locked collection planning step.
+             */
+            collection_max_plan_ns?: number;
+            /**
+             * Format: int64
+             * @description Locked collection copy time excluding final publication.
+             */
+            collection_copy_ns?: number;
+            /**
+             * Format: int64
+             * @description Longest locked collection copy step.
+             */
+            collection_max_copy_ns?: number;
+            /**
+             * Format: int64
+             * @description Locked publication time including directory refresh, inventory, receipts and reclamation.
+             */
+            collection_publish_ns?: number;
+            /**
+             * Format: int64
+             * @description Longest locked publication step.
+             */
+            collection_max_publish_ns?: number;
+            /**
+             * Format: int64
+             * @description Active scan turns scheduled using the experimental wall-time duty policy.
+             */
+            collection_active_scan_turns?: number;
+            /**
+             * Format: int64
+             * @description Requested pause time under the active scan policy; not measured CPU time.
+             */
+            collection_active_scan_pause_ns?: number;
+            /**
+             * Format: int64
+             * @description Protection requests merged into marking, including repeated requests across turns.
+             */
+            collection_rescued_payloads?: number;
+            /**
+             * Format: int64
+             * @description Durable payload preparations protected by marking without another append.
+             */
+            deduplicated_reappend_payloads?: number;
+            /**
+             * Format: int64
+             * @description Raw vector bytes avoided by protecting existing durable payloads during marking.
+             */
+            deduplicated_reappend_bytes?: number;
+            /** Format: int64 */
+            directory_bytes_written?: number;
+            /** Format: int64 */
+            directory_entries?: number;
+            /** Format: int64 */
+            directory_hits?: number;
+            /** Format: int64 */
+            directory_misses?: number;
+            /** Format: int64 */
+            source_segments?: number;
+            /** Format: int64 */
+            ownership_index_collections?: number;
+            /** Format: int64 */
+            ownership_index_entries_scanned?: number;
+            /** Format: int64 */
+            prepare_requests?: number;
+            /** Format: int64 */
+            prepare_lock_wait_ns?: number;
+            /** Format: int64 */
+            decode_outside_lock_ns?: number;
+            /** Format: int64 */
+            snapshot_read_ns?: number;
+            /** Format: int64 */
+            cache_reclaimed_bytes?: number;
+            /** Format: int64 */
+            retired_ann_references_skipped?: number;
+            /** Format: uint64 */
+            retained_payloads?: number;
+            /** Format: uint64 */
+            retained_payload_bytes?: number;
+            /** Format: uint64 */
+            unreferenced_payload_bytes_at_collection?: number;
+            /** Format: uint64 */
+            checkpoint_bytes_read?: number;
+            /** Format: uint64 */
+            checkpoint_bytes_written?: number;
+            /**
+             * Format: uint64
+             * @description Allocator-backed source-store state charged to the shared resource manager, excluding mmap pages and request-owned buffers.
+             */
+            heap_bytes?: number;
+            /** Format: int64 */
+            location_cache_hits?: number;
+            /** Format: int64 */
+            location_cache_misses?: number;
+            /** Format: int64 */
+            location_cache_bytes?: number;
+            /** Format: int64 */
+            source_shards?: number;
+            /** Format: int64 */
+            collection_steps?: number;
+            /** Format: int64 */
+            collection_pending_bytes?: number;
+            /** Format: int64 */
+            collection_mark_ns?: number;
+            /** Format: int64 */
+            checkpoint_receipt_hits?: number;
+            /** Format: int64 */
+            checkpoint_inventory_restores?: number;
+            /** Format: int64 */
+            checkpoint_receipt_bytes_written?: number;
+            /** Format: int64 */
+            prepare_batches?: number;
+            /** Format: int64 */
+            preparation_ns?: number;
+            /** Format: int64 */
+            durable_append_ns?: number;
+            /** Format: int64 */
+            checkpoint_ns?: number;
+            /** Format: uint64 */
+            prepared_payloads?: number;
+            /** Format: uint64 */
+            prepared_payload_bytes?: number;
+            /** Format: uint64 */
+            wal_bytes_written?: number;
+            /** Format: uint64 */
+            active_sessions?: number;
+            /** Format: uint64 */
+            resolved_payloads?: number;
+            /** Format: uint64 */
+            resolved_bytes?: number;
+            /** Format: uint64 */
+            active_wal_bytes?: number;
+            /** Format: uint64 */
+            immutable_block_bytes?: number;
+            /** Format: uint64 */
+            live_payloads_at_collection?: number;
+            /** Format: uint64 */
+            live_payload_bytes_at_collection?: number;
+            /** Format: uint64 */
+            collections?: number;
+            /** Format: uint64 */
+            collection_deferrals?: number;
+            /** Format: uint64 */
+            collection_bytes_read?: number;
+            /** Format: uint64 */
+            collection_bytes_written?: number;
+            /** Format: uint64 */
+            unresolved_primary_commits?: number;
+        };
         StorageStatus: {
+            source_vectors?: components["schemas"]["VectorSourceStorageStatus"];
             /**
              * Format: uint64
              * @description Disk usage in bytes.
@@ -10786,6 +11091,11 @@ export interface components {
             /** @description Whether all sources are settled but coverage remains unhealthy under the configured policy, including terminal failures or policy-rejected skips. */
             degraded: boolean;
         };
+        /**
+         * @description Conservative distributed rollout phase for native WAL-backed dense-index storage. native_authoritative is reported only when every expected shard has supplied current authority evidence.
+         * @enum {string}
+         */
+        DenseNativeStoragePhase: "legacy" | "native_building" | "native_validating" | "native_authoritative";
         /** @description Runtime state for the durable embeddings enrichment worker. */
         EnrichmentRuntimeStatus: {
             enabled: boolean;
@@ -10990,6 +11300,9 @@ export interface components {
             dense_replay_target_sequence?: number;
             /** @description Whether dense/vector artifacts still need publication before queries see the latest data. */
             dense_publish_pending?: boolean;
+            /** @description Whether the shared native exact-vector projection is still being built or reconciled. Queries remain correct by falling back to primary embedding artifacts while this is true. */
+            dense_vector_projection_pending?: boolean;
+            dense_native_storage_phase?: components["schemas"]["DenseNativeStoragePhase"];
             /** Format: uint64 */
             replay_applied_sequence?: number;
             /** Format: uint64 */

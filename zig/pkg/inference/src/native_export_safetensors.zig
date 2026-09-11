@@ -86,10 +86,6 @@ const Plan = struct {
 
 /// Write a caller-validated tensor access into a private staging path. Atomic
 /// publication and source identity belong to the owning artifact exporter.
-pub fn exportAccess(allocator: std.mem.Allocator, access: tensor_access_mod.TensorAccess, output_path: []const u8) !void {
-    return exportAccessWithMetadata(allocator, access, access, output_path, null);
-}
-
 pub fn exportAccessWithMetadata(allocator: std.mem.Allocator, metadata: tensor_access_mod.TensorAccess, values: tensor_access_mod.TensorAccess, output_path: []const u8, control: ?@import("execution_control.zig").InferenceExecutionControl) !void {
     var plan = try buildPlan(allocator, metadata);
     defer plan.deinit(allocator);

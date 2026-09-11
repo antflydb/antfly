@@ -1,404 +1,53 @@
-# GLiNER2.5 native training implementation contract
+# GLiNER2.5 native training contract
 
-GLiNER2.5 training is a separate qualification milestone from inference. The
-existing GLiNER2 span-grid objective and cached top-layer boundary trainer do not
-train the GLiNER2.5 boundary architecture. Native CPU encoder/head gradients,
-PEFT LoRA/DoRA math, optimizer accumulation and durable state now have focused
-reference evidence. A tiny complete mixed-task CPU training step also passed
-all four profiles with both zero dropout and source-matched explicit dropout
-masks, including durable mid-window restore. The native job/CLI/export path is
-implemented, with a real-small head-only integration probe, strict upstream
-reload, and a fresh supervised CPU CLI pause/resume with complete redirected
-stdout and exact final state/model agreement. All eight tiny Metal mixed-step profiles now match the pinned
-losses and gradients at unchanged tolerances. Separate resident optimizer and
-managed tiny full/head-only jobs prove updates and exact durable resume.
-Published-small CPU LoRA/DoRA jobs also pass two updates and exact partial
-resume for all 59 task-head Linear targets and, separately, all 131 encoder
-plus task-head Linear targets. Their standard adapters load with
-a separately pinned official PEFT 0.18.0 export profile, preserving every
-loaded parameter byte. The two all-131-target materialized FP32 artifacts also
-pass ten-task Zig CPU and Metal output/token comparisons against all three
-Python forms. This qualifies their artifact execution, not general training
-update behavior. The separate inactive-adapter correction now passes all eight
-tiny source profiles through NativeTrainer on CPU and Metal, including actual
-gradients, optimizer updates and durable resume. Separate production CPU and
-resident Metal CLI jobs now pass the five-row active/inactive classifier
-sequence for published small LoRA and DoRA, with three updates and
-byte-identical fresh-owner resume within each backend. All four final
-classifier-only adapters also pass exact 334-base/four-or-six-adapter tensor
-loading through pinned Fastino plus isolated PEFT 0.18.0 on CPU, then ten
-fixed requests each with complete process and private-copy cleanup. Published-source
-numerical VJPs, other target/backbone/rank jobs, convergence and release
-qualification remain open.
+The boundary architecture has its own native training path. It supports full,
+head-only, LoRA and DoRA modes, CPU or resident Metal execution, gradient
+accumulation, durable partial-window resume and portable model/adapter export.
+The legacy GLiNER2 span-grid trainer is a different objective.
 
 The reference is Fastino commit
-`3c913c7369301133d3b7699252074c4303ada50e`, with the Python, Torch, PEFT, tokenizer,
-and model-file identities recorded alongside each fixture or training run.
-Training accepts floating-point model weights. Quantized training is outside
-this milestone; quantizing an exported trained checkpoint requires a separate
-inference qualification pass.
+`3c913c7369301133d3b7699252074c4303ada50e`; source, dependency, model and fixture
+identities remain pinned. Training accepts floating-point source weights.
+Quantized training is excluded; reduced-precision inference after export needs
+separate qualification.
 
 Jobs default to `attention_profile: "materialized_v1"` and
 `activation_profile: "retained_v1"`. The independent opt-ins are
-`"replay_tiled_v1"` for attention and `"layer_recompute_v1"` for regional
-encoder activation replay. Both enter durable run identity and retain the
-job's bounded host, backend and combined admission. The
-[regional training guide](GLINER25_RECOMPUTED_TRAINING.md) describes the
-additional scratch, tape and optimizer reservations. Its v3 CPU checkpoint
-passes eight tiny regional source profiles and four retained controlled-dropout
-regressions. The later Metal-enabled checkpoint passes 43 selected tests,
-including the eight regional Step profiles on actual Metal, full/head-only
-NativeTrainer resume on both backends, and all eight inactive-adapter source
-profiles per backend with native-owned updates and durable resume.
-No published checkpoint has run the regional activation profile;
-the published results above use retained activations.
+`replay_tiled_v1` and `layer_recompute_v1`. Both enter durable run identity and
+retain bounded host, backend and combined admission. See the
+[regional training guide](GLINER25_RECOMPUTED_TRAINING.md) for replay ownership,
+work and scratch accounting.
 
-## Proved foundations
+## Reference coverage and limits
 
-These results use exact pinned source or library fixtures and bounded inputs;
-the real-small job uses four authored examples. Fixture identities are recorded
-in [the oracle contract](GLINER25_ORACLE.md).
+| Boundary | Retained verification |
+| --- | --- |
+| Targets, candidates and assignment | Strict mixed-task/Unicode packing, full declared schemas, detached gold injection and matching, retained gold-capacity failures. |
+| Losses and VJPs | Pinned Torch fixtures for boundary, classification, relation and record losses; empty/masked behavior and trainable-gradient presence. |
+| Complete training steps | [Full/head/LoRA/DoRA step fixtures](../zig/pkg/inference/scripts/gliner25/TRAIN_STEP_ORACLE.md) plus [controlled dropout](../zig/pkg/inference/scripts/gliner25/TRAIN_STEP_DROPOUT_ORACLE.md), including the exact semantic-pair/mask-transport contract. |
+| Inactive adapters | [Source fixtures](../zig/pkg/inference/scripts/gliner25/TRAINING_INACTIVE_ADAPTERS.md) distinguish absent gradients, optional-head zero touches and wholly inactive fallback; native consumers perform their own later updates and resume. |
+| Replay attention | [Actual-source forward and five-VJP oracle](../zig/pkg/inference/scripts/gliner25/TRAINING_ATTENTION_ORACLE.md), exact native counter masks and fixed numeric tolerances. |
+| Managed jobs | Cancellation/allocation failure, atomic optimizer transactions, epoch-end partial flushes, exact same-backend fresh-owner resume and explicit resource denial. |
+| Exports | [Complete tensor and PEFT checks](GLINER25_TRAINING_EXPORT.md), [native materialization](GLINER25_MERGE.md), and [trained-artifact execution](../zig/pkg/inference/scripts/gliner25/TRAINED_EXECUTION_CHECK.md). |
 
-| Component | Completed evidence | Remaining composition |
-| --- | --- | --- |
-| Losses, targets and detached decisions | Five loss tests, seven target tests, six selection tests and six matching tests passed, including 10 target, 42 selection and 18 matching oracle cases | Representative supervision/capacity qualification and published-model CPU/Metal composition |
-| DeBERTa encoder graph | Two tiny shapes, including padding and longer relative buckets, passed train/eval forward and all 38 parameter VJPs in training mode; repeated word/query/classification/relation routing and four structural/admission/replay/OOM checks passed | Evaluation-mode VJPs and real-checkpoint encoder/task composition |
-| Boundary and task graphs | All 11 graph tests passed: stage-one 9 outputs/46 parameter/3 input VJPs; shared pool 14/72/3; explicit spans 2/28/6; relations 6/12/2; dense records 18 parameter/3 input VJPs in all three modes | Published-model training/inference across all profiles and backends |
-| Dense record loss | All four tests and 10 actual batched loss/logit-gradient cases passed, including global denominators, masked columns and alternative occurrence mass | Representative record supervision/quality and published-model composition |
-| Retained staged execution | Three tests passed, including live relation selection after shared-pool scoring and allocation-failure cleanup; the tiny complete Metal step also passes | Published-model memory, cancellation and admission behavior |
-| LoRA/DoRA graph | Three tests passed, including 8 PEFT 0.17.1 train/eval/dropout cases, shared projection calls, and every adapter/magnitude/input VJP; tiny complete Metal losses/VJPs pass separately | Other ranks/target sets/variants and published-model Metal updates |
-| AdamW and checkpoint state | The CPU Torch fixture passed 3 parameters, 3 microbatches and 2 flushes, including clipping, partial-window correction and absent/zero gradients; mid-window resume, exact large counters and ordered epoch resume checks passed | Published-model/profile job lifecycle and recovery |
-| Resident Metal optimizer owner | Two actual GPU Controller tests passed unchanged CPU fixture tolerances for weights, both moments, counters and norms after both flushes; uninterrupted and fresh-owner resumed states match exactly. Wrong pins, stale identities, cancellation, busy bindings and failed partial host-state copy preserve the authoritative epoch | Published-model admission/update/recovery and managed adapter jobs |
-| Adapter artifacts | Three tests passed, including six variant/mode roundtrips, synthetic mathematical merge equality, identity/tamper/cancellation/OOM checks. The two small all-131-target materialized FP32 adapters pass ten-task Zig CPU/Metal execution against all three Python forms | Other artifacts/profiles and quality |
-| Complete tiny CPU mixed step | All four profiles passed with zero dropout and explicit masks at dropout 0.125: exact preprocessing/mention targets, every component loss, every trainable gradient's absence/zero/value, durable fresh-controller mid-window restore and two source AdamW flushes on native updated weights | Published-model/profile jobs and convergence |
-| Tiny inactive adapter CPU/Metal jobs | All eight tiny LoRA/DoRA source profiles passed through NativeTrainer on both CPU and actual Metal: exact tokens and gradient absence/zero, fallback objective, component losses and VJPs, native AdamW weights/moments/counters, and exact fresh-owner durable resume. The test-only fixture binds captured initial A/B/magnitude values before microbatch zero; every subsequent update is native | Other ranks/dropout settings and resource/quality qualification |
-| Published-small inactive classifier CPU CLI | Six production invocations passed: uninterrupted, pause-after-one and fresh resume for rank-2 LoRA/DoRA. The five ordered active/inactive rows produce three updates, exact fallback reports, independently reconstructed checkpoint/state hashes and byte-identical final results/checkpoints/all four export files | Published-source numerical VJP/quality comparison, other target families/backbones and long context |
-| Published-small inactive classifier Metal CLI | Six separate production invocations passed on strict resident Metal using the same frozen executable and authored recipe. All five microbatches/three updates, inactive zero-loss policy, raw terms and all-slot counters pass; fresh-owner resume matches uninterrupted progress semantics and final result/checkpoint/all four export-file bytes exactly. Source/binary pins, Controller/state hash reconstruction, complete resident admission and process cleanup pass | Published-source and CPU–Metal numerical gradients, other target families/backbones/ranks, long context, quality and performance |
-| Complete tiny Metal mixed step | Eight GPU tests passed: full/heads/LoRA/DoRA with zero and controlled dropout, all component losses and gradient absence/zero/value against pinned source and native references; exact semantic relation membership and backend-local controlled-dropout replay at unchanged numeric tolerances | These consumers bind captured initial/post-update weights; they do not prove GPU optimizer updates or resume by themselves |
-| Managed tiny Metal jobs | The five-row full/head-only regression passed six microbatches and four resident optimizer updates per mode, exact fresh-owner partial resume, shuffled batch order, classifier `None`, busy/cancel/OOM retry, scalar optimizer receipts and explicit host synchronization. A separate restored epoch-end flush admission/retry test passed before mutation | Published-model GPU jobs and GPU CLI, managed LoRA/DoRA updates and production resource/quality qualification |
-| Published source admission | All three original FP32 checkpoints passed exact five-file identities, complete 334-tensor inventory, native tokenizer loading and bounded immutable source ownership | Other model/profile job and trained-artifact qualification |
-| Real-small head-only job and export | Four microbatches/two updates, pause-after-one/resume and exact state/model equality passed. A persistent CLI run produced the same hashes; pinned Fastino strictly loaded all 334 export tensors and executed ten bounded task requests. A fresh supervised CPU CLI then repeated the paused/resumed job with identical final hashes and all six redirected stdout events preserved | Trained native/Python output parity, full/other-model jobs and held-out quality |
-| Real-small adapters | Separate 59-task-head and 131-encoder-plus-head CPU LoRA/DoRA jobs each completed four microbatches/two updates over two training rows. Fresh resume after microbatch one produced byte-identical final results, checkpoints and exports. Pinned Fastino plus isolated official PEFT 0.18.0 verified all 334 base tensors and all 118/177 or 262/393 adapter tensors, then executed ten requests per export. The all-131-target materialized artifacts additionally pass Zig CPU/Metal token/output parity | Broader inactive-adapter cases, task-head-only trained execution comparisons, other ranks/targets/variants, published GPU jobs and quality; PEFT 0.17.1's loader is incompatible with the `inside_weight` target |
-| Training command supervision | Six pure unit tests and eight process tests passed alongside the four existing server process tests. Single-worker ownership, exact argv/config binding, safe signal pauses, hard deadlines, parent-loss cleanup and immediate exit past blocking C shutdown handlers are covered. Three focused CLI tests passed for streaming output, config fingerprinting and allocation-failure cleanup | Actual-model signal/deadline recovery beyond the proved planned CPU pause; published-model GPU command qualification |
+Published-small local jobs exercised task-head and all-131-target CPU adapters,
+classifier-only CPU/Metal inactive batches, and all-target regional CPU
+LoRA/DoRA restart consistency. Those bounded authored recipes do not establish
+published-model PyTorch gradient equality, equality of training updates between
+backends, full-context numerics, useful trained quality or convergence. Published
+regional Metal and other backbone/rank/target combinations remain open.
 
-Six actual Metal primitive tests also passed without skips: physical i32
-values around `2^24` in a 64 MiB device buffer, repeated and negative
-gather/scatter indices, independently retained interpreter captures after source
-overwrite, no hidden activation downloads, and strict admission/allocation
-checks. These establish device primitives; the complete-step and managed-job
-evidence below is independently scoped.
+Same-backend resume requires exact state and output bytes. Cross-implementation
+losses, gradients and adapted arithmetic use their predeclared fixture
+tolerances; a byte-identical artifact reload is a separate property. Native
+random streams are deterministic across resume, not PyTorch RNG replicas.
 
-The expanded resident primitive suite subsequently passed all 13 tests on
-Metal. Three compiled Metal oracle tests then passed without skips: both
-encoder fixtures in train/eval forward, all 38 training parameter VJPs,
-repeated typed routing cotangents, and all eight pinned LoRA/DoRA cases with
-unchanged tolerances. The compiled programs do not read back activations before
-the numerical comparisons. The opt-in resident Session/staged integration then
-passed five actual GPU tests covering direct, two-stage and three-stage leased
-inputs, finite cotangents, stale-state/cancellation recovery and runtime-array
-allocation failures. The complete mixed-task Metal consumers subsequently
-passed all eight profile/dropout combinations. They bind captured initial or
-post-update parameter inputs for each of three microbatches, so their direct
-proof is forward/objective/gradient composition; GPU optimizer updates and
-resume are established by separate owner and managed-run tests.
-
-The complete-step consumer now distinguishes exact selected relation
-identities from cross-backend ranking order at nearly tied float32 products.
-It validates every pair and label through a bijection, checks all padding,
-and transports the captured relation hidden-dropout rows by pair identity
-before replay. Exact backend-local ordered decisions remain required on
-replay, and production ranking and retained input seals are unchanged. The
-[oracle contract](../zig/pkg/inference/scripts/gliner25/TRAIN_STEP_DROPOUT_ORACLE.md)
-documents the near-tie evidence and unchanged numeric tolerances. All eight
-corrected GPU comparisons passed. Cross-backend pair membership and labels are
-exact; bit-identical cross-backend ranking order is not claimed.
-
-The separate resident optimizer Controller then passed two actual GPU tests
-against the existing three-parameter AdamW fixture, without loosening the CPU
-tolerances. Both flushes match weights, first/second moments, parameter/global
-counters and clipping norms. Saving unfinished accumulation and restoring into
-a fresh GPU owner preserves the exact canonical state digest and produces the
-same final digest as uninterrupted execution. Submissions transfer scalar
-finite/norm summaries without generic host mirrors. Host mirrors remain
-uncertified after device updates and after cancellation during a partially
-completed readback; a complete checkpoint/diagnostic retry certifies them.
-Wrong run/state pins, stale update identity, cancellation and live binding
-leases preserve device handles and counters, followed by numerical state
-verification.
-
-The earlier hardware checkpoint completed successfully with **15 selected,
-15 passed, zero skips and zero leaks**. It includes all eight complete mixed
-Metal profiles, both resident optimizer Controller tests, the managed tiny
-full/head-only regression, restored epoch-end flush admission/retry, large
-budget arithmetic, job admission rejection, and preservation of two independent
-cancellation controls. The managed run keeps frozen tensors resident, consumes
-GPU VJPs directly, and checks scalar-only optimizer receipts. Host mirrors are
-synchronized explicitly for checkpoint/final state comparisons, never as a
-per-step side effect. Its full/head-only modes each use five authored rows over
-two epochs, six microbatches, two epoch-end partial flushes and four updates.
-The restored-flush admission regression separately uses one synthetic 2 MiB
-parameter; it does not execute a published encoder.
-
-| Checkpoint | Exact result | Log SHA-256 |
-| --- | --- | --- |
-| `/private/tmp/gliner25-managed-metal-integration-v3.log` | Process exit 0; 15/15 selected passed, no skips or leaks | `aa17d7b1439b18324f5caafb5aaf5e2c40492f6b8395aad153d6e94c5fcb39b2` |
-| `/private/tmp/gliner25-managed-metal-integration-v2.log` | First 30 tests passed, then the managed Metal test aborted on budget-arithmetic overflow; this process was not a suite pass | `710212ea307f40e6bb5a94eb949dd804a4452dd29a1eef4d7760b02cab2c44a2` |
-
-The earlier 30 successes cover eight optimizer transaction tests, six backend
-ownership tests, six native Controller regressions, two snapshot tests, five
-device-state tests, two GPU Controller tests and one native managed-run test.
-The overflow was corrected with shared full-width `usize` budget arithmetic;
-the successful v3 checkpoint includes its regression and the previously blocked
-managed GPU run. These are separate checkpoint results, not a claimed aggregate
-45-test pass. Earlier observer/fixture-path failures are superseded by the
-specific successful tests recorded here.
-
-Published-model GPU training beyond the separate classifier-only small jobs
-below, other-variant/rank jobs, and trained-artifact comparisons beyond the two
-small all-target merged files remain unqualified. No convergence,
-throughput, peak-RSS benchmark or production training qualification follows
-from these tiny fixtures. The separate supervised published-small CPU heads
-pause/resume is recorded in [the job evidence](GLINER25_TRAINING_JOB.md): binary
-SHA-256 `73695721460619998009dc6ea10e8cd436616c36897e1732d99cab57009d1c0f`,
-four total microbatches, two optimizer updates, exact earlier final state/model
-hashes, and all two paused plus four resumed stdout events. This used explicit
-256 MiB trainer-host and 128 MiB backend limits after the previous profile was
-denied by unchanged live-memory admission. The measured resumed allocator
-peaks were 155,626,435 and 63,338,112 bytes, respectively; these are not RSS.
-
-Separate published-small CPU task-head LoRA and DoRA jobs now completed under
-the same explicit 256 MiB host/128 MiB backend ceilings. Both use rank 2,
-alpha 4, adapter dropout zero, 59 task-head Linear modules, two training and
-two disjoint validation rows, and four microbatches/two updates. Every training
-row retained all six gold mentions and its one gold relation. Validation was
-preflight only. Each job paused after one microbatch and resumed into a new
-directory with identical final result, checkpoint and all exported file bytes;
-the redirected uninterrupted/pause/resume streams contain 5/2/4 events.
-Observed host/backend allocator peaks were 36,273,111/50,741,560 bytes for
-LoRA and 38,373,962/60,666,312 bytes for DoRA. These are bounded integration
-measurements, not RSS, performance results or encoder-adapter memory estimates.
-
-Strict upstream checks independently loaded all 334 frozen source tensors
-plus every one of the 118 LoRA or 177 DoRA tensors byte-exactly and ran the
-ten fixed extraction requests. The original PEFT 0.17.1 loader failed because
-its global adapter-name replacement corrupts the `inside_weight` module path.
-The official PEFT 0.18.0 export profile fixes this through its released loader,
-with exact wheel/file pins and a private import overlay. The training oracle
-remains pinned to PEFT 0.17.1. No target is omitted or renamed, and the original
-failure is retained. [Export evidence and commands](GLINER25_TRAINING_EXPORT.md)
-record both runtime profiles, job/resume digests and the unchanged numerical
-scope. Successful request execution does not imply useful predictions: the
-anchorless example and relation examples can have empty outputs.
-
-The public CPU training route also completed separate small-model LoRA/DoRA
-jobs for all 72 encoder and 59 task-head Linear modules. Both retained the
-same rank-2/alpha-4/zero-dropout settings, four microbatches and two updates,
-and passed exact final-result/checkpoint/export comparison after a fresh
-pause-after-one resume. Their 262/393-tensor exports then passed the same
-strict PEFT 0.18.0 load over all 334 source tensors and ten bounded requests.
-LoRA used explicit 128 MiB host/384 MiB backend ceilings and reached
-44,640,688/282,550,704 measured owner bytes. DoRA used 128/512 MiB and reached
-50,930,139/484,999,240 bytes. These limits cover the named owners; source,
-optimizer and other owners have separate admitted reservations. Smaller
-backend profiles returned resource denials before completing a step. The
-[all-target export evidence](GLINER25_TRAINING_EXPORT.md#complete-encoder-plus-head-jobs)
-records the executable, every artifact/receipt digest and failed-profile
-scope. Both all-target adapters subsequently passed native materialization and
-[the fixed-tolerance three-form merge checker](../zig/pkg/inference/scripts/gliner25/TRAINING_MERGE_CHECK.md): all 334 tensors, zero adapted violations, exact untouched/bias/sidecar
-bytes, and ten matching requests across unmerged PEFT, official PEFT merge
-and the Python-loaded native-produced artifact. A subsequent separate
-[trained-execution checker](../zig/pkg/inference/scripts/gliner25/TRAINED_EXECUTION_CHECK.md)
-passed Zig CPU and Metal for both all-target merged artifacts: 40 executed
-requests, 120 comparisons against the three Python forms and 20 CPU–Metal
-comparisons. Token IDs, selected outputs and source coordinates match exactly
-with the unchanged `5e-4` confidence bound. The independently rederived audit
-is `/private/tmp/antfly-gliner25-materialization-v1/trained-execution-validation-v1.json`,
-SHA-256 `ea3c2fb430d10d68fd5a0db0e5449ebae76008600698868147508db4f4e826eb`.
-The earlier `validation.json` remains the historical Python-only checkpoint.
-This inference proof does not establish update parity for arbitrary training
-batches. Exact receipts and resource observations are in
-[the merge evidence](GLINER25_MERGE.md#actual-small-all-target-materialization).
-
-NativeTrainer now preserves the pinned inactive-adapter behavior for
-heterogeneous data and narrow adapter targets. A loss without any trainable
-path is replaced by a zero term touching every selected parameter:
-classifier-only adapters on an entity-only batch therefore report zero loss
-and produce present zero gradients. Those rows still count in accumulation;
-AdamW applies weight/moment decay and advances slot/scheduler steps at a flush.
-Absent record/relation heads are already zero-touched by the model, so their
-reported frozen-task loss is retained. An absent classifier stays `None` when
-another selected path is live. Raw component terms remain available as model
-diagnostics; the submitted optimizer objective records the zero-loss fallback.
-The run fingerprint includes this semantic version so older checkpoints cannot
-silently resume under the changed rule. Cancellation, invalid inputs and
-allocation failures remain errors and cannot trigger the fallback.
-
-The separate [source fixtures](../zig/pkg/inference/scripts/gliner25/TRAINING_INACTIVE_ADAPTERS.md)
-cover LoRA and DoRA with classifier-only, record-only, relation-only and
-encoder-plus-classifier targets. The immutable control fixture flushes its
-classifier sequence at `[2,3,5]`, including an all-inactive two-row window after
-moments have been learned. A companion captures the ordinary five-row native
-epoch at `[2,4,5]`, with windows `[2,2,1]` and a final inactive partial flush.
-Both have byte-identical source repeats; their schedules are not interchangeable.
-The original control has a separate passing CPU optimizer consumer using
-captured gradients. That test proves optimizer handling, not native gradient
-generation.
-
-The companion now passes all eight profiles through the actual CPU and Metal
-NativeTrainer, from its versioned JSONL inputs through token preparation,
-forward/backward, accumulation and AdamW. This uses the source H=16,
-two-layer, vocabulary-192 baseline, rank 2, alpha 3 and dropout zero, with
-at most 128 encoded tokens. A compile-time test-only constructor validates the
-exact tiny base/adapter descriptors and copies captured initial A/B/magnitude
-values before microbatch zero, with zero optimizer counters and moments.
-Every later weight update is native; no source post-update values are injected.
-Production construction retains the published inventory checks and exposes
-no synthetic layout through options, JSON or environment variables.
-
-The consumer compares all eight prepared token/routing tensors exactly,
-gradient `None` versus present zero exactly, fallback flags/objectives,
-component losses and every live VJP. It compares weights, both moments,
-accumulated gradients and slot/global counters at every flush. Numerical
-checks use the existing complete-step tolerances; zeros and presence are
-exact. A fresh owner restores the durable checkpoint after the first
-microbatch and produces the same canonical final state as uninterrupted
-execution. A failing pre-update observer preserves the state and permits a
-retry without advancing the optimizer or cursor.
-
-The subsequent hardware checkpoint passed **17 selected tests, zero skips
-and zero leaks**, including the actual source NativeTrainer consumers and
-supplemental control consumers on both CPU and Metal, managed classifier-only
-LoRA/DoRA regressions on both backends, existing managed full/head jobs,
-forward-only gradient tapes and socket regressions. The source Metal consumer
-uses the same numerical tolerances as CPU, takes explicitly bounded gradient
-readbacks only for diagnostic comparisons, and performs the actual optimizer
-updates on resident tensors. Host state synchronization occurs explicitly at
-checkpoint/state comparisons. This is update/resume correctness evidence,
-not a GPU throughput or transfer-performance claim.
-
-| Checkpoint | Exact result | Log SHA-256 |
-| --- | --- | --- |
-| `/private/tmp/gliner25-source-socket-metal-v1.log` | Process exit 0; 17/17 selected passed, zero skips or leaks; all eight source profiles exercised by each actual CPU/Metal NativeTrainer consumer | `7960df3ce368de2937e397b819f4e5f239845287fa8b422ff7b3b8c3cbf8481b` |
-| `/private/tmp/gliner25-source-socket-cpu-v3.log` | Earlier individual CPU NativeTrainer/control and synthetic-descriptor tests passed; an unrelated socket MIME assertion failed, so this was not an aggregate suite pass | Earlier diagnostic checkpoint; superseded for these selected tests by the hardware run above |
-
-These synthetic CPU/Metal results do not qualify published-model inactive
-batches, long-context training, convergence or throughput. Earlier completed
-training recipes and trained-artifact execution receipts remain valid
-historical evidence with their original scope.
-
-The separate published-small classifier-only CPU recipe now passes through
-the ordinary production constructor and public CLI. The ReleaseFast binary is
-32,697,376 bytes, SHA-256
-`9f0d349efa3f33dd29b6c3dd26a12a8bcf2babf2bc78400c2b84d87d58d786f9`;
-its build receipt verifies all 2,753 recorded repository source files remained
-unchanged across compilation. Each mode uses the actual five-file small
-checkpoint/tokenizer, rank 2, alpha 3, adapter dropout zero and the published
-encoder/head dropout of 0.1. No synthetic layout or source parameter injection
-is used. The authored rows are active, inactive, active, inactive, inactive;
-one epoch with accumulation two flushes at `[2,4,5]` and completes five
-microbatches/three updates. Inactive optimizer losses are zero while positive
-raw frozen-task terms remain available. All four LoRA or six DoRA slots reach
-three Adam steps, including the final zero-gradient partial window.
-
-Uninterrupted, paused and fresh-owner resumed invocations all exit cleanly.
-Exact final result, checkpoint and all four exported file bytes agree after
-resume. The checker independently reconstructs the Controller fingerprint
-from the outer run digest, optimizer settings and ordered logical slot shapes,
-then reconstructs the owned-state SHA256 from weights, both moments, pending
-gradients, presence and counters. Source/config/binary identities remain exact.
-The [compact evidence ledger](../zig/pkg/inference/testdata/gliner25/published_inactive_classifier_cpu_v1/manifest.json)
-archives configuration, all six process/progress/result receipts, the build
-inventory, both checker revisions and final tensor-file digests.
-
-| Mode | Resume-validation SHA-256 | Largest host/backend owner bytes | Sampled child-tree RSS bytes |
-| --- | --- | --- | --- |
-| LoRA | `a0d46d07a1a1c8f55967c7193d5ec65c8117e523df5ac32edefa627c70336516` | 25,589,151 / 30,631,060 | 466,141,184 |
-| DoRA | `81106db7aaf6eac4512d367ee29ea96e33c061173a8de253ffce7986d70348fe` | 25,620,123 / 30,659,864 | 466,305,024 |
-
-The enforced trainer ceilings are 128 MiB each for host/backend and 1 GiB
-combined, with source/job/dataset owners separately charged by admission. The
-outer 2 GiB child-tree RSS guard samples every 50 ms using pinned psutil 7.1.3;
-shared pages can be counted twice, and the measurement is not device residency.
-The first paused CLI process already succeeded before its checker rejected
-declared-f32 serialization. Its original failure and helper bytes are retained;
-new offline evidence fixes only typed representations, the Controller hash
-contract and flattened checkpoint shapes, without rerunning or rewriting the
-job. Nineteen revised pure checker tests pass; the unchanged supervisor has
-eight prior lifetime passes. These are CPU job continuity and policy checks,
-separate from published-source numerical gradients, quality, throughput and
-the independently executed Metal jobs below.
-
-The same frozen executable now also passes six separate resident Metal CLI
-invocations for this classifier-only recipe. Original pauses and both fresh
-resume/uninterrupted pairs all exit zero with complete process ownership
-cleanup. Their final results, checkpoints and four export files match exactly
-within Metal; all five progress rows retain the expected fallback and raw-term
-behavior, and all selected slots reach three updates. Both final reports and
-the four continuation phase reports were independently reconstructed read-only
-from the original files, including exact Controller and owned-state hashes.
-The [Metal evidence ledger](../zig/pkg/inference/testdata/gliner25/published_inactive_classifier_metal_v1/manifest.json)
-preserves 86 source/config/helper/build/process/output files and the final
-tensor-file pins; it does not modify the earlier CPU ledger.
-
-| Mode | Metal resume-validation SHA-256 | Host / backend-metadata peak bytes | Resident admitted upper bound bytes | Largest sampled child-tree RSS bytes across all three phases |
-| --- | --- | --- | --- | --- |
-| LoRA | `93e7e83ca915bbcff5f1a45b5437f8cb00d24e3b69a9f71a140598d658e4b018` | 27,969,855 / 1,265,664 | 775,275,748 | 581,730,304 |
-| DoRA | `d723cb5b9be072e767885f9527cd3e631739c9905f642f149fd2e0d668fd7912` | 28,060,948 / 1,278,148 | 775,343,792 | 661,929,984 |
-
-This separate explicit profile admits 128 MiB host, 1 GiB backend including
-64 MiB metadata, and 2 GiB combined, with other owners separately charged and
-the live physical-memory guard unchanged. The outer sampled process-tree RSS
-ceiling is 3 GiB. Resident admission is a conservative allocation bound, not a
-measured device peak; metadata/host allocator peaks and process RSS remain
-separate. These jobs use the existing materialized training profile and do not
-qualify replay-tiled attention or activation recomputation. They prove
-same-backend policy and durable continuity, not published Fastino or CPU–Metal
-numerical gradients, broader target families, long context or convergence.
-
-The four classifier-only final exports subsequently passed the unchanged
-upstream export checker on CPU, including the two Metal-trained artifacts.
-Every original base tensor and all four/six adapter tensors loaded
-byte-exactly, matched the final checkpoint and separately resumed exports,
-and executed all ten fixed requests. Four bounded processes exited and were
-reaped with their private source/adapter/wheel copies removed. A separate
-[reload ledger](../zig/pkg/inference/testdata/gliner25/published_inactive_classifier_export_reload_v1/manifest.json)
-archives the complete reports, portable adapter bytes, supervised cleanup and
-unchanged input/helper pins. This is artifact interoperability; it adds no
-published CPU–Metal update equality or trained-quality claim.
-
-The [mixed-step oracle](../zig/pkg/inference/scripts/gliner25/TRAIN_STEP_ORACLE.md)
-now captures the actual pinned source model in all four training profiles with
-zero dropout, complete mixed-task supervision, three microbatches and two
-AdamW updates. Two captures are byte-identical, including an in-memory
-mid-window resume. Ordered schemas and original annotations let the native
-consumer prepare tokens and targets independently. All four native CPU
-consumers passed the composed forward, gradients and updates. A fresh native
-controller also restores weights, pending accumulators, moments, gradient
-presence and counters byte-exactly from a durable mid-window checkpoint,
-then matches both source optimizer updates. Native explicit dropout-mask
-admission rejects incomplete/unknown/duplicate/invalid sets, replays all
-gradients when a complete set is reordered, and changes the loss when a live
-marginal mask changes.
-
-The separate [controlled-dropout source capture](../zig/pkg/inference/scripts/gliner25/TRAIN_STEP_DROPOUT_ORACLE.md)
-completed all four profiles and a byte-identical repeat. All four native CPU
-consumers subsequently passed every component loss and gradient, durable
-fresh-controller restore, and both AdamW updates. This explicit-mask contract
-does not equate native and Torch random-number streams. Both composition
-fixtures are synthetic and do not establish real-model fine-tuning quality or
-convergence.
-
-The [four-row job fixture](../zig/pkg/inference/scripts/gliner25/TRAINING_JOB_FIXTURE.md)
-provides two training and two disjoint validation examples with one complete
-fixed schema. Its preparation is deterministic and uses no model. The subsequent
-real-small head-only native job and independent strict Fastino export load now
-have narrow integration evidence in [the job guide](GLINER25_TRAINING_JOB.md)
-and [export checker](../zig/pkg/inference/scripts/gliner25/TRAINING_EXPORT_CHECK.md).
-The same fixed data now has separate task-head and encoder-plus-head LoRA/DoRA job, exact resume and
-standard PEFT load evidence in [the adapter export guide](GLINER25_TRAINING_EXPORT.md).
-Held-out preflight runs no evaluation; representative quality, convergence
-and trained-output parity outside the specifically proved artifacts remain
-separate checks.
+The [job guide](GLINER25_TRAINING_JOB.md) defines executable configuration and
+limits. The [data guide](GLINER25_TRAINING_DATA.md) and
+[four-row preparation tool](../zig/pkg/inference/scripts/gliner25/TRAINING_JOB_FIXTURE.md)
+define immutable inputs. Validation-data preflight runs no evaluation.
+Campaign logs and copied source/binaries are external run artifacts under the
+[fixture policy](../zig/pkg/inference/testdata/gliner25/README.md).
 
 ## Implementation sequence
 

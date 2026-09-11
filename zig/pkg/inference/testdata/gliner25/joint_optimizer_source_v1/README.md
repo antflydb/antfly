@@ -42,11 +42,11 @@ Regenerate with CPython 3.12.3 to retain the captured interpreter identity:
 ```sh
 cd zig/pkg/inference/testdata/gliner25/joint_optimizer_source_v1
 PYTHONDONTWRITEBYTECODE=1 PYTHONHASHSEED=0 \
-  /private/tmp/antfly-gliner25-oracle-venv/bin/python capture.py \
-  --upstream /private/tmp/antfly-gliner25-upstream \
-  --output /private/tmp/gliner25-joint-source-regenerated.json
+  python3.12 capture.py \
+  --upstream /path/to/GLiNER2 \
+  --output /absolute/path/to/regenerated-capture.json
 PYTHONDONTWRITEBYTECODE=1 PYTHONHASHSEED=0 \
-  /private/tmp/antfly-gliner25-oracle-venv/bin/python -m unittest -v test_capture
+  python3.12 -m unittest -v test_capture
 ```
 
 The interpreter path supplies Python only; no installed ML package is used.
@@ -58,11 +58,11 @@ returns and is restored on success or error. No upstream methods are replaced.
 
 Bounds are nine cases, at most 32 nodes and 16 edges per case, beam width 32,
 15 seconds, and a 1 MiB result. Output creation fails if the destination exists.
-The source capture repeated byte-for-byte in fresh processes with Python hash
-seeds 0 and 123. Nine tests cover exact control results, source-pin rejection,
-forbidden imports, source-exception cleanup, and deterministic replay. Expected
-warnings describe the deliberately infeasible greedy derived-cycle case.
+The retained tests cover exact control results, source-pin rejection, forbidden
+imports, source-exception cleanup and deterministic replay. Expected warnings
+describe the deliberately infeasible greedy derived-cycle case.
 
-`checkpoint.json` binds the fixture, generator, contract, tests, logs, and fresh
-process repeat evidence. Native fixture consumption is validated separately;
-this source capture alone does not qualify native behavior or model accuracy.
+`capture.json` and `contract.json` retain the authoritative input, source and
+generator identities. Per-run logs and checkpoint/repeat receipts are external
+campaign output. Native fixture consumption is validated separately; this
+source capture alone does not qualify native behavior or model accuracy.

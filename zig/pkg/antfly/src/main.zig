@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const structlog = @import("structlog");
-const build_options = @import("build_options");
+const build_info = @import("build_info");
 const completion = @import("completion.zig");
 const runtime_bridge = @import("runtime_bridge.zig");
 const inference_process_supervisor = @import("antfly_platform").inference_process_supervisor;
@@ -264,7 +264,7 @@ fn printUsage(argv0: []const u8) void {
 }
 
 fn printVersion() void {
-    std.debug.print("antfly {s} (zig runtime)\n", .{build_options.antfly_version});
+    std.debug.print("antfly {s} (zig runtime)\n", .{build_info.version()});
 }
 
 test "main cmd compiles" {

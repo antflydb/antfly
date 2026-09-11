@@ -992,6 +992,7 @@ pub fn processRecordKeys(
 
 pub const ReresolveEnqueueResult = struct {
     queued: usize = 0,
+    sequence: u64 = 0,
     complete: bool = true,
     /// Last source-index marker key scanned; caller owns it and may persist it
     /// as the exclusive resume point for the next bounded marker-index window.
@@ -1345,12 +1346,13 @@ pub fn enqueueReresolveBacklogWindow(
         .{ .repair_complete = repair_resume_after == null };
     errdefer repair_result.deinit(gpa);
 
-    _ = try enqueueChangedArtifactKeys(&asset_keys, write_ctx, write_fn);
+    const sequence = try enqueueChangedArtifactKeys(&asset_keys, write_ctx, write_fn);
     const complete = source_index_complete and repair_result.repair_complete;
     const repair_cursor = repair_result.repair_resume_after;
     repair_result.repair_resume_after = null;
     return .{
         .queued = asset_keys.items.len,
+        .sequence = sequence,
         .complete = complete,
         .resume_after = collector.last_index_key,
         .repair_resume_after = repair_cursor,
@@ -1608,6 +1610,10 @@ pub const ResolutionRuntime = struct {
     target_sequence: std.atomic.Value(u64),
     shutdown_flag: std.atomic.Value(bool),
     catch_up_mutex: std.atomic.Mutex = .unlocked,
+    /// The catalog transaction owns durability; this flag is only a wake hint.
+    /// Catalog changes and cursor advancement share catch_up_mutex so an older
+    /// window cannot clear a newer configuration's restart cursor.
+    backfill_pending: std.atomic.Value(bool) = .init(false),
     worker_started: std.atomic.Value(bool),
     worker_mutex: Io.Mutex = .init,
     worker_cond: Io.Condition = .init,
@@ -1642,6 +1648,8 @@ pub const ResolutionRuntime = struct {
             .applied_sequence = .init(applied),
             .target_sequence = .init(applied),
             .shutdown_flag = .init(false),
+            .backfill_pending = .init((try hasReresolveCursor(&store_handle.store, resolver_catalog.reresolve_resume_key)) or
+                (try hasReresolveCursor(&store_handle.store, resolver_catalog.reresolve_repair_resume_key))),
             .worker_started = .init(false),
             .future = null,
         };
@@ -1666,14 +1674,22 @@ pub const ResolutionRuntime = struct {
         if (advanced) self.wakeWorker();
     }
 
+    /// Called while catalog mutation is serialized with catch-up. The catalog
+    /// already wrote both cursors atomically; never reacquire catch_up_mutex or
+    /// execute callbacks from the metadata refresh activity.
+    pub fn notifyBackfill(self: *ResolutionRuntime) void {
+        self.backfill_pending.store(true, .release);
+        self.wakeWorker();
+    }
+
     pub fn stats(self: *ResolutionRuntime) types.ReplayStageStats {
         const target = self.target_sequence.load(.acquire);
         const applied = self.applied_sequence.load(.acquire);
         return .{
-            .enabled = target > 0 or applied < target,
+            .enabled = target > 0 or applied < target or self.backfill_pending.load(.acquire),
             .target_sequence = target,
             .applied_sequence = applied,
-            .catch_up_required = applied < target,
+            .catch_up_required = applied < target or self.backfill_pending.load(.acquire),
         };
     }
 
@@ -1742,7 +1758,13 @@ pub const ResolutionRuntime = struct {
         while (true) {
             const target = self.target_sequence.load(.acquire);
             const applied = self.applied_sequence.load(.acquire);
-            if (applied >= target) return;
+            if (applied >= target) {
+                if (!self.backfill_pending.load(.acquire)) return;
+                var tick = try self.runReresolveBacklogWindowLocked();
+                tick.deinit(self.alloc);
+                if (single_window) return;
+                continue;
+            }
 
             const resolvers = try self.index_manager.listResolvers(self.alloc);
             defer {
@@ -1790,6 +1812,7 @@ pub const ResolutionRuntime = struct {
     pub fn requestReresolveBacklog(self: *ResolutionRuntime) !void {
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
+        defer self.notifyBackfill();
         const existing = try loadReresolveCursor(self.alloc, &self.store_handle.store, resolver_catalog.reresolve_resume_key);
         defer if (existing) |key| self.alloc.free(key);
         if (existing == null) {
@@ -1817,12 +1840,18 @@ pub const ResolutionRuntime = struct {
     pub fn runReresolveBacklogWindow(self: *ResolutionRuntime) !ReresolveEnqueueResult {
         lockMutex(&self.catch_up_mutex);
         defer self.catch_up_mutex.unlock();
+        return self.runReresolveBacklogWindowLocked();
+    }
 
+    fn runReresolveBacklogWindowLocked(self: *ResolutionRuntime) !ReresolveEnqueueResult {
         const resume_key_value = try loadReresolveCursor(self.alloc, &self.store_handle.store, resolver_catalog.reresolve_resume_key);
         defer if (resume_key_value) |key| self.alloc.free(key);
         const repair_resume_key_value = try loadReresolveCursor(self.alloc, &self.store_handle.store, resolver_catalog.reresolve_repair_resume_key);
         defer if (repair_resume_key_value) |key| self.alloc.free(key);
-        if (resume_key_value == null and repair_resume_key_value == null) return .{};
+        if (resume_key_value == null and repair_resume_key_value == null) {
+            self.backfill_pending.store(false, .release);
+            return .{};
+        }
 
         const resolvers = try self.index_manager.listResolvers(self.alloc);
         defer {
@@ -1832,6 +1861,7 @@ pub const ResolutionRuntime = struct {
         if (resolvers.len == 0) {
             try clearReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_resume_key);
             try clearReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_repair_resume_key);
+            self.backfill_pending.store(false, .release);
             return .{};
         }
 
@@ -1857,6 +1887,8 @@ pub const ResolutionRuntime = struct {
         } else if (result.repair_resume_after) |key| {
             try saveReresolveCursor(&self.store_handle.store, resolver_catalog.reresolve_repair_resume_key, key);
         }
+        if (result.sequence > 0) self.notifySequence(result.sequence);
+        self.backfill_pending.store(!result.complete, .release);
         return result;
     }
 
@@ -1889,7 +1921,8 @@ pub const ResolutionRuntime = struct {
 
     fn workerStep(self: *ResolutionRuntime) ?u64 {
         if (self.shutdown_flag.load(.acquire)) return null;
-        if (self.applied_sequence.load(.acquire) >= self.target_sequence.load(.acquire)) return null;
+        if (self.applied_sequence.load(.acquire) >= self.target_sequence.load(.acquire) and
+            !self.backfill_pending.load(.acquire)) return null;
         if (!self.catch_up_mutex.tryLock()) return 25;
         defer self.catch_up_mutex.unlock();
         self.catchUpLocked(true) catch |err| {

@@ -6,9 +6,7 @@ profiles on CPU and actual Metal, full/head-only NativeTrainer resume, and
 eight inactive-adapter NativeTrainer source profiles per backend with actual
 optimizer updates. A separately pinned published-small native CLI campaign
 also passes all-131-target LoRA/DoRA training and exact partial-window resume.
-The [fixture ledger](../zig/pkg/inference/testdata/gliner25/recomputed_training_execution_v1/manifest.json)
-and [published native ledger](../zig/pkg/inference/testdata/gliner25/recomputed_training_published_small_execution_v1/README.md)
-keep those scopes and source identities separate. Published regional Metal,
+Those fixture and published-artifact scopes remain separate. Published regional Metal,
 long-context numerical execution and the broader training matrix remain open;
 the public `runtime_available: false` gate is unchanged.
 
@@ -153,121 +151,37 @@ measured GPU operations, RSS or timing. Declared-limit failures remain distinct
 from backing allocator OOM; rejection/cancellation must leave optimizer state
 and retry ownership intact.
 
-## Completed evidence and limits
+## Verification scope and limits
 
-| Checkpoint | Result | Scope |
-| --- | --- | --- |
-| Core native v1 | Compile failed | Invalid assignment syntax; requested tests did not run. |
-| Core native v2 | 13 selected: 8 passed, 5 failed, 0 skips/leaks | Synthetic core fixture reached an unsupported resident instruction; recipe/head-wrapper tests passed. |
-| Core native v3 | 13 selected: 13 passed, 0 skips | Full-versus-regional synthetic gradients, shared cotangents, recipe identity, allocation/cancellation recovery and admission. |
-| Integration native v1 | Compile failed | Mutable-slice mismatch in the new merge test; requested tests did not run. |
-| Integration native v2 | 36 selected: 34 passed, 2 expected Metal skips | Regional head/merge/replay helpers, native/resident transaction contracts, exact native staging bounds, and tiny two-layer full/head-only NativeTrainer cancellation and partial resume. |
-| Integration native v3 | 63 selected: 61 passed, 2 expected Metal skips, 0 failures/leaks | Eight pinned-source regional CPU profiles, four retained controlled-dropout regressions, native full/head-only resume and bounded scratch/cache-hit/flush retry, and control/ownership regressions. |
-| Numeric-wire native v1 | Wrapper stopped before tests | Optional executable-argv inspection failed on transient compiler processes. Known child identities were gone, but cleanup inspection errors prevented complete cleanup proof. |
-| Integration Metal v1 | 43 selected: 43 passed, 0 skips/failures/leaks | Eight regional CPU and eight actual-Metal Step source cases; full/head-only NativeTrainer resume on both backends; all eight inactive-adapter NativeTrainer source profiles per backend with native-owned optimizer updates and resume; resource-wire/job and optimizer/control tests. |
+The retained tests compare regional and retained execution with shared
+parameter/cotangent handling, typed dropout replay, explicit admission,
+allocation failure and cancellation recovery. Tiny pinned-source full/head/
+LoRA/DoRA profiles cover CPU and resident Metal. Zero-dropout cases use tiled
+attention; supplied-mask cases retain materialized attention and its original
+mask semantics. Existing numerical tolerances remain unchanged.
 
-The NativeTrainer fixture uses five authored rows, hidden width 4, two encoder
-layers, batch size 2, two epochs and accumulation 2. Each mode completes six
-microbatches and four optimizer updates, including epoch-end partial flushes.
-Its dropout probabilities are zero. It explicitly uses 256 MiB host and backend
-caps, a 1 GiB combined cap, 32 MiB regional-plan and Step caps, and 16 MiB
-caller scratch. Source/dataset reservations remain separately counted.
-
-The separate v3 Step/Controller source consumers reuse the existing mixed-task
-fixtures. Full, heads, LoRA and DoRA each pass with zero dropout and
-`replay_tiled_v1` attention, then with explicit dropout at 0.125 and
-`materialized_v1` attention. The latter preserves the source's dense attention
-probability masks while replaying encoder and PEFT activations. Each case
-checks all loss terms, every trainable gradient including absence, three
-microbatches, two AdamW updates and a durable fresh-Controller mid-window
-restore at the unchanged fixture tolerances. Four retained/materialized
-controlled-dropout cases also pass. These v3 comparisons use CPU execution.
-Metal v1 reruns the eight regional CPU cases and adds the corresponding eight
-resident-Metal Step comparisons. Those GPU Step consumers bind captured
-initial/post-update weights; optimizer updates are proved separately.
-
-The Metal-enabled run also executes the tiny full/head-only NativeTrainer on
-CPU and Metal. Its separate inactive-adapter NativeTrainer source fixture
-covers LoRA and DoRA for classifier-only, encoder-plus-classifier, record-only
-and relation-only targets: eight profiles per backend. Each uses zero dropout,
-replay-tiled attention and regional activation recomputation, checks source
-tokens, objective terms, gradients and absence/zero semantics, performs actual
-native-owned optimizer updates, and compares uninterrupted execution with a
-fresh-owner durable partial-window restore. That fixture retains 128 MiB host,
-256 MiB backend and 512 MiB combined caps, with 32 MiB plan/Step and 16 MiB
-caller caps. Its captured initial adapter values are a test-only fixture;
-subsequent updates are native.
-
-The v3 result is bound to 30 named source files captured during the root
-agent's freeze. This is a partial relevant-source archive; exact test
-executable identity remains unrecorded and is not inferred from cache. Earlier
-core/v2 results do not acquire that later source identity. Caller scratch,
-restored-flush and watchdog-carrier tests belong to v3, while the subsequent
-default/resource-wire changes belong to the later Metal v1 snapshot.
-
-Metal v1 records a live owned test-process identity and the exact 52,470,600-byte
-test executable, SHA-256
-`f366f03f65ec494a00c3f385d7c182b324f2b3957469d4f8d007ff82e8918b83`.
-Its 2,544-file source inventory was unchanged; 38 relevant source files are
-copied in the repository ledger and the full recorded selection and executable
-are archived locally. This is not a complete external dependency closure.
-The bounded wrapper reported 602.390 seconds for compilation plus tests,
-2,544,402,432 bytes sampled peak child-tree RSS, and complete owned-process
-cleanup. Shared pages may be counted more than once; these figures are process
-evidence, not a training benchmark. The runner selected 43 tests; its `/75`
-progress denominator is not a test count.
-
-The earlier failed wrapper and its exact reconstructed source remain archived.
-The successful wrapper treats optional argv inspection errors separately from
-mandatory creation-identity, RSS and cleanup checks; the live executable
-receipt was captured independently. No product result is attributed to the
-failed attempt.
+Managed NativeTrainer tests perform actual later optimizer updates and
+fresh-owner partial-window resume. The inactive-adapter fixture initializes
+only captured adapter values through a test-only constructor; it does not copy
+source post-update state into the trainer. Absent, zero and active gradients
+retain distinct optimizer semantics.
 
 ## Published-small native campaign
 
-A separate production standalone CLI (`92a2816c…`, full identity in the
-[published ledger](../zig/pkg/inference/testdata/gliner25/recomputed_training_published_small_execution_v1/manifest.json))
-completed six phases: pause after one microbatch, fresh-owner resume, and an
-uninterrupted run for both rank-2 LoRA and DoRA. It used the original published
-small FP32 source, the ordinary initializer/inventory, all 131 encoder/task-head
-Linear targets, `replay_tiled_v1` attention and `layer_recompute_v1` activation
-recomputation. There was no synthetic-model or initial-state injection seam.
+Local all-131-target small LoRA/DoRA jobs also exercised the ordinary production
+constructor with both opt-in profiles. Each five-row epoch used accumulation
+two and compared pause-after-one/fresh resume with uninterrupted execution:
+final result, checkpoint and exported adapter bytes matched exactly. This is
+published native restart/artifact consistency, separate from source VJP parity.
 
-Each mode used five short authored rows, one epoch and accumulation two,
-completing five microbatches and three updates at rows 2, 4 and 5. Source dropout
-remained 0.1. The final result, checkpoint and all four adapter-export files
-match byte for byte between resumed and uninterrupted runs. The independent
-checker streamed the checkpoint and reconstructed Controller/state hashes,
-validating 262 LoRA or 393 DoRA slots and their exact per-slot counters. Encoder
-adapters remain active on rows without classification, so the global zero-loss
-fallback is false throughout this all-target campaign. This differs from the
-separately proved classifier-only fallback sequence.
+A restore-cap regression now reserves staged state and the actual immutable
+checkpoint before assigning the remaining transaction bytes to header parsing.
+It preserves the caller's caps and returns a typed denial when the full restore
+cannot fit; increasing memory limits is not part of the fix.
 
-| Mode | Largest trainer host allocation peak | Largest native backend allocation peak | Largest sampled child-tree RSS |
-| --- | ---: | ---: | ---: |
-| LoRA | 22,672,679 B | 21,976,220 B | 463,323,136 B |
-| DoRA | 32,805,432 B | 33,032,120 B | 486,211,584 B |
-
-Every phase admitted 2,354,931,717 bytes including separate source/dataset/job
-owners. Explicit host/backend/combined caps were 768 MiB / 1 GiB / 3 GiB, with
-32 MiB optimizer transaction, 128 MiB each regional-plan/Step, and 64 MiB caller
-scratch caps. The outer sampled tree cap remained 4 GiB. All six processes
-exited 0 with complete owned-child cleanup. Allocation peaks, reserved amounts
-and sampled RSS measure different things; these short runs are not a benchmark.
-
-The ledger also preserves v1's passing LoRA pause and clean
-`TrainingOptimizerLimitExceeded` resume failure. Its restore path charged the
-default 64 MiB parser ceiling against the whole 32 MiB transaction. V2 reserves
-staged state and the actual immutable checkpoint first, then clamps parser
-capacity to the remainder. Every v1/v2 memory cap stayed unchanged. Both frozen
-Controller sources, their exact diff, helper bytes and failure/success receipts
-are retained. The full binary and source archive remain external pinned
-artifacts; the repository carries compact receipts and selected source bytes.
-
-The source remains original FP32; this profile does not enable quantized
-training. This campaign proves native published-small restart/artifact
-consistency. Published regional Metal, published-model PyTorch gradient/update
-parity, full 512-token numerical execution, other backbone/mode combinations,
-memory/performance benchmarks, convergence and release qualification remain
-open. Existing retained-profile results are documented separately in
-[the training contract](GLINER25_TRAINING.md).
+Published regional Metal, published-model PyTorch gradient/update parity,
+full 512-token numerical training, other backbone/mode/rank combinations,
+memory/performance benchmarks and convergence remain open. Source weights stay
+FP32; quantized training and release qualification are excluded. Reusable
+fixtures remain in testdata; per-attempt logs, binaries and source copies are
+external artifacts under the [fixture policy](../zig/pkg/inference/testdata/gliner25/README.md).

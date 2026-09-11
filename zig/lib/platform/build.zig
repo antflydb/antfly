@@ -14,13 +14,14 @@
 
 const std = @import("std");
 const platform_build = @import("build_support.zig");
+pub const addNativeProcessTest = platform_build.addNativeProcessTest;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const link_libc = b.option(bool, "link_libc", "Link the platform module against libc") orelse true;
 
-    const platform = platform_build.addModule(b, "antfly_platform", .{
+    _ = platform_build.addModule(b, "antfly_platform", .{
         .root_source_file = b.path("src/root.zig"),
         .filesystem_capacity_source_file = b.path("src/filesystem_capacity.c"),
         .target = target,
@@ -28,54 +29,17 @@ pub fn build(b: *std.Build) void {
         .link_libc = link_libc,
     });
 
-    const supervisor = b.createModule(.{
-        .root_source_file = b.path("src/inference_process_supervisor.zig"),
+    const tests = platform_build.addTests(b, .{
+        .root = b.path("."),
         .target = target,
         .optimize = optimize,
         .link_libc = link_libc,
     });
-    const unit = b.addTest(.{ .root_module = supervisor });
     const test_step = b.step("test", "Run supervisor unit and process-lifecycle tests (Python 3 on POSIX)");
-    test_step.dependOn(&b.addRunArtifact(unit).step);
-    const one_shot = b.createModule(.{
-        .root_source_file = b.path("src/one_shot_process.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = link_libc,
-    });
-    const command_unit = b.addTest(.{ .root_module = one_shot });
+    test_step.dependOn(&tests.unit.step);
+    if (tests.process) |process| test_step.dependOn(process);
     const command_test_step = b.step("test-one-shot", "Run disposable command worker unit and process tests");
-    command_test_step.dependOn(&b.addRunArtifact(command_unit).step);
+    command_test_step.dependOn(&tests.one_shot_unit.step);
+    if (tests.one_shot_process) |process| command_test_step.dependOn(process);
     test_step.dependOn(command_test_step);
-    if (target.result.os.tag == .linux or target.result.os.tag == .macos) {
-        const fixture = b.addExecutable(.{
-            .name = "inference-supervisor-fixture",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("tests/inference_supervisor_fixture.zig"),
-                .target = target,
-                .optimize = optimize,
-                .link_libc = link_libc,
-                .imports = &.{.{ .name = "supervisor", .module = supervisor }},
-            }),
-        });
-        const integration = b.addSystemCommand(&.{"python3"});
-        integration.addFileArg(b.path("tests/test_inference_supervisor.py"));
-        integration.addArtifactArg(fixture);
-        test_step.dependOn(&integration.step);
-
-        const command_fixture = b.addExecutable(.{
-            .name = "one-shot-process-fixture",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("tests/one_shot_process_fixture.zig"),
-                .target = target,
-                .optimize = optimize,
-                .link_libc = link_libc,
-                .imports = &.{.{ .name = "platform", .module = platform }},
-            }),
-        });
-        const command_integration = b.addSystemCommand(&.{"python3"});
-        command_integration.addFileArg(b.path("tests/test_one_shot_process.py"));
-        command_integration.addArtifactArg(command_fixture);
-        command_test_step.dependOn(&command_integration.step);
-    }
 }

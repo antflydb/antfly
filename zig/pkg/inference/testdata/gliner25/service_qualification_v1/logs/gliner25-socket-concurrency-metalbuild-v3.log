@@ -1,4 +1,0 @@
-CUDA artifact source policy passes: /Users/timkaye/Documents/af/antfly/zig/pkg/inference/src/ops/cuda/artifacts/inference_cuda_kernels.cu (15 compiler-managed dev-only runtime-wired candidates included)
-quant kernel generated sources check: 67 files + Metal/CUDA runtime regions
-1/34 server.gliner_boundary_concurrency_test.test.gliner boundary socket pinned small concurrent admission rejection release and retry...OK
-1 selected; 1 passed; 0 skipped.

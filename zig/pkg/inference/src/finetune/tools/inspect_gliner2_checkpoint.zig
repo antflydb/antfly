@@ -13,54 +13,65 @@
 // limitations under the License.
 
 const std = @import("std");
-const finetune = @import("inference_internal").finetune.gliner2;
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-
-    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
-    defer args.deinit();
-    _ = args.next();
-
-    const model_input = args.next() orelse return usageError();
-    var lora_input: ?[]const u8 = null;
-    var out_path: ?[]const u8 = null;
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--out")) {
-            out_path = args.next() orelse return usageError();
-        } else if (lora_input == null) {
-            lora_input = arg;
-        } else {
-            return usageError();
-        }
-    }
-
-    var summary = try finetune.inspectCheckpoint(allocator, model_input, lora_input);
-    defer finetune.freeCheckpointInspection(allocator, &summary);
-
-    const io = init.io;
-    if (out_path) |path| {
-        if (std.fs.path.dirname(path)) |parent| {
-            if (parent.len > 0) try std.Io.Dir.cwd().createDirPath(io, parent);
-        }
-        const rendered = try std.json.Stringify.valueAlloc(allocator, summary, .{ .whitespace = .indent_2 });
-        defer allocator.free(rendered);
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = rendered });
-        return;
-    }
-    const stdout = std.Io.File.stdout();
-    var buf: [4096]u8 = undefined;
-    var writer = stdout.writer(io, &buf);
-    try std.json.Stringify.value(summary, .{ .whitespace = .indent_2 }, &writer.interface);
-    try writer.interface.writeByte('\n');
-    try writer.interface.flush();
+    return Command(@import("inference_finetune_assets")).main(init);
 }
 
-fn usageError() error{InvalidArguments} {
-    std.debug.print(
-        \\usage: inspect-gliner2-checkpoint <model_dir_or_model.safetensors> [lora_dir_or_checkpoint] [--out <report.json>]
-        \\example: inspect-gliner2-checkpoint /tmp/gliner2-base /tmp/gliner2-lora
-        \\
-    , .{});
-    return error.InvalidArguments;
+// Reuse the parser and implementation in the combined CLI without creating a
+// second instance of model/tensor types inside its inference module.
+pub fn Command(comptime assets: type) type {
+    return struct {
+        const finetune = assets.finetune.gliner2;
+
+        pub fn main(init: std.process.Init) !void {
+            const allocator = init.gpa;
+
+            var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+            defer args.deinit();
+            _ = args.next();
+
+            const model_input = args.next() orelse return usageError();
+            var lora_input: ?[]const u8 = null;
+            var out_path: ?[]const u8 = null;
+            while (args.next()) |arg| {
+                if (std.mem.eql(u8, arg, "--out")) {
+                    out_path = args.next() orelse return usageError();
+                } else if (lora_input == null) {
+                    lora_input = arg;
+                } else {
+                    return usageError();
+                }
+            }
+
+            var summary = try finetune.inspectCheckpoint(allocator, model_input, lora_input);
+            defer finetune.freeCheckpointInspection(allocator, &summary);
+
+            const io = init.io;
+            if (out_path) |path| {
+                if (std.fs.path.dirname(path)) |parent| {
+                    if (parent.len > 0) try std.Io.Dir.cwd().createDirPath(io, parent);
+                }
+                const rendered = try std.json.Stringify.valueAlloc(allocator, summary, .{ .whitespace = .indent_2 });
+                defer allocator.free(rendered);
+                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = rendered });
+                return;
+            }
+            const stdout = std.Io.File.stdout();
+            var buf: [4096]u8 = undefined;
+            var writer = stdout.writer(io, &buf);
+            try std.json.Stringify.value(summary, .{ .whitespace = .indent_2 }, &writer.interface);
+            try writer.interface.writeByte('\n');
+            try writer.interface.flush();
+        }
+
+        fn usageError() error{InvalidArguments} {
+            std.debug.print(
+                \\usage: inspect-gliner2-checkpoint <model_dir_or_model.safetensors> [lora_dir_or_checkpoint] [--out <report.json>]
+                \\example: inspect-gliner2-checkpoint /tmp/gliner2-base /tmp/gliner2-lora
+                \\
+            , .{});
+            return error.InvalidArguments;
+        }
+    };
 }

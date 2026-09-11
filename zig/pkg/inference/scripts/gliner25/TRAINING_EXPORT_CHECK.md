@@ -20,15 +20,10 @@ adapter keys and strict byte checks. `qualification`
 is always false. Four authored training rows or ten curated extraction requests
 cannot establish task quality or convergence.
 
-The separate published-small classifier-only CPU/Metal training artifacts
-now also pass four actual upstream CPU reloads with this unchanged checker:
-334 base tensors and four LoRA or six DoRA tensors byte-exact, then all ten
-requests per export. Complete process cleanup and unchanged input pins were
-independently rechecked. The
-[additive reload ledger](../../testdata/gliner25/published_inactive_classifier_export_reload_v1/manifest.json)
-archives the reports, portable adapter bytes and fixed supervisor/profile.
-This proves reload interoperability; it does not compare training gradients
-or updates between CPU and Metal, or establish useful trained quality.
+Reloads of Metal-trained adapters still execute on CPU in this checker.
+They test loaded artifacts; they do not compare training gradients or updates
+between CPU and Metal. Keep reports, process receipts and output copies outside
+the regression fixture tree.
 
 ## Static checks
 

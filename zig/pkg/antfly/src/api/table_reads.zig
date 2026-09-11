@@ -778,14 +778,19 @@ pub const ProvisionedTableReadCache = struct {
     pub fn beginExclusiveTableAccess(self: *ProvisionedTableReadCache, table_name: []const u8) !ExclusiveTableAccess {
         return self.beginExclusiveTableAccessWithDeadline(
             table_name,
-            platform_time.monotonicNs() +| exclusive_wait_timeout_ns,
+            self.threaded.io(),
+            Io.Clock.Timestamp.fromNow(self.threaded.io(), .{
+                .raw = .fromNanoseconds(exclusive_wait_timeout_ns),
+                .clock = .awake,
+            }),
         );
     }
 
     pub fn beginExclusiveTableAccessWithDeadline(
         self: *ProvisionedTableReadCache,
         table_name: []const u8,
-        deadline_ns: u64,
+        wait_io: Io,
+        deadline: Io.Clock.Timestamp,
     ) !ExclusiveTableAccess {
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
@@ -800,23 +805,25 @@ pub const ProvisionedTableReadCache = struct {
             gop.value_ptr.* = 0;
         }
         gop.value_ptr.* += 1;
+        errdefer {
+            self.releaseExclusiveTableAccessLocked(table_name);
+            self.ready.broadcast(io);
+        }
 
         self.bumpEpochLocked(table_name);
         self.removeEntriesForTableLocked(table_name);
         self.ready.broadcast(io);
-        const drain_started_ns = platform_time.monotonicNs();
+        const started = Io.Clock.Timestamp.now(wait_io, deadline.clock);
         while (self.hasPendingOpenForTableLocked(table_name) or
             self.hasTableLocked(table_name) or
             self.hasRetiredEntryForTableLocked(table_name))
         {
-            const now_ns = platform_time.monotonicNs();
-            const waited_ns = now_ns -| drain_started_ns;
-            if (now_ns >= deadline_ns) {
+            const now = Io.Clock.Timestamp.now(wait_io, deadline.clock);
+            const remaining_ns = now.durationTo(deadline).raw.toNanoseconds();
+            if (remaining_ns <= 0) {
                 const pending_opens = self.pendingOpenCountForTableLocked(table_name);
                 const retired_entries = self.retiredEntryCountForTableLocked(table_name);
                 const active_leases = self.activeLeaseCountForTableLocked(table_name);
-                self.releaseExclusiveTableAccessLocked(table_name);
-                self.ready.broadcast(io);
                 // The caller retains durable convergence ownership and may
                 // retry this bounded drain. Treat timeout as actionable
                 // repair pressure, not process corruption: strict test and
@@ -827,13 +834,16 @@ pub const ProvisionedTableReadCache = struct {
                     pending_opens,
                     retired_entries,
                     active_leases,
-                    @divTrunc(waited_ns, std.time.ns_per_ms),
+                    @divTrunc(started.durationTo(now).raw.toNanoseconds(), std.time.ns_per_ms),
                 });
                 return error.TableReadDrainTimeout;
             }
             self.mutex.unlock(io);
-            io.sleep(Io.Duration.fromNanoseconds(@min(exclusive_wait_poll_ns, deadline_ns - now_ns)), .awake) catch {};
+            // Cache synchronization retains its owner IO; only the wait and
+            // deadline borrow the caller's clock/cancellation authority.
+            const slept = wait_io.sleep(.fromNanoseconds(@min(exclusive_wait_poll_ns, remaining_ns)), deadline.clock);
             self.mutex.lockUncancelable(io);
+            try slept;
         }
         self.mutex.unlock(io);
 
@@ -2603,34 +2613,37 @@ pub const BoundTableReadSource = struct {
         const prepare_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
         try self.reads.reads.prepareSearchWithConsistency(self.reads.group_id, req, consistency);
         const prepare_ns = if (phase_profile) platform_time.monotonicNs() - prepare_start_ns else 0;
-        const snapshot_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
-        const snapshot_req = try self.db.searchRequestAtCurrentIdentityGeneration(req);
-        try checkQueryDeadline(snapshot_req);
-        const snapshot_ns = if (phase_profile) platform_time.monotonicNs() - snapshot_start_ns else 0;
-        var execution: LocalQueryExecution = .{ .request = snapshot_req, .result = undefined };
+        // The DB captures identity after entering its search lease and returns
+        // that token with the result. Sampling here first creates an avoidable
+        // writer race and causes the entire query to be replayed.
+        const snapshot_ns: u64 = 0;
+        var execution: LocalQueryExecution = .{ .request = req, .result = undefined };
         const search_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
-        if (profiledDenseQuery(snapshot_req)) |dense| {
-            const profiled = try self.db.searchDenseProfiled(alloc, dense.req, dense.query);
+        if (profiledDenseQuery(req)) |dense| {
+            const captured = try self.db.searchDenseProfiledWithCapturedRequest(alloc, dense.req, dense.query);
+            var response_req = req;
+            response_req.identity_read_generation = captured.request.identity_read_generation;
             execution = .{
-                .request = snapshot_req,
-                .result = profiled.result,
-                .dense_profile = mapDenseSearchProfile(profiled.profile),
+                .request = response_req,
+                .result = captured.profiled.result,
+                .dense_profile = mapDenseSearchProfile(captured.profiled.profile),
             };
-        } else if (snapshot_req.profile) {
-            const profiled = try self.db.searchWithDenseProfile(alloc, snapshot_req);
+        } else if (req.profile) {
+            const profiled = try self.db.searchWithDenseProfile(alloc, req);
             execution = .{
-                .request = snapshot_req,
+                .request = profiled.request,
                 .result = profiled.result,
                 .dense_profile = if (profiled.dense_profile) |profile| mapDenseSearchProfile(profile) else null,
             };
         } else {
+            const captured = try self.db.searchWithCapturedRequest(alloc, req);
             execution = .{
-                .request = snapshot_req,
-                .result = try self.db.search(alloc, snapshot_req),
+                .request = captured.request,
+                .result = captured.result,
             };
         }
         const search_ns = if (phase_profile) platform_time.monotonicNs() - search_start_ns else 0;
-        try checkQueryDeadline(snapshot_req);
+        try checkQueryDeadline(execution.request);
         var result = execution.result;
         defer result.deinit();
         const response_req = execution.request;
@@ -10945,9 +10958,22 @@ fn mapDenseSearchProfile(profile: db_query_search.DenseSearchProfile) query_api.
         .index_lookup_ns = profile.index_lookup_ns,
         .hbc_search_ns = profile.hbc_search_ns,
         .hbc_runtime_txn_ns = profile.hbc_runtime_txn_ns,
+        .hbc_admission_wait_ns = profile.hbc_admission_wait_ns,
+        .hbc_scan_admission_wait_ns = profile.hbc_scan_admission_wait_ns,
+        .hbc_rerank_admission_wait_ns = profile.hbc_rerank_admission_wait_ns,
+        .hbc_admission_estimated_scan_bytes = profile.hbc_admission_estimated_scan_bytes,
+        .hbc_admission_selected_scan_bytes = profile.hbc_admission_selected_scan_bytes,
+        .hbc_admission_peak_reserved_bytes = profile.hbc_admission_peak_reserved_bytes,
+        .hbc_admission_reservations = profile.hbc_admission_reservations,
+        .hbc_admission_fallback_leaves = profile.hbc_admission_fallback_leaves,
+        .hbc_leaf_scan_bytes = profile.hbc_leaf_scan_bytes,
+        .hbc_native_leaf_lookup_ns = profile.hbc_native_leaf_lookup_ns,
+        .hbc_projection_completion_ns = profile.hbc_projection_completion_ns,
         .hbc_scratch_acquire_ns = profile.hbc_scratch_acquire_ns,
         .hbc_node_cache_lookup_ns = profile.hbc_node_cache_lookup_ns,
         .hbc_quantized_cache_lookup_ns = profile.hbc_quantized_cache_lookup_ns,
+        .hbc_child_expand_ns = profile.hbc_child_expand_ns,
+        .hbc_leaf_score_ns = profile.hbc_leaf_score_ns,
         .hbc_filter_candidates = profile.hbc_filter_candidates,
         .hbc_filter_rejected = profile.hbc_filter_rejected,
         .hbc_filter_metadata_batches = profile.hbc_filter_metadata_batches,
@@ -10958,6 +10984,11 @@ fn mapDenseSearchProfile(profile: db_query_search.DenseSearchProfile) query_api.
         .hbc_traversal_bound_resolutions = profile.hbc_traversal_bound_resolutions,
         .hbc_traversal_bound_fallbacks = profile.hbc_traversal_bound_fallbacks,
         .hbc_traversal_bound_stops = profile.hbc_traversal_bound_stops,
+        .hbc_traversal_bound_unresolved_frontier = profile.hbc_traversal_bound_unresolved_frontier,
+        .hbc_traversal_bound_incomplete_topk = profile.hbc_traversal_bound_incomplete_topk,
+        .hbc_traversal_bound_overlap = profile.hbc_traversal_bound_overlap,
+        .hbc_traversal_unresolved_posting_bounds = profile.hbc_traversal_unresolved_posting_bounds,
+        .hbc_traversal_incomplete_routing_directory = profile.hbc_traversal_incomplete_routing_directory,
         .hbc_traversal_frontier_remaining = profile.hbc_traversal_frontier_remaining,
         .hbc_traversal_eligible_vectors = profile.hbc_traversal_eligible_vectors,
         .hbc_traversal_stop_lower_bound = profile.hbc_traversal_stop_lower_bound,
@@ -10993,6 +11024,14 @@ fn mapDenseSearchProfile(profile: db_query_search.DenseSearchProfile) query_api.
         .hbc_leaves_explored = profile.hbc_leaves_explored,
         .hbc_approx_vectors_scored = profile.hbc_approx_vectors_scored,
         .hbc_exact_vectors_scored = profile.hbc_exact_vectors_scored,
+        .hbc_leaf_payload_stale = profile.hbc_leaf_payload_stale,
+        .hbc_leaf_payload_missing = profile.hbc_leaf_payload_missing,
+        .hbc_native_leaf_scan_hits = profile.hbc_native_leaf_scan_hits,
+        .hbc_subgroup_leaves_scored = profile.hbc_subgroup_leaves_scored,
+        .hbc_subgroup_vectors_skipped = profile.hbc_subgroup_vectors_skipped,
+        .hbc_subgroup_compact_groups_scored = profile.hbc_subgroup_compact_groups_scored,
+        .hbc_subgroup_routing_ns = profile.hbc_subgroup_routing_ns,
+        .hbc_native_leaf_scan_fallbacks = profile.hbc_native_leaf_scan_fallbacks,
         .hbc_reranked_vectors = profile.hbc_reranked_vectors,
         .hbc_approx_candidate_count = profile.hbc_approx_candidate_count,
         .hbc_rerank_candidate_count = profile.hbc_rerank_candidate_count,
@@ -11033,6 +11072,17 @@ fn mapDenseSearchProfile(profile: db_query_search.DenseSearchProfile) query_api.
         .hbc_rerank_artifact_distance_ns = profile.hbc_rerank_artifact_distance_ns,
         .hbc_rerank_lsm_cache_hits = profile.hbc_rerank_lsm_cache_hits,
         .hbc_rerank_lsm_cache_misses = profile.hbc_rerank_lsm_cache_misses,
+        .hbc_rerank_vector_block_hits = profile.hbc_rerank_vector_block_hits,
+        .hbc_rerank_vector_projection_reads = profile.hbc_rerank_vector_projection_reads,
+        .hbc_rerank_vector_projection_borrows = profile.hbc_rerank_vector_projection_borrows,
+        .hbc_rerank_vector_projection_bytes = profile.hbc_rerank_vector_projection_bytes,
+        .hbc_rerank_vector_residual_reads = profile.hbc_rerank_vector_residual_reads,
+        .hbc_rerank_vector_residual_bytes = profile.hbc_rerank_vector_residual_bytes,
+        .hbc_rerank_vector_physical_reads = profile.hbc_rerank_vector_physical_reads,
+        .hbc_rerank_vector_physical_bytes = profile.hbc_rerank_vector_physical_bytes,
+        .hbc_rerank_vector_location_reuses = profile.hbc_rerank_vector_location_reuses,
+        .hbc_rerank_vector_block_misses = profile.hbc_rerank_vector_block_misses,
+        .hbc_rerank_vector_block_fallbacks = profile.hbc_rerank_vector_block_fallbacks,
         .hbc_rerank_artifact_cache_hits = profile.hbc_rerank_artifact_cache_hits,
         .hbc_rerank_artifact_vectors_loaded = profile.hbc_rerank_artifact_vectors_loaded,
         .hbc_rerank_distance_ns = profile.hbc_rerank_distance_ns,
@@ -11130,6 +11180,13 @@ test "profiled composed dense query preserves exact route telemetry" {
         .hbc_rerank_metadata_vectors_loaded = 9,
         .hbc_rerank_artifact_cache_hits = 4,
         .hbc_rerank_artifact_vectors_loaded = 9,
+        .hbc_admission_estimated_scan_bytes = 1024,
+        .hbc_admission_selected_scan_bytes = 72,
+        .hbc_rerank_admission_wait_ns = 91,
+        .hbc_admission_peak_reserved_bytes = 80,
+        .hbc_admission_reservations = 2,
+        .hbc_admission_fallback_leaves = 1,
+        .hbc_leaf_scan_bytes = 64,
     });
     try std.testing.expectEqualStrings("exact_native_filter", public.search_route);
     try std.testing.expectEqual(@as(u64, 123), public.route_estimated_exact_storage_bytes);
@@ -11144,6 +11201,13 @@ test "profiled composed dense query preserves exact route telemetry" {
     try std.testing.expectEqual(@as(u64, 9), public.hbc_rerank_metadata_vectors_loaded);
     try std.testing.expectEqual(@as(u64, 4), public.hbc_rerank_artifact_cache_hits);
     try std.testing.expectEqual(@as(u64, 9), public.hbc_rerank_artifact_vectors_loaded);
+    try std.testing.expectEqual(@as(u64, 1024), public.hbc_admission_estimated_scan_bytes);
+    try std.testing.expectEqual(@as(u64, 72), public.hbc_admission_selected_scan_bytes);
+    try std.testing.expectEqual(@as(u64, 91), public.hbc_rerank_admission_wait_ns);
+    try std.testing.expectEqual(@as(u64, 80), public.hbc_admission_peak_reserved_bytes);
+    try std.testing.expectEqual(@as(u64, 2), public.hbc_admission_reservations);
+    try std.testing.expectEqual(@as(u64, 1), public.hbc_admission_fallback_leaves);
+    try std.testing.expectEqual(@as(u64, 64), public.hbc_leaf_scan_bytes);
 }
 
 fn readPreparationKindForQuery(req: db_mod.types.SearchRequest) ReadPreparation.Kind {
@@ -11230,28 +11294,30 @@ fn queryDbDetailed(
     const db = owner.db();
     var reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
     try reads.reads.prepareSearchWithConsistency(group_id, req, consistency);
-    const snapshot_req = try db.searchRequestAtCurrentIdentityGeneration(req);
-    if (profiledDenseQuery(snapshot_req)) |dense| {
-        const profiled = try db.searchDenseProfiled(alloc, dense.req, dense.query);
+    if (profiledDenseQuery(req)) |dense| {
+        const captured = try db.searchDenseProfiledWithCapturedRequest(alloc, dense.req, dense.query);
+        var response_req = req;
+        response_req.identity_read_generation = captured.request.identity_read_generation;
         return .{
-            .request = snapshot_req,
-            .result = profiled.result,
-            .dense_profile = mapDenseSearchProfile(profiled.profile),
+            .request = response_req,
+            .result = captured.profiled.result,
+            .dense_profile = mapDenseSearchProfile(captured.profiled.profile),
             .db_owner = owner,
         };
     }
-    if (snapshot_req.profile) {
-        const profiled = try db.searchWithDenseProfile(alloc, snapshot_req);
+    if (req.profile) {
+        const profiled = try db.searchWithDenseProfile(alloc, req);
         return .{
-            .request = snapshot_req,
+            .request = profiled.request,
             .result = profiled.result,
             .dense_profile = if (profiled.dense_profile) |profile| mapDenseSearchProfile(profile) else null,
             .db_owner = owner,
         };
     }
+    const captured = try db.searchWithCapturedRequest(alloc, req);
     return .{
-        .request = snapshot_req,
-        .result = try db.search(alloc, snapshot_req),
+        .request = captured.request,
+        .result = captured.result,
         .db_owner = owner,
     };
 }
@@ -31110,9 +31176,45 @@ test "provisioned read cache exclusive access drains active read leases" {
         error.TableReadDrainTimeout,
         cache.beginExclusiveTableAccessWithDeadline(
             "docs",
-            platform_time.monotonicNs() + 5 * std.time.ns_per_ms,
+            std.testing.io,
+            Io.Clock.Timestamp.fromNow(std.testing.io, .{ .raw = .fromMilliseconds(5), .clock = .awake }),
         ),
     );
+    try std.testing.expect(!cache.hasExclusiveTableAccessLocked("docs"));
+
+    const Clock = struct {
+        threadlocal var active: ?*@This() = null;
+        elapsed_ns: i96 = 17,
+        sleeps: usize = 0,
+        cancel: bool = false,
+
+        fn now(_: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
+            std.debug.assert(clock == .awake);
+            return .fromNanoseconds(active.?.elapsed_ns);
+        }
+
+        fn sleep(_: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
+            const self = active.?;
+            self.sleeps += 1;
+            if (self.cancel) return error.Canceled;
+            self.elapsed_ns += timeout.duration.raw.toNanoseconds();
+        }
+    };
+    var clock: Clock = .{};
+    Clock.active = &clock;
+    defer Clock.active = null;
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = Clock.now;
+    vtable.sleep = Clock.sleep;
+    const wait_io: Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    const deadline = Io.Clock.Timestamp.fromNow(wait_io, .{ .raw = .fromMicroseconds(62500), .clock = .awake });
+    try std.testing.expectError(error.TableReadDrainTimeout, cache.beginExclusiveTableAccessWithDeadline("docs", wait_io, deadline));
+    try std.testing.expectEqual(@as(i96, 17 + 62500 * std.time.ns_per_us), clock.elapsed_ns);
+    try std.testing.expectEqual(@as(usize, 3), clock.sleeps);
+    try std.testing.expect(!cache.hasExclusiveTableAccessLocked("docs"));
+    clock = .{ .cancel = true };
+    try std.testing.expectError(error.Canceled, cache.beginExclusiveTableAccessWithDeadline("docs", wait_io, deadline));
+    try std.testing.expectEqual(@as(usize, 1), clock.sleeps);
     try std.testing.expect(!cache.hasExclusiveTableAccessLocked("docs"));
 
     var ctx = ExclusiveThread{ .cache = &cache };

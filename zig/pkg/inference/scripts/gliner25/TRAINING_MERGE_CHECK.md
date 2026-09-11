@@ -66,7 +66,7 @@ paths illustrate a small LoRA check; substitute the actual completed merge
 paths from its receipt.
 
 ```sh
-GLINER25_CHECKER=/Users/timkaye/Documents/af/antfly/zig/pkg/inference/scripts/gliner25/check_training_merge.py
+GLINER25_CHECKER=zig/pkg/inference/scripts/gliner25/check_training_merge.py
 GLINER25_ADAPTER_RUN=/private/tmp/antfly-gliner25-training-runtime-artifact-v1/lora-all-host128-backend384-uninterrupted
 GLINER25_MERGE_JOB=/absolute/path/lora-all-merge.json
 GLINER25_MERGED_MODEL=/absolute/path/lora-all-merged
@@ -156,6 +156,6 @@ other variants/ranks, quality and release qualification remain separate.
 
 ```sh
 python3 -m unittest discover \
-  -s /Users/timkaye/Documents/af/antfly/zig/pkg/inference/scripts/gliner25 \
+  -s zig/pkg/inference/scripts/gliner25 \
   -p 'test_*.py' -v
 ```

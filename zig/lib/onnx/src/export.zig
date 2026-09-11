@@ -22,8 +22,7 @@
 
 const std = @import("std");
 const ml = @import("ml");
-const message = @import("protobuf").message;
-const proto = @import("proto.zig");
+const proto = @import("onnx_data").proto;
 
 const Allocator = std.mem.Allocator;
 
@@ -56,9 +55,7 @@ const DataType = proto.DataType;
 // thin wrapper that hands the assembled struct to the runtime encoder.
 
 /// Serialize a ModelProto to protobuf bytes.
-pub fn serializeModel(alloc: Allocator, model: *const ModelProto) ![]u8 {
-    return message.encode(ModelProto, alloc, model);
-}
+pub const serializeModel = @import("onnx_data").serializeModel;
 
 // ── Graph IR → ONNX Proto ───────────────────────────────────────────
 

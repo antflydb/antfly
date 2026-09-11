@@ -127,12 +127,12 @@ PYTHONDONTWRITEBYTECODE=1 "$GLINER25_PYTHON" "$GLINER25_RUNNER" aggregate \
 ```
 
 Build once through the complete repository graph from `zig/`:
-`zig build inference-gliner25-bundle-check-build -Dmetal=true -Dcuda=false -j1`.
-The delegated build makes the entire dependency graph ReleaseFast. On a CPU
+`zig build inference-gliner25-bundle-check-build -Doptimize=ReleaseFast -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -j1`.
+These explicit flags make the entire shared dependency graph ReleaseFast. On a CPU
 host use `-Dmetal=false`; that binary cannot qualify Metal.
 
 For native shards use the same `run-shard` arguments with `--backend native`,
-`--binary zig/pkg/inference/zig-out/bin/antfly-inference-gliner25-bundle-check`,
+`--binary zig/zig-out/bin/antfly-inference-gliner25-bundle-check`,
 and `--source-reference-report /private/tmp/massive-multi-zh-char-python/report.json`.
 Aggregate those reports with that same source-reference option. `--model-dir`
 may point to original FP32 or an admitted converted bundle. Actual source

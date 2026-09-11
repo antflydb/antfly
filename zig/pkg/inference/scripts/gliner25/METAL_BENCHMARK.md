@@ -65,15 +65,20 @@ Build through the repository graph, from the zig directory:
 
     zig build inference-bench-gliner25-metal-build -Doptimize=ReleaseFast -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -j1
 
+These explicit flags configure the entire shared dependency graph. The worker
+rejects other optimization/backend profiles. The root build installs to
+`zig/zig-out/bin/`; a standalone build from `zig/pkg/inference/` uses
+`bench-gliner25-metal-build` and the package-local `zig-out/bin/`.
+
 Use the pinned oracle environment and existing model directories. The runner
 does not install dependencies or download checkpoints. Run a bounded smoke
 from the repository root into a new output directory:
 
-    PYTHONDONTWRITEBYTECODE=1 /private/tmp/antfly-gliner25-oracle-venv/bin/python zig/pkg/inference/scripts/gliner25/benchmark_metal.py --native-bin zig/pkg/inference/zig-out/bin/antfly-inference-gliner25-metal-bench --model-root /private/tmp/antfly-gliner25-models --upstream /private/tmp/antfly-gliner25-upstream --model small --baseline both --cases mixed_tasks --repetitions 1 --warmup 1 --pairs 2 --output /private/tmp/gliner25-metal-smoke
+    PYTHONDONTWRITEBYTECODE=1 /private/tmp/antfly-gliner25-oracle-venv/bin/python zig/pkg/inference/scripts/gliner25/benchmark_metal.py --native-bin zig/zig-out/bin/antfly-inference-gliner25-metal-bench --model-root /private/tmp/antfly-gliner25-models --upstream /private/tmp/antfly-gliner25-upstream --model small --baseline both --cases mixed_tasks --repetitions 1 --warmup 1 --pairs 2 --output /private/tmp/gliner25-metal-smoke
 
 For the full campaign:
 
-    PYTHONDONTWRITEBYTECODE=1 /private/tmp/antfly-gliner25-oracle-venv/bin/python zig/pkg/inference/scripts/gliner25/benchmark_metal.py --native-bin zig/pkg/inference/zig-out/bin/antfly-inference-gliner25-metal-bench --model-root /private/tmp/antfly-gliner25-models --upstream /private/tmp/antfly-gliner25-upstream --output /private/tmp/gliner25-metal-all-tasks
+    PYTHONDONTWRITEBYTECODE=1 /private/tmp/antfly-gliner25-oracle-venv/bin/python zig/pkg/inference/scripts/gliner25/benchmark_metal.py --native-bin zig/zig-out/bin/antfly-inference-gliner25-metal-bench --model-root /private/tmp/antfly-gliner25-models --upstream /private/tmp/antfly-gliner25-upstream --output /private/tmp/gliner25-metal-all-tasks
 
 Defaults are all three models, both baselines, all ten cases, three fresh
 process repetitions, five warmups, and thirty measured pairs per case.

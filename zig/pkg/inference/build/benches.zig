@@ -1,0 +1,293 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+const std = @import("std");
+const Context = @import("context.zig").Context;
+const runtime_build = @import("runtime.zig");
+
+/// These workloads execute NativeCompute with a CPU profile. Product accelerator
+/// and server settings do not configure their options, imports, or native links.
+fn createCpuComputeModule(ctx: Context, source: []const u8) *std.Build.Module {
+    const module = ctx.b.createModule(.{
+        .root_source_file = ctx.path(source),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "ml", .module = ctx.graph.ml_mod },
+            .{ .name = "antfly_platform", .module = ctx.graph.platform_mod },
+            .{ .name = "inference_linalg", .module = ctx.graph.inference_linalg_mod },
+        },
+    });
+    module.addOptions("build_options", runtime_build.addBuildOptions(ctx.b, .{
+        .enable_system_blas = ctx.backend.enable_system_blas,
+        .enable_native_quant_dispatch_stats = ctx.backend.enable_native_quant_dispatch_stats,
+    }));
+    if (ctx.backend.enable_system_blas)
+        runtime_build.configureSystemBlas(ctx.b, module, ctx.target, ctx.backend.blas_root);
+    return module;
+}
+
+pub fn addPagedAttention(ctx: Context) void {
+    const b = ctx.b;
+    const bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-paged-attention-bench",
+        .root_module = createCpuComputeModule(ctx, "src/paged_attention_bench.zig"),
+    });
+
+    const run_bench = ctx.addRunArtifact(bench_exe);
+    if (ctx.args) |args| {
+        run_bench.addArgs(args);
+    }
+    const bench_step = ctx.step("bench-paged-attention", "Run the native paged-attention benchmark");
+    bench_step.dependOn(&run_bench.step);
+}
+
+pub fn addTrainingAndLinalg(ctx: Context) void {
+    const b = ctx.b;
+    const training_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-training-bench",
+        .root_module = createCpuComputeModule(ctx, "src/training_bench.zig"),
+    });
+    const linalg_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-linalg-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = ctx.path("src/linalg_bench.zig"),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+        }),
+    });
+    const run_training_bench = ctx.addRunArtifact(training_bench_exe);
+    if (ctx.args) |args| {
+        run_training_bench.addArgs(args);
+    }
+    const training_bench_step = ctx.step("bench-training", "Run the native training benchmark");
+    training_bench_step.dependOn(&run_training_bench.step);
+    linalg_bench_exe.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
+    const run_linalg_bench = ctx.addRunArtifact(linalg_bench_exe);
+    if (ctx.args) |args| {
+        run_linalg_bench.addArgs(args);
+    }
+    const linalg_bench_step = ctx.step("bench-linalg", "Run the shared linalg benchmark");
+    linalg_bench_step.dependOn(&run_linalg_bench.step);
+}
+
+pub fn addGliner(ctx: Context) void {
+    const b = ctx.b;
+    const gliner2_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-gliner2-native-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = ctx.path("src/bench/gliner2_native.zig"),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+        }),
+    });
+    gliner2_bench_exe.root_module.addImport("build_options", ctx.graph.build_options_mod);
+    gliner2_bench_exe.root_module.addImport("ml", ctx.graph.ml_mod);
+    if (ctx.graph.pjrt_mod) |pjrt| gliner2_bench_exe.root_module.addImport("pjrt", pjrt);
+    gliner2_bench_exe.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
+    gliner2_bench_exe.root_module.addImport("inference_hf_tokenizer", ctx.graph.inference_hf_tokenizer_mod);
+    gliner2_bench_exe.root_module.addImport("antfly_image", ctx.graph.image_mod);
+    gliner2_bench_exe.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
+    gliner2_bench_exe.root_module.addImport("protobuf", ctx.graph.protobuf_mod);
+    gliner2_bench_exe.root_module.addImport("onnx_graph", ctx.graph.onnx.graph);
+    gliner2_bench_exe.root_module.addImport("onnx_data", ctx.graph.onnx.data);
+    gliner2_bench_exe.root_module.addImport("antfly_platform", ctx.graph.platform_mod);
+    ctx.graph.identities.addImports(gliner2_bench_exe.root_module);
+    gliner2_bench_exe.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    // inference_internal already owns the native backend linkage, including
+    // metal_kernels.m. Linking it again at the executable root produces
+    // duplicate Metal symbols in these standalone benchmark tools.
+    gliner2_bench_exe.root_module.link_libc = true;
+    runtime_build.configureOnnxRuntime(b, gliner2_bench_exe.root_module, ctx.backend.enable_onnx, ctx.backend.onnx_root);
+    const run_gliner2_bench = ctx.addRunArtifact(gliner2_bench_exe);
+    if (ctx.args) |args| {
+        run_gliner2_bench.addArgs(args);
+    }
+    const gliner2_bench_step = ctx.step("bench-gliner2-native", "Run an end-to-end GLiNER2 bench against the native backend with random weights");
+    gliner2_bench_step.dependOn(&run_gliner2_bench.step);
+}
+
+pub fn addAudio(ctx: Context) void {
+    const b = ctx.b;
+    const audio_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-audio-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = ctx.path("src/audio_bench.zig"),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+        }),
+    });
+    audio_bench_exe.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
+    audio_bench_exe.root_module.link_libc = true;
+    const run_audio_bench = ctx.addRunArtifact(audio_bench_exe);
+    if (ctx.args) |args| {
+        run_audio_bench.addArgs(args);
+    }
+    const audio_bench_step = ctx.step("bench-audio", "Run the checked-in audio decode and synthesis benchmark");
+    audio_bench_step.dependOn(&run_audio_bench.step);
+}
+
+pub const CreateBgeResult = struct {
+    bge_m3_e2e_bench_exe: *std.Build.Step.Compile,
+    tests: *std.Build.Step.Compile,
+};
+
+pub fn createBge(ctx: Context) CreateBgeResult {
+    const b = ctx.b;
+    const module_options: std.Build.Module.CreateOptions = .{
+        .root_source_file = ctx.path("src/bench/bge_m3_e2e.zig"),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+    };
+    const bge_m3_e2e_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-bge-m3-e2e-bench",
+        .root_module = b.createModule(module_options),
+    });
+    const tests = b.addTest(.{ .root_module = b.createModule(module_options) });
+    const bge_m3_runtime_mod = b.createModule(.{
+        .root_source_file = ctx.path("src/bge_m3_runtime.zig"),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+    });
+    runtime_build.addInferenceRootImports(bge_m3_runtime_mod, .{
+        .build_info_mod = ctx.graph.build_info_mod,
+        .identities = ctx.graph.identities,
+        .build_options_mod = ctx.graph.build_options_mod,
+        .json_mod = ctx.graph.json_mod,
+        .httpx_mod = ctx.graph.httpx_mod,
+        .inference_api_mod = ctx.graph.inference_api_mod,
+        .inference_audio_mod = ctx.graph.inference_audio_mod,
+        .inference_chunker_mod = ctx.graph.inference_chunker_mod,
+        .jinja_mod = ctx.graph.jinja_mod,
+        .inference_tokenizer_mod = ctx.graph.inference_tokenizer_mod,
+        .inference_hf_tokenizer_mod = ctx.graph.inference_hf_tokenizer_mod,
+        .inference_linalg_mod = ctx.graph.inference_linalg_mod,
+        .inference_fixed_tokenizer_data_mod = ctx.graph.inference_fixed_tokenizer_data_mod,
+        .jsonschema_mod = ctx.graph.jsonschema_mod,
+        .scraping_mod = ctx.graph.scraping_mod,
+        .image_mod = ctx.graph.image_mod,
+        .ml_mod = ctx.graph.ml_mod,
+        .ml_tabular_mod = ctx.graph.ml_tabular_mod,
+        .prometheus_mod = ctx.graph.prometheus_mod,
+        .structlog_mod = ctx.graph.structlog_mod,
+        .onnx = ctx.graph.onnx,
+        .pjrt_mod = ctx.graph.pjrt_mod,
+        .platform_mod = ctx.graph.platform_mod,
+        .protobuf_mod = ctx.graph.protobuf_mod,
+        .reader_config_mod = ctx.graph.reader_config_mod,
+        .inference_client_mod = ctx.graph.inference_client_mod,
+    });
+    bge_m3_runtime_mod.addImport("antfly_generating_openapi", ctx.graph.generating_openapi_mod);
+    bge_m3_runtime_mod.addImport("antfly_extraction_openapi", ctx.graph.extraction_openapi_mod);
+    bge_m3_runtime_mod.addImport("antfly_extracting", ctx.graph.extracting_mod);
+    for ([_]*std.Build.Step.Compile{ bge_m3_e2e_bench_exe, tests }) |artifact| {
+        artifact.root_module.addImport("build_options", ctx.graph.build_options_mod);
+        artifact.root_module.addImport("ml", ctx.graph.ml_mod);
+        const pjrt = if (artifact.kind.isTest()) ctx.graph.qualification_pjrt_mod else ctx.graph.pjrt_mod;
+        if (pjrt) |module| artifact.root_module.addImport("pjrt", module);
+        artifact.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
+        artifact.root_module.addImport("inference_hf_tokenizer", ctx.graph.inference_hf_tokenizer_mod);
+        artifact.root_module.addImport("antfly_image", ctx.graph.image_mod);
+        artifact.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
+        artifact.root_module.addImport("protobuf", ctx.graph.protobuf_mod);
+        artifact.root_module.addImport("onnx_graph", ctx.graph.onnx.graph);
+        artifact.root_module.addImport("onnx_data", ctx.graph.onnx.data);
+        artifact.root_module.addImport("bge_m3_runtime", bge_m3_runtime_mod);
+        ctx.configureNativeTool(artifact, ctx.backend.enable_metal);
+        runtime_build.configureOnnxRuntime(b, artifact.root_module, ctx.backend.enable_onnx, ctx.backend.onnx_root);
+    }
+    return .{
+        .bge_m3_e2e_bench_exe = bge_m3_e2e_bench_exe,
+        .tests = tests,
+    };
+}
+
+/// The root and standalone package share identical GLiNER2.5 worker modules.
+/// Return the trained worker module so its protocol tests use the same imports.
+pub fn addGliner25(ctx: Context) *std.Build.Module {
+    const b = ctx.b;
+    // Use the shared optimize value for the entire dependency graph. The
+    // worker refuses to compile unless that graph is ReleaseFast; forcing
+    // only this executable root would leave imported kernels unoptimized.
+    const gliner25_cpu_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-gliner25-cpu-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = ctx.path("src/bench/gliner25_cpu.zig"),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+        }),
+    });
+    gliner25_cpu_bench_exe.root_module.addImport("build_options", ctx.graph.build_options_mod);
+    gliner25_cpu_bench_exe.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    // The imported native runtime owns backend and BLAS linkage.
+    gliner25_cpu_bench_exe.root_module.link_libc = true;
+    const install_gliner25_cpu_bench = b.addInstallArtifact(gliner25_cpu_bench_exe, .{});
+    const gliner25_cpu_bench_step = ctx.step("bench-gliner25-cpu-build", "Build the supervised GLiNER2.5 direct-core CPU benchmark worker (requires ReleaseFast)");
+    gliner25_cpu_bench_step.dependOn(&install_gliner25_cpu_bench.step);
+
+    const gliner25_metal_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-gliner25-metal-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = ctx.path("src/bench/gliner25_metal.zig"),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+        }),
+    });
+    gliner25_metal_bench_exe.root_module.addImport("build_options", ctx.graph.build_options_mod);
+    gliner25_metal_bench_exe.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    gliner25_metal_bench_exe.root_module.link_libc = true;
+    const install_gliner25_metal_bench = b.addInstallArtifact(gliner25_metal_bench_exe, .{});
+    ctx.step("bench-gliner25-metal-build", "Build the supervised GLiNER2.5 production-lifetime Metal comparison worker (requires ReleaseFast)").dependOn(&install_gliner25_metal_bench.step);
+
+    const gliner25_convert = b.addExecutable(.{
+        .name = "antfly-inference-gliner25-convert",
+        .root_module = b.createModule(.{
+            .root_source_file = ctx.path("src/bench/gliner25_convert.zig"),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+        }),
+    });
+    gliner25_convert.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    gliner25_convert.root_module.link_libc = true;
+    const install_gliner25_convert = b.addInstallArtifact(gliner25_convert, .{});
+    ctx.step("gliner25-convert-build", "Build the atomic GLiNER2.5 converter and bundle verifier").dependOn(&install_gliner25_convert.step);
+    const gliner25_bundle_check = b.addExecutable(.{
+        .name = "antfly-inference-gliner25-bundle-check",
+        .root_module = b.createModule(.{
+            .root_source_file = ctx.path("src/bench/gliner25_bundle_check.zig"),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+        }),
+    });
+    gliner25_bundle_check.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    gliner25_bundle_check.root_module.link_libc = true;
+    const install_gliner25_bundle_check = b.addInstallArtifact(gliner25_bundle_check, .{});
+    ctx.step("gliner25-bundle-check-build", "Build the converted GLiNER2.5 CPU diagnostic runner").dependOn(&install_gliner25_bundle_check.step);
+
+    const gliner25_trained_check_module = b.createModule(.{
+        .root_source_file = ctx.path("src/bench/gliner25_trained_check.zig"),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+    });
+    gliner25_trained_check_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    gliner25_trained_check_module.link_libc = true;
+    const gliner25_trained_check = b.addExecutable(.{
+        .name = "antfly-inference-gliner25-trained-check",
+        .root_module = gliner25_trained_check_module,
+    });
+    const install_gliner25_trained_check = b.addInstallArtifact(gliner25_trained_check, .{});
+    ctx.step("gliner25-trained-check-build", "Build the bounded trained GLiNER2.5 CPU/Metal artifact execution worker").dependOn(&install_gliner25_trained_check.step);
+    return gliner25_trained_check_module;
+}

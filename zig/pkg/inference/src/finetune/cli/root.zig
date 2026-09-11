@@ -17,12 +17,12 @@ const builtin = @import("builtin");
 
 const recipe = @import("../recipe.zig");
 const analyze_gemma4_recursive_lora_sweep = @import("../tools/analyze_gemma4_recursive_lora_sweep.zig");
-const bootstrap_colqwen2_lora = @import("../tools/bootstrap_colqwen2_lora.zig");
-const bootstrap_gemma4_lora = @import("../tools/bootstrap_gemma4_lora.zig");
-const bootstrap_gliner2_lora = @import("../tools/bootstrap_gliner2_lora.zig");
-const bootstrap_layoutlmv3_lora = @import("../tools/bootstrap_layoutlmv3_lora.zig");
-const bootstrap_reranker_lora = @import("../tools/bootstrap_reranker_lora.zig");
-const compose_lora_adapters = @import("../tools/compose_lora_adapters.zig");
+const bootstrap_colqwen2_lora = @import("../tools/bootstrap_colqwen2_lora.zig").Command(@import("inference_internal"));
+const bootstrap_gemma4_lora = @import("../tools/bootstrap_gemma4_lora.zig").Command(@import("inference_internal"));
+const bootstrap_gliner2_lora = @import("../tools/bootstrap_gliner2_lora.zig").Command(@import("inference_internal"));
+const bootstrap_layoutlmv3_lora = @import("../tools/bootstrap_layoutlmv3_lora.zig").Command(@import("inference_internal"));
+const bootstrap_reranker_lora = @import("../tools/bootstrap_reranker_lora.zig").Command(@import("inference_internal"));
+const compose_lora_adapters = @import("../tools/compose_lora_adapters.zig").Command(@import("inference_internal"));
 const eval_fused_chunker = @import("../eval/eval_fused_chunker.zig");
 const eval_gliner2_autodiff_adapter = @import("../tools/eval_gliner2_autodiff_adapter.zig");
 const eval_gliner2_autodiff_adapter_dataset = @import("../tools/eval_gliner2_autodiff_adapter_dataset.zig");
@@ -31,30 +31,30 @@ const eval_gliner2_boundary_task_head = @import("../eval/eval_gliner2_top_layer_
 const eval_reranker_checkpoint = @import("../eval/eval_reranker_checkpoint.zig");
 const generate_gemma4_multimodal_pilot_dataset = @import("../tools/generate_gemma4_multimodal_pilot_dataset.zig");
 const generate_gemma4_pilot_dataset = @import("../tools/generate_gemma4_pilot_dataset.zig");
-const inspect_colqwen2_checkpoint = @import("../tools/inspect_colqwen2_checkpoint.zig");
-const inspect_colqwen2_lora_bundle = @import("../tools/inspect_colqwen2_lora_bundle.zig");
-const inspect_gemma4_lora_bundle = @import("../tools/inspect_gemma4_lora_bundle.zig");
-const inspect_gliner2_checkpoint = @import("../tools/inspect_gliner2_checkpoint.zig");
-const inspect_gliner2_dataset = @import("../tools/inspect_gliner2_dataset.zig");
-const inspect_gliner2_lora_bundle = @import("../tools/inspect_gliner2_lora_bundle.zig");
+const inspect_colqwen2_checkpoint = @import("../tools/inspect_colqwen2_checkpoint.zig").Command(@import("inference_internal"));
+const inspect_colqwen2_lora_bundle = @import("../tools/inspect_colqwen2_lora_bundle.zig").Command(@import("inference_internal"));
+const inspect_gemma4_lora_bundle = @import("../tools/inspect_gemma4_lora_bundle.zig").Command(@import("inference_internal"));
+const inspect_gliner2_checkpoint = @import("../tools/inspect_gliner2_checkpoint.zig").Command(@import("inference_internal"));
+const inspect_gliner2_dataset = dataCommand(@import("../tools/inspect_gliner2_dataset.zig"));
+const inspect_gliner2_lora_bundle = @import("../tools/inspect_gliner2_lora_bundle.zig").Command(@import("inference_internal"));
 const inspect_layoutlmv3_bundle = @import("../tools/inspect_layoutlmv3_bundle.zig");
-const inspect_layoutlmv3_lora_bundle = @import("../tools/inspect_layoutlmv3_lora_bundle.zig");
-const inspect_reranker_dataset = @import("../tools/inspect_reranker_dataset.zig");
-const inspect_reranker_lora_bundle = @import("../tools/inspect_reranker_lora_bundle.zig");
-const materialize_colqwen2_lora = @import("../tools/materialize_colqwen2_lora.zig");
-const materialize_gemma4_lora = @import("../tools/materialize_gemma4_lora.zig");
-const materialize_gemma4_recursive_base = @import("../tools/materialize_gemma4_recursive_base.zig");
+const inspect_layoutlmv3_lora_bundle = @import("../tools/inspect_layoutlmv3_lora_bundle.zig").Command(@import("inference_internal"));
+const inspect_reranker_dataset = dataCommand(@import("../tools/inspect_reranker_dataset.zig"));
+const inspect_reranker_lora_bundle = @import("../tools/inspect_reranker_lora_bundle.zig").Command(@import("inference_internal"));
+const materialize_colqwen2_lora = @import("../tools/materialize_colqwen2_lora.zig").Command(@import("inference_internal"));
+const materialize_gemma4_lora = @import("../tools/materialize_gemma4_lora.zig").Command(@import("inference_internal"));
+const materialize_gemma4_recursive_base = @import("../tools/materialize_gemma4_recursive_base.zig").Command(@import("inference_internal"));
 const materialize_gemma4_teacher_targets = @import("../tools/materialize_gemma4_teacher_targets.zig");
-const materialize_gliner2_lora = @import("../tools/materialize_gliner2_lora.zig");
+const materialize_gliner2_lora = @import("../tools/materialize_gliner2_lora.zig").Command(@import("inference_internal"));
 const materialize_gliner25_adapter = @import("../tools/materialize_gliner25_adapter.zig");
-const materialize_layoutlmv3_checkpoint = @import("../tools/materialize_layoutlmv3_checkpoint.zig");
-const materialize_reranker_head = @import("../tools/materialize_reranker_head.zig");
-const materialize_reranker_lora = @import("../tools/materialize_reranker_lora.zig");
+const materialize_layoutlmv3_checkpoint = @import("../tools/materialize_layoutlmv3_checkpoint.zig").Command(@import("inference_internal"));
+const materialize_reranker_head = @import("../tools/materialize_reranker_head.zig").Command(@import("inference_internal"));
+const materialize_reranker_lora = @import("../tools/materialize_reranker_lora.zig").Command(@import("inference_internal"));
 const prepare_colqwen2_inputs = @import("../tools/prepare_colqwen2_inputs.zig");
 const prepare_entity_cleanup_cache = @import("../tools/prepare_entity_cleanup_cache.zig");
 const prepare_gemma4_lora_inputs = @import("../tools/prepare_gemma4_lora_inputs.zig");
-const prepare_gemma4_multimodal_dataset = @import("../tools/prepare_gemma4_multimodal_dataset.zig");
-const prepare_gemma4_text_dataset = @import("../tools/prepare_gemma4_text_dataset.zig");
+const prepare_gemma4_multimodal_dataset = dataCommand(@import("../tools/prepare_gemma4_multimodal_dataset.zig"));
+const prepare_gemma4_text_dataset = dataCommand(@import("../tools/prepare_gemma4_text_dataset.zig"));
 const prepare_gliner2_entity_cleanup_cache = @import("../tools/prepare_gliner2_entity_cleanup_cache.zig");
 const prepare_gliner2_top_layer_boundary_cache = @import("../tools/prepare_gliner2_top_layer_boundary_cache.zig");
 const prepare_reranker_pooled_cache = @import("../tools/prepare_reranker_pooled_cache.zig");
@@ -86,7 +86,7 @@ test {
     _ = train_gliner25;
 }
 const train_layoutlmv3_lora_one_step = @import("../train/train_layoutlmv3_lora_one_step.zig");
-const validate_gliner2_autodiff_run = @import("../tools/validate_gliner2_autodiff_run.zig");
+const validate_gliner2_autodiff_run = @import("../tools/validate_gliner2_autodiff_run.zig").Command(@import("inference_internal"));
 
 const CommandMain = *const fn (std.process.Init) anyerror!void;
 
@@ -109,7 +109,7 @@ const commands = [_]Command{
     .{ .domain = "dataset", .action = "prepare", .subject = "gemma4-multimodal", .adapter_argv0 = "prepare-gemma4-multimodal-dataset", .main_fn = prepare_gemma4_multimodal_dataset.main },
     .{ .domain = "dataset", .action = "prepare", .subject = "gemma4-lora", .adapter_argv0 = "prepare-gemma4-lora-inputs", .main_fn = prepare_gemma4_lora_inputs.main },
     .{ .domain = "dataset", .action = "prepare", .subject = "colqwen2", .adapter_argv0 = "prepare-colqwen2-inputs", .main_fn = prepare_colqwen2_inputs.main },
-    .{ .domain = "dataset", .action = "prepare", .subject = "entity-cleanup-cache", .adapter_argv0 = "prepare-entity-cleanup-cache", .main_fn = prepare_entity_cleanup_cache.main },
+    .{ .domain = "dataset", .action = "prepare", .subject = "entity-cleanup-cache", .adapter_argv0 = "prepare-entity-cleanup-cache", .main_fn = prepare_entity_cleanup_cache.Command(@import("inference_internal")).main },
     .{ .domain = "dataset", .action = "prepare", .subject = "gliner2-entity-cleanup-cache", .adapter_argv0 = "prepare-gliner2-entity-cleanup-cache", .main_fn = prepare_gliner2_entity_cleanup_cache.main },
     .{ .domain = "dataset", .action = "prepare", .subject = "gliner2-boundary-cache", .adapter_argv0 = "prepare-gliner2-top-layer-boundary-cache", .main_fn = prepare_gliner2_top_layer_boundary_cache.main },
     .{ .domain = "dataset", .action = "prepare", .subject = "reranker-pooled-cache", .adapter_argv0 = "prepare-reranker-pooled-cache", .main_fn = prepare_reranker_pooled_cache.main },
@@ -128,7 +128,7 @@ const commands = [_]Command{
     .{ .domain = "adapter", .action = "inspect", .subject = "colqwen2", .adapter_argv0 = "inspect-colqwen2-lora-bundle", .main_fn = inspect_colqwen2_lora_bundle.main },
     .{ .domain = "adapter", .action = "inspect", .subject = "colqwen2-checkpoint", .adapter_argv0 = "inspect-colqwen2-checkpoint", .main_fn = inspect_colqwen2_checkpoint.main },
     .{ .domain = "adapter", .action = "inspect", .subject = "layoutlmv3", .adapter_argv0 = "inspect-layoutlmv3-lora-bundle", .main_fn = inspect_layoutlmv3_lora_bundle.main },
-    .{ .domain = "adapter", .action = "inspect", .subject = "layoutlmv3-bundle", .adapter_argv0 = "inspect-layoutlmv3-bundle", .main_fn = inspect_layoutlmv3_bundle.main },
+    .{ .domain = "adapter", .action = "inspect", .subject = "layoutlmv3-bundle", .adapter_argv0 = "inspect-layoutlmv3-bundle", .main_fn = inspect_layoutlmv3_bundle.Command(@import("inference_internal")).main },
     .{ .domain = "adapter", .action = "inspect", .subject = "reranker", .adapter_argv0 = "inspect-reranker-lora-bundle", .main_fn = inspect_reranker_lora_bundle.main },
     .{ .domain = "adapter", .action = "materialize", .subject = "gemma4", .adapter_argv0 = "materialize-gemma4-lora", .main_fn = materialize_gemma4_lora.main },
     .{ .domain = "adapter", .action = "materialize", .subject = "gemma4-recursive-base", .adapter_argv0 = "materialize-gemma4-recursive-base", .main_fn = materialize_gemma4_recursive_base.main },
@@ -144,7 +144,7 @@ const commands = [_]Command{
     .{ .domain = "train", .action = "run", .subject = "gliner2-autodiff", .adapter_argv0 = "train-gliner2-autodiff", .main_fn = train_gliner2_autodiff.main },
     .{ .domain = "train", .action = "run", .subject = "gliner2-boundary-head", .adapter_argv0 = "train-eval-gliner2-top-layer-boundary-head", .main_fn = train_eval_gliner2_boundary_head.main },
     .{ .domain = "train", .action = "run", .subject = "gliner2-boundary-task-head", .adapter_argv0 = "train-eval-gliner2-top-layer-boundary-task-head", .main_fn = train_eval_gliner2_boundary_task_head.main },
-    .{ .domain = "train", .action = "run", .subject = "entity-cleanup-head", .adapter_argv0 = "train-eval-entity-cleanup-head", .main_fn = train_eval_entity_cleanup_head.main },
+    .{ .domain = "train", .action = "run", .subject = "entity-cleanup-head", .adapter_argv0 = "train-eval-entity-cleanup-head", .main_fn = train_eval_entity_cleanup_head.Command(@import("inference_internal")).main },
     .{ .domain = "train", .action = "run", .subject = "reranker-head", .adapter_argv0 = "train-eval-reranker-head", .main_fn = train_eval_reranker_head.main },
     .{ .domain = "train", .action = "run", .subject = "reranker-head-cached", .adapter_argv0 = "train-eval-reranker-head-cached", .main_fn = train_eval_reranker_head_cached.main },
     .{ .domain = "train", .action = "run", .subject = "reranker-head-top-layer-cached", .adapter_argv0 = "train-eval-reranker-head-top-layer-cached", .main_fn = train_eval_reranker_head_top_layer_cached.main },
@@ -429,4 +429,14 @@ test "finetune cli command table has unique canonical commands and adapter argv 
             try std.testing.expect(!std.mem.eql(u8, command.adapter_argv0, other.adapter_argv0));
         }
     }
+}
+
+// Reuse data implementations inside this owner without creating another module
+// instance for types that recipe dispatch already imports.
+fn dataCommand(comptime command: type) type {
+    return struct {
+        pub fn main(init: std.process.Init) !void {
+            return command.runWithData(@import("../../finetune_data_root.zig"), init);
+        }
+    };
 }

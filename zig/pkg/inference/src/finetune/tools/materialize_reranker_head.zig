@@ -13,53 +13,64 @@
 // limitations under the License.
 
 const std = @import("std");
-const reranker_head = @import("../reranker_head.zig");
-
-const print = std.debug.print;
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
-    defer args.deinit();
-    _ = args.next();
-
-    const model_dir = args.next() orelse {
-        printUsage();
-        return error.InvalidArguments;
-    };
-    const head_input = args.next() orelse {
-        printUsage();
-        return error.InvalidArguments;
-    };
-    const out_dir = args.next() orelse {
-        printUsage();
-        return error.InvalidArguments;
-    };
-    if (args.next() != null) {
-        printUsage();
-        return error.InvalidArguments;
-    }
-
-    try reranker_head.materializeHeadFromDir(allocator, model_dir, head_input, out_dir);
-
-    const stdout = std.Io.File.stdout();
-    var buf: [1024]u8 = undefined;
-    var writer = stdout.writer(init.io, &buf);
-    try std.json.Stringify.value(.{
-        .model_dir = model_dir,
-        .head_input = head_input,
-        .output_dir = out_dir,
-        .checkpoint = reranker_head.merged_head_checkpoint_file_name,
-        .materialized_head_contract = "classifier.out_proj.{weight,bias}",
-    }, .{ .whitespace = .indent_2 }, &writer.interface);
-    try writer.interface.writeByte('\n');
-    try writer.interface.flush();
+    return Command(@import("inference_finetune_assets")).main(init);
 }
 
-fn printUsage() void {
-    print(
-        \\usage: materialize-reranker-head <model-dir> <head-dir-or-checkpoint> <out-dir>
-        \\example: materialize-reranker-head /tmp/bge-reranker /tmp/out /tmp/materialized
-        \\
-    , .{});
+// Reuse the parser and implementation in the combined CLI without creating a
+// second instance of model/tensor types inside its inference module.
+pub fn Command(comptime assets: type) type {
+    return struct {
+        const reranker_head = assets.finetune.reranker_head;
+
+        const print = std.debug.print;
+
+        pub fn main(init: std.process.Init) !void {
+            const allocator = init.gpa;
+            var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+            defer args.deinit();
+            _ = args.next();
+
+            const model_dir = args.next() orelse {
+                printUsage();
+                return error.InvalidArguments;
+            };
+            const head_input = args.next() orelse {
+                printUsage();
+                return error.InvalidArguments;
+            };
+            const out_dir = args.next() orelse {
+                printUsage();
+                return error.InvalidArguments;
+            };
+            if (args.next() != null) {
+                printUsage();
+                return error.InvalidArguments;
+            }
+
+            try reranker_head.materializeHeadFromDir(allocator, model_dir, head_input, out_dir);
+
+            const stdout = std.Io.File.stdout();
+            var buf: [1024]u8 = undefined;
+            var writer = stdout.writer(init.io, &buf);
+            try std.json.Stringify.value(.{
+                .model_dir = model_dir,
+                .head_input = head_input,
+                .output_dir = out_dir,
+                .checkpoint = reranker_head.merged_head_checkpoint_file_name,
+                .materialized_head_contract = "classifier.out_proj.{weight,bias}",
+            }, .{ .whitespace = .indent_2 }, &writer.interface);
+            try writer.interface.writeByte('\n');
+            try writer.interface.flush();
+        }
+
+        fn printUsage() void {
+            print(
+                \\usage: materialize-reranker-head <model-dir> <head-dir-or-checkpoint> <out-dir>
+                \\example: materialize-reranker-head /tmp/bge-reranker /tmp/out /tmp/materialized
+                \\
+            , .{});
+        }
+    };
 }

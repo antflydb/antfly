@@ -101,16 +101,10 @@ fields and opaque structure values retain their existing contract. Consumers
 must still retain the model, schema, input and destination versions needed
 for a later migration or backfill.
 
-The extracting library suite passes. Seven focused asset tests pass with no
-skips or leaks, including single/batch identity, extensions, malformed values,
-legacy omission and allocation-failure ownership. The receipt is
-`/private/tmp/gliner25-enrichment-typed-v2.log`, SHA-256
-`fcf07ca834a820defd14afad0012085884a56d51350ad0f4eaff1c241ee82204`.
-Separate SDK checks pass for seven Go top-level tests, 43 Python tests,
-41 TypeScript tests and TypeScript typechecking. These include exact
-version/model/count/object/positional-ID contracts and bounded responses;
-repeated and empty string IDs remain valid where sent by a caller. These
-focused checks do not establish live service or reindex/backfill qualification.
+Regression coverage includes single/batch identity, extensions, malformed
+values, legacy omission, bounded responses and allocation-failure ownership.
+Repeated and empty string IDs remain valid where sent by a caller. These
+contracts do not establish live service or reindex/backfill qualification.
 
 ## Bound decoding and long documents
 
@@ -139,171 +133,31 @@ remains distinct from that fixed-cap rejection. Raising a retry count cannot
 make an unchanged fixed-cap request fit. Genuine backing-allocation failures
 remain internal failures.
 
-## Measured HTTP handler and loopback qualification
+## HTTP and lifecycle regression coverage
 
-The pinned original small FP32 model now passes the real `Node.extractJSON`
-handler path with managed loading, the Node-owned watchdog, shared admission,
-owned HTTP response bytes and lifecycle metrics. The test supplies
-`ANTFLY_GLINER25_SMALL_MODEL_DIR`, verifies the existing pipeline fixture's five
-artifact hashes before and after execution, and compares those hashes with the
-managed session's immutable identity. It checks four entities and one
-classification from the first mixed-task fixture, including exact selections
-and source offsets and the unchanged confidence tolerance of `5e-4`.
+Model-free tests exercise schema rejection, response parsing, atomic batch
+failure, cancellation, bounded metrics and retry. Model-gated tests additionally
+exercise the pinned-small handler and generated HTTP/1.1 route on CPU and
+Metal, compare exact selections/source coordinates at the fixed `5e-4`
+confidence bound, and rehash the source files before and after execution.
 
-This test crosses the public capability gate through a default-false field on
-one test Node only. That field has type `void` in production builds; there is no
-environment, configuration or request override. The primary Node and an
-independent Node both reject the model by default, and `runtime_available`
-remains false. The original test qualifies the handler directly. Separate
-loopback tests now qualify actual HTTP/1.1 delivery on CPU and managed Metal as
-described below, including competing-request admission. These do not prove
-simultaneous learned forwards, long-document HTTP handling, non-loopback
-deployment or production release qualification.
+The public availability gate stays closed. A default-false, test-only per-Node
+field admits these cases; it has no production environment or request override.
+A missing model or backend produces an explicit skip, not qualification.
 
-The primary Node retains a 128 MiB request-scratch ceiling. After a successful
-request, a two-item request decodes its first item and rejects the second item's
-4,097-word text with HTTP 413, `EXTRACTION_LIMIT_EXCEEDED`, input index 1 and
-stage `tokenizing`. No partial `data` or usage escapes. An anonymous retry
-succeeds with the same cached model and fixture outputs. The primary Node's
-four calls produce two successes, one unsupported-model rejection and one
-resource-limit rejection; counters report five parsed, three decoded and two
-returned items. Active request slots, model handles, scratch/KV reservations
-and watchdog leases return to zero. The cached model's residency remains
-admitted and unchanged.
+Regression assertions include second-item failures without partial output,
+anonymous same-cache retry, competing-request admission with one learned
+forward at a time, transport disconnect/shutdown cancellation, and cleanup of
+request, listener, cache, residency and watchdog owners. Metrics/listing
+snapshot release must preserve the exact last-use timestamp so observation
+cannot keep idle models alive indefinitely. Ordinary inference handles still
+refresh usage.
 
-The initial test exposed a separate preflight defect in the independent Node's
-16 MiB request heap: full manifest parsing materialized the tokenizer vocabulary
-before the capability gate and reported its declared allocation denial as HTTP
-500 `OutOfMemory`. The primary 128 MiB Node's default-gate check had already
-passed. Preflight now uses the existing lightweight manifest reader, which
-fully validates the boundary discriminator/configuration while leaving
-tokenizer materialization to the admitted managed loader. Both original caps
-remain unchanged. A model-free regression supplies a vocabulary larger than
-the whole request heap, then an oversized valid configuration: the former
-reaches the default gate, the latter returns model-stage HTTP 507, and restoring
-the configuration recovers. Terminal allocator-failure attribution covers the
-bounded scope; failed resize/remap attempts do not turn a later genuine backing
-OOM into a fixed-budget rejection. The managed model owner and caller-owned
-response allocation keep their independent failure attribution. A post-control
-check discards completed JSON if cancellation or a deadline wins during inner
-model/backend teardown.
-
-A separate caller-owned `httpx.Server.ListenerTask` now passes actual HTTP/1.1
-requests on `127.0.0.1` with an OS-assigned ephemeral port. It registers the
-Node's generated `/ai/v1/extract` route and `/ml/v1/metrics`, and uses independent
-server/client executors with a 16 MiB transport allocation ceiling, 64 KiB
-request limit, 1 MiB response limit, two connection/request lanes, explicit
-connect/read/write/request deadlines, and no client retries or redirects. The
-pinned-small model executes on CPU under the same unchanged 128 MiB request
-scratch cap. Default rejection, exact fixture success, atomic second-item 413,
-anonymous retry, cached-model reuse, all-five-file identity, decoded-versus-
-returned counters and the delivered metrics body all pass. The listener joins
-before routes, Node or executor ownership can be destroyed.
-
-A separate actual managed-Metal socket case now passes the same first fixture,
-five source-file hashes, confidence tolerance, default 400, atomic second-item
-413, anonymous retry and delivered metrics. Both session managers require
-Metal explicitly on this test Node. Its declared profile is 1 GiB host, 4 GiB
-backend, 5 GiB combined and 3 GiB scratch; the normal live-physical-memory guard
-still applies. This differs from the CPU fixture's 128 MiB scratch profile.
-The executor's unchanged 2 GiB encoder and 256 MiB head device ceilings combine
-with its 512 MiB request heap for 2,816 MiB of admitted transient scratch.
-Model/tokenizer residency remains separately admitted. A model-free budget
-regression proves that 128 MiB rejects this reservation; it does not claim an
-actual 128 MiB Metal HTTP run.
-
-The Metal case checks the loaded session's real backend, FP32 identity,
-process-required interruption, serialized model mutex and ready strict-device
-compute backend. Physical MetalTensor allocation/release counters advance
-across each decoded request, without a diagnostic upload or a counter reset.
-Request cleanup returns host scratch, KV, active handles, watchdog entries and
-model execution ownership; retained model scratch is reconciled against the
-actual model lease. The full admitted residency stays unchanged through the
-atomic failure and retry. After Node destruction, physical owned-tensor and
-host-mirror live bytes return to their initial values and created/released
-device bytes balance. This is resident execution evidence, not a claim that
-request-owned FP32 weights remain resident after request teardown.
-
-The accompanying model-free transport test owns a separate cancellation
-barrier route. A real TCP reset makes the transport signal cancellation; the
-Node observes that signal and rejects before parsing, admission or loading.
-The generated extraction route remains usable afterward. A second connected
-barrier request is cancelled when the caller's 25 ms graceful shutdown period
-ends; joining drains handlers, sockets, request-body capacity, cancellation
-observers and listener leases. This tests the ingress cancellation boundary,
-not interruption in the middle of a learned encoder operation.
-
-A separate actual pinned-small CPU concurrency test now passes through two
-independent HTTP clients. The test owner holds the existing model-registry
-lock until the first cold request owns the single Node slot and its real
-128 MiB request-scratch lease. The competing request receives HTTP 503 with
-the exact inference-admission reason and retry metadata. Releasing the lock
-lets the original request succeed; an anonymous retry reuses the same admitted
-cached model with unchanged fixture outputs. Delivered metrics reconcile two
-successes and one admission rejection. The transport reaches two active
-requests while the Node peaks at one, and all tasks, sockets, request leases,
-handles and watchdog entries drain. This qualifies competing-request
-admission with one learned forward at a time.
-
-The concurrency test's first run exposed a test race with lazy resource-owner
-initialization; the shared helper now mirrors `Node.serve` by initializing that
-owner before listener publication. Its next run rejected the test's extra
-outer driver with `ConcurrencyUnavailable`: the client already uses four lanes
-for request/watchdog and connect/watchdog. The corrected driver has one
-separate executor lane within the existing 4 MiB test metadata owner. Client
-and production capacities remain unchanged. The targeted correction passes
-one selected test with no skips, failures or leaks; the earlier aborted and
-failed receipts remain historical failures.
-
-The first socket attempt reached an installed Zig 0.16 POSIX connect-timeout
-TODO and aborted; the test now uses a bounded `Io.Select` race, joins its timer
-and closes a connection that completes after the deadline. No installed
-toolchain code changed. The next run completed the model requests but both
-socket tests expected an incorrect metrics MIME. The established handler's
-final `ctx.text()` emits `text/plain; charset=utf-8`; only the test expectation
-changed. Both corrections pass in the latest socket receipt below.
-
-An additional actual managed-Metal case now qualifies cancellation while a
-request waits for the loaded model's existing execution mutex. After a real
-HTTP warmup, the test retains that model handle and locks the mutex. A second
-raw TCP request acquires one Node slot, 512 MiB of host scratch and 2,304 MiB of
-device scratch under the unchanged Metal profile. Resetting its owned socket
-must release those request leases and watchdog state within five seconds while
-the mutex remains locked. The retained model lease remains live. Unlocking
-then permits an exact-fixture retry on the same cached model/session; metrics,
-physical device cleanup and all five source pins are checked. This case uses
-the existing cancellation-aware lock, with no production hook, artificial
-reservation or mid-kernel interruption claim. It passes one selected test with
-zero skips, failures or leaks.
-
-The compact [service qualification ledger](../zig/pkg/inference/testdata/gliner25/service_qualification_v1/manifest.json)
-preserves the five concurrency/Metal/cancellation checkpoint logs, source-fixture and
-test-source hashes, exact five model pins, commands, build/backend/resource
-profiles and result scopes. The successful concurrency and queued-cancellation
-logs omit exact test-executable paths; those identities remain unrecorded, and the
-command comes from the root execution transcript. The ledger does not change
-upstream numerical fixtures or public availability. Evidence remains scoped
-to the individual receipts:
-
-| Receipt | Result and limits |
-| --- | --- |
-| `/private/tmp/gliner25-socket-queued-metal-v2.log`, SHA-256 `dfbc576d1d6fc7cde50fe5631e445e73386ff155c0bd072c53ea494d9e89c496` | Actual queued managed-Metal cancellation exits zero: one selected, one passed, zero skips/failures/leaks. Host/device request leases and watchdog state drain before the execution mutex is unlocked; same-session retry, exact outputs, metrics and source/device cleanup pass. |
-| `/private/tmp/gliner25-socket-queued-metal-v1.log`, SHA-256 `d33e79ec9e6fd0865b0fb0e67cd2ed3625ab2cf7edb89c5ad1223f1055b6bcf3` | Earlier compilation stopped at an unrelated interpreter switch after two new training-attention tags were added. The socket test did not run; the dedicated hook/interpreter integration resolves this in v2. |
-| `/private/tmp/gliner25-socket-concurrency-metalbuild-v3.log`, SHA-256 `11db69c03acb9ce6e34ecce5a9958bcfe567d983f6c8f338b26619b15e062ba3` | Targeted corrected concurrency test exits zero: one selected, one passed, zero skips/failures/leaks. The real pinned-small CPU request/rejection/release/retry and metric/resource contract passes. This is separate from v2's Metal success. |
-| `/private/tmp/gliner25-socket-all-metalbuild-v2.log`, SHA-256 `e3328a86b1455be4003074efa4dc9542afd5ab38b7c234ec17ca477538213508` | Actual managed-Metal HTTP, its model-free scratch-budget regression, and both earlier socket cases pass. Five selected, four passed, zero skips, one concurrency-driver failure, zero leaks. The command exits nonzero; v3 resolves its concurrency failure without turning this historical aggregate into a pass. |
-| `/private/tmp/gliner25-socket-concurrency-metalbuild-v1.log`, SHA-256 `37ec45b73bb1180c936cffb4d7fe2c6f8172973e2732f97504775b5e72fa4b19` | Historical ABRT from the test's premature lazy-domain unwrap. No aggregate or leak result is claimed. Serving-owner initialization was corrected before v2; v3 completes the concurrency contract. |
-| `/private/tmp/gliner25-source-socket-metal-v1.log`, SHA-256 `7960df3ce368de2937e397b819f4e5f239845287fa8b422ff7b3b8c3cbf8481b` | Both corrected socket tests pass. The combined Metal-enabled run has 17 selected, 17 passed, zero skips/failures/leaks; other selected cases qualify source/training behavior separately. The socket fixture itself forces native CPU inference. |
-| `/private/tmp/gliner25-source-socket-cpu-v3.log`, SHA-256 `2bb388fc18c3954a98b740a44c7f69dc738f40c5a22f53d32d2a6edcd7eb9bc3` | Historical MIME-only socket failures: eight selected, four passed, two expected Metal skips, two socket failures, zero leaks. Both socket extraction paths had completed before the incorrect MIME assertion. |
-| `/private/tmp/gliner25-source-socket-cpu-v2.log`, SHA-256 `ee39edc9f34079051f26b0fb7643319bab7c8851ad45dfaf48841cd3d334f630` | Historical aborted socket attempt at Zig 0.16 native connect timeout; no successful aggregate or leak result is claimed for this run. |
-| `/private/tmp/gliner25-service-inactive-cpu-v4.log`, SHA-256 `e1fa91f1a99b7b7d005e68699c25ea4cf3196efe9c97441adbafa4359b879184` | Latest focused run exits zero: 21 selected, 17 passed, four expected Metal skips, zero failures or leaks. All eight V2 tests and all four adapter-file regressions pass, along with the corrected inactive/no-gradient training tests. |
-| `/private/tmp/gliner25-service-inactive-cpu-v3.log`, SHA-256 `9020d6ac8fdacc2ce83887107d482a95cae2e6d4d84c84226af48f01eddddb92` | Earlier checkpoint: all eight selected V2 tests and all four adapter-file regressions pass. The combined run has 21 selected, 15 passed, four Metal skips, two unrelated newly added inactive-training failures, and zero leaks. Those two failures are resolved in v4; v3 itself was not a passing aggregate suite. |
-| `/private/tmp/gliner25-service-cleanup-v1.log`, SHA-256 `76492a1386739e85b34f28287bd3f4329f0da119828d2e7529848ea7db3a22a4` | Common private-publication cleanup and actual merge cleanup both pass with pending Io cancellation, alongside selected export/job/merge regressions. The combined run has 14 selected, 12 passed, one optional published-export skip, the initial secondary-Node service failure described above, and zero leaks. |
-
-Private cleanup tests re-arm real Io cancellation before unwinding with a
-distinct execution-control error. They verify removal of the owned unpublished
-tree/file, restoration of the prior cancellation state, and preservation of
-the published payload. The cleanup helpers block only task-local cooperative
-Io cancellation; the caller's process watchdog remains armed through teardown.
+Private-output cleanup masks task-local cooperative I/O cancellation only
+while removing owned unpublished files. The process watchdog remains armed,
+and already published artifacts are preserved. These tests do not establish
+concurrent learned forwards, long-document HTTP, non-loopback deployment or
+production release qualification.
 
 ## Bound model and session teardown
 
@@ -315,72 +169,22 @@ raw session escapes. The production close deadline is 30 seconds. Expiration
 terminates the supervised worker with exit 86, leaving process restart to its
 supervisor. Admission remains held until physical destruction returns.
 
-The separate [teardown ledger](../zig/pkg/inference/testdata/gliner25/service_teardown_execution_v1/manifest.json)
-preserves three CPU attempts, exact helpers, the observed executable identity
-and three frozen source files. Its final CPU run passes nine tests with one
-expected process-fixture skip. Seven fresh model-free children then all exit 86
-through the watchdog, with no outer kill and complete reaping. They exercise
-cache destruction, TTL/admission eviction, retired-handle release, shutdown,
-load rollback and an escaped raw session. The first six prove a 64-byte lease
-remains held during blocked destruction; the escaped case explicitly has no
-lease. Earlier optional macOS argv-observation failure and six fixture compile
-errors remain recorded as failures, with successful owned-process cleanup.
+Model-free child regressions block physical close and cache destruction,
+including polling/final-release paths with stderr locked. Expiration must exit
+86 without synchronous logging, retain any admission lease until destruction,
+and complete outer ownership cleanup. An escaped raw session has no admission
+lease; its ticket and driver IO must still outlive the original manager.
 
-These child fixtures block synthetic callbacks and use a private 100 ms test
-deadline, bounded externally at five seconds per child. They qualify ownership
-and watchdog behavior, not a real driver hang or a measured production
-30-second timeout. The later nine-child proof and actual-model TTL status are
-tracked in the [latest service checkpoint](#latest-local-service-checkpoint);
-the historical source snapshot is not itself execution evidence. Public
-availability remains closed.
+Actual-model TTL tests cover held handles, expiry, fresh reload, same-cache
+retry, metrics observation without usage refresh, and return of caches,
+leases, tickets and transient allocations to their empty baseline. Memory
+admission failures remain failures and cannot count as successful TTL tests.
+The 30-second production close bound is unchanged. Synthetic short-deadline
+child tests do not simulate a real driver hang or measure production latency.
 
-## Latest local service checkpoint
-
-The [additive qualification/lifecycle ledger](../zig/pkg/inference/testdata/gliner25/qualification_lifecycle_execution_v1/ledger.json) binds the following
-scopes to their own source, executable and supervision receipts. The public
-runtime gate is still false, and the exact-artifact production policy is empty.
-
-All four learned-multiwindow tests pass, including the actual small CPU and
-Metal task/retry cases. Their final-focused v2 aggregate remains failed:
-67 selected, 65 passed, one expected child-fixture skip, one TTL failure and
-zero leaks. This does not qualify long-document HTTP or concurrent forwards.
-
-Nine separate fresh child probes then pass against that frozen executable,
-all with exit 86 and no outer kill. Eight retain their 64-byte admission lease;
-the escaped-session case has no lease. New polling and final-release cases
-hold stderr's real lock: fatal watchdog paths exit immediately without logging,
-so a wedged logging thread cannot prevent termination. These are synthetic
-100 ms close deadlines under five-second outer guards, not measured driver hangs.
-
-The actual TTL failure exposed an operational issue: releasing metrics/listing
-snapshot handles refreshed each model's last-use timestamp, so frequent scrapes
-could prevent idle eviction indefinitely. Snapshot release now preserves that
-timestamp while retaining the same active-handle and retired-final-owner cleanup.
-Ordinary inference handles still refresh usage. The model-free snapshot,
-retirement and listing checks pass; no public release-mode knob was added.
-
-Corrected actual-Metal TTL validation now passes all 11 selected tests with
-no skips, failures or leaks, using the same frozen executable as the first
-post-fix attempt. The first attempt passed ten model-free checks but hit the
-live-memory guard before initial inference; that 11/10/0/1 receipt remains a
-failed admission checkpoint. No cap or source change was made for the retry.
-
-The successful test retains the same 1/4/5 GiB host/backend/combined profile,
-3 GiB scratch and live-memory guard. A held model survives expiry, then actual
-eviction releases its aliases, residency leases and teardown ticket. Fresh reload
-and same-cache retry pass the fixture and five source-file hashes. A real metrics
-scrape preserves the exact pre-scrape last-use timestamp; final eviction uses that
-original expiry and returns cache, leases, tickets and transient device ownership
-to their empty baseline. Both closing phases pass the unchanged 30-second bound
-(15.871518 and 20.680144 seconds); held/pre-expiry/empty checks each take 1 microsecond
-under their five-second bound. These are whole-maintenance timings, including
-post-close allocator reclaim, not isolated driver latency or a performance gate.
-The 74.024-second run reports 1,001,390,080 bytes sampled peak child-tree RSS,
-unchanged 2,588-file source inventory and complete owned-process cleanup.
-
-The independent [published regional training campaign](GLINER25_RECOMPUTED_TRAINING.md#published-small-native-campaign)
-is also complete for native small all-target LoRA/DoRA restart/artifact consistency.
-It does not qualify published regional Metal, broader source numerics or release.
+Run logs and intermediate failed checkpoints are external artifacts, separate
+from reusable regression sources. Public availability and the exact-artifact
+production policy remain closed pending release qualification.
 
 ## Inspect extraction lifecycle metrics
 
@@ -412,14 +216,9 @@ in-memory counters. Correlate parent supervision and worker-exit evidence with
 these metrics; missing completions must not be interpreted as successful
 requests. Process restarts reset counters. Use the deployment's existing
 process/resource metrics for RSS, device allocation and hard-kill accounting.
-The five focused observability tests pass, along with renderer, V2 dispatch
-and cancellation/admission tests, in a 25-selected-test CPU checkpoint with
-no skips or leaks. Its receipt is
-`/private/tmp/gliner25-merge-metrics-integration-v1.log`, SHA-256
-`0a0b81baffed9696beef213f13fa01dec138e0f7346c1b1ed79fd63712c41c7c`.
-The shared Prometheus package suite also exits successfully, including scalar
-and vector exact-boundary regressions: histogram `le` buckets include values
-equal to the declared upper bound. The optional
+Observability regressions cover rendering, dispatch, cancellation/admission
+and scalar/vector histogram boundaries: `le` buckets include values equal to
+the declared upper bound. The optional
 [dashboard, recording rules and alert runbook](GLINER25_MONITORING.md) now have
 offline native Prometheus validation and a pinned temporary-tool CI bootstrap.
 They keep missing data, worker identity, strict rejection and decoded witnesses

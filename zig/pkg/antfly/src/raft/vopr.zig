@@ -48,7 +48,7 @@ pub fn Scenario(comptime hostile_budget: u64) type {
         const Self = @This();
 
         pub const name: []const u8 = "raft-group";
-        pub const version: u32 = 1;
+        pub const version: u32 = 2;
         pub const properties = &[_]vopr.property.Declaration{
             .{ .id = one_leader_per_term_id, .name = "raft.group.one_leader_per_term", .kind = .always },
             .{ .id = monotonic_progress_id, .name = "raft.group.term_commit_apply_monotonic", .kind = .always },
@@ -67,6 +67,8 @@ pub fn Scenario(comptime hostile_budget: u64) type {
             applied: [peers.len]Applied = .{ .empty, .empty, .empty },
             max_term: [peers.len]u64 = .{ 0, 0, 0 },
             max_commit: [peers.len]u64 = .{ 0, 0, 0 },
+            max_durable_term: [peers.len]u64 = .{ 0, 0, 0 },
+            max_durable_commit: [peers.len]u64 = .{ 0, 0, 0 },
             max_applied: [peers.len]u64 = .{ 0, 0, 0 },
             compacted: [peers.len]u64 = .{ 0, 0, 0 },
             actions: u64 = 0,
@@ -109,6 +111,8 @@ pub fn Scenario(comptime hostile_budget: u64) type {
             state.applied = .{ .empty, .empty, .empty };
             state.max_term = .{ 0, 0, 0 };
             state.max_commit = .{ 0, 0, 0 };
+            state.max_durable_term = .{ 0, 0, 0 };
+            state.max_durable_commit = .{ 0, 0, 0 };
             state.max_applied = .{ 0, 0, 0 };
             state.compacted = .{ 0, 0, 0 };
             state.actions = 0;
@@ -192,6 +196,13 @@ pub fn Scenario(comptime hostile_budget: u64) type {
                 const spec = restartSpec(node_id);
                 try state.faults.start(spec, events, allocator);
                 try state.cluster.restart(node_id);
+                // A crash discards pending local writes. Volatile term/commit
+                // may return to the durable frontier, but durable progress and
+                // completed application must never regress across incarnations.
+                const offset = nodeOffset(node_id);
+                const durable = state.cluster.stores[offset].hard_state;
+                state.max_term[offset] = durable.current_term;
+                state.max_commit[offset] = durable.commit_index;
                 _ = try state.faults.consumeOneShot(.node, spec.resource_id, events, allocator);
                 try events.emitNamed(allocator, .state_change, "raft.group.node_restarted", node_id);
             } else if (nodeForTransition(selected, compact_base)) |node_id| {
@@ -262,6 +273,9 @@ pub fn Scenario(comptime hostile_budget: u64) type {
                 try addNodeObservation(builder, allocator, "raft.group.node.role", node_id, @intFromEnum(status.soft.role));
                 try addNodeObservation(builder, allocator, "raft.group.node.leader", node_id, @intCast(status.soft.leader_id orelse 0));
                 try addNodeObservation(builder, allocator, "raft.group.node.commit", node_id, @intCast(status.hard.commit_index));
+                const durable = state.cluster.stores[index].hard_state;
+                try addNodeObservation(builder, allocator, "raft.group.node.durable_term", node_id, @intCast(durable.current_term));
+                try addNodeObservation(builder, allocator, "raft.group.node.durable_commit", node_id, @intCast(durable.commit_index));
                 try addNodeObservation(builder, allocator, "raft.group.node.applied", node_id, @intCast(status.applied_index));
                 try addNodeObservation(builder, allocator, "raft.group.node.last_index", node_id, @intCast(status.last_index));
                 try addNodeObservation(builder, allocator, "raft.group.node.app_count", node_id, @intCast(state.applied[index].items.len));
@@ -356,6 +370,14 @@ fn partitionNodeForTransition(state: anytype, selected: vopr.transition.Transiti
 
 fn enumerateMessages(messages: []const Message, list: *vopr.transition.List, allocator: std.mem.Allocator, storage: bool) !void {
     for (messages, 0..) |msg, index| {
+        if (storage) {
+            // Async Raft storage has one ordered append lane and one ordered
+            // apply lane per node. Only different lanes may complete out of order.
+            const blocked = for (messages[0..index]) |prior| {
+                if (prior.from == msg.from and prior.msg_type == msg.msg_type) break true;
+            } else false;
+            if (blocked) continue;
+        }
         const occurrence = identicalOccurrence(messages[0..index], msg);
         const identity = vopr.id.derive("raft.group.queued-message-occurrence", messageDigest(msg), occurrence);
         if (storage) {
@@ -500,11 +522,18 @@ fn finishAndVerify(state: anytype, events: *vopr.event.Sink, allocator: std.mem.
 fn auditProgress(state: anytype) void {
     for (peers, 0..) |node_id, index| {
         const status = state.cluster.node(node_id).status();
+        const durable = state.cluster.stores[index].hard_state;
         if (status.hard.current_term < state.max_term[index] or
             status.hard.commit_index < state.max_commit[index] or
+            durable.current_term < state.max_durable_term[index] or
+            durable.commit_index < state.max_durable_commit[index] or
+            status.hard.current_term < durable.current_term or
+            status.hard.commit_index < durable.commit_index or
             status.applied_index < state.max_applied[index]) state.monotonic = false;
         state.max_term[index] = @max(state.max_term[index], status.hard.current_term);
         state.max_commit[index] = @max(state.max_commit[index], status.hard.commit_index);
+        state.max_durable_term[index] = @max(state.max_durable_term[index], durable.current_term);
+        state.max_durable_commit[index] = @max(state.max_durable_commit[index], durable.commit_index);
         state.max_applied[index] = @max(state.max_applied[index], status.applied_index);
         state.ever_had_leader = state.ever_had_leader or status.soft.role == .leader;
     }
@@ -606,6 +635,51 @@ fn runRecordReplay(comptime budget: u64, seed: u64) !void {
 test "raft VOPR schedules real per-group network storage apply restart and snapshot transitions" {
     try runRecordReplay(32, 0xA17F_AA01);
     try runRecordReplay(32, 0xA17F_AA02);
+}
+
+test "raft VOPR crash before persistence discards only volatile progress" {
+    const RaftScenario = Scenario(32);
+    var world = try RaftScenario.init(std.testing.allocator);
+    defer RaftScenario.deinit(&world, std.testing.allocator);
+    const state = world.state;
+    state.cluster.setNodePreVote(3, false);
+    try state.cluster.campaign(3);
+    auditProgress(state);
+    try std.testing.expectEqual(@as(u64, 1), state.cluster.node(3).status().hard.current_term);
+    try std.testing.expectEqual(@as(u64, 0), state.cluster.stores[2].hard_state.current_term);
+    var events = vopr.event.Sink{};
+    defer events.deinit(std.testing.allocator);
+    _ = try RaftScenario.execute(&world, nodeTransition(restart_base, "raft.group.restart", .fault, 3), &events, std.testing.allocator);
+    try std.testing.expect(state.monotonic);
+    try std.testing.expectEqual(@as(u64, 0), state.cluster.node(3).status().hard.current_term);
+
+    // Once persisted, the same term is an invariant across every restart.
+    try state.cluster.campaign(3);
+    while (state.cluster.pendingStorageCompletions() != 0) try state.cluster.completeStorageAt(0);
+    auditProgress(state);
+    try std.testing.expect(state.max_durable_term[2] > 0);
+    _ = try RaftScenario.execute(&world, nodeTransition(restart_base, "raft.group.restart", .fault, 3), &events, std.testing.allocator);
+    try std.testing.expect(state.monotonic);
+    state.cluster.stores[2].hard_state.current_term = 0;
+    auditProgress(state);
+    try std.testing.expect(!state.monotonic);
+}
+
+test "raft VOPR storage scheduling preserves each node append and apply lane order" {
+    const messages = [_]Message{
+        .{ .from = 1, .to = 0, .msg_type = .storage_append },
+        .{ .from = 1, .to = 0, .msg_type = .storage_append, .term = 2 },
+        .{ .from = 1, .to = 0, .msg_type = .storage_apply },
+        .{ .from = 2, .to = 0, .msg_type = .storage_append },
+    };
+    var enabled = vopr.transition.List{};
+    defer enabled.deinit(std.testing.allocator);
+    try enumerateMessages(&messages, &enabled, std.testing.allocator, true);
+    try std.testing.expectEqual(@as(usize, 3), enabled.items.items.len);
+    for (enabled.items.items) |candidate| try std.testing.expect(candidate.parameter != 1);
+    enabled.items.clearRetainingCapacity();
+    try enumerateMessages(messages[1..], &enabled, std.testing.allocator, true);
+    try std.testing.expectEqual(@as(usize, 3), enabled.items.items.len);
 }
 
 test "raft VOPR exact replay is stable across repeated fresh worlds" {

@@ -1,5 +1,6 @@
 """Pure ownership/admission tests; no subprocess or numerical runtime executes."""
 import os
+import io
 from pathlib import Path
 import signal
 import tempfile
@@ -11,6 +12,53 @@ import supervise_training_attention as capture
 
 
 class TrainingAttentionSupervisorTest(unittest.TestCase):
+    def test_supervisor_is_independent_of_archived_campaign_files(self):
+        self.assertEqual(capture.HERE, capture.SUPERVISOR.parent)
+        raw = capture.require_pin(capture.SUPERVISOR, capture.SUPERVISOR_PIN)
+        self.assertEqual(12474, len(raw))
+        runtime = capture.json.loads((capture.HERE / "oracle_manifest.json").read_text())["runtime"]
+        generator = SimpleNamespace(
+            preflight=mock.Mock(return_value=({"runtime": runtime, "source_commit": "pinned"}, Path("source.py"))),
+            digest=mock.Mock(return_value={"sha256": "source"}),
+        )
+        identity = {"python_invocation": "/chosen/venv/bin/python", "python_executable": {"sha256": "python"}, "pyvenv_cfg": None}
+        with mock.patch.object(capture, "module_from_bytes", return_value=generator), \
+                mock.patch.object(capture, "python_identity", return_value=identity):
+            _, _, admitted = capture.preflight(Path("/chosen/upstream"))
+        generator.preflight.assert_called_once_with(Path("/chosen/upstream"))
+        self.assertEqual(identity["python_invocation"], admitted["python_invocation"])
+        self.assertNotIn("prior_checks", admitted)
+        self.assertEqual("gliner25_training_attention_supervision/v2", admitted["scope"])
+
+    def test_interpreter_identity_preserves_virtualenv_invocation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            actual = root / "real-python"
+            actual.write_bytes(b"test executable")
+            virtualenv = root / "venv"
+            (virtualenv / "bin").mkdir(parents=True)
+            invocation = virtualenv / "bin/python"
+            invocation.symlink_to(actual)
+            config = virtualenv / "pyvenv.cfg"
+            config.write_bytes(b"test environment")
+            with mock.patch.object(capture.sys, "executable", str(invocation)):
+                identity = capture.python_identity()
+                self.assertEqual(str(invocation), identity["python_invocation"])
+                self.assertEqual(capture.pin(actual.read_bytes()), identity["python_executable"])
+                self.assertEqual(capture.pin(config.read_bytes()), identity["pyvenv_cfg"])
+                config.unlink()
+                self.assertIsNone(capture.python_identity()["pyvenv_cfg"])
+
+    def test_capture_requires_explicit_paths_but_preflight_needs_no_old_outputs(self):
+        args = capture.parse_args(["--upstream", "/chosen/upstream", "--preflight-only"])
+        self.assertIsNone(args.output_dir)
+        self.assertIsNone(args.evidence_dir)
+        for arguments in ([], ["--upstream", "/chosen/upstream"],
+                ["--upstream", "/chosen/upstream", "--output-dir", "/fresh/capture"]):
+            with self.subTest(arguments=arguments), mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as error:
+                capture.parse_args(arguments)
+            self.assertEqual(2, error.exception.code)
+
     def test_exact_source_pin_rejects_same_size_substitution(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "source.py"

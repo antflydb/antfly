@@ -20,6 +20,7 @@ const builtin = @import("builtin");
 const test_runtime_support = if (builtin.is_test) @import("http_test_runtime.zig") else struct {};
 const platform = @import("antfly_platform");
 const build_options = @import("build_options");
+const openapi_specs = @import("antfly_openapi_specs");
 const scraping = @import("antfly_scraping");
 const fs_paths = @import("../common/fs_paths.zig");
 const common_secrets = @import("../common/secrets.zig");
@@ -5398,6 +5399,8 @@ pub const ApiHttpServer = struct {
                 .replay_applied_sequence = index.replay_applied_sequence,
                 .replay_target_sequence = index.replay_target_sequence,
                 .replay_catch_up_required = index.replay_catch_up_required,
+                .dense_vector_projection_pending = index.dense_vector_projection_pending,
+                .dense_native_storage_phase = index.dense_native_storage_phase,
                 // Metadata already applied its incarnation-scoped TTL cache
                 // before producing this report. Preserve the observation bit
                 // and ordering token together; dropping either makes the API
@@ -5722,7 +5725,18 @@ pub const ApiHttpServer = struct {
             // backfill and turns a supposedly best-effort field into an
             // unbounded GET /tables stall.
             .lsm = liveLsmStorageStatusFromRuntimeStatuses(local_statuses.items),
+            .source_vectors = liveSourceVectorStatus(local_statuses.items),
         };
+    }
+
+    fn liveSourceVectorStatus(statuses: []const runtime_status.LocalTableRuntimeStatus) ?@import("../storage/artifact_payload.zig").Stats {
+        // Source mode is admitted only for one shard. Read its resident-owner
+        // observation; do not open files or trigger maintenance from status.
+        for (statuses) |status| {
+            if (!runtime_status.statusRuntimeFresh(status)) continue;
+            if (status.source_vectors) |source| return source;
+        }
+        return null;
     }
 
     fn liveLsmStorageStatusFromRuntimeStatuses(
@@ -6112,7 +6126,7 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
         if (std.mem.eql(u8, path, routes.Routes.ard_v1_openapi)) {
-            return contextual_operations.bytes("application/yaml", try self.alloc.dupe(u8, build_options.ard_openapi_ard_yaml));
+            return contextual_operations.bytes("application/yaml", try self.alloc.dupe(u8, openapi_specs.ard));
         }
         if (std.mem.startsWith(u8, path, routes.Routes.ard_v1_openapi_prefix)) {
             const name = path[routes.Routes.ard_v1_openapi_prefix.len..];
@@ -6354,11 +6368,11 @@ pub const ApiHttpServer = struct {
     }
 
     fn ardOpenApiSpec(name: []const u8) ?ArdOpenApiSpec {
-        if (std.mem.eql(u8, name, "antfly.yaml")) return .{ .body = build_options.ard_openapi_antfly_yaml };
-        if (std.mem.eql(u8, name, "metadata.yaml")) return .{ .body = build_options.ard_openapi_metadata_yaml };
-        if (std.mem.eql(u8, name, "inference-config.yaml")) return .{ .body = build_options.ard_openapi_inference_config_yaml };
-        if (std.mem.eql(u8, name, "extensions.yaml")) return .{ .body = build_options.ard_openapi_extensions_yaml, .admin_only = true };
-        if (std.mem.eql(u8, name, "auth.yaml")) return .{ .body = build_options.ard_openapi_auth_yaml, .admin_only = true };
+        if (std.mem.eql(u8, name, "antfly.yaml")) return .{ .body = openapi_specs.antfly };
+        if (std.mem.eql(u8, name, "metadata.yaml")) return .{ .body = openapi_specs.metadata };
+        if (std.mem.eql(u8, name, "inference-config.yaml")) return .{ .body = openapi_specs.inference_config };
+        if (std.mem.eql(u8, name, "extensions.yaml")) return .{ .body = openapi_specs.extensions, .admin_only = true };
+        if (std.mem.eql(u8, name, "auth.yaml")) return .{ .body = openapi_specs.auth, .admin_only = true };
         return null;
     }
 
@@ -14914,6 +14928,7 @@ pub const ApiHttpServer = struct {
         self.source.createTable(self.alloc, table_name, request) catch |err| return switch (err) {
             error.TableAlreadyExists => try contextual_operations.textAlloc(self.alloc, 409, "table already exists"),
             error.InvalidCreateTableRequest, error.InvalidTableName => try contextual_operations.textAlloc(self.alloc, 400, "invalid table configuration"),
+            error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => try contextual_operations.textAlloc(self.alloc, 400, "vector_store requires a fresh local single-shard standalone table without replication"),
             error.CreateTableShardCountOutOfRange => try contextual_operations.textAlloc(self.alloc, 400, tables_api.table_initial_ranges_error_message),
             error.CreateTableRequestTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "create table request too large"),
             error.TableTopologyProtocolUpgradeRequired => try contextualRetryableTextResponse(self.alloc, 503, "metadata cluster upgrade in progress; retry later"),
@@ -39309,6 +39324,7 @@ test "remote runtime status reports replay debt separately from active catch-up"
             .lifecycle_work_class = .repair,
             .repair_status = .waiting,
             .repair_active_generation_serviceable = false,
+            .dense_vector_projection_pending = true,
             .embedding_activity_observed = true,
             .embedding_activity = .{
                 .epoch = 7,
@@ -39329,6 +39345,7 @@ test "remote runtime status reports replay debt separately from active catch-up"
     try std.testing.expectEqual(true, index.replay_catch_up_required);
     try std.testing.expectEqual(db_mod.types.IndexRepairStatus.waiting, index.index_repair_status.?);
     try std.testing.expect(!index.index_repair_active_generation_serviceable);
+    try std.testing.expect(index.dense_vector_projection_pending);
     try std.testing.expectEqual(false, index.catch_up_active);
     try std.testing.expectEqual(@as(u64, 225), index.catch_up_applied_sequence);
     try std.testing.expectEqual(@as(u64, 300), index.catch_up_target_sequence);

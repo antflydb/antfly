@@ -1265,12 +1265,12 @@ class StatefulAntflyServer:
 def require_standalone_storage_headroom(root: Path) -> None:
     """Fail before launch when production disk admission cannot run fixtures.
 
-    Match storage/resource_manager.zig's default max(1 GiB, capacity/20)
+    Match storage/resource_manager.zig's max(1 GiB, min(capacity/20, 16 GiB))
     safety floor, plus 256 MiB for the small local fixtures. This is a test
     environment requirement, not an override of the server's disk guard.
     """
     usage = shutil.disk_usage(root)
-    safety_floor = max(1024**3, usage.total // 20)
+    safety_floor = max(1024**3, min(usage.total // 20, 16 * 1024**3))
     required = safety_floor + 256 * 1024**2
     if usage.free < required:
         raise RuntimeError(
@@ -2189,6 +2189,12 @@ class InferenceEmbeddingServer:
                     f"{INFERENCE_PUBLIC_API_ROOT}/embed",
                     f"{INFERENCE_PUBLIC_API_ROOT}/embeddings",
                 ):
+                    # Match the inference API's optional, non-nullable strings.
+                    # Permissive fixtures previously hid invalid database requests.
+                    for field in ("task_type", "instruction"):
+                        if field in payload and not isinstance(payload[field], str):
+                            self.send_error(400, f"{field} must be a string")
+                            return
                     model = payload.get("model", "")
                     is_dimension_probe = (
                         "antfly embedding dimension probe"
@@ -2970,8 +2976,11 @@ def stateful_api(request: pytest.FixtureRequest):
             num_shards: int = 1,
             description: str | None = None,
             indexes: dict[str, dict] | None = None,
+            storage: dict[str, str] | None = None,
         ) -> dict:
             payload: dict[str, object] = {"num_shards": num_shards}
+            if storage is not None:
+                payload["storage"] = storage
             if description is not None:
                 payload["description"] = description
             if indexes is not None:

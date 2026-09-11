@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const build_info = @import("build_info");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const httpx = @import("httpx");
@@ -17105,7 +17106,7 @@ pub const Node = struct {
 
     pub fn getVersion(_: *Node, ctx: *httpx.Context) !httpx.Response {
         return ctx.json(.{
-            .version = build_options.inference_version,
+            .version = build_info.version(),
             .git_commit = build_options.git_commit,
             .build_time = build_options.build_time,
             .go_version = build_options.go_version,

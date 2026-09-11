@@ -1,3 +1,0 @@
-1/100 server.model_manager.test.model manager teardown supervised child fixture...teardown-fixture operation-start:retired
-[default] (warn): retiring failed inference model path=teardown-fixture backend=metal
-teardown-fixture close-entered lease-held64

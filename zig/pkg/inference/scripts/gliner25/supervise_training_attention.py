@@ -17,13 +17,8 @@ import sys
 from types import ModuleType
 
 HERE = Path(__file__).resolve().parent
-FIXTURES = HERE.parent.parent / "testdata/gliner25"
-SUPERVISOR = FIXTURES / "published_inactive_classifier_cpu_v1/helpers/v2/supervision.py"
-PYTHON = Path("/private/tmp/antfly-gliner25-oracle-venv/bin/python")
-UPSTREAM = Path("/private/tmp/antfly-gliner25-upstream")
-DEFAULT_OUTPUT = Path("/private/tmp/gliner25-training-attention-v1")
-DEFAULT_EVIDENCE = Path("/private/tmp/gliner25-training-attention-probe-v1")
-SCOPE = "gliner25_training_attention_supervision/v1"
+SUPERVISOR = HERE / "process_supervision.py"
+SCOPE = "gliner25_training_attention_supervision/v2"
 MAX_ARTIFACT_BYTES = 64 * 1024**2
 PINS = {
     "capture_training_attention.py": {"size_bytes": 20879, "sha256": "c67ee517899871b4ad36a11408ff321028ad10ab88f0941aa0c09ef48f6a1a6f"},
@@ -33,10 +28,6 @@ PINS = {
     "oracle_manifest.json": {"size_bytes": 4097, "sha256": "918005508a57d2c558c18a78167637f39c54e7c2c6d67814be15fc6714c4152f"},
 }
 SUPERVISOR_PIN = {"size_bytes": 12474, "sha256": "a937237975be2ed879f62afd285494ccb51a7c1d7cc1dff7160621fb26b87332"}
-PROOF_PINS = {
-    "/private/tmp/gliner25-training-attention-preflight-v3.log": {"size_bytes": 118, "sha256": "4fb33fa67f62f8f2a25df60b90fc4d71ce840efe810d3e453b237b817692ddc1"},
-    "/private/tmp/gliner25-training-attention-contract-tests-v2.log": {"size_bytes": 1339, "sha256": "c80a5175af28c38a51dd57e8e86ff5c64939cbd8a6e3ad3635daaeb6b2e4548f"},
-}
 LIMITS = {"timeout_seconds": 180, "rss_limit_bytes": 2 * 1024**3,
           "output_limit_bytes": 4 * 1024**2, "grace_seconds": 2.0,
           "kill_seconds": 5.0, "worker_grace_seconds": 2.0, "tick": 0.05}
@@ -135,30 +126,35 @@ def fresh_path(path):
     checked(not os.path.lexists(path), "refusing to overwrite attention output: " + str(path))
 
 
-def preflight():
-    checked(Path(os.path.abspath(sys.executable)) == PYTHON, "invoke the supervisor through the pinned virtualenv Python")
+def python_identity():
+    # Keep the invocation path: resolving a venv symlink before spawn escapes
+    # its environment. Hash the underlying executable and record optional venv
+    # metadata; the oracle independently verifies every dependency version.
+    invocation = Path(os.path.abspath(sys.executable))
+    executable = read(invocation.resolve(), 32 * 1024**2)
+    cfg = invocation.parent.parent / "pyvenv.cfg"
+    return {"python_invocation": str(invocation), "python_executable": pin(executable),
+            "pyvenv_cfg": pin(read(cfg)) if cfg.exists() else None}
+
+
+def preflight(upstream):
     inputs = {name: require_pin(HERE / name, expected) for name, expected in PINS.items()}
     supervisor_raw = require_pin(SUPERVISOR, SUPERVISOR_PIN)
-    proofs = {name: pin(require_pin(Path(name), expected)) for name, expected in PROOF_PINS.items()}
     generator = module_from_bytes("attention_source_contract", HERE / "capture_training_attention.py", inputs["capture_training_attention.py"])
-    contract, source = generator.preflight(UPSTREAM)
+    contract, source = generator.preflight(upstream)
     manifest_raw = inputs["oracle_manifest.json"]
     checked(json.loads(manifest_raw)["runtime"] == contract["runtime"], "oracle manifest dependency closure differs")
     inputs["oracle_manifest.json"] = manifest_raw
     checked(not any(name in sys.modules for name in ("torch", "gliner2", "peft")), "supervisor preflight imported a numerical runtime")
-    executable = read(PYTHON.resolve(), 32 * 1024**2)
-    checked(pin(executable)["sha256"] == "80ee2dd97bc26259d4e30853336f72ad38aa4aa0531bb196cc444d899422689d", "Python executable changed")
-    cfg = read(PYTHON.parent.parent / "pyvenv.cfg")
-    checked(pin(cfg) == {"size_bytes": 339, "sha256": "b5575d239986adf44b66e0f3c032be806b508ec16f37cdb548653c301e9c6793"}, "virtualenv configuration changed")
     return inputs, supervisor_raw, {"scope": SCOPE, "qualification": False, "inputs": {name: pin(raw) for name, raw in inputs.items()},
-        "supervisor": SUPERVISOR_PIN, "prior_checks": proofs, "transformers_source": generator.digest(source),
-        "runtime": contract["runtime"], "python_invocation": str(PYTHON), "python_executable": pin(executable),
-        "pyvenv_cfg": pin(cfg), "limits": {**LIMITS, "artifact_bytes": MAX_ARTIFACT_BYTES},
+        "supervisor": SUPERVISOR_PIN, "transformers_source": generator.digest(source),
+        "runtime": contract["runtime"], **python_identity(),
+        "limits": {**LIMITS, "artifact_bytes": MAX_ARTIFACT_BYTES},
         "source_commit": contract["source_commit"], "wrapper": pin(read(Path(__file__)))}
 
 
-def execute(output, evidence):
-    inputs, supervisor_raw, admitted = preflight()
+def execute(upstream, output, evidence):
+    inputs, supervisor_raw, admitted = preflight(upstream)
     fresh_path(output)
     fresh_path(evidence)
     checked(output != evidence, "capture and supervision owners must differ")
@@ -168,8 +164,8 @@ def execute(output, evidence):
     for name in ("capture_training_attention.py", "training_attention_contract_v1.json", "oracle.py", "oracle_manifest.json"):
         with (snapshots / name).open("xb") as destination:
             destination.write(inputs[name])
-    command = [str(PYTHON), "-B", str(snapshots / "capture_training_attention.py"),
-               "--upstream", str(UPSTREAM), "--output-dir", str(output)]
+    command = [admitted["python_invocation"], "-B", str(snapshots / "capture_training_attention.py"),
+               "--upstream", str(upstream), "--output-dir", str(output)]
     admitted.update(command=command, output_dir=str(output), evidence_dir=str(evidence), status="admitted")
     publish(evidence / "start.json", admitted)
     supervisor = module_from_bytes("pinned_attention_supervision", SUPERVISOR, supervisor_raw)
@@ -211,21 +207,31 @@ def stop_signal(_number, _frame):
     raise KeyboardInterrupt("attention supervisor interrupted")
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--upstream", type=Path, required=True, help="Checkout of the pinned Fastino commit")
     parser.add_argument("--preflight-only", action="store_true")
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--evidence-dir", type=Path, default=DEFAULT_EVIDENCE)
-    args = parser.parse_args()
+    parser.add_argument("--output-dir", type=Path, help="Fresh absolute capture directory")
+    parser.add_argument("--evidence-dir", type=Path, help="Fresh absolute process-receipt directory")
+    args = parser.parse_args(argv)
+    if not args.preflight_only and (args.output_dir is None or args.evidence_dir is None):
+        parser.error("capture requires --output-dir and --evidence-dir")
+    args.upstream = args.upstream.expanduser().resolve()
+    return args
+
+
+def main():
+    args = parse_args()
     if args.preflight_only:
-        _, _, admitted = preflight()
-        fresh_path(args.output_dir)
-        fresh_path(args.evidence_dir)
+        _, _, admitted = preflight(args.upstream)
+        for path in (args.output_dir, args.evidence_dir):
+            if path is not None:
+                fresh_path(path)
         print(json.dumps({**admitted, "status": "preflight_only", "model_execution": False}, sort_keys=True))
     else:
         previous = {number: signal.signal(number, stop_signal) for number in (signal.SIGINT, signal.SIGTERM)}
         try:
-            result = execute(args.output_dir, args.evidence_dir)
+            result = execute(args.upstream, args.output_dir, args.evidence_dir)
         finally:
             for number, handler in previous.items():
                 signal.signal(number, handler)

@@ -12,8 +12,12 @@ Run through the public inference executable:
 antfly-inference finetune adapter materialize gliner25 /absolute/path/merge.json
 ```
 
-The standalone repository target is `materialize-gliner25-adapter`. Both routes
-use the same job and disposable worker. `--shutdown-grace-seconds N` accepts
+The standalone package target is `materialize-gliner25-adapter`; from `zig/`,
+the shared repository graph exposes `inference-materialize-gliner25-adapter`.
+For example, `zig build inference-materialize-gliner25-adapter
+-Doptimize=ReleaseFast -Dmetal=false -Dcuda=false -Donnx=false -Dpjrt=false -j1
+-- /absolute/path/merge.json` builds and runs the same command. All routes use
+the same job and disposable worker. `--shutdown-grace-seconds N` accepts
 1–300 seconds and defaults to 30. The first SIGINT or SIGTERM cancels the merge
 and allows private staging cleanup; a second signal or the hard deadline forces
 termination. The supervisor owns the child PID and reaping and never retries a

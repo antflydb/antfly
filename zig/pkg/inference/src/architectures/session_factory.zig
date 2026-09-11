@@ -2172,12 +2172,14 @@ fn createGpuHostedSessionWithTaskOverride(
     backend_resources_transferred = true;
     gpu_jina_lora_adapter = null;
     errdefer archClose(impl);
-    if (boundary_identity) |identity| if (identity.precision == .fp32) {
-        // Only metadata is attached here. The managed loader supplies its
-        // request control and admitted peak to the preparation hook before it
-        // publishes the session. Unmanaged owners call that same hook explicitly.
-        gpuBackendData(impl).boundary_resident = try boundary_resident.Owner.create(allocator, identity);
-    };
+    if (comptime build_options.enable_metal) {
+        if (boundary_identity) |identity| if (identity.precision == .fp32) {
+            // Only metadata is attached here. The managed loader supplies its
+            // request control and admitted peak to the preparation hook before it
+            // publishes the session. Unmanaged owners call that same hook explicitly.
+            gpuBackendData(impl).boundary_resident = try boundary_resident.Owner.create(allocator, identity);
+        };
+    }
     // Build and qualify the model-scoped provider before publishing the
     // session. Required mode therefore fails model loading, and subsequent
     // compute wrappers reuse the already-initialized shared provider.
@@ -4684,6 +4686,16 @@ fn openGpuHostedStream(backend_type: BackendType) !GpuHostedStream {
 fn ensureMetalHostedSessionAvailable() !void {
     if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
     if (!metal_runtime.metalDeviceAvailable()) return error.MetalDeviceUnavailable;
+}
+
+test "gpu-hosted Metal disabled constructors reject before model allocation" {
+    if (comptime build_options.enable_metal) return error.SkipZigTest;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const allocator = failing.allocator();
+    const missing_model = "/private/tmp/antfly-metal-disabled-intentionally-missing";
+    try std.testing.expectError(error.MetalNotEnabled, createMetalSession(allocator, missing_model));
+    try std.testing.expectError(error.MetalNotEnabled, createMetalSessionWithTaskOverride(allocator, missing_model, .classifier));
+    try std.testing.expect(!failing.has_induced_failure);
 }
 
 test "gpu-hosted Metal availability gate agrees with linked runtime probe" {

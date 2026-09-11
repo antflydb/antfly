@@ -1,3 +1,0 @@
-# Preserve the raw execution receipts despite the repository-wide *.log rule.
-!logs/*.log
-!receipts/**/*.log

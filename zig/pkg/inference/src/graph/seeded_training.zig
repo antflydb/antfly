@@ -172,8 +172,6 @@ pub const Session = struct {
         errdefer forward_analysis.deinit(a);
         var backward_analysis = try interpreter.CachedAnalysis.compute(a, &backward.graph);
         errdefer backward_analysis.deinit(a);
-        @import("resident_program_census.zig").emitIfEnabled(a, "forward", &differentiated.graph, forward_analysis.reachable);
-        @import("resident_program_census.zig").emitIfEnabled(a, "backward", &backward.graph, backward_analysis.reachable);
         const capture_ids = try a.dupe(Id, captures.items);
         errdefer a.free(capture_ids);
         const owned_seeds = try a.dupe(ml.autodiff.Seed, seeds);

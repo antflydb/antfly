@@ -38,6 +38,59 @@ pub const QuantizedSet = union(enum) {
         };
     }
 
+    /// Copy an ordered subset without changing its scoring origin or error
+    /// metadata. The caller binds row offsets to one posting mutation version;
+    /// offsets from another membership revision must never be reused here.
+    pub fn selectRows(self: *const QuantizedSet, alloc: Allocator, rows: []const usize) !QuantizedSet {
+        const count = switch (self.*) {
+            .rabit => |set| set.getCount(),
+            .nonquant => |set| std.math.cast(usize, set.vectors.count) orelse return error.InvalidPostingRows,
+        };
+        for (rows, 0..) |row, i| {
+            if (row >= count or (i != 0 and row <= rows[i - 1])) return error.InvalidPostingRows;
+        }
+        var result: QuantizedSet = switch (self.*) {
+            .nonquant => .{ .nonquant = .{} },
+            .rabit => .{ .rabit = .{} },
+        };
+        errdefer result.deinit(alloc);
+        switch (self.*) {
+            .nonquant => |set| {
+                const dims = std.math.cast(usize, set.vectors.dims) orelse return error.InvalidPostingRows;
+                if (set.vectors.data.len != try std.math.mul(usize, count, dims)) return error.InvalidPostingRows;
+                result.nonquant.vectors = .{
+                    .dims = set.vectors.dims,
+                    .count = @intCast(rows.len),
+                    .data = try selectRowPlane(f32, alloc, set.vectors.data, dims, rows),
+                };
+            },
+            .rabit => |set| {
+                const width = std.math.cast(usize, set.codes.width) orelse return error.InvalidPostingRows;
+                if (width == 0 or set.codes.count != count or
+                    set.codes.data.len != try std.math.mul(usize, count, width) or
+                    set.centroid_distances.len != count or set.quantized_dot_products.len != count or
+                    (set.centroid_dot_products.len != 0 and set.centroid_dot_products.len != count) or
+                    (set.metric != .l2_squared and set.centroid_dot_products.len != count)) return error.InvalidPostingRows;
+                const out = &result.rabit;
+                out.metric = set.metric;
+                out.centroid_norm = set.centroid_norm;
+                out.centroid = try alloc.dupe(f32, set.centroid);
+                out.codes = .{ .count = @intCast(rows.len), .width = set.codes.width, .data = try selectRowPlane(u64, alloc, set.codes.data, width, rows) };
+                out.code_counts = try selectRowPlane(u32, alloc, set.code_counts, 1, rows);
+                out.centroid_distances = try selectRowPlane(f32, alloc, set.centroid_distances, 1, rows);
+                out.quantized_dot_products = try selectRowPlane(f32, alloc, set.quantized_dot_products, 1, rows);
+                if (set.centroid_dot_products.len != 0) out.centroid_dot_products = try selectRowPlane(f32, alloc, set.centroid_dot_products, 1, rows);
+            },
+        }
+        return result;
+    }
+
+    fn selectRowPlane(comptime T: type, alloc: Allocator, data: []const T, width: usize, rows: []const usize) ![]T {
+        const out = try alloc.alloc(T, try std.math.mul(usize, rows.len, width));
+        for (rows, 0..) |row, i| @memcpy(out[i * width ..][0..width], data[row * width ..][0..width]);
+        return out;
+    }
+
     pub fn deinit(self: *QuantizedSet, alloc: Allocator) void {
         switch (self.*) {
             .rabit => |*set| set.deinit(alloc),
@@ -45,6 +98,162 @@ pub const QuantizedSet = union(enum) {
         }
         self.* = undefined;
     }
+};
+
+test "posting row selection preserves scoring origin and is allocation safe" {
+    const alloc = std.testing.allocator;
+    const Attempt = struct {
+        fn run(a: Allocator, source: *const QuantizedSet) !void {
+            var selected = try source.selectRows(a, &.{ 0, 2 });
+            defer selected.deinit(a);
+            switch (source.*) {
+                .nonquant => |set| {
+                    try std.testing.expectEqualSlices(f32, set.vectors.data[0..2], selected.nonquant.vectors.data[0..2]);
+                    try std.testing.expectEqualSlices(f32, set.vectors.data[4..6], selected.nonquant.vectors.data[2..4]);
+                },
+                .rabit => |set| {
+                    try std.testing.expectEqualSlices(f32, set.centroid, selected.rabit.centroid);
+                    try std.testing.expectEqual(set.centroid_norm, selected.rabit.centroid_norm);
+                    for ([_]usize{ 0, 2 }, 0..) |row, i| {
+                        try std.testing.expectEqualSlices(u64, set.codes.atConst(row), selected.rabit.codes.atConst(i));
+                        try std.testing.expectEqual(set.code_counts[row], selected.rabit.code_counts[i]);
+                        try std.testing.expectEqual(set.centroid_distances[row], selected.rabit.centroid_distances[i]);
+                        try std.testing.expectEqual(set.quantized_dot_products[row], selected.rabit.quantized_dot_products[i]);
+                    }
+                },
+            }
+        }
+    };
+    for ([_]vec.DistanceMetric{ .l2_squared, .cosine, .inner_product }) |metric| {
+        var q = try @import("antfly_vector").quantizer.RaBitQuantizer.init(alloc, 2, 42, metric);
+        defer q.deinit();
+        var source: QuantizedSet = .{ .rabit = try q.quantize(&.{ 0.5, 0.5 }, &.{ 1, 2, 3, 4, 5, 6 }, 3) };
+        defer source.deinit(alloc);
+        try std.testing.checkAllAllocationFailures(alloc, Attempt.run, .{&source});
+        try std.testing.expectError(error.InvalidPostingRows, source.selectRows(alloc, &.{ 1, 1 }));
+        try std.testing.expectError(error.InvalidPostingRows, source.selectRows(alloc, &.{ 2, 0 }));
+        try std.testing.expectError(error.InvalidPostingRows, source.selectRows(alloc, &.{3}));
+        var empty = try source.selectRows(alloc, &.{});
+        defer empty.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), empty.getCount());
+    }
+    var source: QuantizedSet = .{ .nonquant = .{ .vectors = .{ .dims = 2, .count = 3, .data = try alloc.dupe(f32, &.{ 1, 2, 3, 4, 5, 6 }) } } };
+    defer source.deinit(alloc);
+    try std.testing.checkAllAllocationFailures(alloc, Attempt.run, .{&source});
+}
+
+/// One immutable leaf scoring row borrowed from a generation lease. Keeping
+/// membership beside the fixed-width candidate plane removes the packed-node
+/// lookup and copy from the flat-directory search path. The source generation
+/// remains authoritative: adapters decline this view as soon as any leaf
+/// membership, posting state, or quantized payload is shadowed by a delta.
+pub const NativeLeafScanView = struct {
+    member_ids: []const u64,
+    quantized: QuantizedSet,
+    /// Native base/delta rows under the same complete generation lease. When
+    /// present, quantized is only a placeholder and must not be scored/freed.
+    row_snapshot: ?*const @import("posting_row_delta.zig").Snapshot = null,
+    /// Optional source-space float16 rows owned by the same immutable posting
+    /// generation. Rows follow member_ids exactly; per-row metadata makes the
+    /// resulting score interval conservative enough to defer authoritative
+    /// residual reads until the public top-k boundary is known.
+    projections: ?NativeProjectionPlane = null,
+    subgroup_plan: ?@import("posting_subgroups.zig").View = null,
+};
+
+pub const NativeProjectionPlane = struct {
+    dims: usize,
+    values: []const f16,
+    scales: []const f32,
+    error_norms: []const f32,
+    decoded_norm_lower_bounds: []const f32,
+    /// Source vector payload CRCs. Version-three posting generations omit
+    /// this column and remain scoreable, but cannot use residual-only exact
+    /// completion without revalidating the projection payload.
+    checksums: []const u32 = &.{},
+    verification: ?[]std.atomic.Value(u8) = null,
+    /// Optional generation-bound locations of the lossless residuals in the
+    /// shared exact-vector store. Older posting generations omit this plane;
+    /// callers must then resolve the artifact key through the authoritative
+    /// directory. A location is only a hint until the exact-vector generation
+    /// validates its generation, shard, sequence, projection checksum, and
+    /// residual checksum.
+    residual_locations: ?NativeResidualLocationPlane = null,
+
+    pub fn validateRow(self: @This(), row: usize) !void {
+        if (row >= self.scales.len or row >= self.checksums.len or self.dims == 0 or
+            row >= self.values.len / self.dims) return error.InvalidQuantizedDirectory;
+        const values = self.values[row * self.dims ..][0..self.dims];
+        try validateProjectionPayload(values, self.checksums[row], if (self.verification) |states| &states[row] else null);
+    }
+
+    pub fn validFor(self: @This(), count: usize, dims: usize) bool {
+        const expected_values = std.math.mul(usize, count, dims) catch return false;
+        return self.dims == dims and
+            self.values.len == expected_values and
+            self.scales.len == count and
+            self.error_norms.len == count and
+            self.decoded_norm_lower_bounds.len == count and
+            (self.checksums.len == 0 or self.checksums.len == count) and
+            (self.verification == null or self.verification.?.len == count) and
+            (self.residual_locations == null or self.residual_locations.?.validFor(count));
+    }
+};
+
+/// Memoization belongs to the immutable generation, never to an artifact ID
+/// that can be reused by a later mutation. Concurrent first readers may both
+/// hash a row; neither waits or holds a lock across mmap faults.
+pub fn validateProjectionPayload(values: []const f16, checksum: u32, verification: ?*std.atomic.Value(u8)) !void {
+    if (verification) |state| switch (state.load(.acquire)) {
+        1 => return,
+        2 => return error.QuantizedDirectoryChecksumMismatch,
+        else => {},
+    };
+    const valid = @import("antfly_hash").Crc32.hash(std.mem.sliceAsBytes(values)) == checksum;
+    if (verification) |state| state.store(if (valid) 1 else 2, .release);
+    if (!valid) return error.QuantizedDirectoryChecksumMismatch;
+}
+
+pub const NativeResidualLocation = types.NativeResidualLocation;
+pub const NativeResidualLocationPlane = types.NativeResidualLocationPlane;
+
+/// One transient projection returned to an immutable checkpoint builder. The
+/// callback owns the bytes only until it returns; the posting codec copies the
+/// complete leaf plane before the next callback invocation.
+pub const NativeProjectionBuildValue = struct {
+    bytes: []const u8 = &.{},
+    scale: f32 = 1,
+    error_norm: f32 = 0,
+    decoded_norm_lower_bound: f32 = 0,
+    checksum: u32 = 0,
+    residual_location: ?NativeResidualLocation = null,
+};
+
+pub const NativeProjectionBuildLoader = *const fn (
+    ctx: *anyopaque,
+    vector_ids: []const u64,
+    metadata: []const ?[]const u8,
+    values: []NativeProjectionBuildValue,
+    payload_scratch: []u8,
+    dims: usize,
+    source_sequence: u64,
+) anyerror!void;
+
+pub const NativeProjectionBuildBegin = *const fn (ctx: *anyopaque, source_sequence: u64) anyerror!void;
+pub const NativeProjectionBuildEnd = *const fn (ctx: *anyopaque) void;
+
+pub const NativeProjectionBuildSource = struct {
+    /// Training reads the shared projection, but need not duplicate that
+    /// matrix in the posting generation.
+    retain_projection_plane: bool = true,
+    subgroup_count: u8 = 0,
+    ctx: *anyopaque,
+    loader: NativeProjectionBuildLoader,
+    begin: ?NativeProjectionBuildBegin = null,
+    end: ?NativeProjectionBuildEnd = null,
+    /// Layout policy, independent of whether the source is available at this
+    /// instant. Missing optional acceleration remains retryable serving debt.
+    required: bool = false,
 };
 
 pub const WriteProfile = struct {
@@ -81,6 +290,9 @@ pub const WriteProfile = struct {
     external_vector_cache_hits: u64 = 0,
     external_vector_cache_misses: u64 = 0,
     centroid_recompute_calls: u64 = 0,
+    delete_reused_vector_rows: u64 = 0,
+    delete_preserved_vector_rows: u64 = 0,
+    delete_native_vector_rows: u64 = 0,
     centroid_recompute_members_total: u64 = 0,
     centroid_recompute_members_max: u64 = 0,
     save_split_range_ns: u64 = 0,
@@ -179,6 +391,10 @@ pub const BatchVectorLookup = struct {
 };
 
 pub const BatchInsertOptions = struct {
+    /// Share one authoritative transformed leaf matrix between centroid and
+    /// payload refresh on eager batch deletes. Does not defer either refresh.
+    reuse_delete_vectors: bool = false,
+    preserve_delete_rows: bool = false,
     defer_quantized_rebuild: bool = false,
     defer_quantized_rebuild_to_bulk_finish: bool = false,
     centroid_only_routing: bool = false,
@@ -567,18 +783,37 @@ pub fn cacheMetadata(self: anytype, vector_id: u64, metadata: []const u8) ![]con
 
 pub fn acquireSearchScratch(self: anytype) !ScratchHandle {
     lockAtomic(&self.scratch_mu);
-    defer self.scratch_mu.unlock();
     if (self.cached_scratch) |scratch| {
         self.cached_scratch = null;
+        self.scratch_mu.unlock();
         return .{ .scratch = scratch, .from_cache = true, .accounted_bytes = scratch.bytes() };
     }
-    const scratch = try SearchScratch.init(
+    const Index = @TypeOf(self.*);
+    if (comptime @hasField(Index, "cached_search_scratches")) {
+        if (self.cached_search_scratches.pop()) |scratch| {
+            self.scratch_mu.unlock();
+            return .{ .scratch = scratch, .from_cache = true, .accounted_bytes = scratch.bytes() };
+        }
+    }
+    self.scratch_mu.unlock();
+
+    const dims: usize = @intCast(self.metadata.dims);
+    const branching_factor: usize = @intCast(self.metadata.branching_factor);
+    const leaf_size: usize = @intCast(self.metadata.leaf_size);
+    const initial_bytes = try SearchScratch.initialBytes(dims, branching_factor, leaf_size);
+    const pre_admitted = comptime @hasDecl(Index, "admitNewSearchScratchBytes") and
+        @hasDecl(Index, "releaseSearchScratchBytes");
+    if (pre_admitted) try self.admitNewSearchScratchBytes(initial_bytes);
+    errdefer if (pre_admitted) self.releaseSearchScratchBytes(initial_bytes);
+    var scratch = try SearchScratch.init(
         self.alloc,
-        @intCast(self.metadata.dims),
-        @intCast(self.metadata.branching_factor),
-        @intCast(self.metadata.leaf_size),
+        dims,
+        branching_factor,
+        leaf_size,
     );
-    if (comptime @hasDecl(@TypeOf(self.*), "observeSearchWorkspaceBytes")) {
+    errdefer scratch.deinit(self.alloc);
+    std.debug.assert(scratch.bytes() == initial_bytes);
+    if (!pre_admitted and comptime @hasDecl(Index, "observeSearchWorkspaceBytes")) {
         self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted + scratch.bytes());
     }
     return .{
@@ -615,16 +850,37 @@ pub fn endSearchEpoch(self: anytype) void {
 
 pub fn releaseSearchScratch(self: anytype, handle: *ScratchHandle) void {
     lockAtomic(&self.scratch_mu);
-    defer self.scratch_mu.unlock();
     if (self.cached_scratch == null) {
         self.cached_scratch = handle.scratch;
-    } else {
-        var scratch = handle.scratch;
-        if (comptime @hasDecl(@TypeOf(self.*), "observeSearchWorkspaceBytes")) {
-            self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted -| handle.accounted_bytes);
-        }
-        scratch.deinit(self.alloc);
+        self.scratch_mu.unlock();
+        return;
     }
+    const Index = @TypeOf(self.*);
+    if (comptime @hasField(Index, "cached_search_scratches") and @hasDecl(Index, "searchScratchCacheLimit")) {
+        const cached_count = self.cached_search_scratches.items.len + 1;
+        if (cached_count < self.searchScratchCacheLimit()) {
+            self.cached_search_scratches.append(self.alloc, handle.scratch) catch {
+                self.scratch_mu.unlock();
+                deinitReleasedSearchScratch(self, handle);
+                return;
+            };
+            self.scratch_mu.unlock();
+            return;
+        }
+    }
+    self.scratch_mu.unlock();
+    deinitReleasedSearchScratch(self, handle);
+}
+
+fn deinitReleasedSearchScratch(self: anytype, handle: *ScratchHandle) void {
+    var scratch = handle.scratch;
+    const Index = @TypeOf(self.*);
+    if (comptime @hasDecl(Index, "releaseSearchScratchBytes")) {
+        self.releaseSearchScratchBytes(handle.accounted_bytes);
+    } else if (comptime @hasDecl(Index, "observeSearchWorkspaceBytes")) {
+        self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted -| handle.accounted_bytes);
+    }
+    scratch.deinit(self.alloc);
 }
 
 pub fn transformVector(self: anytype, original: []const f32, transformed: []f32) []const f32 {

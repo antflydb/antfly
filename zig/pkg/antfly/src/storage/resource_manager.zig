@@ -17,6 +17,10 @@ const builtin = @import("builtin");
 const platform_time = @import("antfly_platform").time;
 const shared_platform_time = @import("antfly_platform").time;
 const cache_budget = @import("../common/cache_budget.zig");
+pub const DenseWorkAdmission = @import("dense_work_admission.zig");
+const admission = @import("admission_waiter.zig");
+const dense_perf = @import("dense_perf_experiments.zig");
+pub const ProjectionPageCache = @import("projection_page_cache.zig");
 
 const MiB: u64 = 1024 * 1024;
 const dense_replay_window_min_bytes: u64 = 16 * MiB;
@@ -28,6 +32,14 @@ const dense_replay_finish_target_ns: u64 = 3 * std.time.ns_per_s;
 const dense_replay_finish_hard_ns: u64 = 8 * std.time.ns_per_s;
 const dense_replay_write_pressure_hard_ns: u64 = std.time.ns_per_s;
 const dense_replay_soft_compaction_quiet_ns: u64 = 500 * std.time.ns_per_ms;
+const foreground_query_maintenance_quiet_ns: u64 = 25 * std.time.ns_per_ms;
+const foreground_write_maintenance_quiet_ns: u64 = 2 * std.time.ns_per_ms;
+// A two-millisecond cap is shorter than one cold vector query and lets a
+// multi-GiB compactor repeatedly reclaim the storage device before the query
+// can fault its native posting/vector pages. Fifty milliseconds still gives a
+// sustained query stream bounded compaction progress at every merge quantum,
+// while allowing ordinary foreground reads to finish in one yield window.
+const foreground_query_compaction_yield_max_ns: u64 = 50 * std.time.ns_per_ms;
 const soft_throttle_delay_ns: u64 = 10 * std.time.ns_per_ms;
 const supports_pressure_wait = builtin.os.tag != .freestanding and
     builtin.link_libc and
@@ -74,6 +86,11 @@ else
     };
 const default_disk_safety_floor_bytes: u64 = 1024 * MiB;
 const default_disk_safety_floor_divisor: u64 = 20;
+// Percentage-only reserves strand tens or hundreds of GiB on large volumes
+// and can prevent the small repair that restores query service. Planned
+// candidate bytes are reserved independently, so this cap is additional
+// emergency durability headroom rather than the maintenance work budget.
+const default_disk_safety_floor_max_bytes: u64 = 16 * 1024 * MiB;
 
 pub const Slice = enum(u8) {
     lsm_block_table_cache,
@@ -106,6 +123,13 @@ pub const Slice = enum(u8) {
     inference_scratch_working_set,
     dense_repair_working_set,
     shard_transition_working_set,
+    /// Transient heap used to project primary embedding artifacts into an
+    /// immutable mmap exact-vector generation. This is separate from dense
+    /// apply so readiness publication cannot consume foreground mutation
+    /// admission, and every builder allocation remains inside the aggregate
+    /// host-memory envelope.
+    dense_vector_block_build_working_set,
+    dense_source_payload_state,
     /// Pending persistent object-range cache writes. The durable bytes use
     /// the capacity-domain ledger; this slice owns only queued key/payload
     /// memory until the cache worker completes or drops the write.
@@ -143,6 +167,8 @@ pub const Slice = enum(u8) {
             .inference_scratch_working_set => "inference.scratch_working_set",
             .dense_repair_working_set => "dense_repair.working_set",
             .shard_transition_working_set => "shard_transition.working_set",
+            .dense_vector_block_build_working_set => "dense.vector_block_build_working_set",
+            .dense_source_payload_state => "dense.source_payload_state",
             .lake_range_cache_queue => "lake.range_cache_queue",
         };
     }
@@ -312,22 +338,32 @@ pub const Options = struct {
     /// These are runtime policy values, not index or API configuration.
     derived_backlog_high_sequences: usize = 200,
     derived_backlog_resume_sequences: usize = 100,
-    /// Bound how much sequence-only replay debt one foreground admission must
-    /// inherit. Byte and aggregate LSM pressure can still request a larger
-    /// drain; this window only prevents a healthy async index backlog from
-    /// concentrating minutes of work into one public write acknowledgement.
+    /// Bound the asynchronous urgency target emitted when sequence-only replay
+    /// debt crosses its high watermark. Foreground requests never drain this
+    /// window themselves; payload plus tracker metadata remain independently
+    /// bounded by the derived-backlog byte budget.
     derived_backlog_throttle_window_sequences: usize = 16,
     /// Node-owned filesystem growth policy. This is deliberately not table or
-    /// index configuration. The larger of the fixed floor and this fraction
-    /// of observed capacity is kept available for WAL, checkpoints, and
-    /// foreground durability.
+    /// index configuration. The larger of the fixed floor and the bounded
+    /// capacity fraction is kept available for WAL, checkpoints, and
+    /// foreground durability. A zero max preserves an uncapped fraction.
     disk_safety_floor_bytes: u64 = default_disk_safety_floor_bytes,
     disk_safety_floor_divisor: u64 = default_disk_safety_floor_divisor,
+    disk_safety_floor_max_bytes: u64 = default_disk_safety_floor_max_bytes,
     /// Internal query-embedding cache policy. Serving layers consume this
     /// policy but cannot override it independently of the node manager.
     query_embedding_cache_bytes: usize = 64 * 1024 * 1024,
     query_embedding_cache_ttl_ns: u64 = 5 * std.time.ns_per_min,
     query_embedding_max_inflight: usize = 16,
+    /// Node-wide bandwidth budget for concurrently scanning dense candidate
+    /// planes. Null derives the budget from the dense-search soft byte limit;
+    /// zero disables bandwidth admission. This is intentionally separate from
+    /// retained-memory accounting: permits model bytes simultaneously streamed
+    /// through shared caches and memory channels.
+    dense_search_bandwidth_capacity_bytes: ?u64 = null,
+    /// Additional std.Io read workers, beyond already-admitted query callers.
+    /// Null derives from logical CPUs; zero keeps caller-only execution.
+    dense_read_extra_task_limit: ?u32 = null,
     /// Allocates identity tables and the reclaimer registry only as concurrent
     /// owners exceed their previous high-water mark. Production owners should
     /// pass their lifetime allocator; the page allocator keeps lightweight
@@ -335,78 +371,81 @@ pub const Options = struct {
     identity_allocator: std.mem.Allocator = std.heap.page_allocator,
 
     pub fn defaultBudgets() [slice_count]Budget {
-        return .{
-            .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 256 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 1024 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 384 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 160 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 160 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 256 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 192 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 192 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 160 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 48 * 1024 * 1024, .hard_limit_bytes = 64 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 12 * 1024 * 1024, .hard_limit_bytes = 16 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 64 * 1024 * 1024, .hard_limit_bytes = 128 * 1024 * 1024 },
-            // ModelManager owns hardware-aware host/backend limits. These
-            // owner-bridge slices are unlimited by default, while deployments
-            // may set coordinated node budgets through ResourceManager options.
-            .{},
-            .{},
-            .{},
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
-            .{ .soft_limit_bytes = 384 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
-        };
+        // Name every slice: additions cannot silently shift another owner's policy.
+        return std.enums.EnumArray(Slice, Budget).init(.{
+            .lsm_block_table_cache = .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .lsm_compaction_work = .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
+            .lsm_table_builder_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .lsm_in_memory_state = .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
+            .lsm_wal_write_working_set = .{ .soft_limit_bytes = 256 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
+            .lsm_wal_retention = .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 1024 * 1024 * 1024 },
+            .lsm_recovery_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .hbc_node_metadata_cache = .{ .soft_limit_bytes = 384 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
+            .dense_search_working_set = .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 160 * 1024 * 1024 },
+            .dense_apply_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .dense_routing_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .derived_replay_window = .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 160 * 1024 * 1024 },
+            .full_text_pending_segments = .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .full_text_build_working_set = .{ .soft_limit_bytes = 256 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
+            .full_text_segment_residency = .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
+            .document_extraction_working_set = .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .derived_backlog = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 192 * 1024 * 1024 },
+            .text_merge_buffers = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 192 * 1024 * 1024 },
+            .algebraic_tensor_accumulators = .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 160 * 1024 * 1024 },
+            .sparse_apply_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .lite_native_page_cache = .{ .soft_limit_bytes = 48 * 1024 * 1024, .hard_limit_bytes = 64 * 1024 * 1024 },
+            .lite_native_link_cache = .{ .soft_limit_bytes = 12 * 1024 * 1024, .hard_limit_bytes = 16 * 1024 * 1024 },
+            .lite_docstore_snapshot_cache = .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .inference_prompt_cache = .{ .soft_limit_bytes = 512 * 1024 * 1024, .hard_limit_bytes = 768 * 1024 * 1024 },
+            .inference_tokenizer_cache = .{ .soft_limit_bytes = 64 * 1024 * 1024, .hard_limit_bytes = 128 * 1024 * 1024 },
+            .inference_model_residency = .{},
+            .inference_kv_working_set = .{},
+            .inference_scratch_working_set = .{},
+            .dense_repair_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .shard_transition_working_set = .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .dense_vector_block_build_working_set = .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 128 * 1024 * 1024 },
+            .dense_source_payload_state = .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 384 * 1024 * 1024 },
+            .lake_range_cache_queue = .{ .soft_limit_bytes = 384 * 1024 * 1024, .hard_limit_bytes = 512 * 1024 * 1024 },
+        }).values;
     }
 
     pub fn defaultPolicies() [slice_count]Policy {
-        return .{
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
-            .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
-            .{ .soft_action = .throttle_writes, .hard_action = .throttle_writes },
-            .{ .soft_action = .report, .hard_action = .throttle_writes },
-            .{ .soft_action = .report, .hard_action = .throttle_writes },
-            .{ .soft_action = .report, .hard_action = .report },
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .report, .hard_action = .throttle_writes },
-            .{ .soft_action = .report, .hard_action = .throttle_writes },
-            .{ .soft_action = .report, .hard_action = .throttle_writes },
-            .{ .soft_action = .report, .hard_action = .reject_work },
-            .{ .soft_action = .defer_background_work, .hard_action = .defer_background_work },
-            .{ .soft_action = .throttle_writes, .hard_action = .reject_work },
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
-            .{ .soft_action = .throttle_writes, .hard_action = .throttle_writes },
-            .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
-            .{ .soft_action = .throttle_writes, .hard_action = .reject_work },
-            .{ .soft_action = .report, .hard_action = .throttle_writes },
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
-            .{ .soft_action = .report, .hard_action = .reject_work },
-            .{ .soft_action = .report, .hard_action = .reject_work },
-            .{ .soft_action = .report, .hard_action = .reject_work },
-            .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
-            .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
-            .{ .soft_action = .report, .hard_action = .reject_work },
-        };
+        // Name every slice: additions cannot silently shift another owner's policy.
+        return std.enums.EnumArray(Slice, Policy).init(.{
+            .lsm_block_table_cache = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .lsm_compaction_work = .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .lsm_table_builder_working_set = .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .lsm_in_memory_state = .{ .soft_action = .throttle_writes, .hard_action = .throttle_writes },
+            .lsm_wal_write_working_set = .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .lsm_wal_retention = .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .lsm_recovery_working_set = .{ .soft_action = .report, .hard_action = .report },
+            .hbc_node_metadata_cache = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .dense_search_working_set = .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .dense_apply_working_set = .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .dense_routing_working_set = .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .derived_replay_window = .{ .soft_action = .report, .hard_action = .reject_work },
+            .full_text_pending_segments = .{ .soft_action = .defer_background_work, .hard_action = .defer_background_work },
+            .full_text_build_working_set = .{ .soft_action = .throttle_writes, .hard_action = .reject_work },
+            .full_text_segment_residency = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .document_extraction_working_set = .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .derived_backlog = .{ .soft_action = .throttle_writes, .hard_action = .throttle_writes },
+            .text_merge_buffers = .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .algebraic_tensor_accumulators = .{ .soft_action = .throttle_writes, .hard_action = .reject_work },
+            .sparse_apply_working_set = .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .lite_native_page_cache = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .lite_native_link_cache = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .lite_docstore_snapshot_cache = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .inference_prompt_cache = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .inference_tokenizer_cache = .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .inference_model_residency = .{ .soft_action = .report, .hard_action = .reject_work },
+            .inference_kv_working_set = .{ .soft_action = .report, .hard_action = .reject_work },
+            .inference_scratch_working_set = .{ .soft_action = .report, .hard_action = .reject_work },
+            .dense_repair_working_set = .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .shard_transition_working_set = .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .dense_vector_block_build_working_set = .{ .soft_action = .report, .hard_action = .reject_work },
+            .dense_source_payload_state = .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .lake_range_cache_queue = .{ .soft_action = .report, .hard_action = .reject_work },
+        }).values;
     }
 };
 
@@ -429,7 +468,49 @@ pub const Stats = struct {
     slices: [slice_count]SliceStats,
     reclaim_requests: u64 = 0,
     reclaimed_bytes: u64 = 0,
+    dense_search_admission: DenseSearchAdmissionStats = .{},
+    dense_read_tasks: DenseReadTaskStats = .{},
 };
+
+pub const DenseReadTaskStats = struct {
+    limit: u32 = 0,
+    active: u32 = 0,
+    peak_active: u32 = 0,
+    denied: u64 = 0,
+};
+
+pub const DenseSearchAdmissionStats = struct {
+    capacity_bytes: u64 = 0,
+    active_bytes: u64 = 0,
+    peak_active_bytes: u64 = 0,
+    active_queries: u64 = 0,
+    peak_active_queries: u64 = 0,
+    queued_queries: u64 = 0,
+    peak_queued_queries: u64 = 0,
+    admissions: u64 = 0,
+    waits: u64 = 0,
+    cancellations: u64 = 0,
+    wait_ns: u64 = 0,
+};
+
+pub const DenseSearchCancellation = admission.Cancellation;
+
+pub const DenseSearchAdmissionLease = struct {
+    manager: ?*ResourceManager = null,
+    bytes: u64 = 0,
+
+    pub fn release(self: *@This()) void {
+        const manager = self.manager orelse return;
+        manager.releaseDenseSearchBandwidth(self.bytes);
+        self.* = .{};
+    }
+};
+
+const DenseSearchWaiters = admission.Fifo(struct {
+    bytes: u64,
+    enqueued_ns: u64,
+});
+const DenseSearchWaiter = DenseSearchWaiters.Waiter;
 
 pub const MemoryStats = struct {
     used_bytes: u64 = 0,
@@ -568,6 +649,7 @@ const DerivedRecoverableRetryCounters = struct {
         switch (err) {
             error.WriterLocked => _ = self.writer_locked.fetchAdd(1, .monotonic),
             error.ResourceBudgetExceeded,
+            error.PostingWalTooLarge,
             error.PersistentDescriptorAdmissionExhausted,
             error.TextMergeBackpressureTimeout,
             error.TextMergeBackpressureUnavailable,
@@ -658,7 +740,25 @@ pub const ReclaimerOptions = struct {
     weight: u32 = 1,
 };
 
+test "dense aggregate resource manager bounds callers and helpers together" {
+    var manager = ResourceManager.init(.{ .dense_read_extra_task_limit = 4 });
+    defer manager.deinit(std.testing.allocator);
+    manager.dense_aggregate_admission = true;
+    manager.dense_driver_admission.capacity = 2;
+    var caller = try manager.dense_driver_admission.acquire(null, null);
+    defer caller.release();
+    try std.testing.expect(manager.tryAcquireDenseReadTask());
+    try std.testing.expect(!manager.tryAcquireDenseReadTask());
+    try std.testing.expectEqual(@as(u32, 1), manager.denseReadTaskStats().active);
+    manager.releaseDenseReadTask();
+    try std.testing.expect(manager.tryAcquireDenseReadTask());
+    manager.releaseDenseReadTask();
+    caller.release();
+    manager.dense_driver_admission.assertIdle();
+}
+
 pub const ResourceManager = struct {
+    dense_checkpoint_ready: @import("maintenance_signal.zig").Signal = .{},
     mutex: std.atomic.Mutex = .unlocked,
     reclaimer_mutex: std.atomic.Mutex = .unlocked,
     // Slots are never compacted while the manager is live: an invocation can
@@ -676,6 +776,52 @@ pub const ResourceManager = struct {
     memory: MutableMemory,
     latency_sensitive_derived_replay_sessions: std.atomic.Value(u64) = .init(0),
     latency_sensitive_derived_replay_quiet_until_ns: std.atomic.Value(u64) = .init(0),
+    foreground_query_sessions: std.atomic.Value(u64) = .init(0),
+    foreground_query_quiet_until_ns: std.atomic.Value(u64) = .init(0),
+    foreground_write_sessions: std.atomic.Value(u64) = .init(0),
+    foreground_write_quiet_until_ns: std.atomic.Value(u64) = .init(0),
+    dense_search_admission_mutex: std.atomic.Mutex = .unlocked,
+    dense_search_bandwidth_capacity_bytes: u64 = 0,
+    dense_search_active_bytes: u64 = 0,
+    dense_search_peak_active_bytes: u64 = 0,
+    dense_search_active_queries: u64 = 0,
+    dense_search_peak_active_queries: u64 = 0,
+    dense_search_waiters: DenseSearchWaiters = .{},
+    dense_search_queued_queries: u64 = 0,
+    dense_search_peak_queued_queries: u64 = 0,
+    dense_search_admissions: u64 = 0,
+    dense_search_waits: u64 = 0,
+    dense_search_cancellations: u64 = 0,
+    dense_search_wait_ns: u64 = 0,
+    dense_read_extra_task_limit: u32 = 0,
+    dense_rerank_admission: DenseWorkAdmission.Queue = .{},
+    dense_driver_admission: DenseWorkAdmission.Queue = .{},
+    dense_aggregate_admission: bool = false,
+    dense_phase_admission: bool = false,
+    dense_scan_prediction: bool = false,
+    dense_fused_no_copy: bool = false,
+    dense_angular_bounds: bool = false,
+    dense_quantized_routing: bool = false,
+    dense_centered_routing: bool = false,
+    dense_subgroup_count: u8 = 0,
+    dense_subgroup_routing: bool = false,
+    dense_global_subgroup_routing: bool = false,
+    dense_compact_subgroup_routing: bool = false,
+    dense_certified_subgroups: bool = false,
+    dense_deferred_source_capture: bool = false,
+    dense_coalesced_replay_deletes: bool = false,
+    dense_reused_delete_vectors: bool = false,
+    dense_stable_posting_origins: bool = false,
+    dense_posting_row_deltas: bool = false,
+    dense_projection_pages_enabled: bool = false,
+    dense_projection_borrow_enabled: bool = false,
+    dense_projection_trace_enabled: bool = false,
+    dense_grouped_fallbacks: bool = false,
+    dense_projection_pages: std.atomic.Value(?*ProjectionPageCache.Cache) = .init(null),
+    dense_projection_pages_mutex: std.atomic.Mutex = .unlocked,
+    dense_read_extra_tasks: std.atomic.Value(u32) = .init(0),
+    dense_read_peak_extra_tasks: std.atomic.Value(u32) = .init(0),
+    dense_read_denied_tasks: std.atomic.Value(u64) = .init(0),
     slices: [slice_count]MutableSlice,
     dense_replay_window_budget_bytes: u64 = 0,
     dense_replay_last_finish_ns: u64 = 0,
@@ -686,6 +832,7 @@ pub const ResourceManager = struct {
     derived_backlog_throttle_window_sequences: usize,
     disk_safety_floor_bytes: u64,
     disk_safety_floor_divisor: u64,
+    disk_safety_floor_max_bytes: u64,
     capacity_domains: std.AutoHashMapUnmanaged(CapacityDomainId, MutableCapacityDomain) = .empty,
     query_embedding_cache_budget: cache_budget.CacheBudget,
     query_embedding_cache_ttl_ns: u64,
@@ -719,15 +866,98 @@ pub const ResourceManager = struct {
             .derived_backlog_throttle_window_sequences = options.derived_backlog_throttle_window_sequences,
             .disk_safety_floor_bytes = options.disk_safety_floor_bytes,
             .disk_safety_floor_divisor = options.disk_safety_floor_divisor,
+            .disk_safety_floor_max_bytes = options.disk_safety_floor_max_bytes,
             .query_embedding_cache_budget = cache_budget.CacheBudget.init(options.query_embedding_cache_bytes),
             .query_embedding_cache_ttl_ns = options.query_embedding_cache_ttl_ns,
             .query_embedding_max_inflight = @max(@as(usize, 1), options.query_embedding_max_inflight),
+            .dense_search_bandwidth_capacity_bytes = options.dense_search_bandwidth_capacity_bytes orelse
+                options.budgets[@intFromEnum(Slice.dense_search_working_set)].soft_limit_bytes,
+            .dense_read_extra_task_limit = options.dense_read_extra_task_limit orelse
+                @intCast(@min(std.math.maxInt(u32), (std.Thread.getCpuCount() catch 1) *| 2)),
+            .dense_rerank_admission = .{ .capacity = @intCast(std.Thread.getCpuCount() catch 1) },
+            .dense_driver_admission = .{ .capacity = @intCast(std.Thread.getCpuCount() catch 1) },
+            .dense_aggregate_admission = dense_perf.enabled("ANTFLY_EXPERIMENT_AGGREGATE_ADMISSION"),
+            .dense_phase_admission = dense_perf.enabled("ANTFLY_EXPERIMENT_PHASE_ADMISSION"),
+            .dense_scan_prediction = dense_perf.enabled("ANTFLY_EXPERIMENT_SCAN_PREDICTION"),
+            .dense_fused_no_copy = dense_perf.enabled("ANTFLY_EXPERIMENT_FUSED_NO_COPY"),
+            .dense_angular_bounds = dense_perf.enabled("ANTFLY_EXPERIMENT_ANGULAR_BOUNDS"),
+            .dense_quantized_routing = dense_perf.enabled("ANTFLY_EXPERIMENT_QUANTIZED_ROUTING"),
+            .dense_centered_routing = dense_perf.enabled("ANTFLY_EXPERIMENT_CENTERED_ROUTING"),
+            .dense_subgroup_count = if (dense_perf.enabled("ANTFLY_EXPERIMENT_SUBGROUPS_16")) 16 else if (dense_perf.enabled("ANTFLY_EXPERIMENT_SUBGROUPS_8")) 8 else if (dense_perf.enabled("ANTFLY_EXPERIMENT_SUBGROUPS_4")) 4 else 0,
+            .dense_subgroup_routing = dense_perf.enabled("ANTFLY_EXPERIMENT_SUBGROUP_ROUTING"),
+            .dense_global_subgroup_routing = dense_perf.enabled("ANTFLY_EXPERIMENT_GLOBAL_SUBGROUP_ROUTING"),
+            .dense_compact_subgroup_routing = dense_perf.enabled("ANTFLY_EXPERIMENT_COMPACT_SUBGROUP_ROUTING"),
+            .dense_certified_subgroups = dense_perf.enabled("ANTFLY_EXPERIMENT_CERTIFIED_SUBGROUPS"),
+            .dense_deferred_source_capture = dense_perf.enabled("ANTFLY_EXPERIMENT_DEFER_SOURCE_CAPTURE"),
+            .dense_coalesced_replay_deletes = dense_perf.enabled("ANTFLY_EXPERIMENT_COALESCE_REPLAY_DELETES"),
+            .dense_reused_delete_vectors = dense_perf.enabled("ANTFLY_EXPERIMENT_REUSE_DELETE_VECTORS"),
+            .dense_stable_posting_origins = dense_perf.enabled("ANTFLY_EXPERIMENT_STABLE_POSTING_ORIGINS"),
+            .dense_posting_row_deltas = dense_perf.enabled("ANTFLY_EXPERIMENT_POSTING_ROW_DELTAS"),
+            .dense_projection_pages_enabled = dense_perf.enabled("ANTFLY_EXPERIMENT_PROJECTION_PAGES"),
+            .dense_projection_borrow_enabled = dense_perf.enabled("ANTFLY_EXPERIMENT_PROJECTION_BORROW"),
+            .dense_projection_trace_enabled = dense_perf.enabled("ANTFLY_EXPERIMENT_PROJECTION_TRACE"),
+            .dense_grouped_fallbacks = dense_perf.enabled("ANTFLY_EXPERIMENT_GROUPED_FALLBACKS"),
             .identity_allocator = options.identity_allocator,
         };
     }
 
     pub fn queryEmbeddingCacheBudget(self: *ResourceManager) *cache_budget.CacheBudget {
         return &self.query_embedding_cache_budget;
+    }
+
+    pub fn projectionPageCache(self: *ResourceManager) ?*ProjectionPageCache.Cache {
+        if (!self.dense_projection_pages_enabled) return null;
+        if (self.dense_projection_pages.load(.acquire)) |cache| return cache;
+        if (!self.dense_projection_pages_mutex.tryLock()) return null;
+        defer self.dense_projection_pages_mutex.unlock();
+        if (self.dense_projection_pages.load(.acquire)) |cache| return cache;
+        const cache = ProjectionPageCache.Cache.create(self) catch return null;
+        self.dense_projection_pages.store(cache, .release);
+        return cache;
+    }
+
+    /// Optional parallelism is nonblocking. The admitted query caller always
+    /// drains its queue, so no generation/scratch lease waits for more workers.
+    pub fn tryAcquireDenseReadTask(self: *ResourceManager) bool {
+        var driver: DenseWorkAdmission.Queue.Lease = .{};
+        if (self.dense_aggregate_admission) {
+            driver = self.dense_driver_admission.tryAcquire() orelse {
+                _ = self.dense_read_denied_tasks.fetchAdd(1, .monotonic);
+                return false;
+            };
+        }
+        var granted = false;
+        defer if (!granted) driver.release();
+        var active = self.dense_read_extra_tasks.load(.monotonic);
+        while (active < self.dense_read_extra_task_limit) {
+            if (self.dense_read_extra_tasks.cmpxchgWeak(active, active + 1, .acquire, .monotonic)) |updated| {
+                active = updated;
+            } else {
+                _ = self.dense_read_peak_extra_tasks.fetchMax(active + 1, .monotonic);
+                granted = true;
+                return true;
+            }
+        }
+        _ = self.dense_read_denied_tasks.fetchAdd(1, .monotonic);
+        return false;
+    }
+
+    pub fn releaseDenseReadTask(self: *ResourceManager) void {
+        const previous = self.dense_read_extra_tasks.fetchSub(1, .release);
+        std.debug.assert(previous != 0);
+        if (self.dense_aggregate_admission) {
+            var driver: DenseWorkAdmission.Queue.Lease = .{ .queue = &self.dense_driver_admission };
+            driver.release();
+        }
+    }
+
+    pub fn denseReadTaskStats(self: *const ResourceManager) DenseReadTaskStats {
+        return .{
+            .limit = self.dense_read_extra_task_limit,
+            .active = self.dense_read_extra_tasks.load(.monotonic),
+            .peak_active = self.dense_read_peak_extra_tasks.load(.monotonic),
+            .denied = self.dense_read_denied_tasks.load(.monotonic),
+        };
     }
 
     pub fn registerReclaimer(
@@ -946,6 +1176,188 @@ pub const ResourceManager = struct {
         return platform_time.monotonicNs() < self.latency_sensitive_derived_replay_quiet_until_ns.load(.acquire);
     }
 
+    /// Foreground searches share storage bandwidth with LSM compaction and
+    /// whole-HBC checkpoint construction. Optional maintenance yields while a
+    /// query is active and for a short coalescing interval afterward. Hard WAL
+    /// and write-pressure work deliberately does not consult this signal.
+    pub fn beginForegroundQuery(self: *ResourceManager) void {
+        _ = self.foreground_query_sessions.fetchAdd(1, .release);
+    }
+
+    pub fn finishForegroundQuery(self: *ResourceManager) void {
+        const previous = self.foreground_query_sessions.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        if (previous == 1) {
+            self.foreground_query_quiet_until_ns.store(
+                platform_time.monotonicNs() +| foreground_query_maintenance_quiet_ns,
+                .release,
+            );
+        }
+    }
+
+    pub const ForegroundWriteLease = struct {
+        manager: ?*ResourceManager = null,
+
+        pub fn release(self: *ForegroundWriteLease) void {
+            const manager = self.manager orelse return;
+            const previous = manager.foreground_write_sessions.fetchSub(1, .acq_rel);
+            std.debug.assert(previous > 0);
+            if (previous == 1) {
+                manager.foreground_write_quiet_until_ns.store(
+                    platform_time.monotonicNs() +| foreground_write_maintenance_quiet_ns,
+                    .release,
+                );
+            }
+            self.manager = null;
+        }
+    };
+
+    /// Marks only the latency-sensitive mutation portion of a request. Callers
+    /// release this lease immediately after primary WAL publication, before
+    /// any explicit full-index visibility wait.
+    pub fn beginForegroundWrite(self: *ResourceManager) ForegroundWriteLease {
+        _ = self.foreground_write_sessions.fetchAdd(1, .release);
+        return .{ .manager = self };
+    }
+
+    fn denseSearchGrantBytes(self: *const ResourceManager, requested_bytes: u64) u64 {
+        const capacity = self.dense_search_bandwidth_capacity_bytes;
+        if (capacity == 0) return 0;
+        return @min(@max(requested_bytes, 1), capacity);
+    }
+
+    fn canGrantDenseSearchLocked(self: *const ResourceManager, bytes: u64) bool {
+        return bytes <= self.dense_search_bandwidth_capacity_bytes -| self.dense_search_active_bytes;
+    }
+
+    fn noteDenseSearchGrantLocked(self: *ResourceManager, bytes: u64) void {
+        self.dense_search_active_bytes += bytes;
+        self.dense_search_active_queries += 1;
+        self.dense_search_peak_active_bytes = @max(self.dense_search_peak_active_bytes, self.dense_search_active_bytes);
+        self.dense_search_peak_active_queries = @max(self.dense_search_peak_active_queries, self.dense_search_active_queries);
+        self.dense_search_admissions +|= 1;
+    }
+
+    fn admitDenseSearchWaitersLocked(self: *ResourceManager) void {
+        while (self.dense_search_waiters.head) |head| {
+            if (!self.canGrantDenseSearchLocked(head.payload.bytes)) return;
+            const waiter = self.dense_search_waiters.pop().?;
+            self.dense_search_queued_queries -|= 1;
+            self.noteDenseSearchGrantLocked(waiter.payload.bytes);
+            self.dense_search_wait_ns +|= platform_time.monotonicNs() -| waiter.payload.enqueued_ns;
+            waiter.handoff.publish();
+        }
+    }
+
+    fn cancelDenseSearchWaiter(self: *ResourceManager, waiter: *DenseSearchWaiter) void {
+        lockAtomic(&self.dense_search_admission_mutex);
+        defer self.dense_search_admission_mutex.unlock();
+        if (waiter.handoff.isAdmitted()) {
+            // Cancellation was observed before grant but lost the queue-lock
+            // race. No lease escapes: return its charge here exactly once.
+            std.debug.assert(self.dense_search_active_queries > 0);
+            std.debug.assert(self.dense_search_active_bytes >= waiter.payload.bytes);
+            self.dense_search_active_queries -= 1;
+            self.dense_search_active_bytes -= waiter.payload.bytes;
+        } else {
+            const removed = self.dense_search_waiters.remove(waiter);
+            std.debug.assert(removed);
+            self.dense_search_queued_queries -|= 1;
+            self.dense_search_wait_ns +|= platform_time.monotonicNs() -| waiter.payload.enqueued_ns;
+        }
+        self.dense_search_cancellations +|= 1;
+        self.admitDenseSearchWaitersLocked();
+    }
+
+    /// Acquire a fair node-wide permit for the estimated candidate bytes one
+    /// dense search will scan. Waiters must not hold mutable index/cache locks
+    /// or a publication fence. Native two-phase searches may retain immutable
+    /// generation leases and separately budgeted request scratch. Oversized searches consume the
+    /// whole budget and therefore retain correctness progress without letting
+    /// smaller requests starve them indefinitely.
+    pub fn acquireDenseSearchBandwidth(
+        self: *ResourceManager,
+        requested_bytes: u64,
+        cancellation: ?DenseSearchCancellation,
+        wait_io: ?std.Io,
+    ) !DenseSearchAdmissionLease {
+        const bytes = self.denseSearchGrantBytes(requested_bytes);
+        if (bytes == 0) return .{};
+        if (cancellation) |token| {
+            if (token.is_cancelled(token.ptr)) return error.Cancelled;
+        }
+
+        lockAtomic(&self.dense_search_admission_mutex);
+        if (self.dense_search_waiters.head == null and self.canGrantDenseSearchLocked(bytes)) {
+            self.noteDenseSearchGrantLocked(bytes);
+            self.dense_search_admission_mutex.unlock();
+            return .{ .manager = self, .bytes = bytes };
+        }
+        var waiter = DenseSearchWaiter{
+            .payload = .{ .bytes = bytes, .enqueued_ns = platform_time.monotonicNs() },
+            .handoff = .{ .io = wait_io },
+        };
+        self.dense_search_waiters.enqueue(&waiter);
+        self.dense_search_queued_queries += 1;
+        self.dense_search_peak_queued_queries = @max(self.dense_search_peak_queued_queries, self.dense_search_queued_queries);
+        self.dense_search_waits +|= 1;
+        self.dense_search_admission_mutex.unlock();
+
+        waiter.handoff.wait(cancellation) catch |err| {
+            self.cancelDenseSearchWaiter(&waiter);
+            return err;
+        };
+        return .{ .manager = self, .bytes = bytes };
+    }
+
+    fn releaseDenseSearchBandwidth(self: *ResourceManager, bytes: u64) void {
+        if (bytes == 0) return;
+        lockAtomic(&self.dense_search_admission_mutex);
+        std.debug.assert(self.dense_search_active_queries > 0);
+        std.debug.assert(self.dense_search_active_bytes >= bytes);
+        self.dense_search_active_queries -= 1;
+        self.dense_search_active_bytes -= bytes;
+        self.admitDenseSearchWaitersLocked();
+        self.dense_search_admission_mutex.unlock();
+    }
+
+    pub fn denseSearchAdmissionStats(self: *ResourceManager) DenseSearchAdmissionStats {
+        lockAtomic(&self.dense_search_admission_mutex);
+        defer self.dense_search_admission_mutex.unlock();
+        return .{
+            .capacity_bytes = self.dense_search_bandwidth_capacity_bytes,
+            .active_bytes = self.dense_search_active_bytes,
+            .peak_active_bytes = self.dense_search_peak_active_bytes,
+            .active_queries = self.dense_search_active_queries,
+            .peak_active_queries = self.dense_search_peak_active_queries,
+            .queued_queries = self.dense_search_queued_queries,
+            .peak_queued_queries = self.dense_search_peak_queued_queries,
+            .admissions = self.dense_search_admissions,
+            .waits = self.dense_search_waits,
+            .cancellations = self.dense_search_cancellations,
+            .wait_ns = self.dense_search_wait_ns,
+        };
+    }
+
+    pub fn shouldDeferOptionalMaintenanceForForegroundTraffic(self: *const ResourceManager) bool {
+        if (self.foreground_query_sessions.load(.acquire) != 0) return true;
+        if (self.foreground_write_sessions.load(.acquire) != 0) return true;
+        const now_ns = platform_time.monotonicNs();
+        return now_ns < self.foreground_query_quiet_until_ns.load(.acquire) or
+            now_ns < self.foreground_write_quiet_until_ns.load(.acquire);
+    }
+
+    /// Soft compaction builders call this at bounded work intervals. Each
+    /// pause is capped: a compaction selected before hard pressure developed
+    /// must continue making progress even under a sustained query stream.
+    pub fn yieldOptionalMaintenanceForForegroundQuery(self: *const ResourceManager) void {
+        const deadline_ns = platform_time.monotonicNs() +| foreground_query_compaction_yield_max_ns;
+        while (self.shouldDeferOptionalMaintenanceForForegroundTraffic()) {
+            if (platform_time.monotonicNs() >= deadline_ns) return;
+            platform_time.yieldBriefly();
+        }
+    }
+
     pub fn queryEmbeddingPolicy(self: *const ResourceManager) QueryEmbeddingPolicy {
         return .{
             .enabled = self.query_embedding_cache_budget.max_bytes != 0 and self.query_embedding_cache_ttl_ns != 0,
@@ -1022,6 +1434,17 @@ pub const ResourceManager = struct {
     /// ledger. Reservation handles remain strict because they can outlive the
     /// backing allocation and must be released before their manager.
     pub fn deinit(self: *ResourceManager, alloc: std.mem.Allocator) void {
+        self.dense_checkpoint_ready.assertUnbound();
+        self.dense_rerank_admission.assertIdle();
+        self.dense_driver_admission.assertIdle();
+        if (self.dense_projection_pages.load(.acquire)) |cache| cache.deinit();
+        if (self.dense_read_extra_tasks.load(.acquire) != 0)
+            @panic("resource manager deinitialized with active dense read workers");
+        lockAtomic(&self.dense_search_admission_mutex);
+        if (self.dense_search_active_queries != 0 or self.dense_search_waiters.head != null)
+            @panic("resource manager deinitialized with active dense search admission");
+        self.dense_search_admission_mutex.unlock();
+
         _ = alloc;
         lockAtomic(&self.reclaimer_mutex);
         for (self.reclaimers.items) |slot| {
@@ -1192,7 +1615,11 @@ pub const ResourceManager = struct {
         var floor = self.disk_safety_floor_bytes;
         if (self.disk_safety_floor_divisor != 0) {
             if (observation.capacity_bytes) |capacity| {
-                floor = @max(floor, capacity / self.disk_safety_floor_divisor);
+                var proportional = capacity / self.disk_safety_floor_divisor;
+                if (self.disk_safety_floor_max_bytes != 0) {
+                    proportional = @min(proportional, self.disk_safety_floor_max_bytes);
+                }
+                floor = @max(floor, proportional);
             }
         }
         return floor;
@@ -1576,6 +2003,14 @@ pub const ResourceManager = struct {
             if (self.reclaimForAllocation(slice, bytes) == 0) return err;
             return self.reserveOnce(slice, bytes);
         };
+    }
+
+    /// Performs the final non-blocking admission check at a commit boundary.
+    /// Unlike `reserve`, this never invokes reclaimers: callers may use it
+    /// while holding a short mutation fence when failure still precedes WAL
+    /// publication. Any slower pacing or reclamation belongs above that fence.
+    pub fn reserveImmediate(self: *ResourceManager, slice: Slice, bytes: u64) !Reservation {
+        return try self.reserveOnce(slice, bytes);
     }
 
     /// Attempt admission exactly once and never invoke a reclaimer callback.
@@ -2335,6 +2770,8 @@ pub const ResourceManager = struct {
             .slices = stats,
             .reclaim_requests = self.reclaim_requests.load(.monotonic),
             .reclaimed_bytes = self.reclaimed_bytes.load(.monotonic),
+            .dense_search_admission = self.denseSearchAdmissionStats(),
+            .dense_read_tasks = self.denseReadTaskStats(),
         };
     }
 
@@ -2764,6 +3201,18 @@ pub const OwnedSplitReservation = struct {
 /// backing allocator. One operation may make bounded progress above the normal
 /// hard limit only while it is the slice's sole user.
 pub const BudgetedAllocator = struct {
+    pub const AllocationFailure = struct {
+        cause: enum { admission, backing },
+        requested_bytes: usize,
+        live_bytes: u64,
+        slice_used_bytes: u64,
+        slice_limit_bytes: u64,
+        aggregate_used_bytes: u64,
+        aggregate_limit_bytes: u64,
+        return_address: usize,
+    };
+
+    allocator_mutex: std.atomic.Mutex = .unlocked,
     backing: std.mem.Allocator,
     reservation: Reservation,
     max_hard_limit_multiple: u64,
@@ -2773,6 +3222,67 @@ pub const BudgetedAllocator = struct {
     budget_denied: bool = false,
     denial_generation: u64 = 0,
     reclaim_on_denial: bool = false,
+    last_allocation_failure: ?AllocationFailure = null,
+    reservation_floor: u64 = 0,
+
+    pub const ScratchReservation = struct {
+        owner: *BudgetedAllocator,
+        previous_floor: u64,
+
+        pub fn release(self: ScratchReservation) void {
+            lockAtomic(&self.owner.allocator_mutex);
+            defer self.owner.allocator_mutex.unlock();
+            self.owner.reservation_floor = self.previous_floor;
+            self.owner.releaseBytes(0);
+        }
+    };
+
+    /// Admit an operation's temporary working set before durable mutation.
+    /// Allocations consume these same credits instead of being charged twice.
+    /// Scopes nest and release in reverse order under owner serialization.
+    pub fn reserveScratch(self: *BudgetedAllocator, bytes: usize) !ScratchReservation {
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        const previous_floor = self.reservation_floor;
+        if (!self.reserveGrowth(bytes)) {
+            self.recordAllocationFailure(.admission, bytes, @returnAddress());
+            return error.ResourceBudgetExceeded;
+        }
+        self.reservation_floor = @max(previous_floor, self.live_bytes);
+        self.live_bytes -= bytes;
+        return .{ .owner = self, .previous_floor = previous_floor };
+    }
+
+    pub fn allocationFailureThreadSafe(self: *BudgetedAllocator) ?AllocationFailure {
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        return self.last_allocation_failure;
+    }
+
+    fn recordAllocationFailure(self: *BudgetedAllocator, cause: @FieldType(AllocationFailure, "cause"), bytes: usize, ret_addr: usize) void {
+        const snapshot = self.reservation.manager.snapshot();
+        const slice = snapshot.slices[@intFromEnum(self.reservation.slice)];
+        self.last_allocation_failure = .{
+            .cause = cause,
+            .requested_bytes = bytes,
+            .live_bytes = self.live_bytes,
+            .slice_used_bytes = slice.used_bytes,
+            .slice_limit_bytes = slice.hard_limit_bytes,
+            .aggregate_used_bytes = snapshot.memory.used_bytes,
+            .aggregate_limit_bytes = snapshot.memory.hard_limit_bytes,
+            .return_address = ret_addr,
+        };
+        // Opt-in stack diagnostics allocate through the debug runtime, never
+        // this allocator. Normal admission records only a bounded receipt.
+        if (@import("builtin").link_libc and self.reservation.slice == .dense_source_payload_state) {
+            if (std.c.getenv("ANTFLY_SOURCE_VECTOR_ALLOCATION_DIAGNOSTICS")) |raw| {
+                if (std.mem.eql(u8, std.mem.span(raw), "1")) {
+                    std.log.warn("source allocation denied cause={s} requested={d} live={d} slice_used={d} slice_limit={d} aggregate_used={d} aggregate_limit={d} caller=0x{x}", .{ @tagName(cause), bytes, self.live_bytes, slice.used_bytes, slice.hard_limit_bytes, snapshot.memory.used_bytes, snapshot.memory.hard_limit_bytes, ret_addr });
+                    std.debug.dumpCurrentStackTrace(.{});
+                }
+            }
+        }
+    }
 
     pub fn init(
         manager: *ResourceManager,
@@ -2829,6 +3339,45 @@ pub const BudgetedAllocator = struct {
         };
     }
 
+    /// Shared immutable generations may release their final allocation on a
+    /// query thread while the source writer allocates a successor. Owners that
+    /// publish such leases must use this interface for every allocation.
+    /// Reclaimers for this allocator must not recursively free through it.
+    pub fn threadSafeAllocator(self: *BudgetedAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = lockedAlloc, .resize = lockedResize, .remap = lockedRemap, .free = lockedFree } };
+    }
+
+    pub fn liveBytesThreadSafe(self: *BudgetedAllocator) u64 {
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        return self.live_bytes;
+    }
+
+    fn lockedAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        return alloc(ctx, len, alignment, ret_addr);
+    }
+    fn lockedResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        return resize(ctx, memory, alignment, new_len, ret_addr);
+    }
+    fn lockedRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        return remap(ctx, memory, alignment, new_len, ret_addr);
+    }
+    fn lockedFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        free(ctx, memory, alignment, ret_addr);
+    }
+
     pub fn denied(self: *const BudgetedAllocator) bool {
         return self.budget_denied;
     }
@@ -2842,7 +3391,7 @@ pub const BudgetedAllocator = struct {
     /// Pressure reclamation must return amortized spare credit as well as
     /// freed buffers, without disturbing live bytes or an invocation's pin.
     pub fn releaseUnusedCredit(self: *BudgetedAllocator) u64 {
-        const bytes = self.reservation.bytes -| @max(self.live_bytes, self.pinned_bytes);
+        const bytes = self.reservation.bytes -| @max(self.live_bytes, @max(self.pinned_bytes, self.reservation_floor));
         self.reservation.shrink(bytes);
         return bytes;
     }
@@ -2909,22 +3458,26 @@ pub const BudgetedAllocator = struct {
         const amount = std.math.cast(u64, bytes) orelse std.math.maxInt(u64);
         self.live_bytes -|= amount;
         if (self.live_bytes == 0) {
-            self.reservation.shrink(self.reservation.bytes -| self.pinned_bytes);
+            self.reservation.shrink(self.reservation.bytes -| @max(self.pinned_bytes, self.reservation_floor));
             return;
         }
         const spare = self.reservation.bytes -| self.live_bytes;
         if (spare < self.credit_quantum *| 2) return;
         const retained_spare = @min(self.credit_quantum, self.reservation.bytes);
-        const target = @max(self.pinned_bytes, self.live_bytes +| retained_spare);
+        const target = @max(@max(self.pinned_bytes, self.reservation_floor), self.live_bytes +| retained_spare);
         if (self.reservation.bytes > target)
             self.reservation.shrink(self.reservation.bytes - target);
     }
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
-        if (!self.reserveGrowth(len)) return null;
+        if (!self.reserveGrowth(len)) {
+            self.recordAllocationFailure(.admission, len, ret_addr);
+            return null;
+        }
         return self.backing.rawAlloc(len, alignment, ret_addr) orelse {
             self.releaseBytes(len);
+            self.recordAllocationFailure(.backing, len, ret_addr);
             return null;
         };
     }
@@ -2976,6 +3529,33 @@ pub const BudgetedAllocator = struct {
         self.releaseBytes(memory.len);
     }
 };
+
+test "source vector payloads scratch admission accounts credits and records denial cause" {
+    const alloc = std.testing.allocator;
+    var budgets = Options.defaultBudgets();
+    budgets[@intFromEnum(Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = 4096 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    var budget = BudgetedAllocator.init(&manager, .dense_source_payload_state, alloc, 1);
+    defer budget.deinit();
+    {
+        const scratch = try budget.reserveScratch(1024);
+        defer scratch.release();
+        const buffer = try budget.threadSafeAllocator().alloc(u8, 512);
+        budget.threadSafeAllocator().free(buffer);
+        try std.testing.expect(budget.reservation.bytes >= 1024);
+        try std.testing.expectError(error.ResourceBudgetExceeded, budget.reserveScratch(4097));
+        try std.testing.expectEqual(@as(usize, 4097), budget.allocationFailureThreadSafe().?.requested_bytes);
+        try std.testing.expect(budget.allocationFailureThreadSafe().?.cause == .admission);
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.dense_source_payload_state).used_bytes);
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    var denied_backing = BudgetedAllocator.init(&manager, .dense_source_payload_state, failing.allocator(), 1);
+    defer denied_backing.deinit();
+    try std.testing.expectError(error.OutOfMemory, denied_backing.threadSafeAllocator().alloc(u8, 1));
+    try std.testing.expect(denied_backing.allocationFailureThreadSafe().?.cause == .backing);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.dense_source_payload_state).used_bytes);
+}
 
 test "default tokenizer cache budget is aligned with its resource slice" {
     const budgets = Options.defaultBudgets();
@@ -3334,6 +3914,123 @@ test "bounded oversized progress cannot bypass aggregate host memory" {
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 }
 
+test "dense search bandwidth admission is FIFO and work weighted" {
+    var manager = ResourceManager.init(.{ .dense_search_bandwidth_capacity_bytes = 10 });
+    defer manager.deinit(std.testing.allocator);
+    var first = try manager.acquireDenseSearchBandwidth(7, null, null);
+
+    const State = struct {
+        manager: *ResourceManager,
+        bytes: u64,
+        order_counter: *std.atomic.Value(u32),
+        order: std.atomic.Value(u32) = .init(0),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var lease = self.manager.acquireDenseSearchBandwidth(self.bytes, null, null) catch unreachable;
+            const order = self.order_counter.fetchAdd(1, .acq_rel) + 1;
+            self.order.store(order, .release);
+            while (!self.release.load(.acquire)) platform_time.yieldBriefly();
+            lease.release();
+        }
+    };
+    var order_counter = std.atomic.Value(u32).init(0);
+    var heavy = State{ .manager = &manager, .bytes = 8, .order_counter = &order_counter };
+    const heavy_thread = try std.Thread.spawn(.{}, State.run, .{&heavy});
+    while (manager.denseSearchAdmissionStats().queued_queries != 1) platform_time.yieldBriefly();
+    var light = State{ .manager = &manager, .bytes = 3, .order_counter = &order_counter };
+    const light_thread = try std.Thread.spawn(.{}, State.run, .{&light});
+    while (manager.denseSearchAdmissionStats().queued_queries != 2) platform_time.yieldBriefly();
+
+    // The light request would fit beside the active request, but cannot barge
+    // ahead of the older heavy request.
+    try std.testing.expectEqual(@as(u32, 0), light.order.load(.acquire));
+    first.release();
+    while (heavy.order.load(.acquire) == 0) platform_time.yieldBriefly();
+    try std.testing.expectEqual(@as(u32, 1), heavy.order.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), light.order.load(.acquire));
+    heavy.release.store(true, .release);
+    while (light.order.load(.acquire) == 0) platform_time.yieldBriefly();
+    try std.testing.expectEqual(@as(u32, 2), light.order.load(.acquire));
+    light.release.store(true, .release);
+    heavy_thread.join();
+    light_thread.join();
+
+    const stats = manager.denseSearchAdmissionStats();
+    try std.testing.expectEqual(@as(u64, 8), stats.peak_active_bytes);
+    try std.testing.expectEqual(@as(u64, 1), stats.peak_active_queries);
+    try std.testing.expectEqual(@as(u64, 2), stats.waits);
+}
+
+test "dense search bandwidth admission removes cancelled waiters" {
+    var manager = ResourceManager.init(.{ .dense_search_bandwidth_capacity_bytes = 1 });
+    defer manager.deinit(std.testing.allocator);
+    var first = try manager.acquireDenseSearchBandwidth(1, null, null);
+
+    const State = struct {
+        manager: *ResourceManager,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        saw_cancelled: std.atomic.Value(bool) = .init(false),
+
+        fn isCancelled(raw: *const anyopaque) bool {
+            const signal: *const std.atomic.Value(bool) = @ptrCast(@alignCast(raw));
+            return signal.load(.acquire);
+        }
+
+        fn run(self: *@This()) void {
+            var lease = self.manager.acquireDenseSearchBandwidth(1, .{
+                .ptr = &self.cancelled,
+                .is_cancelled = isCancelled,
+            }, std.Io.Threaded.global_single_threaded.io()) catch |err| {
+                std.debug.assert(err == error.Cancelled);
+                self.saw_cancelled.store(true, .release);
+                return;
+            };
+            lease.release();
+        }
+    };
+    var state = State{ .manager = &manager };
+    const thread = try std.Thread.spawn(.{}, State.run, .{&state});
+    while (manager.denseSearchAdmissionStats().queued_queries != 1) platform_time.yieldBriefly();
+    state.cancelled.store(true, .release);
+    thread.join();
+    try std.testing.expect(state.saw_cancelled.load(.acquire));
+    const stats = manager.denseSearchAdmissionStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.queued_queries);
+    try std.testing.expectEqual(@as(u64, 1), stats.cancellations);
+    first.release();
+}
+
+test "dense search bandwidth cancellation racing a grant returns its full charge" {
+    var manager = ResourceManager.init(.{ .dense_search_bandwidth_capacity_bytes = 10 });
+    defer manager.deinit(std.testing.allocator);
+    var blocker = try manager.acquireDenseSearchBandwidth(10, null, null);
+    defer blocker.release();
+    const Cancel = struct {
+        blocker: *DenseSearchAdmissionLease,
+        calls: usize = 0,
+        fn check(ptr: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            self.calls += 1;
+            if (self.calls == 1) return false;
+            self.blocker.release(); // synchronous grant between observing cancellation and removing
+            return true;
+        }
+    };
+    var cancel = Cancel{ .blocker = &blocker };
+    try std.testing.expectError(error.Cancelled, manager.acquireDenseSearchBandwidth(7, .{ .ptr = &cancel, .is_cancelled = Cancel.check }, null));
+    try std.testing.expectEqual(@as(usize, 2), cancel.calls);
+    const stats = manager.denseSearchAdmissionStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.active_bytes);
+    try std.testing.expectEqual(@as(u64, 0), stats.active_queries);
+    try std.testing.expectEqual(@as(u64, 0), stats.queued_queries);
+    try std.testing.expectEqual(@as(u64, 1), stats.cancellations);
+    var next = try manager.acquireDenseSearchBandwidth(10, null, null);
+    next.release();
+    next.release();
+    try std.testing.expectEqual(@as(u64, 0), manager.denseSearchAdmissionStats().active_bytes);
+}
+
 test "resource manager coordinates growable capacity by physical domain" {
     var manager = ResourceManager.init(.{
         .disk_safety_floor_bytes = 10,
@@ -3361,6 +4058,32 @@ test "resource manager coordinates growable capacity by physical domain" {
     try std.testing.expectEqual(@as(u64, 2), stats.denials);
     try std.testing.expectEqual(@as(u64, 1), stats.growth_denials);
     try std.testing.expectEqual(@as(usize, 2), stats.domain_count);
+}
+
+test "capacity percentage safety floor is capped on large volumes" {
+    var manager = ResourceManager.init(.{
+        .disk_safety_floor_bytes = 10,
+        .disk_safety_floor_divisor = 20,
+        .disk_safety_floor_max_bytes = 30,
+    });
+    defer manager.deinit(std.testing.allocator);
+    const observation = CapacityObservation{
+        .available_bytes = 100,
+        .capacity_bytes = 1000,
+    };
+
+    // Five percent would reserve 50 bytes. The independent 30-byte emergency
+    // cap leaves room for 70 bytes of explicitly accounted maintenance.
+    var admitted = try manager.reserveCapacity(std.testing.allocator, 7, 70, observation, 0);
+    defer admitted.release();
+    try std.testing.expectError(
+        error.CapacityUnavailable,
+        manager.reserveCapacity(std.testing.allocator, 7, 1, observation, 0),
+    );
+    const domains = try manager.capacityDomainStats(std.testing.allocator);
+    defer std.testing.allocator.free(domains);
+    try std.testing.expectEqual(@as(usize, 1), domains.len);
+    try std.testing.expectEqual(@as(u64, 30), domains[0].last_safety_floor_bytes);
 }
 
 test "resource manager owns capacity domains independently of consumer allocator" {
@@ -3748,6 +4471,29 @@ test "latency-sensitive derived replay defers only optional background work" {
     try std.testing.expect(manager.shouldDeferSoftCompactionForDerivedReplay());
     manager.latency_sensitive_derived_replay_quiet_until_ns.store(0, .release);
     try std.testing.expect(!manager.shouldDeferSoftCompactionForDerivedReplay());
+}
+
+test "foreground traffic defers optional maintenance through bounded quiet windows" {
+    var manager = ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
+
+    try std.testing.expect(!manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
+    manager.beginForegroundQuery();
+    manager.beginForegroundQuery();
+    try std.testing.expect(manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
+    manager.finishForegroundQuery();
+    try std.testing.expect(manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
+    manager.finishForegroundQuery();
+    try std.testing.expect(manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
+    manager.foreground_query_quiet_until_ns.store(0, .release);
+    try std.testing.expect(!manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
+
+    var write = manager.beginForegroundWrite();
+    try std.testing.expect(manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
+    write.release();
+    try std.testing.expect(manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
+    manager.foreground_write_quiet_until_ns.store(0, .release);
+    try std.testing.expect(!manager.shouldDeferOptionalMaintenanceForForegroundTraffic());
 }
 
 test "resource manager background deferral follows slice policy" {
@@ -4503,6 +5249,70 @@ test "budgeted allocator reclaim denial does not retry a busy cache" {
     try std.testing.expectEqual(@as(u64, 1), required.denialGeneration());
     try std.testing.expectEqual(@as(u64, 0), required.live_bytes);
     try std.testing.expectEqual(@as(u64, 48), retained.bytes);
+}
+
+test "budgeted allocator reclaims aggregate cache before denying growth" {
+    const ReclaimContext = struct {
+        manager: *ResourceManager,
+        accounted: u64,
+
+        fn reclaim(raw: *anyopaque, target: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const released = @min(target, self.accounted);
+            self.manager.observeUsage(.hbc_node_metadata_cache, &self.accounted, self.accounted - released);
+            return released;
+        }
+    };
+
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.hbc_node_metadata_cache)] = .{ .soft_limit_bytes = 80, .hard_limit_bytes = 100 };
+    budgets[sliceIndex(.dense_vector_block_build_working_set)] = .{ .soft_limit_bytes = 80, .hard_limit_bytes = 100 };
+    var manager = ResourceManager.init(.{
+        .memory_budget = .{ .soft_limit_bytes = 90, .hard_limit_bytes = 100 },
+        .budgets = budgets,
+    });
+    defer manager.deinit(std.testing.allocator);
+
+    var context = ReclaimContext{ .manager = &manager, .accounted = 0 };
+    manager.observeUsage(.hbc_node_metadata_cache, &context.accounted, 80);
+    const identity = try manager.registerReclaimer(.hbc_node_metadata_cache, &context, ReclaimContext.reclaim);
+    defer manager.unregisterReclaimer(identity);
+
+    var budgeted = BudgetedAllocator.initReclaiming(
+        &manager,
+        .dense_vector_block_build_working_set,
+        std.testing.allocator,
+        1,
+    );
+    defer budgeted.deinit();
+    const bytes = try budgeted.allocator().alloc(u8, 30);
+    defer budgeted.allocator().free(bytes);
+
+    try std.testing.expectEqual(@as(u64, 70), context.accounted);
+    try std.testing.expectEqual(@as(u64, 30), budgeted.live_bytes);
+    const stats = manager.snapshot();
+    try std.testing.expectEqual(@as(u64, 100), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 1), stats.reclaim_requests);
+    try std.testing.expectEqual(@as(u64, 10), stats.reclaimed_bytes);
+}
+
+test "budgeted allocator retains both scratch and pinned credit floors" {
+    var manager = ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
+    var pinned = try manager.reserve(.dense_source_payload_state, 32);
+    defer pinned.release();
+    var budget = BudgetedAllocator.init(&manager, .dense_source_payload_state, std.testing.allocator, 1);
+    defer budget.deinit();
+    try budget.adoptPinnedReservationCredit(&pinned, 32);
+    const bytes = try budget.allocator().alloc(u8, 8);
+    const scratch = try budget.reserveScratch(64);
+    _ = budget.releaseUnusedCredit();
+    try std.testing.expectEqual(@as(u64, 72), budget.reservation.bytes);
+    budget.allocator().free(bytes);
+    try std.testing.expectEqual(@as(u64, 72), budget.reservation.bytes);
+    scratch.release();
+    try std.testing.expectEqual(@as(u64, 32), budget.reservation.bytes);
+    try std.testing.expectEqual(@as(u64, 0), budget.releaseUnusedCredit());
 }
 
 test "budgeted allocator allows concurrent operations within the shared hard limit" {

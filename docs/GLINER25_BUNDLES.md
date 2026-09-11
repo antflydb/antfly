@@ -7,15 +7,17 @@ encoder/head split bundle. Original checkpoint tensor names are preserved.
 Build the converter from `zig/`:
 
 ```sh
-ZIG_GLOBAL_CACHE_DIR=/private/tmp/antfly-gliner25-zig-cache zig build inference-gliner25-convert-build -Dmetal=false -Dcuda=false -j1
+zig build inference-gliner25-convert-build -Doptimize=ReleaseFast -Dmetal=false -Dcuda=false -Donnx=false -Dpjrt=false -j1
 ```
 
-The delegated build uses ReleaseFast and one build job. From the repository
-root, convert an already downloaded, complete checkpoint:
+These flags select ReleaseFast for the complete shared build graph and one
+build job. Root targets install into `zig/zig-out/bin/`; standalone package
+targets keep their package-local `zig-out/bin/`. From the repository root,
+convert an already downloaded, complete checkpoint:
 
 ```sh
-zig/pkg/inference/zig-out/bin/antfly-inference-gliner25-convert --model-dir /models/gliner2.5-small-v1 --output-dir /models/gliner2.5-small-q8 --precision q8_0
-zig/pkg/inference/zig-out/bin/antfly-inference-gliner25-convert --verify-dir /models/gliner2.5-small-q8
+zig/zig-out/bin/antfly-inference-gliner25-convert --model-dir /models/gliner2.5-small-v1 --output-dir /models/gliner2.5-small-q8 --precision q8_0
+zig/zig-out/bin/antfly-inference-gliner25-convert --verify-dir /models/gliner2.5-small-q8
 ```
 
 The output parent must exist. The destination must not exist. Conversion writes
@@ -75,10 +77,11 @@ explicit skips; they do not count as model evidence.
 
 The diagnostic runner exercises the real session loader for a converted
 bundle. Build its native version with `zig build inference-gliner25-bundle-check-build
--Dmetal=false -Dcuda=false -j1` from `zig/`, then run from the repository root:
+-Doptimize=ReleaseFast -Dmetal=false -Dcuda=false -Donnx=false -Dpjrt=false -j1`
+from `zig/`, then run from the repository root:
 
 ```sh
-python zig/pkg/inference/scripts/gliner25/check_bundles.py --backend native --binary zig/pkg/inference/zig-out/bin/antfly-inference-gliner25-bundle-check --bundle /models/gliner2.5-small-q8 --output-dir /tmp/gliner25-small-q8-native
+python zig/pkg/inference/scripts/gliner25/check_bundles.py --backend native --binary zig/zig-out/bin/antfly-inference-gliner25-bundle-check --bundle /models/gliner2.5-small-q8 --output-dir /tmp/gliner25-small-q8-native
 ```
 
 Use the pinned oracle environment, which supplies `psutil`. The driver never
@@ -90,11 +93,11 @@ offsets, and confidence differences. Expected outputs are deserialized only in
 the independent comparison driver, after inference. The executable verifies
 the actual bundle on load and rehashes it again before reporting completion.
 
-For Metal, build with `-Dmetal=true -Dcuda=false -j1` and retain the completed
+For Metal, change only `-Dmetal=false` to `-Dmetal=true` and retain the completed
 native report. Use the exact same converted directory:
 
 ```sh
-python zig/pkg/inference/scripts/gliner25/check_bundles.py --backend metal --binary zig/pkg/inference/zig-out/bin/antfly-inference-gliner25-bundle-check --bundle /models/gliner2.5-small-q8 --native-reference-report /tmp/gliner25-small-q8-native/report.json --output-dir /tmp/gliner25-small-q8-metal
+python zig/pkg/inference/scripts/gliner25/check_bundles.py --backend metal --binary zig/zig-out/bin/antfly-inference-gliner25-bundle-check --bundle /models/gliner2.5-small-q8 --native-reference-report /tmp/gliner25-small-q8-native/report.json --output-dir /tmp/gliner25-small-q8-metal
 ```
 
 Version 2 reports require the runner's `strict_f32_activations_v1` policy and
