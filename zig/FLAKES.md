@@ -4,6 +4,36 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-11: mixed-version Raft rejection compatibility (#694)
+
+A fresh review of `667e09a58` found that the new rejection correlation assumed
+all followers echoed the rejected AppendEntries previous index. Released main
+instead reports its own last index in both `log_index` and `reject_hint`, with
+the same version-1 wire encoding. A new leader could therefore ignore every
+rejection from a lagging older follower and never catch it up.
+
+The deterministic regression fails before the fix (expected next index 2,
+observed 5) and covers empty, lagging, and longer conflicting follower logs.
+Legacy-shaped feedback now backs a probe toward the confirmed prefix. During
+pipelined replication, ambiguous rejections coalesce into one heartbeat-paced
+retry; an intervening forward acknowledgement cancels it. Confirmed progress
+never regresses, message/byte limits remain intact, and pending snapshots retain
+exclusive ownership. The wire format is unchanged. A burst of 32 legacy
+rejections produces no immediate payload retransmissions; the next heartbeat
+issues one bounded retry, or preserves the pipeline if progress has resumed.
+
+Validation: all **403 Raft library tests passed**, including compacted-log
+snapshot recovery and the two compatibility regressions. **100/100 stable
+etcd differential seeds**, 48 actions each, matched with the fix. Evidence:
+`/private/tmp/ci694-legacy-rejection-before.log`,
+`/private/tmp/ci694-legacy-rejection-final-library.log`, and
+`/private/tmp/ci694-legacy-rejection-stable-differential.log`.
+
+The preceding merged revision also passed **1,477 integration tests** (one
+existing opt-in external endpoint skip), **179 data-runtime tests**, and
+**73 Python harness checks**, without failures or leaks. Fresh Linux acceptance
+must use the compatibility fix; the pre-merge 300/300 below is historical.
+
 ## Peer endpoint changes bypass stable placement reconciliation (#694 review)
 
 After merging `origin/main` (`444440574`) in `6b0985d09`, review found that

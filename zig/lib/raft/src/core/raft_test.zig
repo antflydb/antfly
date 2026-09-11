@@ -2756,3 +2756,105 @@ test "raw node persists replacement before apply and restart" {
         try std.testing.expectEqual(@as(usize, 0), restarted.raft.log.entriesFrom(2)[0].data.len);
     }
 }
+
+test "rolling upgrade leader catches up legacy follower rejection" {
+    var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var voters = [_]types.NodeId{ 1, 2, 3 };
+    try storage.seedConfState(.{ .voters = &voters });
+    try storage.append(&.{ .{ .index = 1, .term = 1 }, .{ .index = 2, .term = 1 }, .{ .index = 3, .term = 1 } });
+    storage.setHardState(.{ .current_term = 1, .commit_index = 1 });
+    var raft = try raft_mod.Raft.init(std.testing.allocator, .{
+        .id = 1,
+        .group_id = 7,
+        .peers = &voters,
+        .check_quorum = false,
+        .pre_vote = false,
+    }, storage.storage());
+    defer raft.deinit();
+    try raft.campaign();
+    clearMessages(&raft);
+    try raft.step(.{ .msg_type = .request_vote_response, .from = 2, .to = 1, .term = 2 });
+    clearMessages(&raft);
+    for ([_]types.Index{ 0, 1, 7 }) |follower_last| {
+        clearMessages(&raft);
+        raft.progress[1] = .{ .match_index = 0, .next_index = raft.log.lastIndex() + 1, .state = .probe, .probe_sent = true };
+        // Released main reports the follower's last index in both fields; it
+        // cannot echo the leader's rejected previous index during upgrade.
+        // Include an empty follower and a longer conflicting follower tail.
+        try raft.step(.{
+            .msg_type = .append_entries_response,
+            .from = 2,
+            .to = 1,
+            .term = 2,
+            .reject = true,
+            .log_index = follower_last,
+            .reject_hint = follower_last,
+        });
+        const next = @min(raft.log.lastIndex(), follower_last + 1);
+        try std.testing.expectEqual(next, raft.progress[1].next_index);
+        try std.testing.expectEqual(@as(usize, 1), raft.messages.items.len);
+        try std.testing.expectEqual(next, raft.messages.items[0].entries[0].index);
+    }
+}
+
+test "legacy append rejections coalesce until heartbeat and forward progress cancels fallback" {
+    for ([_]bool{ false, true }) |ack_before_heartbeat| {
+        var fixture = try initLeaderFromSnapshotWithMaxInflight(1);
+        defer fixture.raft.deinit();
+        defer fixture.storage.deinit();
+        const base = fixture.raft.log.lastIndex();
+        fixture.raft.progress[1] = .{
+            .match_index = base,
+            .next_index = base + 1,
+            .state = .replicate,
+            .recent_active = true,
+        };
+        try fixture.raft.propose("first");
+        try fixture.raft.propose("second");
+        const sent_next = fixture.raft.progress[1].next_index;
+        clearMessages(&fixture.raft);
+        for (0..32) |_| try fixture.raft.step(.{
+            .msg_type = .append_entries_response,
+            .from = 2,
+            .to = 1,
+            .term = fixture.raft.hard_state.current_term,
+            .reject = true,
+            .log_index = base,
+            .reject_hint = base,
+        });
+        try std.testing.expectEqual(base, fixture.raft.progress[1].match_index);
+        try std.testing.expectEqual(sent_next, fixture.raft.progress[1].next_index);
+        try std.testing.expectEqual(@as(usize, 1), fixture.raft.inflights[1].items.len);
+        try std.testing.expectEqual(@as(usize, 0), fixture.raft.messages.items.len);
+        if (ack_before_heartbeat) {
+            try fixture.raft.step(.{
+                .msg_type = .append_entries_response,
+                .from = 2,
+                .to = 1,
+                .term = fixture.raft.hard_state.current_term,
+                .log_index = base + 1,
+            });
+            try std.testing.expect(!fixture.raft.progress[1].legacy_rejection_pending);
+            clearMessages(&fixture.raft);
+        }
+        try fixture.raft.step(.{
+            .msg_type = .heartbeat_response,
+            .from = 2,
+            .to = 1,
+            .term = fixture.raft.hard_state.current_term,
+        });
+        try std.testing.expectEqual(@as(usize, 1), fixture.raft.messages.items.len);
+        const retry = fixture.raft.messages.items[0];
+        if (ack_before_heartbeat) {
+            try std.testing.expectEqual(@as(usize, 0), retry.entries.len);
+            try std.testing.expectEqual(types.ProgressState.replicate, fixture.raft.progress[1].state);
+            try std.testing.expectEqual(base + 1, fixture.raft.progress[1].match_index);
+        } else {
+            try std.testing.expectEqual(base + 1, retry.entries[0].index);
+            try std.testing.expectEqual(types.ProgressState.probe, fixture.raft.progress[1].state);
+            try std.testing.expectEqual(base, fixture.raft.progress[1].match_index);
+        }
+        try std.testing.expect(!fixture.raft.progress[1].legacy_rejection_pending);
+    }
+}

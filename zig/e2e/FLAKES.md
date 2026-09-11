@@ -1,5 +1,16 @@
 # Zig E2E flakes
 
+## 2026-09-11: fresh review before the merged Linux soak (#694)
+
+The fresh review additionally reproduced mixed-version Raft catch-up stalling:
+released followers report their last index in rejection fields that the new
+leader interpreted as a request index. Compatibility handling now preserves the
+confirmed prefix and coalesces ambiguous pipeline failures into heartbeat-paced
+recovery. Its deterministic before/after regression and 403-test Raft suite
+pass, as do 100 stable etcd differential seeds. See `zig/FLAKES.md` for details.
+The new mixed Linux soak remains pending until the corrected binary is built;
+the pre-merge acceptance below does not validate this revision.
+
 ## 2026-09-11: main merge and peer endpoint review follow-up (#694)
 
 The main merge preserves the regression targets in the new build modules.

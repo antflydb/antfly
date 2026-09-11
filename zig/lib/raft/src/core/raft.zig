@@ -1042,7 +1042,23 @@ pub const Raft = struct {
             // failed, not the follower's last index (which is only a hint).
             // Delayed failures must not discard a newer successful prefix or
             // reopen the window for an already superseded probe.
-            if (self.progress[idx].state == .replicate) {
+            if (msg.log_index == msg.reject_hint) {
+                // Older binaries put follower lastIndex in both fields. This
+                // feedback cannot identify an obsolete request. During a
+                // pipeline, coalesce it until a heartbeat; intervening forward
+                // progress cancels it. Never amplify every delayed rejection
+                // into another payload batch or regress the matched prefix.
+                if (self.progress[idx].state == .replicate) {
+                    self.progress[idx].legacy_rejection_pending = true;
+                    return;
+                }
+                const next = @max(self.progress[idx].match_index + 1, @min(
+                    self.progress[idx].next_index - 1,
+                    msg.reject_hint +| 1,
+                ));
+                if (next >= self.progress[idx].next_index and next >= self.log.firstIndex()) return;
+                self.progress[idx].next_index = next;
+            } else if (self.progress[idx].state == .replicate) {
                 if (msg.log_index <= self.progress[idx].match_index) return;
                 self.progress[idx].next_index = self.progress[idx].match_index + 1;
             } else {
@@ -1064,6 +1080,7 @@ pub const Raft = struct {
             (msg.log_index == self.progress[idx].match_index and
                 (!was_probe or msg.log_index != self.progress[idx].next_index - 1))) return;
         self.progress[idx].state = .replicate;
+        self.progress[idx].legacy_rejection_pending = false;
         self.freeInflightsTo(idx, msg.log_index);
         self.progress[idx].match_index = msg.log_index;
         self.progress[idx].next_index = if (was_probe) msg.log_index + 1 else @max(self.progress[idx].next_index, msg.log_index + 1);
@@ -1107,6 +1124,21 @@ pub const Raft = struct {
         if (self.soft_state.role != .leader) return;
         if (msg.term != self.hard_state.current_term) return;
         if (peerIndex(self.peers, msg.from)) |idx| {
+            if (self.progress[idx].legacy_rejection_pending and
+                self.progress[idx].pending_snapshot_attempt == null)
+            {
+                self.progress[idx].legacy_rejection_pending = false;
+                if (self.progress[idx].state == .replicate and
+                    self.progress[idx].match_index < self.log.lastIndex())
+                {
+                    // Legacy wire feedback cannot fence a particular append.
+                    // Retry once per heartbeat from the proven prefix, keeping
+                    // the normal message/byte bounds and future pipelining.
+                    self.progress[idx].state = .probe;
+                    self.progress[idx].next_index = self.progress[idx].match_index + 1;
+                    self.clearInflights(idx);
+                }
+            }
             // A dedicated snapshot attempt remains authoritative until its
             // transport completion fails or the follower acknowledges it.
             // Heartbeats must not mint duplicate multi-gigabyte attempts.
