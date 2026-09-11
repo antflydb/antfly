@@ -4,6 +4,45 @@ See also the [E2E flake history](e2e/FLAKES.md). Record the original evidence,
 reproduction conditions, deterministic regression, and before/after results;
 a passing soak alone does not establish a failure's cause.
 
+## 2026-09-11: admitted topology receipt loses leadership (#694)
+
+The merged Linux soak on `0259bab66` failed its first backup iteration with a
+public create returning an unknown-outcome 409. Metadata logged `NotLeader`
+after admission. The retained uncompacted logs on all three replicas contain
+the common term-1 prefix through index 73, a term-3 no-op at 74, and no table
+create. The request had not survived the election; this was not a coverage
+counter failure. The fixture correctly refused to replay an unknown outcome.
+
+The receipt waiter previously classified a leader change as supersession before
+observing the admitted entry's applied identity. It now keeps the existing
+bounded, event-driven wait across leader changes. An applied matching term
+proves success; an applied different term proves replacement; missing status
+or term proof remains unknown. The deterministic stepdown regression failed
+before the fix: expected `pending`, observed `superseded` (101 other metadata
+checks passed, with no leaks).
+
+Only a single atomic topology proposal promotes proven replacement into the
+new `MetadataMutationNotApplied` outcome. Compound reconciliation/other mutation
+callers retain ambiguity, because replacement of their last entry cannot prove
+that earlier entries did not commit. Authenticated forwarding carries the
+separate `not-applied-v1` response; it never mislabels an admitted command as
+`not-proposed-v1`. Older clients do not recognize the new value and fail closed.
+Metadata and data routing may retry the complete atomic operation with this
+proof, retaining the existing absolute deadline, hop budget, and campaign
+ownership. Public exhaustion preserves the distinct proof. Transport failures,
+missing proof, wrong status codes, and unresolved outcomes remain non-replayable.
+The runtime error detail is appended, preserving all existing ABI values.
+
+Evidence: `/private/tmp/ci694-main-review-first-failure.tar.gz` (SHA-256
+`8893cda56544fb8af67124724cd730cb42c56900b46c4bbcec23021d4ca1eda9`, verified
+against the runner), `/private/tmp/ci694-main-review-raft-state.jsonl`, and
+`/private/tmp/ci694-receipt-stepdown-regression-before.log`.
+Initial validation passes 179 data-runtime tests, 104 metadata/routing tests,
+and 10 ABI tests without failures or leaks. Final receipt-mapping and public
+response validation, the corrected Linux build, and fresh 100-per-scenario
+acceptance are pending. The failed `0259bab66` batch is diagnostic evidence,
+not acceptance for this fix.
+
 ## 2026-09-11: mixed-version Raft rejection compatibility (#694)
 
 A fresh review of `667e09a58` found that the new rejection correlation assumed

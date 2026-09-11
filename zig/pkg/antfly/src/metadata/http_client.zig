@@ -891,6 +891,11 @@ pub const MetadataHttpClient = struct {
                 return error.TableTopologyProtocolUpgradeRequired;
             return error.MetadataMutationOutcomeUnknown;
         }
+        // A committed replacement at the receipt position proves the atomic
+        // command cannot apply. Older peers do not recognize this outcome and
+        // conservatively retain ambiguity; never label it not-proposed.
+        if (resp.status == 503 and std.mem.eql(u8, outcome_header.?, routes.Routes.raft_mutation_outcome_not_applied))
+            return error.MetadataMutationNotApplied;
         const outcome = raft_mutation_forwarding.parseOutcome(
             outcome_header,
             routes.Routes.raft_mutation_outcome_not_proposed,
@@ -2705,6 +2710,22 @@ test "metadata http client surfaces typed rejection for forwarded table mutation
         topology_too_large_client.dropTableForwarded("http://127.0.0.1:9000", "docs"),
     );
     try std.testing.expectEqual(@as(usize, 1), topology_too_large.attempts);
+    // The new proof is distinct from non-admission. Incompatible status or
+    // unknown outcomes must not authorize a replay, including a success code.
+    for ([_]u16{ 200, 409, 500, 503 }) |status| {
+        var superseded = RejectingExecutor{
+            .header_name = "Retry-After",
+            .header_value = "1",
+            .outcome_value = routes.Routes.raft_mutation_outcome_not_applied,
+            .status = status,
+        };
+        var superseded_client = MetadataHttpClient.init(std.testing.allocator, superseded.executor());
+        try std.testing.expectError(
+            if (status == 503) error.MetadataMutationNotApplied else error.MetadataMutationOutcomeUnknown,
+            superseded_client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
+        );
+        try std.testing.expectEqual(@as(usize, 1), superseded.attempts);
+    }
 }
 
 test "metadata http client preserves transport ambiguity for forwarded table mutations" {

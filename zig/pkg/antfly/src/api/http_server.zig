@@ -2177,6 +2177,44 @@ test "routed table mutation rediscovers the leader after a typed pre-admission r
     try std.testing.expectEqual(@as(usize, 2), script.route_resolutions);
 }
 
+test "routed table mutation retries proven non-application with the same hop bound" {
+    for ([_]bool{ false, true }) |local_first| {
+        var script = RoutedTableMutationScript{
+            .routes = if (local_first) &.{ .local, .{ .forward = .{ .node_id = 3, .orchestration_url = "http://new-leader" } } } else &.{
+                .{ .forward = .{ .node_id = 2, .orchestration_url = "http://old-leader" } },
+                .{ .forward = .{ .node_id = 3, .orchestration_url = "http://new-leader" } },
+            },
+            .local_errors = if (local_first) &.{error.MetadataMutationNotApplied} else &.{},
+            .forward_errors = if (local_first) &.{} else &.{error.MetadataMutationNotApplied},
+        };
+        try runRoutedTableMutation(&script, RoutedTableMutationScript.Ops{ .script = &script });
+        try std.testing.expectEqual(@as(usize, 2), script.route_resolutions);
+        try std.testing.expectEqual(@as(u8, if (local_first) 1 else 0), script.last_forwarding.?.forwards_remaining);
+        try std.testing.expect(!script.last_forwarding.?.campaign_allowed);
+    }
+    var bounded = RoutedTableMutationScript{
+        .routes = &.{.{ .forward = .{ .node_id = 2, .orchestration_url = "http://flapping" } }},
+        .forward_errors = &.{ error.MetadataMutationNotApplied, error.NotLeader, error.NotLeader },
+    };
+    try std.testing.expectError(error.MetadataMutationNotApplied, runRoutedTableMutation(&bounded, RoutedTableMutationScript.Ops{ .script = &bounded }));
+    try std.testing.expectEqual(@as(usize, raft_mutation_forwarding.max_forwards), bounded.forward_calls);
+}
+
+test "routed table mutation public non-application response preserves its distinct proof" {
+    var response = try contextualMutationNotAppliedResponse(std.testing.allocator);
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), response.status);
+    var found_proof = false;
+    for (response.headers) |header| {
+        try std.testing.expect(!std.ascii.eqlIgnoreCase(header.name, http_common.metadata_mutation_not_admitted_header));
+        if (std.ascii.eqlIgnoreCase(header.name, metadata_http_routes.Routes.raft_mutation_outcome_header)) {
+            try std.testing.expectEqualStrings(metadata_http_routes.Routes.raft_mutation_outcome_not_applied, header.value);
+            found_proof = true;
+        }
+    }
+    try std.testing.expect(found_proof);
+}
+
 test "routed table mutation preserves hop budget for provably unsent request" {
     var script = RoutedTableMutationScript{
         .routes = &.{
@@ -14938,6 +14976,7 @@ pub const ApiHttpServer = struct {
             error.RaftMutationDeadlineExceeded => try contextualRetryableTextResponse(self.alloc, 503, "metadata mutation deadline exceeded before admission; retry later"),
             error.NotLeader => try contextualRetryableTextResponse(self.alloc, 503, "metadata leader unavailable; retry later"),
             error.TableTransitionActive, error.TableGenerationChanged, error.ExtensionOwnedObject => try contextual_operations.textAlloc(self.alloc, 409, "table topology changed; retry with the current table state"),
+            error.MetadataMutationNotApplied => try contextualMutationNotAppliedResponse(self.alloc),
             error.MetadataMutationOutcomeUnknown => try contextualMutationOutcomeUnknownTextResponse(self.alloc, "table mutation outcome is unknown; observe table state before retrying"),
             error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
             else => if (metadata_authority.isMutationNotAdmittedError(err))
@@ -15011,6 +15050,7 @@ pub const ApiHttpServer = struct {
             error.RaftMutationDeadlineExceeded => try contextualRetryableTextResponse(self.alloc, 503, "metadata mutation deadline exceeded before admission; retry later"),
             error.NotLeader => try contextualRetryableTextResponse(self.alloc, 503, "metadata leader unavailable; retry later"),
             error.ExtensionOwnedObject => try contextual_operations.textAlloc(self.alloc, 409, "table is owned by an extension"),
+            error.MetadataMutationNotApplied => try contextualMutationNotAppliedResponse(self.alloc),
             error.MetadataMutationOutcomeUnknown => try contextualMutationOutcomeUnknownTextResponse(self.alloc, "table mutation outcome is unknown; observe table state before retrying"),
             error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
             else => if (metadata_authority.isMutationNotAdmittedError(err))
@@ -18924,6 +18964,21 @@ fn contextualRetryableTextResponse(alloc: std.mem.Allocator, status: u16, body: 
         .status = status,
         .content_type = "text/plain",
         .body = try alloc.dupe(u8, body),
+        .headers = headers,
+    };
+}
+
+fn contextualMutationNotAppliedResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
+    const headers = try alloc.alloc(contextual_operations.Header, 2);
+    errdefer alloc.free(headers);
+    headers[0] = try ownedContextualHeader(alloc, metadata_http_routes.Routes.raft_mutation_outcome_header, metadata_http_routes.Routes.raft_mutation_outcome_not_applied);
+    errdefer headers[0].deinit(alloc);
+    headers[1] = try ownedContextualHeader(alloc, "Retry-After", "1");
+    errdefer headers[1].deinit(alloc);
+    return .{
+        .status = 503,
+        .content_type = "text/plain",
+        .body = try alloc.dupe(u8, "table mutation was superseded before application; retry on the current leader"),
         .headers = headers,
     };
 }

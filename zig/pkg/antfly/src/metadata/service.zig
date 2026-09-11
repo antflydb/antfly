@@ -1036,6 +1036,7 @@ const MetadataProposalApplyObservation = enum {
     pending,
     applied,
     superseded,
+    unavailable,
 };
 
 fn acceptedMetadataProposalIndex(accepted_index: ?u64, dispatch_error: ?anyerror) !u64 {
@@ -1049,18 +1050,15 @@ fn observeMetadataProposalApply(
     applied_entry_term: ?u64,
     receipt: MetadataProposalReceipt,
 ) MetadataProposalApplyObservation {
-    const raft_status = status orelse return .superseded;
+    const raft_status = status orelse return .unavailable;
     if (raft_status.applied_index >= receipt.index) {
-        return if (applied_entry_term != null and applied_entry_term.? == receipt.term)
-            .applied
-        else
-            .superseded;
+        const actual_term = applied_entry_term orelse return .unavailable;
+        return if (actual_term == receipt.term) .applied else .superseded;
     }
-    const still_receipt_leader = raft_status.soft.role == .leader and
-        raft_status.soft.leader_id != null and
-        raft_status.soft.leader_id.? == raft_status.id and
-        raft_status.hard.current_term == receipt.term;
-    return if (still_receipt_leader) .pending else .superseded;
+    // An admitted entry can survive a leader change. Wait for its exact
+    // applied identity within the existing caller deadline; role and current
+    // term alone prove neither application nor replacement.
+    return .pending;
 }
 
 test "metadata proposal receipt requires the accepted term at the applied index" {
@@ -1078,12 +1076,24 @@ test "metadata proposal receipt requires the accepted term at the applied index"
     status.applied_index = 9;
     try std.testing.expectEqual(.applied, observeMetadataProposalApply(status, 3, receipt));
     try std.testing.expectEqual(.superseded, observeMetadataProposalApply(status, 4, receipt));
-    try std.testing.expectEqual(.superseded, observeMetadataProposalApply(status, null, receipt));
+    try std.testing.expectEqual(.unavailable, observeMetadataProposalApply(status, null, receipt));
 
     status.applied_index = 8;
     status.soft = .{ .role = .follower, .leader_id = 2 };
     status.hard.current_term = 4;
-    try std.testing.expectEqual(.superseded, observeMetadataProposalApply(status, null, receipt));
+    // Losing leadership does not supersede an admitted log entry. The new
+    // leader can retain it and apply it after this node has stepped down.
+    try std.testing.expectEqual(.pending, observeMetadataProposalApply(status, null, receipt));
+    status.soft = .{ .role = .candidate, .leader_id = null };
+    try std.testing.expectEqual(.pending, observeMetadataProposalApply(status, null, receipt));
+    status.soft = .{ .role = .follower, .leader_id = 2 };
+    status.applied_index = 9;
+    try std.testing.expectEqual(.applied, observeMetadataProposalApply(status, 3, receipt));
+    // Only applied entry identity can resolve success versus replacement;
+    // missing identity remains conservative, and a removed group terminates.
+    try std.testing.expectEqual(.superseded, observeMetadataProposalApply(status, 4, receipt));
+    try std.testing.expectEqual(.unavailable, observeMetadataProposalApply(status, null, receipt));
+    try std.testing.expectEqual(.unavailable, observeMetadataProposalApply(null, null, receipt));
 }
 
 test "metadata proposal receipt survives a post-acceptance dispatch failure" {
@@ -4579,8 +4589,9 @@ pub const MetadataService = struct {
                             .{ self.metadata_group_id, receipt.term, receipt.index, raft_status.hard.current_term, raft_status.applied_index, applied_entry_term },
                         );
                     }
-                    return error.NotLeader;
+                    return error.MetadataProposalSuperseded;
                 },
+                .unavailable => return error.MetadataMutationOutcomeUnknown,
                 .pending => {},
             }
             if (progress_driver_lease == null) {
@@ -7042,7 +7053,8 @@ pub const MetadataHttpService = struct {
             self.unlockRuntime();
             switch (observation) {
                 .applied => return,
-                .superseded => return error.NotLeader,
+                .superseded => return error.MetadataProposalSuperseded,
+                .unavailable => return error.MetadataMutationOutcomeUnknown,
                 .pending => {},
             }
             if (progress_driver_lease == null) {

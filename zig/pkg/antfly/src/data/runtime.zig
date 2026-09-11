@@ -20018,8 +20018,8 @@ const RemoteMetadataSource = struct {
 
     /// Mutation failover is deliberately narrower than ordinary metadata API
     /// failover. Once a request may have crossed an admission boundary, only
-    /// `NotLeader` proves that replaying it against another configured URI is
-    /// safe. Every other result, especially MetadataMutationOutcomeUnknown,
+    /// non-admission or exact atomic-command non-application proves replay is
+    /// safe. Every unresolved result, especially MetadataMutationOutcomeUnknown,
     /// must reach the public caller unchanged.
     fn withMetadataMutationApiClient(
         self: *RemoteMetadataSource,
@@ -20030,6 +20030,7 @@ const RemoteMetadataSource = struct {
         const deadline_ns = self.awakeNs() +|
             @as(u64, antfly.public_api.raft_mutation_forwarding.max_remaining_ms) * std.time.ns_per_ms;
         var mutation_driver = antfly.public_api.raft_mutation_forwarding.AbsoluteDriver.init(deadline_ns);
+        var replay_proof_error: anyerror = error.NotLeader;
         var last_pre_admission_err: anyerror = error.MissingMetadataApi;
         const fallback_indices = try std.heap.page_allocator.alloc(usize, self.base_uris.len);
         defer std.heap.page_allocator.free(fallback_indices);
@@ -20041,7 +20042,7 @@ const RemoteMetadataSource = struct {
         for (0..self.base_uris.len) |attempt| {
             const now_ns = self.awakeNs();
             if (now_ns >= deadline_ns)
-                return error.NotLeader;
+                return replay_proof_error;
             const index = (start_index + attempt) % self.base_uris.len;
             // A slow or unavailable status endpoint cannot consume the whole
             // mutation budget. Give every remaining endpoint a turn and
@@ -20056,7 +20057,7 @@ const RemoteMetadataSource = struct {
             var metadata_client = self.metadataClient(scratch);
             const status = metadata_client.fetchStatusWithBudget(self.base_uris[index], discovery_budget) catch |err| {
                 if (self.awakeNs() >= deadline_ns)
-                    return error.NotLeader;
+                    return replay_proof_error;
                 last_pre_admission_err = if (err == error.Timeout) error.NotLeader else err;
                 continue;
             };
@@ -20083,6 +20084,7 @@ const RemoteMetadataSource = struct {
                 ctx,
             ) catch |err| {
                 if (!remoteMetadataMutationRetryable(err)) return err;
+                if (err == error.MetadataMutationNotApplied) replay_proof_error = err;
                 last_pre_admission_err = if (err == error.RaftMutationRequestNotSent)
                     error.NotLeader
                 else
@@ -20094,7 +20096,7 @@ const RemoteMetadataSource = struct {
         }
         for (endpoint_discovery.fallbacks()) |index| {
             if (self.awakeNs() >= deadline_ns)
-                return error.NotLeader;
+                return replay_proof_error;
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
@@ -20108,6 +20110,7 @@ const RemoteMetadataSource = struct {
                 ctx,
             ) catch |err| {
                 if (!remoteMetadataMutationRetryable(err)) return err;
+                if (err == error.MetadataMutationNotApplied) replay_proof_error = err;
                 last_pre_admission_err = if (err == error.RaftMutationRequestNotSent)
                     error.NotLeader
                 else
@@ -20117,7 +20120,7 @@ const RemoteMetadataSource = struct {
             self.noteMetadataAuthoritySuccess(index);
             return result;
         }
-        return last_pre_admission_err;
+        return if (replay_proof_error == error.MetadataMutationNotApplied) replay_proof_error else last_pre_admission_err;
     }
 
     const MetadataMutationEndpointDiscovery = struct {
@@ -20190,10 +20193,11 @@ const RemoteMetadataSource = struct {
 
     fn remoteMetadataMutationRetryable(err: anyerror) bool {
         // The authenticated forwarding endpoint emits NotLeader only with its
-        // explicit not-proposed outcome. Transport ambiguity, deterministic
-        // catalog results, and local allocation failures must never be hidden
+        // explicit not-proposed outcome, or MetadataMutationNotApplied after
+        // an applied replacement proves the atomic command lost. Transport
+        // ambiguity, catalog results, and allocation failures must never be hidden
         // by endpoint failover.
-        return err == error.NotLeader or err == error.RaftMutationRequestNotSent;
+        return err == error.NotLeader or err == error.RaftMutationRequestNotSent or err == error.MetadataMutationNotApplied;
     }
 
     fn remoteHead(ptr: *anyopaque) !antfly.metadata_api.MetadataHead {
@@ -40485,6 +40489,7 @@ test "remote metadata status source advertises exact table drop cleanup" {
 test "remote metadata mutation failover preserves ambiguous and deterministic outcomes" {
     try std.testing.expect(RemoteMetadataSource.remoteMetadataMutationRetryable(error.NotLeader));
     try std.testing.expect(RemoteMetadataSource.remoteMetadataMutationRetryable(error.RaftMutationRequestNotSent));
+    try std.testing.expect(RemoteMetadataSource.remoteMetadataMutationRetryable(error.MetadataMutationNotApplied));
     try std.testing.expect(!RemoteMetadataSource.remoteMetadataMutationRetryable(error.MetadataMutationOutcomeUnknown));
     try std.testing.expect(!RemoteMetadataSource.remoteMetadataMutationRetryable(error.TableNotFound));
     try std.testing.expect(!RemoteMetadataSource.remoteMetadataMutationRetryable(error.TableAlreadyExists));

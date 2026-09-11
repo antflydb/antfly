@@ -356,6 +356,7 @@ pub const Detail = enum(c_int) {
     vector_store_reference_format_required,
     // An ambiguous remote backup cannot authorize rollback at its caller.
     backup_outcome_ambiguous,
+    metadata_mutation_not_applied,
 };
 
 pub const Status = extern struct {
@@ -583,6 +584,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.BackupArtifactMissing => status(.not_found, .backup_artifact_missing),
         error.BackupIntegrityMissing => status(.corrupt, .backup_integrity_missing),
         error.BackupOutcomeAmbiguous => status(.conflict, .backup_outcome_ambiguous),
+        error.MetadataMutationNotApplied => status(.retryable, .metadata_mutation_not_applied),
         error.BackupAttemptLeaseLost => status(.conflict, .backup_attempt_lease_lost),
         error.BackgroundOwnerClosed => status(.unavailable, .background_owner_closed),
         error.RestoreSchedulingCapacity => status(.retryable, .restore_scheduling_capacity),
@@ -904,6 +906,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .backup_artifact_missing => "BackupArtifactMissing",
         .backup_integrity_missing => "BackupIntegrityMissing",
         .backup_outcome_ambiguous => "BackupOutcomeAmbiguous",
+        .metadata_mutation_not_applied => "MetadataMutationNotApplied",
         .backup_attempt_lease_lost => "BackupAttemptLeaseLost",
         .background_owner_closed => "BackgroundOwnerClosed",
         .restore_scheduling_capacity => "RestoreSchedulingCapacity",
@@ -1059,6 +1062,7 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.DeadlineExceeded, errorFromStatus(statusFromError(error.DeadlineExceeded)));
     try std.testing.expectEqual(error.PreDecisionDeadlineExceeded, errorFromStatus(statusFromError(error.PreDecisionDeadlineExceeded)));
     try std.testing.expectEqual(error.MetadataMutationOutcomeUnknown, errorFromStatus(statusFromError(error.MetadataMutationOutcomeUnknown)));
+    try std.testing.expectEqual(error.MetadataMutationNotApplied, errorFromStatus(statusFromError(error.MetadataMutationNotApplied)));
     try std.testing.expectEqual(error.InvalidEmbeddingArtifactProducer, errorFromStatus(statusFromError(error.InvalidEmbeddingArtifactProducer)));
     try std.testing.expectEqual(error.NativeBackupRepairStateNotQuiescent, errorFromStatus(statusFromError(error.NativeBackupRepairStateNotQuiescent)));
     try std.testing.expectEqual(error.NativeBackupProjectionNotQuiescent, errorFromStatus(statusFromError(error.NativeBackupProjectionNotQuiescent)));

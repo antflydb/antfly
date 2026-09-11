@@ -1,5 +1,20 @@
 # Zig E2E flakes
 
+## 2026-09-11: merged soak exposes a superseded create receipt (#694)
+
+The fresh `0259bab66` Linux batch failed an initial backup-table create with an
+unknown-outcome 409 after metadata leadership loss. Durable logs retain the
+common prefix and its replacement no-op, with no create. The failed root and
+worker log are preserved in `/private/tmp/ci694-main-review-first-failure.tar.gz`
+(SHA-256 `8893cda56544fb8af67124724cd730cb42c56900b46c4bbcec23021d4ca1eda9`).
+
+The production fix waits for the receipt's actual applied identity and exposes
+a distinct non-application proof only for a superseded single atomic topology
+command. Routing can then retry within its existing budgets. It does not replay
+unknown outcomes or change the fixture's assertions, cadence, or deadlines.
+See `zig/FLAKES.md` for the proof, protocol compatibility, and validation details.
+A new complete 100-per-scenario batch is required after this correction.
+
 ## 2026-09-11: fresh review before the merged Linux soak (#694)
 
 The fresh review additionally reproduced mixed-version Raft catch-up stalling:
