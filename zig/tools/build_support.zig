@@ -12,8 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const impl = @import("training.zig");
+const std = @import("std");
 
-pub fn main(init: @import("std").process.Init) !void {
-    return impl.main(init);
+pub fn addFileCompareTool(b: *std.Build, root: std.Build.LazyPath) *std.Build.Step.Compile {
+    return b.addExecutable(.{
+        .name = "check-files-equal",
+        .root_module = b.createModule(.{
+            .root_source_file = root.path(b, "check_files_equal.zig"),
+            .target = b.graph.host,
+        }),
+    });
 }

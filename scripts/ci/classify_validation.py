@@ -54,6 +54,7 @@ SDK_FILES = {
     "scripts/join_public_openapi.py",
     "scripts/join_openapi.py",
     "scripts/openapi_joiner.py",
+    "scripts/openapi_inputs.py",
     "scripts/public_openapi_overlays.py",
     "scripts/generate_graph_identifier_policy.py",
     "scripts/pyproject.toml",

@@ -121,6 +121,19 @@ jobs:
             scripts/run_db_query_matrix.py \
             scripts/test_run_db_query_matrix.py \
             scripts/test_conformance_fixtures.py \
+            ':(glob)specs/openapi/**' \
+            openapi.yaml \
+            scripts/join_openapi.py \
+            scripts/join_public_openapi.py \
+            scripts/openapi_joiner.py \
+            scripts/openapi_inputs.py \
+            scripts/public_openapi_overlays.py \
+            scripts/yaml_to_json.py \
+            scripts/generate_graph_identifier_policy.py \
+            scripts/generate_mcp_schema_fragments.py \
+            scripts/pyproject.toml \
+            scripts/uv.lock \
+            scripts/ci/test_zig_validation_scope.py \
             ':(glob)scripts/bench/pdf/**' \
             Makefile \
             .github/workflows/zig-tests.yml \
@@ -155,6 +168,11 @@ jobs:
           if git diff --quiet "$base" "${{ github.sha }}" -- \
             scripts/test-backup-s3-integration.sh \
             zig/build.zig \
+            ':(glob)zig/pkg/antfly/build/**' \
+            ':(glob)zig/pkg/inference/build/**' \
+            ':(glob)zig/lib/**/build_support.zig' \
+            ':(glob)zig/lib/**/build.zig' \
+            zig/tools/build_support.zig \
             zig/lib/httpx \
             zig/lib/objectstore \
             zig/pkg/antfly/src/api/backups.zig \
@@ -188,6 +206,11 @@ jobs:
             ':(glob)zig/lib/raft/**' \
             Makefile \
             zig/build.zig \
+            ':(glob)zig/pkg/antfly/build/**' \
+            ':(glob)zig/pkg/inference/build/**' \
+            ':(glob)zig/lib/**/build_support.zig' \
+            ':(glob)zig/lib/**/build.zig' \
+            zig/tools/build_support.zig \
             .github/workflows/zig-tests.yml
           then
             echo "trace_validate=false" >> "$GITHUB_OUTPUT"
@@ -351,14 +374,24 @@ jobs:
           zig test lib/hash/src/mod.zig -O Debug -mcpu=baseline -fno-llvm
           zig build lib-hash-test -Dcpu=baseline -Doptimize=ReleaseSafe
 
+      - name: Test native static-musl process execution
+        working-directory: zig
+        run: |
+          set -euo pipefail
+          zig build lib-platform-test -Dtarget=x86_64-linux-musl --summary all 2>&1 | tee "$RUNNER_TEMP/platform-musl.log"
+          # A successful aggregate could hide a skipped process check.
+          grep -q 'run python3 success' "$RUNNER_TEMP/platform-musl.log"
+
       - name: Check generated sources
         run: make zig-generated-check
 
       - name: Compile consolidated storage benchmark contracts
         if: needs.changes.outputs.zig_tests == 'true'
         working-directory: zig
-        run: zig build antfly-storage-bench-build -Doptimize=Debug
+        run: zig build antfly-storage-bench -Doptimize=Debug
 
+      # The unit gate compiles registered finetune commands once in its normal
+      # cache. These checks inspect coverage and run bounded dependency probes.
       - name: Test bounded-build tooling
         working-directory: zig
         run: >-
@@ -370,6 +403,8 @@ jobs:
           tools/test_run_test_partitions.py
           tools/test_run_recall_checks.py
           tools/test_test_runner.py
+          tools/test_sync_generated.py
+          tools/test_runtime_cache.py
 
       - name: Test benchmark orchestration and fixture setup
         run: |
@@ -377,9 +412,12 @@ jobs:
           python3 -m unittest discover -s scripts -p test_conformance_fixtures.py
           python3 -m unittest discover -s scripts/bench/pdf -p 'test_*.py'
 
-      - name: Check inference kernel generator
-        working-directory: zig/pkg/inference
-        run: zig build quant-kernel-local-check -Dmetal=false -Dcuda=false
+      - name: Check inference kernels through the root build graph
+        working-directory: zig
+        run: >-
+          zig build inference-test -Dmetal=false -Dcuda=false --
+          --test-filter "quant kernel compiler"
+          --test-filter "metal renderer"
 
       - name: Run inference benchmark and release contract tests
         working-directory: zig/pkg/inference
@@ -655,6 +693,8 @@ jobs:
       - name: Check generated sources
         run: make zig-generated-check
 
+      # The unit gate compiles registered finetune commands once in its normal
+      # cache. These checks inspect coverage and run bounded dependency probes.
       - name: Test bounded-build tooling
         working-directory: zig
         run: >-
@@ -666,6 +706,8 @@ jobs:
           tools/test_run_test_partitions.py
           tools/test_run_recall_checks.py
           tools/test_test_runner.py
+          tools/test_sync_generated.py
+          tools/test_runtime_cache.py
 
       - name: Test benchmark orchestration and fixture setup
         run: |

@@ -13,9 +13,9 @@
 // limitations.
 
 const builtin = @import("builtin");
-const build_options = @import("build_options");
+const lite_options = @import("antfly_lite_options");
 
-const local_inference_runtime_available = build_options.lite_local_inference_runtime and builtin.os.tag != .freestanding;
+const local_inference_runtime_available = lite_options.local_inference_runtime and builtin.os.tag != .freestanding;
 
 pub const Profile = enum {
     native,

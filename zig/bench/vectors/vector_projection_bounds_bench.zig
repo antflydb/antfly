@@ -7,11 +7,9 @@
 //     http://www.apache.org/licenses/LICENSE-2.0
 
 const std = @import("std");
-const antfly = @import("antfly-zig");
-
-const vector = antfly.vector;
-const vector_block = antfly.vectorindex.vector_block;
-const platform_time = antfly.platform_time;
+const vector = @import("antfly_vector").vector;
+const vector_block = @import("antfly_vector_index").vector_block;
+const platform_time = @import("antfly_platform").time;
 
 const Config = struct {
     vectors: usize = 4096,
