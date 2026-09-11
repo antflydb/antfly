@@ -3,13 +3,8 @@ SHELL := /bin/bash
 ZIG ?= zig
 ZIG_BUILD_FLAGS ?=
 UV ?= uv
-GIT ?= git
 SCRIPTS_PY := $(UV) run --project ../scripts --locked python
 INFERENCE_BIN ?= ./zig-out/bin/antfly
-OPENAPI_CODEGEN_SOURCES = build.zig build.zig.zon $(wildcard lib/openapi/src/*.zig)
-OPENAPI_CODEGEN_CACHE_KEY = $(strip $(shell $(GIT) hash-object $(OPENAPI_CODEGEN_SOURCES) 2>/dev/null | $(GIT) hash-object --stdin 2>/dev/null))
-OPENAPI_CODEGEN_CACHE_DIR ?= .zig-cache/openapi-generate-$(OPENAPI_CODEGEN_CACHE_KEY)
-OPENAPI_ZIG_BUILD = $(if $(OPENAPI_CODEGEN_CACHE_KEY),$(ZIG) build --cache-dir $(OPENAPI_CODEGEN_CACHE_DIR),$(error failed to compute OPENAPI_CODEGEN_CACHE_KEY; ensure git is available))
 
 # ====================================================================================
 # Build
@@ -70,13 +65,10 @@ tls-compat-check: ## Verify the checked-in Zig 0.16 TLS compatibility patch has 
 	@sh lib/httpx/src/tls/check_client_compat.sh
 
 openapi-generate: mcp-schema-fragments-generate
-	$(SCRIPTS_PY) ../scripts/join_public_openapi.py openapi.yaml
-	$(OPENAPI_ZIG_BUILD) regen-openapi
+	$(ZIG) build regen-openapi $(ZIG_BUILD_FLAGS)
 
 openapi-check: mcp-schema-fragments-check
-	$(SCRIPTS_PY) ../scripts/join_public_openapi.py --compare openapi.yaml
-	$(OPENAPI_ZIG_BUILD) regen-openapi
-	test -z "$$(git status --porcelain -- ../openapi.yaml pkg/antfly/src/api/generated/mcp_query_hierarchy_schema.json pkg/antfly/src/api/generated/mcp_query_input_schema.json pkg/antfly/src/openapi/generated pkg/inference/src/api/generated)"
+	$(ZIG) build check-openapi $(ZIG_BUILD_FLAGS)
 
 mcp-schema-fragments-generate:
 	$(SCRIPTS_PY) ../scripts/generate_mcp_schema_fragments.py

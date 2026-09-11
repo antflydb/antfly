@@ -824,14 +824,19 @@ pub const ProvisionedTableReadCache = struct {
     pub fn beginExclusiveTableAccess(self: *ProvisionedTableReadCache, table_name: []const u8) !ExclusiveTableAccess {
         return self.beginExclusiveTableAccessWithDeadline(
             table_name,
-            platform_time.monotonicNs() +| exclusive_wait_timeout_ns,
+            self.threaded.io(),
+            Io.Clock.Timestamp.fromNow(self.threaded.io(), .{
+                .raw = .fromNanoseconds(exclusive_wait_timeout_ns),
+                .clock = .awake,
+            }),
         );
     }
 
     pub fn beginExclusiveTableAccessWithDeadline(
         self: *ProvisionedTableReadCache,
         table_name: []const u8,
-        deadline_ns: u64,
+        wait_io: Io,
+        deadline: Io.Clock.Timestamp,
     ) !ExclusiveTableAccess {
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
@@ -846,23 +851,25 @@ pub const ProvisionedTableReadCache = struct {
             gop.value_ptr.* = 0;
         }
         gop.value_ptr.* += 1;
+        errdefer {
+            self.releaseExclusiveTableAccessLocked(table_name);
+            self.ready.broadcast(io);
+        }
 
         self.bumpEpochLocked(table_name);
         self.removeEntriesForTableLocked(table_name);
         self.ready.broadcast(io);
-        const drain_started_ns = platform_time.monotonicNs();
+        const started = Io.Clock.Timestamp.now(wait_io, deadline.clock);
         while (self.hasPendingOpenForTableLocked(table_name) or
             self.hasTableLocked(table_name) or
             self.hasRetiredEntryForTableLocked(table_name))
         {
-            const now_ns = platform_time.monotonicNs();
-            const waited_ns = now_ns -| drain_started_ns;
-            if (now_ns >= deadline_ns) {
+            const now = Io.Clock.Timestamp.now(wait_io, deadline.clock);
+            const remaining_ns = now.durationTo(deadline).raw.toNanoseconds();
+            if (remaining_ns <= 0) {
                 const pending_opens = self.pendingOpenCountForTableLocked(table_name);
                 const retired_entries = self.retiredEntryCountForTableLocked(table_name);
                 const active_leases = self.activeLeaseCountForTableLocked(table_name);
-                self.releaseExclusiveTableAccessLocked(table_name);
-                self.ready.broadcast(io);
                 // The caller retains durable convergence ownership and may
                 // retry this bounded drain. Treat timeout as actionable
                 // repair pressure, not process corruption: strict test and
@@ -873,13 +880,16 @@ pub const ProvisionedTableReadCache = struct {
                     pending_opens,
                     retired_entries,
                     active_leases,
-                    @divTrunc(waited_ns, std.time.ns_per_ms),
+                    @divTrunc(started.durationTo(now).raw.toNanoseconds(), std.time.ns_per_ms),
                 });
                 return error.TableReadDrainTimeout;
             }
             self.mutex.unlock(io);
-            io.sleep(Io.Duration.fromNanoseconds(@min(exclusive_wait_poll_ns, deadline_ns - now_ns)), .awake) catch {};
+            // Cache synchronization retains its owner IO; only the wait and
+            // deadline borrow the caller's clock/cancellation authority.
+            const slept = wait_io.sleep(.fromNanoseconds(@min(exclusive_wait_poll_ns, remaining_ns)), deadline.clock);
             self.mutex.lockUncancelable(io);
+            try slept;
         }
         self.mutex.unlock(io);
 
@@ -31834,9 +31844,45 @@ test "provisioned read cache exclusive access drains active read leases" {
         error.TableReadDrainTimeout,
         cache.beginExclusiveTableAccessWithDeadline(
             "docs",
-            platform_time.monotonicNs() + 5 * std.time.ns_per_ms,
+            std.testing.io,
+            Io.Clock.Timestamp.fromNow(std.testing.io, .{ .raw = .fromMilliseconds(5), .clock = .awake }),
         ),
     );
+    try std.testing.expect(!cache.hasExclusiveTableAccessLocked("docs"));
+
+    const Clock = struct {
+        threadlocal var active: ?*@This() = null;
+        elapsed_ns: i96 = 17,
+        sleeps: usize = 0,
+        cancel: bool = false,
+
+        fn now(_: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
+            std.debug.assert(clock == .awake);
+            return .fromNanoseconds(active.?.elapsed_ns);
+        }
+
+        fn sleep(_: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
+            const self = active.?;
+            self.sleeps += 1;
+            if (self.cancel) return error.Canceled;
+            self.elapsed_ns += timeout.duration.raw.toNanoseconds();
+        }
+    };
+    var clock: Clock = .{};
+    Clock.active = &clock;
+    defer Clock.active = null;
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = Clock.now;
+    vtable.sleep = Clock.sleep;
+    const wait_io: Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    const deadline = Io.Clock.Timestamp.fromNow(wait_io, .{ .raw = .fromMicroseconds(62500), .clock = .awake });
+    try std.testing.expectError(error.TableReadDrainTimeout, cache.beginExclusiveTableAccessWithDeadline("docs", wait_io, deadline));
+    try std.testing.expectEqual(@as(i96, 17 + 62500 * std.time.ns_per_us), clock.elapsed_ns);
+    try std.testing.expectEqual(@as(usize, 3), clock.sleeps);
+    try std.testing.expect(!cache.hasExclusiveTableAccessLocked("docs"));
+    clock = .{ .cancel = true };
+    try std.testing.expectError(error.Canceled, cache.beginExclusiveTableAccessWithDeadline("docs", wait_io, deadline));
+    try std.testing.expectEqual(@as(usize, 1), clock.sleeps);
     try std.testing.expect(!cache.hasExclusiveTableAccessLocked("docs"));
 
     var ctx = ExclusiveThread{ .cache = &cache };

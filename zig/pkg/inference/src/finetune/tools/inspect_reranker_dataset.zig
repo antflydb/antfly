@@ -13,11 +13,13 @@
 // limitations under the License.
 
 const std = @import("std");
-const inference = @import("inference_internal");
-
-const reranker_data = inference.finetune.reranker_data;
-
 pub fn main(init: std.process.Init) !void {
+    return runWithData(@import("inference_finetune_data"), init);
+}
+
+/// The combined CLI supplies its existing owner; standalone tools import only data.
+pub fn runWithData(comptime data: type, init: std.process.Init) !void {
+    const reranker_data = data.reranker_data;
     const allocator = init.gpa;
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
     defer args.deinit();

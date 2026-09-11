@@ -7245,6 +7245,7 @@ const StateMergeHeap = struct {
             .advanced_sources = advanced_sources,
             .cursors = cursors,
         };
+        // The allocation errdefers own cleanup until the heap is returned.
         for (states, 0..) |state, source| {
             if (state.entryCount() != 0) try heap.pushSource(source);
         }
@@ -7352,7 +7353,8 @@ const PersistedRunMergeHeap = struct {
             .sources = sources,
             .advanced_sources = advanced_sources,
         };
-        errdefer heap.deinit();
+        // Reading cursor blocks can fail during heap construction. The
+        // allocation errdefers still own both buffers until we return.
 
         for (cursors, 0..) |*cursor, source| {
             if (cursor.position != null) try heap.pushSource(source);
@@ -8080,6 +8082,64 @@ fn tableEntryFromOwnedEntry(entry: state_mod.OwnedEntry) lsm_table_file.Entry {
 
 fn compareOwnedEntry(lhs: state_mod.OwnedEntry, rhs: state_mod.OwnedEntry) std.math.Order {
     return compareTableEntry(tableEntryFromOwnedEntry(lhs), tableEntryFromOwnedEntry(rhs));
+}
+
+test "persisted compaction merge heap initialization cleans up read and allocation failures" {
+    const Fixture = struct {
+        const Failure = enum { none, missing, corrupt };
+
+        fn run(allocator: std.mem.Allocator, failure: Failure, failing_source: usize) !void {
+            var memory = @import("storage_io.zig").MemoryStorage.init(std.testing.allocator);
+            defer memory.deinit();
+            const storage = memory.storage();
+            const paths = [_][]const u8{ "/runs/1.tbl", "/runs/2.tbl" };
+            const encoded = try lsm_table_file.encodeAlloc(std.testing.allocator, &.{
+                .{ .key = "key", .value = "value" },
+            });
+            defer std.testing.allocator.free(encoded);
+            for (paths) |path| try storage.writeFileAbsolute(path, encoded);
+
+            var cursors: [paths.len]PersistedRunCursor = undefined;
+            var initialized: usize = 0;
+            defer for (cursors[0..initialized]) |*cursor| cursor.deinit();
+            for (paths, 0..) |path, i| {
+                cursors[i] = try PersistedRunCursor.init(allocator, storage, path);
+                initialized += 1;
+            }
+
+            // Index discovery succeeds before the first heap comparison reads
+            // either payload. Exercise failures both before and after a peer
+            // cursor has materialized its block.
+            switch (failure) {
+                .none => {},
+                .missing => try storage.deleteFileAbsolute(paths[failing_source]),
+                .corrupt => {
+                    const bytes = memory.files.get(paths[failing_source]).?;
+                    bytes[cursors[failing_source].index.entry_data_start] ^= 1;
+                },
+            }
+
+            var heap = PersistedRunMergeHeap.init(allocator, &cursors) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                switch (failure) {
+                    .none => return err,
+                    .missing => try std.testing.expectEqual(error.FileNotFound, err),
+                    .corrupt => try std.testing.expectEqual(error.TableBlockChecksumMismatch, err),
+                }
+                return;
+            };
+            defer heap.deinit();
+            try std.testing.expectEqual(Failure.none, failure);
+            try std.testing.expectEqual(@as(usize, 2), heap.len);
+            try std.testing.expectEqual(@as(?usize, 0), heap.peekSource());
+        }
+    };
+
+    for ([_]Fixture.Failure{ .none, .missing, .corrupt }) |failure| {
+        for (0..2) |source| {
+            try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ failure, source });
+        }
+    }
 }
 
 test "unlocked compaction snapshots retain source file references until build cleanup" {
