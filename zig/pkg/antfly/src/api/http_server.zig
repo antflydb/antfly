@@ -7414,7 +7414,10 @@ pub const ApiHttpServer = struct {
             const listing = try std.json.parseFromSliceLeaky(@import("../system_catalog/projection.zig").TableListing, arena.allocator(), bytes, .{});
             if (listing.entries.len != 1) return error.InvalidCatalogRecord;
             snapshot = try listing.adminSnapshot(arena.allocator());
-            table_name = snapshot.tables[0].name;
+            if (target == .logical) {
+                if (!std.mem.eql(u8, listing.entries[0].name, target.logical.table)) return error.InvalidCatalogRecord;
+                table_name = snapshot.tables[0].name;
+            }
         } else {
             if (target == .logical and (!std.mem.eql(u8, target.logical.database, "default") or !std.mem.eql(u8, target.logical.namespace, "public"))) return error.UnsupportedOperation;
             legacy = (try self.source.adminSnapshot()) orelse return null;
@@ -48556,9 +48559,10 @@ test "system catalog HTTP and MCP detail resolve and project in one observation"
         fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: system_catalog.Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expect(input == .table_status);
-            try std.testing.expect(input.table_status == .logical);
-            try std.testing.expectEqualStrings("tenant", input.table_status.logical.database);
-            try std.testing.expectEqualStrings("docs", input.table_status.logical.table);
+            if (input.table_status == .logical) {
+                try std.testing.expectEqualStrings("tenant", input.table_status.logical.database);
+                try std.testing.expectEqualStrings("docs", input.table_status.logical.table);
+            }
             self.calls += 1;
             return std.json.Stringify.valueAlloc(a, @import("../system_catalog/projection.zig").TableListing{
                 .revision = 9,
@@ -48584,4 +48588,6 @@ test "system catalog HTTP and MCP detail resolve and project in one observation"
     var described = try server.executeMcpApplicationOperation(.{ .describe_table = .{ .table_name = logical } }, null);
     defer described.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expect((try server.maybeEncodeTableStatus("table:missing")) == null);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
 }
