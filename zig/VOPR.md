@@ -3182,6 +3182,15 @@ qualification requires two successful default-budget Linux workflow runs; the
 second dispatch must set `require_seed=true` and report nonzero consumed seeds
 for every shard. A local gate alone is not full-soak evidence.
 
+The same CI gate runs the production Raft transport tests and determinism
+audit. A bounded-fair HA/scaling history exposed a timer divergence: the HTTP
+frame queue calculated retry deadlines and jitter from host time while sleeping
+on borrowed I/O. Retry readiness and snapshot-transfer deadlines now use their
+owning I/O's monotonic clock throughout. Snapshot staging names also obtain
+entropy from that I/O instead of host time and a process-global counter.
+Virtual-clock regressions cover retry readiness, repeatable jitter, and a
+transfer's remaining deadline across realtime clock changes.
+
 The executable, run and merged-corpus artifacts are retained for 90 days.
 Fiber callsite identities are scoped to a pinned executable layout; keep the
 original executable when investigating older traces. The diagnostic dispatch

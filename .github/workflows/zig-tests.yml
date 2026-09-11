@@ -233,6 +233,7 @@ jobs:
             zig/build.zig.zon \
             ':(glob)zig/lib/vopr/**' \
             ':(glob)zig/pkg/antfly/src/vopr/**' \
+            ':(glob)zig/pkg/antfly/src/raft/transport/**' \
             ':(glob)zig/pkg/antfly/build/**' \
             ':(glob)scripts/ci/*vopr*.py' \
             scripts/ci/toolchain-policy.json \
