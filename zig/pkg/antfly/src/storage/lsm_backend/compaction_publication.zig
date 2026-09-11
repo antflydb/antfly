@@ -19,7 +19,6 @@ const std = @import("std");
 const Directory = @import("run_directory.zig").Directory;
 const Store = @import("run_store.zig").Store;
 const Ledger = @import("obsolete_ledger.zig").Ledger;
-const Account = @import("memory_account.zig").Account;
 const repository = @import("repository.zig");
 const Run = repository.Run;
 const Plan = @import("compaction.zig").CompactionPlan;
@@ -55,7 +54,6 @@ pub const Job = struct {
     rebases: usize = 0,
     rebase: ?Rebase = null,
     reservation: ?resources.Reservation = null,
-    cleanup_account: ?*Account = null,
     next: ?*Job = null,
     published: bool = false,
 
@@ -97,7 +95,6 @@ pub const Job = struct {
         // Never inspect candidate headers while the off-lock step mutates them.
         var bytes = self.accounting.accountedMemoryBytes(pass) +| self.base.accountedMemoryBytes(pass) +| self.source.memoryBytes(pass) +| self.base_obsolete.memoryBytes(pass);
         if (self.rebase) |*rebase| bytes +|= rebase.directory.accountedMemoryBytes(pass) +| rebase.store.memoryBytes(pass) +| rebase.obsolete.memoryBytes(pass);
-        if (self.cleanup_account) |account| bytes +|= account.chargeOnce(pass);
         return bytes;
     }
 
@@ -248,27 +245,9 @@ pub const Job = struct {
         return rebase.runs.done() and rebase.paths.done();
     }
 
-    fn drainLedger(self: *Job, backend: anytype, ledger: Ledger) void {
-        self.cleanup_account = if (ledger.tree.account) |account| account.retain() else null;
-        var reclaimer = Ledger.Reclaimer.init(ledger);
-        while (true) {
-            runtime.unlockBackend(@TypeOf(backend.*), backend, true);
-            var credits: usize = 2048;
-            const deadline = clock.monotonicNs() +| quantum_ns;
-            var done = false;
-            while (credits != 0 and clock.monotonicNs() < deadline) {
-                var part: usize = @min(credits, 64);
-                const before = part;
-                done = reclaimer.step(backend.allocator, &part);
-                credits -= before - part;
-                if (done) break;
-            }
-            if (!done) if (backend.manifestCoordinationIo()) |io| io.sleep(.fromNanoseconds(1), .awake) catch {};
-            _ = runtime.lockBackend(@TypeOf(backend.*), backend);
-            if (done) break;
-        }
-        if (self.cleanup_account) |account| account.release();
-        self.cleanup_account = null;
+    fn drainLedger(_: *Job, backend: anytype, ledger: Ledger) void {
+        var owned = ledger;
+        backend.releaseObsoleteLedgerLocked(&owned);
     }
 
     pub fn advanceLocked(self: *Job, backend: anytype, outputs: []Run) !bool {

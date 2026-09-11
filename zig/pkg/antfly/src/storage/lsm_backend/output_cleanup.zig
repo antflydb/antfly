@@ -32,6 +32,12 @@ pub const Queue = struct {
     wake_context: ?*anyopaque = null,
     wake_fn: ?*const fn (*anyopaque) void = null,
 
+    /// Reserved ticket allocations have a single accounting owner. Without
+    /// a manager, include them in observational estimates for diagnostics.
+    pub fn observedMemoryBytes(self: *const Queue) u64 {
+        return @sizeOf(Queue) +| if (self.manager == null) self.bytes.load(.acquire) else 0;
+    }
+
     pub fn create(self: *Queue, path: []const u8) !*Ticket {
         var reservation: ?resources.Reservation = null;
         errdefer if (reservation) |*lease| lease.release();
@@ -124,6 +130,32 @@ test "output cleanup tickets own paths through allocation failures and shared ru
         }
     };
     for ([_]bool{ false, true }) |commit| try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{commit});
+}
+
+test "output cleanup charges aggregate memory exactly once across ownership transitions" {
+    const Backend = @import("../lsm_backend.zig").Backend;
+    var manager = resources.ResourceManager.init(.{});
+    var backend = Backend.init(std.testing.allocator, .{ .resource_manager = &manager });
+    defer backend.close();
+    try backend.initOutputCleanup();
+    backend.syncTrackedInMemoryStateUsageCurrentLocked();
+    const baseline = manager.snapshot().memory.used_bytes;
+    const queue = backend.options.unpublished_outputs.?;
+    for ([_]bool{ false, true }) |abandon| {
+        const ticket = try queue.create("accounted-output.tbl");
+        const bytes = queue.bytes.load(.acquire);
+        backend.syncTrackedInMemoryStateUsageCurrentLocked();
+        try std.testing.expectEqual(baseline + bytes, manager.snapshot().memory.used_bytes);
+        if (abandon) {
+            ticket.abandon();
+            backend.syncTrackedInMemoryStateUsageCurrentLocked();
+            try std.testing.expectEqual(baseline + bytes, manager.snapshot().memory.used_bytes);
+            try std.testing.expectEqual(ticket, queue.pop().?);
+        }
+        ticket.destroy();
+        backend.syncTrackedInMemoryStateUsageCurrentLocked();
+        try std.testing.expectEqual(baseline, manager.snapshot().memory.used_bytes);
+    }
 }
 
 test "output cleanup persists failed deletes and retries off-lock after reopen" {

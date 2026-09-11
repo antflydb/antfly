@@ -909,6 +909,10 @@ pub const Backend = struct {
         unpublished_output_cleanup_pending: u64 = 0,
         unpublished_output_cleanup_bytes: u64 = 0,
         unpublished_output_cleanup_admission_failures: u64 = 0,
+        ledger_reclaim_pending: u64 = 0,
+        ledger_reclaim_slices: u64 = 0,
+        ledger_reclaim_units: u64 = 0,
+        ledger_reclaim_max_slice_ns: u64 = 0,
         active_readers: u64 = 0,
         active_readers_by_kind: [reader_pin_kind_count]u64 = [_]u64{0} ** reader_pin_kind_count,
         obsolete_paths_pinned_by_reader_kind: [reader_pin_kind_count]u64 = [_]u64{0} ** reader_pin_kind_count,
@@ -1029,6 +1033,10 @@ pub const Backend = struct {
         dst.unpublished_output_cleanup_pending +|= src.unpublished_output_cleanup_pending;
         dst.unpublished_output_cleanup_bytes +|= src.unpublished_output_cleanup_bytes;
         dst.unpublished_output_cleanup_admission_failures +|= src.unpublished_output_cleanup_admission_failures;
+        dst.ledger_reclaim_pending +|= src.ledger_reclaim_pending;
+        dst.ledger_reclaim_slices +|= src.ledger_reclaim_slices;
+        dst.ledger_reclaim_units +|= src.ledger_reclaim_units;
+        dst.ledger_reclaim_max_slice_ns = @max(dst.ledger_reclaim_max_slice_ns, src.ledger_reclaim_max_slice_ns);
         dst.current_manifest_bytes +|= src.current_manifest_bytes;
         dst.active_readers +|= src.active_readers;
         for (&dst.active_readers_by_kind, src.active_readers_by_kind) |*dst_count, src_count| dst_count.* +|= src_count;
@@ -1585,6 +1593,14 @@ pub const Backend = struct {
     active_readers_by_kind: [reader_pin_kind_count]usize = [_]usize{0} ** reader_pin_kind_count,
     manifest_dirty: bool = false,
     obsolete_paths: repository_mod.ObsoleteLedger = .empty,
+    active_ledger_reclamations: ?*@import("lsm_backend/ledger_reclamation.zig").Job = null,
+    ledger_snapshots: ?*@import("lsm_backend/ledger_reclamation.zig").Snapshot = null,
+    retired_ledger_snapshots: ?*@import("lsm_backend/ledger_reclamation.zig").Snapshot = null,
+    retired_ledger_tail: ?*@import("lsm_backend/ledger_reclamation.zig").Snapshot = null,
+    ledger_reclaim_in_flight: bool = false,
+    ledger_reclaim_slices: u64 = 0,
+    ledger_reclaim_units: u64 = 0,
+    ledger_reclaim_max_slice_ns: u64 = 0,
     obsolete_manifest_dirty: bool = false,
     obsolete_delete_failures: u64 = 0,
     obsolete_delete_retries: u64 = 0,
@@ -2340,6 +2356,11 @@ pub const Backend = struct {
             stats.unpublished_output_cleanup_bytes = queue.bytes.load(.acquire);
         }
         stats.unpublished_output_cleanup_admission_failures = self.output_cleanup_admission_failures;
+        var retired_ledger = self.retired_ledger_snapshots;
+        while (retired_ledger) |snapshot| : (retired_ledger = snapshot.retired_next) stats.ledger_reclaim_pending +|= 1;
+        stats.ledger_reclaim_slices = self.ledger_reclaim_slices;
+        stats.ledger_reclaim_units = self.ledger_reclaim_units;
+        stats.ledger_reclaim_max_slice_ns = self.ledger_reclaim_max_slice_ns;
         stats.tombstone_reconcile_rows = self.tombstone_reconcile_rows;
         stats.tombstone_reconcile_completed = self.tombstone_reconcile_completed;
         stats.tombstone_reconcile_failures = self.tombstone_reconcile_failures;
@@ -2678,6 +2699,7 @@ pub const Backend = struct {
 
     fn maintenanceScoreLocked(self: *Backend) u64 {
         var score: u64 = 0;
+        if (self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) score +|= 1;
         if ((self.outputCleanupDelayLocked() orelse 1) == 0) score +|= 1;
         if (self.pending_bulk_plan != null or self.retired_bulk_plans != null) score +|= 1;
         if (self.tombstoneReconcileDelayLocked()) |delay| if (delay == 0) {
@@ -2828,7 +2850,14 @@ pub const Backend = struct {
     fn estimateInMemoryStateBytesWithCandidateLocked(self: *const Backend, candidate: ?*const ActiveMemTable) u64 {
         const pass = state_mod.memory_account.nextPass();
         var bytes = self.mutable.accountedMemoryBytes(pass);
-        if (self.options.unpublished_outputs) |queue| bytes +|= @sizeOf(output_cleanup.Queue) +| queue.bytes.load(.acquire);
+        // Tickets already own builder-slice reservations. Only the queue
+        // header belongs to this observer; charging tickets here duplicates
+        // their contribution to the resource manager's aggregate budget.
+        if (self.options.unpublished_outputs) |queue| bytes +|= queue.observedMemoryBytes();
+        var ledger_reclamation = self.active_ledger_reclamations;
+        while (ledger_reclamation) |job| : (ledger_reclamation = job.next) bytes +|= job.memoryBytes(pass);
+        var ledger_snapshot = self.ledger_snapshots;
+        while (ledger_snapshot) |snapshot| : (ledger_snapshot = snapshot.active_next) bytes +|= snapshot.memoryBytes(pass);
         var publication = self.active_compaction_publications;
         while (publication) |job| : (publication = job.next) bytes +|= job.accountedMemoryBytes(pass);
         bytes +|= self.runs.memoryBytes(pass);
@@ -2915,6 +2944,17 @@ pub const Backend = struct {
         manager.observeUsage(.lsm_recovery_working_set, &self.tracked_recovery_working_set_bytes, 0);
     }
 
+    pub fn releaseObsoleteLedgerLocked(self: *Backend, ledger: *repository_mod.ObsoleteLedger) void {
+        @import("lsm_backend/ledger_reclamation.zig").drainLocked(self, ledger);
+    }
+
+    pub fn drainRetiredLedgers(self: *Backend) void {
+        _ = runtime_mod.lockBackend(Backend, self);
+        while (self.retired_ledger_snapshots != null) @import("lsm_backend/ledger_reclamation.zig").reclaimSliceLocked(self);
+        std.debug.assert(self.ledger_snapshots == null);
+        self.mu.unlock();
+    }
+
     pub fn acquireCompactionGrant(self: *Backend, work: anytype) ?compaction_scheduler_mod.Grant {
         const io_bytes = if (@hasField(@TypeOf(work), "io_bytes")) work.io_bytes else work.input_bytes;
         if (!self.canReserveMaintenanceIoBudget(io_bytes)) return null;
@@ -2985,6 +3025,9 @@ pub const Backend = struct {
     }
 
     fn runMaintenanceStepLocked(self: *Backend) !bool {
+        // Cleanup is safe even after a durability fence or under pressure.
+        // The unlock path executes one bounded FIFO reclamation turn.
+        if (self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) return true;
         if (self.manifest_recovery_required) return false;
         const reclaim_visits_before = self.obsolete_reclaim_visits;
         const planning_slices_before = self.directory_planning_slices;
@@ -3562,6 +3605,7 @@ pub const Backend = struct {
     /// Detach retired generations while serialized; reclaim their potentially
     /// large subtrees outside the writer lock. A lifecycle pin protects close.
     pub fn unlockWithReclamation(self: *Backend) void {
+        @import("lsm_backend/ledger_reclamation.zig").reclaimSliceLocked(self);
         if ((self.outputCleanupDelayLocked() orelse 1) == 0) self.cached_maintenance_hint.store(1, .release);
         // Reclamation releases lifecycle pins only. It must not initiate a
         // best-effort manifest write and consume a durability error belonging
@@ -3637,6 +3681,10 @@ pub const Backend = struct {
             self.syncTrackedInMemoryStateUsageCurrentLocked();
         }
         if ((self.outputCleanupDelayLocked() orelse 1) == 0) self.cached_maintenance_hint.store(1, .release);
+        // Small snapshot retirements normally finish in this unlock. Only
+        // residual debt warrants a worker; pre-unlock scheduling would submit
+        // an otherwise empty background job on each ordinary manifest edit.
+        if (self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) self.scheduleMaintenanceJobLocked(true);
         self.mu.unlock();
     }
 
@@ -4675,20 +4723,27 @@ pub const Backend = struct {
     fn deinitImmutableFlushJob(_: *anyopaque) void {}
 
     fn scheduleMaintenanceJobIfNeededLocked(self: *Backend) void {
+        self.scheduleMaintenanceJobLocked(false);
+    }
+
+    fn scheduleMaintenanceJobLocked(self: *Backend, after_reclamation: bool) void {
         if (self.closing.load(.acquire)) return;
         if (self.options.backend.read_only) return;
-        if (self.bulkIngestActive() and self.outputCleanupDelayLocked() == null and self.pending_bulk_plan == null and self.retired_bulk_plans == null and self.tombstoneReconcileDelayLocked() == null and !self.wal_checkpoint_pending and !self.bulkTieredL0MaintenanceDueLocked() and !(self.manifest_journal.sequence != null and self.manifest_journal.checkpointDue())) return;
+        const pending_ledger = self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight;
+        const ledger_cleanup = after_reclamation and pending_ledger;
+        if (self.bulkIngestActive() and !ledger_cleanup and self.outputCleanupDelayLocked() == null and self.pending_bulk_plan == null and self.retired_bulk_plans == null and self.tombstoneReconcileDelayLocked() == null and !self.wal_checkpoint_pending and !self.bulkTieredL0MaintenanceDueLocked() and !(self.manifest_journal.sequence != null and self.manifest_journal.checkpointDue())) return;
+        const score = self.maintenanceScoreLocked() - @intFromBool(pending_ledger and !after_reclamation);
         if (self.options.maintenance_waker != null) {
-            if (self.maintenanceScoreLocked() != 0) self.wakeMaintenanceWorker();
+            if (score != 0) self.wakeMaintenanceWorker();
             return;
         }
         if (self.maintenance_job_in_flight) return;
-        if (!self.bulkIngestActive()) {
+        if (!self.bulkIngestActive() and !ledger_cleanup) {
             if (self.immutable_flush_job_in_flight or self.immutable_flush_build_in_flight) return;
             if (self.activeImmutableMemtableCount() > 0) return;
         }
         if (!self.background_executor.canRunDetached()) return;
-        if (!self.bulkIngestActive() and self.maintenanceScoreLocked() == 0 and !self.hasReclaimableObsoletePathsLocked()) return;
+        if (!self.bulkIngestActive() and score == 0 and !self.hasReclaimableObsoletePathsLocked()) return;
 
         self.maintenance_job_in_flight = true;
         self.background_executor.submit(.maintenance, self, runMaintenanceJob, deinitMaintenanceJob) catch |err| {
@@ -8096,6 +8151,7 @@ pub const Backend = struct {
     pub fn nextMaintenanceWakeDelayNsBestEffort(self: *Backend) ?u64 {
         if (!self.mu.tryLock()) return null;
         defer self.mu.unlock();
+        if (self.retired_ledger_snapshots != null and !self.ledger_reclaim_in_flight) return 0;
         if (self.manifest_recovery_required) return null;
 
         // Keep the advertised deadline consistent with runMaintenanceStepLocked:
@@ -11460,7 +11516,7 @@ test "lsm backend accounts in-memory recovery state in the resource manager and 
     }
 
     const maintenance = backend.snapshotMaintenanceStats();
-    const expected_in_memory_bytes = maintenance.mutable_bytes + maintenance.immutable_bytes + @sizeOf(output_cleanup.Queue) + maintenance.unpublished_output_cleanup_bytes;
+    const expected_in_memory_bytes = maintenance.mutable_bytes + maintenance.immutable_bytes + @sizeOf(output_cleanup.Queue);
     try std.testing.expect(expected_in_memory_bytes > 0);
     try std.testing.expectEqual(expected_in_memory_bytes, manager.sliceStats(.lsm_in_memory_state).used_bytes);
 

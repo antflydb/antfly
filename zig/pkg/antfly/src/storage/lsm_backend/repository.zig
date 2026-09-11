@@ -793,6 +793,8 @@ pub var publication_test_hook: ?struct { context: *anyopaque, run: *const fn (*a
 /// Benchmark control: identical durable format and planner, serialized fsync.
 pub var publication_test_keep_backend_locked = false;
 
+const LedgerSnapshot = @import("ledger_reclamation.zig").Snapshot;
+
 pub const ManifestJournal = struct {
     sequence: ?u64 = null,
     bytes: u64 = 0,
@@ -1005,8 +1007,9 @@ pub const ManifestJournal = struct {
         }
         const directory = try backend.manifest_directory.?.fork(allocator);
         defer backend.retireCheckpointDirectory(directory);
-        var ledger = self.obsolete.fork();
-        defer ledger.deinit(allocator);
+        const ledger_owner = try LedgerSnapshot.capture(backend, &self.obsolete);
+        defer ledger_owner.retire(backend);
+        const ledger = &ledger_owner.value;
         const paths = try allocator.alloc(lsm_manifest.ObsoletePathMeta, retired_count);
         defer allocator.free(paths);
         var initialized: usize = 0;
@@ -1097,8 +1100,9 @@ pub const ManifestJournal = struct {
         // exhausted recovery headroom. Publishing an individually valid base
         // plus an oversized suffix would make the next reopen unrecoverable.
         if (!self.checkpointFits(checkpoint_bytes, old_bytes)) return error.ManifestJournalBacklogExceeded;
-        var next_ledger = self.obsolete.fork();
-        defer next_ledger.deinit(allocator);
+        const next_ledger_owner = try LedgerSnapshot.capture(backend, &self.obsolete);
+        defer next_ledger_owner.retire(backend);
+        const next_ledger = &next_ledger_owner.value;
         // Writers may have grown the ledger while the checkpoint streamed.
         // Admit path-copy scratch from the actual publication-time heights,
         // not a fixed bytes-per-path approximation made at capture time.
@@ -1135,7 +1139,7 @@ pub const ManifestJournal = struct {
             self.sequence = null;
             return err;
         };
-        std.mem.swap(ObsoleteLedger, &self.obsolete, &next_ledger);
+        std.mem.swap(ObsoleteLedger, &self.obsolete, next_ledger);
         self.descriptor = descriptor;
         self.checkpoint_sequence = sequence;
         self.next_run_id = @max(self.next_run_id, next_run_id);
@@ -1194,8 +1198,9 @@ pub const ManifestJournal = struct {
             } else backend.obsolete_paths.appendAssumeCapacity(.{ .path = @constCast(path.path), .delete_after_ns = path.delete_after_ns });
         }
         transferred = true;
-        var ledger = backend.obsolete_paths.fork();
-        defer ledger.deinit(allocator);
+        const ledger_owner = try LedgerSnapshot.capture(backend, &backend.obsolete_paths);
+        defer ledger_owner.retire(backend);
+        const ledger = &ledger_owner.value;
         const id = backend.next_run_id;
         backend.next_run_id = try std.math.add(u64, id, 1);
         const next_run_id = backend.next_run_id;
@@ -1254,7 +1259,7 @@ pub const ManifestJournal = struct {
             backend.write_stats.manifest_io_unlocked_ns +|= backend.writeStatsElapsedNs(started);
         }
         const bytes = try built;
-        std.mem.swap(ObsoleteLedger, &self.obsolete, &ledger);
+        std.mem.swap(ObsoleteLedger, &self.obsolete, ledger);
         self.descriptor = descriptor;
         self.active_segment = id;
         self.segments[0] = id;
@@ -1376,9 +1381,9 @@ pub const ManifestJournal = struct {
             // Semantically unchanged edits may have a different COW root.
             // Settle that identity as well, or cleanup debt stays dirty and
             // every maintenance turn repeats the same empty ledger diff.
-            var settled_obsolete = backend.obsolete_paths.fork();
-            std.mem.swap(ObsoleteLedger, &self.obsolete, &settled_obsolete);
-            settled_obsolete.deinit(allocator);
+            const settled = try LedgerSnapshot.capture(backend, &backend.obsolete_paths);
+            defer settled.retire(backend);
+            std.mem.swap(ObsoleteLedger, &self.obsolete, &settled.value);
             backend.publishManifestDirectory(next_directory);
             return .{ .written = 0, .total = self.bytes, .checkpoint = false };
         }
@@ -1388,8 +1393,9 @@ pub const ManifestJournal = struct {
             break :blk id;
         } else self.active_segment;
         const next_run_id = backend.next_run_id;
-        var next_obsolete = backend.obsolete_paths.fork();
-        defer next_obsolete.deinit(allocator);
+        const next_obsolete_owner = try LedgerSnapshot.capture(backend, &backend.obsolete_paths);
+        defer next_obsolete_owner.retire(backend);
+        const next_obsolete = &next_obsolete_owner.value;
         const sequence = if (checkpoint) 0 else self.sequence.? + 1;
         const wire_removed_paths = try allocator.alloc([]const u8, removed_paths.items.len);
         defer allocator.free(wire_removed_paths);
@@ -1421,7 +1427,7 @@ pub const ManifestJournal = struct {
             self.checkpoint_sequence = 0;
         }
         self.sequence = sequence;
-        std.mem.swap(ObsoleteLedger, &self.obsolete, &next_obsolete);
+        std.mem.swap(ObsoleteLedger, &self.obsolete, next_obsolete);
         self.bytes = total;
         self.edit_bytes = if (checkpoint) 0 else self.edit_bytes + encoded.len;
         self.next_run_id = next_run_id;

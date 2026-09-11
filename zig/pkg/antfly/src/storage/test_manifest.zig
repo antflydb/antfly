@@ -225,6 +225,7 @@ comptime {
     _ = @import("lsm_backend/compaction.zig");
     _ = @import("lsm_backend/compaction_publication.zig");
     _ = @import("lsm_backend/output_cleanup.zig");
+    _ = @import("lsm_backend/ledger_reclamation.zig");
     _ = @import("lsm_backend/compaction_scheduler.zig");
     _ = @import("lsm_backend/mod.zig");
     _ = @import("lsm_backend/manifest_set.zig");

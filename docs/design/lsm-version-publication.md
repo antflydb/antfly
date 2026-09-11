@@ -20,7 +20,10 @@ defers physical deletion. Sync drains pending handoffs and persists their paths
 in the existing obsolete-file journal. Queue paths and memory, admission failures,
 and existing deletion/retry counters make the debt observable. Tickets reserve
 builder working-set credit before file creation and release it on publication or
-ledger handoff.
+ledger handoff. These ticket reservations are the sole owner of ticket bytes in
+the resource manager: the in-memory-state observer charges the queue header,
+not the reserved ticket allocations again. Diagnostic queue byte counters still
+report every live ticket, including tickets held by builders.
 
 Physical reclamation retains its own path and lifecycle pin, releases the backend
 mutex for deletion/cache invalidation, then reacquires it to update the ledger.
@@ -43,6 +46,57 @@ the delete hook checks that the backend mutex is available during physical I/O.
 ```sh
 python3 tools/run_bounded_zig_build.py build lsm-backend-test -- --test-filter 'output cleanup'
 python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'output cleanup off-lock handoff scaling benchmark'
+```
+
+### Journal snapshot ownership and bounded reclamation
+
+Journal edits, fenced replacement checkpoints, and background checkpoints capture
+obsolete ledgers in preallocated snapshot owners. Success, cancellation, and
+error unwind retire the owner to an intrusive FIFO without allocation, I/O, or
+unlocking. This is essential for administrative publications such as splits:
+their lock must remain held until all live roots have been installed. A captured
+ledger can become the last owner of a large tree while concurrent writes replace
+its original root; reference counting alone does not bound its destruction cost.
+
+At safe unlock points, one reclaimer advances the oldest snapshot outside the
+writer mutex. Cleanup-only workers are requested after this turn, so small
+retirements do not submit redundant jobs on ordinary manifest edits. A turn
+processes at most 2,048 reclamation credits, 64 completed
+owners, or two milliseconds, checking time between 64-credit chunks. Arrivals
+append at the tail, so they cannot starve an older snapshot. Reentrant unlocks
+cannot process the same owner concurrently. Maintenance advertises and services
+this memory-only cleanup during bulk mode and after a durability fence without
+requiring I/O admission. Close drains the remaining owners after other operations
+stop. Detached compaction ledgers use the same slice primitive with a stack-owned
+registration and complete cleanup even after cancellation; yielding uses `std.Io`.
+
+Lifecycle pins keep the backend alive while the mutex is released. Immutable
+accounting handles keep active and retired snapshot memory visible without
+inspecting an off-lock destructive cursor. Shared allocations are deduplicated
+per observation; snapshot headers and private pool arrays remain charged until
+released. Pending owners, total slices/credits, and maximum destructive-slice time
+are exposed in maintenance statistics. Time slicing remains cooperative: a single
+allocator operation or scheduler delay can exceed the nominal deadline.
+
+Local arm64 ReleaseFast last-owner teardown benchmark using `std.heap.smp_allocator`
+(no storage I/O, no competing writers):
+
+| Obsolete paths | Previous teardown under lock | FIFO retirement under lock | Total off-lock cleanup | Slices |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 14.6 µs | 250 ns | 15.9 µs | 1 |
+| 10,000 | 156 µs | 125 ns | 191 µs | 5 |
+| 100,000 | 2.87 ms | 83 ns | 3.64 ms | 49 |
+
+The largest measured destructive slice was 152 µs. These samples demonstrate
+moving size-dependent work off the publication lock, not a reduction in total
+destruction work or an end-to-end throughput claim. Separate debug-allocator tests
+cover every capture allocation failure, checkpoint success/failure after ledger
+churn, administrative fencing, cancellation, FIFO arrivals during reclamation,
+and single-charge resource accounting.
+
+```sh
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -- --test-filter 'ledger reclamation' --test-filter 'output cleanup'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'ledger reclamation checkpoint churn benchmark'
 ```
 
 ### Time-sliced compaction publication
