@@ -1,6 +1,8 @@
 import json
+import os
 import subprocess
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -9,6 +11,47 @@ import zig_vopr_soak as soak
 
 
 class SoakTests(unittest.TestCase):
+    def test_workflow_resolves_scheduled_and_dispatch_history_budgets(self):
+        workflow = (
+            Path(__file__).resolve().parents[2] / ".github/workflows/zig-vopr-soak.yml"
+        ).read_text()
+        step = workflow.split("      - name: Run retained-corpus campaign\n", 1)[1]
+        step = step.split("      - name:", 1)[0]
+        command = textwrap.dedent(step.split("        run: |\n", 1)[1])
+        # Execute the workflow's actual shell; intercept only the expensive
+        # campaign launch so the CLI boundary sees exactly what CI would pass.
+        capture = "python3() { printf '%s\\0' \"$@\"; }\n"
+        for scenario, default in (
+            ("ha", 1000),
+            ("raft", 1000),
+            ("distributed-data", 12),
+            ("ha-scaling", 2),
+        ):
+            for override in ("", "0", "7", "-1"):
+                with self.subTest(scenario=scenario, override=override):
+                    result = subprocess.run(
+                        ["bash", "-e", "-c", capture + command],
+                        env={
+                            **os.environ,
+                            "SCENARIO": scenario,
+                            "SHARD": "1",
+                            "RUN_NUMBER": "2",
+                            "RUNNER_TEMP": "/tmp/vopr soak contract",
+                            "HISTORY_BUDGET": override,
+                            "DEFAULT_HISTORY_BUDGET": str(default),
+                        },
+                        check=True,
+                        capture_output=True,
+                    )
+                    arguments = result.stdout.decode().rstrip("\0").split("\0")
+                    expected = str(default) if override in ("", "0") else override
+                    self.assertEqual(
+                        arguments[arguments.index("--histories") + 1], expected
+                    )
+                    self.assertEqual(
+                        arguments[arguments.index("--scenario") + 1], scenario
+                    )
+
     def test_finding_retains_seed_and_failure_evidence_and_fails(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)

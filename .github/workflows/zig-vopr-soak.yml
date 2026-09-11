@@ -37,6 +37,8 @@ jobs:
         with:
           version: ${{ steps.toolchain.outputs.zig_version }}
           use-cache: false
+      - name: Test soak orchestration
+        run: python3 -m unittest discover -s scripts/ci -p test_zig_vopr_soak.py
       - name: Build campaign runner
         working-directory: zig
         run: zig build vopr-build -Doptimize=ReleaseSafe -j1 --summary all
@@ -90,9 +92,15 @@ jobs:
         env:
           SCENARIO: ${{ matrix.scenario }}
           SHARD: ${{ matrix.shard }}
-          HISTORY_BUDGET: ${{ inputs.histories || matrix.histories }}
+          HISTORY_BUDGET: ${{ inputs.histories }}
+          DEFAULT_HISTORY_BUDGET: ${{ matrix.histories }}
           RUN_NUMBER: ${{ github.run_number }}
         run: |
+          # Dispatch can supply the string "0", which is truthy in expressions.
+          # Normalize the sentinel and the absent scheduled input explicitly.
+          if [ -z "$HISTORY_BUDGET" ] || [ "$HISTORY_BUDGET" = "0" ]; then
+            HISTORY_BUDGET="$DEFAULT_HISTORY_BUDGET"
+          fi
           seed=$((0xa17f5500 + RUN_NUMBER * 65536 + SHARD))
           python3 ../scripts/ci/zig_vopr_soak.py --binary "$RUNNER_TEMP/runner/vopr" run \
             --scenario "$SCENARIO" --histories "$HISTORY_BUDGET" --seed "$seed" \
