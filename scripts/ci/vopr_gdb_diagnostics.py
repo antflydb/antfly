@@ -10,6 +10,36 @@ production_fixture = None
 inspection_failed = False
 
 
+def request_details():
+    """Expose request ownership beyond std.Io's queue/select wrapper frames."""
+    frame = gdb.newest_frame()
+    for _ in range(48):
+        if frame is None:
+            break
+        name = frame.name() or ""
+        if "executeRequestCancellable" in name or "waitForRequestCancellation" in name:
+            gdb.write(f"  request frame: {name}\n")
+            for variable in (
+                "timeout_ms",
+                "request_timeout_ms",
+                "deadline_ms",
+                "deadline_ns",
+            ):
+                try:
+                    gdb.write(f"    {variable}={frame.read_var(variable)}\n")
+                except gdb.error:
+                    pass  # Optimized-out values are not evidence of a timeout.
+            try:
+                request = frame.read_var("req").dereference()
+                uri = request["uri"]["raw"]
+                length = min(int(uri["len"]), 512)
+                raw = gdb.selected_inferior().read_memory(int(uri["ptr"]), length)
+                gdb.write(f"    request={request['method']} {bytes(raw)!r}\n")
+            except (gdb.error, ValueError) as error:
+                gdb.write(f"    request details unavailable: {error}\n")
+        frame = frame.older()
+
+
 def suspended_tasks(fixture):
     """Read saved fiber stacks before teardown destroys the retained owners."""
     runtime = fixture.dereference()["sim"].dereference()
@@ -38,7 +68,10 @@ def suspended_tasks(fixture):
             for name in saved:
                 gdb.execute(f"set ${name} = {int(task['context'][name])}")
             gdb.invalidate_cached_frames()
-            gdb.execute("bt 12")
+            # Queue/select helpers can consume the first twelve frames. Keep
+            # enough stack to identify the production caller owning the wait.
+            gdb.execute("bt 48")
+            request_details()
         finally:
             for name, value in saved.items():
                 gdb.execute(f"set ${name} = {value}")
