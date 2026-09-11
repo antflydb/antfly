@@ -386,7 +386,11 @@ pub fn releaseOutputsLocked(backend: anytype, outputs: *std.ArrayListUnmanaged(R
         const end = @min(outputs.items.len, index + 512);
         while (index < end and clock.monotonicNs() < deadline) : (index += 1) {
             const run = &outputs.items[index];
-            if (discard) if (backend.storage) |storage| if (run.path) |path| repository.deleteFileAbsoluteWithStorage(storage, path) catch {};
+            if (discard) {
+                // Production outputs own preallocated tickets. Destruction
+                // queues cleanup even if the request's Io is cancelled.
+                if (!run.abandonOutput()) if (backend.storage) |storage| if (run.path) |path| repository.deleteFileAbsoluteWithStorage(storage, path) catch {};
+            } else run.commitOutput();
             run.deinit(backend.allocator);
         }
         if (backend.manifestCoordinationIo()) |io| io.sleep(.fromNanoseconds(1), .awake) catch {};

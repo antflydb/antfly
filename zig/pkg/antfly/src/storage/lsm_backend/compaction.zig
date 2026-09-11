@@ -4526,7 +4526,7 @@ fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendT
     std.debug.assert(relocked);
     var reader_retained = true;
     errdefer if (reader_retained) if (@hasDecl(BackendType, "releaseReaderKind")) backend.releaseReaderKind(.compaction) else backend.releaseReader();
-    errdefer if (build_result_valid) discardOutputRuns(BackendType, backend, &build_result);
+    errdefer if (build_result_valid) discardOutputRunsLocked(BackendType, backend, &build_result);
     if (build_err) |err| {
         return err;
     }
@@ -4543,7 +4543,7 @@ fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendT
         relocatePlanIfInputsStillMatch((try run_store.oracleItems(backend)), plan, selected_run_ids)) orelse {
         if (@hasDecl(BackendType, "releaseReaderKind")) backend.releaseReaderKind(.compaction) else backend.releaseReader();
         reader_retained = false;
-        discardOutputRuns(BackendType, backend, &build_result);
+        discardOutputRunsLocked(BackendType, backend, &build_result);
         releaseCompactionSnapshots(BackendType, backend, &selected_runs);
         return;
     };
@@ -4555,7 +4555,7 @@ fn compactPlanAtWithUnlockedBuild(comptime BackendType: type, backend: *BackendT
     if (drop_tombstones and !complete_coverage) {
         if (@hasDecl(BackendType, "releaseReaderKind")) backend.releaseReaderKind(.compaction) else backend.releaseReader();
         reader_retained = false;
-        discardOutputRuns(BackendType, backend, &build_result);
+        discardOutputRunsLocked(BackendType, backend, &build_result);
         releaseCompactionSnapshots(BackendType, backend, &selected_runs);
         return;
     }
@@ -4615,14 +4615,14 @@ fn compactPinnedPlanWithUnlockedBuild(backend: anytype, plan: CompactionPlan, dr
     inheritL0Sequence(&outputs, handles, plan.output_level);
     _ = runtime_mod.lockBackend(BackendType, backend);
     locked = true;
-    errdefer discardOutputRuns(BackendType, backend, &outputs);
+    errdefer discardOutputRunsLocked(BackendType, backend, &outputs);
     const relocated = try relocateDirectoryPlan(backend, plan) orelse {
-        discardOutputRuns(BackendType, backend, &outputs);
+        discardOutputRunsLocked(BackendType, backend, &outputs);
         return;
     };
     defer relocated.deinit(backend.allocator);
     if (drop_tombstones and !(relocated.complete_coverage orelse false)) {
-        discardOutputRuns(BackendType, backend, &outputs);
+        discardOutputRunsLocked(BackendType, backend, &outputs);
         return;
     }
     try installCompactedRuns(BackendType, backend, relocated.plan, handles.len, input_bytes, start_ns, &outputs);
@@ -5098,11 +5098,23 @@ fn installOwnedTreeRuns(backend: anytype, plan: CompactionPlan, selected_len: us
     try job.publishLocked(backend, input_bytes, start_ns);
 }
 
+/// Caller holds Backend.mu; large metadata destruction yields off-lock.
+pub fn discardOutputRunsLocked(comptime BackendType: type, backend: *BackendType, runs: *std.ArrayListUnmanaged(Run)) void {
+    if (comptime @hasDecl(BackendType, "initOutputCleanup")) {
+        backend.retainReaderKind(.compaction);
+        defer backend.releaseReaderKind(.compaction);
+        return @import("compaction_publication.zig").releaseOutputsLocked(backend, runs, true);
+    }
+    discardOutputRuns(BackendType, backend, runs);
+}
+
+/// Build/split cleanup does not assume or modify backend lock ownership.
 pub fn discardOutputRuns(comptime BackendType: type, backend: *BackendType, runs: *std.ArrayListUnmanaged(Run)) void {
     if (@hasField(BackendType, "storage")) {
         if (backend.storage) |storage| {
             for (runs.items) |run| {
-                if (run.path) |path| repository_mod.deleteFileAbsoluteWithStorage(storage, path) catch {};
+                var owned = run;
+                if (owned.versionOwner().output_ticket == null) if (run.path) |path| repository_mod.deleteFileAbsoluteWithStorage(storage, path) catch {};
             }
         }
     }
@@ -6730,6 +6742,7 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
         entry_count: usize = 0,
         tombstone_count: u32 = 0,
         logical_bytes: usize = 0,
+        output_ticket: ?*@import("output_cleanup.zig").Ticket = null,
 
         const Self = @This();
 
@@ -6742,6 +6755,13 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
                 .output_level = output_level,
             };
             errdefer self.deinit();
+            if (comptime @hasField(@TypeOf(backend.options), "unpublished_outputs")) {
+                if (backend.options.unpublished_outputs) |queue| {
+                    const path = try repository_mod.runPath(backend.allocator, backend.root_dir.?, run_id);
+                    defer backend.allocator.free(path);
+                    self.output_ticket = try queue.create(path);
+                }
+            }
             try self.writer.initInPlace(
                 backend.storage.?,
                 backend.allocator,
@@ -6767,6 +6787,7 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
             if (self.smallest_key.len > 0) self.backend.allocator.free(self.smallest_key);
             if (self.largest_namespace_name) |name| self.backend.allocator.free(name);
             if (self.largest_key.len > 0) self.backend.allocator.free(self.largest_key);
+            if (self.output_ticket) |ticket| ticket.abandon();
             self.* = undefined;
         }
 
@@ -6836,8 +6857,11 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
                 self.backend.allocator.free(largest_key);
             }
 
+            const ticket = self.output_ticket;
+            self.output_ticket = null;
             return .{
                 .id = self.run_id,
+                .output_ticket = ticket,
                 .level = self.output_level,
                 .size_bytes = persisted.size_bytes,
                 .compression_stats = persisted.compression_stats,
@@ -7883,6 +7907,7 @@ pub fn appendOwnedRuns(dst: anytype, allocator: std.mem.Allocator, src: *std.Arr
         for (src.items) |run| try candidate.stage(allocator, run);
         for (src.items) |*run| {
             candidate.adopt(run);
+            candidate.find(run).?.commitOutput();
             if (run.owner) |owner| owner.release(allocator);
             disarmRun(run);
         }

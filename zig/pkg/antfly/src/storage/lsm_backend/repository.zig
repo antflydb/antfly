@@ -67,6 +67,7 @@ pub const RunOwner = struct {
 
 pub const Run = struct {
     owner: ?*RunOwner = null,
+    output_ticket: ?*@import("output_cleanup.zig").Ticket = null,
     id: u64,
     /// Logical newest-write precedence for L0. Physical rewrites allocate a
     /// fresh id but retain the newest input sequence so tiered merges cannot
@@ -103,6 +104,8 @@ pub const Run = struct {
             owner.release(allocator);
             return;
         }
+        if (self.output_ticket) |ticket| ticket.abandon();
+        self.output_ticket = null;
         if (self.owns_path) {
             if (self.path) |path| allocator.free(path);
         }
@@ -152,6 +155,22 @@ pub const Run = struct {
 
     pub fn versionOwner(self: *Run) *Run {
         return if (self.owner) |owner| owner.raw else self;
+    }
+
+    /// Only after publication is irrevocable; caller retains an owner until
+    /// this completes, so a concurrent retirement cannot abandon this ticket.
+    pub fn commitOutput(self: *Run) void {
+        const raw = self.versionOwner();
+        if (raw.output_ticket) |ticket| ticket.destroy();
+        raw.output_ticket = null;
+    }
+
+    pub fn abandonOutput(self: *Run) bool {
+        const raw = self.versionOwner();
+        const ticket = raw.output_ticket orelse return false;
+        raw.output_ticket = null;
+        ticket.abandon();
+        return true;
     }
 
     pub fn ensureState(self: *Run, allocator: Allocator) !*state_mod.State {

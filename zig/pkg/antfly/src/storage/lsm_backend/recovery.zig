@@ -115,6 +115,7 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
     }
     errdefer cleanup(BackendType, backend, false);
     errdefer finishOpenFailure(BackendType, backend);
+    if (@hasDecl(BackendType, "initOutputCleanup")) try backend.initOutputCleanup();
 
     if (@hasDecl(BackendType, "acquireRootLockState")) {
         try backend.acquireRootLockState(options.create_if_missing);
@@ -369,6 +370,7 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
         }
         backend.obsolete_runs.deinit(backend.allocator);
     }
+    if (@hasDecl(BackendType, "deinitOutputCleanup")) backend.deinitOutputCleanup();
     if (@hasField(BackendType, "run_state_cache")) {
         for (backend.run_state_cache.items) |*cached| cached.deinit(backend.allocator);
         backend.run_state_cache.deinit(backend.allocator);

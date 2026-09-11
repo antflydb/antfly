@@ -30,6 +30,7 @@ const run_directory_mod = @import("lsm_backend/run_directory.zig");
 const RunDirectory = run_directory_mod.Directory;
 const run_store_mod = @import("lsm_backend/run_store.zig");
 const RunStore = run_store_mod.Store;
+const output_cleanup = @import("lsm_backend/output_cleanup.zig");
 const compaction_mod = @import("lsm_backend/compaction.zig");
 const compaction_scheduler_mod = @import("lsm_backend/compaction_scheduler.zig");
 const background_runtime_mod = @import("background_runtime.zig");
@@ -339,6 +340,8 @@ fn atomicMaxCounter(counter: *CounterU64, candidate: u64) void {
 }
 
 pub const Options = struct {
+    /// Backend-owned internal cleanup sink; reset on every open/init.
+    unpublished_outputs: ?*output_cleanup.Queue = null,
     backend: backend_types.OpenOptions = .{},
     flush_threshold: usize = 8,
     flush_threshold_bytes: u64 = 0,
@@ -903,6 +906,9 @@ pub const Backend = struct {
         obsolete_paths_reclaimable: u64 = 0,
         obsolete_delete_failures: u64 = 0,
         obsolete_delete_retries: u64 = 0,
+        unpublished_output_cleanup_pending: u64 = 0,
+        unpublished_output_cleanup_bytes: u64 = 0,
+        unpublished_output_cleanup_admission_failures: u64 = 0,
         active_readers: u64 = 0,
         active_readers_by_kind: [reader_pin_kind_count]u64 = [_]u64{0} ** reader_pin_kind_count,
         obsolete_paths_pinned_by_reader_kind: [reader_pin_kind_count]u64 = [_]u64{0} ** reader_pin_kind_count,
@@ -1020,6 +1026,9 @@ pub const Backend = struct {
         dst.obsolete_paths_reclaimable +|= src.obsolete_paths_reclaimable;
         dst.obsolete_delete_failures +|= src.obsolete_delete_failures;
         dst.obsolete_delete_retries +|= src.obsolete_delete_retries;
+        dst.unpublished_output_cleanup_pending +|= src.unpublished_output_cleanup_pending;
+        dst.unpublished_output_cleanup_bytes +|= src.unpublished_output_cleanup_bytes;
+        dst.unpublished_output_cleanup_admission_failures +|= src.unpublished_output_cleanup_admission_failures;
         dst.current_manifest_bytes +|= src.current_manifest_bytes;
         dst.active_readers +|= src.active_readers;
         for (&dst.active_readers_by_kind, src.active_readers_by_kind) |*dst_count, src_count| dst_count.* +|= src_count;
@@ -1708,6 +1717,9 @@ pub const Backend = struct {
     retired_run_directories: ?*RunDirectory = null,
     retired_run_stores: ?*RunStore = null,
     active_compaction_publications: ?*compaction_mod.Publication = null,
+    output_cleanup_retry_at_ns: u64 = 0,
+    output_cleanup_admission_failures: u64 = 0,
+    obsolete_reclaim_in_flight: bool = false,
     retired_closures: ?*compaction_mod.PendingDirectoryClosure = null,
     closure_reclaim_in_flight: bool = false,
     store_reclaimer: ?RunStore.Reclaimer = null,
@@ -1755,6 +1767,78 @@ pub const Backend = struct {
             .storage_owner = null,
             .storage = options.storage,
         };
+        self.options.unpublished_outputs = null;
+    }
+
+    pub fn initOutputCleanup(self: *Backend) !void {
+        if (self.options.backend.read_only) return;
+        const queue = try self.allocator.create(output_cleanup.Queue);
+        queue.* = .{ .allocator = self.allocator, .manager = self.options.resource_manager };
+        if (self.options.maintenance_waker) |waker| {
+            queue.wake_context = waker.ptr;
+            queue.wake_fn = waker.wake_fn;
+        }
+        self.options.unpublished_outputs = queue;
+    }
+
+    pub fn deinitOutputCleanup(self: *Backend) void {
+        if (self.options.unpublished_outputs) |queue| {
+            queue.deinit();
+            self.allocator.destroy(queue);
+        }
+        self.options.unpublished_outputs = null;
+    }
+
+    fn outputCleanupDelayLocked(self: *Backend) ?u64 {
+        const queue = self.options.unpublished_outputs orelse return null;
+        if (queue.pending.load(.acquire) == 0) return null;
+        return self.output_cleanup_retry_at_ns -| self.nowNs();
+    }
+
+    /// One bounded metadata handoff. No physical deletion under Backend.mu.
+    /// Tickets are restored to the queue on OOM/admission failure without
+    /// allocating, including when the originating request was cancelled.
+    fn drainOutputCleanupSliceLocked(self: *Backend) !bool {
+        const queue = self.options.unpublished_outputs orelse return false;
+        const deadline = platform.time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        var progressed = false;
+        for (0..64) |_| {
+            if (platform.time.monotonicNs() >= deadline) break;
+            const ticket = queue.pop() orelse break;
+            errdefer {
+                queue.append(ticket);
+                self.output_cleanup_admission_failures +|= 1;
+                self.output_cleanup_retry_at_ns = self.nowNs() +| @max(std.time.ns_per_ms, self.options.obsolete_delete_retry_ns);
+            }
+            var credit = try self.admitCompactionMetadataBytes(32 +| ticket.path.len);
+            defer credit.release();
+            try self.obsolete_paths.ensureUnusedCapacity(self.allocator, 1);
+            if (!self.obsolete_paths.contains(ticket.path)) {
+                const path = try self.allocator.dupe(u8, ticket.path);
+                self.obsolete_paths.appendAssumeCapacity(.{ .path = path, .delete_after_ns = self.nowNs() });
+                self.obsolete_manifest_dirty = true;
+                credit.commit();
+            }
+            ticket.destroy();
+            progressed = true;
+        }
+        if (progressed) {
+            self.output_cleanup_retry_at_ns = 0;
+            self.obsolete_reclaim_retry_at_ns = 0;
+        }
+        return progressed;
+    }
+
+    fn drainOutputCleanupLocked(self: *Backend) !void {
+        while (self.outputCleanupDelayLocked() != null) {
+            _ = try self.drainOutputCleanupSliceLocked();
+            self.retainReaderKind(.other);
+            self.mu.unlock();
+            const yielded = if (self.manifestCoordinationIo()) |io| io.sleep(.fromNanoseconds(1), .awake) else @as(anyerror!void, {});
+            _ = runtime_mod.lockBackend(Backend, self);
+            self.releaseReaderKind(.other);
+            try yielded;
+        }
     }
 
     pub fn open(allocator: Allocator, root_dir: []const u8, options: Options) !Backend {
@@ -2251,6 +2335,11 @@ pub const Backend = struct {
             .obsolete_delete_retries = self.obsolete_delete_retries,
         };
         const obsolete_now_ns = self.nowNs();
+        if (self.options.unpublished_outputs) |queue| {
+            stats.unpublished_output_cleanup_pending = queue.pending.load(.acquire);
+            stats.unpublished_output_cleanup_bytes = queue.bytes.load(.acquire);
+        }
+        stats.unpublished_output_cleanup_admission_failures = self.output_cleanup_admission_failures;
         stats.tombstone_reconcile_rows = self.tombstone_reconcile_rows;
         stats.tombstone_reconcile_completed = self.tombstone_reconcile_completed;
         stats.tombstone_reconcile_failures = self.tombstone_reconcile_failures;
@@ -2589,6 +2678,7 @@ pub const Backend = struct {
 
     fn maintenanceScoreLocked(self: *Backend) u64 {
         var score: u64 = 0;
+        if ((self.outputCleanupDelayLocked() orelse 1) == 0) score +|= 1;
         if (self.pending_bulk_plan != null or self.retired_bulk_plans != null) score +|= 1;
         if (self.tombstoneReconcileDelayLocked()) |delay| if (delay == 0) {
             score +|= 1;
@@ -2738,6 +2828,7 @@ pub const Backend = struct {
     fn estimateInMemoryStateBytesWithCandidateLocked(self: *const Backend, candidate: ?*const ActiveMemTable) u64 {
         const pass = state_mod.memory_account.nextPass();
         var bytes = self.mutable.accountedMemoryBytes(pass);
+        if (self.options.unpublished_outputs) |queue| bytes +|= @sizeOf(output_cleanup.Queue) +| queue.bytes.load(.acquire);
         var publication = self.active_compaction_publications;
         while (publication) |job| : (publication = job.next) bytes +|= job.accountedMemoryBytes(pass);
         bytes +|= self.runs.memoryBytes(pass);
@@ -2898,6 +2989,14 @@ pub const Backend = struct {
         const reclaim_visits_before = self.obsolete_reclaim_visits;
         const planning_slices_before = self.directory_planning_slices;
         if (self.options.backend.read_only) return false;
+        if ((self.outputCleanupDelayLocked() orelse 1) == 0) {
+            const progressed = self.drainOutputCleanupSliceLocked() catch |err| switch (err) {
+                error.OutOfMemory, error.ResourceBudgetExceeded => return false,
+                else => return err,
+            };
+            if (progressed) try self.persistManifestLocked();
+            return progressed;
+        }
         // Admission pressure governs new work, not the lifetime of an owned
         // continuation. Retire obsolete jobs even while foreground work owns
         // the I/O lane; unlock reclamation drains their pins in bounded slices.
@@ -3463,6 +3562,7 @@ pub const Backend = struct {
     /// Detach retired generations while serialized; reclaim their potentially
     /// large subtrees outside the writer lock. A lifecycle pin protects close.
     pub fn unlockWithReclamation(self: *Backend) void {
+        if ((self.outputCleanupDelayLocked() orelse 1) == 0) self.cached_maintenance_hint.store(1, .release);
         // Reclamation releases lifecycle pins only. It must not initiate a
         // best-effort manifest write and consume a durability error belonging
         // to the explicit sync/publication operation that unlocked us.
@@ -3536,6 +3636,7 @@ pub const Backend = struct {
             self.releaseReaderKind(.other);
             self.syncTrackedInMemoryStateUsageCurrentLocked();
         }
+        if ((self.outputCleanupDelayLocked() orelse 1) == 0) self.cached_maintenance_hint.store(1, .release);
         self.mu.unlock();
     }
 
@@ -4369,7 +4470,10 @@ pub const Backend = struct {
         const manifest_start_ns = self.writeStatsNowNs();
         _ = try self.writeRunSetManifestSnapshotInTurnLocked(self.root_dir.?, prospective_runs.items, manifest_start_ns, false, manifest_turn.waited);
 
-        for (prospective_runs.items) |*run| prepared_store.adopt(run);
+        for (prospective_runs.items) |*run| {
+            prepared_store.adopt(run);
+            prepared_store.find(run).?.commitOutput();
+        }
 
         for (old_runs.items, 0..) |*run, i| {
             switch (actions[i]) {
@@ -4573,7 +4677,7 @@ pub const Backend = struct {
     fn scheduleMaintenanceJobIfNeededLocked(self: *Backend) void {
         if (self.closing.load(.acquire)) return;
         if (self.options.backend.read_only) return;
-        if (self.bulkIngestActive() and self.pending_bulk_plan == null and self.retired_bulk_plans == null and self.tombstoneReconcileDelayLocked() == null and !self.wal_checkpoint_pending and !self.bulkTieredL0MaintenanceDueLocked() and !(self.manifest_journal.sequence != null and self.manifest_journal.checkpointDue())) return;
+        if (self.bulkIngestActive() and self.outputCleanupDelayLocked() == null and self.pending_bulk_plan == null and self.retired_bulk_plans == null and self.tombstoneReconcileDelayLocked() == null and !self.wal_checkpoint_pending and !self.bulkTieredL0MaintenanceDueLocked() and !(self.manifest_journal.sequence != null and self.manifest_journal.checkpointDue())) return;
         if (self.options.maintenance_waker != null) {
             if (self.maintenanceScoreLocked() != 0) self.wakeMaintenanceWorker();
             return;
@@ -4743,7 +4847,7 @@ pub const Backend = struct {
         std.debug.assert(relocked);
         var build_in_flight = true;
         defer if (build_in_flight) self.finishImmutableFlushBuildLocked();
-        errdefer if (build_result_valid) compaction_mod.discardOutputRuns(Backend, self, &build_result);
+        errdefer if (build_result_valid) compaction_mod.discardOutputRunsLocked(Backend, self, &build_result);
         if (build_err) |err| return err;
 
         var window_matches = publish_head == self.immutable_head and
@@ -4758,7 +4862,7 @@ pub const Backend = struct {
             }
         }
         if (!window_matches) {
-            compaction_mod.discardOutputRuns(Backend, self, &build_result);
+            compaction_mod.discardOutputRunsLocked(Backend, self, &build_result);
             return false;
         }
 
@@ -7656,10 +7760,13 @@ pub const Backend = struct {
 
     fn finalizeDeferredStorageWorkLocked(self: *Backend) !void {
         if (self.options.backend.read_only) return;
+        try self.drainOutputCleanupLocked();
         if (self.mutable.entryCount() > 0 or self.activeImmutableMemtableCount() > 0) {
             try self.flushMutable();
         }
         try self.finalizeDeferredRunWork(.{});
+        try self.drainOutputCleanupLocked();
+        if (self.root_dir != null and self.obsolete_manifest_dirty) try self.persistManifestLocked();
     }
 
     const DeferredRunWorkOptions = struct {
@@ -7891,11 +7998,16 @@ pub const Backend = struct {
     }
 
     fn reconcileObsoletePathsForManifest(self: *Backend) !void {
+        if (self.obsolete_reclaim_in_flight) return;
+        self.obsolete_reclaim_in_flight = true;
+        defer self.obsolete_reclaim_in_flight = false;
+        const deadline = platform.time.monotonicNs() +| 2 * std.time.ns_per_ms;
         const now_ns = self.nowNs();
         // Bound each maintenance turn, including already-due pinned files.
         // Resume by path against the current root so churn cannot invalidate
         // a borrowed cursor or force a restart from the first pinned file.
         for (0..128) |_| {
+            if (platform.time.monotonicNs() >= deadline) return;
             const obsolete = self.obsolete_paths.nextDueAfter(now_ns, self.obsolete_reclaim_after) orelse {
                 if (self.obsolete_reclaim_after) |path| self.allocator.free(path);
                 self.obsolete_reclaim_after = null;
@@ -7912,15 +8024,24 @@ pub const Backend = struct {
                 continue;
             }
 
-            // Reserve the metadata edit before deletion; failure must leave a
-            // durable retry identity, never an untracked missing file.
+            // Retain the path across off-lock I/O; a failed post-I/O allocation
+            // leaves it in the durable ledger for an idempotent retry.
+            const path = try self.allocator.dupe(u8, obsolete.path);
+            defer self.allocator.free(path);
+            self.retainReaderKind(.other);
+            self.mu.unlock();
+            const deleted = repository_mod.deleteFileAbsoluteWithStorage(self.storage.?, path);
+            if (self.options.cache) |cache| cache.invalidatePath(path);
+            _ = runtime_mod.lockBackend(Backend, self);
+            self.releaseReaderKind(.other);
+            if (!self.obsolete_paths.contains(path)) continue;
             try self.obsolete_paths.ensureUnusedCapacity(self.allocator, 1);
-            repository_mod.deleteFileAbsoluteWithStorage(self.storage.?, obsolete.path) catch |err| switch (err) {
+            deleted catch |err| switch (err) {
                 error.FileNotFound => {},
                 else => {
                     self.obsolete_delete_failures +|= 1;
                     self.obsolete_delete_retries +|= 1;
-                    self.obsolete_paths.setDeadlinePrepared(obsolete.path, now_ns +| self.options.obsolete_delete_retry_ns);
+                    self.obsolete_paths.setDeadlinePrepared(path, self.nowNs() +| self.options.obsolete_delete_retry_ns);
                     self.obsolete_manifest_dirty = true;
                     continue;
                 },
@@ -7928,14 +8049,14 @@ pub const Backend = struct {
             // Readers of the retired generation were allowed to repopulate
             // the cache while the file was retained. No version pins remain
             // at this boundary, so remove any such late entries as well.
-            if (self.options.cache) |cache| cache.invalidatePath(obsolete.path);
-            run_snapshot_refs.forget(obsolete.path);
-            self.obsolete_paths.removePrepared(obsolete.path);
+            run_snapshot_refs.forget(path);
+            self.obsolete_paths.removePrepared(path);
             self.obsolete_manifest_dirty = true;
         }
     }
 
     fn hasReclaimableObsoletePathsLocked(self: *Backend) bool {
+        if (self.obsolete_reclaim_in_flight) return false;
         if (self.bulkIngestActive() or self.obsolete_paths.count() == 0) return false;
         if (self.root_dir == null or self.storage == null or self.options.backend.read_only) return false;
         const now_ns = self.nowNs();
@@ -7983,6 +8104,8 @@ pub const Backend = struct {
         // spinning while bulk mode intentionally suppresses that task.
         if (self.bulkIngestActive()) {
             var delay = self.bulkPlanningWakeDelayLocked();
+            if (self.outputCleanupDelayLocked()) |candidate|
+                delay = if (delay) |current| @min(current, candidate) else candidate;
             if (!self.bulk_plan_in_flight and self.bulkTieredL0MaintenanceDueLocked()) {
                 const candidate: u64 = if (self.optionalMaintenanceDeferredLocked()) maintenance_admission_retry_ns else 0;
                 delay = if (delay) |current| @min(current, candidate) else candidate;
@@ -7995,6 +8118,7 @@ pub const Backend = struct {
         }
 
         var delay_ns = self.nextObsoleteReclaimDelayNsLocked();
+        if (self.outputCleanupDelayLocked()) |candidate| delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
         // Retired owners still need bounded reclamation turns even after a
         // build error or the last runnable plan disappears. Cleanup is not
         // optional I/O and must not wait for foreground pressure to clear.
@@ -20007,6 +20131,8 @@ test "lsm obsolete reclamation resumes beyond pinned prefixes and observes cross
     // Establish a durable lineage: an unknown/ambiguous journal deliberately
     // fences deletion of every path.
     try backend.persistManifest();
+    try std.testing.expect(backend.mu.tryLock());
+    defer backend.mu.unlock();
     var paths: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
         for (paths.items) |path| {
@@ -20030,7 +20156,10 @@ test "lsm obsolete reclamation resumes beyond pinned prefixes and observes cross
     try std.testing.expect(backend.obsolete_reclaim_after != null);
     try std.testing.expect(!backend.hasReclaimableObsoletePathsLocked());
     try std.testing.expect(backend.hasReclaimableObsoletePathsLocked());
-    try backend.reconcileObsoletePathsForManifest();
+    for (0..16) |_| {
+        try backend.reconcileObsoletePathsForManifest();
+        if (!backend.obsolete_paths.contains(paths.items[300])) break;
+    }
     try std.testing.expect(!backend.obsolete_paths.contains(paths.items[300]));
     try std.testing.expectEqual(@as(usize, 300), backend.obsolete_paths.count());
     try std.testing.expect(!backend.hasReclaimableObsoletePathsLocked());
