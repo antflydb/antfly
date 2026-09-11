@@ -31599,6 +31599,8 @@ test "system catalog parallel hosted candidate fanout sends only owned keys" {
             _ = self.calls.fetchAdd(1, .monotonic);
             _ = self.keys_seen.fetchAdd(@as(usize, @intFromBool(left)) + @intFromBool(right), .monotonic);
             try std.testing.expect(left != right);
+            try std.testing.expectEqual(left, std.mem.indexOf(u8, req.uri, "/groups/7/") != null);
+            try std.testing.expectEqual(right, std.mem.indexOf(u8, req.uri, "/groups/8/") != null);
             // Stop after wire capture; both fibers must still finish. This
             // exercises the real parallel dispatch and serializer, not merely
             // the partition helper or the final result set.

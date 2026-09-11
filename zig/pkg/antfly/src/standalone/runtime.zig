@@ -2151,6 +2151,13 @@ const LocalStandaloneMetadata = struct {
         txn_open = false;
         mutation.committed = true;
         self.catalog_rows_initialized = true;
+        // The owned LSM was opened with fully durable WAL commits. Syncing
+        // its WAL/index again would add two redundant fsyncs to every DDL.
+        // Borrowed stores (including Lite) retain the explicit sync boundary.
+        if (self.catalog_store == null) {
+            std.debug.assert(self.owned_catalog_backend.?.backend.options.wal_sync_on_commit);
+            return;
+        }
         store.sync(true) catch {
             self.catalog_durability_failed = true;
             return error.MetadataMutationOutcomeUnknown;
@@ -10248,6 +10255,16 @@ test "system catalog standalone writes bounded deltas and recovers an ambiguous 
     // One resource and the head, regardless of the thousand unrelated tenants.
     try std.testing.expect(written > 0 and written < 4096);
 
+    // Reopen without a graceful backend flush: acknowledged row transactions
+    // must recover directly from their WAL, including the latest rename.
+    metadata.owned_catalog_store.?.deinit();
+    metadata.owned_catalog_store = null;
+    metadata.owned_catalog_backend.?.abandonAfterCrash();
+    metadata.owned_catalog_backend = null;
+    metadata.deinit();
+    metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    try std.testing.expect(metadata.system_catalog_state.?.index.find(.database, 0, "renamed") != null);
+
     const Failure = struct {
         fn sync(_: *anyopaque, _: bool) !void {
             return error.InjectedSyncFailure;
@@ -10256,6 +10273,8 @@ test "system catalog standalone writes bounded deltas and recovers an ambiguous 
     var failing = metadata.owned_catalog_store.?.vtable.*;
     failing.sync = Failure.sync;
     metadata.owned_catalog_store.?.vtable = &failing;
+    // Exercise the borrowed-store contract, which requires an explicit sync.
+    metadata.catalog_store = &metadata.owned_catalog_store.?;
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source.systemCatalog(alloc, .{}, .{ .mutate = .{ .mutation = .{ .action = .rename, .kind = .database, .name = "renamed", .new_name = "committed" } } }));
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source.systemCatalog(alloc, .{}, .{ .read = .{ .kind = .database, .name = "committed" } }));
     metadata.deinit();

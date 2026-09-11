@@ -186,7 +186,8 @@ arena so replacement cannot invalidate a pending binding.
 
 Local standalone stores catalog rows in an LSM directory beside the legacy file
 (`local-metadata.json.store`), using the existing engine's WAL, recovery, and
-compaction. Lite uses its existing `system/metadata` namespace. Startup prefers
+compaction. Local commits sync the WAL before acknowledgement; they do not
+repeat that sync after a successful commit. Lite uses its existing `system/metadata` namespace. Startup prefers
 the versioned row catalog; without it, startup reads the legacy JSON file or Lite
 `catalog` value. The first successful mutation atomically imports the legacy
 state and publishes the new head. Subsequent DDL writes changed rows and the head,
