@@ -18,7 +18,6 @@ const platform = @import("antfly_platform");
 const platform_clock = antfly.platform_clock;
 const graph_metric_runtime_mod = antfly.db.graph_metric_runtime;
 const graph_query_mod = antfly.graph_query;
-const writer_lock_mod = antfly.lmdb_engine.writer_lock;
 const internal_service_auth = @import("../api/internal_service_auth.zig");
 
 const RuntimeRole = graph_metric_runtime_mod.Role;
@@ -488,7 +487,7 @@ pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.pro
         break :blk try runServiceConfigured(init, target, cli);
     } else blk: {
         const db_path = cli.db_path orelse return error.InvalidArguments;
-        break :blk try runConfigured(alloc, db_path, cli);
+        break :blk try runConfigured(init.io, alloc, db_path, cli);
     };
     try writeJson(init.io, alloc, summary);
     if (cli.summary_file) |path| {
@@ -505,12 +504,12 @@ fn ownerIncarnationAlloc(alloc: std.mem.Allocator, logical_owner_id: []const u8)
     });
 }
 
-fn runConfigured(alloc: std.mem.Allocator, db_path: []const u8, cli: CliConfig) !RunSummary {
+fn runConfigured(io: std.Io, alloc: std.mem.Allocator, db_path: []const u8, cli: CliConfig) !RunSummary {
     var local_db_writer_lock = if (cli.local_db_writer_lock)
-        try acquireLocalDbWriterLock(alloc, db_path)
+        try acquireLocalDbWriterLock(io, alloc, db_path, local_db_writer_lock_retries)
     else
         null;
-    defer if (local_db_writer_lock) |*lock| lock.release();
+    defer if (local_db_writer_lock) |*lock| lock.close(io);
 
     var manual_clock = platform_clock.ManualClock{};
     if (cli.test_now_ms) |now_ms| manual_clock.setRealtimeNs(now_ms * std.time.ns_per_ms);
@@ -1530,21 +1529,67 @@ fn appendSupervisorTargetArgs(out: *ChildArgv, alloc: std.mem.Allocator, target:
     }
 }
 
-fn acquireLocalDbWriterLock(alloc: std.mem.Allocator, db_path: []const u8) !writer_lock_mod.WriterLock {
-    const lock_path = try std.fmt.allocPrint(alloc, "{s}-graph-metric-maintenance", .{db_path});
+fn acquireLocalDbWriterLock(io: std.Io, alloc: std.mem.Allocator, db_path: []const u8, max_attempts: usize) !std.Io.File {
+    // Keep the existing kernel-lock pathname, independently of the optional
+    // LMDB engine. Closing the descriptor (including process death) releases
+    // ownership; no PID record, fsync, or private executor is needed.
+    const lock_path = try std.fmt.allocPrint(alloc, "{s}-graph-metric-maintenance-writer", .{db_path});
     defer alloc.free(lock_path);
 
     var attempts: usize = 0;
-    while (attempts < local_db_writer_lock_retries) : (attempts += 1) {
-        return writer_lock_mod.acquire(lock_path) catch |err| switch (err) {
-            error.WriterLocked => {
-                platform.time.sleepNs(local_db_writer_lock_sleep_ms * std.time.ns_per_ms);
+    while (attempts < max_attempts) : (attempts += 1) {
+        return std.Io.Dir.cwd().createFile(io, lock_path, .{
+            .read = true,
+            .truncate = false,
+            .permissions = .fromMode(0o600),
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        }) catch |err| switch (err) {
+            error.WouldBlock => {
+                if (attempts + 1 == max_attempts) return error.WriterLocked;
+                try io.sleep(.fromMilliseconds(local_db_writer_lock_sleep_ms), .awake);
                 continue;
             },
             else => return err,
         };
     }
     return error.WriterLocked;
+}
+
+test "graph metric maintenance local writer lock is backend independent bounded and cancelable" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/db", .{tmp.sub_path});
+    defer a.free(path);
+    const first = try acquireLocalDbWriterLock(io, a, path, 1);
+    var held = true;
+    defer if (held) first.close(io);
+    try std.testing.expectError(error.WriterLocked, acquireLocalDbWriterLock(io, a, path, 1));
+    const Wait = struct {
+        threadlocal var sleeps: usize = 0;
+        threadlocal var cancel: bool = false;
+        fn sleep(_: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+            sleeps += 1;
+            if (cancel) return error.Canceled;
+        }
+    };
+    var vtable = io.vtable.*;
+    vtable.sleep = Wait.sleep;
+    const waiting_io: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    Wait.sleeps = 0;
+    Wait.cancel = false;
+    try std.testing.expectError(error.WriterLocked, acquireLocalDbWriterLock(waiting_io, a, path, 3));
+    try std.testing.expectEqual(@as(usize, 2), Wait.sleeps);
+    Wait.sleeps = 0;
+    Wait.cancel = true;
+    try std.testing.expectError(error.Canceled, acquireLocalDbWriterLock(waiting_io, a, path, 3));
+    try std.testing.expectEqual(@as(usize, 1), Wait.sleeps);
+    first.close(io);
+    held = false;
+    const second = try acquireLocalDbWriterLock(io, a, path, 1);
+    second.close(io);
 }
 
 fn launchSummaryPathAlloc(
@@ -1957,7 +2002,6 @@ const LoopbackSupervisorChildRunner = struct {
         io: std.Io,
         argv: []const []const u8,
     ) !ChildRunSummary {
-        _ = io;
         if (argv.len < 3) return error.InvalidArguments;
         if (!std.mem.eql(u8, argv[1], process_subcommand)) return error.InvalidArguments;
         const argv_z = try alloc.alloc([*:0]const u8, argv.len - 2);
@@ -1972,7 +2016,7 @@ const LoopbackSupervisorChildRunner = struct {
         var cli = try parseCli(alloc, &args);
         defer cli.deinit(alloc);
         const db_path = cli.db_path orelse return error.InvalidArguments;
-        const summary = try runConfigured(alloc, db_path, cli);
+        const summary = try runConfigured(io, alloc, db_path, cli);
         self.calls += 1;
         return .{
             .exit = .{ .exited = true, .code = 0 },
@@ -4196,7 +4240,7 @@ test "graph metric maintenance command exits after configured idle streak" {
         defer db.close();
     }
 
-    const summary = try runConfigured(alloc, path, .{
+    const summary = try runConfigured(std.testing.io, alloc, path, .{
         .role = .coordinator,
         .runtime_id = "command-idle-coordinator",
         .owner_id = "command-idle-coordinator",
@@ -4229,7 +4273,7 @@ test "graph metric maintenance command summary exposes ownership telemetry" {
         defer db.close();
     }
 
-    const coordinator_summary = try runConfigured(alloc, path, .{
+    const coordinator_summary = try runConfigured(std.testing.io, alloc, path, .{
         .role = .coordinator,
         .runtime_id = "command-telemetry-coordinator-runtime",
         .owner_id = "command-telemetry-coordinator-owner",
@@ -4269,7 +4313,7 @@ test "graph metric maintenance command summary exposes ownership telemetry" {
     defer worker_ids.deinit(alloc);
     try worker_ids.appendSlice(alloc, workers[0..]);
 
-    const worker_pool_summary = try runConfigured(alloc, path, .{
+    const worker_pool_summary = try runConfigured(std.testing.io, alloc, path, .{
         .role = .worker_pool,
         .runtime_id = "command-telemetry-worker-runtime",
         .owner_id = "command-telemetry-worker-owner",
@@ -4372,11 +4416,11 @@ test "graph metric maintenance command drives split degree through db-open runti
 
     var fresh = false;
     for (0..80) |_| {
-        _ = try runConfigured(alloc, path, coordinator);
-        const worker_summary = try runConfigured(alloc, path, worker_pool);
+        _ = try runConfigured(std.testing.io, alloc, path, coordinator);
+        const worker_summary = try runConfigured(std.testing.io, alloc, path, worker_pool);
         try std.testing.expectEqual(RuntimeRole.worker_pool, worker_summary.role);
         try std.testing.expect(!worker_summary.stats.started);
-        _ = try runConfigured(alloc, path, coordinator);
+        _ = try runConfigured(std.testing.io, alloc, path, coordinator);
 
         var reader = try antfly.db.DB.open(alloc, path, .{
             .open_mode = .query_readonly,

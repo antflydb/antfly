@@ -167,6 +167,9 @@ view that no thread can unlock, and avoids retaining stale ownership fences.
 
 ## Non-serverless
 
+- The local maintenance command uses its caller's `std.Io` for an exclusive
+  kernel file lock and bounded, cancelable contention waits. It requires no
+  LMDB engine, private executor, persisted PID record or lock-record fsync.
 - Generation-transition contention retains a stable retryable error across
   runtime archives and internal HTTP. Public queries retry a fresh snapshot
   within the existing cancellation/deadline budget; persistent contention is
