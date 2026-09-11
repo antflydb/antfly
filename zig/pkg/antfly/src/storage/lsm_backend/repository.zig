@@ -48,6 +48,38 @@ pub const ObsoletePath = struct {
 };
 
 pub const Run = struct {
+    /// Immutable memory runs own their state and routing metadata together.
+    /// Readers pin this generation rather than duplicating every key/value.
+    const SharedMemory = struct {
+        refs: std.atomic.Value(usize) = .init(1),
+        allocator: Allocator,
+        run: Run,
+    };
+
+    pub fn shareMemory(self: *Run, allocator: Allocator) !void {
+        std.debug.assert(self.path == null and self.state != null and self.shared_memory == null);
+        const shared = try allocator.create(SharedMemory);
+        shared.* = .{ .allocator = allocator, .run = self.* };
+        self.shared_memory = shared;
+    }
+
+    pub fn retainMemory(self: Run) ?Run {
+        const shared = self.shared_memory orelse return null;
+        _ = shared.refs.fetchAdd(1, .monotonic);
+        return self;
+    }
+
+    pub fn releaseMemory(self: *Run) bool {
+        const shared = self.shared_memory orelse return false;
+        self.shared_memory = null;
+        if (shared.refs.fetchSub(1, .acq_rel) == 1) {
+            const allocator = shared.allocator;
+            shared.run.deinit(allocator);
+            allocator.destroy(shared);
+        }
+        self.state = null;
+        return true;
+    }
     id: u64,
     /// Logical newest-write precedence for L0. Physical rewrites allocate a
     /// fresh id but retain the newest input sequence so tiered merges cannot
@@ -73,8 +105,13 @@ pub const Run = struct {
     table_index: ?lsm_table_file.TableIndex = null,
     version_ref_pinned: bool = false,
     state: ?state_mod.State,
+    shared_memory: ?*SharedMemory = null,
 
     pub fn deinit(self: *Run, allocator: Allocator) void {
+        if (self.releaseMemory()) {
+            self.* = undefined;
+            return;
+        }
         if (self.owns_path) {
             if (self.path) |path| allocator.free(path);
         }
@@ -154,6 +191,7 @@ pub const Run = struct {
 };
 
 pub fn cloneRunSnapshot(allocator: Allocator, source: Run) !Run {
+    if (source.retainMemory()) |pinned| return pinned;
     const smallest_namespace_name = if (source.smallest_namespace_name) |name| try allocator.dupe(u8, name) else null;
     errdefer if (smallest_namespace_name) |name| allocator.free(name);
     const smallest_key = try allocator.dupe(u8, source.smallest_key);
@@ -192,6 +230,7 @@ pub fn cloneRunSnapshot(allocator: Allocator, source: Run) !Run {
 }
 
 pub fn cloneRunCompactionSnapshot(allocator: Allocator, source: Run) !Run {
+    if (source.retainMemory()) |pinned| return pinned;
     const smallest_namespace_name = if (source.smallest_namespace_name) |name| try allocator.dupe(u8, name) else null;
     errdefer if (smallest_namespace_name) |name| allocator.free(name);
     const smallest_key = try allocator.dupe(u8, source.smallest_key);
@@ -1115,6 +1154,45 @@ const WrittenTableFile = struct {
     size_bytes: u64,
     compression_stats: lsm_table_file.CompressionStats,
 };
+
+test "repository immutable memory pins outlive owner without copying state or metadata" {
+    const Runner = struct {
+        fn check(allocator: Allocator) !void {
+            var run = Run{
+                .id = 1,
+                .level = 0,
+                .size_bytes = 1,
+                .path = null,
+                .smallest_namespace_name = null,
+                .smallest_key = &.{},
+                .largest_namespace_name = null,
+                .largest_key = &.{},
+                .entry_count = 1,
+                .bloom_filter = null,
+                .state = .{},
+            };
+            var owner_active = true;
+            defer if (owner_active) run.deinit(allocator);
+            run.smallest_key = try allocator.dupe(u8, "key");
+            run.largest_key = try allocator.dupe(u8, "key");
+            try run.state.?.entries.ensureTotalCapacity(allocator, 1);
+            run.state.?.entries.appendAssumeCapacity(try state_mod.initEntry(allocator, .{}, "key", "value", false));
+            try run.shareMemory(allocator);
+            var reader = try cloneRunSnapshot(allocator, run);
+            defer reader.deinit(allocator);
+            var compactor = try cloneRunCompactionSnapshot(allocator, run);
+            defer compactor.deinit(allocator);
+            try std.testing.expectEqual(run.state.?.entries.items.ptr, reader.state.?.entries.items.ptr);
+            try std.testing.expectEqual(run.smallest_key.ptr, compactor.smallest_key.ptr);
+            run.deinit(allocator);
+            owner_active = false;
+            try std.testing.expectEqualStrings("value", try reader.state.?.get(.{}, "key"));
+            try std.testing.expectEqualStrings("key", compactor.smallest_key);
+            try std.testing.expectEqualStrings("value", try compactor.state.?.get(.{}, "key"));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.check, .{});
+}
 
 test "repository manifest persist omits run bloom filters" {
     const allocator = std.testing.allocator;

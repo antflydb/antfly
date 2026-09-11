@@ -809,6 +809,7 @@ test "graph metric edge filter validation uses configured edge type metadata" {
 const reverse_rebuild_batch_size: usize = 1024;
 pub var test_abort_reverse_rebuild_after_batches: ?usize = null;
 pub var test_abort_prune_after_forward_commit = false;
+threadlocal var test_counter_publication_hook: ?*const fn (*GraphIndex, GraphIndex.Stats) anyerror!void = null;
 pub var test_abort_ownership_before_range_commit = false;
 pub var test_abort_counter_rebuild_after_pages: ?usize = null;
 const graph_meta_prefix = "meta:";
@@ -1681,19 +1682,19 @@ pub const GraphIndex = struct {
         return try std.fmt.allocPrint(alloc, "meta:node_ref:{s}", .{node});
     }
 
-    fn adjustNodeRef(self: *GraphIndex, batch: anytype, node: []const u8, delta: i64) !void {
+    fn adjustNodeRef(self: *GraphIndex, batch: anytype, counters: *Stats, node: []const u8, delta: i64) !void {
         const key = try graphNodeRefKeyAlloc(self.alloc, node);
         defer self.alloc.free(key);
         const current = try readU64OrZero(batch, key);
         if (delta > 0) {
-            if (current == 0) self.node_count += 1;
+            if (current == 0) counters.node_count += 1;
             try putU64(batch, key, current + @as(u64, @intCast(delta)));
             return;
         }
         const dec: u64 = @intCast(-delta);
         const next = if (dec >= current) 0 else current - dec;
         if (current > 0 and next == 0) {
-            self.node_count = if (self.node_count == 0) 0 else self.node_count - 1;
+            counters.node_count = if (counters.node_count == 0) 0 else counters.node_count - 1;
             batch.delete(key) catch |err| switch (err) {
                 error.NotFound => {},
                 else => return err,
@@ -1703,22 +1704,22 @@ pub const GraphIndex = struct {
         }
     }
 
-    fn accountReverseDelete(self: *GraphIndex, batch: anytype, source: []const u8, target: []const u8, rev_key: []const u8) !void {
+    fn accountReverseDelete(self: *GraphIndex, batch: anytype, counters: *Stats, source: []const u8, target: []const u8, rev_key: []const u8) !void {
         _ = batch.get(rev_key) catch |err| switch (err) {
             error.NotFound => return,
             else => return err,
         };
-        self.edge_count = if (self.edge_count == 0) 0 else self.edge_count - 1;
-        try self.adjustNodeRef(batch, source, -1);
-        try self.adjustNodeRef(batch, target, -1);
+        counters.edge_count = if (counters.edge_count == 0) 0 else counters.edge_count - 1;
+        try self.adjustNodeRef(batch, counters, source, -1);
+        try self.adjustNodeRef(batch, counters, target, -1);
     }
 
-    fn accountReverseInsert(self: *GraphIndex, batch: anytype, source: []const u8, target: []const u8, rev_key: []const u8) !void {
+    fn accountReverseInsert(self: *GraphIndex, batch: anytype, counters: *Stats, source: []const u8, target: []const u8, rev_key: []const u8) !void {
         _ = batch.get(rev_key) catch |err| switch (err) {
             error.NotFound => {
-                self.edge_count += 1;
-                try self.adjustNodeRef(batch, source, 1);
-                try self.adjustNodeRef(batch, target, 1);
+                counters.edge_count += 1;
+                try self.adjustNodeRef(batch, counters, source, 1);
+                try self.adjustNodeRef(batch, counters, target, 1);
                 return;
             },
             else => return err,
@@ -1726,9 +1727,29 @@ pub const GraphIndex = struct {
     }
 
     fn persistGraphCounters(self: *GraphIndex, batch: anytype) !void {
-        try putU64(batch, graph_edge_count_key, self.edge_count);
-        try putU64(batch, graph_node_count_key, self.node_count);
-        try putU64(batch, graph_edge_generation_key, self.edge_generation);
+        try persistCounters(batch, self.committedStats());
+    }
+
+    fn persistCounters(batch: anytype, counters: Stats) !void {
+        try putU64(batch, graph_edge_count_key, counters.edge_count);
+        try putU64(batch, graph_node_count_key, counters.node_count);
+        try putU64(batch, graph_edge_generation_key, counters.edge_generation);
+    }
+
+    fn committedStats(self: *GraphIndex) Stats {
+        @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+        defer self.ownership_mutex.unlock();
+        return .{ .edge_count = self.edge_count, .node_count = self.node_count, .edge_generation = self.edge_generation };
+    }
+
+    /// Call only after the counter transaction commits, with graph mutation
+    /// admission still held. The status lock never covers backend I/O.
+    fn publishCounters(self: *GraphIndex, counters: Stats) void {
+        @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+        defer self.ownership_mutex.unlock();
+        self.edge_count = counters.edge_count;
+        self.node_count = counters.node_count;
+        self.edge_generation = counters.edge_generation;
     }
 
     fn graphMetricKeyAlloc(self: *GraphIndex, parts: []const []const u8) ![]u8 {
@@ -3824,7 +3845,7 @@ pub const GraphIndex = struct {
                 .range_upper = "",
                 .output_prefix = output_prefix,
                 .worker_id = "",
-                .total_units = graphMetricBuildManifestPhaseUnits(phase, self.edge_count, self.node_count),
+                .total_units = graphMetricBuildManifestPhaseUnits(phase, try readU64OrZero(batch, graph_edge_count_key), try readU64OrZero(batch, graph_node_count_key)),
             });
         }
         try self.ensureTopologyBindingInBatch(batch, metric_name, cfg, job);
@@ -4074,8 +4095,9 @@ pub const GraphIndex = struct {
     }
 
     pub fn graphMetricPlannedBuildControlRecordEstimate(self: *GraphIndex, cfg: GraphMetricConfig) usize {
-        const edge_count = std.math.cast(usize, self.edge_count) orelse std.math.maxInt(usize);
-        const node_count = std.math.cast(usize, self.node_count) orelse std.math.maxInt(usize);
+        const counters = self.committedStats();
+        const edge_count = std.math.cast(usize, counters.edge_count) orelse std.math.maxInt(usize);
+        const node_count = std.math.cast(usize, counters.node_count) orelse std.math.maxInt(usize);
         const reverse_edge_page_count = if (cfg.kind == .degree or graphMetricKindUsesIterativeBuild(cfg.kind))
             self.graphMetricDegreeScanPageCount(edge_count)
         else
@@ -6075,7 +6097,7 @@ pub const GraphIndex = struct {
         try batch.commit();
     }
 
-    fn markMetricDirty(self: *GraphIndex, batch: anytype, changed_types: *const std.StringHashMapUnmanaged(void)) !void {
+    fn markMetricDirty(self: *GraphIndex, batch: anytype, changed_types: *const std.StringHashMapUnmanaged(void), generation: u64) !void {
         if (self.metric_configs.len == 0) return;
         for (self.metric_configs) |cfg| {
             if (cfg.edge_filter.mode != .all) {
@@ -6088,7 +6110,7 @@ pub const GraphIndex = struct {
             }
             const key = try self.graphMetricDirtyGenerationKeyAlloc(cfg.name);
             defer self.alloc.free(key);
-            try putU64(batch, key, self.edge_generation);
+            try putU64(batch, key, generation);
         }
     }
 
@@ -6103,7 +6125,7 @@ pub const GraphIndex = struct {
                 batch.abort();
             } else |err| switch (err) {
                 error.NotFound => {
-                    const generation = try std.math.add(u64, self.edge_generation, 1);
+                    const generation = try std.math.add(u64, (try graphCountersInTxn(&batch)).edge_generation, 1);
                     try batch.put(maintenance.counters_key, &.{0});
                     try putU64(&batch, graph_edge_count_key, 0);
                     try putU64(&batch, graph_node_count_key, 0);
@@ -6123,9 +6145,7 @@ pub const GraphIndex = struct {
                         try putU64(&batch, key, generation);
                     }
                     try batch.commit();
-                    self.edge_count = 0;
-                    self.node_count = 0;
-                    self.edge_generation = generation;
+                    self.publishCounters(.{ .edge_generation = generation });
                 },
                 else => return err,
             }
@@ -6199,14 +6219,9 @@ pub const GraphIndex = struct {
             }
             complete = item == null;
         }
-        const previous_edges = self.edge_count;
-        const previous_nodes = self.node_count;
-        errdefer {
-            self.edge_count = previous_edges;
-            self.node_count = previous_nodes;
-        }
         var batch = try self.beginWriteReverseBatch();
         errdefer batch.abort();
+        var counters = try graphCountersInTxn(&batch);
         if (phase == 0) {
             for (keys.items) |key| try batch.delete(key);
         } else {
@@ -6215,8 +6230,8 @@ pub const GraphIndex = struct {
                 const parsed = (try parseMetricReverseEdgeKeyView(temp, key, self.index_name)) orelse return error.InvalidGraphMaintenancePage;
                 try mutations.put(temp, key, .{ .before = false, .after = true, .source = parsed.source.bytes, .target = parsed.target.bytes, .kind = parsed.edge_type.bytes });
             }
-            try self.accountTopologyMutations(&batch, &mutations);
-            try self.persistGraphCounters(&batch);
+            try self.accountTopologyMutations(&batch, &counters, &mutations);
+            try persistCounters(&batch, counters);
         }
         if (complete and phase == 1) {
             try batch.delete(maintenance.counters_key);
@@ -6229,6 +6244,7 @@ pub const GraphIndex = struct {
             try batch.put(maintenance.counters_key, progress);
         }
         try batch.commit();
+        self.publishCounters(counters);
         return complete and phase == 1;
     }
 
@@ -6479,21 +6495,38 @@ pub const GraphIndex = struct {
         // Physical counters converge during retirement; never report them as
         // logical counts for the newly owned range.
         if (self.ownershipCleanupPending()) return self.scanStats(alloc);
-        if (self.edge_count == 0 and self.node_count == 0) {
-            const persisted = try loadGraphCounters(&self.reverse_store);
-            if (persisted.edge_count != 0 or persisted.node_count != 0) {
-                self.edge_count = persisted.edge_count;
-                self.node_count = persisted.node_count;
-                return persisted;
-            }
-        }
-        return .{
-            .edge_count = self.edge_count,
-            .node_count = self.node_count,
-        };
+        return self.committedStats();
     }
 
     pub const OperationalStats = struct { edge_count: u64, node_count: u64, counts_pending: bool };
+
+    test "graph maintenance counters publish only committed state" {
+        const a = std.testing.allocator;
+        var graph = try GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "g", .{ .reverse_backend = .mem });
+        defer graph.close();
+        const Hook = struct {
+            threadlocal var fail: bool = true;
+            fn check(index: *GraphIndex, staged: Stats) !void {
+                const published = index.operationalStats();
+                try std.testing.expectEqual(@as(u64, 0), published.edge_count);
+                try std.testing.expectEqual(@as(u64, 0), published.node_count);
+                try std.testing.expectEqual(@as(u64, 1), staged.edge_count);
+                try std.testing.expectEqual(@as(u64, 2), staged.node_count);
+                if (fail) return error.TestInjectedBackfillFailure;
+            }
+        };
+        test_counter_publication_hook = Hook.check;
+        defer test_counter_publication_hook = null;
+        Hook.fail = true;
+        const writes = [_]BatchWrite{.{ .source = "a", .target = "b", .edge_type = "link" }};
+        try std.testing.expectError(error.TestInjectedBackfillFailure, graph.batchApply(&writes, &.{}));
+        try std.testing.expectEqual(@as(u64, 0), (try loadGraphCounters(&graph.reverse_store)).edge_count);
+        Hook.fail = false;
+        try graph.batchApply(&writes, &.{});
+        const published = graph.operationalStats();
+        try std.testing.expectEqual(@as(u64, 1), published.edge_count);
+        try std.testing.expectEqual(@as(u64, 2), published.node_count);
+    }
 
     /// Physical counters are upper bounds until ownership cleanup completes.
     /// Status publication never allocates a node set or scans graph topology.
@@ -6534,7 +6567,7 @@ pub const GraphIndex = struct {
         return .{
             .edge_count = edge_count,
             .node_count = seen_nodes.count(),
-            .edge_generation = self.edge_generation,
+            .edge_generation = try readU64OrZero(&txn, graph_edge_generation_key),
         };
     }
 
@@ -6723,14 +6756,9 @@ pub const GraphIndex = struct {
         while (changes.next()) |entry| {
             if (entry.value_ptr.before != entry.value_ptr.after) try changed_types.put(self.alloc, entry.value_ptr.kind, {});
         }
-        const prev_edge_count = self.edge_count;
-        const prev_node_count = self.node_count;
-        const prev_edge_generation = self.edge_generation;
-        errdefer {
-            self.edge_count = prev_edge_count;
-            self.node_count = prev_node_count;
-            self.edge_generation = prev_edge_generation;
-        }
+        var counters = try graphCountersInTxn(&reverse_batch);
+        const prev_edge_count = counters.edge_count;
+        const prev_edge_generation = counters.edge_generation;
 
         for (deletes) |delete| {
             const out_key = try edgeKeyAlloc(self.alloc, delete.source, self.index_name, delete.edge_type, delete.target);
@@ -6742,7 +6770,7 @@ pub const GraphIndex = struct {
 
             const rev_key = try reverseEdgeKeyAlloc(self.alloc, delete.target, self.index_name, delete.edge_type, delete.source);
             defer self.alloc.free(rev_key);
-            if (!coalesced) try self.accountReverseDelete(&reverse_batch, delete.source, delete.target, rev_key);
+            if (!coalesced) try self.accountReverseDelete(&reverse_batch, &counters, delete.source, delete.target, rev_key);
             reverse_batch.delete(rev_key) catch |err| switch (err) {
                 error.NotFound => {},
                 else => return err,
@@ -6765,11 +6793,11 @@ pub const GraphIndex = struct {
 
             const rev_key = try reverseEdgeKeyAlloc(self.alloc, write.target, self.index_name, write.edge_type, write.source);
             defer self.alloc.free(rev_key);
-            if (!coalesced) try self.accountReverseInsert(&reverse_batch, write.source, write.target, rev_key);
+            if (!coalesced) try self.accountReverseInsert(&reverse_batch, &counters, write.source, write.target, rev_key);
             try reverse_batch.put(rev_key, edge_val);
         }
 
-        if (coalesced) try self.accountTopologyMutations(&reverse_batch, &topology_changes);
+        if (coalesced) try self.accountTopologyMutations(&reverse_batch, &counters, &topology_changes);
         var typed_updates = typed_edges.Updates.init(self.alloc);
         defer typed_updates.deinit();
         changes = topology_changes.iterator();
@@ -6782,7 +6810,7 @@ pub const GraphIndex = struct {
         try typed_updates.flush(&reverse_batch);
         if (typed_state.active and prev_edge_count == 0) try reverse_batch.put(typed_edges.ready_key, "1");
         if (changed_types.count() > 0) {
-            self.edge_generation = std.math.add(u64, self.edge_generation, 1) catch return error.InvalidGraphMetricBuildManifest;
+            counters.edge_generation = std.math.add(u64, counters.edge_generation, 1) catch return error.InvalidGraphMetricBuildManifest;
             // A migration floor gives previously indexed types a conservative
             // dependency epoch without an unbounded writer-side backfill.
             if (reverse_batch.get(graph_metric_type_epoch_floor_key)) |_| {} else |err| switch (err) {
@@ -6793,11 +6821,11 @@ pub const GraphIndex = struct {
             while (kinds.next()) |kind| {
                 const key = try self.graphMetricTypeEpochKeyAlloc(kind.*);
                 defer self.alloc.free(key);
-                try putU64(&reverse_batch, key, self.edge_generation);
+                try putU64(&reverse_batch, key, counters.edge_generation);
             }
-            try self.markMetricDirty(&reverse_batch, &changed_types);
+            try self.markMetricDirty(&reverse_batch, &changed_types, counters.edge_generation);
         }
-        try self.persistGraphCounters(&reverse_batch);
+        try persistCounters(&reverse_batch, counters);
         if (completed_intent) |key| {
             // Advance the whole-range cursor atomically with reverse
             // accounting and intent retirement. Reopen never rescans the
@@ -6814,11 +6842,13 @@ pub const GraphIndex = struct {
             } else |err| if (err != error.NotFound) return err;
             try reverse_batch.delete(key);
         }
+        if (builtin.is_test) if (test_counter_publication_hook) |hook| try hook(self, counters);
         try main_batch.commit();
         main_active = false;
         if (completed_intent != null) try self.outgoing_owner.sync(true);
         if (builtin.is_test and completed_intent != null and test_abort_prune_after_forward_commit) return error.TestInjectedBackfillFailure;
         try reverse_batch.commit();
+        self.publishCounters(counters);
     }
 
     const TopologyMutation = struct { before: bool, after: bool, kind: []const u8, source: []const u8, target: []const u8 };
@@ -6826,7 +6856,7 @@ pub const GraphIndex = struct {
     /// Count original-to-final connectivity once, independent of duplicate
     /// writes, attribute replacement and intermediate delete/reinsert pairs.
     /// Only distinct changed endpoints incur a counter read and mutation.
-    fn accountTopologyMutations(self: *GraphIndex, batch: anytype, mutations: *const std.StringHashMapUnmanaged(TopologyMutation)) !void {
+    fn accountTopologyMutations(self: *GraphIndex, batch: anytype, counters: *Stats, mutations: *const std.StringHashMapUnmanaged(TopologyMutation)) !void {
         var deltas = std.StringHashMapUnmanaged(i64).empty;
         defer deltas.deinit(self.alloc);
         var edge_delta: i128 = 0;
@@ -6841,7 +6871,7 @@ pub const GraphIndex = struct {
                 entry.value_ptr.* = try std.math.add(i64, entry.value_ptr.*, delta);
             }
         }
-        self.edge_count = std.math.cast(u64, @as(i128, self.edge_count) + edge_delta) orelse return error.InvalidGraphMetricBuildManifest;
+        counters.edge_count = std.math.cast(u64, @as(i128, counters.edge_count) + edge_delta) orelse return error.InvalidGraphMetricBuildManifest;
         const Update = struct { key: []u8, delta: i64 };
         const updates = try self.alloc.alloc(Update, deltas.count());
         defer self.alloc.free(updates);
@@ -6874,8 +6904,8 @@ pub const GraphIndex = struct {
                 } else 0;
                 const next = std.math.cast(u64, @as(i128, current) + update.delta) orelse return error.InvalidGraphMetricBuildManifest;
                 next_counts[i] = next;
-                if (current == 0 and next != 0) self.node_count += 1;
-                if (current != 0 and next == 0) self.node_count = std.math.sub(u64, self.node_count, 1) catch return error.InvalidGraphMetricBuildManifest;
+                if (current == 0 and next != 0) counters.node_count += 1;
+                if (current != 0 and next == 0) counters.node_count = std.math.sub(u64, counters.node_count, 1) catch return error.InvalidGraphMetricBuildManifest;
             }
             for (page, next_counts[0..page.len]) |update, next| {
                 if (next == 0) try batch.delete(update.key) else try putU64(batch, update.key, next);
@@ -13246,7 +13276,7 @@ pub const GraphIndex = struct {
                 const norm = @sqrt(summary.rank_sum);
                 if (!std.math.isFinite(norm)) return error.InvalidGraphMetricScore;
                 break :blk .{
-                    .count = std.math.cast(usize, self.node_count) orelse std.math.maxInt(usize),
+                    .count = std.math.cast(usize, try readU64OrZero(&txn, graph_node_count_key)) orelse std.math.maxInt(usize),
                     .norm = norm,
                     .raw_fingerprint = summary.output_fingerprint,
                     .fingerprint = summary.output_fingerprint,

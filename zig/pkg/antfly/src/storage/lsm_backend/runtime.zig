@@ -4424,6 +4424,7 @@ fn borrowRunSnapshotList(comptime BackendType: type, backend: *BackendType, allo
     var initialized: usize = 0;
     errdefer {
         for (runs[0..initialized]) |*run| {
+            if (run.releaseMemory()) continue;
             if (@hasDecl(BackendType, "releaseRunSnapshotRef")) {
                 backend.releaseRunSnapshotRef(run);
             }
@@ -4437,6 +4438,11 @@ fn borrowRunSnapshotList(comptime BackendType: type, backend: *BackendType, allo
     }
 
     for (source, 0..) |run, i| {
+        if (run.retainMemory()) |pinned| {
+            runs[i] = pinned;
+            initialized = i + 1;
+            continue;
+        }
         runs[i] = run;
         runs[i].owns_metadata = false;
         runs[i].owns_bloom_filter = false;
@@ -4463,6 +4469,7 @@ fn borrowRunSnapshotList(comptime BackendType: type, backend: *BackendType, allo
 
 fn freeRunSnapshotList(comptime BackendType: type, backend: *BackendType, allocator: Allocator, runs: []Run) void {
     for (runs) |*run| {
+        if (run.releaseMemory()) continue;
         if (@hasDecl(BackendType, "releaseRunSnapshotRef")) {
             backend.releaseRunSnapshotRef(run);
         }

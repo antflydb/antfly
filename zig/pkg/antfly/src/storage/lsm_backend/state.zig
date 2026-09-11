@@ -191,7 +191,9 @@ pub const State = struct {
         }
 
         const idx = self.lowerBound(namespace, key);
-        try self.entries.insert(allocator, idx, try initEntry(allocator, namespace, key, value, tombstone));
+        var entry = try initEntry(allocator, namespace, key, value, tombstone);
+        errdefer entry.deinit(allocator);
+        try self.entries.insert(allocator, idx, entry);
     }
 
     pub fn appendUpsert(
@@ -203,7 +205,7 @@ pub const State = struct {
         tombstone: bool,
     ) !void {
         if (self.entries.items.len == 0) {
-            try self.entries.append(allocator, try initEntry(allocator, namespace, key, value, tombstone));
+            try self.appendNew(allocator, namespace, key, value, tombstone);
             return;
         }
 
@@ -211,13 +213,19 @@ pub const State = struct {
         const last = self.entries.items[last_idx];
         switch (compareEntryTo(last, namespace, key)) {
             .lt => {
-                try self.entries.append(allocator, try initEntry(allocator, namespace, key, value, tombstone));
+                try self.appendNew(allocator, namespace, key, value, tombstone);
             },
             .eq => {
                 try replaceEntryValueCopy(&self.entries.items[last_idx], allocator, value, tombstone, false);
             },
             .gt => try self.upsert(allocator, namespace, key, value, tombstone),
         }
+    }
+
+    fn appendNew(self: *State, allocator: Allocator, namespace: backend_types.Namespace, key: []const u8, value: []const u8, tombstone: bool) !void {
+        var entry = try initEntry(allocator, namespace, key, value, tombstone);
+        errdefer entry.deinit(allocator);
+        try self.entries.append(allocator, entry);
     }
 
     pub fn upsertMove(self: *State, allocator: Allocator, entry: OwnedEntry) !void {
@@ -505,15 +513,7 @@ pub const SplitStates = struct {
 };
 
 pub fn cloneEntry(allocator: Allocator, entry: OwnedEntry) !OwnedEntry {
-    return .{
-        .namespace_name = if (entry.namespace_name) |name| try allocator.dupe(u8, name) else null,
-        .namespace_from_arena = false,
-        .key = try allocator.dupe(u8, entry.key),
-        .key_from_arena = false,
-        .value = try allocator.dupe(u8, entry.value),
-        .value_from_arena = false,
-        .tombstone = entry.tombstone,
-    };
+    return initEntry(allocator, .{ .name = entry.namespace_name }, entry.key, entry.value, entry.tombstone);
 }
 
 pub fn initEntry(
@@ -523,15 +523,35 @@ pub fn initEntry(
     value: []const u8,
     tombstone: bool,
 ) !OwnedEntry {
+    const owned_namespace = if (namespace.name) |name| try allocator.dupe(u8, name) else null;
+    errdefer if (owned_namespace) |name| allocator.free(name);
+    const owned_key = try allocator.dupe(u8, key);
+    errdefer allocator.free(owned_key);
     return .{
-        .namespace_name = if (namespace.name) |name| try allocator.dupe(u8, name) else null,
+        .namespace_name = owned_namespace,
         .namespace_from_arena = false,
-        .key = try allocator.dupe(u8, key),
+        .key = owned_key,
         .key_from_arena = false,
         .value = try allocator.dupe(u8, value),
         .value_from_arena = false,
         .tombstone = tombstone,
     };
+}
+
+test "lsm state entry construction insertion and cloning unwind allocation failures" {
+    const Runner = struct {
+        fn run(allocator: Allocator) !void {
+            var state = State{};
+            defer state.deinit(allocator);
+            try state.appendUpsert(allocator, .{ .name = "docs" }, "a", "A", false);
+            try state.appendUpsert(allocator, .{ .name = "docs" }, "c", "C", false);
+            try state.upsert(allocator, .{ .name = "docs" }, "b", "B", false);
+            var cloned = try state.clone(allocator);
+            defer cloned.deinit(allocator);
+            try std.testing.expectEqualStrings("B", try cloned.get(.{ .name = "docs" }, "b"));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 pub fn initArenaEntry(
